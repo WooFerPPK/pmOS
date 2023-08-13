@@ -3,23 +3,35 @@ import { Question } from './Question.js';
 import { Conversation } from './Conversation.js';
 import { Action } from './Action.js';
 import StartupManager from '/assets/js/modules/StartupManager/StartupManager.js';
-import DateModule from '/assets/js/modules/DateModule/DateModule.js';
+import { getDayOfWeek, formatDate, formatTime12Hour} from '/assets/js/utilities/DateTime.js';
+import { initiateDownload } from '/assets/js/utilities/Download.js';
+import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_TXT_PATH, RESUME_PDF_PATH, RESUME_HTML_PATH, RESUME_FILE_NAME } from '/assets/js/utilities/Constants.js';
 
-const GITHUB_PAGE = 'https://github.com/wooferppk';
-const LINKEDIN_PAGE = 'https://www.linkedin.com/in/paulmoscuzza/';
 
 export class Actions {
     constructor(terminal) {
         this.help = new Action(() => {
-            return 'Supported commands: ' + Object.keys(this).join(', ');
+            let commands = Object.keys(this);
+            let basicTerminalOperations = ['help', 'clear', 'date', 'shutdown'];
+            let resumeActions = ['resume', 'download resume', 'open resume', 'open html resume'];
+            let socialMediaActions = ['github', 'linkedin'];
+            
+            let helpOutput = '';
+        
+            helpOutput += 'Basic Terminal Operations: ' + basicTerminalOperations.join(', ') + '<br></br>';
+            helpOutput += 'Resume Actions: ' + resumeActions.join(', ') + '<br></br>';
+            helpOutput += 'Social Media Actions: ' + socialMediaActions.join(', ') + '<br></br>';
+            
+            return helpOutput;
         });
+        
 
         this.clear = new Action(() => {
             terminal.outputHandler.clearOutput();
             return '';
         });
 
-        this.resume = this.createFetchAction('/assets/templates/text/resume.txt', (result) => {
+        this.resume = this.createFetchAction(RESUME_TXT_PATH, (result) => {
             terminal.outputHandler.setTypeSpeed(-5);
             terminal.terminalEvents.on('outputRunningChanged', (isRunning) => {
                 if (!isRunning) {
@@ -30,23 +42,28 @@ export class Actions {
         });
 
         this['download resume'] = new Action(() => {
-            this.initiateDownload('/assets/templates/pdf/Paul-Moscuzza-Resume.pdf', 'Paul-Moscuzza-Resume.pdf');
-            return 'Initiating download of the resume';
+            initiateDownload(RESUME_PDF_PATH, RESUME_FILE_NAME);
+            return `Initiating download of Paul Moscuzza's resume`;
         });
 
         this['open resume'] = new Action(() => {
-            this.startupManager = new StartupManager(terminal.observable, terminal.interactiveWindows);
-            this.startupManager.startPDFViewer('/assets/templates/pdf/Paul-Moscuzza-Resume.pdf');
-            return 'Opening resume window'
+            this.startupManager = new StartupManager(terminal.interactiveWindows);
+            this.startupManager.startPDFViewer(RESUME_PDF_PATH, RESUME_HTML_PATH);
+            return `Opening Paul Moscuzza's PDF resume`;
         });
+
+        this['open html resume'] = new Action(() => {
+            this.startupManager = new StartupManager(terminal.interactiveWindows);
+            this.startupManager.startHTMLViewer(RESUME_HTML_PATH);
+            return `Opening HTML version of Paul Moscuzza's resume`
+        })
         
         this.github = this.createSocialMediaAction(GITHUB_PAGE, terminal);
         this.linkedin = this.createSocialMediaAction(LINKEDIN_PAGE, terminal);
 
         this.date = new Action(() => {
-            const dateModule = new DateModule();
             const currentDate = new Date();
-            return `${dateModule.getDayOfWeek(currentDate)} ${dateModule.formatDate(currentDate)} ${dateModule.formatTime12Hour(currentDate)} `;
+            return `${getDayOfWeek(currentDate)} ${formatDate(currentDate)} ${formatTime12Hour(currentDate)} `;
         });
 
         this.shutdown = this.createFetchAction('/assets/templates/text/shutdown.txt', (result) => {
@@ -90,9 +107,10 @@ export class Actions {
 
             const question = new Question(QUESTION, {
                 yes: new Action(() => {
-                    window.open(pageUrl, '_blank');
                     const promptHandler = new PromptHandler(terminal, `Opening ${pageUrl} in a new tab`);
                     promptHandler.handle();
+                    this.startupManager = new StartupManager(terminal.interactiveWindows);
+                    this.startupManager.startOpenPage(pageUrl);
                 }),
                 no: new Action(() => {
                     const promptHandler = new PromptHandler(terminal, 'Okay, let me know if you need anything else!');
@@ -104,14 +122,5 @@ export class Actions {
             conversation.start();
             return '';
         });
-    }
-
-    initiateDownload(url, filename) {
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
     }
 }

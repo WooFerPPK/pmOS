@@ -1,10 +1,10 @@
 <h1>Paul Moscuzza</h1>
-<h2>Senior Frontend Developer</h2>
+<h2>Senior Developer & Technical Leader</h2>
 <a href="mailto:paul.moscuzza@gmail.com">paul.moscuzza@gmail.com</a>
 <br></br>
 <h3>Summary</h3>
 <hr></hr>
-<p>Senior Frontend Developer with over 10 years of experience in Node.js, Vue.js, React, and other technologies. I specialize in developing high-quality web applications and boosting system performance. I have a track record of driving process improvements and have successfully streamlined the user interface for a network of over a million resellers worldwide. I led the development of an administrative tool using Vue.js and Node.js, providing a modern and efficient user experience. I have a history of effective collaboration with cross-functional teams, which has consistently led to decreased integration issues and increased project efficiency.</p>
+<p>Senior Developer & Technical Leader with over 10 years of experience in Node.js, Vue.js, React, and other technologies. I specialize in developing high-quality web applications and boosting system performance. I have a track record of driving process improvements and have successfully streamlined the user interface for a network of over a million resellers worldwide. I led the development of an administrative tool using Vue.js and Node.js, providing a modern and efficient user experience. I have a history of effective collaboration with cross-functional teams, which has consistently led to decreased integration issues and increased project efficiency.</p>
 <h3>Skills</h3>
 <hr></hr>
 <p>Expertise in: JavaScript, Vue.js, CanJS, Node.js / Express, Vuex, Pinia, HTML, CSS, SASS / SCSS, LESS</p>
