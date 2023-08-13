@@ -6,7 +6,10 @@ import { TerminalEvents } from './TerminalEvents.js';
 import { TerminalState } from './TerminalState.js';
 
 export class Terminal {
-    constructor(windowElement) {
+    constructor(windowElement, observable, interactiveWindows) {
+        this.observable = observable;
+        this.interactiveWindows = interactiveWindows;
+        
         this.terminalUI = new TerminalUI(windowElement);
         this.terminalEvents = new TerminalEvents(this);
         this.terminalState = new TerminalState();

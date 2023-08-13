@@ -1,23 +1,16 @@
 import { Terminal } from './modules/Terminal/Terminal.js';
 import { InteractiveWindows } from './modules/InteractiveWindows/InteractiveWindows.js';
+import { Observable } from './modules/observable/Observable.js';  // Import Observable
+import AutoStartupFactory from '/assets/js/factories/AutoStartupFactory.js';
+import { IconFactory } from './factories/IconFactory.js';
+// import { WindowFactory } from './factories/WindowFactory.js';
 
-let windows = document.querySelectorAll('.window');
-let interactiveWindows = new InteractiveWindows(windows);
+// Create a shared Observable instance for the entire app context
+const observable = new Observable();
+let interactiveWindows = new InteractiveWindows({observable});
 
-windows.forEach(win => {
-    new Terminal(win);
-});
+const iconFactory = new IconFactory(observable, interactiveWindows);
+iconFactory.initialize();
 
-document.querySelector('#terminal-icon').addEventListener('click', function() {
-    const terminalContainer = document.createElement('div');
-    terminalContainer.setAttribute('data-title', 'Terminal');
-    terminalContainer.classList.add('window');
-    
-    const desktopDiv = document.querySelector('#desktop');
-    desktopDiv.appendChild(terminalContainer);
-    
-    // Add the new terminal to the existing InteractiveWindow instance
-    interactiveWindows.addWindow(terminalContainer);
-
-    new Terminal(terminalContainer);
-});
+const autoStartupFactory = new AutoStartupFactory(observable, interactiveWindows);
+autoStartupFactory.initialize();

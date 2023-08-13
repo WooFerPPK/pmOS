@@ -2,6 +2,11 @@ import { PromptHandler } from './PromptHandler.js';
 import { Question } from './Question.js';
 import { Conversation } from './Conversation.js';
 import { Action } from './Action.js';
+import StartupManager from '/assets/js/modules/StartupManager/StartupManager.js';
+import DateModule from '/assets/js/modules/DateModule/DateModule.js';
+
+const GITHUB_PAGE = 'https://github.com/wooferppk';
+const LINKEDIN_PAGE = 'https://www.linkedin.com/in/paulmoscuzza/';
 
 export class Actions {
     constructor(terminal) {
@@ -14,39 +19,79 @@ export class Actions {
             return '';
         });
 
-        this.about = new Action(async () => {
-            const originalTypeSpeed = terminal.outputHandler.typeSpeed;
+        this.resume = this.createFetchAction('/assets/templates/text/resume.txt', (result) => {
+            terminal.outputHandler.setTypeSpeed(-5);
+            terminal.terminalEvents.on('outputRunningChanged', (isRunning) => {
+                if (!isRunning) {
+                    terminal.outputHandler.setTypeSpeed(0); // originalTypeSpeed
+                }
+            });
+            return result;
+        });
+
+        this['download resume'] = new Action(() => {
+            this.initiateDownload('/assets/templates/pdf/Paul-Moscuzza-Resume.pdf', 'Paul-Moscuzza-Resume.pdf');
+            return 'Initiating download of the resume';
+        });
+
+        this['open resume'] = new Action(() => {
+            this.startupManager = new StartupManager(terminal.observable, terminal.interactiveWindows);
+            this.startupManager.startPDFViewer('/assets/templates/pdf/Paul-Moscuzza-Resume.pdf');
+            return 'Opening resume window'
+        });
+        
+        this.github = this.createSocialMediaAction(GITHUB_PAGE, terminal);
+        this.linkedin = this.createSocialMediaAction(LINKEDIN_PAGE, terminal);
+
+        this.date = new Action(() => {
+            const dateModule = new DateModule();
+            const currentDate = new Date();
+            return `${dateModule.getDayOfWeek(currentDate)} ${dateModule.formatDate(currentDate)} ${dateModule.formatTime12Hour(currentDate)} `;
+        });
+
+        this.shutdown = this.createFetchAction('/assets/templates/text/shutdown.txt', (result) => {
+            terminal.terminalEvents.removeCtrlCListener();
+
+            terminal.terminalEvents.on('outputRunningChanged', (isRunning) => {
+                if (!isRunning) {
+                    setTimeout(() => {
+                        terminal.terminalUI.destroyTerminal();
+                    }, 2000);
+                }
+            });
+
+            return result;
+        });
+    }
+
+    createFetchAction(url, onSuccess) {
+        return new Action(async () => {
             try {
-                const response = await fetch('/assets/templates/text/resume.txt');
+                const response = await fetch(url);
                 if (!response.ok) {
-                    throw new Error("Failed to fetch the resume");
+                    throw new Error(`Failed to fetch from ${url}`);
                 }
                 const result = await response.text();
-                terminal.outputHandler.setTypeSpeed(-5);
-                terminal.terminalEvents.on('outputRunningChanged', (isRunning) => {
-                    if (!isRunning) {
-                        terminal.outputHandler.setTypeSpeed(originalTypeSpeed);
-                    }
-                });
-                return result;
+                return onSuccess(result);
             } catch (error) {
                 return `Error: ${error.message}`;
             }
         });
+    }
 
-        this.github = new Action(() => {
-            const GITHUB_PAGE = 'https://github.com/wooferppk';
+    createSocialMediaAction(pageUrl, terminal) {
+        return new Action(() => {
             const QUESTION = `
-            <a href="${GITHUB_PAGE}" target="_blank">${GITHUB_PAGE}</a>
-            <br></br>
-            Would you like me to redirect you to that page?
-            <br></br>
-            Type 'yes' or 'no'`;
+                <a href="${pageUrl}" target="_blank">${pageUrl}</a>
+                <br></br>
+                Would you like me to redirect you to that page?
+                <br></br>
+                Type 'yes' or 'no'`;
 
             const question = new Question(QUESTION, {
                 yes: new Action(() => {
-                    window.open(GITHUB_PAGE, '_blank');
-                    const promptHandler = new PromptHandler(terminal, `Opening ${GITHUB_PAGE} in a new tab`);
+                    window.open(pageUrl, '_blank');
+                    const promptHandler = new PromptHandler(terminal, `Opening ${pageUrl} in a new tab`);
                     promptHandler.handle();
                 }),
                 no: new Action(() => {
@@ -54,62 +99,19 @@ export class Actions {
                     promptHandler.handle();
                 })
             });
-    
+
             const conversation = new Conversation(question, terminal, terminal.lastCommand());
             conversation.start();
             return '';
         });
+    }
 
-        this.linkedin = new Action(() => {
-            const LINKEDIN_PAGE = 'https://www.linkedin.com/in/paulmoscuzza/';
-            const QUESTION = `
-            <a href="${LINKEDIN_PAGE}" target="_blank">${LINKEDIN_PAGE}</a>
-            <br></br>
-            Would you like me to redirect you to that page?
-            <br></br>
-            Type 'yes' or 'no'`;
-
-            const question = new Question(QUESTION, {
-                yes: new Action(() => {
-                    window.open(LINKEDIN_PAGE, '_blank');
-                    const promptHandler = new PromptHandler(terminal, `Opening ${LINKEDIN_PAGE} in a new tab`);
-                    promptHandler.handle();
-                }),
-                no: new Action(() => {
-                    const promptHandler = new PromptHandler(terminal, 'Okay, let me know if you need anything else!');
-                    promptHandler.handle();
-                })
-            });
-    
-            const conversation = new Conversation(question, terminal, terminal.lastCommand());
-            conversation.start();
-            return '';
-        });
-
-        this.shutdown = new Action(async () => {
-            terminal.outputHandler.clearOutput();
-            try {
-                const response = await fetch('/assets/templates/text/shutdown.txt');
-                if (!response.ok) {
-                    throw new Error('Failed to shutdown');
-                }
-
-                const result = await response.text();
-
-                terminal.terminalEvents.removeCtrlCListener();
-
-                terminal.terminalEvents.on('outputRunningChanged', (isRunning) => {
-                    if (!isRunning) {
-                        setTimeout(() => {
-                            terminal.terminalUI.destroyTerminal();
-                        }, 2000);
-                    }
-                });
-
-                return result;
-            } catch (error) {
-                return `Error: ${error.message}`;
-            }
-        })
+    initiateDownload(url, filename) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
     }
 }

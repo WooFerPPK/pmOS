@@ -72,7 +72,13 @@ html, body {
     margin: 10px 0 0 0;
 }
 
-.terminal-container {
+.container {
+    overflow-y: auto;
+    height: calc(100% - 20px - 20px);
+    border-radius: 0 0 10px 10px;  
+}
+
+.terminal {
     background-color: #000;
     overflow-y: auto;
     padding: 20px 20px 0 20px;
@@ -84,11 +90,11 @@ html, body {
     border-radius: 0 0 10px 10px;
 }
 
-.terminal-container a {
+.terminal a {
     color: #fff;
 }
 
-.terminal-container .input {
+.terminal .input {
     background: none;
     border: none;
     color: #fff;
