@@ -146,6 +146,7 @@ export class OutputHandler {
         } else {
             requestAnimationFrame(callback);
         }
+        this.scrollTerminalToBottom()
     }
 
     setTypeSpeed(speed) {

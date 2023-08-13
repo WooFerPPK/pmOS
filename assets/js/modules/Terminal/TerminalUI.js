@@ -30,7 +30,6 @@ export class TerminalUI {
         inputContainer.appendChild(inputDiv);  // Append inputDiv to input container
     
         // Append the input container to terminalElement
-        debugger;
         terminalContainer.appendChild(inputContainer);
         this.windowElement.appendChild(terminalContainer);
     }    
@@ -44,10 +43,11 @@ export class TerminalUI {
         this.clickHandler = () => {
             if (inputHandler && inputHandler.inputElement) {
                 inputHandler.inputElement.focus();
-                inputHandler.inputElement.scrollIntoView({
-                    behavior: 'smooth',
-                    block: 'center'
-                });
+                this.terminalElement.scrollTop = this.terminalElement.scrollHeight;
+                // inputHandler.inputElement.scrollIntoView({
+                //     behavior: 'smooth',
+                //     block: 'center'
+                // });
             } else {
                 // If inputHandler doesn't exist anymore, remove the event listener
                 this.removeFocusHandler();

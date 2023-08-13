@@ -1,8 +1,29 @@
+import HTMLLoader from "/assets/js/modules/HTMLLoader/HTMLLoader.js"; // Replace with the correct path
+
 export default class PDFViewer {
-    constructor(container, pdfPath) {
+    constructor(container, pdfPath, htmlPath) {
         this.container = container;
         this.pdfPath = pdfPath;
-        this.init();
+
+        if (this.isIOS()) {
+            const htmlLoader = new HTMLLoader(container, htmlPath);
+            htmlLoader.load();
+        } else {
+            this.init();
+        }
+    }
+
+    isIOS() {
+        return [
+            'iPad Simulator',
+            'iPhone Simulator',
+            'iPod Simulator',
+            'iPad',
+            'iPhone',
+            'iPod'
+        ].includes(navigator.platform)
+        // iPad on iOS 13+ detection
+        || (navigator.userAgent.includes("Mac") && "ontouchend" in document);
     }
 
     init() {
@@ -16,6 +37,7 @@ export default class PDFViewer {
         
         // Fallback content in case the PDF cannot be displayed
         const fallbackMessage = document.createElement('p');
+        fallbackMessage.className = "message"
         fallbackMessage.innerHTML = `It appears you don't have a PDF plugin for this browser. You can <a href="${this.pdfPath}">click here to download the PDF file.</a>`;
         pdfObject.appendChild(fallbackMessage);
 

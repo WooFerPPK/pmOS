@@ -1,8 +1,8 @@
 import StartupManager from '/assets/js/modules/StartupManager/StartupManager.js'
 
 export default class AutoStartupFactory {
-    constructor(observable, interactiveWindows) {
-        this.startupManager = new StartupManager(observable, interactiveWindows);
+    constructor(interactiveWindows) {
+        this.startupManager = new StartupManager(interactiveWindows);
     }
 
     initialize() {
