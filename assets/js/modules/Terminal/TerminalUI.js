@@ -3,12 +3,12 @@ export class TerminalUI {
     constructor(windowElement) {
         this.windowElement = windowElement;
         this.createUI();
-        this.terminalElement = this.windowElement.querySelector('.terminal-container');
+        this.terminalElement = this.windowElement.querySelector('.terminal');
     }
 
     createUI() {
         const terminalContainer = document.createElement('div');
-        terminalContainer.className = 'terminal-container';
+        terminalContainer.className = 'terminal container';
 
         const outputDiv = document.createElement('div');
         outputDiv.id = "output";
@@ -30,6 +30,7 @@ export class TerminalUI {
         inputContainer.appendChild(inputDiv);  // Append inputDiv to input container
     
         // Append the input container to terminalElement
+        debugger;
         terminalContainer.appendChild(inputContainer);
         this.windowElement.appendChild(terminalContainer);
     }    

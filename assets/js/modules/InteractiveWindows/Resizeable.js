@@ -21,7 +21,12 @@ export class Resizable {
         this.boundDoDrag = this.doDrag.bind(this);
         this.boundStopDrag = this.stopDrag.bind(this);
         
+        this.boundInitTouchDrag = this.initTouchDrag.bind(this);
+        this.boundDoTouchDrag = this.doTouchDrag.bind(this);
+        this.boundStopTouchDrag = this.stopTouchDrag.bind(this);
+
         this.handle.addEventListener('mousedown', this.boundInitDrag);
+        this.handle.addEventListener('touchstart', this.boundInitTouchDrag);
     }
 
     createResizeHandle() {
@@ -32,17 +37,7 @@ export class Resizable {
 
     initDrag(e) {
         e.preventDefault();
-        // Call the onResizeStart callback if provided
-        if (this.onResizeStart) {
-            this.onResizeStart();
-        }
-
-        this.dragging = true;
-
-        this.startX = e.clientX;
-        this.startY = e.clientY;
-        this.startWidth = this.element.offsetWidth;
-        this.startHeight = this.element.offsetHeight;
+        this.initResize(e.clientX, e.clientY);
 
         document.addEventListener('mousemove', this.boundDoDrag);
         document.addEventListener('mouseup', this.boundStopDrag);
@@ -50,9 +45,52 @@ export class Resizable {
 
     doDrag(e) {
         if (!this.dragging) return;
+        this.resize(e.clientX, e.clientY);
+    }
 
-        const newWidth = this.startWidth + e.clientX - this.startX;
-        const newHeight = this.startHeight + e.clientY - this.startY;
+    stopDrag() {
+        this.dragging = false;
+        document.removeEventListener('mousemove', this.boundDoDrag);
+        document.removeEventListener('mouseup', this.boundStopDrag);
+    }
+
+    initTouchDrag(e) {
+        e.preventDefault();
+        const touch = e.touches[0];
+        this.initResize(touch.clientX, touch.clientY);
+
+        document.addEventListener('touchmove', this.boundDoTouchDrag);
+        document.addEventListener('touchend', this.boundStopTouchDrag);
+    }
+
+    doTouchDrag(e) {
+        if (!this.dragging) return;
+        const touch = e.touches[0];
+        this.resize(touch.clientX, touch.clientY);
+    }
+
+    stopTouchDrag() {
+        this.dragging = false;
+        document.removeEventListener('touchmove', this.boundDoTouchDrag);
+        document.removeEventListener('touchend', this.boundStopTouchDrag);
+    }
+
+    initResize(clientX, clientY) {
+        if (this.onResizeStart) {
+            this.onResizeStart();
+        }
+
+        this.dragging = true;
+
+        this.startX = clientX;
+        this.startY = clientY;
+        this.startWidth = this.element.offsetWidth;
+        this.startHeight = this.element.offsetHeight;
+    }
+
+    resize(clientX, clientY) {
+        const newWidth = this.startWidth + clientX - this.startX;
+        const newHeight = this.startHeight + clientY - this.startY;
         const maxWidth = window.innerWidth - this.element.offsetLeft;
         const maxHeight = window.innerHeight - this.element.offsetTop;
     
@@ -61,11 +99,5 @@ export class Resizable {
     
         this.element.style.width = finalWidth + 'px';
         this.element.style.height = finalHeight + 'px';
-    }
-
-    stopDrag() {
-        this.dragging = false;
-        document.removeEventListener('mousemove', this.boundDoDrag);
-        document.removeEventListener('mouseup', this.boundStopDrag);
     }
 }

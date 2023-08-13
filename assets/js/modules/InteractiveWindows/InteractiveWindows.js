@@ -4,20 +4,21 @@ import { WindowBar } from './WindowBar.js';
 import { Draggable } from './Draggable.js';
 
 export class InteractiveWindows {
-    constructor(windows, config = {}) {
-        // Initializing the zIndex manager and converting input windows to array.
-        this.zIndexManager = new ZIndexManager();
-        this.windows = Array.from(windows);
-
-        const { minWidth = 400, minHeight = 300 } = config;
+    constructor(config = {}) {
+        // Initializing the zIndex manager.
+        const { minWidth = 400, minHeight = 300, observable } = config;
+        this.observable = observable
         this.minWidth = minWidth;
         this.minHeight = minHeight;
+        
+        this.zIndexManager = new ZIndexManager();
+        this.windows = []; // Start with an empty array
+
         
         this.offsetIncrement = 30; // Offset for each new window
         this.currentOffset = 0;    // Current accumulated offset for next window
 
-        // Initializing the windows and attaching resize listener.
-        this.initializeWindows(this.windows);
+        // Only listen to the window resize event at this point
         this.addResizeListener();
     }
     
@@ -36,9 +37,15 @@ export class InteractiveWindows {
         const windowWidth = this.clampWidth(window.innerWidth * 0.6);
         const windowHeight = this.clampHeight(window.innerHeight * 0.5);
         
+        // Calculate horizontal and vertical centering, then add current offset for a cascading effect
+        let centeredLeft = (window.innerWidth - windowWidth) / 2 + this.currentOffset;
+        let centeredTop = (window.innerHeight - windowHeight) / 2 + this.currentOffset;
+    
         // Check if the window with the current offset would exceed the viewport
-        if (this.currentOffset + windowWidth > window.innerWidth || this.currentOffset + windowHeight > window.innerHeight) {
+        if (centeredLeft + windowWidth > window.innerWidth || centeredTop + windowHeight > window.innerHeight) {
             this.currentOffset = 0;  // Reset offset if it exceeds viewport
+            centeredLeft = 40;       // Reset to 40px from the left
+            centeredTop = 0;
         }
     
         Object.assign(win.style, {
@@ -47,13 +54,15 @@ export class InteractiveWindows {
             minWidth: `${this.minWidth}px`,
             minHeight: `${this.minHeight}px`,
             position: 'absolute',
-            top: `${this.currentOffset}px`,  // Add current offset to top
-            left: `${this.currentOffset}px`  // Add current offset to left
+            top: `${centeredTop}px`,  // Adjusted position for the window
+            left: `${centeredLeft}px`
         });
         
         // Increment the current offset for next window
         this.currentOffset += this.offsetIncrement;
     }
+    
+    
 
     makeBar(win) {
         // Making the window bar. Must be run before draggable.
@@ -93,7 +102,12 @@ export class InteractiveWindows {
     addWindow(win) {
         // Add a new window to the list and initialize it.
         this.windows.push(win);
-        this.initializeWindows([win]);
+        this.setWindowStyles(win);
+        win.style.zIndex = this.zIndexManager.getTopZIndex(); // Assign z-index for each new window
+        this.windowBar = this.makeBar(win);
+        this.makeResizable(win);
+        this.makeDraggable(win);
+        this.addFocusEffect(win);
     }
 
     adjustWindowsToFitViewport() {
