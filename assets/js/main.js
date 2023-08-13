@@ -13,8 +13,8 @@ document.querySelector('#terminal-icon').addEventListener('click', function() {
     terminalContainer.setAttribute('data-title', 'Terminal');
     terminalContainer.classList.add('window');
     
-    const contentDiv = document.querySelector('#content');
-    contentDiv.appendChild(terminalContainer);
+    const desktopDiv = document.querySelector('#desktop');
+    desktopDiv.appendChild(terminalContainer);
     
     // Add the new terminal to the existing InteractiveWindow instance
     interactiveWindows.addWindow(terminalContainer);
