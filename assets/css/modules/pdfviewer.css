@@ -1,0 +1,16 @@
+.pdfviewer.container, .htmlviewer.container {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid #e0e0e0;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    background-color: #f8f9fa;
+    border-radius: 0 0 10px 10px;
+}
+
+.pdfviewer.container .message, .htmlviewer.container {
+    font-size: 1.2rem;
+    text-align: center;
+    color: #333;
+    margin-bottom: 1.5rem;
+    line-height: 1.5;
+}

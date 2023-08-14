@@ -24,6 +24,7 @@ export function formatDate(date) {
 
     return `${months[date.getMonth()]} ${day}${daySuffix} ${date.getFullYear()}`;
 }
+
 export function getDayOfWeek(date) {
     const daysOfWeek = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     return daysOfWeek[date.getDay()];

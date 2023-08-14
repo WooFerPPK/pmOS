@@ -1,0 +1,26 @@
+.terminal {
+    background-color: #000;
+    overflow-y: auto;
+    padding: 20px 20px 20px 20px;
+    color: #fff;;
+    font-size: 21px;
+    font-family: monospace;
+    word-wrap: break-word;
+    height: calc(100% - 20px - 20px);
+    border-radius: 0 0 10px 10px;
+}
+
+.terminal a {
+    color: #fff;
+}
+
+.terminal .input {
+    background: none;
+    border: none;
+    color: #fff;
+    display: inline;
+    font-family: 21px;
+    outline: none;
+    white-space: pre-wrap;
+    width: calc(100% - 10px);
+}
