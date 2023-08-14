@@ -18,13 +18,13 @@ export class WindowBar {
 
         // Close button
         this.closeButton = document.createElement('button');
-        this.closeButton.innerText = 'X';
+        // this.closeButton.innerText = 'X';
         this.closeButton.className = 'close-btn';
         this.controlsContainer.appendChild(this.closeButton);
 
         // Full Screen button
         this.fullScreenButton = document.createElement('button');
-        this.fullScreenButton.innerText = '[ ]'; // Symbol for entering full screen
+        // this.fullScreenButton.innerText = '[ ]'; // Symbol for entering full screen
         this.fullScreenButton.className = 'fullscreen-btn';
         this.controlsContainer.appendChild(this.fullScreenButton);
 
@@ -43,7 +43,7 @@ export class WindowBar {
             this.element.style.height = this.originalHeight || '';
             this.element.style.top = this.originalTop || '';
             this.element.style.left = this.originalLeft || '';
-            this.fullScreenButton.innerText = '[ ]';
+            // this.fullScreenButton.innerText = '[ ]';
             this.fullScreenButton.className = 'fullscreen-btn';
         } else {
             // Store the current state
@@ -57,7 +57,7 @@ export class WindowBar {
             this.element.style.height = '100vh';
             this.element.style.top = '0';
             this.element.style.left = '0';
-            this.fullScreenButton.innerText = '-';
+            // this.fullScreenButton.innerText = '-';
             this.fullScreenButton.className = 'smallscreen-btn';
         }
 

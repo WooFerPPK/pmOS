@@ -1,0 +1,108 @@
+.window {
+    position: relative;
+    background: linear-gradient(145deg, #f7f7f7, #e1e1e1);
+    border: 1px solid #b5b5b5;
+    border-radius: 10px;
+    z-index: 0;
+    box-shadow:
+        0 4px 8px rgba(0,0,0,0.1),
+        0 6px 20px rgba(0,0,0,0.08);
+    background: 
+        linear-gradient(white, white) padding-box,
+        linear-gradient(to right, #d4d4d4, #f1f1f1) border-box;
+    border-width: 3px;
+}
+
+.window .container {
+    overflow-y: auto;
+    height: calc(100% - 20px - 20px);
+    border-radius: 0 0 10px 10px;  
+}
+
+.window .resizable-handle {
+    background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAsAAAALCAYAAACprHcmAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAE5JREFUeNpi%2Bf%2F%2FPwMxwNvb24GJWIX6%2Bvr7mYhVePHiRUcmYhUCuQeYiFUIxNjdjE0hVjfjUojhZnwKUdxMSCHczcQoBLuZWIUgPkCAAQCFeVrlOKc1%2BgAAAABJRU5ErkJggg%3D%3D) no-repeat 7px 7px;
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    width: 20px;
+    height: 20px;
+    cursor: se-resize;
+}
+
+.window .draggable-bar {
+    display: flex;
+    cursor: move;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    height: 40px;
+    padding: 0 20px;
+    background: linear-gradient(180deg, #4a4a4a, #2e2e2e);
+    border-radius: 8px 8px 0 0;
+    color: #fff;
+    font-size: 21px;
+    font-weight: 600;
+    box-shadow: inset 0 -2px 5px rgba(0, 0, 0, 0.2);
+}
+
+
+.window .draggable-bar .window-title {
+    color: #fff;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+.window .draggable-bar .controls-container {
+    display: flex;
+    flex-direction: row-reverse;
+    column-gap: 10px;
+}
+
+/* Mac Styled Control Buttons */
+.window .draggable-bar .controls-container .close-btn {
+    background-color: #FF5F56;
+    border: none;
+    transition: background-color 0.2s;
+}
+
+.window .draggable-bar .controls-container .close-btn:hover {
+    background-color: #e0443b;
+}
+
+.window .draggable-bar .controls-container .fullscreen-btn {
+    background-color: #58C244;
+    margin-right: 10px;
+    border: none;
+    transition: background-color 0.2s;
+}
+
+.window .draggable-bar .controls-container .fullscreen-btn:hover {
+    background-color: #48a832;
+}
+
+.window .draggable-bar .controls-container .smallscreen-btn {
+    background-color: #FFBD2E;
+    margin-right: 10px;
+    border: none;
+    transition: background-color 0.2s;
+}
+
+.window .draggable-bar .controls-container .smallscreen-btn:hover {
+    background-color: #e5a920;
+}
+
+.window .draggable-bar .controls-container .close-btn, 
+.window .draggable-bar .controls-container .fullscreen-btn, 
+.window .draggable-bar .controls-container .smallscreen-btn {
+    padding: 0;
+    margin: 0;
+    line-height: 16px;
+    font-size: 16px;
+    font-weight: 600;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 15px;
+}
