@@ -1,7 +1,17 @@
 export default class HTMLLoader {
-    constructor(container, htmlPath) {
+    constructor(container, htmlPath, observable) {
+        this.observable = observable;
+
+        this.observable.subscribe("windowShutdown", this);
+
         this.container = container;
         this.htmlPath = htmlPath;
+    }
+
+    update(message) {
+        if (message === "shutdown") {
+            this.container.remove();
+        }
     }
 
     async load() {

@@ -1,7 +1,11 @@
 import HTMLLoader from "/assets/js/modules/HTMLLoader/HTMLLoader.js"; // Replace with the correct path
 
 export default class PDFViewer {
-    constructor(container, pdfPath, htmlPath) {
+    constructor(container, pdfPath, htmlPath, observable) {
+        this.observable = observable;
+
+        this.observable.subscribe("windowShutdown", this);
+
         this.container = container;
         this.pdfPath = pdfPath;
 
@@ -10,6 +14,12 @@ export default class PDFViewer {
             htmlLoader.load();
         } else {
             this.init();
+        }
+    }
+
+    update(message) {
+        if (message === "shutdown") {
+            this.container.remove();
         }
     }
 

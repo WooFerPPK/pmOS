@@ -6,8 +6,11 @@ import { TerminalEvents } from './TerminalEvents.js';
 import { TerminalState } from './TerminalState.js';
 
 export class Terminal {
-    constructor(windowElement, interactiveWindows) {
+    constructor(windowElement, interactiveWindows, observable) {
         this.interactiveWindows = interactiveWindows;
+        this.observable = observable;
+
+        this.observable.subscribe("windowShutdown", this);
 
         this.terminalUI = new TerminalUI(windowElement);
         this.terminalEvents = new TerminalEvents(this);
@@ -21,6 +24,12 @@ export class Terminal {
         this.terminalEvents.initCtrlCListener(this.outputHandler, this.terminalElement);
     }
     
+    update(message) {
+        if (message === "shutdown") {
+            this.terminalUI.destroyTerminal();
+        }
+    }
+
     get isOutputRunning() {
         return this.terminalState.isOutputRunning;
     }
