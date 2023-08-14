@@ -5,28 +5,29 @@ import HTMLLoader from "/assets/js/modules/HTMLLoader/HTMLLoader.js";
 
 
 export default class StartupManager {
-    constructor(interactiveWindows) {
+    constructor(interactiveWindows, observable) {
+        this.observable = observable
         this.interactiveWindows = interactiveWindows;
     }
 
     startTerminal() {
         const terminalContainer = WindowFactory.create('Terminal');
         this.interactiveWindows.addWindow(terminalContainer);
-        new Terminal(terminalContainer, this.interactiveWindows);
+        new Terminal(terminalContainer, this.interactiveWindows, this.observable);
         return terminalContainer;
     }
 
     startPDFViewer(pdfPath, htmlPath) {
         const pdfContainer = WindowFactory.create(`Paul Moscuzza's Resume`);
         this.interactiveWindows.addWindow(pdfContainer);
-        new PDFViewer(pdfContainer, pdfPath, htmlPath);
+        new PDFViewer(pdfContainer, pdfPath, htmlPath, this.observable);
         return pdfContainer;
     }
 
     startHTMLViewer(htmlPath) {
         const htmlContainer = WindowFactory.create(`Paul Moscuzza's Resume`);
         this.interactiveWindows.addWindow(htmlContainer);
-        const htmlLoader = new HTMLLoader(htmlContainer, htmlPath);
+        const htmlLoader = new HTMLLoader(htmlContainer, htmlPath, this.observable);
         htmlLoader.load();
         return htmlContainer;
     }

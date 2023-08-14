@@ -6,7 +6,8 @@ import { Draggable } from './Draggable.js';
 export class InteractiveWindows {
     constructor(config = {}) {
         // Initializing the zIndex manager.
-        const { minWidth = 330, minHeight = 370 } = config;
+        const { minWidth = 330, minHeight = 370, observable} = config;
+        this.observable = observable;
         this.minWidth = minWidth;
         this.minHeight = minHeight;
         

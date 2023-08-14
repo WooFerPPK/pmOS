@@ -10,6 +10,8 @@ import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_TXT_PATH, RESUME_PDF_PATH, RESUME_HT
 
 export class Actions {
     constructor(terminal) {
+        this.startupManager = new StartupManager(terminal.interactiveWindows, terminal.observable);
+
         this.help = new Action(() => {
             let commands = Object.keys(this);
             let basicTerminalOperations = ['help', 'clear', 'date', 'shutdown'];
@@ -47,13 +49,11 @@ export class Actions {
         });
 
         this['open resume'] = new Action(() => {
-            this.startupManager = new StartupManager(terminal.interactiveWindows);
             this.startupManager.startPDFViewer(RESUME_PDF_PATH, RESUME_HTML_PATH);
             return `Opening Paul Moscuzza's PDF resume`;
         });
 
         this['open html resume'] = new Action(() => {
-            this.startupManager = new StartupManager(terminal.interactiveWindows);
             this.startupManager.startHTMLViewer(RESUME_HTML_PATH);
             return `Opening HTML version of Paul Moscuzza's resume`
         })
@@ -72,6 +72,7 @@ export class Actions {
             terminal.terminalEvents.on('outputRunningChanged', (isRunning) => {
                 if (!isRunning) {
                     setTimeout(() => {
+                        terminal.observable.notify("windowShutdown", { source: terminal, message: 'shutdown' });
                         terminal.terminalUI.destroyTerminal();
                     }, 2000);
                 }
@@ -109,7 +110,7 @@ export class Actions {
                 yes: new Action(() => {
                     const promptHandler = new PromptHandler(terminal, `Opening ${pageUrl} in a new tab`);
                     promptHandler.handle();
-                    this.startupManager = new StartupManager(terminal.interactiveWindows);
+                    
                     this.startupManager.startOpenPage(pageUrl);
                 }),
                 no: new Action(() => {
