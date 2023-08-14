@@ -43,11 +43,6 @@ export class TerminalUI {
         this.clickHandler = () => {
             if (inputHandler && inputHandler.inputElement) {
                 inputHandler.inputElement.focus();
-                this.terminalElement.scrollTop = this.terminalElement.scrollHeight;
-                // inputHandler.inputElement.scrollIntoView({
-                //     behavior: 'smooth',
-                //     block: 'center'
-                // });
             } else {
                 // If inputHandler doesn't exist anymore, remove the event listener
                 this.removeFocusHandler();
