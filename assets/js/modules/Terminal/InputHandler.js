@@ -66,7 +66,7 @@ export class InputHandler {
 
     destroy() {
         this.inputElement.removeEventListener('keydown', this.boundListener);
-        this.inputElement = null;
+        // this.inputElement = null;
         this.terminal = null;
         this.actions = null;
     }

@@ -17,15 +17,15 @@ export default class StartupManager {
         return terminalContainer;
     }
 
-    startPDFViewer(pdfPath, htmlPath) {
-        const pdfContainer = WindowFactory.create(`Paul Moscuzza's Resume`);
+    startPDFViewer(pdfPath, htmlPath, title) {
+        const pdfContainer = WindowFactory.create(title);
         this.interactiveWindows.addWindow(pdfContainer);
         new PDFViewer(pdfContainer, pdfPath, htmlPath, this.observable);
         return pdfContainer;
     }
 
-    startHTMLViewer(htmlPath) {
-        const htmlContainer = WindowFactory.create(`Paul Moscuzza's Resume`);
+    startHTMLViewer(htmlPath, title) {
+        const htmlContainer = WindowFactory.create(title);
         this.interactiveWindows.addWindow(htmlContainer);
         const htmlLoader = new HTMLLoader(htmlContainer, htmlPath, this.observable);
         htmlLoader.load();
