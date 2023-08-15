@@ -2,6 +2,7 @@ import { ZIndexManager } from './ZIndexManager.js';
 import { Resizable } from './Resizeable.js';
 import { WindowBar } from './WindowBar.js';
 import { Draggable } from './Draggable.js';
+import WindowManager from './WindowManager.js';
 
 export class InteractiveWindows {
     constructor(config = {}) {
@@ -11,9 +12,8 @@ export class InteractiveWindows {
         this.minWidth = minWidth;
         this.minHeight = minHeight;
         
+        this.windowManager = new WindowManager(this.observable);
         this.zIndexManager = new ZIndexManager();
-        this.windows = []; // Start with an empty array
-
         
         this.offsetIncrement = 30; // Offset for each new window
         this.currentOffset = 0;    // Current accumulated offset for next window
@@ -21,16 +21,18 @@ export class InteractiveWindows {
         // Only listen to the window resize event at this point
         this.addResizeListener();
     }
-    
-    initializeWindows(windows) {
-        windows.forEach(win => {
-            this.setWindowStyles(win); // Set initial styles
-            this.windowBar = this.makeBar(win);
-            this.makeResizable(win); // Make window resizable
-            this.makeDraggable(win); // Make window draggable
-            this.addFocusEffect(win); // Apply focus effect on mousedown
-        });
+
+    addWindow(win) {
+        // Add a new window to the list and initialize it.
+        this.windowManager.addWindow(win);
+        this.setWindowStyles(win);
+        this.windowBar = this.makeBar(win);
+        win.style.zIndex = this.zIndexManager.getTopZIndex(); // Assign z-index for each new window
+        this.makeResizable(win);
+        this.makeDraggable(win);
+        this.addFocusEffect(win);
     }
+
 
     setWindowStyles(win) {
         // Setting default size and position styles for each window.
@@ -61,12 +63,10 @@ export class InteractiveWindows {
         // Increment the current offset for next window
         this.currentOffset += this.offsetIncrement;
     }
-    
-    
 
     makeBar(win) {
         // Making the window bar. Must be run before draggable.
-        return new WindowBar(win);
+        return new WindowBar(win, this.windowManager);
     }
 
     makeDraggable(win) {
@@ -80,15 +80,11 @@ export class InteractiveWindows {
     }
 
     addFocusEffect(win) {
-        // Add an event listener to the window to adjust zIndex and opacity when focused.
         win.addEventListener('mousedown', () => {
-            win.style.zIndex = this.zIndexManager.getTopZIndex();
-            win.style.opacity = '1';  
-            this.windows.forEach(otherWin => {
-                if (otherWin !== win) {
-                    otherWin.style.opacity = '0.7';
-                }
-            });
+            win.style.zIndex = this.zIndexManager.getTopZIndex(); 
+            // Inform WindowManager about the focused window
+            this.windowManager.setFocusedWindow(win);
+            
         });
     }
 
@@ -99,20 +95,11 @@ export class InteractiveWindows {
         });
     }
 
-    addWindow(win) {
-        // Add a new window to the list and initialize it.
-        this.windows.push(win);
-        this.setWindowStyles(win);
-        win.style.zIndex = this.zIndexManager.getTopZIndex(); // Assign z-index for each new window
-        this.windowBar = this.makeBar(win);
-        this.makeResizable(win);
-        this.makeDraggable(win);
-        this.addFocusEffect(win);
-    }
 
     adjustWindowsToFitViewport() {
         // For each window, adjust its size and position to ensure it's within the viewport.
-        this.windows.forEach(win => {
+        const allOpenWindows = this.windowManager.getOpenWindows();
+        allOpenWindows.forEach(win => {
             const rect = win.getBoundingClientRect();
             
             win.style.width = this.clampWidth(rect.width) + 'px';

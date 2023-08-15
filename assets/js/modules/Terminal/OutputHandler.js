@@ -8,10 +8,11 @@ export class OutputHandler {
 
     displayStartupMessage() {
         const message = `
-        Welcome to the pmOS (Paul Moscuzza Operating System)<br/>
-        Type 'help' for a list of supported commands.<br/>
-        Press 'ctrl-c' to interrupt the output at any time<br/>
-        Press 'ctrl-l' to clear the window
+        Welcome to pmOS by Paul Moscuzza.<br/><br/>
+        Reflecting over 13 years of expertise in web development.<br/><br/>
+        -> Type 'help' to get started.<br/>
+        -> 'ctrl-c' to pause.<br/>
+        -> 'ctrl-l' to clear the screen.<br/><br/>
         `;
         this.outputElement.innerHTML = message;
     }

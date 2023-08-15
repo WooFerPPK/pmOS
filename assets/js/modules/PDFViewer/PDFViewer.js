@@ -19,7 +19,7 @@ export default class PDFViewer {
 
     update(message) {
         if (message === "shutdown") {
-            this.container.remove();
+            this.observable.notify("windowClosed", { source: 'PDFViewer', message: this.container });
         }
     }
 

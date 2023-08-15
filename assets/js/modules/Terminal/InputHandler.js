@@ -6,6 +6,7 @@ export class InputHandler {
         this.terminal = terminal;
         this.actions = actions || new Actions(terminal);
         this.boundListener = this.handleKeydown.bind(this);
+        this.freeInputProcessor = null;  // New variable to hold the function for free input processing
         this.initInputListener();
     }
     initInputListener() {
@@ -21,10 +22,17 @@ export class InputHandler {
         if (event.key === 'Enter') {
             event.preventDefault();
             const command = event.target.textContent.trim();
-            this.terminal.addCommandToHistory(command);
-            this.processCommand(command);
-            event.target.textContent = '';
 
+            if (this.freeInputProcessor) {
+                // If in free input mode, process the entire string
+                this.terminal.outputHandler.displayOutput(command, this.processFreeInput(command));
+            } else {
+                // Else, process as a command
+                this.terminal.addCommandToHistory(command);
+                this.processCommand(command);
+            }
+
+            event.target.textContent = '';
         } else if (event.key === 'ArrowUp') {
             if (this.terminal.terminalState.historyPosition > 0) {
                 this.terminal.terminalState.historyPosition--;
@@ -61,6 +69,22 @@ export class InputHandler {
             }
         } else {
             this.terminal.outputHandler.displayOutput(command, `${command}: command not found`);
+        }
+    }
+
+    processFreeInput(input) {
+        if (input === "exit") {
+            this.freeInputProcessor = null;  // Exit free input mode
+            return "Exited application. You can now use regular terminal commands.";
+        }
+
+        // If not exit, process input as a mathematical expression
+        try {
+            
+            let result = this.freeInputProcessor(input);
+            return result.toString();
+        } catch (error) {
+            return "Invalid expression.";
         }
     }
 
