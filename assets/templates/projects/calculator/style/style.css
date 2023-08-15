@@ -16,8 +16,8 @@ body {
 }
 
 .display {
-    background-color: #1a1a1a; /* Darker gray for the display */
-    color: #fff; /* White text for the display */
+    background-color: #1a1a1a;
+    color: #fff;
     padding: 10px 15px;
     font-size: 1.5em;
     border-radius: 5px;
@@ -25,7 +25,7 @@ body {
     display: flex;
     justify-content: flex-end;
     align-items: center;
-    height: 50px;
+    min-height: 50px;
 }
 
 .buttons {
@@ -49,12 +49,12 @@ body {
     border-radius: 5px;
     cursor: pointer;
     transition: background-color 0.3s;
-    background-color: #3a3a3a; /* Slightly lighter gray for buttons */
-    color: #fff; /* White text for buttons */
+    background-color: #3a3a3a;
+    color: #fff;
 }
 
 .number:hover, .operator:hover {
-    background-color: #4a4a4a; /* A bit lighter gray for hover effect */
+    background-color: #4a4a4a;
 }
 
 /* Place the 0 button on its own row spanning 3 columns */
@@ -64,121 +64,37 @@ body {
 
 .operators {
     display: grid;
-    grid-template-columns: repeat(2, 1fr); /* Two columns for operators */
+    grid-template-columns: repeat(2, 1fr);
     grid-template-rows: repeat(4, 1fr);
     gap: 10px;
-}
-
-/* ← button to span two columns and take up one row */
-.operator[value="back"] {
-    grid-column: 1 / span 2;
 }
 
 /* = button to span two columns and take up one row */
 .operator[value="equal"] {
     grid-column: 1 / span 2;
 }
-body {
-    font-family: 'Arial', sans-serif;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    height: 100vh;
-    background-color: #333; /* Dark background for the body */
-}
-
-.calculator {
-    background-color: #2a2a2a; /* Dark gray for the calculator */
-    padding: 20px;
-    border-radius: 8px;
-}
-
-.display {
-    background-color: #1a1a1a; /* Darker gray for the display */
-    color: #fff; /* White text for the display */
-    padding: 10px 15px;
-    font-size: 1.5em;
-    border-radius: 5px;
-    margin-bottom: 20px;
-    display: flex;
-    justify-content: flex-end;
-    align-items: center;
-    height: 50px;
-}
-
-.buttons {
-    display: grid;
-    grid-template-columns: 3fr 1fr; 
-    gap: 10px;
-}
-
-.numbers {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    grid-template-rows: repeat(4, 1fr);
-    gap: 10px;
-}
-
-.operator, .number {
-    width: 100%;
-    height: 50px;
-    font-size: 1.2em;
-    border: none;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: background-color 0.3s;
-    background-color: #3a3a3a; /* Slightly lighter gray for buttons */
-    color: #fff; /* White text for buttons */
-}
-
-.number:hover, .operator:hover {
-    background-color: #4a4a4a; /* A bit lighter gray for hover effect */
-}
-
-/* Place the 0 button on its own row spanning 3 columns */
-.number[value="0"] {
-    grid-column: 1 / span 3;
-}
-
-.operators {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr); /* Two columns for operators */
-    grid-template-rows: repeat(4, 1fr);
-    gap: 10px;
-}
-
-/* ← button to span two columns and take up one row */
-.operator[value="back"] {
-    grid-column: 1 / span 2;
-}
-
-/* = button to span two columns and take up one row */
-.operator[value="equal"] {
-    grid-column: 1 / span 2;
-}
-
 
 @media only screen and (max-width: 420px) {
     .operator, .number {
-        height: 40px; /* Reduced height for the buttons */
-        font-size: 1em; /* Reduced font size */
+        height: 40px;
+        font-size: 1em;
     }
 
     .display {
-        height: 40px; /* Reduced height for the display */
-        font-size: 1.3em; /* Reduced font size for the display */
-        padding: 8px 12px; /* Reduced padding */
+        min-height: 40px;
+        font-size: 1.3em;
+        padding: 8px 12px;
     }
 
     .calculator {
-        padding: 15px; /* Reduced padding for the calculator */
+        padding: 15px;
     }
 
     .buttons {
-        gap: 5px; /* Reduced gap between buttons */
+        gap: 5px;
     }
 
     .numbers, .operators {
-        gap: 5px; /* Reduced gap within the numbers and operators grids */
+        gap: 5px;
     }
 }
