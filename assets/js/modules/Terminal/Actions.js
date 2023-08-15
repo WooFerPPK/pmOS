@@ -14,18 +14,24 @@ export class Actions {
 
 
         this.help = new Action(() => {
-            let commands = Object.keys(this).join(', ');
-            // let basicTerminalOperations = ['help', 'clear', 'date', 'shutdown'];
-            // let resumeActions = ['resume', 'download resume', 'open resume', 'open html resume'];
-            // let socialMediaActions = ['github', 'linkedin'];
-            
-            // let helpOutput = '';
-        
-            // helpOutput += 'Basic Terminal Operations: ' + basicTerminalOperations.join(', ') + '<br></br>';
-            // helpOutput += 'Resume Actions: ' + resumeActions.join(', ') + '<br></br>';
-            // helpOutput += 'Social Media Actions: ' + socialMediaActions.join(', ') + '<br></br>';
-            
+            let commands = Object.keys(this).join(', ');            
             return commands;
+        });
+
+        this.about = new Action(() => {
+            return `
+            Welcome!
+            <br></br>
+            Hey there! I'm Paul. Ever since I was young, I've been drawn to taking things apart and putting them back together. What started with toys and led to graphic design eventually became a deep passion for web development. I've worn many hats in this field, from designing to coding, but the thrill of solving a tough problem and seeing people use what I've built never gets old.
+            <br></br>
+            Away from the screen, you can find me immersed in video games, tinkering with the latest tech, trying out a new restaurant, or planning my next travel adventure.
+            <br></br>
+            Want to dive deeper?
+            <br></br>
+            Type 'linkedin' to check out my professional background, 'github' to see some of my code, or 'resume' for a detailed look at my journey.
+            <br></br>
+            Stuck or curious? Type help for more commands. Happy exploring!
+            `
         });
 
         // Add the 'calculate' action
