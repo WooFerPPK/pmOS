@@ -11,8 +11,9 @@ export class Terminal {
         this.observable = observable;
 
         this.observable.subscribe("windowShutdown", this);
+        this.observable.subscribe("windowClosed", this);
 
-        this.terminalUI = new TerminalUI(windowElement);
+        this.terminalUI = new TerminalUI(windowElement, observable);
         this.terminalEvents = new TerminalEvents(this);
         this.terminalState = new TerminalState();
 

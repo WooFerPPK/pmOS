@@ -5,26 +5,43 @@ import { Action } from './Action.js';
 import StartupManager from '/assets/js/modules/StartupManager/StartupManager.js';
 import { getDayOfWeek, formatDate, formatTime12Hour} from '/assets/js/utilities/DateTime.js';
 import { initiateDownload } from '/assets/js/utilities/Download.js';
+import { CalculatingEngine } from '/assets/js/modules/Calculator/CalculatingEngine.js';
 import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_TXT_PATH, RESUME_PDF_PATH, RESUME_HTML_PATH, RESUME_FILE_NAME, CALCULATOR_PATH } from '/assets/js/utilities/Constants.js';
 
 
 export class Actions {
     constructor(terminal) {
-        this.startupManager = new StartupManager(terminal.interactiveWindows, terminal.observable);
+
 
         this.help = new Action(() => {
-            let commands = Object.keys(this);
-            let basicTerminalOperations = ['help', 'clear', 'date', 'shutdown'];
-            let resumeActions = ['resume', 'download resume', 'open resume', 'open html resume'];
-            let socialMediaActions = ['github', 'linkedin'];
+            let commands = Object.keys(this).join(', ');
+            // let basicTerminalOperations = ['help', 'clear', 'date', 'shutdown'];
+            // let resumeActions = ['resume', 'download resume', 'open resume', 'open html resume'];
+            // let socialMediaActions = ['github', 'linkedin'];
             
-            let helpOutput = '';
+            // let helpOutput = '';
         
-            helpOutput += 'Basic Terminal Operations: ' + basicTerminalOperations.join(', ') + '<br></br>';
-            helpOutput += 'Resume Actions: ' + resumeActions.join(', ') + '<br></br>';
-            helpOutput += 'Social Media Actions: ' + socialMediaActions.join(', ') + '<br></br>';
+            // helpOutput += 'Basic Terminal Operations: ' + basicTerminalOperations.join(', ') + '<br></br>';
+            // helpOutput += 'Resume Actions: ' + resumeActions.join(', ') + '<br></br>';
+            // helpOutput += 'Social Media Actions: ' + socialMediaActions.join(', ') + '<br></br>';
             
-            return helpOutput;
+            return commands;
+        });
+
+        // Add the 'calculate' action
+        this.calculate = new Action(() => {
+            // Set the free input processor function
+            terminal.inputHandler.freeInputProcessor = (input) => {
+                const calculateEngine = new CalculatingEngine();
+                // Here, we can use eval or any other safe evaluator for math expressions
+                try {
+                    return calculateEngine.evaluate(input);
+                    // return eval(input);
+                } catch (error) {
+                    return error;
+                }
+            };
+            return "Enter your mathematical expression. Type 'exit' to leave this mode.";
         });
         
 
@@ -34,6 +51,7 @@ export class Actions {
         });
 
         this.resume = new Action(() => {
+            const startupManager = new StartupManager(terminal.interactiveWindows, terminal.observable);
             const RESUME_QUESTION = `
                 What would you like to do with Paul Moscuzza's resume?
                 <br></br>
@@ -67,12 +85,12 @@ export class Actions {
                     return result;
                 }),
                 '3': new Action(() => {
-                    this.startupManager.startPDFViewer(RESUME_PDF_PATH, RESUME_HTML_PATH, `PDF Resume`);
+                    startupManager.startPDFViewer(RESUME_PDF_PATH, RESUME_HTML_PATH, `PDF Resume`);
                     const promptHandler = new PromptHandler(terminal, `Opening Paul Moscuzza's PDF resume`);
                     promptHandler.handle();
                 }),
                 '4': new Action(() => {
-                    this.startupManager.startHTMLViewer(RESUME_HTML_PATH, `HTML Resume`);
+                    startupManager.startHTMLViewer(RESUME_HTML_PATH, `HTML Resume`);
                     const promptHandler = new PromptHandler(terminal, `Opening HTML version of Paul Moscuzza's resume`);
                     promptHandler.handle();
                 }),
@@ -86,24 +104,10 @@ export class Actions {
             conversation.start();
             return '';
         });
-
-        this['download resume'] = new Action(() => {
-            initiateDownload(RESUME_PDF_PATH, RESUME_FILE_NAME);
-            return `Initiating download of Paul Moscuzza's resume`;
-        });
-
-        this['open resume'] = new Action(() => {
-            this.startupManager.startPDFViewer(RESUME_PDF_PATH, RESUME_HTML_PATH, `PDF Resume`);
-            return `Opening Paul Moscuzza's PDF resume`;
-        });
-
-        this['open html resume'] = new Action(() => {
-            this.startupManager.startHTMLViewer(RESUME_HTML_PATH, `HTML Resume`);
-            return `Opening HTML version of Paul Moscuzza's resume`
-        });
         
         this['open calculator'] = new Action(() => {
-            this.startupManager.startHTMLViewer(CALCULATOR_PATH, `Calculator`);
+            const startupManager = new StartupManager(terminal.interactiveWindows, terminal.observable);
+            startupManager.startHTMLViewer(CALCULATOR_PATH, `Calculator`);
             return `Opening Calculator`;
         });
 
@@ -114,6 +118,11 @@ export class Actions {
             const currentDate = new Date();
             return `${getDayOfWeek(currentDate)} ${formatDate(currentDate)} ${formatTime12Hour(currentDate)} `;
         });
+
+        this.exit = new Action(() => {
+            terminal.terminalUI.destroyTerminal();
+            return '';
+        })
 
         this.shutdown = this.createFetchAction('/assets/templates/text/shutdown.txt', (result) => {
             terminal.terminalEvents.removeCtrlCListener();
@@ -147,6 +156,7 @@ export class Actions {
     }
 
     createSocialMediaAction(pageUrl, terminal) {
+        const startupManager = new StartupManager(terminal.interactiveWindows, terminal.observable);
         return new Action(() => {
             const QUESTION = `
                 <a href="${pageUrl}" target="_blank">${pageUrl}</a>
@@ -155,12 +165,12 @@ export class Actions {
                 <br></br>
                 Type 'yes' or 'no'`;
 
-            const question = new Question(QUESTION, {
+            const questions = new Question(QUESTION, {
                 yes: new Action(() => {
                     const promptHandler = new PromptHandler(terminal, `Opening ${pageUrl} in a new tab`);
                     promptHandler.handle();
                     
-                    this.startupManager.startOpenPage(pageUrl);
+                    startupManager.startOpenPage(pageUrl);
                 }),
                 no: new Action(() => {
                     const promptHandler = new PromptHandler(terminal, 'Okay, let me know if you need anything else!');
@@ -168,7 +178,7 @@ export class Actions {
                 })
             });
 
-            const conversation = new Conversation(question, terminal, terminal.lastCommand());
+            const conversation = new Conversation(questions, terminal, terminal.lastCommand());
             conversation.start();
             return '';
         });

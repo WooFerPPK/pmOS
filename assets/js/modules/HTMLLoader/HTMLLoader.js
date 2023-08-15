@@ -10,7 +10,7 @@ export default class HTMLLoader {
 
     update(message) {
         if (message === "shutdown") {
-            this.container.remove();
+            this.observable.notify("windowClosed", { source: 'HTMLViewer', message: this.container });
         }
     }
 

@@ -15,7 +15,6 @@
     background: radial-gradient(circle at center, rgba(255,255,255,0.05), #1c0e65 70%);
     position: absolute;
     border-radius: 50%;
-    animation: floatUp 120s linear infinite;
     bottom: 0;
 }
 
@@ -83,21 +82,4 @@
 #wallpaper .text-container {
     position: relative;
     top: -20%;
-}
-
-#wallpaper .circle1,
-#wallpaper .circle2,
-#wallpaper .circle3,
-#wallpaper .circle4,
-#wallpaper .circleCenter {
-    top: auto;
-}
-
-@keyframes floatUp {
-    0%, 100% {
-        transform: translateY(100%);
-    }
-    50% {
-        transform: translateY(-100%);
-    }
 }

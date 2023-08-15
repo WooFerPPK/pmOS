@@ -6,7 +6,7 @@ export class IconFactory {
         this.startupManager = new StartupManager(interactiveWindows, observable);
         this.iconActions = {
             'terminal-icon': this.startupManager.startTerminal.bind(this.startupManager),
-            'resume-icon': this.startupManager.startPDFViewer.bind(this.startupManager, RESUME_PDF_PATH, RESUME_HTML_PATH),
+            'resume-icon': this.startupManager.startPDFViewer.bind(this.startupManager, RESUME_PDF_PATH, RESUME_HTML_PATH, 'PDF Resume'),
             'github-icon': this.startupManager.startOpenPage.bind(this.startupManager, GITHUB_PAGE),
             'linkedin-icon': this.startupManager.startOpenPage.bind(this.startupManager, LINKEDIN_PAGE),
             'calculator-icon': this.startupManager.startHTMLViewer.bind(this.startupManager, CALCULATOR_PATH, 'Calculator'),

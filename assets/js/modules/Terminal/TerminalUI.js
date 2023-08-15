@@ -1,6 +1,7 @@
 
 export class TerminalUI {
-    constructor(windowElement) {
+    constructor(windowElement, observable) {
+        this.observable = observable;
         this.windowElement = windowElement;
         this.createUI();
         this.terminalElement = this.windowElement.querySelector('.terminal');
@@ -35,7 +36,7 @@ export class TerminalUI {
     }    
 
     destroyTerminal() {
-        this.windowElement.remove();
+        this.observable.notify("windowClosed", { source: 'terminalUI', message: this.windowElement });
     }
 
     initFocusHandler(inputHandler) {
