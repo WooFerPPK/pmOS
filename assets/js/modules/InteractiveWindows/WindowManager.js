@@ -35,7 +35,6 @@ export default class WindowManager {
 
         win.remove();
         this.windows = this.windows.filter(window => window !== win);
-        console.log('removed');
     }
 
     // Get the current window in focus

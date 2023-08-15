@@ -9,7 +9,6 @@ export class OutputHandler {
     displayStartupMessage() {
         const message = `
         Welcome to pmOS by Paul Moscuzza.<br/><br/>
-        Reflecting over 13 years of expertise in web development.<br/><br/>
         -> Type 'help' to get started.<br/>
         -> 'ctrl-c' to pause.<br/>
         -> 'ctrl-l' to clear the screen.<br/><br/>
