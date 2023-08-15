@@ -7,6 +7,7 @@ import { getDayOfWeek, formatDate, formatTime12Hour} from '/assets/js/utilities/
 import { initiateDownload } from '/assets/js/utilities/Download.js';
 import { CalculatingEngine } from '/assets/js/modules/Calculator/CalculatingEngine.js';
 import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_TXT_PATH, RESUME_PDF_PATH, RESUME_HTML_PATH, RESUME_FILE_NAME, CALCULATOR_PATH } from '/assets/js/utilities/Constants.js';
+import TemplateLoader from '/assets/js/modules/TemplateLoader/TemplateLoader.js';
 
 
 export class Actions {
@@ -18,13 +19,24 @@ export class Actions {
             return commands;
         });
 
+        this.login = new Action(() => {
+            const desktop = document.querySelector("#desktop");
+            const loginScreen = new TemplateLoader(desktop, terminal.observable, '/assets/templates/html/LoginScreen/LoginScreen.html', 'loginScreen', (container) => {
+                container.querySelector('#startPmOS').addEventListener('click', ()=>{
+                    container.remove();
+                })
+            });
+            loginScreen.open();
+            return 'Testing login'
+        })
+
         this.about = new Action(() => {
             return `
-            Welcome!
+            Hello! I'm Paul, a seasoned Frontend Developer and Technical Leader based in Toronto. Ever since I was young, I've been drawn to taking things apart and putting them back together. This innate curiosity seamlessly transitioned into a profound passion for web development. Over the past decade, I've honed my expertise in technologies like Node.js, Vue.js, and React, and I'm proud of the high-quality web applications I've brought to life.
             <br></br>
-            Hey there! I'm Paul. Ever since I was young, I've been drawn to taking things apart and putting them back together. What started with toys and led to graphic design eventually became a deep passion for web development. I've worn many hats in this field, from designing to coding, but the thrill of solving a tough problem and seeing people use what I've built never gets old.
+            I've played pivotal roles in crafting state-of-the-art administrative tools and domain management systems, enhancing digital experiences for users everywhere. My portfolio also boasts of projects catering to cinephiles, where I've merged my technical skills with the world of film, providing seamless digital interfaces for film enthusiasts.
             <br></br>
-            Away from the screen, you can find me immersed in video games, tinkering with the latest tech, trying out a new restaurant, or planning my next travel adventure.
+            Beyond the code, I pride myself on being a true team player. My ability to effectively collaborate with diverse cross-functional teams has led to smoother integrations and more efficient projects. When I step away from the screen, my world revolves around video games, the latest tech, cinema, or planning my next travel adventure. With every project and every journey, I carry the thrill of solving a challenge and the joy of seeing people benefit from my efforts.
             <br></br>
             Want to dive deeper?
             <br></br>
@@ -138,6 +150,13 @@ export class Actions {
                     setTimeout(() => {
                         terminal.observable.notify("windowShutdown", { source: terminal, message: 'shutdown' });
                         terminal.terminalUI.destroyTerminal();
+                        const desktop = document.querySelector("#desktop");
+                        const loginScreen = new TemplateLoader(desktop, terminal.observable, '/assets/templates/html/LoginScreen/LoginScreen.html', 'loginScreen', (container) => {
+                            container.querySelector('#startPmOS').addEventListener('click', ()=>{
+                                container.remove();
+                            })
+                        });
+                        loginScreen.open();
                     }, 2000);
                 }
             });

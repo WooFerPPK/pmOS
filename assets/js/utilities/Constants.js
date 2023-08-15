@@ -5,3 +5,4 @@ export const RESUME_PDF_PATH = '/assets/templates/pdf/Paul-Moscuzza-Resume.pdf';
 export const RESUME_HTML_PATH = '/assets/templates/html/resume/Paul-Moscuzza-Resume.html';
 export const RESUME_FILE_NAME = 'Paul-Moscuzza-Resume.pdf';
 export const CALCULATOR_PATH = '/assets/templates/projects/calculator/index.html';
+export const ABOUT_PATH = '/assets/templates/html/about/About.html';
