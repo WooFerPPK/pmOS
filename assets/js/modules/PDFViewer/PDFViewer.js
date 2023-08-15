@@ -10,7 +10,7 @@ export default class PDFViewer {
         this.pdfPath = pdfPath;
 
         if (this.isIOS()) {
-            const htmlLoader = new HTMLLoader(container, htmlPath);
+            const htmlLoader = new HTMLLoader(container, htmlPath, this.observable);
             htmlLoader.load();
         } else {
             this.init();
