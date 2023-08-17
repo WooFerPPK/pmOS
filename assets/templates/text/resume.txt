@@ -1,0 +1,68 @@
+<h1>Paul Moscuzza</h1>
+<h2>Senior Developer & Technical Leader</h2>
+<a href="mailto:paul.moscuzza@gmail.com">paul.moscuzza@gmail.com</a>
+<br></br>
+<h3>Summary</h3>
+<hr></hr>
+<p>Senior Developer & Technical Leader with over 10 years of experience in Node.js, Vue.js, React, and other technologies. I specialize in developing high-quality web applications and boosting system performance. I have a track record of driving process improvements and have successfully streamlined the user interface for a network of over a million resellers worldwide. I led the development of an administrative tool using Vue.js and Node.js, providing a modern and efficient user experience. I have a history of effective collaboration with cross-functional teams, which has consistently led to decreased integration issues and increased project efficiency.</p>
+<h3>Skills</h3>
+<hr></hr>
+<p>Expertise in: JavaScript, Vue.js, CanJS, Node.js / Express, Vuex, Pinia, HTML, CSS, SASS / SCSS, LESS</p>
+<p>Experienced with: React, Redux |ASP.net/VB.net</p>
+<p>Familiar with: Python, Perl,  PHP | MongoDB, PostgreSQL, Oracle | TypeScript</p>
+<p>Tools: Webpack, StealJS, Quasar, Storybook, YAML, Docker</p>
+<h3>Work Experience</h3>
+<hr></hr>
+<h4>Senior Frontend Developer</h4>
+<h5>Tucows | Toronto, Ontario, Canada | 2014 / Present</h5>
+<p>• Led a team of developers in creating a new administrative control panel using Vue.js and Node.js, providing a modern and faster user experience compared to the previous system.</p>
+<p>• Initiated and developed the Domain Access Portal using React and Redux, enhancing domain management for resellers' customers based on their specific needs.</p>
+<p>• Developed and maintained the Reseller Control Panel Node.js service using Express and MongoDB, creating a middleware solution shared across all Tucows services.</p>
+<p>• Optimized the wholesale control panel used by a global network of over a million resellers, resulting in a noticeable reduction in average handling time.</p>
+<p>• Spearheaded the Tucows Storefront Manager project, simplifying reseller storefront management and improving reseller adoption.</p>
+<p>• Designed a user-friendly frontend for the reseller messaging service, which received positive feedback and led to increased reseller engagement.</p>
+<p>• Significantly improved the performance, maintainability, and stability of Tucows' web applications, leading to fewer support tickets and increased customer satisfaction.</p>
+<p>• Collaborated with cross-functional teams for seamless project delivery, resulting in fewer integration issues and improved project efficiency.</p>
+<p>• Implemented Agile methodologies in software development, leading to more projects being completed on time and fewer projects going over budget.</p>
+<p>• Conducted code reviews and provided mentorship to junior developers, leading to fewer critical code issues and improved team productivity.</p>
+<h4>Web Developer</h4>
+<h5>Toronto International Film Festival | Toronto, Ontario, Canada | 2011 / 2014</h5>
+<p>• Improved the performance of the TIFF website by introducing AJAX and reducing reliance on complete page server-side rendering, leading to noticeably faster page load times and a lower bounce rate.</p>
+<p>• Collaborated with web designers to completely overhaul the TIFF website design and branding, resulting in increased user engagement and more time spent on the site.</p>
+<p>• Revitalized TIFF's custom CMS, reducing the time required to update content and eliminating the need for overtime during festival season. This change significantly saved developer time.</p>
+<p>• Created and maintained a user-friendly film library and movie event scheduler, leading to increased user interaction and a boost in film and event screening attendance.</p>
+<p>• Built the first mobile version of the TIFF website, which was used by over 100,000 patrons and led to a significant increase in mobile traffic.</p>
+<h3>Projects</h3>
+<hr></hr>
+<h4>Reseller Control Panel</h4>
+<p>Reseller Control Panel was aimed at consolidating all the services offered by OpenSRS and allowing resellers to manage their domains. I was responsible for developing the frontend of the application using the CanJS framework. By working closely with the backend team, I ensured the successful integration of the application with OpenSRS services. This effort led to a streamlined single-page application that significantly improved the management of domains for resellers.</p>
+<h4>Reseller Control Panel Node.js Middleware Service</h4>
+<p>The Reseller Control Panel Node.js Middleware Service was an initiative to replace an older middleware system used by OpenSRS for communication. I developed the service using Node.js and Express, and collaborated with other teams at OpenSRS to ensure the service met the needs of the various services it would be interfacing with. The result was a modern, efficient middleware service that significantly improved communication between OpenSRS services.</p>
+<h4>Reseller Control Panel</h4>
+<p>Reseller Verification Email System was a project where I developed a mechanism to send unique verification emails to new resellers or resellers who updated their contact information. I modified six services using a range of skills and technologies including JavaScript, Node.js with Express, Perl, Catalyst, Python, Django, Oracle, and PostgreSQL. The outcome was a robust verification system that enhanced the onboarding process for new resellers and the update process for existing resellers.</p>
+<h4>Message Template Content Management System</h4>
+<p>For the Message Template Content Management System project, I developed a system to allow clients to brand their own emails and customize content. I developed the frontend of the system using CanJS and implemented a user-friendly drag-and-drop interface for email customization and an HTML editor for template creation. As a result, clients enjoyed a more streamlined and efficient email branding process.</p>
+<h4>Financial Payment Section</h4>
+<p>Financial Payment Section was a project aimed at integrating PayPal, Automated Clearing House (ACH) services, and Stripe into a credit card payment system. I added these services to the existing system by closely collaborating with the financial team and payment providers to ensure secure and reliable transactions. The result was a more versatile payment system that offers more options to users.</p>
+<h4>Domain Access Portal</h4>
+<p>Domain Access Portal was developed to provide a tool for resellers' customers to manage their own subset of domains. The tool was built in React using Redux. By understanding the needs of resellers and their customers, I was able to deliver a versatile and user-friendly tool that significantly improved the domain management process for resellers' customers.</p>
+<h3>Volunteer</h3>
+<hr></hr>
+<h4>Board Director</h4>
+<h5>Element Condominium | Toronto, Ontario, Canada | 2021 / Present</h5>
+<p>• Spearheaded the replacement of the intercom system with a modern solution enabling resident access via cell phones, eliminating landline dependency.</p>
+<p>• Implemented a state-of-the-art license plate recognition system to enhance building security and access control.</p>
+<p>• Installed an advanced and secure fob system to further improve the condominium's security measures.</p>
+<p>• Led the renovation of the theater room, including new carpets, chairs, and high-end audio-visual equipment, resulting in an enhanced entertainment experience for residents.</p>
+<p>• Influenced key decision-making processes to ensure the condominium's long-term success and improvement.</p>
+<p>• Facilitated the ongoing renovation of the spa room, creating a more appealing and relaxing space for residents.</p>
+<p>• Played a key role in relocating and rebuilding the security desk, enhancing security measures and incorporating a modern, visually appealing design.</p>
+<p>• Managed the annual budget for the condominium, ensuring optimal resource allocation and financial responsibility.</p>
+<p>• Directed resource management for various projects, including vendor selection, negotiations, and contract management.</p>
+<h3>Education</h3>
+<hr></hr>
+<h4>Web Development</h4>
+<h5>Postgraduate Certificate | Humber College | Toronto, Ontario, Canada | 2010 / 2011</h5>
+<p>Graduated with Honors</p>
+<h4>Graphic Design</h4>
+<h5>Diploma | Seneca College | Toronto, Ontario, Canada | 2004 / 2008</h5>

@@ -1,0 +1,24 @@
+:root {
+    /* Colors */
+    --bg-color-body: #333;
+    --text-color-link: #fff;
+    --bg-color-window: #000;
+    --border-color-window: #555;
+    --text-color-input: #fff;
+
+    /* Dimensions */
+    --full-height: 100%;
+    --full-width: 100vw;
+    --window-width: 40vw;
+    --window-height: 40vh;
+    --window-margin-right: 1vw;
+    --window-padding: 20px;
+    --window-padding-top: 20px;
+    --window-border-width: 3px;
+    --input-width: calc(100% - 10px);
+    --input-min-height: 20px;
+
+    /* Font properties */
+    --font-size-window: 21px;
+    --font-family-window: monospace;
+}
