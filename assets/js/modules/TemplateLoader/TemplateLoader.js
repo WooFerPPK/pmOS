@@ -6,7 +6,7 @@ export default class TemplateLoader {
      * Creates a new TemplateLoader.
      *
      * @param {HTMLElement} container - The container where the template will be appended.
-     * @param {any} observable - An observable object (not used in the provided code but presumably for future features).
+     * @param {any} observable - An observable object
      * @param {string} templateUrl - URL from which the HTML template will be fetched.
      * @param {string} templateClass - A CSS class to wrap around the loaded template content.
      * @param {Function} callback - Callback function to be invoked after the template is appended to the container.
@@ -14,12 +14,19 @@ export default class TemplateLoader {
     constructor(container, observable, templateUrl, templateClass, callback) {
         this.container = container;
         this.observable = observable;
+        this.observable.subscribe('windowShutdown', this);
         this.templateHTMLContent = null;
         this.templateContentWrapper = null;
         this.templateUrl = templateUrl;
         this.templateClass = templateClass;
         this.callback = callback;
         this.templateHTMLFetchPromise = this.fetchHTML(); // Fetch the HTML content upon instantiation.
+    }
+
+    update(message) {
+        if (message === 'shutdown') {
+            this.observable.notify('windowClosed', { source: 'TemplateLoader', message: this.container });
+        }
     }
 
     /**

@@ -38,6 +38,7 @@ F
         this.interactiveWindows.addWindow(aboutContainer);
         const aboutPage = new TemplateLoader(aboutContainer, this.observable, 'assets/templates/html/About/About.html', 'about');
         aboutPage.open();
+        return aboutContainer;
     }
 
     startOpenPage(pageUrl) {

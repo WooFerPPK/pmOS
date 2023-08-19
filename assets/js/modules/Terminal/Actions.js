@@ -29,13 +29,8 @@ export class Actions {
         });
 
         // this.login = new Action(() => {
-        //     const desktop = document.querySelector('#desktop');
-        //     const loginScreen = new TemplateLoader(desktop, terminal.observable, 'assets/templates/html/LoginScreen/LoginScreen.html', 'loginScreen', (container) => {
-        //         container.querySelector('#startPmOS').addEventListener('click', ()=>{
-        //             container.remove();
-        //         })
-        //     });
-        //     loginScreen.open();
+        //     terminal.observable.notify('windowShutdown', { source: terminal, message: 'shutdown' });
+        //     // loginScreen.open();
         //     return 'Testing login'
         // })
 
