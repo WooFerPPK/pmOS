@@ -9,26 +9,35 @@ import { CalculatingEngine } from '../Calculator/CalculatingEngine.js';
 import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_TXT_PATH, RESUME_PDF_PATH, RESUME_HTML_PATH, RESUME_FILE_NAME, CALCULATOR_PATH } from '../../utilities/Constants.js';
 import TemplateLoader from '../TemplateLoader/TemplateLoader.js';
 
-
+/**
+ * Constructs Actions with the provided terminal interface.
+ * @param {Object} terminal - The terminal interface for user interaction.
+ */
 export class Actions {
+    /**
+     * Constructs Actions with the provided terminal interface.
+     * @param {Object} terminal - The terminal interface for user interaction.
+     */
     constructor(terminal) {
-
-
+        /**
+         * List and return available terminal commands.
+         * @returns {string} Comma-separated list of commands.
+         */
         this.help = new Action(() => {
             let commands = Object.keys(this).join(', ');            
             return commands;
         });
 
-        this.login = new Action(() => {
-            const desktop = document.querySelector('#desktop');
-            const loginScreen = new TemplateLoader(desktop, terminal.observable, 'assets/templates/html/LoginScreen/LoginScreen.html', 'loginScreen', (container) => {
-                container.querySelector('#startPmOS').addEventListener('click', ()=>{
-                    container.remove();
-                })
-            });
-            loginScreen.open();
-            return 'Testing login'
-        })
+        // this.login = new Action(() => {
+        //     const desktop = document.querySelector('#desktop');
+        //     const loginScreen = new TemplateLoader(desktop, terminal.observable, 'assets/templates/html/LoginScreen/LoginScreen.html', 'loginScreen', (container) => {
+        //         container.querySelector('#startPmOS').addEventListener('click', ()=>{
+        //             container.remove();
+        //         })
+        //     });
+        //     loginScreen.open();
+        //     return 'Testing login'
+        // })
 
         this.about = new Action(() => {
             return `
@@ -46,7 +55,6 @@ export class Actions {
             `
         });
 
-        // Add the 'calculate' action
         this.calculate = new Action(() => {
             // Set the free input processor function
             terminal.inputHandler.freeInputProcessor = (input) => {
@@ -149,12 +157,25 @@ export class Actions {
                         terminal.observable.notify('windowShutdown', { source: terminal, message: 'shutdown' });
                         terminal.terminalUI.destroyTerminal();
                         const desktop = document.querySelector('#desktop');
-                        const loginScreen = new TemplateLoader(desktop, terminal.observable, 'assets/templates/html/LoginScreen/LoginScreen.html', 'loginScreen', (container) => {
-                            container.querySelector('#startPmOS').addEventListener('click', ()=>{
-                                container.remove();
-                            })
-                        });
-                        loginScreen.open();
+                        setTimeout(() => {
+                            const loginScreen = new TemplateLoader(desktop, terminal.observable, 'assets/templates/html/LoginScreen/LoginScreen.html', 'loginScreen', (container) => {
+                                const loginButton = container.querySelector('#startPmOS');
+                                const loginScreenElement = container.querySelector('.loginScreenContent'); 
+
+                                loginButton.addEventListener('click', ()=>{
+                                    container.remove();
+                                })
+                                
+                                loginButton.addEventListener('mouseover', () => {
+                                    loginScreenElement.style.background = "transparent";
+                                });
+                                
+                                loginButton.addEventListener('mouseleave', () => {
+                                    loginScreenElement.style.background = "black";
+                                });
+                            });
+                            loginScreen.open();
+                        }, 2000);
                     }, 2000);
                 }
             });
