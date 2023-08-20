@@ -1,12 +1,13 @@
 export class Draggable {
-    constructor(element, zIndexManager, bar) {
+    constructor(element, zIndexManager, bar, dragDelay = 0) {
         this.element = element;
         this.zIndexManager = zIndexManager;
-        this.bar = bar || element.querySelector('.draggable-bar');
+        this.bar = bar;
 
         // Initial positions
         this.startX = 0;
         this.startY = 0;
+        this.dragDelay = dragDelay; // Drag Delay time
         this.dragging = false;
 
         this.bar.addEventListener('mousedown', this.initDrag);
@@ -28,20 +29,37 @@ export class Draggable {
 
     initDrag = (e) => {
         if (e.target.closest('.close-btn') || e.target.closest('.fullscreen-btn') || e.target.closest('.smallscreen-btn')) return;
-
+    
         e.preventDefault();
-        this.dragging = true;
 
-        const { clientX, clientY } = e;
-
-        // Calculate offsets based on the element itself, not the target of the event
-        const { left, top } = this.element.getBoundingClientRect();
-        this.startX = clientX - left;
-        this.startY = clientY - top;
-
-        document.addEventListener('mousemove', this.doDrag);
-        document.addEventListener('mouseup', this.stopDrag);
+        let dragTimeout;
+        
+        const initiateDragging = () => {
+            this.dragging = true;
+            this.bar.classList.add('dragging');
+    
+            const { clientX, clientY } = e;
+    
+            // Calculate offsets based on the element itself, not the target of the event
+            const { left, top } = this.element.getBoundingClientRect();
+            this.startX = clientX - left;
+            this.startY = clientY - top;
+    
+            document.addEventListener('mousemove', this.doDrag);
+            document.addEventListener('mouseup', this.stopDrag);
+        };
+    
+        dragTimeout = setTimeout(initiateDragging, this.dragDelay);
+    
+        // Temporary mouseup listener to clear the timeout if mouseup happens before dragging starts
+        const tempMouseUp = () => {
+            clearTimeout(dragTimeout);
+            document.removeEventListener('mouseup', tempMouseUp);
+        };
+    
+        document.addEventListener('mouseup', tempMouseUp);
     }
+    
 
     doDrag = (e) => {
         if (!this.dragging) return;
@@ -49,9 +67,12 @@ export class Draggable {
     }
 
     stopDrag = () => {
-        this.dragging = false;
         document.removeEventListener('mousemove', this.doDrag);
         document.removeEventListener('mouseup', this.stopDrag);
+        setTimeout(() => { 
+            this.dragging = false; 
+            this.bar.classList.remove('dragging');
+        }, this.dragDelay);
     }
 
     initTouchDrag = (e) => {

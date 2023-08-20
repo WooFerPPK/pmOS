@@ -1,9 +1,12 @@
+import { Draggable } from '../modules/InteractiveWindows/Draggable.js';
+import { ZIndexManager } from '../modules/InteractiveWindows/ZIndexManager.js';
 import StartupManager from '../modules/StartupManager/StartupManager.js'
-import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_PDF_PATH, RESUME_HTML_PATH, CALCULATOR_PATH, ABOUT_PATH } from '/assets/js/utilities/Constants.js';
+import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_PDF_PATH, RESUME_HTML_PATH, CALCULATOR_PATH } from '/assets/js/utilities/Constants.js';
 
 export class IconFactory {
     constructor(interactiveWindows, observable) {
         this.startupManager = new StartupManager(interactiveWindows, observable);
+        this.ZIndexManager = new ZIndexManager();
         this.iconActions = {
             'terminal-icon': this.startupManager.startTerminal.bind(this.startupManager),
             'resume-icon': this.startupManager.startPDFViewer.bind(this.startupManager, RESUME_PDF_PATH, RESUME_HTML_PATH, 'PDF Resume'),
@@ -17,7 +20,14 @@ export class IconFactory {
     initialize() {
         Object.entries(this.iconActions).forEach(([iconId, createWindowFunction]) => {
             const iconElement = document.querySelector(`#${iconId}`);
-            iconElement.addEventListener('click', createWindowFunction);
+            
+            // Add a delay to dragging for icons so they can be clicked, or dragged but not both at the same time.
+            const draggable = new Draggable(iconElement, this.ZIndexManager, iconElement, 120);
+            iconElement.addEventListener('click', (e) => {
+                if (!draggable.dragging) {
+                    createWindowFunction(e);
+                }
+            });
         });
     }
 }
