@@ -6,13 +6,11 @@ import { TerminalState } from './TerminalState.js';
 
 /**
  * Represents a terminal interface.
- * 
- * @class
+  * @class
  */
 export class Terminal {
     /**
      * Creates a new Terminal instance.
-     * 
      * @param {Element} windowElement - The main DOM element for the terminal window.
      * @param {Array} interactiveWindows - A list of windows that can interact with the terminal.
      * @param {Observable} observable - An observable instance for subscribing to and emitting events.
@@ -43,7 +41,6 @@ export class Terminal {
     
     /**
      * Handle updates based on observable messages.
-     * 
      * @param {string} message - The message type received from the observable.
      */
     update(message) {
@@ -54,7 +51,6 @@ export class Terminal {
 
     /**
      * Get the status of output running.
-     * 
      * @returns {boolean} - Whether the output is currently running or not.
      */
     get isOutputRunning() {
@@ -63,7 +59,6 @@ export class Terminal {
 
     /**
      * Set the status of output running.
-     * 
      * @param {boolean} value - The status value to set.
      */
     set isOutputRunning(value) {
@@ -73,7 +68,6 @@ export class Terminal {
 
     /**
      * Adds a command to the terminal's history.
-     * 
      * @param {string} command - The command string to add to the history.
      */
     addCommandToHistory(command) {
@@ -82,7 +76,6 @@ export class Terminal {
 
     /**
      * Fetches the last command entered in the terminal.
-     * 
      * @returns {string} - The last command from the terminal history.
      */
     lastCommand() {

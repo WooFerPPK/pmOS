@@ -7,8 +7,7 @@ export class Action {
      * @param {function} runFunction - The function to be executed when the action is run.
      */
     constructor(runFunction) {
-        /** 
-         * The function to execute when the action is run.
+        /*         * The function to execute when the action is run.
          * @type {function}
          */
         this.runFunction = runFunction;

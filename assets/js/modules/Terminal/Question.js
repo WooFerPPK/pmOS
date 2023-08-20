@@ -1,7 +1,6 @@
 /**
  * Represents a Question with its prompt and associated responses.
- * 
- * @class
+  * @class
  */
 export class Question {
     /**

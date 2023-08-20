@@ -2,8 +2,7 @@
  * Provides an event management system for the Terminal. 
  * Allows registration, deregistration, and emission of custom events.
  * Also provides handling for the Ctrl+C key press event.
- * 
- * @class
+  * @class
  */
 export class TerminalEvents {
     constructor() {
@@ -16,7 +15,6 @@ export class TerminalEvents {
 
     /**
      * Registers a listener for a specific event.
-     * 
      * @param {string} event - The event name.
      * @param {Function} listener - The callback function to execute when the event is emitted.
      */
@@ -29,7 +27,6 @@ export class TerminalEvents {
 
     /**
      * Removes a listener from a specific event.
-     * 
      * @param {string} event - The event name.
      * @param {Function} listener - The callback function to remove.
      */
@@ -43,7 +40,6 @@ export class TerminalEvents {
 
     /**
      * Emits an event, executing all registered listeners for that event.
-     * 
      * @param {string} event - The event name.
      * @param {*} data - The data to be passed to the listeners.
      */
@@ -56,7 +52,6 @@ export class TerminalEvents {
 
     /**
      * Initializes the Ctrl+C keydown event listener.
-     * 
      * @param {OutputHandler} outputHandler - The handler to interrupt output when Ctrl+C is pressed.
      */
     initCtrlCListener(outputHandler) {
@@ -76,7 +71,6 @@ export class TerminalEvents {
 
     /**
      * Handles the Ctrl+C keydown event, interrupts output if pressed.
-     * 
      * @param {OutputHandler} outputHandler - The handler to interrupt output.
      * @param {KeyboardEvent} event - The keydown event.
      */
@@ -89,7 +83,6 @@ export class TerminalEvents {
 
     /**
      * Checks if the Ctrl+C keys were pressed together.
-     * 
      * @param {KeyboardEvent} event - The keydown event.
      * @returns {boolean} - True if Ctrl+C was pressed, otherwise false.
      */

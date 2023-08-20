@@ -1,8 +1,7 @@
 /**
  * Manages the User Interface of the Terminal, including the creation 
  * of the terminal display and handling user interactions.
- * 
- * @class
+  * @class
  */
 export class TerminalUI {
     /**
@@ -60,7 +59,6 @@ export class TerminalUI {
 
     /**
      * Initializes a click handler on the terminal that sets focus to the input.
-     * 
      * @param {InputHandler} inputHandler - The input handler associated with the terminal input.
      */
     initFocusHandler(inputHandler) {

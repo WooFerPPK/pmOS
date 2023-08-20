@@ -4,7 +4,6 @@
 export class OutputHandler {
     /**
      * Initializes a new instance of the OutputHandler class.
-     * 
      * @param {HTMLElement} outputElement - The element where the output will be displayed.
      * @param {Object} terminal - The terminal instance.
      */
@@ -30,7 +29,6 @@ export class OutputHandler {
 
     /**
      * Appends the executed command to the output display.
-     * 
      * @param {string} command - The executed command.
      */
     appendCommandToOutput(command) {
@@ -41,7 +39,6 @@ export class OutputHandler {
 
     /**
      * Extracts a full HTML element from a string starting from a specific index.
-     * 
      * @param {string} str - The string containing HTML.
      * @param {number} startingIndex - The starting index of the tag.
      * @returns {Object} The extracted HTML element details.
@@ -64,7 +61,6 @@ export class OutputHandler {
 
     /**
      * Displays the output for a given command.
-     * 
      * @param {string} command - The executed command.
      * @param {string|Promise} resultOrPromise - The output or a promise resolving to the output.
      */
@@ -87,7 +83,6 @@ export class OutputHandler {
 
     /**
      * Types the output in a typewriter fashion.
-     * 
      * @param {string} result - The output to type out.
      */
     typeOutput(result) {
@@ -126,7 +121,6 @@ export class OutputHandler {
 
     /**
      * Handles a specific HTML element and types its content.
-     * 
      * @param {string} result - The output containing the HTML.
      * @param {number} index - The starting index of the HTML element.
      * @param {Function} callback - The callback function to be called after processing.
@@ -150,7 +144,6 @@ export class OutputHandler {
 
     /**
      * Types the inner content of an HTML element.
-     * 
      * @param {string} content - The inner content of the HTML element.
      * @param {HTMLElement} tagElement - The HTML element itself.
      * @param {Function} callback - The callback function to be called after typing.
@@ -189,7 +182,6 @@ export class OutputHandler {
 
     /**
      * Requests the next frame for the typing animation.
-     * 
      * @param {Function} callback - The callback function to be called on the next frame.
      */
     requestNextFrame(callback) {
@@ -244,7 +236,6 @@ export class OutputHandler {
      * Appends a text node to the output element.
      * If the typing speed is positive, it appends one character.
      * If negative, it appends a group of characters at once.
-     * 
      * @param {string} char - The current character.
      * @param {string} result - The full string being processed.
      * @param {number} currentIndex - The index of the current character in the string.
@@ -281,7 +272,6 @@ export class OutputHandler {
     
     /**
      * Appends an element to the output.
-     * 
      * @param {HTMLElement} element - The element to append.
      */
     appendElement(element) {
@@ -290,7 +280,6 @@ export class OutputHandler {
 
     /**
      * Creates an HTML element from a given opening tag string.
-     * 
      * @param {string} openingTag - The opening tag string.
      * @returns {HTMLElement} The created HTML element.
      */
@@ -302,7 +291,6 @@ export class OutputHandler {
 
     /**
      * Appends a character to a given HTML element.
-     * 
      * @param {string} char - The character to append.
      * @param {HTMLElement} element - The element to which the character should be appended.
      */
@@ -312,7 +300,6 @@ export class OutputHandler {
 
     /**
      * Appends a closing tag to the output.
-     * 
      * @param {string} closingTag - The closing tag string.
      */
     appendClosingTag(closingTag) {

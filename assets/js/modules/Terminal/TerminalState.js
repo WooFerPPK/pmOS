@@ -1,8 +1,7 @@
 /**
  * Manages the state of the Terminal, specifically around output status 
  * and command history.
- * 
- * @class
+  * @class
  */
 export class TerminalState {
     constructor() {
@@ -18,7 +17,6 @@ export class TerminalState {
 
     /**
      * Setter for the output running status.
-     * 
      * @param {boolean} value - True if output is running, false otherwise.
      */
     set isOutputRunning(value) {
@@ -27,7 +25,6 @@ export class TerminalState {
 
     /**
      * Getter for the output running status.
-     * 
      * @returns {boolean} - True if output is running, false otherwise.
      */
     get isOutputRunning() {
@@ -36,7 +33,6 @@ export class TerminalState {
 
     /**
      * Adds a command to the terminal's history.
-     * 
      * @param {string} command - The command string to add to the history.
      */
     addCommandToHistory(command) {
@@ -48,7 +44,6 @@ export class TerminalState {
 
     /**
      * Fetches the last command entered in the terminal.
-     * 
      * @returns {string} - The last command from the terminal history or an empty string if no commands are stored.
      */
     lastCommand() {
