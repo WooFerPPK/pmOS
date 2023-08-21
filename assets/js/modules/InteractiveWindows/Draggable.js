@@ -11,7 +11,7 @@ export class Draggable {
         this.dragging = false;
 
         this.bar.addEventListener('mousedown', this.initDrag);
-        this.bar.addEventListener('touchstart', this.initTouchDrag);
+        this.bar.addEventListener('touchstart', this.initDrag);
     }
 
     updatePosition = (clientX, clientY) => {
@@ -37,8 +37,14 @@ export class Draggable {
         const initiateDragging = () => {
             this.dragging = true;
             this.bar.classList.add('dragging');
-    
-            const { clientX, clientY } = e;
+            
+            let clientX = e.clientX;
+            let clientY = e.clientY;
+            
+            if (e.touches) {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+            }
     
             // Calculate offsets based on the element itself, not the target of the event
             const { left, top } = this.element.getBoundingClientRect();
@@ -47,6 +53,9 @@ export class Draggable {
     
             document.addEventListener('mousemove', this.doDrag);
             document.addEventListener('mouseup', this.stopDrag);
+
+            document.addEventListener('touchmove', this.doDrag);
+            document.addEventListener('touchend', this.stopDrag);
         };
     
         dragTimeout = setTimeout(initiateDragging, this.dragDelay);
@@ -55,52 +64,33 @@ export class Draggable {
         const tempMouseUp = () => {
             clearTimeout(dragTimeout);
             document.removeEventListener('mouseup', tempMouseUp);
+            document.addEventListener('touchend', this.stopDrag);
         };
     
         document.addEventListener('mouseup', tempMouseUp);
+        document.addEventListener('touchend', this.stopDrag);
     }
     
 
     doDrag = (e) => {
         if (!this.dragging) return;
-        this.updatePosition(e.clientX, e.clientY);
+        if (e.touches) {
+            const touch = e.touches[0];
+            this.updatePosition(touch.clientX, touch.clientY);
+        } else {
+            this.updatePosition(e.clientX, e.clientY);
+        }
     }
 
     stopDrag = () => {
         document.removeEventListener('mousemove', this.doDrag);
         document.removeEventListener('mouseup', this.stopDrag);
+
+        document.removeEventListener('touchmove', this.doDrag);
+        document.removeEventListener('touchend', this.stopDrag);
         setTimeout(() => { 
             this.dragging = false; 
             this.bar.classList.remove('dragging');
         }, this.dragDelay);
-    }
-
-    initTouchDrag = (e) => {
-        if (e.target.closest('.close-btn') || e.target.closest('.fullscreen-btn') || e.target.closest('.smallscreen-btn')) return;
-
-        e.preventDefault();
-        this.dragging = true;
-
-        const touch = e.touches[0];
-
-        // Calculate offsets based on the element itself, not the target of the event
-        const { left, top } = this.element.getBoundingClientRect();
-        this.startX = touch.clientX - left;
-        this.startY = touch.clientY - top;
-
-        document.addEventListener('touchmove', this.doTouchDrag);
-        document.addEventListener('touchend', this.stopTouchDrag);
-    }
-
-    doTouchDrag = (e) => {
-        if (!this.dragging) return;
-        const touch = e.touches[0];
-        this.updatePosition(touch.clientX, touch.clientY);
-    }
-
-    stopTouchDrag = () => {
-        this.dragging = false;
-        document.removeEventListener('touchmove', this.doTouchDrag);
-        document.removeEventListener('touchend', this.stopTouchDrag);
     }
 }
