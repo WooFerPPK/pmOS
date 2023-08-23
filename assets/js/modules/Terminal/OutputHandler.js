@@ -44,18 +44,33 @@ export class OutputHandler {
      * @returns {Object} The extracted HTML element details.
      */
     extractFullHtmlElement(str, startingIndex) {
-        const openTagEndIndex = str.indexOf('>', startingIndex);
+        const selfClosingIndex = str.indexOf('/>', startingIndex);
+        const selfClosing = (selfClosingIndex !== -1);
+       
+        let openTagEndIndex = str.indexOf('>', startingIndex);
+
         const tagDetails = str.substring(startingIndex + 1, openTagEndIndex).split(/\s+/);
         const tagName = tagDetails[0];
         const attributes = tagDetails.slice(1).join(' ');
         const closingTag = `</${tagName}>`;
         const closingTagIndex = str.indexOf(closingTag, openTagEndIndex);
-        
+       
+        let content = str.substring(openTagEndIndex + 1, closingTagIndex);
+        let endIndex = closingTagIndex + closingTag.length;
+
+        if (selfClosingIndex !== -1) {
+            openTagEndIndex = selfClosingIndex;
+            content = '';
+            endIndex = openTagEndIndex + 2;
+        }
+       
         return {
             tagName,
             attributes,
-            content: str.substring(openTagEndIndex + 1, closingTagIndex),
-            endIndex: closingTagIndex + closingTag.length
+           
+            content,
+            endIndex,
+            selfClosing
         };
     }
 
@@ -127,10 +142,14 @@ export class OutputHandler {
      */
     handleHtmlElement(result, index, callback) {
         const fullHtmlElement = this.extractFullHtmlElement(result, index);
-        const { tagName, attributes, content, endIndex } = fullHtmlElement;
+        const { tagName, attributes, content, endIndex, selfClosing } = fullHtmlElement;
+       
+        let openingTag = `<${tagName} ${attributes}>`;
+        let closingTag = `</${tagName}>`;
 
-        const openingTag = `<${tagName} ${attributes}>`;
-        const closingTag = `</${tagName}>`;
+        if (selfClosing !== -1) {
+            closingTag = '';
+        }
 
         const tagElement = this.createHtmlTagElement(openingTag);
 

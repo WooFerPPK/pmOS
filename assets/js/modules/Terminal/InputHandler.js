@@ -88,12 +88,20 @@ export class InputHandler {
         const action = this.actions[command];
         if (action) {
             const result = action.run();
-            if (this.terminal && command !== 'clear') {
-                this.terminal.outputHandler.displayOutput(command, result, true);
+            if (this.terminal) {
+                if (command !== 'clear') {
+                    this.terminal.outputHandler.displayOutput(command, result, true);
+                }
+            } else {
+                return;
             }
         } else {
-            // Display error message for unrecognized commands
-            this.terminal.outputHandler.displayOutput(command, `${command}: command not found`);
+            if (command) {
+                this.terminal.outputHandler.displayOutput(command, `${command}: command not found`);
+            } else {
+                this.terminal.outputHandler.displayOutput('', '');
+            }
+
         }
     }
 
