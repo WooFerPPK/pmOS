@@ -12,7 +12,7 @@ export class CalculatingEngine {
             } else if (char === '.') {
                 decimalPointCount++;
                 if (decimalPointCount > 1) {
-                    throw new Error("Invalid number with multiple decimal points detected.");
+                    throw new Error('nvalid number with multiple decimal points detected.');
                 }
                 buffer.push(char);
             } else {
@@ -126,7 +126,7 @@ export class CalculatingEngine {
                     case '/': {
                         const b = stack.pop();
                         if (b === 0) {
-                            throw new Error("Division by zero is not allowed!");
+                            throw new Error('Division by zero is not allowed!');
                         }
                         const a = stack.pop();
                         stack.push(a / b);
@@ -156,7 +156,7 @@ export class CalculatingEngine {
                     case '!': {
                         const a = stack.pop();
                         if (a < 0 || Math.floor(a) !== a) {
-                            throw new Error("Factorial is only defined for non-negative integers.");
+                            throw new Error('Factorial is only defined for non-negative integers.');
                         }
                         stack.push(this.factorial(a));
                         break;

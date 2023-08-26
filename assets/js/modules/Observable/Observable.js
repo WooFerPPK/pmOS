@@ -1,7 +1,7 @@
 export class Observable {
     // When an Observable is created, it starts with no topics and no subscribers.
     constructor() {
-        // "topics" holds a list of subscribers for each topic.
+        // topics holds a list of subscribers for each topic.
         this.topics = {};
     }
 

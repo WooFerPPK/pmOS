@@ -2,15 +2,15 @@ export default class HTMLLoader {
     constructor(container, htmlPath, observable) {
         this.observable = observable;
 
-        this.observable.subscribe("windowShutdown", this);
+        this.observable.subscribe('windowShutdown', this);
 
         this.container = container;
         this.htmlPath = htmlPath;
     }
 
     update(message) {
-        if (message === "shutdown") {
-            this.observable.notify("windowClosed", { source: 'HTMLViewer', message: this.container });
+        if (message === 'shutdown') {
+            this.observable.notify('windowClosed', { source: 'HTMLViewer', message: this.container });
         }
     }
 
@@ -25,7 +25,7 @@ export default class HTMLLoader {
     
                 // Create a div with the required class
                 const htmlContainer = document.createElement('div');
-                htmlContainer.className = "htmlviewer container";
+                htmlContainer.className = 'htmlviewer container';
                 htmlContainer.id = uniqueId;  // Set the unique ID
         
                 // Create a shadow root for the container
@@ -37,9 +37,9 @@ export default class HTMLLoader {
                 data = data.replace(/__SHADOWROOT_REFERENCE__/g, shadowRootReference);
         
                 // Execute scripts
-                const scripts = shadowRoot.querySelectorAll("script");
+                const scripts = shadowRoot.querySelectorAll('script');
                 scripts.forEach((script) => {
-                    const newScript = document.createElement("script");
+                    const newScript = document.createElement('script');
                     if (script.type) {
                         newScript.type = script.type; // Preserve the type attribute
                     }

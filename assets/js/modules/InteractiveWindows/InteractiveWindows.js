@@ -6,7 +6,6 @@ import WindowManager from './WindowManager.js';
 
 export class InteractiveWindows {
     constructor(config = {}) {
-        // Initializing the zIndex manager.
         const { minWidth = 330, minHeight = 370, observable} = config;
         this.observable = observable;
         this.minWidth = minWidth;
@@ -16,7 +15,7 @@ export class InteractiveWindows {
         this.zIndexManager = new ZIndexManager();
         
         this.offsetIncrement = 30; // Offset for each new window
-        this.currentOffset = 0;    // Current accumulated offset for next window
+        this.currentOffset = 0; // Current accumulated offset for next window
 
         // Only listen to the window resize event at this point
         this.addResizeListener();
@@ -45,8 +44,8 @@ export class InteractiveWindows {
     
         // Check if the window with the current offset would exceed the viewport
         if (centeredLeft + windowWidth > window.innerWidth || centeredTop + windowHeight > window.innerHeight) {
-            this.currentOffset = 0;  // Reset offset if it exceeds viewport
-            centeredLeft = 40;       // Reset to 40px from the left
+            this.currentOffset = 0; // Reset offset if it exceeds viewport
+            centeredLeft = 40; // Reset to 40px from the left
             centeredTop = 0;
         }
     
@@ -56,7 +55,7 @@ export class InteractiveWindows {
             minWidth: `${this.minWidth}px`,
             minHeight: `${this.minHeight}px`,
             position: 'absolute',
-            top: `${centeredTop}px`,  // Adjusted position for the window
+            top: `${centeredTop}px`,
             left: `${centeredLeft}px`
         });
         

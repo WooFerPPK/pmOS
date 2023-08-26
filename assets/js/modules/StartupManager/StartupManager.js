@@ -1,8 +1,8 @@
-import { WindowFactory } from "/assets/js/factories/WindowFactory.js";
-import { Terminal } from "/assets/js/modules/terminal/Terminal.js";
-import PDFViewer from "/assets/js/modules/PDFViewer/PDFViewer.js";
-import HTMLLoader from "/assets/js/modules/HTMLLoader/HTMLLoader.js";
-import TemplateLoader from "/assets/js/modules/TemplateLoader/TemplateLoader.js";
+import { WindowFactory } from '../../factories/WindowFactory.js';
+import { Terminal } from '../Terminal/Terminal.js';
+import PDFViewer from '../PDFViewer/PDFViewer.js';
+import HTMLLoader from '../HTMLLoader/HTMLLoader.js';
+import TemplateLoader from '../TemplateLoader/TemplateLoader.js';
 
 
 export default class StartupManager {
@@ -17,7 +17,7 @@ export default class StartupManager {
         new Terminal(terminalContainer, this.interactiveWindows, this.observable);
         return terminalContainer;
     }
-
+F
     startPDFViewer(pdfPath, htmlPath, title) {
         const pdfContainer = WindowFactory.create(title);
         this.interactiveWindows.addWindow(pdfContainer);
@@ -34,10 +34,11 @@ export default class StartupManager {
     }
 
     startOpenAbout() {
-        const aboutContainer = WindowFactory.create("About");
+        const aboutContainer = WindowFactory.create('About');
         this.interactiveWindows.addWindow(aboutContainer);
-        const aboutPage = new TemplateLoader(aboutContainer, this.observable, '/assets/templates/html/About/About.html', 'about');
+        const aboutPage = new TemplateLoader(aboutContainer, this.observable, 'assets/templates/html/About/About.html', 'about');
         aboutPage.open();
+        return aboutContainer;
     }
 
     startOpenPage(pageUrl) {

@@ -1,4 +1,4 @@
-import StartupManager from '/assets/js/modules/StartupManager/StartupManager.js'
+import StartupManager from '../modules/StartupManager/StartupManager.js'
 
 export default class AutoStartupFactory {
     constructor(interactiveWindows, observable) {
@@ -6,7 +6,7 @@ export default class AutoStartupFactory {
     }
 
     initialize() {
-        // Add all the things you want to auto-start here
+        // Things to autostart on application load
         this.startupManager.startTerminal();
     }
 }

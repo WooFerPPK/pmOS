@@ -1,24 +1,24 @@
 export function formatDate(date) {
-    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     
     const day = date.getDate();
     let daySuffix;
 
     if (day >= 11 && day <= 13) {
-        daySuffix = "th";
+        daySuffix = 'th';
     } else {
         switch (day % 10) {
             case 1:
-                daySuffix = "st";
+                daySuffix = 'st';
                 break;
             case 2:
-                daySuffix = "nd";
+                daySuffix = 'nd';
                 break;
             case 3:
-                daySuffix = "rd";
+                daySuffix = 'rd';
                 break;
             default:
-                daySuffix = "th";
+                daySuffix = 'th';
         }
     }
 
@@ -26,7 +26,7 @@ export function formatDate(date) {
 }
 
 export function getDayOfWeek(date) {
-    const daysOfWeek = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
     return daysOfWeek[date.getDay()];
 }
 

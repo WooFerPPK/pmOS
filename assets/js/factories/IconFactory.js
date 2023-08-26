@@ -1,9 +1,11 @@
-import StartupManager from '/assets/js/modules/StartupManager/StartupManager.js'
-import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_PDF_PATH, RESUME_HTML_PATH, CALCULATOR_PATH, ABOUT_PATH } from '/assets/js/utilities/Constants.js';
+import { ZIndexManager } from '../modules/InteractiveWindows/ZIndexManager.js';
+import StartupManager from '../modules/StartupManager/StartupManager.js'
+import { GITHUB_PAGE, LINKEDIN_PAGE, RESUME_PDF_PATH, RESUME_HTML_PATH, CALCULATOR_PATH } from '/assets/js/utilities/Constants.js';
 
 export class IconFactory {
     constructor(interactiveWindows, observable) {
         this.startupManager = new StartupManager(interactiveWindows, observable);
+        this.ZIndexManager = new ZIndexManager();
         this.iconActions = {
             'terminal-icon': this.startupManager.startTerminal.bind(this.startupManager),
             'resume-icon': this.startupManager.startPDFViewer.bind(this.startupManager, RESUME_PDF_PATH, RESUME_HTML_PATH, 'PDF Resume'),

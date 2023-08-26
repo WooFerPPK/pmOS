@@ -1,4 +1,12 @@
+/**
+ * Represents a handler for terminal output.
+ */
 export class OutputHandler {
+    /**
+     * Initializes a new instance of the OutputHandler class.
+     * @param {HTMLElement} outputElement - The element where the output will be displayed.
+     * @param {Object} terminal - The terminal instance.
+     */
     constructor(outputElement, terminal) {
         this.outputElement = outputElement;
         this.terminal = terminal;
@@ -6,6 +14,9 @@ export class OutputHandler {
         this.shouldType = true;
     }
 
+    /**
+     * Displays the startup message in the terminal.
+     */
     displayStartupMessage() {
         const message = `
         Welcome to pmOS by Paul Moscuzza.<br/><br/>
@@ -16,32 +27,62 @@ export class OutputHandler {
         this.outputElement.innerHTML = message;
     }
 
+    /**
+     * Appends the executed command to the output display.
+     * @param {string} command - The executed command.
+     */
     appendCommandToOutput(command) {
         const commandDiv = document.createElement('div');
         commandDiv.textContent = '> ' + command;
         this.outputElement.appendChild(commandDiv);
     }
-    
+
+    /**
+     * Extracts a full HTML element from a string starting from a specific index.
+     * @param {string} str - The string containing HTML.
+     * @param {number} startingIndex - The starting index of the tag.
+     * @returns {Object} The extracted HTML element details.
+     */
     extractFullHtmlElement(str, startingIndex) {
-        const openTagEndIndex = str.indexOf('>', startingIndex);
+        const selfClosingIndex = str.indexOf('/>', startingIndex);
+        const selfClosing = (selfClosingIndex !== -1);
+       
+        let openTagEndIndex = str.indexOf('>', startingIndex);
+
         const tagDetails = str.substring(startingIndex + 1, openTagEndIndex).split(/\s+/);
         const tagName = tagDetails[0];
         const attributes = tagDetails.slice(1).join(' ');
         const closingTag = `</${tagName}>`;
         const closingTagIndex = str.indexOf(closingTag, openTagEndIndex);
-        
+       
+        let content = str.substring(openTagEndIndex + 1, closingTagIndex);
+        let endIndex = closingTagIndex + closingTag.length;
+
+        if (selfClosingIndex !== -1) {
+            openTagEndIndex = selfClosingIndex;
+            content = '';
+            endIndex = openTagEndIndex + 2;
+        }
+       
         return {
             tagName,
             attributes,
-            content: str.substring(openTagEndIndex + 1, closingTagIndex),
-            endIndex: closingTagIndex + closingTag.length
+           
+            content,
+            endIndex,
+            selfClosing
         };
     }
-    
+
+    /**
+     * Displays the output for a given command.
+     * @param {string} command - The executed command.
+     * @param {string|Promise} resultOrPromise - The output or a promise resolving to the output.
+     */
     displayOutput(command, resultOrPromise) {
         this.shouldType = true;
         this.terminal.isOutputRunning = true;
-        this.terminal.inputHandler.inputElement.contentEditable = "false";
+        this.terminal.inputHandler.inputElement.contentEditable = 'false';
         this.appendCommandToOutput(command);
         
         if (resultOrPromise instanceof Promise) {
@@ -54,7 +95,11 @@ export class OutputHandler {
             this.typeOutput(resultOrPromise);
         }
     }
-    
+
+    /**
+     * Types the output in a typewriter fashion.
+     * @param {string} result - The output to type out.
+     */
     typeOutput(result) {
         let index = 0;
         let processingInnerContent = false;
@@ -89,12 +134,22 @@ export class OutputHandler {
         this.requestNextFrame(processOutput);
     }
 
+    /**
+     * Handles a specific HTML element and types its content.
+     * @param {string} result - The output containing the HTML.
+     * @param {number} index - The starting index of the HTML element.
+     * @param {Function} callback - The callback function to be called after processing.
+     */
     handleHtmlElement(result, index, callback) {
         const fullHtmlElement = this.extractFullHtmlElement(result, index);
-        const { tagName, attributes, content, endIndex } = fullHtmlElement;
+        const { tagName, attributes, content, endIndex, selfClosing } = fullHtmlElement;
+       
+        let openingTag = `<${tagName} ${attributes}>`;
+        let closingTag = `</${tagName}>`;
 
-        const openingTag = `<${tagName} ${attributes}>`;
-        const closingTag = `</${tagName}>`;
+        if (selfClosing !== -1) {
+            closingTag = '';
+        }
 
         const tagElement = this.createHtmlTagElement(openingTag);
 
@@ -106,6 +161,12 @@ export class OutputHandler {
         });
     }
 
+    /**
+     * Types the inner content of an HTML element.
+     * @param {string} content - The inner content of the HTML element.
+     * @param {HTMLElement} tagElement - The HTML element itself.
+     * @param {Function} callback - The callback function to be called after typing.
+     */
     typeInnerContent(content, tagElement, callback) {
         let innerIndex = 0;
 
@@ -119,7 +180,7 @@ export class OutputHandler {
                 this.requestNextFrame(typeContent);
             } else if (this.typeSpeed < 0 && innerIndex < content.length) {
                 const groupSize = Math.abs(this.typeSpeed);
-                let groupedText = "";
+                let groupedText = '';
 
                 for (let i = 0; i < groupSize && innerIndex + i < content.length; i++) {
                     groupedText += content[innerIndex + i];
@@ -138,6 +199,10 @@ export class OutputHandler {
         typeContent();
     }
 
+    /**
+     * Requests the next frame for the typing animation.
+     * @param {Function} callback - The callback function to be called on the next frame.
+     */
     requestNextFrame(callback) {
         if (this.typeSpeed > 0) {
             setTimeout(() => {
@@ -146,13 +211,19 @@ export class OutputHandler {
         } else {
             requestAnimationFrame(callback);
         }
-        this.scrollTerminalToBottom()
+        this.scrollTerminalToBottom();
     }
 
     setTypeSpeed(speed) {
         this.typeSpeed = speed;
     }
 
+    /**
+     * Increases the typing speed. 
+     * If the speed is above 10, it reduces by 10.
+     * If the speed is 10 or below but above 0, it sets the speed to -1.
+     * For negative speeds, it decreases the speed (makes it faster).
+     */
     speedUp() {
         if (this.typeSpeed > 10) {
             this.typeSpeed -= 10;
@@ -163,6 +234,12 @@ export class OutputHandler {
         }
     }
 
+    /**
+     * Decreases the typing speed (making it slower). 
+     * If the speed is negative, it increases the speed (makes it slower).
+     * If the speed becomes 0 from a negative value, it sets the speed to 10.
+     * For positive speeds, it increases by 10.
+     */
     slowDown() {
         if (this.typeSpeed < 0) {
             this.typeSpeed++;
@@ -174,6 +251,15 @@ export class OutputHandler {
         }
     }
 
+    /**
+     * Appends a text node to the output element.
+     * If the typing speed is positive, it appends one character.
+     * If negative, it appends a group of characters at once.
+     * @param {string} char - The current character.
+     * @param {string} result - The full string being processed.
+     * @param {number} currentIndex - The index of the current character in the string.
+     * @returns {number} The number of characters processed.
+     */
     appendTextNode(char, result, currentIndex) {
         if (this.typeSpeed >= 0) {
             const textNode = document.createTextNode(char);
@@ -203,24 +289,45 @@ export class OutputHandler {
         }
     }
     
+    /**
+     * Appends an element to the output.
+     * @param {HTMLElement} element - The element to append.
+     */
     appendElement(element) {
         this.outputElement.appendChild(element);
     }
 
+    /**
+     * Creates an HTML element from a given opening tag string.
+     * @param {string} openingTag - The opening tag string.
+     * @returns {HTMLElement} The created HTML element.
+     */
     createHtmlTagElement(openingTag) {
         const tempDiv = document.createElement('div');
         tempDiv.innerHTML = openingTag;
         return tempDiv.firstChild;
     }
 
+    /**
+     * Appends a character to a given HTML element.
+     * @param {string} char - The character to append.
+     * @param {HTMLElement} element - The element to which the character should be appended.
+     */
     appendCharToElement(char, element) {
         element.appendChild(document.createTextNode(char));
     }
 
+    /**
+     * Appends a closing tag to the output.
+     * @param {string} closingTag - The closing tag string.
+     */
     appendClosingTag(closingTag) {
         this.outputElement.innerHTML += closingTag;
     }
 
+    /**
+     * Completes the current output by interrupting any ongoing typing and appending a prompt node.
+     */
     finishOutput() {
         this.interruptOutput();
         const promptNode = document.createElement('div');
@@ -228,18 +335,27 @@ export class OutputHandler {
         this.scrollTerminalToBottom();
     }
 
+    /**
+     * Scrolls the terminal UI to the bottom, ensuring the latest output is visible.
+     */
     scrollTerminalToBottom() {
         this.terminal.terminalUI.terminalElement.scrollTop = this.terminal.terminalUI.terminalElement.scrollHeight;
     }
-    
+
+    /**
+     * Stops any ongoing typing and resets the input field's interactivity.
+     */
     interruptOutput() {
         this.shouldType = false;
         this.terminal.isOutputRunning = false;
-        this.terminal.inputHandler.inputElement.contentEditable = "true";
+        this.terminal.inputHandler.inputElement.contentEditable = 'true';
         this.terminal.inputHandler.inputElement.focus();
         this.terminal.terminalUI.terminalElement.scrollTop = this.terminal.terminalUI.terminalElement.scrollHeight;
-    }      
-
+    }
+      
+    /**
+     * Clears all current output from the terminal.
+     */
     clearOutput() {
         this.shouldType = false;
         this.outputElement.innerHTML = '';

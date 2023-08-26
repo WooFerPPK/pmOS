@@ -42,7 +42,6 @@ export class WindowBar {
     addEventListeners() {
         this.closeButton.addEventListener('click', () => {
             this.windowManager.removeWindow(this.element);
-            // this.element.remove();
         });
 
         this.fullScreenButton.addEventListener('click', this.toggleFullScreen.bind(this));
@@ -59,13 +58,13 @@ export class WindowBar {
 
     enterFullScreen() {
         this.storeOriginalStyles();
-        
+       
         this.element.style.width = '100vw';
         this.element.style.height = '100vh';
         this.element.style.top = '0';
         this.element.style.left = '0';
 
-        this.fullScreenButton.className = 'smallscreen-btn';
+        this.changeScreenButton();
     }
 
     exitFullScreen() {
@@ -74,7 +73,15 @@ export class WindowBar {
         this.element.style.top = this.originalTop || '';
         this.element.style.left = this.originalLeft || '';
 
-        this.fullScreenButton.className = 'fullscreen-btn';
+        this.changeScreenButton();    
+    }
+
+    changeScreenButton() {
+        if (this.isFullScreen) {
+            this.fullScreenButton.className = 'fullscreen-btn';
+        } else {
+            this.fullScreenButton.className = 'smallscreen-btn';
+        }
     }
 
     storeOriginalStyles() {
@@ -86,7 +93,7 @@ export class WindowBar {
 
     forceExitFullScreen() {
         if (this.isFullScreen) {
-            this.exitFullScreen();
+            this.changeScreenButton();
             this.isFullScreen = false;
         }
     }

@@ -1,6 +1,6 @@
 export default class WindowManager {
     constructor(observable) {
-         // Subscribe WindowManager to specific topics/events
+        // Subscribe WindowManager to specific topics/events
         this.observable = observable;
         this.observable.subscribe('windowClosed', this);
 
@@ -45,7 +45,7 @@ export default class WindowManager {
     // Set a window to be in focus
     setFocusedWindow(win) {
         if (!win) {
-            console.warn("Trying to focus a non-existent window.");
+            console.warn('Trying to focus a non-existent window.');
             return;
         }
         
@@ -57,7 +57,7 @@ export default class WindowManager {
             this.focusedWindow = win;
             win.style.opacity = '1';
         } else {
-            console.warn("Trying to focus a window that isn't managed.");
+            console.warn(`Trying to focus a window that isn't managed.`);
         }
     }
     // Get all open windows
