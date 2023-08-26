@@ -31,15 +31,15 @@ export class Actions {
         this.about = new Action(() => {
             return `
             Hello! I'm Paul, a seasoned Frontend Developer and Technical Leader based in Toronto. Ever since I was young, I've been drawn to taking things apart and putting them back together. This innate curiosity seamlessly transitioned into a profound passion for web development. Over the past decade, I've honed my expertise in technologies like Node.js, Vue.js, and React, and I'm proud of the high-quality web applications I've brought to life.
-            <br></br>
+            <br />
             I've played pivotal roles in crafting state-of-the-art administrative tools and domain management systems, enhancing digital experiences for users everywhere. My portfolio also boasts of projects catering to cinephiles, where I've merged my technical skills with the world of film, providing seamless digital interfaces for film enthusiasts.
-            <br></br>
+            <br />
             Beyond the code, I pride myself on being a true team player. My ability to effectively collaborate with diverse cross-functional teams has led to smoother integrations and more efficient projects. When I step away from the screen, my world revolves around video games, the latest tech, cinema, or planning my next travel adventure. With every project and every journey, I carry the thrill of solving a challenge and the joy of seeing people benefit from my efforts.
-            <br></br>
+            <br />
             Want to dive deeper?
-            <br></br>
+            <br />
             Type 'linkedin' to check out my professional background, 'github' to see some of my code, or 'resume' for a detailed look at my journey.
-            <br></br>
+            <br />
             Stuck or curious? Type help for more commands. Happy exploring!
             `
         });
