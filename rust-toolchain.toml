@@ -3,6 +3,9 @@ channel = "stable"
 components = ["rustfmt", "clippy"]
 targets = [
     "wasm32-unknown-unknown",
-    "wasm32-wasi",
+    # "wasm32-wasip1" — the renamed successor to the old wasm32-wasi
+    # target used in the plan/contracts. Left commented until the
+    # userland tasks (T008..T017) are ready to actually compile.
+    # Reinstall with `rustup target add wasm32-wasip1` when needed.
 ]
 profile = "minimal"

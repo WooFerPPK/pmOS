@@ -1,0 +1,10 @@
+{
+  "version": "0.1.0-demo",
+  "build": "bootstrap-demo",
+  "assets": [
+    "index.html",
+    "assets/bootstrap.js",
+    "sw.js",
+    "_headers"
+  ]
+}

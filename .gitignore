@@ -6,7 +6,13 @@ target/
 
 # TypeScript / Node
 node_modules/
-dist/
+# dist/ is NOT gitignored during the demo-build period: we ship a
+# pre-built boot-screen demo directly in git so it can be served
+# from any static host without a Rust toolchain. Once the real
+# `just build` pipeline is wired in and produces kernel.wasm +
+# display-server.wasm + toolkit + bundled apps, dist/ will become
+# a pure build output and this line can be uncommented:
+# dist/
 build/
 *.log
 .env

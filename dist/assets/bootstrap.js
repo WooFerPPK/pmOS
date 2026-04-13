@@ -1,72 +1,24 @@
-// PMos bootstrap.
-//
-// First-run mode: a self-contained boot-screen demo that paints
-// directly onto the top-level canvas, runs every environment
-// check the real kernel will need (cross-origin isolation,
-// SharedArrayBuffer, Atomics.waitAsync, OPFS, service workers),
-// and reports status. Intentionally stalls at "kernel loading…"
-// with a clear explanation that the kernel WASM is the next
-// build step — this demo exists so the static deployment is
-// visible on a real server before the Rust build is wired up.
-//
-// Once the real kernel WASM is produced by `just build`, the
-// `kernelReady` branch below takes over and this boot screen
-// is replaced by the actual kernel boot sequence (T085+).
-
-const BOOT_VERSION = "0.1.0-demo";
-
-type CheckStatus = "pending" | "running" | "ok" | "fail" | "warn" | "stalled";
-
-interface CheckRow {
-  label: string;
-  status: CheckStatus;
-  detail: string;
-}
-
-// --- Check the browser environment -----------------------------------
-
-function hasSharedArrayBuffer(): boolean {
+// web/src/bootstrap.ts
+var BOOT_VERSION = "0.1.0-demo";
+function hasSharedArrayBuffer() {
   return typeof SharedArrayBuffer !== "undefined";
 }
-
-function hasAtomicsWait(): boolean {
+function hasAtomicsWait() {
   return typeof Atomics !== "undefined" && typeof Atomics.wait === "function";
 }
-
-function isCrossOriginIsolated(): boolean {
+function isCrossOriginIsolated() {
   return typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
 }
-
-function hasOpfs(): boolean {
-  return (
-    typeof navigator !== "undefined" &&
-    typeof navigator.storage !== "undefined" &&
-    typeof (navigator.storage as unknown as { getDirectory?: unknown }).getDirectory === "function"
-  );
+function hasOpfs() {
+  return typeof navigator !== "undefined" && typeof navigator.storage !== "undefined" && typeof navigator.storage.getDirectory === "function";
 }
-
-function hasServiceWorker(): boolean {
+function hasServiceWorker() {
   return typeof navigator !== "undefined" && "serviceWorker" in navigator;
 }
-
-function hasOffscreenCanvas(): boolean {
+function hasOffscreenCanvas() {
   return typeof OffscreenCanvas !== "undefined";
 }
-
-// --- Canvas painter ---------------------------------------------------
-
-interface Palette {
-  bg: string;
-  dim: string;
-  fg: string;
-  accent: string;
-  ok: string;
-  warn: string;
-  fail: string;
-  muted: string;
-}
-
-const PALETTE: Palette = {
+var PALETTE = {
   bg: "#0a0e14",
   dim: "#1a1f26",
   fg: "#e6e6e6",
@@ -74,17 +26,10 @@ const PALETTE: Palette = {
   ok: "#6ddf6d",
   warn: "#f2c045",
   fail: "#ff6b6b",
-  muted: "#808591",
+  muted: "#808591"
 };
-
-type Canvas2D = {
-  canvas: HTMLCanvasElement;
-  ctx: CanvasRenderingContext2D;
-  dpr: number;
-};
-
-function setupCanvas(): Canvas2D {
-  const canvas = document.getElementById("pmos-fb") as HTMLCanvasElement | null;
+function setupCanvas() {
+  const canvas = document.getElementById("pmos-fb");
   if (!canvas) {
     throw new Error("pmos-fb canvas element missing from index.html");
   }
@@ -105,44 +50,33 @@ function setupCanvas(): Canvas2D {
   }
   return { canvas, ctx, dpr };
 }
-
-function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void {
+function paintBoot(c, rows, animationFrame) {
   const { ctx, canvas, dpr } = c;
   const W = canvas.width;
   const H = canvas.height;
-
-  // Full-screen wash.
   ctx.fillStyle = PALETTE.bg;
   ctx.fillRect(0, 0, W, H);
-
-  // Top-left logo block.
   const padX = 48 * dpr;
   const padY = 48 * dpr;
   const lineHeight = 22 * dpr;
   const mono = `${14 * dpr}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
   const monoBig = `bold ${20 * dpr}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
   const monoSmall = `${12 * dpr}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
-
   ctx.font = monoBig;
   ctx.fillStyle = PALETTE.accent;
   ctx.fillText(`PMos ${BOOT_VERSION}`, padX, padY);
-
   ctx.font = monoSmall;
   ctx.fillStyle = PALETTE.muted;
   ctx.fillText(
-    "browser-hosted operating system — demo build",
+    "browser-hosted operating system \u2014 demo build",
     padX,
-    padY + 18 * dpr,
+    padY + 18 * dpr
   );
-
-  // Check rows.
   const rowsX = padX;
   const rowsY = padY + 70 * dpr;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const y = rowsY + i * lineHeight;
-
-    // Bracket tag: [  OK  ], [ WAIT ], [ FAIL ], [  --  ]
     let tag = "  --  ";
     let tagColor = PALETTE.muted;
     switch (row.status) {
@@ -159,8 +93,7 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
         tagColor = PALETTE.warn;
         break;
       case "running":
-        // animated dots
-        tag = ` ${"*".repeat((animationFrame % 3) + 1).padEnd(3, ".")}  `;
+        tag = ` ${"*".repeat(animationFrame % 3 + 1).padEnd(3, ".")}  `;
         tagColor = PALETTE.accent;
         break;
       case "stalled":
@@ -173,7 +106,6 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
         tagColor = PALETTE.muted;
         break;
     }
-
     ctx.font = mono;
     ctx.fillStyle = PALETTE.muted;
     ctx.fillText("[", rowsX, y);
@@ -181,53 +113,40 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
     ctx.fillText(tag, rowsX + 10 * dpr, y);
     ctx.fillStyle = PALETTE.muted;
     ctx.fillText("]", rowsX + 70 * dpr, y);
-
-    ctx.fillStyle =
-      row.status === "fail"
-        ? PALETTE.fail
-        : row.status === "warn" || row.status === "stalled"
-          ? PALETTE.warn
-          : PALETTE.fg;
+    ctx.fillStyle = row.status === "fail" ? PALETTE.fail : row.status === "warn" || row.status === "stalled" ? PALETTE.warn : PALETTE.fg;
     ctx.fillText(row.label, rowsX + 90 * dpr, y);
-
     if (row.detail) {
       ctx.fillStyle = PALETTE.muted;
       ctx.fillText(row.detail, rowsX + 340 * dpr, y);
     }
   }
-
-  // Footer.
   const footerY = H - padY;
   ctx.font = monoSmall;
   ctx.fillStyle = PALETTE.muted;
   ctx.fillText(
     "This is the PMos boot-screen demo. The kernel WASM is not yet",
     padX,
-    footerY - 3 * lineHeight,
+    footerY - 3 * lineHeight
   );
   ctx.fillText(
-    "compiled — reaching the desktop requires running `just build`",
+    "compiled \u2014 reaching the desktop requires running `just build`",
     padX,
-    footerY - 2 * lineHeight,
+    footerY - 2 * lineHeight
   );
   ctx.fillText(
     "against the PMos source tree (Rust + Node + wasm32 target).",
     padX,
-    footerY - 1 * lineHeight,
+    footerY - 1 * lineHeight
   );
   ctx.fillText(
-    "Source: https://github.com/example/pmos  •  specs/001-browser-os-v1/",
+    "Source: https://github.com/example/pmos  \u2022  specs/001-browser-os-v1/",
     padX,
-    footerY,
+    footerY
   );
 }
-
-// --- Main boot sequence ------------------------------------------------
-
-function main(): void {
+function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
-
-  const rows: CheckRow[] = [
+  const rows = [
     { label: "Cross-origin isolation (COOP/COEP)", status: "pending", detail: "" },
     { label: "SharedArrayBuffer", status: "pending", detail: "" },
     { label: "Atomics.wait", status: "pending", detail: "" },
@@ -236,10 +155,9 @@ function main(): void {
     { label: "OffscreenCanvas", status: "pending", detail: "" },
     { label: "Kernel WASM load (/assets/kernel.wasm)", status: "pending", detail: "" },
     { label: "Display server", status: "pending", detail: "" },
-    { label: "Desktop shell", status: "pending", detail: "" },
+    { label: "Desktop shell", status: "pending", detail: "" }
   ];
-
-  let canvas: Canvas2D;
+  let canvas;
   try {
     canvas = setupCanvas();
   } catch (e) {
@@ -247,14 +165,12 @@ function main(): void {
     showFallbackMessage(String(e));
     return;
   }
-
   let frame = 0;
   const repaint = () => {
     paintBoot(canvas, rows, frame++);
   };
   repaint();
-
-  const step = (i: number, delay: number, fn: () => void) => {
+  const step = (i, delay, fn) => {
     setTimeout(() => {
       rows[i].status = "running";
       repaint();
@@ -264,8 +180,6 @@ function main(): void {
       }, 200);
     }, delay);
   };
-
-  // Sequence: each step runs one check, then repaints.
   step(0, 300, () => {
     if (isCrossOriginIsolated()) {
       rows[0].status = "ok";
@@ -275,7 +189,6 @@ function main(): void {
       rows[0].detail = "COOP/COEP headers missing";
     }
   });
-
   step(1, 600, () => {
     if (hasSharedArrayBuffer()) {
       rows[1].status = "ok";
@@ -285,7 +198,6 @@ function main(): void {
       rows[1].detail = "undefined";
     }
   });
-
   step(2, 900, () => {
     if (hasAtomicsWait()) {
       rows[2].status = "ok";
@@ -295,7 +207,6 @@ function main(): void {
       rows[2].detail = "Atomics.wait missing";
     }
   });
-
   step(3, 1200, () => {
     if (hasOpfs()) {
       rows[3].status = "ok";
@@ -305,7 +216,6 @@ function main(): void {
       rows[3].detail = "navigator.storage.getDirectory missing";
     }
   });
-
   step(4, 1500, () => {
     if (hasServiceWorker()) {
       rows[4].status = "ok";
@@ -315,7 +225,6 @@ function main(): void {
       rows[4].detail = "navigator.serviceWorker missing";
     }
   });
-
   step(5, 1800, () => {
     if (hasOffscreenCanvas()) {
       rows[5].status = "ok";
@@ -325,18 +234,11 @@ function main(): void {
       rows[5].detail = "falling back to main-thread putImageData";
     }
   });
-
-  // Kernel load attempt — deliberately stalls. We try to fetch
-  // /assets/kernel.wasm to demonstrate the real path that T085
-  // will use; in the demo build it will 404 and we report that
-  // cleanly.
   step(6, 2200, () => {
     void attemptKernelFetch().then((result) => {
       if (result.ok) {
         rows[6].status = "ok";
         rows[6].detail = `${result.size} bytes`;
-        // Real kernel would take over here (T085+). For the demo
-        // we stop at "kernel loaded" and stall the next rows.
         rows[7].status = "stalled";
         rows[7].detail = "not wired in the demo";
         rows[8].status = "stalled";
@@ -350,24 +252,18 @@ function main(): void {
       repaint();
     });
   });
-
-  // Animation loop — keeps the "running…" tags moving.
   setInterval(repaint, 300);
-
-  // Panic overlay wiring: if any unhandled error reaches
-  // window.onerror or window.onunhandledrejection, show the
-  // overlay declared in index.html.
   window.addEventListener("error", (event) => showPanic(event.message));
-  window.addEventListener("unhandledrejection", (event) =>
-    showPanic(String(event.reason)),
+  window.addEventListener(
+    "unhandledrejection",
+    (event) => showPanic(String(event.reason))
   );
 }
-
-async function attemptKernelFetch(): Promise<{ ok: true; size: number } | { ok: false; reason: string }> {
+async function attemptKernelFetch() {
   try {
     const res = await fetch("/assets/kernel.wasm", { method: "HEAD" });
     if (!res.ok) {
-      return { ok: false, reason: `HTTP ${res.status} — not yet built` };
+      return { ok: false, reason: `HTTP ${res.status} \u2014 not yet built` };
     }
     const size = Number(res.headers.get("content-length") || "0");
     return { ok: true, size };
@@ -375,8 +271,7 @@ async function attemptKernelFetch(): Promise<{ ok: true; size: number } | { ok: 
     return { ok: false, reason: `fetch failed: ${String(e)}` };
   }
 }
-
-function showFallbackMessage(error: string): void {
+function showFallbackMessage(error) {
   document.body.innerHTML = `
     <div style="padding:2rem;font-family:ui-monospace,monospace;color:#e6e6e6;background:#0a0e14;height:100vh">
       <h1 style="color:#ff6b6b">PMos bootstrap failed</h1>
@@ -384,8 +279,7 @@ function showFallbackMessage(error: string): void {
       <p style="color:#808591">See devtools console for details.</p>
     </div>`;
 }
-
-function showPanic(message: string): void {
+function showPanic(message) {
   const panel = document.getElementById("pmos-panic");
   const msg = document.getElementById("pmos-panic-message");
   if (panel && msg) {
@@ -401,21 +295,13 @@ function showPanic(message: string): void {
       return;
     }
     n--;
-    setTimeout(tick, 1000);
+    setTimeout(tick, 1e3);
   };
   tick();
 }
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-
-// Go.
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", main);
 } else {
