@@ -97,13 +97,13 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 ### Kernel VFS and in-memory filesystems
 
-- [ ] T049 Define `Vnode`, `NodeType`, `Filesystem` trait in `crates/kernel/src/vfs/mod.rs` per `data-model.md §3.1`
-- [ ] T050 Implement the mount table in `crates/kernel/src/vfs/mount.rs`
-- [ ] T051 Implement path resolution (absolute, cwd-relative, symlink traversal, `..` handling) in `crates/kernel/src/vfs/path.rs`
-- [ ] T052 [P] tmpfs implementation in `crates/kernel/src/fs/tmpfs.rs`
-- [ ] T053 [P] devfs implementation (node registry, open/read/write dispatch to device drivers) in `crates/kernel/src/fs/devfs.rs`
-- [ ] T054 [P] procfs implementation reading from process table, exposing `/proc/<pid>/{status,cmdline,environ,fd,comm,stat}` and `/proc/{version,uptime,meminfo,loadavg,storage}` per `data-model.md §10`
-- [ ] T055 [P] VFS isolation tests (mount, lookup, read/write, readdir, cross-mount traversal) in `crates/kernel/tests/vfs.rs`
+- [x] T049 Define `Vnode`, `NodeType`, `Filesystem` trait in `crates/kernel/src/vfs/mod.rs` per `data-model.md §3.1`
+- [x] T050 Implement the mount table in `crates/kernel/src/vfs/mount.rs`
+- [x] T051 Implement path resolution (absolute, cwd-relative, symlink traversal, `..` handling) in `crates/kernel/src/vfs/path.rs`
+- [x] T052 [P] tmpfs implementation in `crates/kernel/src/fs/tmpfs.rs`
+- [x] T053 [P] devfs implementation (node registry, open/read/write dispatch to device drivers) in `crates/kernel/src/fs/devfs.rs`
+- [x] T054 [P] procfs implementation reading from process table, exposing `/proc/<pid>/{status,cmdline,environ,fd,comm,stat}` and `/proc/{version,uptime,meminfo,loadavg,storage}` per `data-model.md §10`
+- [x] T055 [P] VFS isolation tests (mount, lookup, read/write, readdir, cross-mount traversal) in `crates/kernel/tests/vfs.rs`
 
 ### Kernel OPFS-backed root filesystem
 
