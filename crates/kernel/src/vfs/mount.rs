@@ -110,11 +110,13 @@ impl MountTable {
     }
 
     /// Borrow a filesystem by mount id.
-    pub fn fs_mut(&mut self, id: MountId) -> Option<&mut dyn Filesystem> {
-        self.mounts
-            .iter_mut()
-            .find(|m| m.id == id)
-            .map(|m| m.fs.as_mut())
+    pub fn fs_mut(&mut self, id: MountId) -> Option<&mut (dyn Filesystem + '_)> {
+        for m in self.mounts.iter_mut() {
+            if m.id == id {
+                return Some(&mut *m.fs);
+            }
+        }
+        None
     }
 
     /// Iterate mount metadata (id + mountpoint string) in the

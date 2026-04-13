@@ -35,9 +35,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use abi::ring::{
     OFF_KERNEL_BLOCK_COUNT, OFF_KERNEL_WAIT_SLOT, OFF_REQ_HEAD, OFF_REQ_RING, OFF_REQ_TAIL,
     OFF_RES_HEAD, OFF_RES_RING, OFF_RES_TAIL, OFF_USER_BLOCK_COUNT, OFF_USER_WAIT_SLOT,
-    REQ_RING_BYTES, REQ_SLOT_COUNT, RES_RING_BYTES, RES_SLOT_COUNT, SAB_SIZE, SLOT_SIZE,
-    STATUS_IDLE, STATUS_REQUESTED, STATUS_SERVICING, STATUS_READY,
-    Request, Response,
+    REQ_SLOT_COUNT, RES_SLOT_COUNT, SAB_SIZE, SLOT_SIZE, Request, Response,
 };
 
 /// Wraps a byte slice whose layout follows `abi::ring`. The slice

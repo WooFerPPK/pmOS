@@ -167,7 +167,14 @@ pub enum FsError {
 /// Every method takes `&mut self` because real filesystems (tmpfs,
 /// OPFS) mutate their internal caches on every call. Filesystems
 /// that truly don't mutate can still take `&mut self` cheaply.
-pub trait Filesystem: Send + Sync {
+///
+/// **Bound on `Send` only, not `Sync`.** The kernel is strictly
+/// single-threaded (it runs in one Web Worker) and filesystems
+/// are owned by the kernel. `Sync` would forbid
+/// `Box<dyn BlockDevice>` (correctly not `Sync`) inside an
+/// `OpfsFs`. `Send` is kept so tests can move a boxed filesystem
+/// across thread boundaries.
+pub trait Filesystem: Send {
     /// Return the root inode number of this filesystem.
     fn root(&self) -> Ino;
 

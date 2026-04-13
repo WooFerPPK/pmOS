@@ -11,7 +11,7 @@ use core::panic::PanicInfo;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use super::{DevId, DriverError, DriverResult, Platform};
+use super::{DevId, DriverResult, Platform};
 
 /// A recorded driver invocation, kept by the mock driver registry so
 /// tests can assert on what the kernel asked drivers to do.

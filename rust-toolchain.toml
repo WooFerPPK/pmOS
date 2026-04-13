@@ -1,11 +1,10 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-targets = [
-    "wasm32-unknown-unknown",
-    # "wasm32-wasip1" — the renamed successor to the old wasm32-wasi
-    # target used in the plan/contracts. Left commented until the
-    # userland tasks (T008..T017) are ready to actually compile.
-    # Reinstall with `rustup target add wasm32-wasip1` when needed.
-]
+# wasm32-unknown-unknown (for the kernel) and wasm32-wasip1 (for
+# userland crates once they start compiling) are added via
+# `rustup target add` AFTER the base toolchain is installed.
+# Listing them here makes rustup attempt a full component
+# download on every cargo invocation, which fails reliably in
+# constrained environments on the libLLVM.so extraction step.
 profile = "minimal"

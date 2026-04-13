@@ -107,12 +107,12 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 ### Kernel OPFS-backed root filesystem
 
-- [ ] T056 Implement the on-disk superblock / inode / extent layout in `crates/kernel/src/fs/opfs/layout.rs` matching `data-model.md §3.3`
-- [ ] T057 Implement OPFS block-device client (talks to the TS block driver via the driver control channel) in `crates/kernel/src/fs/opfs/block.rs`
-- [ ] T058 Implement the journaling layer (ring journal, replay on mount, atomic superblock commit) in `crates/kernel/src/fs/opfs/journal.rs` to satisfy FR-014
-- [ ] T059 Implement the OPFS `Filesystem` trait front-end (lookup, read, write, create, unlink, rename, readdir) in `crates/kernel/src/fs/opfs/mod.rs`
-- [ ] T060 Implement `mkfs` (first-boot initialiser): allocates root inode, creates `/bin`, `/etc`, `/dev`, `/proc`, `/run`, `/tmp`, `/home/user`, `/opt`, `/usr/bin`, `/usr/share/applications`, copies bundled binaries from the embedded initramfs, AND installs the FR-013a starter kit (`/home/user/README.md`, `/home/user/Downloads/`, `/home/user/Documents/welcome.txt`, `/home/user/Documents/editing.md`, `/home/user/Pictures/`) in `crates/kernel/src/fs/opfs/mkfs.rs`
-- [ ] T061 [P] OPFS client tests against a mock block device (round-trip write/read, journal replay after simulated crash, mkfs produces the expected tree) in `crates/kernel/tests/opfs.rs`
+- [x] T056 Implement the on-disk superblock / inode / extent layout in `crates/kernel/src/fs/opfs/layout.rs` matching `data-model.md §3.3`
+- [x] T057 Implement OPFS block-device client (talks to the TS block driver via the driver control channel) in `crates/kernel/src/fs/opfs/block.rs`
+- [x] T058 Implement the journaling layer (ring journal, replay on mount, atomic superblock commit) in `crates/kernel/src/fs/opfs/journal.rs` to satisfy FR-014
+- [x] T059 Implement the OPFS `Filesystem` trait front-end (lookup, read, write, create, unlink, rename, readdir) in `crates/kernel/src/fs/opfs/mod.rs`
+- [x] T060 Implement `mkfs` (first-boot initialiser): allocates root inode, creates `/bin`, `/etc`, `/dev`, `/proc`, `/run`, `/tmp`, `/home/user`, `/opt`, `/usr/bin`, `/usr/share/applications`, copies bundled binaries from the embedded initramfs, AND installs the FR-013a starter kit (`/home/user/README.md`, `/home/user/Downloads/`, `/home/user/Documents/welcome.txt`, `/home/user/Documents/editing.md`, `/home/user/Pictures/`) in `crates/kernel/src/fs/opfs/mkfs.rs`
+- [x] T061 [P] OPFS client tests against a mock block device (round-trip write/read, journal replay after simulated crash, mkfs produces the expected tree) in `crates/kernel/tests/opfs.rs`
 
 ### Kernel IPC (pipes and unix-socket-equivalents)
 

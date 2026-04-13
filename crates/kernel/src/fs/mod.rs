@@ -9,9 +9,9 @@
 //! * [`devfs`] — static device-node directory, used for `/dev`.
 //! * [`procfs`] — synthetic process-introspection filesystem,
 //!   used for `/proc`.
-//!
-//! OPFS client lives under this same module (Phase 2 T056..T061).
+//! * [`opfs`] — OPFS-backed persistent filesystem, used for `/`.
 
 pub mod tmpfs;
 pub mod devfs;
 pub mod procfs;
+pub mod opfs;
