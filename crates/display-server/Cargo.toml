@@ -1,0 +1,13 @@
+[package]
+name = "display-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "display-server"
+path = "src/main.rs"
+
+[dependencies]
+abi = { path = "../abi" }
+ring = { path = "../ring" }

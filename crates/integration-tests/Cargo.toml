@@ -1,0 +1,15 @@
+[package]
+name = "integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# Host-target only. Do NOT compile for wasm; this crate exists so
+# native Rust can drive full-stack perf harnesses with timing
+# precision that the Playwright JS layer cannot provide (see I6 fix
+# and T220). Rust-native binaries live in src/bin/ and are added by
+# the tasks that need them.
+[dependencies]

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>PMos</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        width: 100%;
+        overflow: hidden;
+        background: #000;
+        color: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      #pmos-fb {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        image-rendering: pixelated;
+      }
+      /* Hidden textarea used by the console driver for stdin reads
+         and the test harness for input injection. */
+      #pmos-console-input {
+        position: absolute;
+        left: -10000px;
+        top: -10000px;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+      }
+      /* Kernel panic overlay (FR-009a). Shown by bootstrap on
+         kernel Worker error; auto-reloads after ~5 s. */
+      #pmos-panic {
+        position: fixed;
+        inset: 0;
+        display: none;
+        background: #1a0000;
+        color: #ffb0b0;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        padding: 2rem;
+        z-index: 9999;
+      }
+      #pmos-panic h1 { color: #ff4040; margin-top: 0; }
+      #pmos-panic pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <canvas id="pmos-fb"></canvas>
+    <textarea id="pmos-console-input" autocomplete="off" spellcheck="false"></textarea>
+    <div id="pmos-panic" role="alert">
+      <h1>PMos kernel panic</h1>
+      <pre id="pmos-panic-message"></pre>
+      <p>Reloading in <span id="pmos-panic-countdown">5</span> seconds…</p>
+    </div>
+    <script type="module" src="./assets/bootstrap.js"></script>
+  </body>
+</html>

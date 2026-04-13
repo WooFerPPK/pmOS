@@ -1,0 +1,25 @@
+[package]
+name = "kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+# The kernel compiles to both a cdylib (for the WASM runtime target)
+# and a rlib (for native `cargo test` via the Platform abstraction).
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[dependencies]
+abi = { path = "../abi" }
+ring = { path = "../ring" }
+
+[features]
+default = []
+# Enable the native Platform implementation for host-target test runs.
+# wasm32-unknown-unknown builds do not use this feature.
+native-platform = []

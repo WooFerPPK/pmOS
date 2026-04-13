@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/abi",
+    "crates/ring",
+    "crates/kernel",
+    "crates/init",
+    "crates/display-server",
+    "crates/toolkit",
+    "crates/shell",
+    "crates/sh",
+    "crates/term",
+    "crates/files",
+    "crates/edit",
+    "crates/settings",
+    "crates/sysmon",
+    "crates/sample-app",
+    "crates/toolkit-free-client",
+    "crates/integration-tests",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["PMos contributors"]
+repository = "https://github.com/example/pmos"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

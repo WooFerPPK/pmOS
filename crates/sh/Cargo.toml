@@ -1,0 +1,12 @@
+[package]
+name = "sh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sh"
+path = "src/main.rs"
+
+[dependencies]
+abi = { path = "../abi" }

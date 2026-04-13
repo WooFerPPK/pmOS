@@ -1,0 +1,12 @@
+[package]
+name = "sample-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[dependencies]
+toolkit = { path = "../toolkit" }

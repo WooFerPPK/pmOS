@@ -1,0 +1,11 @@
+[package]
+name = "toolkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+abi = { path = "../abi" }

@@ -1,0 +1,16 @@
+[package]
+name = "toolkit-free-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# NO dependency on the `toolkit` crate — this fixture exists to
+# demonstrate that the display-server wire protocol is the source
+# of truth (Principle VII) and that an app can speak it directly
+# without the toolkit.
+[[bin]]
+name = "toolkit-free-client"
+path = "src/main.rs"
+
+[dependencies]
+abi = { path = "../abi" }

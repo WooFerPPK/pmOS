@@ -27,34 +27,34 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 **Purpose**: Stand up the build system, workspace, toolchains, dev server, and empty crate/module skeletons so Phase 2 tasks can proceed independently and in parallel without worrying about project scaffolding.
 
-- [ ] T001 Create Cargo workspace root `Cargo.toml` listing every crate in `crates/` (abi, ring, kernel, init, display-server, toolkit, shell, sh, term, files, edit, settings, sysmon, sample-app, toolkit-free-client, integration-tests, xtask); set `resolver = "2"`
-- [ ] T002 Add `rust-toolchain.toml` pinning stable and adding targets `wasm32-unknown-unknown` and `wasm32-wasi`
-- [ ] T003 Create `Justfile` with targets: `build`, `dev`, `test`, `test-kernel`, `test-display-server`, `test-toolkit`, `test-drivers`, `test-integration`, `clean`, `package sample-app`, `push-sample`
-- [ ] T004 Create `.gitignore` covering `target/`, `build/`, `dist/`, `node_modules/`, `.playwright/`, `*.pmpkg.tar`
-- [ ] T005 [P] Create `crates/abi/Cargo.toml` and `crates/abi/src/lib.rs` stub (no_std, no deps)
-- [ ] T006 [P] Create `crates/ring/Cargo.toml` and `crates/ring/src/lib.rs` stub (depends on abi)
-- [ ] T007 [P] Create `crates/kernel/Cargo.toml` (bin + lib for testability; target wasm32-unknown-unknown; `no_std` + `alloc` feature-gated) and stub `crates/kernel/src/main.rs` + `crates/kernel/src/lib.rs`
-- [ ] T008 [P] Create `crates/init/Cargo.toml` (target wasm32-wasi) and `crates/init/src/main.rs` stub
-- [ ] T009 [P] Create `crates/display-server/Cargo.toml` (target wasm32-wasi) and `crates/display-server/src/main.rs` stub
-- [ ] T010 [P] Create `crates/toolkit/Cargo.toml` (library crate) and `crates/toolkit/src/lib.rs` stub
-- [ ] T011 [P] Create `crates/shell/Cargo.toml` (the desktop shell — `/usr/bin/shell`) and `crates/shell/src/main.rs` stub
-- [ ] T012 [P] Create `crates/sh/Cargo.toml` (the CLI shell — `/usr/bin/sh`) and `crates/sh/src/main.rs` stub
-- [ ] T013 [P] Create `crates/term/Cargo.toml` and `crates/term/src/main.rs` stub
-- [ ] T014 [P] Create `crates/files/Cargo.toml` and `crates/files/src/main.rs` stub
-- [ ] T015 [P] Create `crates/edit/Cargo.toml` and `crates/edit/src/main.rs` stub
-- [ ] T016 [P] Create `crates/settings/Cargo.toml` and `crates/settings/src/main.rs` stub
-- [ ] T017 [P] Create `crates/sysmon/Cargo.toml` and `crates/sysmon/src/main.rs` stub
-- [ ] T018 [P] Create `crates/sample-app/Cargo.toml` and `crates/sample-app/src/main.rs` stub
-- [ ] T019 [P] Create `crates/toolkit-free-client/Cargo.toml` and `crates/toolkit-free-client/src/main.rs` stub (no dependency on the toolkit crate)
-- [ ] T020 [P] Create `crates/xtask/Cargo.toml` and `crates/xtask/src/main.rs` with subcommand dispatch for `assemble-dist`, `dev-server`, `gen-sab-layout`, `package`. Also create `crates/integration-tests/Cargo.toml` and `crates/integration-tests/src/lib.rs` as an empty native-Rust integration-test harness crate (to be populated by T220 with `perf/input-latency.rs`; host-target builds only, not compiled for wasm)
-- [ ] T021 [P] Create `web/package.json` with dev dependencies: `esbuild`, `typescript`, `vitest`, `@playwright/test`; no runtime deps
-- [ ] T022 [P] Create `web/tsconfig.json` with `strict: true`, target `ES2022`, module `ESNext`
-- [ ] T023 [P] Create `web/index.html` with a single top-level `<canvas id="pmos-fb">` element and a `<script type="module" src="./assets/bootstrap.js">` tag
-- [ ] T024 [P] Create `web/src/bootstrap.ts` skeleton that registers the service worker, sets up the canvas element, and prints `crossOriginIsolated` to the console (T085 will complete it)
-- [ ] T025 [P] Create `web/src/sw.ts` skeleton with an install handler that opens a versioned cache (actual precache list is populated in T087)
-- [ ] T026 Implement `crates/xtask/src/assemble_dist.rs`: copies kernel, init, display-server, and bundled-app WASM into `dist/assets/`, runs `esbuild` on `web/src/bootstrap.ts` and `web/src/sw.ts`, copies `web/index.html`, writes `dist/_headers` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`
-- [ ] T027 Implement `crates/xtask/src/dev_server.rs`: serves `dist/` on `http://localhost:8080` with COOP/COEP headers and no-caching
-- [ ] T028 [P] Create `.github/workflows/ci.yml` running `just test` (all layers) on every push
+- [x] T001 Create Cargo workspace root `Cargo.toml` listing every crate in `crates/` (abi, ring, kernel, init, display-server, toolkit, shell, sh, term, files, edit, settings, sysmon, sample-app, toolkit-free-client, integration-tests, xtask); set `resolver = "2"`
+- [x] T002 Add `rust-toolchain.toml` pinning stable and adding targets `wasm32-unknown-unknown` and `wasm32-wasi`
+- [x] T003 Create `Justfile` with targets: `build`, `dev`, `test`, `test-kernel`, `test-display-server`, `test-toolkit`, `test-drivers`, `test-integration`, `clean`, `package sample-app`, `push-sample`
+- [x] T004 Create `.gitignore` covering `target/`, `build/`, `dist/`, `node_modules/`, `.playwright/`, `*.pmpkg.tar`
+- [x] T005 [P] Create `crates/abi/Cargo.toml` and `crates/abi/src/lib.rs` stub (no_std, no deps)
+- [x] T006 [P] Create `crates/ring/Cargo.toml` and `crates/ring/src/lib.rs` stub (depends on abi)
+- [x] T007 [P] Create `crates/kernel/Cargo.toml` (bin + lib for testability; target wasm32-unknown-unknown; `no_std` + `alloc` feature-gated) and stub `crates/kernel/src/main.rs` + `crates/kernel/src/lib.rs`
+- [x] T008 [P] Create `crates/init/Cargo.toml` (target wasm32-wasi) and `crates/init/src/main.rs` stub
+- [x] T009 [P] Create `crates/display-server/Cargo.toml` (target wasm32-wasi) and `crates/display-server/src/main.rs` stub
+- [x] T010 [P] Create `crates/toolkit/Cargo.toml` (library crate) and `crates/toolkit/src/lib.rs` stub
+- [x] T011 [P] Create `crates/shell/Cargo.toml` (the desktop shell — `/usr/bin/shell`) and `crates/shell/src/main.rs` stub
+- [x] T012 [P] Create `crates/sh/Cargo.toml` (the CLI shell — `/usr/bin/sh`) and `crates/sh/src/main.rs` stub
+- [x] T013 [P] Create `crates/term/Cargo.toml` and `crates/term/src/main.rs` stub
+- [x] T014 [P] Create `crates/files/Cargo.toml` and `crates/files/src/main.rs` stub
+- [x] T015 [P] Create `crates/edit/Cargo.toml` and `crates/edit/src/main.rs` stub
+- [x] T016 [P] Create `crates/settings/Cargo.toml` and `crates/settings/src/main.rs` stub
+- [x] T017 [P] Create `crates/sysmon/Cargo.toml` and `crates/sysmon/src/main.rs` stub
+- [x] T018 [P] Create `crates/sample-app/Cargo.toml` and `crates/sample-app/src/main.rs` stub
+- [x] T019 [P] Create `crates/toolkit-free-client/Cargo.toml` and `crates/toolkit-free-client/src/main.rs` stub (no dependency on the toolkit crate)
+- [x] T020 [P] Create `crates/xtask/Cargo.toml` and `crates/xtask/src/main.rs` with subcommand dispatch for `assemble-dist`, `dev-server`, `gen-sab-layout`, `package`. Also create `crates/integration-tests/Cargo.toml` and `crates/integration-tests/src/lib.rs` as an empty native-Rust integration-test harness crate (to be populated by T220 with `perf/input-latency.rs`; host-target builds only, not compiled for wasm)
+- [x] T021 [P] Create `web/package.json` with dev dependencies: `esbuild`, `typescript`, `vitest`, `@playwright/test`; no runtime deps
+- [x] T022 [P] Create `web/tsconfig.json` with `strict: true`, target `ES2022`, module `ESNext`
+- [x] T023 [P] Create `web/index.html` with a single top-level `<canvas id="pmos-fb">` element and a `<script type="module" src="./assets/bootstrap.js">` tag
+- [x] T024 [P] Create `web/src/bootstrap.ts` skeleton that registers the service worker, sets up the canvas element, and prints `crossOriginIsolated` to the console (T085 will complete it)
+- [x] T025 [P] Create `web/src/sw.ts` skeleton with an install handler that opens a versioned cache (actual precache list is populated in T087)
+- [x] T026 Implement `crates/xtask/src/assemble_dist.rs`: copies kernel, init, display-server, and bundled-app WASM into `dist/assets/`, runs `esbuild` on `web/src/bootstrap.ts` and `web/src/sw.ts`, copies `web/index.html`, writes `dist/_headers` with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`
+- [x] T027 Implement `crates/xtask/src/dev_server.rs`: serves `dist/` on `http://localhost:8080` with COOP/COEP headers and no-caching
+- [x] T028 [P] Create `.github/workflows/ci.yml` running `just test` (all layers) on every push
 - [ ] T029 Verify `just build` produces a complete `dist/` tree and `just dev` boots to a blank canvas with `crossOriginIsolated === true` logged to the devtools console
 
 **Checkpoint**: the repo builds, the dev server serves COOP/COEP headers, every crate compiles as a stub, and `cargo test --workspace` runs (against stub code).

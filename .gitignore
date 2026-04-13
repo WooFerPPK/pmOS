@@ -1,0 +1,35 @@
+# Rust
+target/
+*.rs.bk
+*.rlib
+*.prof*
+
+# TypeScript / Node
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.*
+!.env.example
+
+# Playwright
+.playwright/
+test-results/
+playwright-report/
+playwright/.cache/
+
+# PMos package bundles (built artefacts)
+*.pmpkg.tar
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# xtask build intermediates
+build/

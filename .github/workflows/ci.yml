@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master, '001-*']
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: just test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup target add wasm32-unknown-unknown wasm32-wasi
+          rustc --version
+          cargo --version
+
+      - name: Install just
+        run: cargo install just --locked
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright browsers
+        run: |
+          cd web
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build everything
+        run: just build
+
+      - name: Run every test layer
+        run: just test
