@@ -208,6 +208,11 @@ not accepted. Plans MUST state the expected impact on each budget;
 tasks that measurably regress a budget MUST be rejected or accompanied
 by an approved deviation.
 
+Aggregate empirical gates (notably T220 for input latency and
+T128/T208 for cold/warm load and asset size) satisfy this principle's
+testability requirement; per-task budget annotations are not required
+when an aggregate gate covers the relevant budget.
+
 ### X. Testability At Every Layer
 
 Each layer MUST ship with tests that exercise it in isolation from the

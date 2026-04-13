@@ -27,7 +27,7 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 **Purpose**: Stand up the build system, workspace, toolchains, dev server, and empty crate/module skeletons so Phase 2 tasks can proceed independently and in parallel without worrying about project scaffolding.
 
-- [ ] T001 Create Cargo workspace root `Cargo.toml` listing every crate in `crates/` (abi, ring, kernel, init, display-server, toolkit, shell, sh, term, files, edit, settings, sysmon, sample-app, toolkit-free-client, xtask); set `resolver = "2"`
+- [ ] T001 Create Cargo workspace root `Cargo.toml` listing every crate in `crates/` (abi, ring, kernel, init, display-server, toolkit, shell, sh, term, files, edit, settings, sysmon, sample-app, toolkit-free-client, integration-tests, xtask); set `resolver = "2"`
 - [ ] T002 Add `rust-toolchain.toml` pinning stable and adding targets `wasm32-unknown-unknown` and `wasm32-wasi`
 - [ ] T003 Create `Justfile` with targets: `build`, `dev`, `test`, `test-kernel`, `test-display-server`, `test-toolkit`, `test-drivers`, `test-integration`, `clean`, `package sample-app`, `push-sample`
 - [ ] T004 Create `.gitignore` covering `target/`, `build/`, `dist/`, `node_modules/`, `.playwright/`, `*.pmpkg.tar`
@@ -46,7 +46,7 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 - [ ] T017 [P] Create `crates/sysmon/Cargo.toml` and `crates/sysmon/src/main.rs` stub
 - [ ] T018 [P] Create `crates/sample-app/Cargo.toml` and `crates/sample-app/src/main.rs` stub
 - [ ] T019 [P] Create `crates/toolkit-free-client/Cargo.toml` and `crates/toolkit-free-client/src/main.rs` stub (no dependency on the toolkit crate)
-- [ ] T020 [P] Create `crates/xtask/Cargo.toml` and `crates/xtask/src/main.rs` with subcommand dispatch for `assemble-dist`, `dev-server`, `gen-sab-layout`, `package`
+- [ ] T020 [P] Create `crates/xtask/Cargo.toml` and `crates/xtask/src/main.rs` with subcommand dispatch for `assemble-dist`, `dev-server`, `gen-sab-layout`, `package`. Also create `crates/integration-tests/Cargo.toml` and `crates/integration-tests/src/lib.rs` as an empty native-Rust integration-test harness crate (to be populated by T220 with `perf/input-latency.rs`; host-target builds only, not compiled for wasm)
 - [ ] T021 [P] Create `web/package.json` with dev dependencies: `esbuild`, `typescript`, `vitest`, `@playwright/test`; no runtime deps
 - [ ] T022 [P] Create `web/tsconfig.json` with `strict: true`, target `ES2022`, module `ESNext`
 - [ ] T023 [P] Create `web/index.html` with a single top-level `<canvas id="pmos-fb">` element and a `<script type="module" src="./assets/bootstrap.js">` tag

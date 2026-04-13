@@ -282,7 +282,8 @@ crates/
 ├── settings/                    # /usr/bin/settings — wallpaper / theme
 ├── sysmon/                      # /usr/bin/sysmon — reads /proc
 ├── sample-app/                  # third-party package test fixture
-└── toolkit-free-client/         # integration-test fixture: a client speaking the wire protocol directly
+├── toolkit-free-client/         # integration-test fixture: a client speaking the wire protocol directly
+└── integration-tests/           # native-Rust integration-test harness crate (host-target only, not wasm); houses perf/input-latency.rs and future Rust-native full-stack tests that need precise timing the Playwright JS layer cannot provide
 
 # TypeScript side — small, hand-written, no framework
 web/
