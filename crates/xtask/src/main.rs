@@ -17,6 +17,7 @@ use std::process::ExitCode;
 
 mod assemble_dist;
 mod dev_server;
+mod gen_sab_layout;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -33,10 +34,7 @@ fn main() -> ExitCode {
     let result = match subcmd {
         "assemble-dist" => assemble_dist::run(&rest),
         "dev-server" => dev_server::run(&rest),
-        "gen-sab-layout" => {
-            eprintln!("xtask: gen-sab-layout not yet implemented (T037)");
-            Ok(())
-        }
+        "gen-sab-layout" => gen_sab_layout::run(&rest),
         "package" => {
             eprintln!("xtask: package not yet implemented (T203)");
             Ok(())

@@ -69,15 +69,15 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 ### ABI and ring-buffer transport (the two-ended contract)
 
-- [ ] T030 Define WASI preview 1 opcode constants, errno values, and record layouts in `crates/abi/src/wasi.rs` mirroring `contracts/syscalls.md §2`
-- [ ] T031 [P] Define extension syscall opcodes, `SpawnManifest`, signal numbers, and the `ENOTCAPABLE`/`ENOABIVER` additions in `crates/abi/src/ext.rs` mirroring `contracts/syscalls.md §3`
-- [ ] T032 [P] Define the `Cap` enum, `CapSet` bitset, and default cap grants per role in `crates/abi/src/cap.rs` mirroring `data-model.md §5`
-- [ ] T033 [P] Define `Request`/`Response` record shapes and magic status values (`IDLE`, `REQUESTED`, `SERVICING`, `READY`) in `crates/abi/src/ring.rs` mirroring `contracts/driver-kernel.md §1`
-- [ ] T034 Declare `ABI_VERSION = (1, 0)` and a `check_abi` helper in `crates/abi/src/version.rs`
-- [ ] T035 Implement the SAB ring-buffer producer/consumer sides in `crates/ring/src/lib.rs` using raw shared-memory atomics (producer: push request + notify; consumer: pop request, service, push response + notify)
-- [ ] T036 [P] Unit tests for ring-buffer ordering, wraparound, and atomic slot transitions in `crates/ring/tests/ring.rs`
-- [ ] T037 Generate `web/src/shared/sab-layout.ts` from the abi crate's constants via `xtask gen-sab-layout` and write the generator in `crates/xtask/src/gen_sab_layout.rs`
-- [ ] T038 [P] Unit test in `web/tests/unit/sab-layout.test.ts` asserting that every offset/constant in `sab-layout.ts` matches what `abi` emits (guards against silent drift)
+- [x] T030 Define WASI preview 1 opcode constants, errno values, and record layouts in `crates/abi/src/wasi.rs` mirroring `contracts/syscalls.md §2`
+- [x] T031 [P] Define extension syscall opcodes, `SpawnManifest`, signal numbers, and the `ENOTCAPABLE`/`ENOABIVER` additions in `crates/abi/src/ext.rs` mirroring `contracts/syscalls.md §3`
+- [x] T032 [P] Define the `Cap` enum, `CapSet` bitset, and default cap grants per role in `crates/abi/src/cap.rs` mirroring `data-model.md §5`
+- [x] T033 [P] Define `Request`/`Response` record shapes and magic status values (`IDLE`, `REQUESTED`, `SERVICING`, `READY`) in `crates/abi/src/ring.rs` mirroring `contracts/driver-kernel.md §1`
+- [x] T034 Declare `ABI_VERSION = (1, 0)` and a `check_abi` helper in `crates/abi/src/version.rs`
+- [x] T035 Implement the SAB ring-buffer producer/consumer sides in `crates/ring/src/lib.rs` using raw shared-memory atomics (producer: push request + notify; consumer: pop request, service, push response + notify)
+- [x] T036 [P] Unit tests for ring-buffer ordering, wraparound, and atomic slot transitions in `crates/ring/tests/ring.rs`
+- [x] T037 Generate `web/src/shared/sab-layout.ts` from the abi crate's constants via `xtask gen-sab-layout` and write the generator in `crates/xtask/src/gen_sab_layout.rs`
+- [x] T038 [P] Unit test in `web/tests/unit/sab-layout.test.ts` asserting that every offset/constant in `sab-layout.ts` matches what `abi` emits (guards against silent drift)
 
 ### Kernel platform abstraction (for native testability per Principle X)
 

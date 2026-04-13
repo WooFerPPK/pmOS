@@ -11,3 +11,4 @@ path = "src/main.rs"
 # xtask runs on the host, not wasm, so it can use std + any native
 # dependency it likes. Keep dependencies tiny on purpose.
 [dependencies]
+abi = { path = "../abi" }
