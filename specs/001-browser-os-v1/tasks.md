@@ -81,17 +81,17 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 ### Kernel platform abstraction (for native testability per Principle X)
 
-- [ ] T039 Define the `Platform` trait (driver transport, clock, shutdown, panic hook) in `crates/kernel/src/platform/mod.rs`
-- [ ] T040 [P] Implement `NativePlatform` for `cargo test` (in-process driver stubs, monotonic clock, panic → `panic!`) in `crates/kernel/src/platform/native.rs` (gated `cfg(not(target_arch = "wasm32"))`)
-- [ ] T041 [P] Implement `WasmPlatform` for the `wasm32-unknown-unknown` runtime target in `crates/kernel/src/platform/wasm.rs` (gated `cfg(target_arch = "wasm32")`)
-- [ ] T042 Wire up a minimal `alloc` crate allocator (bump or linked-list) in `crates/kernel/src/alloc.rs` with a `#[global_allocator]` for the wasm target
+- [x] T039 Define the `Platform` trait (driver transport, clock, shutdown, panic hook) in `crates/kernel/src/platform/mod.rs`
+- [x] T040 [P] Implement `NativePlatform` for `cargo test` (in-process driver stubs, monotonic clock, panic → `panic!`) in `crates/kernel/src/platform/native.rs` (gated `cfg(not(target_arch = "wasm32"))`)
+- [x] T041 [P] Implement `WasmPlatform` for the `wasm32-unknown-unknown` runtime target in `crates/kernel/src/platform/wasm.rs` (gated `cfg(target_arch = "wasm32")`)
+- [x] T042 Wire up a minimal `alloc` crate allocator (bump or linked-list) in `crates/kernel/src/alloc.rs` with a `#[global_allocator]` for the wasm target
 
 ### Kernel process table, fd table, scheduler
 
-- [ ] T043 Implement `Process`, `ProcState`, `ExitStatus` in `crates/kernel/src/proc/mod.rs` per `data-model.md §1`
-- [ ] T044 Implement PID allocator + process table in `crates/kernel/src/proc/table.rs`
-- [ ] T045 Implement cooperative scheduler + ready-queue in `crates/kernel/src/proc/sched.rs`
-- [ ] T046 [P] Process-table isolation tests (create / ready / running / blocked / zombie / dead transitions) in `crates/kernel/tests/proc.rs`
+- [x] T043 Implement `Process`, `ProcState`, `ExitStatus` in `crates/kernel/src/proc/mod.rs` per `data-model.md §1`
+- [x] T044 Implement PID allocator + process table in `crates/kernel/src/proc/table.rs`
+- [x] T045 Implement cooperative scheduler + ready-queue in `crates/kernel/src/proc/sched.rs`
+- [x] T046 [P] Process-table isolation tests (create / ready / running / blocked / zombie / dead transitions) in `crates/kernel/tests/proc.rs`
 - [ ] T047 Implement `FdTable`, `FdEntry`, `FdObject` in `crates/kernel/src/fd/mod.rs` per `data-model.md §2`
 - [ ] T048 [P] fd-table tests (allocation lowest-free, close releases, dup, O_CLOEXEC) in `crates/kernel/tests/fd.rs`
 

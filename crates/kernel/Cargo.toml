@@ -19,7 +19,10 @@ abi = { path = "../abi" }
 ring = { path = "../ring" }
 
 [features]
-default = []
+# `native-platform` is **on by default** so that `cargo test -p kernel`
+# just works on the developer's host without extra flags. The wasm32
+# runtime build must pass `--no-default-features` to disable it
+# (handled by the Justfile's `build` target).
+default = ["native-platform"]
 # Enable the native Platform implementation for host-target test runs.
-# wasm32-unknown-unknown builds do not use this feature.
 native-platform = []

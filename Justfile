@@ -13,7 +13,7 @@ default: build
 # Full build: Rust crates (kernel + userland) + TS (bootstrap + sw) + dist/ assembly
 build:
     @echo "[just] building PMos..."
-    cargo build --release --target wasm32-unknown-unknown -p kernel
+    cargo build --release --target wasm32-unknown-unknown -p kernel --no-default-features
     cargo build --release --target wasm32-wasi \
         -p init -p display-server -p toolkit \
         -p shell -p sh -p term -p files -p edit -p settings -p sysmon \
