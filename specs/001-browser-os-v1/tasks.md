@@ -92,8 +92,8 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 - [x] T044 Implement PID allocator + process table in `crates/kernel/src/proc/table.rs`
 - [x] T045 Implement cooperative scheduler + ready-queue in `crates/kernel/src/proc/sched.rs`
 - [x] T046 [P] Process-table isolation tests (create / ready / running / blocked / zombie / dead transitions) in `crates/kernel/tests/proc.rs`
-- [ ] T047 Implement `FdTable`, `FdEntry`, `FdObject` in `crates/kernel/src/fd/mod.rs` per `data-model.md §2`
-- [ ] T048 [P] fd-table tests (allocation lowest-free, close releases, dup, O_CLOEXEC) in `crates/kernel/tests/fd.rs`
+- [x] T047 Implement `FdTable`, `FdEntry`, `FdObject` in `crates/kernel/src/fd/mod.rs` per `data-model.md §2`
+- [x] T048 [P] fd-table tests (allocation lowest-free, close releases, dup, O_CLOEXEC) in `crates/kernel/tests/fd.rs`
 
 ### Kernel VFS and in-memory filesystems
 
