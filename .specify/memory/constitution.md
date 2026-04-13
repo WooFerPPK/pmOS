@@ -88,6 +88,12 @@ is a documented "shell" capability granted by the kernel at startup; it
 MUST NOT have any other privilege the toolkit or an app could not also
 request.
 
+The desktop shell MAY additionally hold capabilities it delegates to
+user-launched applications via the launcher; it is the trust root for
+capability delegation to apps the user explicitly launches. This does
+not grant the shell any kernel access beyond what those delegated
+capabilities already permit.
+
 **Layering test (MUST pass at all times)**: the desktop shell can be
 deleted and replaced with a different userland program that holds the
 "shell" capability, and every other layer continues to work unchanged

@@ -505,6 +505,14 @@ without introducing a new protocol-layer event on top of the
 display server (which would violate Principle II layering by
 binding userland preferences to the compositor).
 
+**Scope note**: the API above is deliberately broader than what
+the v1 caller (the toolkit's theme-watch helper) strictly needs.
+Filesystem watch is a primitive that several near-future
+features will want to reach for, and designing it twice — once
+narrowly for v1 and once generally when the second caller
+appears — is more work than designing it once with moderate
+headroom.
+
 ---
 
 ## 4. Error codes
