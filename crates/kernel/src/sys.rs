@@ -25,17 +25,19 @@
 //! Worker / SAB / browser glue.
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 
-use abi::cap::CapSet;
+use abi::cap::{Cap, CapSet};
 use abi::ext::Pid;
 
 use crate::cap::{CapError, CapTable};
 use crate::dev::{DevError, DeviceDispatcher};
 use crate::fd::{FdEntry, FdError, FdFlags, FdObject, FdTable};
-use crate::ipc::IpcTable;
+use crate::ipc::{IpcTable, PipeId};
 use crate::proc::{
-    table::InsertError, ExitStatus, ProcState, Process, ProcessTable, Scheduler,
+    table::{InsertError, ZombieTarget},
+    ExitStatus, ProcState, Process, ProcessTable, Scheduler,
 };
 use crate::vfs::{FsError, NodeType, Vfs};
 
@@ -110,6 +112,59 @@ pub struct RegisterArgs<'a> {
     pub ppid: Pid,
     pub caps: CapSet,
     pub cwd: &'a str,
+}
+
+/// Configuration for [`Kernel::proc_spawn`]. Populated by the
+/// caller (userland `posix_spawn`-equivalent, or by `init` when
+/// launching early processes from the root image).
+pub struct SpawnArgs<'a> {
+    pub name: &'a str,
+    pub caps: CapSet,
+    pub cwd: &'a str,
+    pub argv: Vec<String>,
+    pub envp: BTreeMap<String, String>,
+    /// Fd objects that will be installed at fd 0, 1, and 2 in
+    /// the child's fd table. The kernel automatically bumps
+    /// refcounts on pipe-end objects so the child and parent
+    /// share the underlying pipe correctly.
+    pub stdin: FdObject,
+    pub stdout: FdObject,
+    pub stderr: FdObject,
+}
+
+/// Selector for [`Kernel::proc_wait`]. Mirrors POSIX
+/// `waitpid`'s `pid` argument: `-1` → `Any`, positive → `Specific`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WaitTarget {
+    Any,
+    Specific(Pid),
+}
+
+/// Result of [`Kernel::proc_wait`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// A zombie child was reaped. Payload: `(child_pid, status)`.
+    Reaped(Pid, ExitStatus),
+    /// The parent has children matching the target but none
+    /// have exited yet. Caller blocks or returns `EAGAIN`.
+    WouldBlock,
+    /// The parent has no children matching the target.
+    NoChildren,
+}
+
+/// Signals the v1 kernel understands. Only `SIGKILL` actually
+/// terminates in this slice; the others are accepted-but-queued
+/// placeholders that later slices will deliver through the
+/// per-process signal inbox.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum Signal {
+    /// Terminate the target immediately, no cleanup grace.
+    Kill = 9,
+    /// Request a cooperative shutdown.
+    Term = 15,
+    /// Interrupt (ctrl-c).
+    Interrupt = 2,
 }
 
 /// Kernel glue layer: the composition root of the kernel crate.
@@ -383,9 +438,203 @@ impl Kernel {
     /// move it to `Zombie`. Does NOT reap — that's a separate
     /// call made by the parent's `proc_wait`.
     pub fn proc_exit(&mut self, pid: Pid, status: ExitStatus) -> Result<(), KernelError> {
+        self.sched.remove(pid);
         self.procs
             .exit(pid, status)
             .map_err(|_| KernelError::NoSuchPid)
+    }
+
+    // --- Spawn / wait / kill -------------------------------------
+
+    /// Spawn a fresh child process. Creates the pid, installs its
+    /// cap set (must be a subset of `parent_pid`'s own cap set —
+    /// the privilege-escalation guard), copies stdin/stdout/stderr
+    /// from the manifest into the child's fd table (bumping pipe
+    /// refcounts when the stdio fd object is a pipe end), and
+    /// marks the child `Ready`.
+    ///
+    /// Returns the child pid.
+    pub fn proc_spawn(
+        &mut self,
+        parent_pid: Pid,
+        args: SpawnArgs<'_>,
+    ) -> Result<Pid, KernelError> {
+        // Privilege-escalation guard: the child's cap set must
+        // be a subset of the parent's. This is tighter than the
+        // `cap_grant` rule (which allows CapGrant holders to
+        // grant any cap they hold) and matches POSIX semantics:
+        // a child cannot gain privileges at spawn beyond what
+        // the parent already holds.
+        let parent_caps = self.caps.list(parent_pid)?;
+        if !parent_caps.is_superset_of(args.caps) {
+            return Err(KernelError::NotCapable);
+        }
+
+        // Allocate + construct the child process.
+        let child_pid = self.procs.allocate_pid();
+        let proc = Process::new_starting(
+            child_pid,
+            parent_pid,
+            args.name,
+            args.argv,
+            args.envp,
+            args.cwd,
+            args.caps,
+            0,
+            0,
+            0,
+        );
+        self.procs.insert(proc)?;
+        self.caps.install(child_pid, args.caps);
+        self.fds.insert(child_pid, FdTable::new());
+
+        // Wire stdin/stdout/stderr. Each install bumps pipe
+        // refcounts when the object is a pipe end so the child
+        // and parent share the same underlying kernel object.
+        let stdio = [args.stdin, args.stdout, args.stderr];
+        for (fd, object) in stdio.iter().enumerate() {
+            self.inherit_object(*object);
+            let table = self.fds.get_mut(&child_pid).unwrap();
+            table
+                .install_at(fd as u32, FdEntry::new(*object))
+                .expect("stdio install within soft limit");
+        }
+
+        // Child is ready to run.
+        self.procs
+            .transition(child_pid, ProcState::Ready)
+            .map_err(|_| KernelError::NoSuchPid)?;
+        self.sched.enqueue(child_pid);
+        Ok(child_pid)
+    }
+
+    /// Wait on a child. Non-blocking: returns `WouldBlock` when
+    /// matching children exist but none have exited, and
+    /// `NoChildren` when the target doesn't match any live
+    /// child at all. Real blocking waits are mapped to these
+    /// outcomes at the syscall-dispatch layer.
+    ///
+    /// On a successful reap, the kernel-side resources of the
+    /// reaped child are released: its fd table is drained and
+    /// its cap set is removed.
+    pub fn proc_wait(
+        &mut self,
+        parent_pid: Pid,
+        target: WaitTarget,
+    ) -> Result<WaitOutcome, KernelError> {
+        // Parent must actually exist. Wait on a nonexistent
+        // parent is a programming error.
+        if !self.procs.is_alive(parent_pid) {
+            return Err(KernelError::NoSuchPid);
+        }
+
+        let zt = match target {
+            WaitTarget::Any => ZombieTarget::Any,
+            WaitTarget::Specific(pid) => ZombieTarget::Specific(pid),
+        };
+        if let Some(zombie) = self.procs.find_zombie_child(parent_pid, zt) {
+            let status = self.reap(zombie)?;
+            return Ok(WaitOutcome::Reaped(zombie, status));
+        }
+
+        // No zombie yet. Distinguish "has live children matching
+        // the target" (WouldBlock) from "no children matching at
+        // all" (NoChildren) — important to give userland ECHILD
+        // vs. EAGAIN.
+        let has_live_match = match target {
+            WaitTarget::Any => self.procs.child_count(parent_pid) > 0,
+            WaitTarget::Specific(pid) => {
+                self.procs
+                    .get(pid)
+                    .map(|p| p.ppid == parent_pid && p.state != ProcState::Dead)
+                    .unwrap_or(false)
+            }
+        };
+        if has_live_match {
+            Ok(WaitOutcome::WouldBlock)
+        } else {
+            Ok(WaitOutcome::NoChildren)
+        }
+    }
+
+    /// Deliver `signal` to `target_pid`. The v1 kernel only
+    /// actually terminates on `Kill`; other signals succeed
+    /// syntactically (cap checks apply) but are otherwise
+    /// buffered for a later slice that wires up the per-process
+    /// signal inbox.
+    ///
+    /// Cap rules: the sender must either be the target's parent
+    /// OR hold `Cap::ProcKillAny`. This mirrors the POSIX
+    /// "you can signal your own processes freely" rule, modulo
+    /// the capability-expressed privileged version.
+    pub fn proc_kill(
+        &mut self,
+        sender_pid: Pid,
+        target_pid: Pid,
+        signal: Signal,
+    ) -> Result<(), KernelError> {
+        // Sender must exist.
+        let sender_caps = self.caps.list(sender_pid)?;
+
+        // Target must exist and must not already be reaped.
+        let target = self
+            .procs
+            .get(target_pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        let is_parent = target.ppid == sender_pid;
+        if target.state == ProcState::Dead {
+            return Err(KernelError::NoSuchPid);
+        }
+
+        // Cap check.
+        if !is_parent && !sender_caps.contains(Cap::ProcKillAny) {
+            return Err(KernelError::NotCapable);
+        }
+
+        // Deliver. In v1 only SIGKILL produces a state change;
+        // the rest succeed and do nothing observable. The
+        // signal-inbox wiring lands in the follow-up slice.
+        match signal {
+            Signal::Kill => {
+                // Remove from the scheduler immediately so no
+                // pick_next can resurrect the pid after it's
+                // been marked zombie.
+                self.sched.remove(target_pid);
+                self.procs
+                    .exit(target_pid, ExitStatus::Signaled(signal as u16))
+                    .map_err(|_| KernelError::NoSuchPid)?;
+            }
+            Signal::Term | Signal::Interrupt => {
+                // Accept; delivery wiring is a follow-up slice.
+            }
+        }
+        Ok(())
+    }
+
+    /// Bump the kernel-side refcount on a pipe-ended fd object.
+    /// Called when we're about to install the same object into a
+    /// second fd (proc_spawn inheritance, `dup` inside a
+    /// process, etc.). Non-pipe objects don't need this — they
+    /// are either identifier pairs (`Vnode`) or resources with
+    /// different sharing semantics (sockets, display conns).
+    fn inherit_object(&mut self, object: FdObject) {
+        match object {
+            FdObject::PipeRead(id) => {
+                if let Ok(pipe) = self.ipc.pipe_mut(PipeId(id)) {
+                    pipe.dup_reader();
+                }
+            }
+            FdObject::PipeWrite(id) => {
+                if let Ok(pipe) = self.ipc.pipe_mut(PipeId(id)) {
+                    pipe.dup_writer();
+                }
+            }
+            FdObject::Vnode { .. }
+            | FdObject::CharDevice(_)
+            | FdObject::Socket(_)
+            | FdObject::DisplayConn(_)
+            | FdObject::SignalChannel => {}
+        }
     }
 }
 

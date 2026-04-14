@@ -49,7 +49,11 @@ use kernel::fd::{FdFlags, FdObject};
 use kernel::fs::devfs::{DevFs, DEV_CONSOLE};
 use kernel::fs::procfs::ProcFs;
 use kernel::fs::tmpfs::TmpFs;
-use kernel::sys::{Kernel, KernelError, RegisterArgs};
+use kernel::ipc::PipeId;
+use kernel::proc::ExitStatus;
+use kernel::sys::{
+    Kernel, KernelError, RegisterArgs, Signal, SpawnArgs, WaitOutcome, WaitTarget,
+};
 use kernel::vfs::FsError;
 
 /// Build a Kernel with the v1 default mount layout:
@@ -536,6 +540,379 @@ fn principle_viii_headless_shell_gate() {
     // After reap, the shell is gone and its fd table is freed.
     assert!(!k.procs.is_alive(sh));
     assert!(k.fds(sh).is_err());
+}
+
+// ---- proc_spawn / proc_wait / proc_kill (T074-T076) ---------------
+
+fn spawn_ordinary_app<'a>(
+    k: &mut Kernel,
+    parent: abi::ext::Pid,
+    name: &'a str,
+) -> abi::ext::Pid {
+    k.proc_spawn(
+        parent,
+        SpawnArgs {
+            name,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+            argv: alloc::vec::Vec::new(),
+            envp: alloc::collections::BTreeMap::new(),
+            stdin: FdObject::CharDevice(DEV_CONSOLE),
+            stdout: FdObject::CharDevice(DEV_CONSOLE),
+            stderr: FdObject::CharDevice(DEV_CONSOLE),
+        },
+    )
+    .expect("spawn ordinary app")
+}
+
+#[test]
+fn proc_spawn_creates_child_with_stdio_and_marks_ready() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    // Simulate init briefly running.
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Ready)
+        .unwrap();
+
+    let child = spawn_ordinary_app(&mut k, init, "app");
+    assert!(k.procs.is_alive(child));
+    // Parent link points back at init.
+    let p = k.procs.get(child).unwrap();
+    assert_eq!(p.ppid, init);
+    assert_eq!(p.state, kernel::proc::ProcState::Ready);
+    // stdio is wired at fd 0/1/2.
+    let table = k.fds(child).unwrap();
+    for fd in 0u32..=2 {
+        assert_eq!(
+            table.get(fd).unwrap().object,
+            FdObject::CharDevice(DEV_CONSOLE)
+        );
+    }
+    // Child is on the scheduler's ready queue.
+    assert!(k.sched.ready_len() >= 1);
+}
+
+#[test]
+fn proc_spawn_rejects_child_caps_not_a_subset_of_parent() {
+    let mut k = make_kernel();
+    // Parent is an ordinary app — it only has DisplayClient.
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "app",
+            ppid: 1,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    // It tries to spawn a child with DisplayServer. The
+    // privilege-escalation guard must reject this.
+    let err = k
+        .proc_spawn(
+            parent,
+            SpawnArgs {
+                name: "rogue",
+                caps: CapSet::from_caps(&[Cap::DisplayServer]),
+                cwd: "/",
+                argv: alloc::vec::Vec::new(),
+                envp: alloc::collections::BTreeMap::new(),
+                stdin: FdObject::CharDevice(DEV_CONSOLE),
+                stdout: FdObject::CharDevice(DEV_CONSOLE),
+                stderr: FdObject::CharDevice(DEV_CONSOLE),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(err, KernelError::NotCapable);
+}
+
+#[test]
+fn proc_spawn_bumps_pipe_refcount_so_parent_and_child_share_writer() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+
+    // init creates a pipe and holds both ends on fd 10 (read)
+    // and fd 11 (write).
+    let pid = k.ipc.create_pipe();
+    k.install_fd(init, 10, FdObject::PipeRead(pid.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(init, 11, FdObject::PipeWrite(pid.0), FdFlags::EMPTY)
+        .unwrap();
+    let before = k.ipc.pipe_mut(pid).unwrap().writer_count();
+    assert_eq!(before, 1);
+
+    // Spawn a child with the writer as stdout. The kernel
+    // should bump the pipe's writer refcount to 2.
+    let _child = k
+        .proc_spawn(
+            init,
+            SpawnArgs {
+                name: "producer",
+                caps: initial::ORDINARY_APP,
+                cwd: "/",
+                argv: alloc::vec::Vec::new(),
+                envp: alloc::collections::BTreeMap::new(),
+                stdin: FdObject::CharDevice(DEV_CONSOLE),
+                stdout: FdObject::PipeWrite(pid.0),
+                stderr: FdObject::CharDevice(DEV_CONSOLE),
+            },
+        )
+        .unwrap();
+    let after = k.ipc.pipe_mut(pid).unwrap().writer_count();
+    assert_eq!(after, 2, "pipe writer refcount should bump on spawn inherit");
+}
+
+#[test]
+fn proc_wait_reaps_a_zombie_child() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+
+    let child = spawn_ordinary_app(&mut k, init, "short-lived");
+    // The child runs briefly then exits.
+    k.procs
+        .transition(child, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child, ExitStatus::Exited(42)).unwrap();
+
+    // Init waits on any child.
+    let outcome = k.proc_wait(init, WaitTarget::Any).unwrap();
+    assert_eq!(outcome, WaitOutcome::Reaped(child, ExitStatus::Exited(42)));
+    // Fd table and process table entries are gone.
+    assert!(!k.procs.is_alive(child));
+    assert!(k.fds(child).is_err());
+}
+
+#[test]
+fn proc_wait_with_live_child_returns_would_block() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let _child = spawn_ordinary_app(&mut k, init, "still-running");
+
+    let outcome = k.proc_wait(init, WaitTarget::Any).unwrap();
+    assert_eq!(outcome, WaitOutcome::WouldBlock);
+}
+
+#[test]
+fn proc_wait_with_no_children_returns_no_children() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    // init has no children.
+    let outcome = k.proc_wait(init, WaitTarget::Any).unwrap();
+    assert_eq!(outcome, WaitOutcome::NoChildren);
+}
+
+#[test]
+fn proc_wait_specific_finds_only_the_named_child() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child_a = spawn_ordinary_app(&mut k, init, "a");
+    let child_b = spawn_ordinary_app(&mut k, init, "b");
+
+    // Only child_b exits.
+    k.procs
+        .transition(child_b, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child_b, ExitStatus::Exited(0)).unwrap();
+
+    // Wait on child_a: that one is still running → WouldBlock.
+    assert_eq!(
+        k.proc_wait(init, WaitTarget::Specific(child_a)).unwrap(),
+        WaitOutcome::WouldBlock
+    );
+    // Wait on child_b: reaped with its exit status.
+    assert_eq!(
+        k.proc_wait(init, WaitTarget::Specific(child_b)).unwrap(),
+        WaitOutcome::Reaped(child_b, ExitStatus::Exited(0))
+    );
+}
+
+#[test]
+fn proc_kill_sigkill_from_parent_zombifies_the_child() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "victim");
+
+    k.proc_kill(init, child, Signal::Kill).unwrap();
+    // Child is a zombie with Signaled(9).
+    let status = k.procs.get(child).unwrap().exit_status.unwrap();
+    assert_eq!(status, ExitStatus::Signaled(9));
+    // Parent can now reap it.
+    let outcome = k.proc_wait(init, WaitTarget::Specific(child)).unwrap();
+    assert_eq!(outcome, WaitOutcome::Reaped(child, ExitStatus::Signaled(9)));
+}
+
+#[test]
+fn proc_kill_without_parent_or_cap_is_not_capable() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    // sibling_a and sibling_b are both children of init; so
+    // they are NOT each other's parent.
+    let a = spawn_ordinary_app(&mut k, init, "a");
+    let b = spawn_ordinary_app(&mut k, init, "b");
+
+    let err = k.proc_kill(a, b, Signal::Kill).unwrap_err();
+    assert_eq!(err, KernelError::NotCapable);
+    // b is unchanged.
+    assert_eq!(
+        k.procs.get(b).unwrap().state,
+        kernel::proc::ProcState::Ready
+    );
+}
+
+#[test]
+fn proc_kill_with_proc_kill_any_cap_succeeds_across_families() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    // sysmon holds ProcKillAny. Build it from ORDINARY_APP
+    // plus that cap.
+    let sysmon_caps = initial::ORDINARY_APP.union(CapSet::from_caps(&[Cap::ProcKillAny]));
+    let sysmon = k
+        .proc_spawn(
+            init,
+            SpawnArgs {
+                name: "sysmon",
+                caps: sysmon_caps,
+                cwd: "/",
+                argv: alloc::vec::Vec::new(),
+                envp: alloc::collections::BTreeMap::new(),
+                stdin: FdObject::CharDevice(DEV_CONSOLE),
+                stdout: FdObject::CharDevice(DEV_CONSOLE),
+                stderr: FdObject::CharDevice(DEV_CONSOLE),
+            },
+        )
+        .unwrap();
+    let victim = spawn_ordinary_app(&mut k, init, "victim");
+
+    // sysmon is NOT victim's parent, but it holds ProcKillAny.
+    k.proc_kill(sysmon, victim, Signal::Kill).unwrap();
+    assert_eq!(
+        k.procs.get(victim).unwrap().exit_status.unwrap(),
+        ExitStatus::Signaled(9)
+    );
+}
+
+#[test]
+fn proc_spawn_with_shared_pipe_then_child_exit_cleans_up_pipe() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+
+    // Parent-side pipe setup: init holds both ends.
+    let pid = k.ipc.create_pipe();
+    k.install_fd(init, 10, FdObject::PipeRead(pid.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(init, 11, FdObject::PipeWrite(pid.0), FdFlags::EMPTY)
+        .unwrap();
+
+    // Spawn a child that inherits the write end as stdout.
+    let child = k
+        .proc_spawn(
+            init,
+            SpawnArgs {
+                name: "producer",
+                caps: initial::ORDINARY_APP,
+                cwd: "/",
+                argv: alloc::vec::Vec::new(),
+                envp: alloc::collections::BTreeMap::new(),
+                stdin: FdObject::CharDevice(DEV_CONSOLE),
+                stdout: FdObject::PipeWrite(pid.0),
+                stderr: FdObject::CharDevice(DEV_CONSOLE),
+            },
+        )
+        .unwrap();
+    // Writer refcount is now 2.
+    assert_eq!(k.ipc.pipe_mut(PipeId(pid.0)).unwrap().writer_count(), 2);
+
+    // Child exits; init reaps. Reap drains the child's fd
+    // table, which drops the child's writer reference.
+    k.procs
+        .transition(child, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child, ExitStatus::Exited(0)).unwrap();
+    let _ = k.proc_wait(init, WaitTarget::Specific(child)).unwrap();
+
+    // Writer refcount is back to 1 (init still holds its own
+    // copy on fd 11).
+    assert_eq!(k.ipc.pipe_mut(PipeId(pid.0)).unwrap().writer_count(), 1);
 }
 
 /// Companion test — the same flow but the shell reads FROM a
