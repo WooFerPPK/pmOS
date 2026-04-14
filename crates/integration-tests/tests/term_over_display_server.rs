@@ -902,6 +902,123 @@ fn server_framebuffer_gets_new_pixels_on_each_commit_cycle() {
 }
 
 #[test]
+fn term_rasterize_into_pool_and_present_paints_framebuffer_with_text_pixels() {
+    // End-to-end pixel path with the real rasterizer:
+    // build a term session, type a command so the
+    // scrollback contains "> echo hi" + "hi", rasterize
+    // the snapshot into the shm pool, present(), and
+    // verify the server's framebuffer carries non-
+    // background pixels that match the rasterizer's
+    // output bit-for-bit.
+    use display_server::Server as DisplayServerStateBig;
+    let fb_w = 160u32;
+    let fb_h = 80u32;
+
+    let mut server = DisplayServerStateBig::with_framebuffer_size(fb_w, fb_h);
+    let server_client_id = server.accept_with_caps(APP_CAPS);
+
+    let terminal = term::Terminal::new(term::TerminalOptions {
+        max_lines: 32,
+        banner: Vec::new(),
+        prompt: "> ".to_string(),
+    });
+    let mut session = term::Session::new(MemoryConnection::new(), terminal);
+    session.start().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    let registry_id = session.registry_id().unwrap();
+    {
+        let c = server.client_mut(server_client_id).unwrap();
+        c.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
+        c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
+    }
+    pump_events_into_term(&mut server, server_client_id, &mut session);
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    session.create_surface().unwrap();
+    let pool_size = fb_w * fb_h * 4;
+    let pool_id = session.create_pool(pool_size).unwrap();
+    let buffer_id = session
+        .create_buffer(
+            pool_id,
+            0,
+            fb_w,
+            fb_h,
+            fb_w * 4,
+            display_proto::buffer_format::ARGB8888,
+        )
+        .unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Drive some input through the embedded shell so
+    // there's something visible to rasterize.
+    for ch in "echo hi".chars() {
+        session.feed_key(term::Key::Char(ch));
+    }
+    let _ = session.feed_key(term::Key::Enter);
+
+    // Rasterize the terminal's current snapshot. The
+    // session exposes a shortcut that wraps the module
+    // function.
+    let raster = session.rasterize_snapshot(fb_w, fb_h);
+    assert_eq!(raster.len(), (fb_w * fb_h * 4) as usize);
+
+    // In v1 the client doesn't own the pool memory, so
+    // copy the rasterized bytes into the server-side pool
+    // storage. When SAB lands this step becomes a direct
+    // SAB write on the client side.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .pool_bytes_mut(pool_id)
+        .unwrap()
+        .copy_from_slice(&raster);
+
+    // Present the frame. The compositor hook fires on
+    // commit and blits the buffer into the server's
+    // framebuffer.
+    session.present(buffer_id, fb_w, fb_h).unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // The framebuffer pixels should match the rasterized
+    // bytes exactly (since the pool is the full
+    // framebuffer size and the buffer is attached at the
+    // origin).
+    let fb = server.framebuffer();
+    assert_eq!(fb.width(), fb_w);
+    assert_eq!(fb.height(), fb_h);
+    assert_eq!(fb.pixels(), raster.as_slice());
+
+    // And the result must contain non-background pixels —
+    // otherwise the rasterizer didn't actually draw
+    // anything. Background is 0xFF0A0E14 → [14, 0E, 0A, FF].
+    let bg = [0x14, 0x0E, 0x0A, 0xFF];
+    let non_bg_count = fb
+        .pixels()
+        .chunks_exact(4)
+        .filter(|px| [px[0], px[1], px[2], px[3]] != bg)
+        .count();
+    assert!(
+        non_bg_count > 0,
+        "expected rasterized text to produce non-background pixels"
+    );
+}
+
+#[test]
 fn server_commit_without_attach_does_not_touch_framebuffer() {
     // A commit with nothing ever attached is a legal
     // no-op. The framebuffer should stay exactly as it

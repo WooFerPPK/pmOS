@@ -21,10 +21,17 @@
 //! that point the bin driver will grow from the stdin REPL
 //! below to a full window-hosted renderer.
 
+pub mod font;
+pub mod rasterizer;
 pub mod session;
 pub mod terminal;
 
 pub use sh::{Shell, ShellOutput};
+pub use font::{CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
+pub use rasterizer::{
+    colors, rasterize_snapshot, rasterize_snapshot_with_palette, Palette, BYTES_PER_PIXEL,
+    PADDING,
+};
 pub use session::{
     GlobalEntry, ProtocolErrorNotice, Session, SessionError, SessionStep,
     INTERESTING_INTERFACES,

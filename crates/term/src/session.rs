@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use display_proto::{Interface, ObjectId, RegistryGlobal, RegistryGlobalRemove};
 use toolkit::protocol::{Client, ClientError, Connection};
 
+use crate::rasterizer::{rasterize_snapshot, rasterize_snapshot_with_palette, Palette};
 use crate::terminal::{Key, KeyFeedResult, Terminal};
 
 /// Interfaces every terminal app wants bound as soon as the
@@ -345,6 +346,35 @@ impl<C: Connection> Session<C> {
         self.damage(0, 0, width as i32, height as i32)?;
         self.commit()?;
         Ok(())
+    }
+
+    /// Rasterize the embedded terminal's current snapshot
+    /// into an ARGB8888 pixel buffer of `width × height`
+    /// using the default palette.
+    ///
+    /// The returned `Vec<u8>` is the shape a `pmd_buffer`
+    /// of `width × height` with tight stride expects. In
+    /// v1 the client doesn't own the shm pool memory yet
+    /// (that's the real-SAB slice), so the caller writes
+    /// these bytes into the server's pool via
+    /// `display_server::Client::pool_bytes_mut` during
+    /// tests. Once SAB transport lands, the session will
+    /// gain a `present_snapshot(buffer_id, w, h)` method
+    /// that writes the bytes into its own pool handle
+    /// before firing [`Session::present`].
+    pub fn rasterize_snapshot(&self, width: u32, height: u32) -> Vec<u8> {
+        rasterize_snapshot(&self.terminal.snapshot(), width, height)
+    }
+
+    /// [`Session::rasterize_snapshot`] with an explicit
+    /// palette.
+    pub fn rasterize_snapshot_with_palette(
+        &self,
+        width: u32,
+        height: u32,
+        palette: Palette,
+    ) -> Vec<u8> {
+        rasterize_snapshot_with_palette(&self.terminal.snapshot(), width, height, palette)
     }
 
     /// Feed a key into the embedded terminal. Returns the
