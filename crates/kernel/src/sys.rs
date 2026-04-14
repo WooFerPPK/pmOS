@@ -34,7 +34,7 @@ use abi::ext::Pid;
 use crate::cap::{CapError, CapTable};
 use crate::dev::{DevError, DeviceDispatcher};
 use crate::fd::{FdEntry, FdError, FdFlags, FdObject, FdTable};
-use crate::ipc::{IpcTable, PipeId};
+use crate::ipc::{IpcError, IpcTable, PipeId, SocketId, SocketType};
 use crate::proc::{
     table::{InsertError, ZombieTarget},
     ExitStatus, ProcState, Process, ProcessTable, Scheduler, SignalInbox,
@@ -63,6 +63,16 @@ pub enum KernelError {
     InvalidArgument,
     /// Capability check failure.
     NotCapable,
+    /// Operation would have blocked. The caller turns this
+    /// into `EAGAIN` under `O_NONBLOCK`, or parks the
+    /// process on the underlying endpoint otherwise.
+    WouldBlock,
+    /// Connection refused — e.g. `display_connect` with no
+    /// display server listening at `/run/display`.
+    ConnectionRefused,
+    /// Path already bound — e.g. a second `display_bind`
+    /// call against the same socket path.
+    AddressInUse,
     /// Forwarded filesystem error (wraps `FsError`).
     Fs(FsError),
     /// Forwarded device-dispatch error (wraps `DevError`).
@@ -103,6 +113,30 @@ impl From<InsertError> for KernelError {
         KernelError::InvalidArgument
     }
 }
+impl From<IpcError> for KernelError {
+    fn from(e: IpcError) -> Self {
+        match e {
+            IpcError::NoSuchPipe | IpcError::NoSuchSocket => KernelError::BadFd,
+            IpcError::AddressInUse => KernelError::AddressInUse,
+            IpcError::ConnectionRefused => KernelError::ConnectionRefused,
+            IpcError::InvalidState => KernelError::InvalidArgument,
+            IpcError::WouldBlock => KernelError::WouldBlock,
+            IpcError::PipeBroken => KernelError::NotSupportedOnFd,
+            IpcError::MsgTooLarge => KernelError::InvalidArgument,
+        }
+    }
+}
+
+/// Path at which the PMos display server listens, per
+/// `contracts/display-protocol.md §0`. Exported so userland
+/// code and the kernel-level test harness agree on the
+/// single string.
+pub const DISPLAY_SOCKET_PATH: &str = "/run/display";
+
+/// Default backlog for the display server's listening
+/// socket. Matches the v1 target of "a handful of
+/// concurrent clients during a desktop session".
+pub const DISPLAY_LISTEN_BACKLOG: usize = 16;
 
 /// Configuration for [`Kernel::register_process`].
 ///
@@ -343,7 +377,11 @@ impl Kernel {
                 Ok(n)
             }
             FdObject::CharDevice(devnum) => Ok(self.devs.read(devnum, buf)?),
-            FdObject::PipeRead(_) | FdObject::Socket(_) => Err(KernelError::NotSupportedOnFd),
+            FdObject::Socket(id) => {
+                let (n, _fds) = self.ipc.recv_on_socket(SocketId(id), buf, 0)?;
+                Ok(n)
+            }
+            FdObject::PipeRead(_) => Err(KernelError::NotSupportedOnFd),
             FdObject::PipeWrite(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel => Err(KernelError::NotSupportedOnFd),
@@ -375,7 +413,11 @@ impl Kernel {
                 Ok(n)
             }
             FdObject::CharDevice(devnum) => Ok(self.devs.write(devnum, buf)?),
-            FdObject::PipeWrite(_) | FdObject::Socket(_) => Err(KernelError::NotSupportedOnFd),
+            FdObject::Socket(id) => {
+                let n = self.ipc.send_on_socket(SocketId(id), buf, Vec::new())?;
+                Ok(n)
+            }
+            FdObject::PipeWrite(_) => Err(KernelError::NotSupportedOnFd),
             FdObject::PipeRead(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel => Err(KernelError::NotSupportedOnFd),
@@ -390,6 +432,99 @@ impl Kernel {
         let entry = table.close(fd)?;
         self.release_object(entry.object);
         Ok(())
+    }
+
+    // --- Display server IPC --------------------------------------
+    //
+    // These three methods are the kernel side of the
+    // `display_connect` / `display_bind` extension syscalls
+    // from `contracts/syscalls.md`. They compose the
+    // existing `IpcTable` socket primitives (create_socket,
+    // bind_socket, listen_socket, connect_socket,
+    // accept_socket) with a cap check and the well-known
+    // `/run/display` path string so userland gets a clean
+    // two-call interface:
+    //
+    //   * display server: `display_bind(self_pid) -> fd`
+    //     -> listener socket at `/run/display`
+    //   * ordinary app: `display_connect(self_pid) -> fd`
+    //     -> connected socket (server's accept pops it off)
+    //   * display server: `accept_socket(self_pid, listener_fd)
+    //     -> fd` -> one new server-side connected fd
+    //
+    // Socket fds route through `fd_read` / `fd_write`
+    // already (see the `FdObject::Socket` arms above), so a
+    // paired client/server can round-trip bytes without any
+    // extra syscall layer.
+
+    /// Bind and listen on `/run/display`. The caller must
+    /// hold `Cap::DisplayServer`. Installs the listener in
+    /// `pid`'s fd table and returns the fd number. Fails
+    /// with `KernelError::AddressInUse` if the path is
+    /// already bound (e.g. a second display server tried to
+    /// start).
+    pub fn display_bind(&mut self, pid: Pid) -> Result<u32, KernelError> {
+        let caps = self.caps.list(pid)?;
+        if !caps.contains(Cap::DisplayServer) {
+            return Err(KernelError::NotCapable);
+        }
+        let socket_id = self.ipc.create_socket(SocketType::Stream);
+        self.ipc.bind_socket(socket_id, DISPLAY_SOCKET_PATH)?;
+        self.ipc.listen_socket(socket_id, DISPLAY_LISTEN_BACKLOG)?;
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
+        let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
+        Ok(fd)
+    }
+
+    /// Connect to `/run/display`. The caller must hold
+    /// `Cap::DisplayClient`. Installs the client-side
+    /// socket in `pid`'s fd table and returns the fd
+    /// number. Fails with `KernelError::ConnectionRefused`
+    /// if no display server has bound the path or the
+    /// listener's backlog is full.
+    pub fn display_connect(&mut self, pid: Pid) -> Result<u32, KernelError> {
+        let caps = self.caps.list(pid)?;
+        if !caps.contains(Cap::DisplayClient) {
+            return Err(KernelError::NotCapable);
+        }
+        let socket_id = self.ipc.create_socket(SocketType::Stream);
+        self.ipc.connect_socket(socket_id, DISPLAY_SOCKET_PATH)?;
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
+        let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
+        Ok(fd)
+    }
+
+    /// Accept one pending connection on a listening socket
+    /// fd owned by `pid`. Returns the fd of the newly-
+    /// connected server-side socket. The listener fd stays
+    /// open and can be accepted from again.
+    ///
+    /// `KernelError::WouldBlock` if no pending client is
+    /// waiting; `KernelError::BadFd` if the fd isn't a
+    /// socket at all; `KernelError::InvalidArgument` if the
+    /// socket exists but isn't in `Listening` state.
+    pub fn accept_socket(
+        &mut self,
+        pid: Pid,
+        listener_fd: u32,
+    ) -> Result<u32, KernelError> {
+        let entry = *self
+            .fds
+            .get(&pid)
+            .ok_or(KernelError::NoSuchPid)?
+            .get(listener_fd)
+            .ok_or(KernelError::BadFd)?;
+        let listener_id = match entry.object {
+            FdObject::Socket(id) => SocketId(id),
+            _ => return Err(KernelError::NotSupportedOnFd),
+        };
+        let server_id = self.ipc.accept_socket(listener_id)?;
+        let table = self
+            .fds
+            .get_mut(&pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        let fd = table.alloc(FdEntry::new(FdObject::Socket(server_id.0)))?;
+        Ok(fd)
     }
 
     // --- Private helpers -----------------------------------------

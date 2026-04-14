@@ -53,6 +53,7 @@ use kernel::ipc::PipeId;
 use kernel::proc::ExitStatus;
 use kernel::sys::{
     Kernel, KernelError, RegisterArgs, Signal, SpawnArgs, WaitOutcome, WaitTarget,
+    DISPLAY_SOCKET_PATH,
 };
 use kernel::vfs::FsError;
 
@@ -1107,4 +1108,235 @@ fn principle_viii_shell_can_source_a_script_file() {
     }
     // Both lines flushed through the sink as complete lines.
     assert_eq!(k.devs.drain_console_output(), b"");
+}
+
+// ---- display_bind / display_connect / accept_socket ---------------
+
+/// Spawn a display-server-like pid with the `DisplayServer`
+/// capability set. The real production cap set lives at
+/// `initial::DISPLAY_SERVER`; that constant may not exist
+/// yet in v1 so we synthesise the cap set directly for
+/// tests.
+fn register_display_server(k: &mut Kernel) -> abi::ext::Pid {
+    let caps = CapSet::from_caps(&[
+        Cap::DisplayServer,
+        Cap::DisplayClient,
+        Cap::DevBlock,
+    ]);
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "display-server",
+            ppid: 0,
+            caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(pid).unwrap();
+    pid
+}
+
+fn register_display_client(k: &mut Kernel, name: &str) -> abi::ext::Pid {
+    let pid = k
+        .register_process(RegisterArgs {
+            name,
+            ppid: 0,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(pid).unwrap();
+    pid
+}
+
+#[test]
+fn display_bind_requires_display_server_cap() {
+    let mut k = make_kernel();
+    let app = register_display_client(&mut k, "app");
+    let err = k.display_bind(app).unwrap_err();
+    assert_eq!(err, KernelError::NotCapable);
+}
+
+#[test]
+fn display_bind_creates_listener_and_installs_fd() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let fd = k.display_bind(ds).unwrap();
+    // The installed fd is a Socket fd.
+    let entry = k.fds(ds).unwrap().get(fd).unwrap();
+    assert!(matches!(entry.object, FdObject::Socket(_)));
+    // The path is now bound in the IPC table.
+    assert!(k.ipc.lookup_binding(DISPLAY_SOCKET_PATH).is_some());
+}
+
+#[test]
+fn double_display_bind_returns_address_in_use() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.display_bind(ds).unwrap();
+    // The same pid (or any other DisplayServer-holder) can't
+    // bind a second time — the path is already taken.
+    let err = k.display_bind(ds).unwrap_err();
+    assert_eq!(err, KernelError::AddressInUse);
+}
+
+#[test]
+fn display_connect_requires_display_client_cap() {
+    let mut k = make_kernel();
+    // Build a process that has NEITHER DisplayServer nor
+    // DisplayClient (walled off by cap).
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "minimal",
+            ppid: 0,
+            caps: CapSet::from_caps(&[Cap::ProcEnumerate]),
+            cwd: "/",
+        })
+        .unwrap();
+    let err = k.display_connect(pid).unwrap_err();
+    assert_eq!(err, KernelError::NotCapable);
+}
+
+#[test]
+fn display_connect_with_no_listener_is_connection_refused() {
+    let mut k = make_kernel();
+    let app = register_display_client(&mut k, "app");
+    let err = k.display_connect(app).unwrap_err();
+    assert_eq!(err, KernelError::ConnectionRefused);
+}
+
+#[test]
+fn display_connect_installs_a_socket_fd_once_listener_exists() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.display_bind(ds).unwrap();
+
+    let app = register_display_client(&mut k, "app");
+    let client_fd = k.display_connect(app).unwrap();
+    let entry = k.fds(app).unwrap().get(client_fd).unwrap();
+    assert!(matches!(entry.object, FdObject::Socket(_)));
+}
+
+#[test]
+fn accept_socket_pops_one_pending_client_and_returns_a_fresh_fd() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let listener_fd = k.display_bind(ds).unwrap();
+    let app = register_display_client(&mut k, "app");
+    let _client_fd = k.display_connect(app).unwrap();
+
+    // Server accepts — gets a new fd in its own table.
+    let server_side = k.accept_socket(ds, listener_fd).unwrap();
+    assert_ne!(server_side, listener_fd);
+    let entry = k.fds(ds).unwrap().get(server_side).unwrap();
+    assert!(matches!(entry.object, FdObject::Socket(_)));
+}
+
+#[test]
+fn accept_socket_on_empty_backlog_is_would_block() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let listener_fd = k.display_bind(ds).unwrap();
+    // No client has connected yet.
+    let err = k.accept_socket(ds, listener_fd).unwrap_err();
+    assert_eq!(err, KernelError::WouldBlock);
+}
+
+#[test]
+fn accept_socket_on_non_socket_fd_is_not_supported_on_fd() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    // Install a chardev fd at fd 5.
+    k.install_fd(ds, 5, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let err = k.accept_socket(ds, 5).unwrap_err();
+    assert_eq!(err, KernelError::NotSupportedOnFd);
+}
+
+#[test]
+fn fd_write_on_client_and_fd_read_on_server_round_trips_bytes() {
+    // The T077 analogue for the display-server channel:
+    // bytes written through the client-side socket fd
+    // surface on the server-side accepted fd. No toolkit,
+    // no display-server library — just Kernel methods.
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let listener_fd = k.display_bind(ds).unwrap();
+    let app = register_display_client(&mut k, "app");
+    let client_fd = k.display_connect(app).unwrap();
+    let server_fd = k.accept_socket(ds, listener_fd).unwrap();
+
+    let payload = b"hello display\n";
+    let n = k.fd_write(app, client_fd, payload).unwrap();
+    assert_eq!(n, payload.len());
+
+    let mut buf = [0u8; 64];
+    let m = k.fd_read(ds, server_fd, &mut buf).unwrap();
+    assert_eq!(m, payload.len());
+    assert_eq!(&buf[..m], payload);
+}
+
+#[test]
+fn fd_write_on_server_and_fd_read_on_client_round_trips_bytes() {
+    // The reverse direction: server sends an event, client
+    // reads it.
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let listener_fd = k.display_bind(ds).unwrap();
+    let app = register_display_client(&mut k, "app");
+    let client_fd = k.display_connect(app).unwrap();
+    let server_fd = k.accept_socket(ds, listener_fd).unwrap();
+
+    let event = b"\x01\x00\x00\x00\x0a\x00\x08\x00\x00\x00";
+    let n = k.fd_write(ds, server_fd, event).unwrap();
+    assert_eq!(n, event.len());
+
+    let mut buf = [0u8; 64];
+    let m = k.fd_read(app, client_fd, &mut buf).unwrap();
+    assert_eq!(m, event.len());
+    assert_eq!(&buf[..m], event);
+}
+
+#[test]
+fn fd_read_on_empty_socket_is_would_block() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let listener_fd = k.display_bind(ds).unwrap();
+    let app = register_display_client(&mut k, "app");
+    let _client_fd = k.display_connect(app).unwrap();
+    let server_fd = k.accept_socket(ds, listener_fd).unwrap();
+
+    let mut buf = [0u8; 8];
+    let err = k.fd_read(ds, server_fd, &mut buf).unwrap_err();
+    assert_eq!(err, KernelError::WouldBlock);
+}
+
+#[test]
+fn multiple_clients_accept_into_distinct_server_side_fds() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let listener_fd = k.display_bind(ds).unwrap();
+    let app_a = register_display_client(&mut k, "a");
+    let app_b = register_display_client(&mut k, "b");
+
+    let a_client = k.display_connect(app_a).unwrap();
+    let b_client = k.display_connect(app_b).unwrap();
+
+    let a_server = k.accept_socket(ds, listener_fd).unwrap();
+    let b_server = k.accept_socket(ds, listener_fd).unwrap();
+    assert_ne!(a_server, b_server);
+
+    // Writes on one client do NOT reach the other's server
+    // fd — the two connections are independent.
+    k.fd_write(app_a, a_client, b"from a").unwrap();
+    let mut buf = [0u8; 16];
+    let n = k.fd_read(ds, a_server, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"from a");
+    // The other server-side fd is still empty.
+    let err = k.fd_read(ds, b_server, &mut buf).unwrap_err();
+    assert_eq!(err, KernelError::WouldBlock);
+
+    // Writes on b reach b's server fd and not a's.
+    k.fd_write(app_b, b_client, b"from b").unwrap();
+    let n = k.fd_read(ds, b_server, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"from b");
 }
