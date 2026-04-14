@@ -13,3 +13,15 @@ path = "src/lib.rs"
 # and T220). Rust-native binaries live in src/bin/ and are added by
 # the tasks that need them.
 [dependencies]
+
+[dev-dependencies]
+# Cross-crate integration tests pull in every layer they
+# need to compose. These are dev-dependencies (not regular
+# deps) so production builds that happen to consume this
+# crate don't drag the entire workspace in.
+abi = { path = "../abi" }
+kernel = { path = "../kernel", features = ["native-platform"] }
+display-proto = { path = "../display-proto" }
+display-server = { path = "../display-server" }
+toolkit = { path = "../toolkit" }
+toolkit-free-client = { path = "../toolkit-free-client" }
