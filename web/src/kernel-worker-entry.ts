@@ -109,3 +109,22 @@ export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
     },
   };
 }
+
+// ---- Worker auto-install --------------------------------------
+//
+// When this module is loaded inside a real dedicated Web
+// Worker (production boot path: `new Worker('/assets/kernel-
+// worker.js', {type: 'module'})`), auto-install the entry
+// point against the Worker's global so the scaffold starts
+// listening for main-thread messages without an explicit
+// call. Gated on `DedicatedWorkerGlobalScope` so the Vitest
+// tests — which import this module in a node environment —
+// do NOT auto-install: they call `installWorkerEntry` with
+// their own `FakeWorkerMessaging` instead.
+if (
+  typeof DedicatedWorkerGlobalScope !== "undefined" &&
+  typeof self !== "undefined" &&
+  self instanceof DedicatedWorkerGlobalScope
+) {
+  installWorkerEntry(self as unknown as WorkerMessaging);
+}
