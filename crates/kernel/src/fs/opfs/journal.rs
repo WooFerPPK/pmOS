@@ -101,12 +101,66 @@ impl Transaction {
     /// Stage a block-write to be applied when this transaction
     /// commits. Returns `Err(FsError::NoSpace)` if the txn is
     /// already at its op-count cap.
+    ///
+    /// **Do not use this for read-modify-write on metadata
+    /// blocks.** Use [`Transaction::add_or_merge_write`] instead
+    /// — it correctly merges multiple mutations that target the
+    /// same LBA, preventing the "second write clobbers the
+    /// first" bug when, for instance, `mkdir` needs to update
+    /// two inodes that live in the same inode-table block.
     pub fn add_write(&mut self, target_lba: Lba, data: Block) -> Result<(), FsError> {
         if self.ops.len() >= MAX_OPS_PER_TXN {
             return Err(FsError::NoSpace);
         }
         self.ops.push(JournalOp { target_lba, data });
         Ok(())
+    }
+
+    /// Read-modify-write a block through the transaction,
+    /// merging with any pending write to the same `target_lba`.
+    ///
+    /// If the txn already has an op targeting `target_lba`,
+    /// `patch` is applied to that pending block and no new op
+    /// is added. Otherwise `initial` (usually the current on-
+    /// disk contents read by the caller) becomes the base and
+    /// `patch` applies to it, and the result is appended as a
+    /// new op.
+    ///
+    /// This is the correct primitive for staging multiple
+    /// metadata mutations that may end up targeting the same
+    /// block — e.g., an inode-table block that contains both
+    /// a newly-created inode and an updated parent directory.
+    pub fn add_or_merge_write<F>(
+        &mut self,
+        target_lba: Lba,
+        initial: Block,
+        patch: F,
+    ) -> Result<(), FsError>
+    where
+        F: FnOnce(&mut Block),
+    {
+        if let Some(op) = self.ops.iter_mut().find(|o| o.target_lba == target_lba) {
+            patch(&mut op.data);
+            return Ok(());
+        }
+        if self.ops.len() >= MAX_OPS_PER_TXN {
+            return Err(FsError::NoSpace);
+        }
+        let mut block = initial;
+        patch(&mut block);
+        self.ops.push(JournalOp { target_lba, data: block });
+        Ok(())
+    }
+
+    /// Return the pending block for a given LBA if one exists.
+    /// Used by read-modify-write paths to avoid re-reading from
+    /// disk after a prior stage in the same txn has already
+    /// produced an updated block.
+    pub fn pending_block(&self, target_lba: Lba) -> Option<&Block> {
+        self.ops
+            .iter()
+            .find(|o| o.target_lba == target_lba)
+            .map(|o| &o.data)
     }
 
     pub fn op_count(&self) -> usize {

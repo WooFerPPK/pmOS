@@ -47,8 +47,13 @@ fn mkfs_produces_a_readable_superblock() {
 #[test]
 fn mkfs_refuses_tiny_device() {
     let device = Box::new(MockBlockDevice::new(10));
-    let err = mkfs(device).unwrap_err();
-    assert_eq!(err, FsError::NoSpace);
+    // `unwrap_err()` requires Debug on Ok; OpfsFs contains a
+    // Box<dyn BlockDevice> which can't derive Debug, so we
+    // match by hand.
+    match mkfs(device) {
+        Ok(_) => panic!("mkfs on a 10-block device should fail"),
+        Err(e) => assert_eq!(e, FsError::NoSpace),
+    }
 }
 
 #[test]
@@ -456,8 +461,10 @@ fn invalid_superblock_magic_fails_mount() {
     let mut device = MockBlockDevice::new(TEST_BLOCKS);
     let zero = [0u8; BLOCK_SIZE];
     device.write(0, &zero).unwrap();
-    let err = OpfsFs::mount(Box::new(device)).unwrap_err();
-    assert_eq!(err, FsError::Io);
+    match OpfsFs::mount(Box::new(device)) {
+        Ok(_) => panic!("mount with zero magic should fail"),
+        Err(e) => assert_eq!(e, FsError::Io),
+    }
 }
 
 #[test]
@@ -471,6 +478,8 @@ fn corrupt_superblock_checksum_fails_mount() {
     device.read(0, &mut block).unwrap();
     block[200] ^= 0xFF; // flip a bit inside the protected region
     device.write(0, &block).unwrap();
-    let err = OpfsFs::mount(device).unwrap_err();
-    assert_eq!(err, FsError::Io);
+    match OpfsFs::mount(device) {
+        Ok(_) => panic!("mount with corrupted superblock should fail"),
+        Err(e) => assert_eq!(e, FsError::Io),
+    }
 }

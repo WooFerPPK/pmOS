@@ -126,20 +126,26 @@ fn interleaved_push_pop_respects_bounds() {
     let (mut _buf, mut sab) = fresh_sab();
     sab.init();
 
-    // Push two, pop one, push two, pop one … ad nauseam. Should
-    // never overflow because the producer stays ≤ 2 ahead.
-    for i in 0..1000u32 {
+    // Push two, pop one, push two, pop one … until the queue
+    // is near full. Because the FIFO grows by one per round,
+    // we cap the round count at REQ_SLOT_COUNT - 4 to stay
+    // comfortably inside the ring's capacity.
+    let rounds = (REQ_SLOT_COUNT - 4) as u32;
+    for i in 0..rounds {
         let a = sample_request(i * 2, 0x0001);
         let b = sample_request(i * 2 + 1, 0x0002);
-        assert!(sab.try_push_request(&a));
-        assert!(sab.try_push_request(&b));
-        let first = sab.try_pop_request().expect("pop a");
-        assert_eq!(first.request_id, i * 2);
+        assert!(sab.try_push_request(&a), "push a round {i}");
+        assert!(sab.try_push_request(&b), "push b round {i}");
+        // FIFO pops the oldest queued item — which after the
+        // i-th round of "push 2i, push 2i+1, pop" is exactly
+        // request_id i.
+        let popped = sab.try_pop_request().expect("pop round");
+        assert_eq!(popped.request_id, i, "FIFO round {i}");
     }
-    // After 1000 rounds we should still have ~1000 entries queued
-    // (one leftover per round).
+    // After `rounds` rounds we've pushed 2*rounds and popped
+    // `rounds`, so `rounds` entries remain in the queue.
     let remaining = sab.request_len();
-    assert!(remaining > 0);
+    assert_eq!(remaining, rounds as usize);
     assert!(remaining < REQ_SLOT_COUNT);
 }
 
@@ -266,8 +272,9 @@ fn concurrent_producer_consumer() {
     // data pointer; all mutations go through atomic operations inside
     // Sab, and the slot writes are coordinated by the head/tail
     // atomics with Release/Acquire ordering. The Arc keeps the buffer
-    // alive for the duration of both threads.
-    let ptr = buf.as_ptr() as *mut u8;
+    // alive for the duration of both threads. The pointer is passed
+    // through `usize` so the closures are Send.
+    let ptr_addr = buf.as_ptr() as usize;
     let len = buf.len();
     let pushed_total = Arc::new(AtomicUsize::new(0));
     let popped_total = Arc::new(AtomicUsize::new(0));
@@ -275,7 +282,7 @@ fn concurrent_producer_consumer() {
     let pushed_total_p = pushed_total.clone();
     let buf_p = buf.clone();
     let producer = thread::spawn(move || {
-        let sab = unsafe { Sab::from_raw(ptr, len) };
+        let sab = unsafe { Sab::from_raw(ptr_addr as *mut u8, len) };
         let _keep = buf_p; // keep the Arc alive in this thread
         for i in 0..ROUNDS {
             let req = sample_request(i, 0x0001);
@@ -292,7 +299,7 @@ fn concurrent_producer_consumer() {
     let popped_total_c = popped_total.clone();
     let buf_c = buf.clone();
     let consumer = thread::spawn(move || {
-        let sab = unsafe { Sab::from_raw(ptr, len) };
+        let sab = unsafe { Sab::from_raw(ptr_addr as *mut u8, len) };
         let _keep = buf_c;
         let mut expected: u32 = 0;
         while popped_total_c.load(Ordering::Acquire) < ROUNDS as usize {

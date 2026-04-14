@@ -130,6 +130,17 @@ pub fn mkfs(mut device: DynBlockDevice) -> Result<OpfsFs, FsError> {
     fs.write_superblock()?;
     fs.device_mut().flush()?;
 
+    // Sanity check: read the root inode back and make sure the
+    // on-disk format round-trips via the current journaling path.
+    // If this ever fails, it's a mkfs or inode-serialisation bug.
+    let verify = fs.read_inode(ROOT_INO)?;
+    debug_assert_eq!(
+        verify.kind,
+        InodeKind::Directory,
+        "mkfs: root inode round-trip failed; got kind={:?}",
+        verify.kind,
+    );
+
     // Step 7: from here on, everything goes through the normal
     // journal-backed Filesystem trait methods. Each call is
     // atomic with respect to a crash.

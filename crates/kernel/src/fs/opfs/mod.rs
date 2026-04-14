@@ -175,7 +175,11 @@ impl OpfsFs {
 
     /// Produce a block image in which the inode's slot has been
     /// replaced with `ino`'s new bytes. Leaves the rest of the
-    /// block's inodes untouched. Used by the journal path.
+    /// block's inodes untouched. Used by `mkfs`'s direct write
+    /// path (no journal); the journaled path uses
+    /// [`stage_inode_write`] which routes through
+    /// [`Transaction::add_or_merge_write`] so multiple inode
+    /// slots in the same block merge correctly.
     fn make_inode_block_update(&mut self, ino: &InodeOnDisk) -> Result<(Lba, [u8; BLOCK_SIZE]), FsError> {
         let (lba, within) = self.inode_lba(ino.ino)?;
         let mut block = [0u8; BLOCK_SIZE];
@@ -232,13 +236,35 @@ impl OpfsFs {
     }
 
     /// Stage an inode write into a transaction.
+    ///
+    /// Uses [`Transaction::add_or_merge_write`] so that multiple
+    /// inodes in the same inode-table block (e.g., a newly-
+    /// created inode at slot N and an updated parent-directory
+    /// inode at slot 0) merge into a single op on commit. This
+    /// prevents a classic read-modify-write collision where the
+    /// second stage_inode_write would otherwise read the pre-txn
+    /// block from disk and overwrite the first stage's slot.
     fn stage_inode_write(
         &mut self,
         ino: &InodeOnDisk,
         txn: &mut Transaction,
     ) -> Result<(), FsError> {
-        let (lba, block) = self.make_inode_block_update(ino)?;
-        txn.add_write(lba, block)
+        let (lba, within) = self.inode_lba(ino.ino)?;
+        // If the txn has already staged a write to this block,
+        // use that pending image; otherwise read from disk.
+        let initial = if let Some(pending) = txn.pending_block(lba) {
+            *pending
+        } else {
+            let mut b = [0u8; BLOCK_SIZE];
+            self.device.read(lba, &mut b)?;
+            b
+        };
+        let slot_start = within * INODE_BYTES;
+        let mut slot = [0u8; INODE_BYTES];
+        ino.to_bytes(&mut slot);
+        txn.add_or_merge_write(lba, initial, |block| {
+            block[slot_start..slot_start + INODE_BYTES].copy_from_slice(&slot);
+        })
     }
 
     /// Commit + apply a transaction in one shot. Most callers
@@ -478,9 +504,45 @@ impl OpfsFs {
         if blocks_needed > INODE_DIRECT_BLOCKS {
             return Err(FsError::NoSpace);
         }
-        // Extend if new_size > old_size: allocate new blocks and
-        // zero them.
-        if new_size > file.size {
+
+        if new_size < file.size {
+            // Shrinking. If `new_size` falls inside a retained
+            // block, zero the tail of that block from
+            // `new_size mod BLOCK_SIZE` to the end so a
+            // subsequent extend reads zeros rather than stale
+            // post-truncate data. POSIX: shrinking discards
+            // the truncated content.
+            if new_size > 0 && blocks_needed > 0 {
+                let last_ix = blocks_needed - 1;
+                let offset_in_last = (new_size % BLOCK_SIZE as u64) as usize;
+                if offset_in_last != 0 && file.direct[last_ix] != 0 {
+                    let lba = file.direct[last_ix];
+                    let initial = if let Some(pending) = txn.pending_block(lba) {
+                        *pending
+                    } else {
+                        let mut b = [0u8; BLOCK_SIZE];
+                        self.device.read(lba, &mut b)?;
+                        b
+                    };
+                    txn.add_or_merge_write(lba, initial, |block| {
+                        for byte in &mut block[offset_in_last..] {
+                            *byte = 0;
+                        }
+                    })?;
+                }
+            }
+            // Release direct slots past the new end (leaked in
+            // v1 — see module docs on the next-free-cursor
+            // allocator).
+            for i in blocks_needed..INODE_DIRECT_BLOCKS {
+                file.direct[i] = 0;
+            }
+        } else if new_size > file.size {
+            // Extending. Allocate new blocks; they come from
+            // the MockBlockDevice's sparse-read-returns-zeros
+            // path already zeroed, but we explicitly stage a
+            // zero write so the real block driver doesn't get
+            // surprised.
             let zero_block = [0u8; BLOCK_SIZE];
             for i in 0..blocks_needed {
                 if file.direct[i] == 0 {
@@ -489,11 +551,7 @@ impl OpfsFs {
                 }
             }
         }
-        // Shrink if new_size < old_size: release direct slots
-        // past new end (leaked in v1; see module docs).
-        for i in blocks_needed..INODE_DIRECT_BLOCKS {
-            file.direct[i] = 0;
-        }
+
         file.size = new_size;
         Ok(())
     }
