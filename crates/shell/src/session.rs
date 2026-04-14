@@ -257,6 +257,19 @@ impl<C: Connection> Session<C> {
         self.bound_by_interface.get(&interface).copied()
     }
 
+    /// Reverse lookup: given an object id, which bound
+    /// interface holds it (if any)? Used by the
+    /// display.error handler to drop stale bindings when
+    /// the server rejects a bind.
+    fn interface_for_id(&self, id: ObjectId) -> Option<Interface> {
+        for (iface, bound_id) in &self.bound_by_interface {
+            if *bound_id == id {
+                return Some(*iface);
+            }
+        }
+        None
+    }
+
     /// Read-only access to the known-globals table.
     pub fn known_globals(&self) -> &BTreeMap<u32, GlobalEntry> {
         &self.known_globals
@@ -416,6 +429,22 @@ impl<C: Connection> Session<C> {
             (Interface::Display, 1 /* error */) => {
                 let parsed = display_proto::DisplayError::decode(&event.payload)
                     .map_err(|e| SessionError::MalformedEvent(format!("{e:?}")))?;
+                // If the error's object_id matches an
+                // interface we thought we'd bound (because
+                // the auto-bind happens on registry.global
+                // BEFORE the server's reply), drop the
+                // stale binding. The known_globals entry
+                // is also marked unbound. This is how the
+                // shell observes a server-side cap-gate
+                // rejection.
+                if let Some(iface) = self.interface_for_id(parsed.object_id) {
+                    self.bound_by_interface.remove(&iface);
+                    for entry in self.known_globals.values_mut() {
+                        if entry.bound_id == Some(parsed.object_id) {
+                            entry.bound_id = None;
+                        }
+                    }
+                }
                 step.errors.push(ProtocolErrorNotice {
                     object_id: parsed.object_id,
                     code: parsed.code,

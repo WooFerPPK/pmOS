@@ -468,14 +468,31 @@ fn dispatch_registry_bind_shell_manager_without_cap_shell_is_permission_denied()
         ClientError::PermissionDenied {
             interface,
             required,
+            new_id,
         } => {
             assert_eq!(interface, Interface::ShellManager);
             assert_eq!(required, abi::cap::Cap::Shell);
+            assert_eq!(new_id, ObjectId::new(5));
         }
         other => panic!("expected PermissionDenied, got {other:?}"),
     }
     // Shell-manager is NOT installed at the requested id.
     assert_eq!(c.get(ObjectId::new(5)), None);
+    // The error event was enqueued for the client to
+    // observe — pmd_display.error against object 5.
+    assert_eq!(c.pending_events_len(), 1);
+    let event_bytes = c.drain_pending_events();
+    let header = display_proto::wire::MessageHeader::decode(&event_bytes).unwrap();
+    assert_eq!(header.object_id, ObjectId::DISPLAY);
+    assert_eq!(header.opcode, 1 /* error */);
+    let decoded = display_proto::DisplayError::decode(
+        &event_bytes[10..header.length as usize],
+    )
+    .unwrap();
+    assert_eq!(decoded.object_id, ObjectId::new(5));
+    assert_eq!(decoded.code, display_proto::error_code::PERMISSION_DENIED);
+    assert!(decoded.message.contains("pmd_shell_manager"));
+    assert!(decoded.message.contains("Shell"));
 }
 
 #[test]

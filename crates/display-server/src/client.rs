@@ -128,10 +128,14 @@ pub enum ClientError {
     /// requires a capability the connecting client doesn't
     /// hold. v1: `pmd_shell_manager` requires `Cap::Shell`.
     /// The bind is rejected and the new object is NOT
-    /// installed.
+    /// installed. `new_id` is the client-side id the
+    /// rejected bind would have allocated; the server
+    /// emits a `pmd_display.error` event on it so the
+    /// client can drop its local stale entry.
     PermissionDenied {
         interface: Interface,
         required: Cap,
+        new_id: ObjectId,
     },
     /// An emit-path wire-format failure — usually a payload
     /// whose length would overflow the 16-bit `length`
@@ -300,7 +304,33 @@ impl Client {
                 }
             })?;
 
-        self.auto_install(interface, header.opcode, payload)?;
+        if let Err(e) = self.auto_install(interface, header.opcode, payload) {
+            // Cap-rejected binds get surfaced to the client
+            // as a `pmd_display.error` event so the
+            // client can drop its local stale state. The
+            // emit can fail (e.g. payload-too-big), but
+            // the canonical signal is still the Err we
+            // bubble up to the caller — so we ignore the
+            // emit's Result.
+            if let ClientError::PermissionDenied {
+                interface: target,
+                required,
+                new_id,
+            } = &e
+            {
+                let msg = alloc::format!(
+                    "permission denied: {} requires Cap::{:?}",
+                    target.name(),
+                    required,
+                );
+                let _ = self.emit_error(
+                    *new_id,
+                    display_proto::events::error_code::PERMISSION_DENIED,
+                    &msg,
+                );
+            }
+            return Err(e);
+        }
 
         self.journal.push(HandledRequest {
             object_id: header.object_id,
@@ -359,6 +389,7 @@ impl Client {
                         return Err(ClientError::PermissionDenied {
                             interface: target,
                             required,
+                            new_id: req.new_id,
                         });
                     }
                 }

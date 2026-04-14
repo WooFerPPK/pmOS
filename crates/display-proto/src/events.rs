@@ -57,6 +57,20 @@ pub fn write_string(out: &mut Vec<u8>, s: &str) {
     }
 }
 
+/// Stable `pmd_display.error.code` values. Both sides of
+/// the protocol read these to interpret the numeric code
+/// on a `pmd_display.error` event without having to parse
+/// the human-readable `message` string.
+///
+/// v1 only defines one. New variants land here as the
+/// server learns to surface more errors.
+pub mod error_code {
+    /// The bind targeted an interface that requires a
+    /// capability the connecting client doesn't hold.
+    /// Spec §15: `pmd_shell_manager` requires `Cap::Shell`.
+    pub const PERMISSION_DENIED: u32 = 1;
+}
+
 /// `pmd_display.error(object_id, code, message)` — spec §3.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayError {

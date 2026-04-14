@@ -575,6 +575,12 @@ fn ordinary_client_without_cap_shell_cannot_bind_shell_manager() {
     let bind_bytes = session.drain_outbound();
     assert!(!bind_bytes.is_empty());
 
+    // The shell THINKS it bound shell_manager because
+    // the auto-bind fires on registry.global before the
+    // server replies. Snapshot the id now so we can
+    // assert the shell drops it after pumping the error.
+    let stale_sm_id = session.bound(Interface::ShellManager).unwrap();
+
     // The server rejects the bind with PermissionDenied.
     let mut remaining = bind_bytes;
     let (msg, rest) = split_first_message(&remaining).unwrap();
@@ -585,9 +591,11 @@ fn ordinary_client_without_cap_shell_cannot_bind_shell_manager() {
         ServerError::Client(ClientError::PermissionDenied {
             interface,
             required,
+            new_id,
         }) => {
             assert_eq!(interface, Interface::ShellManager);
             assert_eq!(required, Cap::Shell);
+            assert_eq!(new_id, stale_sm_id);
         }
         other => panic!("expected PermissionDenied, got {other:?}"),
     }
@@ -598,17 +606,30 @@ fn ordinary_client_without_cap_shell_cannot_bind_shell_manager() {
     // contain a shell_manager binding at the new_id the
     // session chose.
     let server_view = server.client(server_client_id).unwrap();
-    let sm_id = session.bound(Interface::ShellManager).unwrap();
-    assert_eq!(server_view.get(sm_id), None);
+    assert_eq!(server_view.get(stale_sm_id), None);
 
-    // The shell client SIDE thinks it bound shell_manager
-    // (since the auto-bind happens on receipt of the
-    // global, before the server's reply). A future slice
-    // could surface the rejection back to the shell via a
-    // pmd_display.error event so the shell can drop its
-    // local state. For now the asymmetry is documented
-    // here.
-    assert_eq!(session.bound(Interface::ShellManager), Some(sm_id));
+    // The server enqueued a pmd_display.error event for
+    // the failed bind. Drain it through the shell.
+    let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
+    // The shell observes the error.
+    assert_eq!(step.errors.len(), 1);
+    assert_eq!(step.errors[0].object_id, stale_sm_id);
+    assert_eq!(
+        step.errors[0].code,
+        display_proto::error_code::PERMISSION_DENIED
+    );
+    assert!(step.errors[0].message.contains("pmd_shell_manager"));
+
+    // AND the shell drops its local stale binding —
+    // the asymmetry from the previous slice is gone.
+    assert_eq!(session.bound(Interface::ShellManager), None);
+    // The known_globals entry's bound_id is also cleared.
+    let entry = session
+        .known_globals()
+        .values()
+        .find(|e| e.interface == Some(Interface::ShellManager))
+        .expect("shell_manager global was discovered");
+    assert_eq!(entry.bound_id, None);
 }
 
 #[test]

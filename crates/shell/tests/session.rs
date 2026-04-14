@@ -604,6 +604,54 @@ fn pump_window_title_changed_updates_the_title_field() {
 }
 
 #[test]
+fn pump_display_error_for_a_bound_object_drops_the_stale_binding() {
+    use display_proto::DisplayError;
+
+    // Walk the bind dance to install shell_manager.
+    let (mut s, sm_id) = shell_manager_bound();
+    assert_eq!(s.bound(Interface::ShellManager), Some(sm_id));
+
+    // Server emits pmd_display.error against the
+    // shell_manager id (this is what the cap-rejected
+    // bind path produces).
+    let err = DisplayError {
+        object_id: sm_id,
+        code: display_proto::error_code::PERMISSION_DENIED,
+        message: "permission denied: pmd_shell_manager requires Cap::Shell"
+            .to_string(),
+    };
+    let bytes = display_error_event(&err);
+    let (step, _) = s.pump(&bytes).unwrap();
+    assert_eq!(step.errors.len(), 1);
+    // The stale binding is gone.
+    assert_eq!(s.bound(Interface::ShellManager), None);
+    // The known_globals entry's bound_id is cleared.
+    let entry = s
+        .known_globals()
+        .values()
+        .find(|e| e.interface == Some(Interface::ShellManager))
+        .expect("shell_manager global was discovered earlier");
+    assert_eq!(entry.bound_id, None);
+}
+
+#[test]
+fn pump_display_error_for_an_unbound_object_just_records_the_notice() {
+    use display_proto::DisplayError;
+
+    let (mut s, _) = boot_started_session();
+    let err = DisplayError {
+        object_id: ObjectId::new(99),
+        code: display_proto::error_code::PERMISSION_DENIED,
+        message: "permission denied: something".to_string(),
+    };
+    let (step, _) = s.pump(&display_error_event(&err)).unwrap();
+    assert_eq!(step.errors.len(), 1);
+    assert_eq!(step.errors[0].object_id, ObjectId::new(99));
+    // No bindings to drop.
+    assert!(s.bound(Interface::ShellManager).is_none());
+}
+
+#[test]
 fn pump_window_title_changed_for_unknown_window_is_silent() {
     let (mut s, sm_id) = shell_manager_bound();
     let rename = ShellWindowTitleChanged {

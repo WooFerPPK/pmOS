@@ -29,9 +29,9 @@ pub mod wire;
 
 pub use decode::DecodeError;
 pub use events::{
-    BufferRelease, DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove,
-    ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused, ShellWindowTitleChanged,
-    ShmFormat,
+    error_code, BufferRelease, DisplayDeleteId, DisplayError, RegistryGlobal,
+    RegistryGlobalRemove, ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused,
+    ShellWindowTitleChanged, ShmFormat,
 };
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
