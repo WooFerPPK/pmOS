@@ -14,9 +14,11 @@ use abi::cap::CapSet;
 use abi::ext::Pid;
 
 pub mod sched;
+pub mod signal;
 pub mod table;
 
 pub use sched::Scheduler;
+pub use signal::{Signal, SignalInbox};
 pub use table::{PidAllocator, ProcessTable};
 
 /// Exit status returned by `proc_wait`.

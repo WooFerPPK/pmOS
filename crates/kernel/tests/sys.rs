@@ -824,6 +824,149 @@ fn proc_kill_without_parent_or_cap_is_not_capable() {
 }
 
 #[test]
+fn proc_kill_sigterm_queues_on_targets_signal_inbox() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "child");
+
+    // Child has an empty inbox at spawn.
+    assert_eq!(k.pending_signals(child).unwrap(), 0);
+    // Parent delivers SIGTERM.
+    k.proc_kill(init, child, Signal::Term).unwrap();
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+    // Child is NOT zombified — Term is catchable.
+    assert_eq!(
+        k.procs.get(child).unwrap().state,
+        kernel::proc::ProcState::Ready
+    );
+    // Drain returns the signal.
+    let drained = k.drain_signals(child).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::Term]);
+    assert_eq!(k.pending_signals(child).unwrap(), 0);
+}
+
+#[test]
+fn proc_kill_sigint_also_queues_and_drains() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "child");
+
+    k.proc_kill(init, child, Signal::Interrupt).unwrap();
+    let drained = k.drain_signals(child).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::Interrupt]);
+}
+
+#[test]
+fn proc_kill_coalesces_repeated_sigterm_deliveries() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "child");
+
+    // Deliver SIGTERM five times — POSIX-style coalescing
+    // collapses these into one pending slot.
+    for _ in 0..5 {
+        k.proc_kill(init, child, Signal::Term).unwrap();
+    }
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+
+    // Deliver a different catchable signal — a new slot.
+    k.proc_kill(init, child, Signal::Interrupt).unwrap();
+    assert_eq!(k.pending_signals(child).unwrap(), 2);
+
+    let drained = k.drain_signals(child).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::Term, Signal::Interrupt]);
+}
+
+#[test]
+fn proc_kill_sigkill_does_not_queue_in_inbox() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "child");
+
+    // SIGKILL zombifies — inbox never sees it, because catching
+    // it wouldn't make sense.
+    k.proc_kill(init, child, Signal::Kill).unwrap();
+    assert_eq!(k.pending_signals(child).unwrap(), 0);
+    assert_eq!(
+        k.procs.get(child).unwrap().exit_status.unwrap(),
+        ExitStatus::Signaled(9)
+    );
+}
+
+#[test]
+fn drain_signals_on_unknown_pid_is_no_such_pid() {
+    let mut k = make_kernel();
+    assert_eq!(
+        k.drain_signals(999).unwrap_err(),
+        KernelError::NoSuchPid
+    );
+    assert_eq!(
+        k.pending_signals(999).unwrap_err(),
+        KernelError::NoSuchPid
+    );
+}
+
+#[test]
+fn reap_releases_the_signal_inbox() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "child");
+    k.proc_kill(init, child, Signal::Term).unwrap();
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+
+    // Kill + reap.
+    k.proc_kill(init, child, Signal::Kill).unwrap();
+    let outcome = k.proc_wait(init, WaitTarget::Specific(child)).unwrap();
+    assert!(matches!(outcome, WaitOutcome::Reaped(_, _)));
+    // After reap the inbox is gone, mirroring the fd-table
+    // cleanup.
+    assert_eq!(
+        k.pending_signals(child).unwrap_err(),
+        KernelError::NoSuchPid
+    );
+}
+
+#[test]
 fn proc_kill_with_proc_kill_any_cap_succeeds_across_families() {
     let mut k = make_kernel();
     let init = k

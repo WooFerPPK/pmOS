@@ -37,8 +37,9 @@ use crate::fd::{FdEntry, FdError, FdFlags, FdObject, FdTable};
 use crate::ipc::{IpcTable, PipeId};
 use crate::proc::{
     table::{InsertError, ZombieTarget},
-    ExitStatus, ProcState, Process, ProcessTable, Scheduler,
+    ExitStatus, ProcState, Process, ProcessTable, Scheduler, SignalInbox,
 };
+pub use crate::proc::Signal;
 use crate::vfs::{FsError, NodeType, Vfs};
 
 /// Error returned by the high-level kernel API.
@@ -152,20 +153,9 @@ pub enum WaitOutcome {
     NoChildren,
 }
 
-/// Signals the v1 kernel understands. Only `SIGKILL` actually
-/// terminates in this slice; the others are accepted-but-queued
-/// placeholders that later slices will deliver through the
-/// per-process signal inbox.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(u16)]
-pub enum Signal {
-    /// Terminate the target immediately, no cleanup grace.
-    Kill = 9,
-    /// Request a cooperative shutdown.
-    Term = 15,
-    /// Interrupt (ctrl-c).
-    Interrupt = 2,
-}
+// `Signal` is re-exported from `crate::proc::signal` above.
+// Its per-process delivery inbox lives in the Kernel struct
+// (see `signal_inboxes` field below).
 
 /// Kernel glue layer: the composition root of the kernel crate.
 ///
@@ -185,6 +175,10 @@ pub struct Kernel {
     /// too so the drop-order of object-side resources is
     /// deterministic.
     fds: BTreeMap<Pid, FdTable>,
+    /// Per-process signal inboxes. Only holds catchable
+    /// signals (Term / Interrupt); SIGKILL is delivered
+    /// synchronously without being queued.
+    signal_inboxes: BTreeMap<Pid, SignalInbox>,
 }
 
 impl Kernel {
@@ -197,6 +191,7 @@ impl Kernel {
             ipc: IpcTable::new(),
             devs: DeviceDispatcher::new(),
             fds: BTreeMap::new(),
+            signal_inboxes: BTreeMap::new(),
         }
     }
 
@@ -228,6 +223,7 @@ impl Kernel {
         self.procs.insert(proc)?;
         self.caps.install(pid, args.caps);
         self.fds.insert(pid, FdTable::new());
+        self.signal_inboxes.insert(pid, SignalInbox::new());
         Ok(pid)
     }
 
@@ -258,6 +254,7 @@ impl Kernel {
             self.release_object(entry.object);
         }
         self.caps.remove(pid);
+        self.signal_inboxes.remove(&pid);
         self.procs.reap(pid).ok_or(KernelError::NoSuchPid)
     }
 
@@ -487,6 +484,7 @@ impl Kernel {
         self.procs.insert(proc)?;
         self.caps.install(child_pid, args.caps);
         self.fds.insert(child_pid, FdTable::new());
+        self.signal_inboxes.insert(child_pid, SignalInbox::new());
 
         // Wire stdin/stdout/stderr. Each install bumps pipe
         // refcounts when the object is a pipe end so the child
@@ -591,9 +589,12 @@ impl Kernel {
             return Err(KernelError::NotCapable);
         }
 
-        // Deliver. In v1 only SIGKILL produces a state change;
-        // the rest succeed and do nothing observable. The
-        // signal-inbox wiring lands in the follow-up slice.
+        // Deliver. SIGKILL terminates synchronously; catchable
+        // signals (Term, Interrupt) are queued on the target's
+        // per-process SignalInbox for `drain_signals` to pick
+        // up. Coalescing is handled by `SignalInbox::post`:
+        // repeated Terms against a target that already has Term
+        // pending do not grow the queue.
         match signal {
             Signal::Kill => {
                 // Remove from the scheduler immediately so no
@@ -601,14 +602,37 @@ impl Kernel {
                 // been marked zombie.
                 self.sched.remove(target_pid);
                 self.procs
-                    .exit(target_pid, ExitStatus::Signaled(signal as u16))
+                    .exit(target_pid, ExitStatus::Signaled(signal.number()))
                     .map_err(|_| KernelError::NoSuchPid)?;
             }
             Signal::Term | Signal::Interrupt => {
-                // Accept; delivery wiring is a follow-up slice.
+                if let Some(inbox) = self.signal_inboxes.get_mut(&target_pid) {
+                    inbox.post(signal);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Drain the pending signals queued on `pid`'s inbox.
+    /// Returns them in delivery order; the inbox is empty after
+    /// this call. Used by tests and (once T071/T072 land) by
+    /// the WASI `signal_wait`-equivalent extension syscall.
+    pub fn drain_signals(&mut self, pid: Pid) -> Result<Vec<Signal>, KernelError> {
+        let inbox = self
+            .signal_inboxes
+            .get_mut(&pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        Ok(inbox.drain())
+    }
+
+    /// Peek at the inbox without draining. Diagnostic only.
+    pub fn pending_signals(&self, pid: Pid) -> Result<usize, KernelError> {
+        let inbox = self
+            .signal_inboxes
+            .get(&pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        Ok(inbox.len())
     }
 
     /// Bump the kernel-side refcount on a pipe-ended fd object.
