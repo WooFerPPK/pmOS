@@ -4,14 +4,22 @@
 // directly onto the top-level canvas, runs every environment
 // check the real kernel will need (cross-origin isolation,
 // SharedArrayBuffer, Atomics.waitAsync, OPFS, service workers),
-// and reports status. Intentionally stalls at "kernel loading…"
-// with a clear explanation that the kernel WASM is the next
-// build step — this demo exists so the static deployment is
-// visible on a real server before the Rust build is wired up.
+// and reports status.
 //
-// Once the real kernel WASM is produced by `just build`, the
-// `kernelReady` branch below takes over and this boot screen
-// is replaced by the actual kernel boot sequence (T085+).
+// After the environment checks, the bootstrap spawns a kernel
+// Worker loaded from `/assets/kernel-worker.js` and runs a
+// short echo round-trip through the TypeScript scaffold's
+// console driver to prove the Worker channel is wired
+// correctly. Until the Rust WASM kernel lands (T085+), the
+// Worker hosts a `MockKernel` with a faux-shell policy, so
+// the round-trip is `echo hello\n → hello\n`. When the WASM
+// kernel arrives, the Worker's entry point swaps the mock
+// for a WasmKernelBridge and the rest of this file changes
+// only if the UI wants to surface more status.
+
+import { ConsoleHost } from "./console-host";
+import { runEchoCheck } from "./console-check";
+import type { EchoCheckResult } from "./console-check";
 
 const BOOT_VERSION = "0.1.0-demo";
 
@@ -235,6 +243,7 @@ function main(): void {
     { label: "Service worker", status: "pending", detail: "" },
     { label: "OffscreenCanvas", status: "pending", detail: "" },
     { label: "Kernel WASM load (/assets/kernel.wasm)", status: "pending", detail: "" },
+    { label: "Kernel worker + console echo", status: "pending", detail: "" },
     { label: "Display server", status: "pending", detail: "" },
     { label: "Desktop shell", status: "pending", detail: "" },
   ];
@@ -326,27 +335,59 @@ function main(): void {
     }
   });
 
-  // Kernel load attempt — deliberately stalls. We try to fetch
-  // /assets/kernel.wasm to demonstrate the real path that T085
-  // will use; in the demo build it will 404 and we report that
-  // cleanly.
+  // Kernel WASM load attempt — deliberately stalled in the
+  // demo because the kernel WASM is not built yet. We HEAD
+  // /assets/kernel.wasm to report the real path T085 will
+  // use; in the demo build it 404s and we report that
+  // cleanly. The kernel-worker round-trip below proceeds
+  // regardless, because the Worker's entry point is able to
+  // run against a MockKernel.
   step(6, 2200, () => {
     void attemptKernelFetch().then((result) => {
       if (result.ok) {
         rows[6].status = "ok";
         rows[6].detail = `${result.size} bytes`;
-        // Real kernel would take over here (T085+). For the demo
-        // we stop at "kernel loaded" and stall the next rows.
-        rows[7].status = "stalled";
-        rows[7].detail = "not wired in the demo";
-        rows[8].status = "stalled";
-        rows[8].detail = "not wired in the demo";
       } else {
         rows[6].status = "stalled";
         rows[6].detail = result.reason;
-        rows[7].status = "pending";
-        rows[8].status = "pending";
       }
+      repaint();
+    });
+  });
+
+  // Kernel worker + console round-trip. Spawns
+  // /assets/kernel-worker.js (built from
+  // `src/kernel-worker-entry.ts`), which boots a MockKernel
+  // with a faux-shell policy, and drives `echo hello\n`
+  // through the console driver. If /assets/kernel-worker.js
+  // is not built yet — e.g. the static site was served
+  // without running `npm run build:kernel-worker` first —
+  // the row stalls cleanly with the Worker load error.
+  step(7, 2600, () => {
+    // step() has already flipped rows[7] to "running" and
+    // repainted by the time this callback runs. Kick off the
+    // echo check and patch the row on resolution.
+    void runKernelWorkerCheck().then((result) => {
+      if (result.ok) {
+        rows[7].status = "ok";
+        rows[7].detail = `echo round-trip ${result.roundtripMs} ms`;
+      } else if (result.reason === "timeout") {
+        rows[7].status = "fail";
+        rows[7].detail = "no response within timeout";
+      } else if (result.reason === "mismatch") {
+        rows[7].status = "fail";
+        rows[7].detail = `unexpected output: ${result.got.slice(0, 32)}`;
+      } else {
+        rows[7].status = "stalled";
+        rows[7].detail = result.message.slice(0, 48);
+      }
+      // Display server + desktop shell follow once the real
+      // kernel is wired (T085+). In the demo they remain
+      // stalled even on a successful echo.
+      rows[8].status = "stalled";
+      rows[8].detail = "awaits T085+ wasm kernel";
+      rows[9].status = "stalled";
+      rows[9].detail = "awaits T085+ wasm kernel";
       repaint();
     });
   });
@@ -374,6 +415,64 @@ async function attemptKernelFetch(): Promise<{ ok: true; size: number } | { ok: 
   } catch (e) {
     return { ok: false, reason: `fetch failed: ${String(e)}` };
   }
+}
+
+/**
+ * Spawn the kernel Worker, wrap it in a ConsoleHost, and run
+ * a single echo round-trip. Resolves with the same
+ * `EchoCheckResult` shape as the test harness so the row
+ * update path can treat both success and every failure
+ * variant uniformly.
+ *
+ * Construction errors (`new Worker` throwing on a bad URL,
+ * bundle 404, syntax error in the worker, etc.) are routed
+ * through `EchoCheckResult` as a `"panic"` result so the
+ * caller doesn't have to distinguish "worker failed" from
+ * "worker ran but panicked".
+ */
+async function runKernelWorkerCheck(): Promise<EchoCheckResult> {
+  let worker: Worker;
+  try {
+    worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  } catch (e) {
+    return { ok: false, reason: "panic", message: `new Worker: ${String(e)}` };
+  }
+
+  // A Worker that fails to load its bundle (404, type error,
+  // syntax error in the bundle, etc.) fires an `error` event
+  // asynchronously. Race the echo check against that error.
+  const loadError = new Promise<EchoCheckResult>((resolve) => {
+    const onError = (event: ErrorEvent): void => {
+      const message =
+        event.message || event.error?.toString?.() || "worker load error";
+      resolve({ ok: false, reason: "panic", message });
+    };
+    worker.addEventListener("error", onError, { once: true });
+  });
+
+  const host = new ConsoleHost({
+    worker,
+    bootConfig: { enableConsole: true, enableInput: false },
+  });
+
+  const checkPromise = runEchoCheck(host, {
+    input: "echo hello\n",
+    expect: "hello\n",
+    timeoutMs: 2000,
+    now: () => Date.now(),
+    setTimer: (h, ms) => globalThis.setTimeout(h, ms),
+    cancelTimer: (h) => globalThis.clearTimeout(h as number),
+  });
+
+  const result = await Promise.race([checkPromise, loadError]);
+  // Tidy up the worker regardless of outcome — we only
+  // wanted one round-trip out of it.
+  try {
+    host.shutdown();
+  } catch {
+    /* terminate is best-effort */
+  }
+  return result;
 }
 
 function showFallbackMessage(error: string): void {

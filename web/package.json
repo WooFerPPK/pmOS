@@ -6,8 +6,9 @@
   "description": "PMos browser-side bootstrap + drivers + service worker",
   "scripts": {
     "build:bootstrap": "esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm",
+    "build:kernel-worker": "esbuild src/kernel-worker-entry.ts --bundle --outfile=../build/assets/kernel-worker.js --format=esm",
     "build:sw": "esbuild src/sw.ts --bundle --outfile=../build/sw.js --format=esm",
-    "build": "npm run build:bootstrap && npm run build:sw",
+    "build": "npm run build:bootstrap && npm run build:kernel-worker && npm run build:sw",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:integration": "playwright test tests/integration"
