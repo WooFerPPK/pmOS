@@ -4,10 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "term"
+path = "src/lib.rs"
+
 [[bin]]
 name = "term"
 path = "src/main.rs"
 
 [dependencies]
 abi = { path = "../abi" }
+sh = { path = "../sh" }
 toolkit = { path = "../toolkit" }
