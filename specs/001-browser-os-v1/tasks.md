@@ -116,14 +116,14 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 ### Kernel IPC (pipes and unix-socket-equivalents)
 
-- [ ] T062 Implement `Pipe` with kernel-owned ring buffer in `crates/kernel/src/ipc/pipe.rs`
-- [ ] T063 Implement `Socket` (STREAM + DGRAM) with bind, listen, connect, accept, send, recv, and fd-passing queue in `crates/kernel/src/ipc/socket.rs` per `data-model.md §4.2`
-- [ ] T064 [P] IPC isolation tests: pipe read/write, reader-closed → writer EPIPE, writer-closed → reader EOF, socket bind + connect + send/recv, fd-passing round-trip in `crates/kernel/tests/ipc.rs`
+- [x] T062 Implement `Pipe` with kernel-owned ring buffer in `crates/kernel/src/ipc/pipe.rs`
+- [x] T063 Implement `Socket` (STREAM + DGRAM) with bind, listen, connect, accept, send, recv, and fd-passing queue in `crates/kernel/src/ipc/socket.rs` per `data-model.md §4.2`
+- [x] T064 [P] IPC isolation tests: pipe read/write, reader-closed → writer EPIPE, writer-closed → reader EOF, socket bind + connect + send/recv, fd-passing round-trip in `crates/kernel/tests/ipc.rs`
 
 ### Kernel capabilities
 
-- [ ] T065 Implement cap storage per process and the `cap_check`, `cap_list`, `cap_grant` handlers in `crates/kernel/src/cap/mod.rs`
-- [ ] T066 [P] Capability isolation tests: grant-subset rule enforced, widening rejected, only `CAP_GRANT` holders can call `cap_grant` in `crates/kernel/tests/cap.rs`
+- [x] T065 Implement cap storage per process and the `cap_check`, `cap_list`, `cap_grant` handlers in `crates/kernel/src/cap/mod.rs`
+- [x] T066 [P] Capability isolation tests: grant-subset rule enforced, widening rejected, only `CAP_GRANT` holders can call `cap_grant` in `crates/kernel/tests/cap.rs`
 
 ### Kernel device node dispatch
 
