@@ -67,7 +67,6 @@ export interface WorkerEntry {
  */
 export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
   let scaffold: KernelWorker | undefined;
-  let mock: MockKernel | undefined;
 
   messaging.onmessage = (ev: { data: MainToKernel }): void => {
     const msg = ev.data;
@@ -80,7 +79,14 @@ export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
         });
         return;
       }
-      mock = new MockKernel({ policy: { kind: "faux-shell" } });
+      const mock = new MockKernel({
+        policy: { kind: "faux-shell" },
+        // When the main thread asked for a framebuffer, have
+        // the mock emit a splash the first time it sees any
+        // console input. The scaffold's fb driver routes it
+        // to the main-thread FbHost.
+        emitSplashOnFirstInput: msg.config.enableFramebuffer,
+      });
       scaffold = bootKernelWorker({
         kernel: mock,
         config: msg.config,

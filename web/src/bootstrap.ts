@@ -19,7 +19,8 @@
 
 import { ConsoleHost } from "./console-host";
 import { runEchoCheck } from "./console-check";
-import type { EchoCheckResult } from "./console-check";
+import { FbHost } from "./fb-host";
+import type { FbFrame } from "./fb-host";
 
 const BOOT_VERSION = "0.1.0-demo";
 
@@ -258,7 +259,14 @@ function main(): void {
   }
 
   let frame = 0;
+  // Flipped true once the first framebuffer blit lands.
+  // After that, the boot-screen repaint is a no-op so the
+  // splash surface owns the canvas.
+  let splashPainted = false;
   const repaint = () => {
+    if (splashPainted) {
+      return;
+    }
     paintBoot(canvas, rows, frame++);
   };
   repaint();
@@ -365,9 +373,42 @@ function main(): void {
   // the row stalls cleanly with the Worker load error.
   step(7, 2600, () => {
     // step() has already flipped rows[7] to "running" and
-    // repainted by the time this callback runs. Kick off the
-    // echo check and patch the row on resolution.
-    void runKernelWorkerCheck().then((result) => {
+    // repainted by the time this callback runs. Spawn the
+    // kernel session (Worker + ConsoleHost + FbHost), wire
+    // the fb host to paint the splash onto the canvas, and
+    // drive a single echo round-trip against the console.
+    let session: KernelSession;
+    try {
+      session = createKernelSession();
+    } catch (e) {
+      rows[7].status = "fail";
+      rows[7].detail = `Worker spawn: ${String(e).slice(0, 48)}`;
+      markShellRowsStalled();
+      repaint();
+      return;
+    }
+    // First blit hands the canvas over to the fb host. We
+    // clear the animation interval so the boot-screen paint
+    // loop stops competing for the canvas.
+    session.fb.onFrame((frame_: FbFrame) => {
+      if (!splashPainted) {
+        splashPainted = true;
+        if (repaintInterval !== null) {
+          clearInterval(repaintInterval);
+          repaintInterval = null;
+        }
+      }
+      paintBlitToCanvas(canvas, frame_);
+    });
+
+    void runEchoCheck(session.console, {
+      input: "echo hello\n",
+      expect: "hello\n",
+      timeoutMs: 2000,
+      now: () => Date.now(),
+      setTimer: (h, ms) => globalThis.setTimeout(h, ms),
+      cancelTimer: (h) => globalThis.clearTimeout(h as number),
+    }).then((result) => {
       if (result.ok) {
         rows[7].status = "ok";
         rows[7].detail = `echo round-trip ${result.roundtripMs} ms`;
@@ -381,19 +422,27 @@ function main(): void {
         rows[7].status = "stalled";
         rows[7].detail = result.message.slice(0, 48);
       }
-      // Display server + desktop shell follow once the real
-      // kernel is wired (T085+). In the demo they remain
-      // stalled even on a successful echo.
-      rows[8].status = "stalled";
-      rows[8].detail = "awaits T085+ wasm kernel";
-      rows[9].status = "stalled";
-      rows[9].detail = "awaits T085+ wasm kernel";
+      markShellRowsStalled();
       repaint();
     });
   });
 
-  // Animation loop — keeps the "running…" tags moving.
-  setInterval(repaint, 300);
+  const markShellRowsStalled = (): void => {
+    // Display server + desktop shell follow once the real
+    // kernel is wired (T085+). In the demo they remain
+    // stalled even on a successful echo.
+    rows[8].status = "stalled";
+    rows[8].detail = "awaits T085+ wasm kernel";
+    rows[9].status = "stalled";
+    rows[9].detail = "awaits T085+ wasm kernel";
+  };
+
+  // Animation loop — keeps the "running…" tags moving. The
+  // first fb blit cancels this so the splash takes over.
+  let repaintInterval: ReturnType<typeof setInterval> | null = setInterval(
+    repaint,
+    300,
+  );
 
   // Panic overlay wiring: if any unhandled error reaches
   // window.onerror or window.onunhandledrejection, show the
@@ -418,62 +467,111 @@ async function attemptKernelFetch(): Promise<{ ok: true; size: number } | { ok: 
 }
 
 /**
- * Spawn the kernel Worker, wrap it in a ConsoleHost, and run
- * a single echo round-trip. Resolves with the same
- * `EchoCheckResult` shape as the test harness so the row
- * update path can treat both success and every failure
- * variant uniformly.
- *
- * Construction errors (`new Worker` throwing on a bad URL,
- * bundle 404, syntax error in the worker, etc.) are routed
- * through `EchoCheckResult` as a `"panic"` result so the
- * caller doesn't have to distinguish "worker failed" from
- * "worker ran but panicked".
+ * A persistent kernel session: one Worker plus the two
+ * main-thread wrappers that consume its messages. The
+ * session outlives the echo check so the FbHost can keep
+ * receiving frames (the MockKernel's splash blit) after the
+ * check completes. `new Worker(...)` is synchronous and may
+ * throw on URL errors; bundle-load failures surface later as
+ * an `error` event on the worker — callers that care about
+ * that failure mode should listen via `session.worker`.
  */
-async function runKernelWorkerCheck(): Promise<EchoCheckResult> {
-  let worker: Worker;
-  try {
-    worker = new Worker("/assets/kernel-worker.js", { type: "module" });
-  } catch (e) {
-    return { ok: false, reason: "panic", message: `new Worker: ${String(e)}` };
-  }
+interface KernelSession {
+  readonly worker: Worker;
+  readonly console: ConsoleHost;
+  readonly fb: FbHost;
+}
 
-  // A Worker that fails to load its bundle (404, type error,
-  // syntax error in the bundle, etc.) fires an `error` event
-  // asynchronously. Race the echo check against that error.
-  const loadError = new Promise<EchoCheckResult>((resolve) => {
-    const onError = (event: ErrorEvent): void => {
+function createKernelSession(): KernelSession {
+  const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  const consoleHost = new ConsoleHost({
+    worker,
+    bootConfig: {
+      enableConsole: true,
+      enableInput: false,
+      enableFramebuffer: true,
+    },
+  });
+  const fbHost = new FbHost({ worker });
+  // If the worker bundle fails to load (404, syntax error,
+  // etc.), funnel the error into the ConsoleHost lifecycle
+  // path so the echo check's panic branch handles it.
+  worker.addEventListener(
+    "error",
+    (event: ErrorEvent) => {
       const message =
         event.message || event.error?.toString?.() || "worker load error";
-      resolve({ ok: false, reason: "panic", message });
-    };
-    worker.addEventListener("error", onError, { once: true });
-  });
-
-  const host = new ConsoleHost({
-    worker,
-    bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
-  });
-
-  const checkPromise = runEchoCheck(host, {
-    input: "echo hello\n",
-    expect: "hello\n",
-    timeoutMs: 2000,
-    now: () => Date.now(),
-    setTimer: (h, ms) => globalThis.setTimeout(h, ms),
-    cancelTimer: (h) => globalThis.clearTimeout(h as number),
-  });
-
-  const result = await Promise.race([checkPromise, loadError]);
-  // Tidy up the worker regardless of outcome — we only
-  // wanted one round-trip out of it.
-  try {
-    host.shutdown();
-  } catch {
-    /* terminate is best-effort */
-  }
-  return result;
+      void message; // observed by the echo check via panic lifecycle
+    },
+    { once: true },
+  );
+  return { worker, console: consoleHost, fb: fbHost };
 }
+
+/**
+ * Paint a single fb blit onto the boot-screen canvas. The
+ * source pixels are stretched to fit the canvas while
+ * preserving aspect ratio; the unfilled margin is wiped to
+ * the boot-screen background colour. A small caption
+ * underneath identifies the frame as coming from the mock
+ * kernel.
+ */
+function paintBlitToCanvas(c: Canvas2D, frame_: FbFrame): void {
+  const { ctx, canvas, dpr } = c;
+  const W = canvas.width;
+  const H = canvas.height;
+  if (frame_.width === 0 || frame_.height === 0) {
+    return;
+  }
+
+  // Render the source pixels into a temporary canvas first,
+  // then drawImage-scale into the target.
+  const tmp = document.createElement("canvas");
+  tmp.width = frame_.width;
+  tmp.height = frame_.height;
+  const tctx = tmp.getContext("2d");
+  if (!tctx) {
+    return;
+  }
+  const imageData = new ImageData(
+    new Uint8ClampedArray(frame_.rgba),
+    frame_.width,
+    frame_.height,
+  );
+  tctx.putImageData(imageData, 0, 0);
+
+  // Scale to fit, letterboxed. 80% of the smaller canvas
+  // dimension leaves room for a caption.
+  const scale = Math.min(W / frame_.width, H / frame_.height) * 0.8;
+  const dw = Math.floor(frame_.width * scale);
+  const dh = Math.floor(frame_.height * scale);
+  const dx = Math.floor((W - dw) / 2);
+  const dy = Math.floor((H - dh) / 2) - Math.floor(20 * dpr);
+
+  ctx.fillStyle = PALETTE.bg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tmp, dx, dy, dw, dh);
+
+  // Caption. Centered under the blit.
+  ctx.font = `${14 * dpr}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
+  ctx.fillStyle = PALETTE.accent;
+  ctx.textAlign = "center";
+  ctx.fillText(
+    "PMos kernel worker — framebuffer blit from MockKernel",
+    W / 2,
+    dy + dh + Math.floor(36 * dpr),
+  );
+  ctx.fillStyle = PALETTE.muted;
+  ctx.font = `${12 * dpr}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
+  ctx.fillText(
+    `${frame_.width}×${frame_.height} RGBA8 • via /dev/fb0 driver`,
+    W / 2,
+    dy + dh + Math.floor(56 * dpr),
+  );
+  ctx.textAlign = "start";
+}
+
 
 function showFallbackMessage(error: string): void {
   document.body.innerHTML = `

@@ -9,14 +9,26 @@
 // `kernel-worker.test.ts`.
 
 import { describe, expect, it } from "vitest";
-import { MockKernel, fauxShellTransform } from "../../src/mock-kernel";
+import {
+  MockKernel,
+  SPLASH_HEIGHT,
+  SPLASH_WIDTH,
+  fauxShellTransform,
+  generateSplashPixels,
+} from "../../src/mock-kernel";
 import type { KernelWorker } from "../../src/kernel-worker";
+import { DriverErrorCode } from "../../src/drivers/types";
 import type { DriverResult } from "../../src/drivers/types";
 import {
   CONSOLE_DRIVER_ID,
   DEV_CONSOLE_NODE,
   OP_WRITE_LINE,
 } from "../../src/drivers/console";
+import {
+  FB_DRIVER_ID,
+  OP_BLIT as FB_OP_BLIT,
+  OP_SET_MODE as FB_OP_SET_MODE,
+} from "../../src/drivers/fb";
 import { Devnum } from "../../src/shared/platform-constants";
 
 interface CapturingScaffold extends KernelWorker {
@@ -120,6 +132,162 @@ describe("MockKernel faux-shell policy", () => {
 
     mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("\n"));
     expect(scaffold.calls).toHaveLength(0);
+  });
+});
+
+// ---- splash emission -----------------------------------------------
+
+/**
+ * Build a scaffold whose `callDriver` always succeeds EXCEPT
+ * the framebuffer path, which returns a caller-specified
+ * value. Used by the splash tests that want to simulate
+ * "fb driver missing".
+ */
+function makeScaffoldWithFbResult(fbResult: DriverResult): CapturingScaffold {
+  const calls: Array<{ driverId: number; op: number; payload: Uint8Array }> = [];
+  return {
+    calls,
+    handleMainMessage(): void {
+      /* unused */
+    },
+    callDriver(driverId: number, op: number, payload: Uint8Array): DriverResult {
+      const copy = new Uint8Array(payload.byteLength);
+      copy.set(payload);
+      calls.push({ driverId, op, payload: copy });
+      if (driverId === FB_DRIVER_ID) {
+        return fbResult;
+      }
+      return { ok: true, value: payload.byteLength };
+    },
+    get driverCount(): number {
+      return 2;
+    },
+  };
+}
+
+describe("MockKernel splash emission", () => {
+  it("is opt-in: default constructor does not emit on input", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("hi\n"));
+    const fbCalls = scaffold.calls.filter((c) => c.driverId === FB_DRIVER_ID);
+    expect(fbCalls).toHaveLength(0);
+  });
+
+  it("emitSplashOnFirstInput=true emits SET_MODE + BLIT on the first injected input", () => {
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      emitSplashOnFirstInput: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+
+    // Before input: no scaffold calls.
+    expect(scaffold.calls).toHaveLength(0);
+
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("hi\n"));
+
+    const fbCalls = scaffold.calls.filter((c) => c.driverId === FB_DRIVER_ID);
+    expect(fbCalls).toHaveLength(2);
+    expect(fbCalls[0]?.op).toBe(FB_OP_SET_MODE);
+    expect(fbCalls[1]?.op).toBe(FB_OP_BLIT);
+
+    // The SET_MODE payload is a 2x u32 LE geometry blob.
+    const setModePayload = fbCalls[0]?.payload;
+    if (setModePayload) {
+      const view = new DataView(
+        setModePayload.buffer,
+        setModePayload.byteOffset,
+        setModePayload.byteLength,
+      );
+      expect(view.getUint32(0, true)).toBe(SPLASH_WIDTH);
+      expect(view.getUint32(4, true)).toBe(SPLASH_HEIGHT);
+    }
+
+    // The BLIT payload is header + width*height*4 pixel bytes.
+    const blitPayload = fbCalls[1]?.payload;
+    if (blitPayload) {
+      expect(blitPayload.byteLength).toBe(8 + SPLASH_WIDTH * SPLASH_HEIGHT * 4);
+    }
+  });
+
+  it("emits the splash only once even across many inputs", () => {
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      emitSplashOnFirstInput: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(
+      DEV_CONSOLE_NODE,
+      new TextEncoder().encode("one\ntwo\nthree\nfour\n"),
+    );
+    const fbCalls = scaffold.calls.filter((c) => c.driverId === FB_DRIVER_ID);
+    expect(fbCalls).toHaveLength(2);
+  });
+
+  it("skips the splash when the scaffold reports NotReady for the fb driver", () => {
+    const scaffold = makeScaffoldWithFbResult({
+      ok: false,
+      error: DriverErrorCode.NotReady,
+    });
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      emitSplashOnFirstInput: true,
+    });
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("go\n"));
+
+    const fbCalls = scaffold.calls.filter((c) => c.driverId === FB_DRIVER_ID);
+    // SET_MODE was ATTEMPTED (one call recorded on the fake
+    // scaffold), then the mock bailed out and never posted BLIT.
+    expect(fbCalls).toHaveLength(1);
+    expect(fbCalls[0]?.op).toBe(FB_OP_SET_MODE);
+  });
+
+  it("still delivers the echo response after emitting the splash", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      emitSplashOnFirstInput: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(
+      DEV_CONSOLE_NODE,
+      new TextEncoder().encode("echo hello\n"),
+    );
+    const consoleCalls = scaffold.calls.filter(
+      (c) => c.driverId === CONSOLE_DRIVER_ID,
+    );
+    expect(consoleCalls).toHaveLength(1);
+    expect(consoleCalls[0]?.op).toBe(OP_WRITE_LINE);
+    expect(new TextDecoder().decode(consoleCalls[0]?.payload)).toBe("hello\n");
+  });
+
+  it("skips the splash when no scaffold is bound", () => {
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      emitSplashOnFirstInput: true,
+    });
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("stray\n"));
+    // No scaffold => nothing to verify, but the mock must
+    // not throw.
+  });
+
+  it("generateSplashPixels produces width*height*4 bytes", () => {
+    const rgba = generateSplashPixels(8, 4);
+    expect(rgba.byteLength).toBe(8 * 4 * 4);
+    // The top-left pixel should differ from the center pixel
+    // (center is brighter under the radial gradient).
+    const cornerG = rgba[1] ?? 0;
+    const centerIdx = (2 * 8 + 4) * 4;
+    const centerG = rgba[centerIdx + 1] ?? 0;
+    expect(centerG).toBeGreaterThan(cornerG);
+    // Every alpha byte is 255.
+    for (let i = 3; i < rgba.byteLength; i += 4) {
+      expect(rgba[i]).toBe(255);
+    }
   });
 });
 

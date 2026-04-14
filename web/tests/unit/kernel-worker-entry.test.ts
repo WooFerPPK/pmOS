@@ -138,4 +138,56 @@ describe("installWorkerEntry", () => {
       expect(new TextDecoder().decode(w.bytes)).toBe("?\n");
     }
   });
+
+  it("boot with enableFramebuffer=true emits an fb:set-mode + fb:blit splash on first input", () => {
+    const msg = makeMessaging();
+    installWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: true },
+    });
+    // Before the first input the splash has not been emitted.
+    expect(msg.posted.some((m) => m.kind === "fb:set-mode")).toBe(false);
+    expect(msg.posted.some((m) => m.kind === "fb:blit")).toBe(false);
+
+    msg.send({
+      kind: "console:input",
+      bytes: new TextEncoder().encode("echo hello\n"),
+    });
+
+    // Splash arrived on the main thread.
+    const setMode = msg.posted.find((m) => m.kind === "fb:set-mode");
+    const blit = msg.posted.find((m) => m.kind === "fb:blit");
+    expect(setMode).toBeDefined();
+    expect(blit).toBeDefined();
+    if (setMode && setMode.kind === "fb:set-mode") {
+      expect(setMode.width).toBeGreaterThan(0);
+      expect(setMode.height).toBeGreaterThan(0);
+    }
+    if (blit && blit.kind === "fb:blit") {
+      expect(blit.rgba.byteLength).toBe(blit.width * blit.height * 4);
+    }
+
+    // The echo response is still delivered alongside the splash.
+    const write = msg.posted.find((m) => m.kind === "console:write");
+    expect(write).toBeDefined();
+    if (write && write.kind === "console:write") {
+      expect(new TextDecoder().decode(write.bytes)).toBe("hello\n");
+    }
+  });
+
+  it("boot with enableFramebuffer=false does NOT emit a splash on first input", () => {
+    const msg = makeMessaging();
+    installWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
+    });
+    msg.send({
+      kind: "console:input",
+      bytes: new TextEncoder().encode("echo hi\n"),
+    });
+    expect(msg.posted.some((m) => m.kind === "fb:set-mode")).toBe(false);
+    expect(msg.posted.some((m) => m.kind === "fb:blit")).toBe(false);
+  });
 });
