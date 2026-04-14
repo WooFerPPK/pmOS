@@ -25,3 +25,4 @@ display-proto = { path = "../display-proto" }
 display-server = { path = "../display-server" }
 toolkit = { path = "../toolkit" }
 toolkit-free-client = { path = "../toolkit-free-client" }
+sh = { path = "../sh" }
