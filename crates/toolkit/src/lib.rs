@@ -27,7 +27,9 @@ pub mod theme;
 pub mod widget;
 pub mod window;
 
-pub use protocol::{Client, ClientError, ClientEvent, Connection, MemoryConnection};
+pub use protocol::{
+    Client, ClientError, ClientEvent, ClientEventWithPayload, Connection, MemoryConnection,
+};
 
 // Re-export the shared protocol types so toolkit callers get
 // a single namespace (`toolkit::Interface`, `toolkit::ObjectId`,

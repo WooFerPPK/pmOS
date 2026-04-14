@@ -114,6 +114,25 @@ pub struct ClientEvent {
     pub fd_passing: u8,
 }
 
+/// A parsed server event that additionally carries the raw
+/// payload bytes from the wire.
+///
+/// Returned by [`Client::push_received_with_payload`] so
+/// callers can run one of the typed-event decoders from
+/// [`display_proto::events`] on the payload. Unlike
+/// [`ClientEvent`], this struct allocates: the payload is
+/// copied out of the input buffer so the event can outlive
+/// the caller's byte stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientEventWithPayload {
+    pub object_id: ObjectId,
+    pub interface: Interface,
+    pub opcode: u16,
+    pub opcode_name: &'static str,
+    pub payload: Vec<u8>,
+    pub fd_passing: u8,
+}
+
 /// Errors surfaced by [`Client`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClientError {
@@ -381,6 +400,54 @@ impl<C: Connection> Client<C> {
                 opcode: header.opcode,
                 opcode_name: opcode.name,
                 payload_len: header.payload_len(),
+                fd_passing: header.fd_passing,
+            });
+            cursor += msg_len;
+        }
+        Ok((events, cursor))
+    }
+
+    /// Same as [`Client::push_received`] but returns events
+    /// with an owned copy of the wire payload, so callers
+    /// can run one of the typed decoders from
+    /// [`display_proto::events`] on the bytes.
+    ///
+    /// Returns `(events, consumed)`. The caller drops
+    /// `consumed` bytes from its input buffer and calls
+    /// again when more arrive.
+    pub fn push_received_with_payload(
+        &mut self,
+        input: &[u8],
+    ) -> Result<(Vec<ClientEventWithPayload>, usize), ClientError> {
+        let mut cursor = 0usize;
+        let mut events = Vec::new();
+        while cursor < input.len() {
+            let remaining = &input[cursor..];
+            if remaining.len() < HEADER_SIZE {
+                break;
+            }
+            let header = MessageHeader::decode(remaining)?;
+            let msg_len = header.length as usize;
+            if remaining.len() < msg_len {
+                break;
+            }
+            let interface = self
+                .objects
+                .get(&header.object_id)
+                .copied()
+                .ok_or(ClientError::UnknownObject {
+                    id: header.object_id,
+                })?;
+            let opcode = interface
+                .lookup_event(header.opcode)
+                .map_err(|e| map_opcode_error(e, Direction::Event))?;
+            let payload = remaining[HEADER_SIZE..msg_len].to_vec();
+            events.push(ClientEventWithPayload {
+                object_id: header.object_id,
+                interface,
+                opcode: header.opcode,
+                opcode_name: opcode.name,
+                payload,
                 fd_passing: header.fd_passing,
             });
             cursor += msg_len;

@@ -21,12 +21,16 @@
 extern crate alloc;
 
 pub mod decode;
+pub mod events;
 pub mod ids;
 pub mod objects;
 pub mod requests;
 pub mod wire;
 
 pub use decode::DecodeError;
+pub use events::{
+    BufferRelease, DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove, ShmFormat,
+};
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
 pub use requests::{

@@ -266,3 +266,156 @@ fn re_exports_from_display_proto_match() {
     fn take_display_proto(_: display_proto::Interface) {}
     take_display_proto(Interface::Display);
 }
+
+// ---- push_received_with_payload + typed event decoders ---------
+
+#[test]
+fn push_received_with_payload_exposes_raw_bytes_for_typed_decoding() {
+    use display_proto::DisplayDeleteId;
+
+    let mut c = boot();
+    // Build a display.delete_id event: opcode 2, 4-byte new_id.
+    let event = DisplayDeleteId {
+        id: ObjectId::new(11),
+    };
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let bytes = build_event_bytes(ObjectId::DISPLAY, 2, &payload);
+
+    let (events, consumed) = c.push_received_with_payload(&bytes).unwrap();
+    assert_eq!(consumed, bytes.len());
+    assert_eq!(events.len(), 1);
+    let e = &events[0];
+    assert_eq!(e.interface, Interface::Display);
+    assert_eq!(e.opcode, 2);
+    assert_eq!(e.opcode_name, "delete_id");
+    assert_eq!(e.payload, payload);
+
+    // Caller runs the typed decoder on the payload.
+    let decoded = DisplayDeleteId::decode(&e.payload).unwrap();
+    assert_eq!(decoded, event);
+}
+
+#[test]
+fn typed_decoder_round_trips_registry_global_through_push_received_with_payload() {
+    use display_proto::RegistryGlobal;
+
+    let mut c = boot();
+    // Register a registry object at id 3 so the incoming
+    // event resolves.
+    let registry_id = c.bind_new(Interface::Registry).unwrap();
+
+    let event = RegistryGlobal {
+        name: 1,
+        interface: "pmd_compositor".to_string(),
+        version: 1,
+    };
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let bytes = build_event_bytes(registry_id, 1 /* global */, &payload);
+
+    let (events, _) = c.push_received_with_payload(&bytes).unwrap();
+    assert_eq!(events.len(), 1);
+    let e = &events[0];
+    assert_eq!(e.interface, Interface::Registry);
+    assert_eq!(e.opcode_name, "global");
+
+    let decoded = RegistryGlobal::decode(&e.payload).unwrap();
+    assert_eq!(decoded, event);
+}
+
+#[test]
+fn push_received_with_payload_parses_multiple_back_to_back_events() {
+    use display_proto::{DisplayError, RegistryGlobal, RegistryGlobalRemove};
+
+    let mut c = boot();
+    let registry_id = c.bind_new(Interface::Registry).unwrap();
+
+    // Three events in one byte buffer.
+    let err = DisplayError {
+        object_id: ObjectId::new(3),
+        code: 7,
+        message: "oops".to_string(),
+    };
+    let global = RegistryGlobal {
+        name: 2,
+        interface: "pmd_shm".to_string(),
+        version: 1,
+    };
+    let remove = RegistryGlobalRemove { name: 2 };
+
+    let mut err_payload = Vec::new();
+    err.encode(&mut err_payload);
+    let mut global_payload = Vec::new();
+    global.encode(&mut global_payload);
+    let mut remove_payload = Vec::new();
+    remove.encode(&mut remove_payload);
+
+    let mut stream = Vec::new();
+    stream.extend(build_event_bytes(ObjectId::DISPLAY, 1, &err_payload));
+    stream.extend(build_event_bytes(registry_id, 1, &global_payload));
+    stream.extend(build_event_bytes(registry_id, 2, &remove_payload));
+
+    let (events, consumed) = c.push_received_with_payload(&stream).unwrap();
+    assert_eq!(consumed, stream.len());
+    assert_eq!(events.len(), 3);
+
+    assert_eq!(events[0].opcode_name, "error");
+    assert_eq!(
+        DisplayError::decode(&events[0].payload).unwrap(),
+        err
+    );
+    assert_eq!(events[1].opcode_name, "global");
+    assert_eq!(
+        RegistryGlobal::decode(&events[1].payload).unwrap(),
+        global
+    );
+    assert_eq!(events[2].opcode_name, "global_remove");
+    assert_eq!(
+        RegistryGlobalRemove::decode(&events[2].payload).unwrap(),
+        remove
+    );
+}
+
+#[test]
+fn push_received_with_payload_stops_at_partial_trailing_message() {
+    use display_proto::DisplayDeleteId;
+
+    let mut c = boot();
+    let event = DisplayDeleteId {
+        id: ObjectId::new(99),
+    };
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let full = build_event_bytes(ObjectId::DISPLAY, 2, &payload);
+    // Append a truncated second header so the parser must
+    // stop cleanly.
+    let mut stream = full.clone();
+    stream.extend_from_slice(&[0, 0, 0]);
+
+    let (events, consumed) = c.push_received_with_payload(&stream).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(consumed, full.len());
+}
+
+#[test]
+fn client_event_with_payload_copies_defensively() {
+    use display_proto::DisplayDeleteId;
+
+    // Mutating the input buffer AFTER parsing must NOT
+    // affect the returned ClientEventWithPayload.
+    let mut c = boot();
+    let event = DisplayDeleteId {
+        id: ObjectId::new(7),
+    };
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let mut bytes = build_event_bytes(ObjectId::DISPLAY, 2, &payload);
+    let (events, _) = c.push_received_with_payload(&bytes).unwrap();
+    // Trash the original buffer.
+    for b in bytes.iter_mut() {
+        *b = 0xff;
+    }
+    let decoded = DisplayDeleteId::decode(&events[0].payload).unwrap();
+    assert_eq!(decoded, event);
+}
