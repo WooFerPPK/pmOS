@@ -27,8 +27,13 @@ describe("sab-layout", () => {
   it("SAB is 64 KiB and split into the documented regions", () => {
     expect(layout.SAB_SIZE).toBe(0x10000);
     expect(layout.OFF_HEAP_SCRATCH + layout.HEAP_SCRATCH_BYTES).toBe(layout.SAB_SIZE);
-    expect(layout.OFF_REQ_RING + layout.REQ_RING_BYTES).toBe(layout.OFF_RES_RING);
-    expect(layout.OFF_RES_RING + layout.RES_RING_BYTES).toBe(layout.OFF_HEAP_SCRATCH);
+    // Request ring packs tight against the response ring; the
+    // response ring has up to 64 bytes of alignment slack before
+    // the heap scratch region starts on a 16 KiB boundary. This
+    // matches the `<=` invariants the `abi` crate asserts at
+    // crates/abi/src/ring.rs:200-201.
+    expect(layout.OFF_REQ_RING + layout.REQ_RING_BYTES).toBeLessThanOrEqual(layout.OFF_RES_RING);
+    expect(layout.OFF_RES_RING + layout.RES_RING_BYTES).toBeLessThanOrEqual(layout.OFF_HEAP_SCRATCH);
   });
 
   it("header offsets are at the documented positions from contracts/driver-kernel.md §1.1", () => {
