@@ -127,10 +127,10 @@ Paths are repository-relative (repo root is `/opt/webos/`). The Rust workspace l
 
 ### Kernel device node dispatch
 
-- [ ] T067 Device dispatch framework and built-in nodes (`/dev/null`, `/dev/zero`, `/dev/random`) in `crates/kernel/src/dev/mod.rs`
-- [ ] T068 `/dev/fb0` dispatch to the framebuffer driver via the driver control channel in `crates/kernel/src/dev/fb.rs`; enforces the `DISPLAY_SERVER` capability on open
-- [ ] T069 `/dev/input/kbd` and `/dev/input/mouse` dispatch to the input driver in `crates/kernel/src/dev/input.rs`; enforces `DISPLAY_SERVER` on open
-- [ ] T070 `/dev/console` dispatch to the console driver (reads + writes both work) in `crates/kernel/src/dev/console.rs`
+- [x] T067 Device dispatch framework and built-in nodes (`/dev/null`, `/dev/zero`, `/dev/random`) in `crates/kernel/src/dev/mod.rs`
+- [x] T068 `/dev/fb0` dispatch to the framebuffer driver via the driver control channel in `crates/kernel/src/dev/fb.rs`; enforces the `DISPLAY_SERVER` capability on open
+- [x] T069 `/dev/input/kbd` and `/dev/input/mouse` dispatch to the input driver in `crates/kernel/src/dev/input.rs`; enforces `DISPLAY_SERVER` on open
+- [x] T070 `/dev/console` dispatch to the console driver (reads + writes both work) in `crates/kernel/src/dev/console.rs`
 
 ### Kernel syscall dispatch
 
