@@ -39,6 +39,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use abi::cap::{Cap, CapSet};
 use display_proto::decode::DecodeError;
 use display_proto::events::{
     DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove, ShellWindowCreated,
@@ -50,6 +51,26 @@ use display_proto::requests::{
     CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
+
+/// Which capability, if any, must a connecting client
+/// hold to bind a given interface via `pmd_registry.bind`?
+/// `None` means "no restriction; any client may bind".
+///
+/// v1 only restricts `pmd_shell_manager` (spec §15: must
+/// hold `Cap::Shell`). Other privileged interfaces land
+/// here as they're added.
+pub const fn interface_required_cap(interface: Interface) -> Option<Cap> {
+    match interface {
+        Interface::ShellManager => Some(Cap::Shell),
+        Interface::Display
+        | Interface::Registry
+        | Interface::Compositor
+        | Interface::Shm
+        | Interface::ShmPool
+        | Interface::Buffer
+        | Interface::Surface => None,
+    }
+}
 
 /// Monotonic per-server identifier for a connected client.
 /// Mirrors the kernel's `Pid` in role: stable for the lifetime
@@ -103,6 +124,15 @@ pub enum ClientError {
     /// client sent so diagnostics and protocol-error events
     /// can quote it back.
     UnknownInterfaceName { name: String },
+    /// `pmd_registry.bind` tried to bind an interface that
+    /// requires a capability the connecting client doesn't
+    /// hold. v1: `pmd_shell_manager` requires `Cap::Shell`.
+    /// The bind is rejected and the new object is NOT
+    /// installed.
+    PermissionDenied {
+        interface: Interface,
+        required: Cap,
+    },
     /// An emit-path wire-format failure — usually a payload
     /// whose length would overflow the 16-bit `length`
     /// field. Should be unreachable in practice for v1
@@ -131,13 +161,27 @@ pub struct Client {
     /// in-memory buffer, etc.). The queue is empty
     /// between drains.
     pub pending_events: Vec<Vec<u8>>,
+    /// Capability set this client connected with. Set
+    /// once at accept time and never widened. Used by
+    /// the bind dispatch path to gate privileged
+    /// interfaces (`pmd_shell_manager` requires
+    /// `Cap::Shell`).
+    pub capabilities: CapSet,
 }
 
 impl Client {
-    /// Build a fresh client with `pmd_display` pre-bound to
-    /// `ObjectId::DISPLAY` and a server-side ID allocator
-    /// ready to hand out even IDs.
+    /// Build a fresh client with no capabilities. Used by
+    /// `Server::accept` for unprivileged connections.
     pub fn new(id: ClientId) -> Self {
+        Client::new_with_caps(id, CapSet::EMPTY)
+    }
+
+    /// Build a fresh client with the given capability set.
+    /// Used by `Server::accept_with_caps` when the
+    /// connecting process advertises the caps it holds
+    /// (typically derived from the kernel's per-pid cap
+    /// table at `display_connect` time).
+    pub fn new_with_caps(id: ClientId, capabilities: CapSet) -> Self {
         let mut objects = BTreeMap::new();
         objects.insert(ObjectId::DISPLAY, Interface::Display);
         Client {
@@ -146,7 +190,14 @@ impl Client {
             server_ids: IdAllocator::for_server(),
             journal: Vec::new(),
             pending_events: Vec::new(),
+            capabilities,
         }
+    }
+
+    /// True iff this client holds `cap` in its connection-
+    /// time capability set.
+    pub fn has_cap(&self, cap: Cap) -> bool {
+        self.capabilities.contains(cap)
     }
 
     /// Number of currently-bound objects in this client's table.
@@ -298,6 +349,19 @@ impl Client {
                         name: req.interface.into(),
                     }
                 })?;
+                // Capability gate: privileged interfaces
+                // (v1: ShellManager → Cap::Shell) reject
+                // the bind for clients that don't hold
+                // the required cap. The new object is NOT
+                // installed.
+                if let Some(required) = interface_required_cap(target) {
+                    if !self.capabilities.contains(required) {
+                        return Err(ClientError::PermissionDenied {
+                            interface: target,
+                            required,
+                        });
+                    }
+                }
                 self.install_client_object(req.new_id, target)?;
                 Ok(())
             }

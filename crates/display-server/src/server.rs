@@ -60,13 +60,30 @@ impl Server {
         }
     }
 
-    /// Accept a new client connection. Returns the allocated
-    /// [`ClientId`]. The client starts with `pmd_display`
-    /// bound at `ObjectId::DISPLAY`.
+    /// Accept a new client connection. Returns the
+    /// allocated [`ClientId`]. The client starts with
+    /// `pmd_display` bound at `ObjectId::DISPLAY` and
+    /// **no capabilities** — privileged interfaces like
+    /// `pmd_shell_manager` will refuse to bind for this
+    /// client. Use [`Server::accept_with_caps`] when the
+    /// connecting process holds capabilities the bind
+    /// dispatcher should honour.
     pub fn accept(&mut self) -> ClientId {
+        self.accept_with_caps(abi::cap::CapSet::EMPTY)
+    }
+
+    /// Accept a new client connection with a given
+    /// capability set. The caps are stored on the
+    /// per-client `Client::capabilities` field and
+    /// consulted by the `pmd_registry.bind` auto-install
+    /// path: binding `pmd_shell_manager` requires
+    /// `Cap::Shell`, future privileged interfaces add
+    /// their own entries to
+    /// [`crate::client::interface_required_cap`].
+    pub fn accept_with_caps(&mut self, caps: abi::cap::CapSet) -> ClientId {
         let id = ClientId(self.next_client_id);
         self.next_client_id = self.next_client_id.checked_add(1).unwrap_or(u32::MAX);
-        self.clients.insert(id, Client::new(id));
+        self.clients.insert(id, Client::new_with_caps(id, caps));
         id
     }
 

@@ -16,10 +16,17 @@
 //! format, interface tables, typed decoders on either
 //! side — one of these tests fails loudly.
 
+use abi::cap::{Cap, CapSet};
 use display_proto::{wire::MessageHeader, Interface, ObjectId};
-use display_server::Server as DisplayServerState;
+use display_server::{ClientError, Server as DisplayServerState, ServerError};
 use shell::Session;
 use toolkit::protocol::MemoryConnection;
+
+/// Capability set the desktop shell holds when it
+/// connects to the display server. `Cap::Shell` is the
+/// gate for binding `pmd_shell_manager`; `Cap::DisplayClient`
+/// is what every display client needs by convention.
+const SHELL_CAPS: CapSet = CapSet::from_caps(&[Cap::Shell, Cap::DisplayClient]);
 
 fn split_first_message(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let header = MessageHeader::decode(bytes).ok()?;
@@ -168,7 +175,9 @@ fn shell_becomes_ready_after_both_compositor_and_shm_advertised() {
     session.start().unwrap();
 
     let mut server = DisplayServerState::new();
-    let server_client_id = server.accept();
+    // Shell client connects with Cap::Shell so shell_manager
+    // is allowed to bind.
+    let server_client_id = server.accept_with_caps(SHELL_CAPS);
     pump_requests_into_server(
         &mut server,
         server_client_id,
@@ -275,7 +284,9 @@ fn shell_receives_multiple_globals_in_one_drain_and_binds_in_order() {
     session.start().unwrap();
 
     let mut server = DisplayServerState::new();
-    let server_client_id = server.accept();
+    // Shell-priv connection so the shell_manager bind
+    // doesn't get cap-rejected.
+    let server_client_id = server.accept_with_caps(SHELL_CAPS);
     pump_requests_into_server(
         &mut server,
         server_client_id,
@@ -378,6 +389,10 @@ fn _keep_imports_honest(_h: MessageHeader) {}
 ///   4. shell sends shell_manager.subscribe_windows
 /// Returns the booted session, the server, and the
 /// server-side client id for the caller to reach into.
+///
+/// Uses `accept_with_caps(SHELL_CAPS)` because the shell
+/// holds `Cap::Shell` — the cap-gate required to bind
+/// `pmd_shell_manager`.
 fn boot_shell_with_shell_manager() -> (
     Session<MemoryConnection>,
     DisplayServerState,
@@ -387,7 +402,7 @@ fn boot_shell_with_shell_manager() -> (
     session.start().unwrap();
 
     let mut server = DisplayServerState::new();
-    let server_client_id = server.accept();
+    let server_client_id = server.accept_with_caps(SHELL_CAPS);
     pump_requests_into_server(
         &mut server,
         server_client_id,
@@ -520,6 +535,80 @@ fn shell_focus_window_request_reaches_the_server_dispatcher() {
     assert_eq!(journal[0].interface, Interface::ShellManager);
     assert_eq!(journal[0].opcode_name, "focus_window");
     assert_eq!(journal[0].payload_len, 4);
+}
+
+#[test]
+fn ordinary_client_without_cap_shell_cannot_bind_shell_manager() {
+    // A client that connects with only Cap::DisplayClient
+    // (i.e. an ordinary app, not the desktop shell) tries
+    // to bind pmd_shell_manager. The server's bind
+    // dispatch path rejects with PermissionDenied and
+    // the new object is NOT installed in the client's
+    // table. This is the empirical Principle II + spec §15
+    // gate.
+    let mut session = Session::new(MemoryConnection::new());
+    session.start().unwrap();
+
+    let mut server = DisplayServerState::new();
+    // Ordinary app: only DisplayClient, no Shell.
+    let ordinary_caps = CapSet::from_caps(&[Cap::DisplayClient]);
+    let server_client_id = server.accept_with_caps(ordinary_caps);
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Server advertises shell_manager via emit_global.
+    let registry_id = session.registry_id().unwrap();
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_global(registry_id, 1, "pmd_shell_manager", 1)
+        .unwrap();
+
+    // Shell pumps the global, auto-binds, queues a
+    // registry.bind request. (The client doesn't know
+    // it'll be rejected — the cap check happens server-
+    // side, on dispatch.)
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    let bind_bytes = session.drain_outbound();
+    assert!(!bind_bytes.is_empty());
+
+    // The server rejects the bind with PermissionDenied.
+    let mut remaining = bind_bytes;
+    let (msg, rest) = split_first_message(&remaining).unwrap();
+    let err = server
+        .dispatch_request(server_client_id, &msg)
+        .unwrap_err();
+    match err {
+        ServerError::Client(ClientError::PermissionDenied {
+            interface,
+            required,
+        }) => {
+            assert_eq!(interface, Interface::ShellManager);
+            assert_eq!(required, Cap::Shell);
+        }
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+    remaining = rest;
+    assert!(remaining.is_empty(), "only one bind expected");
+
+    // The server's object table for this client does NOT
+    // contain a shell_manager binding at the new_id the
+    // session chose.
+    let server_view = server.client(server_client_id).unwrap();
+    let sm_id = session.bound(Interface::ShellManager).unwrap();
+    assert_eq!(server_view.get(sm_id), None);
+
+    // The shell client SIDE thinks it bound shell_manager
+    // (since the auto-bind happens on receipt of the
+    // global, before the server's reply). A future slice
+    // could surface the rejection back to the shell via a
+    // pmd_display.error event so the shell can drop its
+    // local state. For now the asymmetry is documented
+    // here.
+    assert_eq!(session.bound(Interface::ShellManager), Some(sm_id));
 }
 
 #[test]

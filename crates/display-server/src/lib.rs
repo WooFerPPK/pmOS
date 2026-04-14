@@ -34,7 +34,7 @@ pub mod server;
 // (`display_server::wire::MessageHeader`, etc.) keep working.
 pub use display_proto::{ids, objects, wire};
 
-pub use client::{Client, ClientError, ClientId};
+pub use client::{interface_required_cap, Client, ClientError, ClientId};
 pub use display_proto::{
     IdAllocator, IdError, IdKind, Interface, MessageHeader, ObjectId,
     ObjectIdAllocationError, Opcode, OpcodeError, WireError, HEADER_SIZE,

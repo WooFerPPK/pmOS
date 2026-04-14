@@ -451,6 +451,99 @@ fn emit_window_event_on_unknown_object_is_unknown_object() {
     assert!(matches!(err, ClientError::UnknownObject { .. }));
 }
 
+// ---- Capability gate -------------------------------------------
+
+#[test]
+fn dispatch_registry_bind_shell_manager_without_cap_shell_is_permission_denied() {
+    use abi::cap::CapSet;
+    let mut c = Client::new_with_caps(ClientId(1), CapSet::EMPTY);
+    let registry_id = ObjectId::new(3);
+    c.install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+
+    let payload = registry_bind_payload(1, "pmd_shell_manager", 1, ObjectId::new(5));
+    let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+    let err = c.dispatch_request(header, &payload).unwrap_err();
+    match err {
+        ClientError::PermissionDenied {
+            interface,
+            required,
+        } => {
+            assert_eq!(interface, Interface::ShellManager);
+            assert_eq!(required, abi::cap::Cap::Shell);
+        }
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+    // Shell-manager is NOT installed at the requested id.
+    assert_eq!(c.get(ObjectId::new(5)), None);
+}
+
+#[test]
+fn dispatch_registry_bind_shell_manager_with_cap_shell_succeeds() {
+    use abi::cap::{Cap, CapSet};
+    let caps = CapSet::from_caps(&[Cap::Shell]);
+    let mut c = Client::new_with_caps(ClientId(1), caps);
+    let registry_id = ObjectId::new(3);
+    c.install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+
+    let payload = registry_bind_payload(1, "pmd_shell_manager", 1, ObjectId::new(5));
+    let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+    assert_eq!(c.get(ObjectId::new(5)), Some(Interface::ShellManager));
+}
+
+#[test]
+fn dispatch_registry_bind_compositor_does_not_require_any_cap() {
+    use abi::cap::CapSet;
+    // No caps at all.
+    let mut c = Client::new_with_caps(ClientId(1), CapSet::EMPTY);
+    let registry_id = ObjectId::new(3);
+    c.install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+    let payload = registry_bind_payload(1, "pmd_compositor", 1, ObjectId::new(5));
+    let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+    assert_eq!(c.get(ObjectId::new(5)), Some(Interface::Compositor));
+}
+
+#[test]
+fn interface_required_cap_is_only_set_for_shell_manager_in_v1() {
+    use display_server::interface_required_cap;
+    assert_eq!(
+        interface_required_cap(Interface::ShellManager),
+        Some(abi::cap::Cap::Shell)
+    );
+    for iface in [
+        Interface::Display,
+        Interface::Registry,
+        Interface::Compositor,
+        Interface::Shm,
+        Interface::ShmPool,
+        Interface::Buffer,
+        Interface::Surface,
+    ] {
+        assert_eq!(interface_required_cap(iface), None, "{iface:?} should be unrestricted");
+    }
+}
+
+#[test]
+fn new_client_default_constructor_has_empty_caps() {
+    let c = Client::new(ClientId(1));
+    assert!(!c.has_cap(abi::cap::Cap::Shell));
+    assert!(!c.has_cap(abi::cap::Cap::DisplayClient));
+}
+
+#[test]
+fn new_with_caps_constructor_stores_the_cap_set() {
+    use abi::cap::{Cap, CapSet};
+    let caps = CapSet::from_caps(&[Cap::Shell, Cap::DisplayClient]);
+    let c = Client::new_with_caps(ClientId(1), caps);
+    assert!(c.has_cap(Cap::Shell));
+    assert!(c.has_cap(Cap::DisplayClient));
+    assert!(!c.has_cap(Cap::ProcKillAny));
+}
+
 #[test]
 fn dispatch_full_walk_display_to_compositor_to_surface_via_auto_install() {
     // Walks the same sequence a real client uses from a
