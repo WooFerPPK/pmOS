@@ -1,0 +1,180 @@
+//! Toolkit ↔ display-server loopback integration test.
+//!
+//! Pairs a `toolkit::Client` with a `display_server::Server`
+//! over matched in-memory byte buffers and walks a sequence
+//! of real protocol operations to prove the two sides stay in
+//! sync on the identical wire format from `display_proto`.
+//!
+//! This test is the isolation-layer version of Principle VII's
+//! conformance gate: any divergence between the client-side
+//! and server-side state machines fails here loudly, well
+//! before the `toolkit-free-client` fixture runs in browser
+//! integration tests (T109+). Bytes from the toolkit's outbound
+//! queue are fed straight into the server's `dispatch_request`
+//! and both sides agree on every object ID and opcode name.
+
+use display_server::Server;
+use display_server::client::HandledRequest;
+use toolkit::protocol::{Client as ToolkitClient, MemoryConnection};
+use toolkit::{Interface, MessageHeader, ObjectId, HEADER_SIZE};
+
+/// Pop one framed message off the front of `bytes` and return
+/// it alongside the rest of the buffer. Returns `None` if
+/// `bytes` doesn't contain a full message yet.
+fn split_first_message(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    if bytes.len() < HEADER_SIZE {
+        return None;
+    }
+    let header = MessageHeader::decode(bytes).ok()?;
+    let msg_len = header.length as usize;
+    if bytes.len() < msg_len {
+        return None;
+    }
+    Some((bytes[..msg_len].to_vec(), bytes[msg_len..].to_vec()))
+}
+
+#[test]
+fn toolkit_get_registry_reaches_the_server_dispatcher_verbatim() {
+    let mut server = Server::new();
+    let server_client_id = server.accept();
+
+    let mut client = ToolkitClient::new(MemoryConnection::new());
+    let registry_id = client.get_registry().unwrap();
+    assert_eq!(registry_id.raw(), 3);
+
+    let wire_bytes = client.drain_outbound();
+    server
+        .dispatch_request(server_client_id, &wire_bytes)
+        .unwrap();
+
+    // Drain the server's journal and assert on what it saw.
+    let server_view = server.client_mut(server_client_id).unwrap();
+    let journal = server_view.drain_journal();
+    assert_eq!(journal.len(), 1);
+    let rec = &journal[0];
+    assert_eq!(rec.object_id, ObjectId::DISPLAY);
+    assert_eq!(rec.interface, Interface::Display);
+    assert_eq!(rec.opcode_name, "get_registry");
+    // The 4-byte new_id payload was delivered.
+    assert_eq!(rec.payload_len, 4);
+}
+
+#[test]
+fn full_display_to_surface_walk_stays_in_sync_across_sides() {
+    let mut server = Server::new();
+    let server_client_id = server.accept();
+
+    let mut client = ToolkitClient::new(MemoryConnection::new());
+
+    // 1. Client sends display.get_registry → allocates object 3 = Registry.
+    let registry_id = client.get_registry().unwrap();
+
+    // 2. Client pretends to bind compositor from the registry.
+    //    On the wire that's `registry.bind(new_id=5)` against
+    //    object 3. We need to install the compositor on the
+    //    toolkit side manually because `bind` payload decoding
+    //    isn't wired up yet.
+    let compositor_id = client.bind_new(Interface::Compositor).unwrap();
+    client
+        .send_request(registry_id, 1 /* bind */, &compositor_id.raw().to_le_bytes())
+        .unwrap();
+
+    // 3. Client sends compositor.create_surface → allocates
+    //    object 7 = Surface.
+    let surface_id = client.bind_new(Interface::Surface).unwrap();
+    client
+        .send_request(
+            compositor_id,
+            1, // create_surface
+            &surface_id.raw().to_le_bytes(),
+        )
+        .unwrap();
+
+    // 4. Client sends surface.commit.
+    client
+        .send_request(surface_id, 7 /* commit */, &[])
+        .unwrap();
+
+    // --- Feed the byte stream through the server one message at a time. ---
+    //
+    // We split on the header's length field so the server sees
+    // the same framing a real transport would deliver.
+    let mut remaining = client.drain_outbound();
+    // Before the server can see these, it needs registry,
+    // compositor, and surface bound in its own object table —
+    // because the server doesn't decode `new_id` payloads
+    // either in this skeleton slice. Install them by hand so
+    // the object-existence check in the dispatcher passes.
+    {
+        let server_client = server.client_mut(server_client_id).unwrap();
+        server_client
+            .install_client_object(registry_id, Interface::Registry)
+            .unwrap();
+        server_client
+            .install_client_object(compositor_id, Interface::Compositor)
+            .unwrap();
+        server_client
+            .install_client_object(surface_id, Interface::Surface)
+            .unwrap();
+    }
+
+    let mut dispatched = 0usize;
+    while let Some((msg, rest)) = split_first_message(&remaining) {
+        server
+            .dispatch_request(server_client_id, &msg)
+            .unwrap_or_else(|e| panic!("server dispatch failed on msg {dispatched}: {e:?}"));
+        dispatched += 1;
+        remaining = rest;
+    }
+    assert_eq!(dispatched, 4);
+    assert!(remaining.is_empty());
+
+    // Server's journal matches the client's request sequence.
+    let server_client = server.client_mut(server_client_id).unwrap();
+    let journal: Vec<HandledRequest> = server_client.drain_journal();
+    assert_eq!(journal.len(), 4);
+    let names: Vec<(Interface, &str)> =
+        journal.iter().map(|r| (r.interface, r.opcode_name)).collect();
+    assert_eq!(
+        names,
+        vec![
+            (Interface::Display, "get_registry"),
+            (Interface::Registry, "bind"),
+            (Interface::Compositor, "create_surface"),
+            (Interface::Surface, "commit"),
+        ]
+    );
+}
+
+#[test]
+fn malformed_client_request_surfaces_as_a_server_error() {
+    let mut server = Server::new();
+    let server_client_id = server.accept();
+
+    let mut client = ToolkitClient::new(MemoryConnection::new());
+    // Toolkit won't *send* a request with a non-existent
+    // opcode (its own `send_request` rejects it), so we have
+    // to craft the bytes directly. A garbage 50-byte packet
+    // with a valid header pointing at display.opcode=99.
+    let header = MessageHeader::try_new(ObjectId::DISPLAY, 99, 0, 0).unwrap();
+    let mut bytes = vec![0u8; HEADER_SIZE];
+    header.encode(&mut bytes).unwrap();
+
+    // Server rejects the malformed wire.
+    let err = server
+        .dispatch_request(server_client_id, &bytes)
+        .unwrap_err();
+    // Unknown opcode on the Display interface.
+    match err {
+        display_server::ServerError::Client(
+            display_server::ClientError::UnknownOpcode { interface, opcode },
+        ) => {
+            assert_eq!(interface, Interface::Display);
+            assert_eq!(opcode, 99);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    // Drain client's queue too so we don't leave state behind.
+    let _ = client.drain_outbound();
+}

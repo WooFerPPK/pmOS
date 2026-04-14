@@ -1,0 +1,11 @@
+[package]
+name = "display-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "display_proto"
+path = "src/lib.rs"
+
+[dependencies]

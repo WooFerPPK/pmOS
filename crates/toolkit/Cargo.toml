@@ -9,3 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 abi = { path = "../abi" }
+display-proto = { path = "../display-proto" }
+
+[dev-dependencies]
+display-server = { path = "../display-server" }

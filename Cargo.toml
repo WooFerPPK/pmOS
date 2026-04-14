@@ -5,6 +5,7 @@ members = [
     "crates/ring",
     "crates/kernel",
     "crates/init",
+    "crates/display-proto",
     "crates/display-server",
     "crates/toolkit",
     "crates/shell",

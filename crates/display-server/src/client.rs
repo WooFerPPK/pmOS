@@ -38,9 +38,9 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::ids::{IdAllocator, IdKind, ObjectId};
-use crate::objects::{Interface, OpcodeError};
-use crate::wire::MessageHeader;
+use display_proto::ids::{IdAllocator, IdKind, ObjectId};
+use display_proto::objects::{Interface, OpcodeError};
+use display_proto::wire::MessageHeader;
 
 /// Monotonic per-server identifier for a connected client.
 /// Mirrors the kernel's `Pid` in role: stable for the lifetime

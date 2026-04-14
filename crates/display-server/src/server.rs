@@ -16,7 +16,7 @@
 use alloc::collections::BTreeMap;
 
 use crate::client::{Client, ClientError, ClientId};
-use crate::wire::{MessageHeader, WireError};
+use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
 /// Errors surfaced by [`Server`] operations. Most of them are
 /// thin wrappers over [`ClientError`] or [`WireError`] so the
@@ -100,7 +100,7 @@ impl Server {
     ) -> Result<(), ServerError> {
         let header = MessageHeader::decode(bytes)?;
         let payload_end = header.length as usize;
-        let payload = &bytes[super::wire::HEADER_SIZE..payload_end];
+        let payload = &bytes[HEADER_SIZE..payload_end];
         let client = self
             .clients
             .get_mut(&client_id)
