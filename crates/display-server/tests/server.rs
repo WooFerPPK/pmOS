@@ -6,11 +6,38 @@ use display_server::objects::Interface;
 use display_server::server::{Server, ServerError};
 use display_server::wire::{MessageHeader, WireError, HEADER_SIZE};
 
-fn encode_request_bytes(object_id: ObjectId, opcode: u16) -> Vec<u8> {
-    let mut buf = vec![0u8; HEADER_SIZE];
-    let h = MessageHeader::new(object_id, opcode, 0, 0);
-    h.encode(&mut buf).unwrap();
+/// Build a framed message with the supplied payload.
+fn encode_request_bytes(
+    object_id: ObjectId,
+    opcode: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+    let h = MessageHeader::try_new(object_id, opcode, payload.len(), 0).unwrap();
+    h.encode(&mut buf[..HEADER_SIZE]).unwrap();
+    buf[HEADER_SIZE..].copy_from_slice(payload);
     buf
+}
+
+/// `registry.bind` payload per spec §4: u32 name + wire
+/// string + u32 version + u32 new_id, string content padded
+/// to a 4-byte boundary.
+fn registry_bind_payload(
+    name: u32,
+    interface_name: &str,
+    version: u32,
+    new_id: ObjectId,
+) -> Vec<u8> {
+    let bytes = interface_name.as_bytes();
+    let pad = (4 - (bytes.len() % 4)) % 4;
+    let mut out = Vec::with_capacity(4 + 4 + bytes.len() + pad + 4 + 4);
+    out.extend_from_slice(&name.to_le_bytes());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out.extend(core::iter::repeat(0u8).take(pad));
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&new_id.raw().to_le_bytes());
+    out
 }
 
 #[test]
@@ -57,20 +84,30 @@ fn disconnect_removes_the_client() {
 fn dispatch_request_routes_bytes_through_the_client_state_machine() {
     let mut s = Server::new();
     let c = s.accept();
-    // display.get_registry (opcode 2).
-    let bytes = encode_request_bytes(ObjectId::DISPLAY, 2);
+    // display.get_registry(new_id=3).
+    let payload = ObjectId::new(3).raw().to_le_bytes();
+    let bytes = encode_request_bytes(ObjectId::DISPLAY, 2, &payload);
     s.dispatch_request(c, &bytes).unwrap();
 
     let client = s.client_mut(c).unwrap();
     let journal = client.drain_journal();
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].opcode_name, "get_registry");
+    // Auto-install put the registry in the table.
+    assert_eq!(client.get(ObjectId::new(3)), Some(Interface::Registry));
 }
 
 #[test]
 fn dispatch_on_unknown_client_is_no_such_client() {
     let mut s = Server::new();
-    let bytes = encode_request_bytes(ObjectId::DISPLAY, 1);
+    // Use sync (opcode 1) with a new_id payload — sync also
+    // creates an object but the server's skeleton doesn't
+    // yet auto-install it, so any payload shape that satisfies
+    // "length >= 4" works. But for this test we never reach
+    // dispatch_request's decoder: the client-lookup fails
+    // first.
+    let payload = ObjectId::new(99).raw().to_le_bytes();
+    let bytes = encode_request_bytes(ObjectId::DISPLAY, 1, &payload);
     let stray = display_server::ClientId(99);
     let err = s.dispatch_request(stray, &bytes).unwrap_err();
     assert_eq!(err, ServerError::NoSuchClient { id: stray });
@@ -89,8 +126,9 @@ fn dispatch_with_truncated_input_surfaces_a_wire_error() {
 fn dispatch_with_unknown_object_surfaces_a_client_error() {
     let mut s = Server::new();
     let c = s.accept();
-    // Object 99 isn't bound, so dispatch returns UnknownObject.
-    let bytes = encode_request_bytes(ObjectId::new(99), 1);
+    // Object 99 isn't bound, so dispatch returns UnknownObject
+    // BEFORE any payload decoding is attempted.
+    let bytes = encode_request_bytes(ObjectId::new(99), 1, &[]);
     let err = s.dispatch_request(c, &bytes).unwrap_err();
     assert_eq!(
         err,
@@ -106,19 +144,23 @@ fn multiple_clients_have_independent_object_tables() {
     let a = s.accept();
     let b = s.accept();
 
-    // Install a registry object at ID 3 in client a only.
-    s.client_mut(a)
-        .unwrap()
-        .install_client_object(ObjectId::new(3), Interface::Registry)
+    // Client a acquires a registry via the normal flow:
+    // display.get_registry(new_id=3) auto-installs it.
+    let payload_a = ObjectId::new(3).raw().to_le_bytes();
+    s.dispatch_request(a, &encode_request_bytes(ObjectId::DISPLAY, 2, &payload_a))
         .unwrap();
 
-    // Client a can dispatch registry.bind.
-    s.dispatch_request(a, &encode_request_bytes(ObjectId::new(3), 1))
+    // Client a can now dispatch registry.bind(compositor) on
+    // object 3 — the payload names pmd_compositor and carries
+    // a fresh new_id.
+    let bind_payload = registry_bind_payload(1, "pmd_compositor", 1, ObjectId::new(5));
+    s.dispatch_request(a, &encode_request_bytes(ObjectId::new(3), 1, &bind_payload))
         .unwrap();
 
-    // Client b does NOT have object 3 — same bytes fail.
+    // Client b does NOT have object 3 — same registry.bind
+    // bytes fail the object-lookup check.
     let err = s
-        .dispatch_request(b, &encode_request_bytes(ObjectId::new(3), 1))
+        .dispatch_request(b, &encode_request_bytes(ObjectId::new(3), 1, &bind_payload))
         .unwrap_err();
     assert_eq!(
         err,
@@ -126,4 +168,9 @@ fn multiple_clients_have_independent_object_tables() {
             id: ObjectId::new(3)
         })
     );
+
+    // Client a's table now holds registry (3) and
+    // compositor (5); client b still only has display.
+    assert_eq!(s.client(a).unwrap().object_count(), 3);
+    assert_eq!(s.client(b).unwrap().object_count(), 1);
 }

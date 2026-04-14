@@ -36,10 +36,15 @@
 //!    wire; v1 just bubbles the error out.
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 
+use display_proto::decode::DecodeError;
 use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
+use display_proto::requests::{
+    CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
+};
 use display_proto::wire::MessageHeader;
 
 /// Monotonic per-server identifier for a connected client.
@@ -63,7 +68,7 @@ pub struct HandledRequest {
 }
 
 /// Errors surfaced by [`Client::dispatch_request`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientError {
     /// The target object does not exist in this client's table.
     UnknownObject { id: ObjectId },
@@ -79,6 +84,21 @@ pub enum ClientError {
     IllegalBindTarget { requested: ObjectId },
     /// An attempt to reuse an existing object ID.
     DuplicateObject { id: ObjectId },
+    /// The payload of an auto-installed request did not
+    /// decode cleanly. The dispatcher forwards the
+    /// underlying [`DecodeError`] so callers can decide
+    /// whether to emit a `pmd_display.error` event or just
+    /// drop the connection.
+    Malformed {
+        interface: Interface,
+        opcode: u16,
+        error: DecodeError,
+    },
+    /// `pmd_registry.bind` named an interface the server
+    /// does not know about. Recorded with the exact name the
+    /// client sent so diagnostics and protocol-error events
+    /// can quote it back.
+    UnknownInterfaceName { name: String },
 }
 
 /// Per-connection state.
@@ -163,9 +183,25 @@ impl Client {
         self.objects.remove(&id).is_some()
     }
 
-    /// Dispatch a single decoded request. Validates the target
-    /// object exists, that the opcode is a known request on
-    /// its interface, and records the event in the journal.
+    /// Dispatch a single decoded request. Validates the
+    /// target object exists, validates the opcode is a
+    /// known request on its interface, auto-installs any
+    /// `new_id` object the request's payload carries, and
+    /// records the event in the journal.
+    ///
+    /// Auto-installed opcodes (v1):
+    ///
+    /// * `pmd_display.get_registry(new_id)` — new object at
+    ///   `new_id` is [`Interface::Registry`].
+    /// * `pmd_registry.bind(name, interface, version, new_id)`
+    ///   — the interface-name string is mapped through
+    ///   [`Interface::from_name`] and installed at `new_id`.
+    ///   An unknown name yields [`ClientError::UnknownInterfaceName`].
+    /// * `pmd_compositor.create_surface(new_id)` — new
+    ///   object at `new_id` is [`Interface::Surface`].
+    ///
+    /// Other requests fall through to the journal without
+    /// touching the object table.
     pub fn dispatch_request(
         &mut self,
         header: MessageHeader,
@@ -180,9 +216,6 @@ impl Client {
             .lookup_request(header.opcode)
             .map_err(|e| match e {
                 OpcodeError::UnknownOpcode { interface, opcode } => {
-                    // Check whether this opcode is an event on
-                    // the same interface — if so, the caller
-                    // violated the direction contract.
                     if interface.lookup_event(opcode).is_ok() {
                         ClientError::WrongDirection { interface, opcode }
                     } else {
@@ -190,6 +223,9 @@ impl Client {
                     }
                 }
             })?;
+
+        self.auto_install(interface, header.opcode, payload)?;
+
         self.journal.push(HandledRequest {
             object_id: header.object_id,
             interface,
@@ -199,6 +235,60 @@ impl Client {
             fd_passing: header.fd_passing,
         });
         Ok(())
+    }
+
+    /// Decode the payload of a request that creates a new
+    /// object and install the new object in the client's
+    /// table at the client-allocated id. The full list of
+    /// opcodes that auto-install is documented on
+    /// [`Client::dispatch_request`].
+    fn auto_install(
+        &mut self,
+        interface: Interface,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), ClientError> {
+        match (interface, opcode) {
+            (Interface::Display, 2 /* get_registry */) => {
+                let req = DisplayGetRegistry::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                self.install_client_object(req.new_id, Interface::Registry)?;
+                Ok(())
+            }
+            (Interface::Registry, 1 /* bind */) => {
+                let req = RegistryBind::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                let target = Interface::from_name(req.interface).ok_or_else(|| {
+                    ClientError::UnknownInterfaceName {
+                        name: req.interface.into(),
+                    }
+                })?;
+                self.install_client_object(req.new_id, target)?;
+                Ok(())
+            }
+            (Interface::Compositor, 1 /* create_surface */) => {
+                let req = CompositorCreateSurface::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                self.install_client_object(req.new_id, Interface::Surface)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Test helper: drain the dispatch journal and return it.

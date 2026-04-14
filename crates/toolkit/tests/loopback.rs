@@ -61,63 +61,37 @@ fn toolkit_get_registry_reaches_the_server_dispatcher_verbatim() {
 
 #[test]
 fn full_display_to_surface_walk_stays_in_sync_across_sides() {
+    // After the typed-payload decoder slice, NO HAND-
+    // INSTALLED OBJECTS are needed on either side. The
+    // toolkit client carries new_ids in its request
+    // payloads and the server's auto-install path installs
+    // them verbatim. The server's journal exactly matches
+    // the client's request sequence.
     let mut server = Server::new();
     let server_client_id = server.accept();
 
     let mut client = ToolkitClient::new(MemoryConnection::new());
 
-    // 1. Client sends display.get_registry → allocates object 3 = Registry.
+    // 1. display.get_registry → registry_id allocated.
     let registry_id = client.get_registry().unwrap();
 
-    // 2. Client pretends to bind compositor from the registry.
-    //    On the wire that's `registry.bind(new_id=5)` against
-    //    object 3. We need to install the compositor on the
-    //    toolkit side manually because `bind` payload decoding
-    //    isn't wired up yet.
-    let compositor_id = client.bind_new(Interface::Compositor).unwrap();
-    client
-        .send_request(registry_id, 1 /* bind */, &compositor_id.raw().to_le_bytes())
+    // 2. registry.bind(compositor) → compositor_id allocated.
+    //    The toolkit helper builds a full spec-compliant
+    //    payload (u32 name + wire string + u32 version +
+    //    u32 new_id).
+    let compositor_id = client
+        .registry_bind(registry_id, 1, Interface::Compositor, 1)
         .unwrap();
 
-    // 3. Client sends compositor.create_surface → allocates
-    //    object 7 = Surface.
-    let surface_id = client.bind_new(Interface::Surface).unwrap();
-    client
-        .send_request(
-            compositor_id,
-            1, // create_surface
-            &surface_id.raw().to_le_bytes(),
-        )
-        .unwrap();
+    // 3. compositor.create_surface → surface_id allocated.
+    let surface_id = client.compositor_create_surface(compositor_id).unwrap();
 
-    // 4. Client sends surface.commit.
-    client
-        .send_request(surface_id, 7 /* commit */, &[])
-        .unwrap();
+    // 4. surface.commit — no payload, no new_id.
+    client.surface_commit(surface_id).unwrap();
 
-    // --- Feed the byte stream through the server one message at a time. ---
-    //
-    // We split on the header's length field so the server sees
-    // the same framing a real transport would deliver.
+    // Feed the byte stream through the server one framed
+    // message at a time — no hand-install calls.
     let mut remaining = client.drain_outbound();
-    // Before the server can see these, it needs registry,
-    // compositor, and surface bound in its own object table —
-    // because the server doesn't decode `new_id` payloads
-    // either in this skeleton slice. Install them by hand so
-    // the object-existence check in the dispatcher passes.
-    {
-        let server_client = server.client_mut(server_client_id).unwrap();
-        server_client
-            .install_client_object(registry_id, Interface::Registry)
-            .unwrap();
-        server_client
-            .install_client_object(compositor_id, Interface::Compositor)
-            .unwrap();
-        server_client
-            .install_client_object(surface_id, Interface::Surface)
-            .unwrap();
-    }
-
     let mut dispatched = 0usize;
     while let Some((msg, rest)) = split_first_message(&remaining) {
         server
@@ -129,7 +103,7 @@ fn full_display_to_surface_walk_stays_in_sync_across_sides() {
     assert_eq!(dispatched, 4);
     assert!(remaining.is_empty());
 
-    // Server's journal matches the client's request sequence.
+    // Server journal matches the client's request sequence.
     let server_client = server.client_mut(server_client_id).unwrap();
     let journal: Vec<HandledRequest> = server_client.drain_journal();
     assert_eq!(journal.len(), 4);
@@ -144,6 +118,13 @@ fn full_display_to_surface_walk_stays_in_sync_across_sides() {
             (Interface::Surface, "commit"),
         ]
     );
+
+    // The auto-install path also populated the server's
+    // object table: registry, compositor, and surface are
+    // bound at the exact ids the client chose.
+    assert_eq!(server_client.get(registry_id), Some(Interface::Registry));
+    assert_eq!(server_client.get(compositor_id), Some(Interface::Compositor));
+    assert_eq!(server_client.get(surface_id), Some(Interface::Surface));
 }
 
 #[test]

@@ -20,10 +20,16 @@
 
 extern crate alloc;
 
+pub mod decode;
 pub mod ids;
 pub mod objects;
+pub mod requests;
 pub mod wire;
 
+pub use decode::DecodeError;
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
+pub use requests::{
+    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, SurfaceAttach, SurfaceDamage,
+};
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

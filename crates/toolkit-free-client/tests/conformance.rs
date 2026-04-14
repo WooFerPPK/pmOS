@@ -76,26 +76,11 @@ fn principle_vii_full_walk_reaches_commit_through_a_toolkit_free_client() {
     client.surface_commit(surface).unwrap();
 
     let mut remaining = client.drain_outbound();
-
-    // Install the client-allocated ids in the server's
-    // object table by hand. The server's skeleton dispatcher
-    // doesn't decode `new_id` arguments yet, so the caller
-    // is responsible for keeping the two object tables in
-    // sync. A later slice that wires up payload decoders
-    // will remove these hand-installs.
-    {
-        let server_client = server.client_mut(server_client_id).unwrap();
-        server_client
-            .install_client_object(registry, Interface::Registry)
-            .unwrap();
-        server_client
-            .install_client_object(compositor, Interface::Compositor)
-            .unwrap();
-        server_client
-            .install_client_object(surface, Interface::Surface)
-            .unwrap();
-    }
-
+    // No hand-installed objects — the server's typed-payload
+    // decoders auto-install each new_id as it arrives. This
+    // is the structural proof that a hand-written
+    // non-toolkit client drives the server through the
+    // public wire protocol alone.
     let mut dispatched = 0usize;
     while let Some((msg, rest)) = split_first_message(&remaining) {
         server
@@ -132,21 +117,20 @@ fn principle_vii_full_walk_reaches_commit_through_a_toolkit_free_client() {
 #[test]
 fn attach_damage_commit_sequence_reaches_the_server_in_order() {
     // Another walk covering the attach/damage/commit triad
-    // a real drawing frame would send.
+    // a real drawing frame would send. The server still
+    // needs a surface object in its table, and the only
+    // way to create one through the public protocol is via
+    // compositor.create_surface. So we walk the whole
+    // bind-compositor-create-surface preamble first.
     let mut server = Server::new();
     let server_client_id = server.accept();
 
     let mut client = FreeClient::new();
-    // The free client doesn't model buffers in v1, but we
-    // can still send surface.attach with a placeholder
-    // buffer id. Install a surface by hand.
-    let surface = client.allocate_id().unwrap();
-    {
-        let server_client = server.client_mut(server_client_id).unwrap();
-        server_client
-            .install_client_object(surface, Interface::Surface)
-            .unwrap();
-    }
+    let registry = client.get_registry().unwrap();
+    let compositor = client
+        .registry_bind(registry, 1, "pmd_compositor", 1)
+        .unwrap();
+    let surface = client.compositor_create_surface(compositor).unwrap();
 
     client.surface_attach(surface, ObjectId::new(9), 0, 0).unwrap();
     client.surface_damage(surface, 0, 0, 32, 32).unwrap();
@@ -159,14 +143,26 @@ fn attach_damage_commit_sequence_reaches_the_server_in_order() {
         count += 1;
         remaining = rest;
     }
-    assert_eq!(count, 3);
+    // 3 preamble messages (get_registry, bind, create_surface)
+    // + 3 draw messages (attach, damage, commit).
+    assert_eq!(count, 6);
 
     let journal = server
         .client_mut(server_client_id)
         .unwrap()
         .drain_journal();
     let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
-    assert_eq!(names, vec!["attach", "damage", "commit"]);
+    assert_eq!(
+        names,
+        vec![
+            "get_registry",
+            "bind",
+            "create_surface",
+            "attach",
+            "damage",
+            "commit",
+        ]
+    );
 }
 
 #[test]

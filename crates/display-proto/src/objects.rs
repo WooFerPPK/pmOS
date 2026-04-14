@@ -59,6 +59,27 @@ impl Interface {
             Interface::Surface => "pmd_surface",
         }
     }
+
+    /// Reverse of [`Interface::name`] — look up an interface
+    /// by its wire-level string name. Returns `None` for
+    /// unknown names.
+    ///
+    /// Used by the server's `registry.bind` handler to map
+    /// the client's interface-name argument onto a Rust
+    /// variant so the new object can be installed at the
+    /// right interface in the object table.
+    pub fn from_name(name: &str) -> Option<Interface> {
+        match name {
+            "pmd_display" => Some(Interface::Display),
+            "pmd_registry" => Some(Interface::Registry),
+            "pmd_compositor" => Some(Interface::Compositor),
+            "pmd_shm" => Some(Interface::Shm),
+            "pmd_shm_pool" => Some(Interface::ShmPool),
+            "pmd_buffer" => Some(Interface::Buffer),
+            "pmd_surface" => Some(Interface::Surface),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Interface {

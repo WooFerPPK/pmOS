@@ -21,7 +21,10 @@ use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 /// Errors surfaced by [`Server`] operations. Most of them are
 /// thin wrappers over [`ClientError`] or [`WireError`] so the
 /// caller has a single `?`-friendly error type.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Copy` because [`ClientError::UnknownInterfaceName`]
+/// carries an owned `String`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerError {
     /// Client ID is not in the server's table.
     NoSuchClient { id: ClientId },

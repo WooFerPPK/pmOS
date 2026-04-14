@@ -285,6 +285,55 @@ impl<C: Connection> Client<C> {
         Ok(registry_id)
     }
 
+    /// Send `pmd_registry.bind(name, interface, version, new_id)`.
+    /// Allocates a fresh client-side id, binds it to
+    /// `target` in the client's table, and sends the framed
+    /// request. The `interface` string encoded on the wire
+    /// is `target.name()`, so the server's
+    /// `Interface::from_name` lookup round-trips correctly.
+    pub fn registry_bind(
+        &mut self,
+        registry_id: ObjectId,
+        global_name: u32,
+        target: Interface,
+        version: u32,
+    ) -> Result<ObjectId, ClientError> {
+        let new_id = self.bind_new(target)?;
+        let name_str = target.name();
+        let bytes = name_str.as_bytes();
+        let pad = (4 - (bytes.len() % 4)) % 4;
+        let mut payload = Vec::with_capacity(4 + 4 + bytes.len() + pad + 4 + 4);
+        payload.extend_from_slice(&global_name.to_le_bytes());
+        payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(bytes);
+        payload.extend(core::iter::repeat(0u8).take(pad));
+        payload.extend_from_slice(&version.to_le_bytes());
+        payload.extend_from_slice(&new_id.raw().to_le_bytes());
+        self.send_request(registry_id, 1 /* bind */, &payload)?;
+        Ok(new_id)
+    }
+
+    /// Send `pmd_compositor.create_surface(new_id)`. Allocates
+    /// the fresh surface id, binds it to
+    /// [`Interface::Surface`], and sends the framed request.
+    pub fn compositor_create_surface(
+        &mut self,
+        compositor_id: ObjectId,
+    ) -> Result<ObjectId, ClientError> {
+        let surface_id = self.bind_new(Interface::Surface)?;
+        self.send_request(
+            compositor_id,
+            1, /* create_surface */
+            &surface_id.raw().to_le_bytes(),
+        )?;
+        Ok(surface_id)
+    }
+
+    /// Send `pmd_surface.commit()` — no payload.
+    pub fn surface_commit(&mut self, surface_id: ObjectId) -> Result<(), ClientError> {
+        self.send_request(surface_id, 7 /* commit */, &[])
+    }
+
     /// Parse as many complete server-bound events out of the
     /// input byte stream as possible. Stops at the first
     /// partial message (returning the events parsed so far
