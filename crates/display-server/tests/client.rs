@@ -1,6 +1,8 @@
 //! Per-client state machine tests.
 
-use display_server::client::{Client, ClientError, ClientId, HandledRequest};
+use display_server::client::{
+    BufferInfo, Client, ClientError, ClientId, HandledRequest, Pool, MAX_POOL_SIZE,
+};
 use display_server::ids::{IdKind, ObjectId};
 use display_server::objects::Interface;
 use display_server::wire::MessageHeader;
@@ -684,9 +686,20 @@ fn dispatch_shm_create_pool_with_truncated_payload_is_malformed() {
 
 #[test]
 fn dispatch_shm_pool_create_buffer_auto_installs_buffer_at_new_id() {
+    // create_buffer now validates the buffer region against
+    // its parent pool's allocated storage, so we can't just
+    // hand-install a `ShmPool` object — the pool map must
+    // also carry a real `Pool { size, storage }` entry. The
+    // cleanest way to get that is to dispatch a real
+    // `shm.create_pool` request first.
     let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
     let pool_id = ObjectId::new(7);
-    c.install_client_object(pool_id, Interface::ShmPool).unwrap();
+    let payload = shm_create_pool_payload(pool_id, 320 * 240 * 4);
+    let header = MessageHeader::try_new(shm_id, 1, payload.len(), 1).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+    c.drain_journal();
 
     let buffer_id = ObjectId::new(9);
     let payload =
@@ -794,4 +807,259 @@ fn dispatch_full_walk_display_to_surface_commit_with_attached_buffer() {
             "commit",
         ]
     );
+}
+
+// ---- Pool memory backing + buffer region validation ------------
+
+/// Convenience: run `shm.create_pool(pool_id, size)` on a
+/// client that already has a shm_id installed. Panics on
+/// any dispatch error.
+fn dispatch_create_pool(c: &mut Client, shm_id: ObjectId, pool_id: ObjectId, size: u32) {
+    let payload = shm_create_pool_payload(pool_id, size);
+    let header = MessageHeader::try_new(shm_id, 1, payload.len(), 1).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+    c.drain_journal();
+}
+
+#[test]
+fn create_pool_allocates_zero_filled_storage_at_the_requested_size() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    dispatch_create_pool(&mut c, shm_id, pool_id, 1024);
+
+    let pool: &Pool = c.pool(pool_id).expect("pool installed");
+    assert_eq!(pool.size, 1024);
+    assert_eq!(pool.storage.len(), 1024);
+    assert!(pool.storage.iter().all(|b| *b == 0));
+
+    let bytes = c.pool_bytes(pool_id).unwrap();
+    assert_eq!(bytes.len(), 1024);
+}
+
+#[test]
+fn create_pool_of_size_zero_is_accepted_as_an_empty_pool() {
+    // Not useful on its own, but we don't want to reject
+    // it — a client that later resizes the pool starts here.
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    dispatch_create_pool(&mut c, shm_id, ObjectId::new(7), 0);
+    let pool = c.pool(ObjectId::new(7)).unwrap();
+    assert_eq!(pool.size, 0);
+    assert_eq!(pool.storage.len(), 0);
+}
+
+#[test]
+fn create_pool_above_max_size_is_rejected_with_pool_too_large() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    // MAX_POOL_SIZE + 1 is one byte over the limit.
+    let payload = shm_create_pool_payload(pool_id, MAX_POOL_SIZE + 1);
+    let header = MessageHeader::try_new(shm_id, 1, payload.len(), 1).unwrap();
+    let err = c.dispatch_request(header, &payload).unwrap_err();
+    match err {
+        ClientError::PoolTooLarge { requested, max } => {
+            assert_eq!(requested, MAX_POOL_SIZE + 1);
+            assert_eq!(max, MAX_POOL_SIZE);
+        }
+        other => panic!("expected PoolTooLarge, got {other:?}"),
+    }
+    // Neither the object nor the storage was installed.
+    assert_eq!(c.get(pool_id), None);
+    assert!(c.pool(pool_id).is_none());
+}
+
+#[test]
+fn pool_bytes_mut_lets_a_test_simulate_a_client_sab_write() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    dispatch_create_pool(&mut c, shm_id, pool_id, 16);
+
+    let bytes = c.pool_bytes_mut(pool_id).expect("pool exists");
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    // Read-back path.
+    let read = c.pool_bytes(pool_id).unwrap();
+    assert_eq!(read, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+}
+
+#[test]
+fn two_pools_have_independent_storage() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+
+    let pool_a = ObjectId::new(7);
+    let pool_b = ObjectId::new(9);
+    dispatch_create_pool(&mut c, shm_id, pool_a, 4);
+    dispatch_create_pool(&mut c, shm_id, pool_b, 8);
+
+    for (i, b) in c.pool_bytes_mut(pool_a).unwrap().iter_mut().enumerate() {
+        *b = 0xA0 + i as u8;
+    }
+    for (i, b) in c.pool_bytes_mut(pool_b).unwrap().iter_mut().enumerate() {
+        *b = 0xB0 + i as u8;
+    }
+
+    assert_eq!(c.pool_bytes(pool_a).unwrap(), &[0xA0, 0xA1, 0xA2, 0xA3]);
+    assert_eq!(
+        c.pool_bytes(pool_b).unwrap(),
+        &[0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7]
+    );
+}
+
+#[test]
+fn create_buffer_records_buffer_info_in_the_per_client_map() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    dispatch_create_pool(&mut c, shm_id, pool_id, 8 * 8 * 4);
+
+    let buffer_id = ObjectId::new(9);
+    let payload = shm_pool_create_buffer_payload(
+        buffer_id,
+        0,
+        8,
+        8,
+        8 * 4,
+        0, /* ARGB8888 */
+    );
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    let info: &BufferInfo = c.buffer_info(buffer_id).expect("buffer installed");
+    assert_eq!(info.pool_id, pool_id);
+    assert_eq!(info.offset, 0);
+    assert_eq!(info.width, 8);
+    assert_eq!(info.height, 8);
+    assert_eq!(info.stride, 32);
+    assert_eq!(info.format, 0);
+    assert_eq!(info.byte_end(), 8 * 32);
+}
+
+#[test]
+fn create_buffer_outside_pool_bounds_is_rejected_with_buffer_out_of_pool() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    dispatch_create_pool(&mut c, shm_id, pool_id, 16);
+
+    // 4x4 ARGB8888 buffer would need 4 * 16 = 64 bytes,
+    // way past the 16-byte pool.
+    let buffer_id = ObjectId::new(9);
+    let payload = shm_pool_create_buffer_payload(buffer_id, 0, 4, 4, 16, 0);
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    let err = c.dispatch_request(header, &payload).unwrap_err();
+    match err {
+        ClientError::BufferOutOfPool {
+            pool_id: pid,
+            pool_size,
+            byte_end,
+        } => {
+            assert_eq!(pid, pool_id);
+            assert_eq!(pool_size, 16);
+            assert_eq!(byte_end, 64);
+        }
+        other => panic!("expected BufferOutOfPool, got {other:?}"),
+    }
+    // Buffer object was NOT installed on the error path.
+    assert_eq!(c.get(buffer_id), None);
+    assert!(c.buffer_info(buffer_id).is_none());
+}
+
+#[test]
+fn create_buffer_with_offset_pushing_past_end_is_rejected() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    dispatch_create_pool(&mut c, shm_id, pool_id, 128);
+
+    // 2x2 ARGB8888 = 16 bytes, but offset = 120 means the
+    // buffer would span [120, 136) — 8 bytes past the end.
+    let buffer_id = ObjectId::new(9);
+    let payload = shm_pool_create_buffer_payload(buffer_id, 120, 2, 2, 8, 0);
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    let err = c.dispatch_request(header, &payload).unwrap_err();
+    assert!(matches!(err, ClientError::BufferOutOfPool { .. }));
+}
+
+#[test]
+fn buffer_bytes_returns_the_sub_slice_of_the_parent_pool() {
+    // Pool is 32 bytes, buffer is 2x2 ARGB8888 starting at
+    // offset 16 with stride 8 → byte range [16, 32).
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    dispatch_create_pool(&mut c, shm_id, pool_id, 32);
+
+    // Write a distinctive pattern into the pool so we can
+    // verify the sub-slice lands on the right bytes.
+    for (i, b) in c.pool_bytes_mut(pool_id).unwrap().iter_mut().enumerate() {
+        *b = i as u8;
+    }
+
+    let buffer_id = ObjectId::new(9);
+    let payload = shm_pool_create_buffer_payload(buffer_id, 16, 2, 2, 8, 0);
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    let bytes = c.buffer_bytes(buffer_id).expect("buffer bytes");
+    assert_eq!(bytes, &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
+}
+
+#[test]
+fn buffer_bytes_sees_subsequent_pool_writes_live() {
+    // After create_buffer, mutating the pool's storage
+    // directly is visible through buffer_bytes — the
+    // buffer holds no copy, just a view.
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let pool_id = ObjectId::new(7);
+    dispatch_create_pool(&mut c, shm_id, pool_id, 16);
+
+    let buffer_id = ObjectId::new(9);
+    let payload = shm_pool_create_buffer_payload(buffer_id, 0, 2, 2, 8, 0);
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // Buffer starts zero-filled.
+    assert!(c.buffer_bytes(buffer_id).unwrap().iter().all(|&b| b == 0));
+
+    // Simulate a client SAB write.
+    for (i, b) in c.pool_bytes_mut(pool_id).unwrap().iter_mut().enumerate() {
+        *b = 0xFF - i as u8;
+    }
+
+    let bytes = c.buffer_bytes(buffer_id).unwrap();
+    assert_eq!(
+        bytes,
+        &[0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8, 0xF7, 0xF6, 0xF5, 0xF4,
+          0xF3, 0xF2, 0xF1, 0xF0]
+    );
+}
+
+#[test]
+fn buffer_info_none_for_unknown_object_id() {
+    let c = Client::new(ClientId(1));
+    assert!(c.buffer_info(ObjectId::new(999)).is_none());
+    assert!(c.buffer_bytes(ObjectId::new(999)).is_none());
+}
+
+#[test]
+fn pool_none_for_unknown_object_id() {
+    let c = Client::new(ClientId(1));
+    assert!(c.pool(ObjectId::new(999)).is_none());
+    assert!(c.pool_bytes(ObjectId::new(999)).is_none());
 }

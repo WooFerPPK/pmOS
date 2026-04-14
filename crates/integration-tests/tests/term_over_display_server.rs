@@ -640,6 +640,157 @@ fn term_damage_without_surface_returns_no_surface() {
     assert!(matches!(err, term::SessionError::NoSurface));
 }
 
+// ---- Server-side pool memory round-trip ------------------------
+
+#[test]
+fn server_pool_storage_round_trips_pixels_through_buffer_view() {
+    // End-to-end pixel round-trip: the client creates a
+    // pool + buffer, the test simulates a client SAB write
+    // by mutating the server-side pool storage directly,
+    // the client fires present(), and the server reads the
+    // pixels back through the buffer view. Once real SAB
+    // transport lands this test's "simulate a SAB write"
+    // step will be replaced by a client-side write to the
+    // same shared storage.
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    // 2x2 ARGB8888 buffer = 16 bytes.
+    let pool_id = session.create_pool(16).unwrap();
+    let buffer_id = session
+        .create_buffer(pool_id, 0, 2, 2, 8, display_proto::buffer_format::ARGB8888)
+        .unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // The pool exists on the server side as zero-filled
+    // bytes. Simulate a client SAB write: a 2x2 checkerboard.
+    let bytes = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .pool_bytes_mut(pool_id)
+        .expect("pool exists on the server");
+    // Row 0: solid red, solid black.
+    bytes[0..4].copy_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+    bytes[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0xff]);
+    // Row 1: solid black, solid red.
+    bytes[8..12].copy_from_slice(&[0x00, 0x00, 0x00, 0xff]);
+    bytes[12..16].copy_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+
+    // Present the frame.
+    session.present(buffer_id, 2, 2).unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // The server reads the pixels back through the buffer
+    // view, confirming the whole pipeline observed the
+    // same bytes.
+    let view = server
+        .client(server_client_id)
+        .unwrap()
+        .buffer_bytes(buffer_id)
+        .expect("buffer view");
+    assert_eq!(view.len(), 16);
+    assert_eq!(&view[0..4], &[0xff, 0x00, 0x00, 0xff]);
+    assert_eq!(&view[4..8], &[0x00, 0x00, 0x00, 0xff]);
+    assert_eq!(&view[8..12], &[0x00, 0x00, 0x00, 0xff]);
+    assert_eq!(&view[12..16], &[0xff, 0x00, 0x00, 0xff]);
+}
+
+#[test]
+fn server_rejects_create_buffer_that_does_not_fit_in_its_pool() {
+    // The client asks for a pool of 16 bytes, then tries
+    // to carve a 4x4 ARGB8888 buffer out of it (64 bytes —
+    // 48 too many). The server rejects the dispatch and
+    // the client sees the error bubble up through
+    // `ServerError`.
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    let _pool_id = session.create_pool(16).unwrap();
+    let _oversized_buffer = session
+        .create_buffer(_pool_id, 0, 4, 4, 16, display_proto::buffer_format::ARGB8888)
+        .unwrap(); // client-side allocation still succeeds — the
+                   // rejection happens server-side on dispatch.
+
+    // Dispatching one message at a time lets us see exactly
+    // which request errors out. The first is the pool
+    // create; it succeeds. The second is the oversized
+    // buffer create; it errors.
+    let outbound = session.drain_outbound();
+    let (msg1, rest) = split_first_message(&outbound).unwrap();
+    server
+        .dispatch_request(server_client_id, &msg1)
+        .expect("create_pool dispatch ok");
+    let (msg2, rest2) = split_first_message(&rest).unwrap();
+    let err = server
+        .dispatch_request(server_client_id, &msg2)
+        .expect_err("create_buffer dispatch must fail");
+    match err {
+        display_server::ServerError::Client(
+            display_server::ClientError::BufferOutOfPool {
+                pool_size, byte_end, ..
+            },
+        ) => {
+            assert_eq!(pool_size, 16);
+            assert_eq!(byte_end, 64);
+        }
+        other => panic!("expected BufferOutOfPool, got {other:?}"),
+    }
+    assert!(rest2.is_empty());
+}
+
+#[test]
+fn server_pool_storage_persists_across_multiple_present_cycles() {
+    // A terminal redrawing its scrollback reuses the same
+    // pool + buffer for every frame. Each frame the client
+    // updates the pixels (here: a sweep of a single byte)
+    // and the server's buffer view should see the new
+    // bytes on every commit.
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    let pool_id = session.create_pool(4).unwrap();
+    let buffer_id = session
+        .create_buffer(pool_id, 0, 1, 1, 4, display_proto::buffer_format::ARGB8888)
+        .unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    for frame in 0..5u8 {
+        // "SAB write" — simulate the client writing one
+        // pixel of the given frame colour.
+        let bytes = server
+            .client_mut(server_client_id)
+            .unwrap()
+            .pool_bytes_mut(pool_id)
+            .unwrap();
+        bytes.copy_from_slice(&[frame, frame, frame, 0xff]);
+
+        session.present(buffer_id, 1, 1).unwrap();
+        pump_requests_into_server(
+            &mut server,
+            server_client_id,
+            session.drain_outbound(),
+        );
+
+        // After commit, the buffer view carries this
+        // frame's bytes.
+        let view = server
+            .client(server_client_id)
+            .unwrap()
+            .buffer_bytes(buffer_id)
+            .unwrap();
+        assert_eq!(view, &[frame, frame, frame, 0xff]);
+    }
+}
+
 // Silence the `MessageHeader` import — referenced via
 // `display_proto::wire::MessageHeader` in `split_first_message`.
 #[allow(dead_code)]

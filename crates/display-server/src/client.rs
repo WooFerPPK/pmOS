@@ -53,6 +53,57 @@ use display_proto::requests::{
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
+/// Maximum bytes a single `pmd_shm.create_pool` may request.
+/// Protects the server against a runaway client allocating
+/// an enormous pool. 64 MiB is comfortably above anything a
+/// v1 app needs (a 4K ARGB8888 framebuffer is ~33 MiB) while
+/// still being small enough to reject obvious bugs.
+pub const MAX_POOL_SIZE: u32 = 64 * 1024 * 1024;
+
+/// A shm pool installed by `pmd_shm.create_pool`. In v1 the
+/// server owns the pool's backing storage directly (a plain
+/// `Vec<u8>`). When the kernel's display-server host is
+/// wired to SharedArrayBuffer, the `storage` field will
+/// become a shared-memory view; the rest of the pool's
+/// metadata is unchanged.
+///
+/// Tests simulate a "client SAB write" by calling
+/// [`Client::pool_bytes_mut`] and mutating the storage
+/// directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pool {
+    /// Declared pool size in bytes (matches `storage.len()`).
+    pub size: u32,
+    /// Pool's backing bytes. Zero-filled at `create_pool`.
+    pub storage: Vec<u8>,
+}
+
+/// A buffer carved out of a pool by
+/// `pmd_shm_pool.create_buffer`. Records the rectangle +
+/// format so the compositor can interpret the pool bytes
+/// once an `attach` + `commit` sequence promotes the buffer
+/// onto a surface.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BufferInfo {
+    /// Pool the buffer was carved from.
+    pub pool_id: ObjectId,
+    pub offset: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+}
+
+impl BufferInfo {
+    /// Exclusive upper byte offset the buffer covers within
+    /// its pool: `offset + stride * height`. Uses `u64` to
+    /// avoid overflow when stride or height are pathological;
+    /// the caller compares against the pool's `size` as u64.
+    pub fn byte_end(&self) -> u64 {
+        (self.offset as u64) + (self.stride as u64) * (self.height as u64)
+    }
+}
+
 /// Which capability, if any, must a connecting client
 /// hold to bind a given interface via `pmd_registry.bind`?
 /// `None` means "no restriction; any client may bind".
@@ -144,6 +195,27 @@ pub enum ClientError {
     /// events, but we propagate it so test assertions have
     /// something specific to match on.
     EncodeFailed(WireError),
+    /// A `pmd_shm.create_pool(new_id, size)` asked for a
+    /// pool larger than [`MAX_POOL_SIZE`]. The pool is
+    /// rejected and neither the storage nor the object is
+    /// installed.
+    PoolTooLarge { requested: u32, max: u32 },
+    /// A `pmd_shm_pool.create_buffer(...)` specified a
+    /// region that doesn't fit inside its parent pool.
+    /// `byte_end` is the exclusive upper offset the request
+    /// would have used; `pool_size` is what the pool was
+    /// created with.
+    BufferOutOfPool {
+        pool_id: ObjectId,
+        pool_size: u32,
+        byte_end: u64,
+    },
+    /// A `pmd_shm_pool.create_buffer(...)` targetted a
+    /// `ShmPool` object that exists in the object table but
+    /// has no corresponding entry in the per-client pool
+    /// storage map. Indicates server-side state corruption —
+    /// should be unreachable in practice.
+    UnknownPool { pool_id: ObjectId },
 }
 
 impl From<WireError> for ClientError {
@@ -172,6 +244,16 @@ pub struct Client {
     /// interfaces (`pmd_shell_manager` requires
     /// `Cap::Shell`).
     pub capabilities: CapSet,
+    /// Backing storage for every `pmd_shm_pool` object the
+    /// client has allocated. Keyed by the pool's object id.
+    /// Parallel to the entries in `objects` that carry
+    /// `Interface::ShmPool`.
+    pub pools: BTreeMap<ObjectId, Pool>,
+    /// Metadata for every `pmd_buffer` object the client
+    /// has allocated, keyed by the buffer's object id.
+    /// Parallel to the entries in `objects` that carry
+    /// `Interface::Buffer`.
+    pub buffers: BTreeMap<ObjectId, BufferInfo>,
 }
 
 impl Client {
@@ -196,6 +278,8 @@ impl Client {
             journal: Vec::new(),
             pending_events: Vec::new(),
             capabilities,
+            pools: BTreeMap::new(),
+            buffers: BTreeMap::new(),
         }
     }
 
@@ -313,7 +397,7 @@ impl Client {
                 }
             })?;
 
-        if let Err(e) = self.auto_install(interface, header.opcode, payload) {
+        if let Err(e) = self.auto_install(header.object_id, interface, header.opcode, payload) {
             // Cap-rejected binds get surfaced to the client
             // as a `pmd_display.error` event so the
             // client can drop its local stale state. The
@@ -359,6 +443,7 @@ impl Client {
     /// [`Client::dispatch_request`].
     fn auto_install(
         &mut self,
+        target_id: ObjectId,
         interface: Interface,
         opcode: u16,
         payload: &[u8],
@@ -424,7 +509,21 @@ impl Client {
                         error: e,
                     }
                 })?;
+                if req.size > MAX_POOL_SIZE {
+                    return Err(ClientError::PoolTooLarge {
+                        requested: req.size,
+                        max: MAX_POOL_SIZE,
+                    });
+                }
                 self.install_client_object(req.new_id, Interface::ShmPool)?;
+                let storage = alloc::vec![0u8; req.size as usize];
+                self.pools.insert(
+                    req.new_id,
+                    Pool {
+                        size: req.size,
+                        storage,
+                    },
+                );
                 Ok(())
             }
             (Interface::ShmPool, 1 /* create_buffer */) => {
@@ -435,11 +534,72 @@ impl Client {
                         error: e,
                     }
                 })?;
+                let pool = self
+                    .pools
+                    .get(&target_id)
+                    .ok_or(ClientError::UnknownPool { pool_id: target_id })?;
+                let info = BufferInfo {
+                    pool_id: target_id,
+                    offset: req.offset,
+                    width: req.width,
+                    height: req.height,
+                    stride: req.stride,
+                    format: req.format,
+                };
+                let byte_end = info.byte_end();
+                if byte_end > pool.size as u64 {
+                    return Err(ClientError::BufferOutOfPool {
+                        pool_id: target_id,
+                        pool_size: pool.size,
+                        byte_end,
+                    });
+                }
                 self.install_client_object(req.new_id, Interface::Buffer)?;
+                self.buffers.insert(req.new_id, info);
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    /// Borrow a pool by object id. Returns `None` if the
+    /// id is not a pool in this client's table.
+    pub fn pool(&self, pool_id: ObjectId) -> Option<&Pool> {
+        self.pools.get(&pool_id)
+    }
+
+    /// Borrow the raw pool bytes for a given pool id.
+    /// Equivalent to `self.pool(id).map(|p| p.storage.as_slice())`.
+    pub fn pool_bytes(&self, pool_id: ObjectId) -> Option<&[u8]> {
+        self.pools.get(&pool_id).map(|p| p.storage.as_slice())
+    }
+
+    /// Mutable access to a pool's backing storage. Exists
+    /// for tests (and, transitionally, for the
+    /// in-process demo compositor) to simulate a client
+    /// SAB write before the real shared-memory transport
+    /// lands.
+    pub fn pool_bytes_mut(&mut self, pool_id: ObjectId) -> Option<&mut [u8]> {
+        self.pools.get_mut(&pool_id).map(|p| p.storage.as_mut_slice())
+    }
+
+    /// Borrow a buffer's metadata by its object id.
+    pub fn buffer_info(&self, buffer_id: ObjectId) -> Option<&BufferInfo> {
+        self.buffers.get(&buffer_id)
+    }
+
+    /// Borrow the pool-backing bytes for a buffer —
+    /// `&pool.storage[offset .. offset + stride * height]`.
+    /// Returns `None` if the buffer is unknown or its
+    /// parent pool has been destroyed. The returned slice
+    /// includes any stride padding; the caller is expected
+    /// to know the buffer's width and format.
+    pub fn buffer_bytes(&self, buffer_id: ObjectId) -> Option<&[u8]> {
+        let info = self.buffers.get(&buffer_id)?;
+        let pool = self.pools.get(&info.pool_id)?;
+        let start = info.offset as usize;
+        let end = info.byte_end() as usize;
+        pool.storage.get(start..end)
     }
 
     /// Test helper: drain the dispatch journal and return it.
