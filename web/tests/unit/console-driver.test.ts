@@ -8,12 +8,14 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  CONSOLE_DRIVER_ID,
   ConsoleDriver,
-  DEV_CONSOLE,
+  DEV_CONSOLE_NODE,
   OP_WRITE_LINE,
 } from "../../src/drivers/console";
 import { DriverErrorCode } from "../../src/drivers/types";
 import type { DriverHost } from "../../src/drivers/types";
+import { DriverId, Devnum } from "../../src/shared/platform-constants";
 
 interface CapturingHost extends DriverHost {
   readonly posted: unknown[];
@@ -36,10 +38,19 @@ function makeHost(): CapturingHost {
 }
 
 describe("ConsoleDriver", () => {
-  it("identifies itself as the /dev/console driver", () => {
+  it("identifies itself as the Console driver class", () => {
     const d = new ConsoleDriver();
-    expect(d.devId).toBe(DEV_CONSOLE);
+    expect(d.driverId).toBe(CONSOLE_DRIVER_ID);
+    expect(d.driverId).toBe(DriverId.Console);
     expect(d.name).toBe("console");
+  });
+
+  it("DEV_CONSOLE_NODE matches the devnum-namespace value", () => {
+    expect(DEV_CONSOLE_NODE).toBe(Devnum.Console);
+    // Namespaces are distinct — the devnum (4) is NOT the
+    // driver-class id (5). This keeps drivers from accidentally
+    // routing input into the wrong kernel ring.
+    expect(DEV_CONSOLE_NODE).not.toBe(CONSOLE_DRIVER_ID);
   });
 
   it("call() before init() returns NotReady", () => {
@@ -106,7 +117,7 @@ describe("ConsoleDriver", () => {
     expect(msg.bytes.byteLength).toBe(0);
   });
 
-  it("onHostMessage(console:input) pushes bytes into the kernel for DEV_CONSOLE", () => {
+  it("onHostMessage(console:input) pushes bytes into the kernel for DEV_CONSOLE_NODE", () => {
     const host = makeHost();
     const d = new ConsoleDriver();
     d.init(host);
@@ -115,7 +126,10 @@ describe("ConsoleDriver", () => {
     d.onHostMessage?.({ kind: "console:input", bytes });
 
     expect(host.pushed).toHaveLength(1);
-    expect(host.pushed[0]?.devnum).toBe(DEV_CONSOLE);
+    // pushInputToKernel uses the devnum namespace, NOT the
+    // driver-class id.
+    expect(host.pushed[0]?.devnum).toBe(DEV_CONSOLE_NODE);
+    expect(host.pushed[0]?.devnum).toBe(Devnum.Console);
     expect(new TextDecoder().decode(host.pushed[0]?.bytes)).toBe("echo hi\n");
   });
 

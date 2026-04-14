@@ -20,7 +20,16 @@
 import { describe, expect, it } from "vitest";
 import { bootKernelWorker } from "../../src/kernel-worker";
 import type { Kernel } from "../../src/kernel-worker";
-import { DEV_CONSOLE, OP_WRITE_LINE } from "../../src/drivers/console";
+import {
+  CONSOLE_DRIVER_ID,
+  DEV_CONSOLE_NODE,
+  OP_WRITE_LINE,
+} from "../../src/drivers/console";
+import {
+  DEV_INPUT_KBD_NODE,
+  DEV_INPUT_MOUSE_NODE,
+  INPUT_DRIVER_ID,
+} from "../../src/drivers/input";
 import { DriverErrorCode } from "../../src/drivers/types";
 import type { KernelToMain } from "../../src/shared/worker-proto";
 
@@ -59,7 +68,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     bootKernelWorker({
       kernel,
-      config: { enableConsole: true },
+      config: { enableConsole: true, enableInput: false },
       postToMain: main.postToMain,
     });
     expect(main.messages).toEqual([{ kind: "ready" }]);
@@ -70,7 +79,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true },
+      config: { enableConsole: true, enableInput: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(1);
@@ -81,7 +90,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false },
+      config: { enableConsole: false, enableInput: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(0);
@@ -92,11 +101,11 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true },
+      config: { enableConsole: true, enableInput: false },
       postToMain: main.postToMain,
     });
     const result = kw.callDriver(
-      DEV_CONSOLE,
+      CONSOLE_DRIVER_ID,
       OP_WRITE_LINE,
       new TextEncoder().encode("hello\n"),
     );
@@ -118,22 +127,26 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false },
+      config: { enableConsole: false, enableInput: false },
       postToMain: main.postToMain,
     });
     const result = kw.callDriver(99, 0, new Uint8Array(0));
     expect(result).toEqual({ ok: false, error: DriverErrorCode.NotReady });
   });
 
-  it("callDriver with enableConsole:false returns NotReady for DEV_CONSOLE", () => {
+  it("callDriver with enableConsole:false returns NotReady for the console driver", () => {
     const kernel = makeMockKernel();
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false },
+      config: { enableConsole: false, enableInput: false },
       postToMain: main.postToMain,
     });
-    const result = kw.callDriver(DEV_CONSOLE, OP_WRITE_LINE, new Uint8Array(0));
+    const result = kw.callDriver(
+      CONSOLE_DRIVER_ID,
+      OP_WRITE_LINE,
+      new Uint8Array(0),
+    );
     expect(result).toEqual({ ok: false, error: DriverErrorCode.NotReady });
   });
 
@@ -142,14 +155,14 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true },
+      config: { enableConsole: true, enableInput: false },
       postToMain: main.postToMain,
     });
     const bytes = new TextEncoder().encode("ls\n");
     kw.handleMainMessage({ kind: "console:input", bytes });
 
     expect(kernel.injected).toHaveLength(1);
-    expect(kernel.injected[0]?.devnum).toBe(DEV_CONSOLE);
+    expect(kernel.injected[0]?.devnum).toBe(DEV_CONSOLE_NODE);
     expect(new TextDecoder().decode(kernel.injected[0]?.bytes)).toBe("ls\n");
   });
 
@@ -158,7 +171,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false },
+      config: { enableConsole: false, enableInput: false },
       postToMain: main.postToMain,
     });
     kw.handleMainMessage({
@@ -173,10 +186,13 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true },
+      config: { enableConsole: true, enableInput: false },
       postToMain: main.postToMain,
     });
-    kw.handleMainMessage({ kind: "boot", config: { enableConsole: true } });
+    kw.handleMainMessage({
+      kind: "boot",
+      config: { enableConsole: true, enableInput: false },
+    });
     const panic = main.messages.find((m) => m.kind === "panic");
     expect(panic).toBeDefined();
     if (panic && panic.kind === "panic") {
@@ -189,14 +205,18 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true },
+      config: { enableConsole: true, enableInput: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(1);
     kw.handleMainMessage({ kind: "shutdown" });
     expect(kw.driverCount).toBe(0);
     // callDriver on the now-unregistered driver reports NotReady.
-    const result = kw.callDriver(DEV_CONSOLE, OP_WRITE_LINE, new Uint8Array(0));
+    const result = kw.callDriver(
+      CONSOLE_DRIVER_ID,
+      OP_WRITE_LINE,
+      new Uint8Array(0),
+    );
     expect(result.ok).toBe(false);
   });
 
@@ -209,7 +229,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true },
+      config: { enableConsole: true, enableInput: false },
       postToMain: main.postToMain,
     });
 
@@ -221,10 +241,10 @@ describe("bootKernelWorker", () => {
     expect(kernel.injected).toHaveLength(1);
     expect(new TextDecoder().decode(kernel.injected[0]?.bytes)).toBe("echo hello\n");
 
-    // The (synthetic) kernel has written "hello\n" back to
-    // DEV_CONSOLE via its output pipeline.
+    // The (synthetic) kernel has written "hello\n" back
+    // through the console driver's output path.
     const result = kw.callDriver(
-      DEV_CONSOLE,
+      CONSOLE_DRIVER_ID,
       OP_WRITE_LINE,
       new TextEncoder().encode("hello\n"),
     );
@@ -237,5 +257,87 @@ describe("bootKernelWorker", () => {
     if (w && w.kind === "console:write") {
       expect(new TextDecoder().decode(w.bytes)).toBe("hello\n");
     }
+  });
+
+  // ---- input driver routing -----------------------------------
+
+  it("registers the input driver when enableInput is true", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: false, enableInput: true },
+      postToMain: main.postToMain,
+    });
+    expect(kw.driverCount).toBe(1);
+  });
+
+  it("registers both drivers when both flags are true", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: true, enableInput: true },
+      postToMain: main.postToMain,
+    });
+    expect(kw.driverCount).toBe(2);
+  });
+
+  it("handleMainMessage({input:kbd}) pushes bytes into DEV_INPUT_KBD_NODE", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: false, enableInput: true },
+      postToMain: main.postToMain,
+    });
+    kw.handleMainMessage({
+      kind: "input:kbd",
+      bytes: new Uint8Array([0x01, 0x02]),
+    });
+    expect(kernel.injected).toHaveLength(1);
+    expect(kernel.injected[0]?.devnum).toBe(DEV_INPUT_KBD_NODE);
+    expect(Array.from(kernel.injected[0]?.bytes ?? [])).toEqual([0x01, 0x02]);
+  });
+
+  it("handleMainMessage({input:mouse}) pushes bytes into DEV_INPUT_MOUSE_NODE", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: false, enableInput: true },
+      postToMain: main.postToMain,
+    });
+    kw.handleMainMessage({
+      kind: "input:mouse",
+      bytes: new Uint8Array([0xaa, 0xbb, 0xcc]),
+    });
+    expect(kernel.injected).toHaveLength(1);
+    expect(kernel.injected[0]?.devnum).toBe(DEV_INPUT_MOUSE_NODE);
+    expect(Array.from(kernel.injected[0]?.bytes ?? [])).toEqual([0xaa, 0xbb, 0xcc]);
+  });
+
+  it("handleMainMessage({input:kbd}) without the driver is a silent no-op", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: false, enableInput: false },
+      postToMain: main.postToMain,
+    });
+    kw.handleMainMessage({ kind: "input:kbd", bytes: new Uint8Array([0x01]) });
+    expect(kernel.injected).toHaveLength(0);
+  });
+
+  it("callDriver on the input-driver class returns Transport (no write path)", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: false, enableInput: true },
+      postToMain: main.postToMain,
+    });
+    const result = kw.callDriver(INPUT_DRIVER_ID, 0x01, new Uint8Array(0));
+    expect(result).toEqual({ ok: false, error: DriverErrorCode.Transport });
   });
 });

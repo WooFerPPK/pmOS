@@ -24,9 +24,18 @@
 
 import type { Driver, DriverHost, DriverResult } from "./types";
 import { DriverErrorCode } from "./types";
+import { DriverId, Devnum } from "../shared/platform-constants";
 
-/** Matches `kernel::fs::devfs::DEV_CONSOLE`. */
-export const DEV_CONSOLE = 4;
+/** Driver-class identifier for the console driver. */
+export const CONSOLE_DRIVER_ID = DriverId.Console;
+
+/**
+ * Device-node number for `/dev/console`. Used when pushing
+ * captured input bytes into the kernel — the kernel's
+ * `DeviceDispatcher` keys per-device input rings by devnum, not
+ * by driver class. Matches `kernel::fs::devfs::DEV_CONSOLE`.
+ */
+export const DEV_CONSOLE_NODE = Devnum.Console;
 
 /** Output opcode: "write a chunk to the console sink". */
 export const OP_WRITE_LINE = 0x01;
@@ -52,7 +61,7 @@ function isConsoleInput(m: unknown): m is ConsoleInputMessage {
 }
 
 export class ConsoleDriver implements Driver {
-  readonly devId = DEV_CONSOLE;
+  readonly driverId = CONSOLE_DRIVER_ID;
   readonly name = "console";
   private host: DriverHost | undefined;
 
@@ -87,7 +96,7 @@ export class ConsoleDriver implements Driver {
       // ArrayBuffer for later keystrokes.
       const copy = new Uint8Array(msg.bytes.byteLength);
       copy.set(msg.bytes);
-      host.pushInputToKernel(this.devId, copy);
+      host.pushInputToKernel(DEV_CONSOLE_NODE, copy);
     }
   }
 }

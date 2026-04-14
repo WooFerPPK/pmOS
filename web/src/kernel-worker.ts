@@ -20,7 +20,8 @@
 //   5. Post kernel-originated events (driver output, panics) to
 //      the main thread via the injected `postToMain`.
 
-import { ConsoleDriver, DEV_CONSOLE } from "./drivers/console";
+import { ConsoleDriver, CONSOLE_DRIVER_ID } from "./drivers/console";
+import { InputDriver, INPUT_DRIVER_ID } from "./drivers/input";
 import { DriverErrorCode } from "./drivers/types";
 import type { Driver, DriverHost, DriverResult } from "./drivers/types";
 import type { BootConfig, KernelToMain, MainToKernel } from "./shared/worker-proto";
@@ -37,8 +38,9 @@ import type { BootConfig, KernelToMain, MainToKernel } from "./shared/worker-pro
  */
 export interface Kernel {
   /**
-   * Push bytes into the kernel's input buffer for `devnum`. A
-   * process reading from the corresponding fd drains them via
+   * Push bytes into the kernel's input buffer for the given
+   * device-NODE number (not DriverId). A process reading from
+   * the corresponding fd drains them via
    * `DeviceDispatcher::read`. Mirrors
    * `kernel::dev::DeviceDispatcher::inject_console_input` (and
    * the keyboard / mouse equivalents) on the Rust side.
@@ -92,7 +94,13 @@ export function bootKernelWorker(options: BootOptions): KernelWorker {
   if (options.config.enableConsole) {
     const console_ = new ConsoleDriver();
     console_.init(host);
-    drivers.set(console_.devId, console_);
+    drivers.set(console_.driverId, console_);
+  }
+
+  if (options.config.enableInput) {
+    const input = new InputDriver();
+    input.init(host);
+    drivers.set(input.driverId, input);
   }
 
   options.postToMain({ kind: "ready" });
@@ -116,7 +124,13 @@ export function bootKernelWorker(options: BootOptions): KernelWorker {
           return;
         }
         case "console:input": {
-          const d = drivers.get(DEV_CONSOLE);
+          const d = drivers.get(CONSOLE_DRIVER_ID);
+          d?.onHostMessage?.(msg);
+          return;
+        }
+        case "input:kbd":
+        case "input:mouse": {
+          const d = drivers.get(INPUT_DRIVER_ID);
           d?.onHostMessage?.(msg);
           return;
         }

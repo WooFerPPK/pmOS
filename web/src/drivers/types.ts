@@ -2,7 +2,7 @@
 //
 // Every TS-side driver module (console, block, fb, input, net)
 // implements this interface. The kernel-worker scaffold in
-// `../kernel-worker.ts` registers one driver per `DevId` and
+// `../kernel-worker.ts` registers one driver per `DriverId` and
 // routes `driver_call` requests from the Rust kernel into the
 // matching driver.
 //
@@ -10,9 +10,30 @@
 // direct access to the DOM — they post messages to the main
 // thread via the `DriverHost` handed to them at `init` time,
 // which owns the Worker<->main channel.
+//
+// Two numeric namespaces appear in this layer; they are distinct
+// and should not be conflated:
+//
+//   * **DriverId** — driver CLASS identifier. Mirrors
+//     `kernel::platform::DevId` on the Rust side. The kernel's
+//     `Platform::driver_call(dev, op, args)` routes by this.
+//     Values are small and stable: 0 = Framebuffer, 1 = InputKbd,
+//     2 = InputMouse, 3 = Block, 4 = Net, 5 = Console. One
+//     driver instance per class.
+//
+//   * **Devnum** — per-device NODE identifier. Mirrors the u32
+//     inside `NodeType::CharDevice(devnum)` on the Rust side,
+//     defined by `kernel::fs::devfs::DEV_*`. The kernel's
+//     internal `DeviceDispatcher::read/write` pattern-matches
+//     on this. Driver code uses it when pushing input bytes
+//     via `DriverHost::pushInputToKernel`, because the kernel
+//     has one input ring per devnum.
 
-/** A numeric device identifier. Matches `abi::platform::DevId`. */
-export type DevId = number;
+/** Driver-class identifier. See module header. */
+export type DriverId = number;
+
+/** Per-device-node identifier. See module header. */
+export type Devnum = number;
 
 /** A device-specific opcode number. */
 export type DriverOp = number;
@@ -56,8 +77,12 @@ export type DriverResult = DriverOk | DriverErr;
 export interface DriverHost {
   /** Post a message to the main thread. */
   postToMain(msg: unknown): void;
-  /** Push input bytes into the kernel's per-device input ring. */
-  pushInputToKernel(devnum: DevId, bytes: Uint8Array): void;
+  /**
+   * Push input bytes into the kernel's per-device-NODE input
+   * ring. `devnum` is the devnum namespace (e.g.
+   * DEV_CONSOLE = 4, DEV_INPUT_KBD = 20), NOT a `DriverId`.
+   */
+  pushInputToKernel(devnum: Devnum, bytes: Uint8Array): void;
 }
 
 /**
@@ -74,7 +99,8 @@ export interface DriverHost {
  *   v1) can omit it.
  */
 export interface Driver {
-  readonly devId: DevId;
+  /** Driver-class id — the scaffold's map key. */
+  readonly driverId: DriverId;
   readonly name: string;
 
   init(host: DriverHost): void;

@@ -10,18 +10,23 @@
 // defined by `../shared/sab-layout.ts`, not by these messages.
 
 import type { ConsoleInputMessage, ConsoleWriteMessage } from "../drivers/console";
+import type { InputKbdMessage, InputMouseMessage } from "../drivers/input";
 
 /** Boot-time configuration forwarded from the main thread. */
 export interface BootConfig {
   /** When true, the console driver is registered at boot. */
   readonly enableConsole: boolean;
+  /** When true, the input (kbd + mouse) driver is registered at boot. */
+  readonly enableInput: boolean;
 }
 
 /** Main-thread → kernel-worker. */
 export type MainToKernel =
   | { readonly kind: "boot"; readonly config: BootConfig }
   | { readonly kind: "shutdown" }
-  | ConsoleInputMessage;
+  | ConsoleInputMessage
+  | InputKbdMessage
+  | InputMouseMessage;
 
 /** Kernel-worker → main-thread. */
 export type KernelToMain =
