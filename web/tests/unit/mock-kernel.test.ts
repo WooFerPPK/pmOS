@@ -316,4 +316,35 @@ describe("fauxShellTransform", () => {
     const out = fauxShellTransform(new TextEncoder().encode("echo \n"));
     expect(new TextDecoder().decode(out)).toBe("\n");
   });
+
+  it("'help' prints the full command list", async () => {
+    const { FAUX_SHELL_HELP } = await import("../../src/mock-kernel");
+    const out = fauxShellTransform(new TextEncoder().encode("help\n"));
+    const text = new TextDecoder().decode(out);
+    expect(text.endsWith("\n")).toBe(true);
+    // Every line from FAUX_SHELL_HELP appears in the output.
+    for (const line of FAUX_SHELL_HELP) {
+      expect(text).toContain(line);
+    }
+  });
+
+  it("'date' prints a fixed date string", () => {
+    const out = fauxShellTransform(new TextEncoder().encode("date\n"));
+    expect(new TextDecoder().decode(out)).toBe("2026-04-14\n");
+  });
+
+  it("'whoami' prints 'pmos'", () => {
+    const out = fauxShellTransform(new TextEncoder().encode("whoami\n"));
+    expect(new TextDecoder().decode(out)).toBe("pmos\n");
+  });
+
+  it("'uname' prints the system banner", () => {
+    const out = fauxShellTransform(new TextEncoder().encode("uname\n"));
+    expect(new TextDecoder().decode(out)).toBe("PMos 0.1.0-demo\n");
+  });
+
+  it("commands are case-sensitive: 'HELP' is unknown", () => {
+    const out = fauxShellTransform(new TextEncoder().encode("HELP\n"));
+    expect(new TextDecoder().decode(out)).toBe("?\n");
+  });
 });

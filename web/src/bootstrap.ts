@@ -21,6 +21,7 @@ import { ConsoleHost } from "./console-host";
 import { runEchoCheck } from "./console-check";
 import { FbHost } from "./fb-host";
 import type { FbFrame } from "./fb-host";
+import { DEFAULT_PALETTE, Terminal, paintTerminal } from "./terminal";
 
 const BOOT_VERSION = "0.1.0-demo";
 
@@ -371,6 +372,59 @@ function main(): void {
   // is not built yet — e.g. the static site was served
   // without running `npm run build:kernel-worker` first —
   // the row stalls cleanly with the Worker load error.
+  let terminalStarted = false;
+  const startTerminalMode = (session: KernelSession): void => {
+    if (terminalStarted) {
+      return;
+    }
+    terminalStarted = true;
+    if (repaintInterval !== null) {
+      clearInterval(repaintInterval);
+      repaintInterval = null;
+    }
+    splashPainted = true;
+
+    const terminal = new Terminal({
+      maxLines: 64,
+      banner: [
+        "PMos 0.1.0-demo",
+        "kernel worker ready — type 'help' for commands",
+        "",
+      ],
+    });
+
+    session.console.onOutput((bytes: Uint8Array) => {
+      terminal.appendOutput(bytes);
+    });
+
+    window.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (shouldConsumeKey(event.key)) {
+        event.preventDefault();
+      }
+      const committed = terminal.feedKey(event.key);
+      if (committed) {
+        session.console.sendInput(committed);
+      }
+    });
+
+    const paintOnce = () => {
+      paintTerminal(
+        canvas.ctx,
+        canvas.canvas.width,
+        canvas.canvas.height,
+        terminal,
+        {
+          palette: DEFAULT_PALETTE,
+          fontSizePx: 14,
+          dpr: canvas.dpr,
+          title: "PMos kernel worker — interactive console",
+        },
+      );
+    };
+    paintOnce();
+    setInterval(paintOnce, 100);
+  };
+
   step(7, 2600, () => {
     // step() has already flipped rows[7] to "running" and
     // repainted by the time this callback runs. Spawn the
@@ -387,18 +441,23 @@ function main(): void {
       repaint();
       return;
     }
-    // First blit hands the canvas over to the fb host. We
-    // clear the animation interval so the boot-screen paint
-    // loop stops competing for the canvas.
+
+    // First blit briefly paints the splash, then hands the
+    // canvas over to interactive-terminal mode ~600ms later
+    // so the user sees proof-of-fb before the REPL shows.
+    let splashFlashed = false;
     session.fb.onFrame((frame_: FbFrame) => {
-      if (!splashPainted) {
-        splashPainted = true;
-        if (repaintInterval !== null) {
-          clearInterval(repaintInterval);
-          repaintInterval = null;
-        }
+      if (splashFlashed) {
+        return;
       }
+      splashFlashed = true;
+      if (repaintInterval !== null) {
+        clearInterval(repaintInterval);
+        repaintInterval = null;
+      }
+      splashPainted = true;
       paintBlitToCanvas(canvas, frame_);
+      window.setTimeout(() => startTerminalMode(session), 600);
     });
 
     void runEchoCheck(session.console, {
@@ -424,6 +483,14 @@ function main(): void {
       }
       markShellRowsStalled();
       repaint();
+      // Fallback: if the splash path never fired (e.g. the
+      // worker boot races, or the framebuffer config got
+      // turned off somewhere), bring the terminal up
+      // anyway so the page doesn't sit on the frozen boot
+      // screen forever.
+      if (result.ok && !splashFlashed) {
+        window.setTimeout(() => startTerminalMode(session), 400);
+      }
     });
   });
 
@@ -601,6 +668,19 @@ function showPanic(message: string): void {
     setTimeout(tick, 1000);
   };
   tick();
+}
+
+/**
+ * Should a `keydown` event be preventDefault()'d by the
+ * terminal? Consume printable characters, Enter, and
+ * Backspace; let browser shortcuts (ctrl+R, cmd+L, F12)
+ * pass through.
+ */
+function shouldConsumeKey(key: string): boolean {
+  if (key === "Enter" || key === "Backspace") {
+    return true;
+  }
+  return key.length === 1;
 }
 
 function escapeHtml(s: string): string {

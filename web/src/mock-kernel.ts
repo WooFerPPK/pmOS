@@ -168,43 +168,65 @@ export class MockKernel implements Kernel {
 }
 
 /**
+ * Static help text printed by the `help` command. Extracted
+ * so the demo UI can show the command list even before the
+ * user types anything.
+ */
+export const FAUX_SHELL_HELP: ReadonlyArray<string> = [
+  "commands:",
+  "  help     — this list",
+  "  echo X   — print X",
+  "  date     — print build date",
+  "  whoami   — print current user",
+  "  uname    — print system banner",
+];
+
+/**
  * Parses a single newline-terminated input line the way the
- * Rust-side T077 gate's faux shell does. Exported for the
- * unit tests; `kernel-worker-entry.ts` does not call it
- * directly.
+ * Rust-side T077 gate's faux shell does, plus a handful of
+ * extra commands that make the bootstrap demo visually
+ * interesting. Exported for the unit tests;
+ * `kernel-worker-entry.ts` does not call it directly.
+ *
+ * Commands (v1):
+ *   * `echo X\n`   → `X\n`
+ *   * `help\n`     → the lines from `FAUX_SHELL_HELP`
+ *                    joined by `\n` with a trailing `\n`
+ *   * `date\n`     → a fake fixed date
+ *   * `whoami\n`   → `pmos`
+ *   * `uname\n`    → `PMos 0.1.0-demo`
+ *   * empty line   → no output
+ *   * anything else → `?\n`  (matches the T077 gate contract)
  */
 export function fauxShellTransform(line: Uint8Array): Uint8Array {
-  // Strip trailing newline for parsing, restore at end.
+  // Strip trailing newline for parsing.
   let end = line.byteLength;
   if (end > 0 && line[end - 1] === 0x0a) {
     end -= 1;
   }
   const body = line.subarray(0, end);
-  const prefix = new TextEncoder().encode("echo ");
-  if (startsWith(body, prefix)) {
-    const rest = body.subarray(prefix.byteLength);
-    const out = new Uint8Array(rest.byteLength + 1);
-    out.set(rest, 0);
-    out[rest.byteLength] = 0x0a;
-    return out;
-  }
-  // Empty lines flush nothing visible.
-  if (body.byteLength === 0) {
+  const bodyText = new TextDecoder().decode(body);
+
+  if (bodyText.length === 0) {
     return new Uint8Array(0);
   }
+  if (bodyText.startsWith("echo ")) {
+    const rest = bodyText.slice("echo ".length);
+    return new TextEncoder().encode(`${rest}\n`);
+  }
+  if (bodyText === "help") {
+    return new TextEncoder().encode(`${FAUX_SHELL_HELP.join("\n")}\n`);
+  }
+  if (bodyText === "date") {
+    return new TextEncoder().encode("2026-04-14\n");
+  }
+  if (bodyText === "whoami") {
+    return new TextEncoder().encode("pmos\n");
+  }
+  if (bodyText === "uname") {
+    return new TextEncoder().encode("PMos 0.1.0-demo\n");
+  }
   return new TextEncoder().encode("?\n");
-}
-
-function startsWith(haystack: Uint8Array, needle: Uint8Array): boolean {
-  if (haystack.byteLength < needle.byteLength) {
-    return false;
-  }
-  for (let i = 0; i < needle.byteLength; i += 1) {
-    if (haystack[i] !== needle[i]) {
-      return false;
-    }
-  }
-  return true;
 }
 
 // ---- Framebuffer splash helpers --------------------------------
