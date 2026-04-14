@@ -16,3 +16,4 @@ path = "src/main.rs"
 abi = { path = "../abi" }
 sh = { path = "../sh" }
 toolkit = { path = "../toolkit" }
+display-proto = { path = "../display-proto" }

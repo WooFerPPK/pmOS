@@ -21,9 +21,14 @@
 //! that point the bin driver will grow from the stdin REPL
 //! below to a full window-hosted renderer.
 
+pub mod session;
 pub mod terminal;
 
 pub use sh::{Shell, ShellOutput};
+pub use session::{
+    GlobalEntry, ProtocolErrorNotice, Session, SessionError, SessionStep,
+    INTERESTING_INTERFACES,
+};
 pub use terminal::{
     Key, KeyFeedResult, LineKind, Terminal, TerminalLine, TerminalOptions, TerminalSnapshot,
     DEFAULT_MAX_LINES,
