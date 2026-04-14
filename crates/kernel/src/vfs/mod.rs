@@ -304,16 +304,57 @@ impl Vfs {
         Ok((mount_id, parent_ino, name))
     }
 
+    /// Open an absolute path. Returns `(mount_id, ino, ty)` on
+    /// success — enough for the syscall layer to decide which
+    /// `FdObject` variant to install in the calling process's
+    /// fd table.
+    ///
+    /// Paths resolving to character devices return
+    /// `NodeType::CharDevice(devnum)`; the caller should install
+    /// a `FdObject::CharDevice(devnum)` in the fd table so
+    /// subsequent read/write routes through `DeviceDispatcher`
+    /// rather than the filesystem.
+    pub fn open(&mut self, abs_path: &str) -> Result<(MountId, Ino, NodeType), FsError> {
+        let (mount_id, ino) = self.resolve(abs_path)?;
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        let st = fs.stat(ino)?;
+        Ok((mount_id, ino, st.ty))
+    }
+
     /// Read from a regular file at an absolute path.
     pub fn read(&mut self, abs_path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.read(ino, offset, buf)
+        self.read_ino(mount_id, ino, offset, buf)
     }
 
     /// Write to a regular file at an absolute path.
     pub fn write(&mut self, abs_path: &str, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
+        self.write_ino(mount_id, ino, offset, buf)
+    }
+
+    /// Read from `(mount_id, ino)` directly. Used by the syscall
+    /// layer: an fd already carries its mount and inode, so no
+    /// path resolution is necessary per `fd_read`.
+    pub fn read_ino(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FsError> {
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.read(ino, offset, buf)
+    }
+
+    /// Write to `(mount_id, ino)` directly. See [`Vfs::read_ino`].
+    pub fn write_ino(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+        offset: u64,
+        buf: &[u8],
+    ) -> Result<usize, FsError> {
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         fs.write(ino, offset, buf)
     }

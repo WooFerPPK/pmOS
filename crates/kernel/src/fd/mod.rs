@@ -22,6 +22,8 @@
 
 use alloc::vec::Vec;
 
+use crate::vfs::{Ino, MountId};
+
 /// Maximum fd number a process may hold in v1. A process that
 /// tries to allocate past this returns `EMFILE`.
 pub const FD_SOFT_LIMIT: usize = 1024;
@@ -69,7 +71,13 @@ impl FdFlags {
 /// Each variant carries an opaque identifier that points at state
 /// owned by another kernel subsystem:
 ///
-/// * `Vnode` — index into the VFS vnode cache (T049).
+/// * `Vnode` — `(mount_id, ino)` pair naming a regular-file /
+///   directory / symlink / fifo / socket node in the VFS. The
+///   kernel routes `fd_read`/`fd_write` on this variant through
+///   the owning filesystem.
+/// * `CharDevice` — devnum into `DeviceDispatcher` (T067..T070).
+///   Used for any fd that open()ed a `NodeType::CharDevice` node
+///   such as `/dev/null`, `/dev/console`, or `/dev/fb0`.
 /// * `PipeRead` / `PipeWrite` — pipe id from the IPC subsystem (T062).
 /// * `Socket` — socket id from the IPC subsystem (T063).
 /// * `DisplayConn` — connection id returned by `display_connect`
@@ -82,7 +90,8 @@ impl FdFlags {
 /// subsystem.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FdObject {
-    Vnode(u32),
+    Vnode { mount_id: MountId, ino: Ino },
+    CharDevice(u32),
     PipeRead(u32),
     PipeWrite(u32),
     Socket(u32),
