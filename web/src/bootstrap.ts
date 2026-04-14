@@ -452,7 +452,7 @@ async function runKernelWorkerCheck(): Promise<EchoCheckResult> {
 
   const host = new ConsoleHost({
     worker,
-    bootConfig: { enableConsole: true, enableInput: false },
+    bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
   });
 
   const checkPromise = runEchoCheck(host, {

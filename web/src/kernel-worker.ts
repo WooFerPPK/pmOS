@@ -21,6 +21,7 @@
 //      the main thread via the injected `postToMain`.
 
 import { ConsoleDriver, CONSOLE_DRIVER_ID } from "./drivers/console";
+import { FramebufferDriver } from "./drivers/fb";
 import { InputDriver, INPUT_DRIVER_ID } from "./drivers/input";
 import { DriverErrorCode } from "./drivers/types";
 import type { Driver, DriverHost, DriverResult } from "./drivers/types";
@@ -101,6 +102,12 @@ export function bootKernelWorker(options: BootOptions): KernelWorker {
     const input = new InputDriver();
     input.init(host);
     drivers.set(input.driverId, input);
+  }
+
+  if (options.config.enableFramebuffer) {
+    const fb = new FramebufferDriver();
+    fb.init(host);
+    drivers.set(fb.driverId, fb);
   }
 
   options.postToMain({ kind: "ready" });

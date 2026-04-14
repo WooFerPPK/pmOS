@@ -103,7 +103,7 @@ function makeClockAndScheduler(): EchoCheckOptions["now"] extends infer _N
 function bootHost(fake: FakeWorker): ConsoleHost {
   const host = new ConsoleHost({
     worker: fake,
-    bootConfig: { enableConsole: true, enableInput: false },
+    bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
   });
   fake.emit({ kind: "ready" });
   return host;

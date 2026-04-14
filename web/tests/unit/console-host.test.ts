@@ -48,12 +48,12 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     expect(w.posted).toHaveLength(1);
     expect(w.posted[0]).toEqual({
       kind: "boot",
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
   });
 
@@ -61,7 +61,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     expect(host.ready).toBe(false);
     w.emit({ kind: "ready" });
@@ -72,7 +72,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     const events: string[] = [];
     host.onLifecycle((e) => events.push(e.kind));
@@ -84,7 +84,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     const calls: string[] = [];
     host.onOutput((b) => calls.push(`A:${new TextDecoder().decode(b)}`));
@@ -98,7 +98,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     host.sendLine("early\n");
     // Only the boot message is posted — no console:input yet.
@@ -118,7 +118,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     w.emit({ kind: "ready" });
     host.sendLine("late\n");
@@ -133,7 +133,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     const buf = new Uint8Array([0x41, 0x42, 0x0a]);
     host.sendInput(buf);
@@ -150,7 +150,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     w.emit({ kind: "ready" });
     expect(host.ready).toBe(true);
@@ -170,7 +170,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     w.emit({ kind: "ready" });
     host.shutdown();
@@ -184,7 +184,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     w.emit({ kind: "ready" });
     host.shutdown();
@@ -197,7 +197,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     w.emit({ kind: "ready" });
     host.shutdown();
@@ -213,7 +213,7 @@ describe("ConsoleHost", () => {
     const w = makeFakeWorker();
     const host = new ConsoleHost({
       worker: w,
-      bootConfig: { enableConsole: true, enableInput: false },
+      bootConfig: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     const received: string[] = [];
     host.onOutput((b) => received.push(new TextDecoder().decode(b)));

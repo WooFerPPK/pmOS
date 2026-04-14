@@ -56,7 +56,7 @@ describe("installWorkerEntry", () => {
     expect(entry.scaffold).toBeUndefined();
     msg.send({
       kind: "boot",
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     expect(entry.scaffold).toBeDefined();
     expect(entry.scaffold?.driverCount).toBe(1);
@@ -68,12 +68,12 @@ describe("installWorkerEntry", () => {
     const entry = installWorkerEntry(msg);
     msg.send({
       kind: "boot",
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     const firstScaffold = entry.scaffold;
     msg.send({
       kind: "boot",
-      config: { enableConsole: true, enableInput: true },
+      config: { enableConsole: true, enableInput: true, enableFramebuffer: false },
     });
     // The scaffold itself posts the "already booted" panic.
     const panic = msg.posted.find((m) => m.kind === "panic");
@@ -94,7 +94,7 @@ describe("installWorkerEntry", () => {
     installWorkerEntry(msg);
     msg.send({
       kind: "boot",
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     msg.send({
       kind: "console:input",
@@ -113,7 +113,7 @@ describe("installWorkerEntry", () => {
     const entry = installWorkerEntry(msg);
     msg.send({
       kind: "boot",
-      config: { enableConsole: true, enableInput: true },
+      config: { enableConsole: true, enableInput: true, enableFramebuffer: false },
     });
     expect(entry.scaffold?.driverCount).toBe(2);
     msg.send({ kind: "shutdown" });
@@ -125,7 +125,7 @@ describe("installWorkerEntry", () => {
     installWorkerEntry(msg);
     msg.send({
       kind: "boot",
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     msg.send({
       kind: "console:input",

@@ -30,6 +30,10 @@ import {
   DEV_INPUT_MOUSE_NODE,
   INPUT_DRIVER_ID,
 } from "../../src/drivers/input";
+import {
+  FB_DRIVER_ID,
+  OP_SET_MODE as FB_OP_SET_MODE,
+} from "../../src/drivers/fb";
 import { DriverErrorCode } from "../../src/drivers/types";
 import type { KernelToMain } from "../../src/shared/worker-proto";
 
@@ -68,7 +72,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     expect(main.messages).toEqual([{ kind: "ready" }]);
@@ -79,7 +83,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(1);
@@ -90,7 +94,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: false },
+      config: { enableConsole: false, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(0);
@@ -101,7 +105,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     const result = kw.callDriver(
@@ -127,7 +131,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: false },
+      config: { enableConsole: false, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     const result = kw.callDriver(99, 0, new Uint8Array(0));
@@ -139,7 +143,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: false },
+      config: { enableConsole: false, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     const result = kw.callDriver(
@@ -155,7 +159,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     const bytes = new TextEncoder().encode("ls\n");
@@ -171,7 +175,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: false },
+      config: { enableConsole: false, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     kw.handleMainMessage({
@@ -186,12 +190,12 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     kw.handleMainMessage({
       kind: "boot",
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
     });
     const panic = main.messages.find((m) => m.kind === "panic");
     expect(panic).toBeDefined();
@@ -205,7 +209,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(1);
@@ -229,7 +233,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: false },
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
 
@@ -266,7 +270,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: true },
+      config: { enableConsole: false, enableInput: true, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(1);
@@ -277,7 +281,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: true, enableInput: true },
+      config: { enableConsole: true, enableInput: true, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     expect(kw.driverCount).toBe(2);
@@ -288,7 +292,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: true },
+      config: { enableConsole: false, enableInput: true, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     kw.handleMainMessage({
@@ -305,7 +309,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: true },
+      config: { enableConsole: false, enableInput: true, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     kw.handleMainMessage({
@@ -322,7 +326,7 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: false },
+      config: { enableConsole: false, enableInput: false, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     kw.handleMainMessage({ kind: "input:kbd", bytes: new Uint8Array([0x01]) });
@@ -334,10 +338,61 @@ describe("bootKernelWorker", () => {
     const main = captureMain();
     const kw = bootKernelWorker({
       kernel,
-      config: { enableConsole: false, enableInput: true },
+      config: { enableConsole: false, enableInput: true, enableFramebuffer: false },
       postToMain: main.postToMain,
     });
     const result = kw.callDriver(INPUT_DRIVER_ID, 0x01, new Uint8Array(0));
     expect(result).toEqual({ ok: false, error: DriverErrorCode.Transport });
+  });
+
+  // ---- framebuffer driver routing -----------------------------
+
+  it("registers the framebuffer driver when enableFramebuffer is true", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: false, enableInput: false, enableFramebuffer: true },
+      postToMain: main.postToMain,
+    });
+    expect(kw.driverCount).toBe(1);
+  });
+
+  it("registers all three drivers when every flag is true", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: true, enableInput: true, enableFramebuffer: true },
+      postToMain: main.postToMain,
+    });
+    expect(kw.driverCount).toBe(3);
+  });
+
+  it("callDriver(FB_DRIVER_ID, OP_SET_MODE, ...) routes to the fb driver which posts fb:set-mode", () => {
+    const kernel = makeMockKernel();
+    const main = captureMain();
+    const kw = bootKernelWorker({
+      kernel,
+      config: { enableConsole: false, enableInput: false, enableFramebuffer: true },
+      postToMain: main.postToMain,
+    });
+    const payload = new Uint8Array(8);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, 640, true);
+    view.setUint32(4, 480, true);
+    const result = kw.callDriver(
+      FB_DRIVER_ID,
+      FB_OP_SET_MODE,
+      payload,
+    );
+    expect(result.ok).toBe(true);
+    const setModes = main.messages.filter((m) => m.kind === "fb:set-mode");
+    expect(setModes).toHaveLength(1);
+    const m = setModes[0];
+    if (m && m.kind === "fb:set-mode") {
+      expect(m.width).toBe(640);
+      expect(m.height).toBe(480);
+    }
   });
 });

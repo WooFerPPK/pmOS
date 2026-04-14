@@ -10,6 +10,7 @@
 // defined by `../shared/sab-layout.ts`, not by these messages.
 
 import type { ConsoleInputMessage, ConsoleWriteMessage } from "../drivers/console";
+import type { FbBlitMessage, FbSetModeMessage } from "../drivers/fb";
 import type { InputKbdMessage, InputMouseMessage } from "../drivers/input";
 
 /** Boot-time configuration forwarded from the main thread. */
@@ -18,6 +19,8 @@ export interface BootConfig {
   readonly enableConsole: boolean;
   /** When true, the input (kbd + mouse) driver is registered at boot. */
   readonly enableInput: boolean;
+  /** When true, the framebuffer driver is registered at boot. */
+  readonly enableFramebuffer: boolean;
 }
 
 /** Main-thread → kernel-worker. */
@@ -32,4 +35,6 @@ export type MainToKernel =
 export type KernelToMain =
   | { readonly kind: "ready" }
   | { readonly kind: "panic"; readonly message: string }
-  | ConsoleWriteMessage;
+  | ConsoleWriteMessage
+  | FbSetModeMessage
+  | FbBlitMessage;
