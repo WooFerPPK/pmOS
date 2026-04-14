@@ -353,6 +353,87 @@ impl<C: Connection> Client<C> {
         self.send_request(surface_id, 7 /* commit */, &[])
     }
 
+    /// Send `pmd_shm.create_pool(new_id, size)`. Allocates a
+    /// fresh pool id, binds it to [`Interface::ShmPool`] in
+    /// the client table, and sends the framed request.
+    ///
+    /// In the v1 native-host test path the SAB fd is not
+    /// actually transmitted — the server trusts `size`. Once
+    /// the kernel's display-server host is wired to the
+    /// ring's aux fd channel, `fd_passing` on the header
+    /// will carry the pool's SAB handle.
+    pub fn shm_create_pool(
+        &mut self,
+        shm_id: ObjectId,
+        size: u32,
+    ) -> Result<ObjectId, ClientError> {
+        let pool_id = self.bind_new(Interface::ShmPool)?;
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&pool_id.raw().to_le_bytes());
+        payload[4..].copy_from_slice(&size.to_le_bytes());
+        self.send_request(shm_id, 1 /* create_pool */, &payload)?;
+        Ok(pool_id)
+    }
+
+    /// Send `pmd_shm_pool.create_buffer(new_id, offset,
+    /// width, height, stride, format)`. Allocates a fresh
+    /// buffer id, binds it to [`Interface::Buffer`], and
+    /// sends the framed request.
+    pub fn shm_pool_create_buffer(
+        &mut self,
+        pool_id: ObjectId,
+        offset: u32,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: u32,
+    ) -> Result<ObjectId, ClientError> {
+        let buffer_id = self.bind_new(Interface::Buffer)?;
+        let mut payload = [0u8; 24];
+        payload[0..4].copy_from_slice(&buffer_id.raw().to_le_bytes());
+        payload[4..8].copy_from_slice(&offset.to_le_bytes());
+        payload[8..12].copy_from_slice(&width.to_le_bytes());
+        payload[12..16].copy_from_slice(&height.to_le_bytes());
+        payload[16..20].copy_from_slice(&stride.to_le_bytes());
+        payload[20..24].copy_from_slice(&format.to_le_bytes());
+        self.send_request(pool_id, 1 /* create_buffer */, &payload)?;
+        Ok(buffer_id)
+    }
+
+    /// Send `pmd_surface.attach(buffer_id, x, y)`. Does NOT
+    /// install any new object — the buffer is already
+    /// bound via [`Client::shm_pool_create_buffer`].
+    pub fn surface_attach(
+        &mut self,
+        surface_id: ObjectId,
+        buffer_id: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), ClientError> {
+        let mut payload = [0u8; 12];
+        payload[0..4].copy_from_slice(&buffer_id.raw().to_le_bytes());
+        payload[4..8].copy_from_slice(&x.to_le_bytes());
+        payload[8..12].copy_from_slice(&y.to_le_bytes());
+        self.send_request(surface_id, 2 /* attach */, &payload)
+    }
+
+    /// Send `pmd_surface.damage(x, y, width, height)`.
+    pub fn surface_damage(
+        &mut self,
+        surface_id: ObjectId,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), ClientError> {
+        let mut payload = [0u8; 16];
+        payload[0..4].copy_from_slice(&x.to_le_bytes());
+        payload[4..8].copy_from_slice(&y.to_le_bytes());
+        payload[8..12].copy_from_slice(&width.to_le_bytes());
+        payload[12..16].copy_from_slice(&height.to_le_bytes());
+        self.send_request(surface_id, 3 /* damage */, &payload)
+    }
+
     /// Parse as many complete server-bound events out of the
     /// input byte stream as possible. Stops at the first
     /// partial message (returning the events parsed so far

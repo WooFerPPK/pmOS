@@ -36,8 +36,9 @@ pub use events::{
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
 pub use requests::{
-    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, ShellManagerCloseWindow,
-    ShellManagerFocusWindow, ShellManagerMinimizeWindow, ShellManagerSubscribeWindows,
-    SurfaceAttach, SurfaceDamage,
+    buffer_format, CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
+    ShellManagerCloseWindow, ShellManagerFocusWindow, ShellManagerMinimizeWindow,
+    ShellManagerSubscribeWindows, ShmCreatePool, ShmPoolCreateBuffer, SurfaceAttach,
+    SurfaceDamage,
 };
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

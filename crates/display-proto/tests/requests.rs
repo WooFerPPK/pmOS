@@ -6,7 +6,8 @@
 
 use display_proto::decode::DecodeError;
 use display_proto::requests::{
-    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, SurfaceAttach, SurfaceDamage,
+    buffer_format, CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
+    ShmCreatePool, ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage,
 };
 use display_proto::ObjectId;
 
@@ -105,5 +106,58 @@ fn surface_damage_decodes_four_i32s() {
 #[test]
 fn surface_damage_rejects_truncated_payload() {
     let err = SurfaceDamage::decode(&[0u8; 12]).unwrap_err();
+    assert!(matches!(err, DecodeError::Truncated { .. }));
+}
+
+#[test]
+fn shm_create_pool_decodes_new_id_and_size() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&17u32.to_le_bytes()); // new_id
+    payload.extend_from_slice(&(64 * 1024u32).to_le_bytes()); // size
+    let req = ShmCreatePool::decode(&payload).unwrap();
+    assert_eq!(req.new_id, ObjectId::new(17));
+    assert_eq!(req.size, 64 * 1024);
+}
+
+#[test]
+fn shm_create_pool_rejects_truncated_payload() {
+    let err = ShmCreatePool::decode(&[0u8; 5]).unwrap_err();
+    assert!(matches!(err, DecodeError::Truncated { .. }));
+}
+
+#[test]
+fn shm_pool_create_buffer_decodes_all_six_fields() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&23u32.to_le_bytes()); // new_id
+    payload.extend_from_slice(&0u32.to_le_bytes()); // offset
+    payload.extend_from_slice(&320u32.to_le_bytes()); // width
+    payload.extend_from_slice(&240u32.to_le_bytes()); // height
+    payload.extend_from_slice(&(320u32 * 4).to_le_bytes()); // stride
+    payload.extend_from_slice(&buffer_format::ARGB8888.to_le_bytes()); // format
+    let req = ShmPoolCreateBuffer::decode(&payload).unwrap();
+    assert_eq!(req.new_id, ObjectId::new(23));
+    assert_eq!(req.offset, 0);
+    assert_eq!(req.width, 320);
+    assert_eq!(req.height, 240);
+    assert_eq!(req.stride, 320 * 4);
+    assert_eq!(req.format, buffer_format::ARGB8888);
+}
+
+#[test]
+fn shm_pool_create_buffer_round_trips_xrgb8888_format() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&5u32.to_le_bytes());
+    for v in [0u32, 16, 16, 64, 2] {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    let req = ShmPoolCreateBuffer::decode(&payload).unwrap();
+    assert_eq!(req.format, 2);
+    assert_ne!(req.format, buffer_format::ARGB8888);
+    assert_ne!(req.format, buffer_format::XRGB8888);
+}
+
+#[test]
+fn shm_pool_create_buffer_rejects_truncated_payload() {
+    let err = ShmPoolCreateBuffer::decode(&[0u8; 16]).unwrap_err();
     assert!(matches!(err, DecodeError::Truncated { .. }));
 }

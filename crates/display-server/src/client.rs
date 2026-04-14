@@ -48,7 +48,8 @@ use display_proto::events::{
 use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
 use display_proto::requests::{
-    CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
+    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, ShmCreatePool,
+    ShmPoolCreateBuffer,
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
@@ -279,6 +280,14 @@ impl Client {
     ///   An unknown name yields [`ClientError::UnknownInterfaceName`].
     /// * `pmd_compositor.create_surface(new_id)` — new
     ///   object at `new_id` is [`Interface::Surface`].
+    /// * `pmd_shm.create_pool(new_id, size)` — new object
+    ///   at `new_id` is [`Interface::ShmPool`]. The
+    ///   accompanying fd is signalled via the header's
+    ///   `fd_passing` count; v1 trusts `size` for the
+    ///   logical byte length.
+    /// * `pmd_shm_pool.create_buffer(new_id, ...)` — new
+    ///   object at `new_id` is [`Interface::Buffer`]. Format
+    ///   validation happens in the compositor, not here.
     ///
     /// Other requests fall through to the journal without
     /// touching the object table.
@@ -405,6 +414,28 @@ impl Client {
                     }
                 })?;
                 self.install_client_object(req.new_id, Interface::Surface)?;
+                Ok(())
+            }
+            (Interface::Shm, 1 /* create_pool */) => {
+                let req = ShmCreatePool::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                self.install_client_object(req.new_id, Interface::ShmPool)?;
+                Ok(())
+            }
+            (Interface::ShmPool, 1 /* create_buffer */) => {
+                let req = ShmPoolCreateBuffer::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                self.install_client_object(req.new_id, Interface::Buffer)?;
                 Ok(())
             }
             _ => Ok(()),

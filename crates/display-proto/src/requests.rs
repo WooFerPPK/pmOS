@@ -82,6 +82,70 @@ impl CompositorCreateSurface {
     }
 }
 
+/// `pmd_shm.create_pool(new_id, fd, size)` — spec §6 row 1.
+///
+/// The `fd` argument is carried out-of-band in the message
+/// header's `fd_passing` count — the payload itself is just
+/// `new_id` + `size`. In v1 on the native-host test path no
+/// real fd is attached; the server trusts `size` to describe
+/// the pool's logical byte length. When SharedArrayBuffer
+/// transport lands, the client will set `fd_passing = 1` and
+/// the kernel-side display-server host will pull the SAB
+/// handle off the ring's aux channel.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShmCreatePool {
+    pub new_id: ObjectId,
+    pub size: u32,
+}
+
+impl ShmCreatePool {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShmCreatePool {
+            new_id: read_object_id(payload, 0)?,
+            size: read_u32(payload, 4)?,
+        })
+    }
+}
+
+/// `pmd_shm_pool.create_buffer(new_id, offset, width,
+/// height, stride, format)` — spec §7 row 1.
+///
+/// `format` is one of the v1 pixel formats: `ARGB8888 = 0`
+/// or `XRGB8888 = 1`. Decoded as a raw `u32` here; the
+/// display server's compositor path is responsible for
+/// validating that the value is in range.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShmPoolCreateBuffer {
+    pub new_id: ObjectId,
+    pub offset: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+}
+
+impl ShmPoolCreateBuffer {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShmPoolCreateBuffer {
+            new_id: read_object_id(payload, 0)?,
+            offset: read_u32(payload, 4)?,
+            width: read_u32(payload, 8)?,
+            height: read_u32(payload, 12)?,
+            stride: read_u32(payload, 16)?,
+            format: read_u32(payload, 20)?,
+        })
+    }
+}
+
+/// Known v1 pixel formats for [`ShmPoolCreateBuffer::format`].
+/// Kept as a plain u32 constant set so the decoder doesn't
+/// have to validate — the compositor's attach/commit path
+/// owns format validation.
+pub mod buffer_format {
+    pub const ARGB8888: u32 = 0;
+    pub const XRGB8888: u32 = 1;
+}
+
 /// `pmd_surface.attach(buffer_id, x, y)` — spec §9 row 2.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceAttach {

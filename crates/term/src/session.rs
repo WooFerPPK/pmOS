@@ -109,6 +109,12 @@ pub enum SessionError {
     SurfaceAlreadyCreated,
     /// `commit` was called before `create_surface`.
     NoSurface,
+    /// A buffer-pipeline method (`create_pool`, `attach`,
+    /// ...) was called before the shm global was bound.
+    ShmNotBound,
+    /// `attach` was called with a buffer id the session's
+    /// client does not know about.
+    UnknownBuffer(ObjectId),
 }
 
 impl From<ClientError> for SessionError {
@@ -250,15 +256,94 @@ impl<C: Connection> Session<C> {
         Ok(surface_id)
     }
 
-    /// Send `surface.commit` on the session's surface. In v1
-    /// the commit carries no attached buffer — this lands
-    /// once SHM buffer allocation is wired. The important
-    /// bit for now is that the commit reaches the server
-    /// and increments its commit counter, which the future
-    /// pixel path will build on top of.
+    /// Send `surface.commit` on the session's surface. If
+    /// [`Session::attach`] was called earlier in the frame,
+    /// the commit promotes the attached buffer to the
+    /// surface's current content; otherwise the commit is a
+    /// no-op tick (still valid protocol).
     pub fn commit(&mut self) -> Result<(), SessionError> {
         let surface_id = self.surface_id.ok_or(SessionError::NoSurface)?;
         self.client.surface_commit(surface_id)?;
+        Ok(())
+    }
+
+    /// Send `shm.create_pool(size)`. Requires the shm
+    /// global to be bound. Returns the allocated pool id
+    /// so the caller can hand it to
+    /// [`Session::create_buffer`].
+    pub fn create_pool(&mut self, size: u32) -> Result<ObjectId, SessionError> {
+        let shm_id = self.bound(Interface::Shm).ok_or(SessionError::ShmNotBound)?;
+        let pool_id = self.client.shm_create_pool(shm_id, size)?;
+        Ok(pool_id)
+    }
+
+    /// Send `shm_pool.create_buffer(offset, width, height,
+    /// stride, format)` against an already-allocated pool.
+    /// Returns the allocated buffer id.
+    ///
+    /// `format` is one of the `display_proto::buffer_format`
+    /// constants — `ARGB8888` or `XRGB8888` in v1.
+    pub fn create_buffer(
+        &mut self,
+        pool_id: ObjectId,
+        offset: u32,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: u32,
+    ) -> Result<ObjectId, SessionError> {
+        let buffer_id = self
+            .client
+            .shm_pool_create_buffer(pool_id, offset, width, height, stride, format)?;
+        Ok(buffer_id)
+    }
+
+    /// Send `surface.attach(buffer_id, x, y)`. Requires
+    /// that the surface has been created and that
+    /// `buffer_id` is in the session's object table.
+    pub fn attach(
+        &mut self,
+        buffer_id: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<(), SessionError> {
+        let surface_id = self.surface_id.ok_or(SessionError::NoSurface)?;
+        if self.client.get(buffer_id) != Some(Interface::Buffer) {
+            return Err(SessionError::UnknownBuffer(buffer_id));
+        }
+        self.client.surface_attach(surface_id, buffer_id, x, y)?;
+        Ok(())
+    }
+
+    /// Send `surface.damage(x, y, width, height)`.
+    pub fn damage(
+        &mut self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), SessionError> {
+        let surface_id = self.surface_id.ok_or(SessionError::NoSurface)?;
+        self.client.surface_damage(surface_id, x, y, width, height)?;
+        Ok(())
+    }
+
+    /// Convenience wrapper: attach the given buffer at
+    /// origin, mark the entire buffer region as damaged,
+    /// and commit the surface. Equivalent to calling
+    /// [`Session::attach`] then [`Session::damage`] then
+    /// [`Session::commit`] with matching arguments — just
+    /// less typing at the call site and guaranteed to
+    /// short-circuit on the first error.
+    pub fn present(
+        &mut self,
+        buffer_id: ObjectId,
+        width: u32,
+        height: u32,
+    ) -> Result<(), SessionError> {
+        self.attach(buffer_id, 0, 0)?;
+        self.damage(0, 0, width as i32, height as i32)?;
+        self.commit()?;
         Ok(())
     }
 

@@ -618,3 +618,180 @@ fn dispatch_full_walk_display_to_compositor_to_surface_via_auto_install() {
         fd_passing: 0,
     };
 }
+
+/// Build the `pmd_shm.create_pool(new_id, size)` payload.
+/// Matches the display-proto `ShmCreatePool` decoder.
+fn shm_create_pool_payload(new_id: ObjectId, size: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&new_id.raw().to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out
+}
+
+/// Build the `pmd_shm_pool.create_buffer(new_id, offset, w,
+/// h, stride, format)` payload.
+fn shm_pool_create_buffer_payload(
+    new_id: ObjectId,
+    offset: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(&new_id.raw().to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&stride.to_le_bytes());
+    out.extend_from_slice(&format.to_le_bytes());
+    out
+}
+
+#[test]
+fn dispatch_shm_create_pool_auto_installs_shm_pool_at_new_id() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+
+    let pool_id = ObjectId::new(7);
+    let payload = shm_create_pool_payload(pool_id, 64 * 1024);
+    // fd_passing=1 signals that an SAB fd is attached
+    // out-of-band. The v1 skeleton accepts any value and
+    // just journals it — the real host will validate.
+    let header = MessageHeader::try_new(shm_id, 1, payload.len(), 1).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    assert_eq!(c.get(pool_id), Some(Interface::ShmPool));
+    let journal = c.drain_journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].interface, Interface::Shm);
+    assert_eq!(journal[0].opcode_name, "create_pool");
+    assert_eq!(journal[0].fd_passing, 1);
+}
+
+#[test]
+fn dispatch_shm_create_pool_with_truncated_payload_is_malformed() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    let header = frame_request(shm_id, 1);
+    let err = c.dispatch_request(header, &[0u8; 3]).unwrap_err();
+    assert!(matches!(err, ClientError::Malformed { .. }));
+    // No pool was installed on the failure path.
+    assert_eq!(c.object_count(), 2); // Display + Shm
+}
+
+#[test]
+fn dispatch_shm_pool_create_buffer_auto_installs_buffer_at_new_id() {
+    let mut c = Client::new(ClientId(1));
+    let pool_id = ObjectId::new(7);
+    c.install_client_object(pool_id, Interface::ShmPool).unwrap();
+
+    let buffer_id = ObjectId::new(9);
+    let payload =
+        shm_pool_create_buffer_payload(buffer_id, 0, 320, 240, 320 * 4, 0 /* ARGB8888 */);
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    assert_eq!(c.get(buffer_id), Some(Interface::Buffer));
+    let journal = c.drain_journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].interface, Interface::ShmPool);
+    assert_eq!(journal[0].opcode_name, "create_buffer");
+}
+
+#[test]
+fn dispatch_full_walk_display_to_surface_commit_with_attached_buffer() {
+    // Extended version of the compositor-create-surface walk
+    // that also threads through shm.create_pool,
+    // pool.create_buffer, surface.attach, surface.damage, and
+    // surface.commit — the full single-frame present path a
+    // real app uses.
+    let mut c = Client::new(ClientId(1));
+
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+    let pool_id = ObjectId::new(11);
+    let buffer_id = ObjectId::new(13);
+
+    // 1. get_registry → registry auto-installed.
+    let header = MessageHeader::try_new(ObjectId::DISPLAY, 2, 4, 0).unwrap();
+    c.dispatch_request(header, &new_id_payload(registry_id))
+        .unwrap();
+
+    // 2. bind compositor.
+    let payload = registry_bind_payload(1, "pmd_compositor", 1, compositor_id);
+    let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // 3. bind shm.
+    let payload = registry_bind_payload(2, "pmd_shm", 1, shm_id);
+    let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // 4. compositor.create_surface.
+    let payload = new_id_payload(surface_id);
+    let header = MessageHeader::try_new(compositor_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // 5. shm.create_pool.
+    let payload = shm_create_pool_payload(pool_id, 320 * 240 * 4);
+    let header = MessageHeader::try_new(shm_id, 1, payload.len(), 1).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // 6. pool.create_buffer.
+    let payload =
+        shm_pool_create_buffer_payload(buffer_id, 0, 320, 240, 320 * 4, 0);
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // 7. surface.attach(buffer_id, 0, 0). Payload is
+    //    (u32 buffer_id, i32 x, i32 y) = 12 bytes.
+    let mut payload = Vec::with_capacity(12);
+    payload.extend_from_slice(&buffer_id.raw().to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    payload.extend_from_slice(&0i32.to_le_bytes());
+    let header = MessageHeader::try_new(surface_id, 2, 12, 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // 8. surface.damage(0, 0, 320, 240) — four i32s.
+    let mut payload = Vec::with_capacity(16);
+    for v in [0i32, 0, 320, 240] {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    let header = MessageHeader::try_new(surface_id, 3, 16, 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // 9. surface.commit.
+    let header = frame_request(surface_id, 7);
+    c.dispatch_request(header, &[]).unwrap();
+
+    // Object table has every allocated binding.
+    assert_eq!(c.get(registry_id), Some(Interface::Registry));
+    assert_eq!(c.get(compositor_id), Some(Interface::Compositor));
+    assert_eq!(c.get(shm_id), Some(Interface::Shm));
+    assert_eq!(c.get(surface_id), Some(Interface::Surface));
+    assert_eq!(c.get(pool_id), Some(Interface::ShmPool));
+    assert_eq!(c.get(buffer_id), Some(Interface::Buffer));
+
+    // Journal contains every dispatched request in order.
+    let journal = c.drain_journal();
+    let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "get_registry",
+            "bind",
+            "bind",
+            "create_surface",
+            "create_pool",
+            "create_buffer",
+            "attach",
+            "damage",
+            "commit",
+        ]
+    );
+}

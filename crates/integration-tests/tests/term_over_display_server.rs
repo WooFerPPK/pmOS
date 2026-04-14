@@ -400,6 +400,246 @@ fn term_pump_before_start_returns_not_started() {
     assert!(matches!(err, term::SessionError::NotStarted));
 }
 
+// ---- SHM pool + buffer + attach/damage/commit pipeline ---------
+
+#[test]
+fn term_create_pool_before_shm_bound_returns_shm_not_bound() {
+    let mut session = make_session();
+    session.start().unwrap();
+    let err = session.create_pool(1024).unwrap_err();
+    assert!(matches!(err, term::SessionError::ShmNotBound));
+}
+
+#[test]
+fn term_create_pool_reaches_server_as_shm_create_pool() {
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    let pool_id = session.create_pool(320 * 240 * 4).unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let journal = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].interface, Interface::Shm);
+    assert_eq!(journal[0].opcode_name, "create_pool");
+
+    // Server's object table has the pool id at the new id
+    // the session allocated.
+    assert_eq!(
+        server.client(server_client_id).unwrap().get(pool_id),
+        Some(display_proto::Interface::ShmPool)
+    );
+}
+
+#[test]
+fn term_create_buffer_on_a_pool_reaches_server_as_pool_create_buffer() {
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    let pool_id = session.create_pool(320 * 240 * 4).unwrap();
+    let buffer_id = session
+        .create_buffer(
+            pool_id,
+            0,
+            320,
+            240,
+            320 * 4,
+            display_proto::buffer_format::ARGB8888,
+        )
+        .unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let journal = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+    assert_eq!(journal.len(), 2);
+    assert_eq!(journal[0].opcode_name, "create_pool");
+    assert_eq!(journal[1].interface, Interface::ShmPool);
+    assert_eq!(journal[1].opcode_name, "create_buffer");
+
+    // Server's object table has the buffer.
+    assert_eq!(
+        server.client(server_client_id).unwrap().get(buffer_id),
+        Some(display_proto::Interface::Buffer)
+    );
+}
+
+#[test]
+fn term_attach_rejects_buffer_id_the_client_does_not_know_about() {
+    let (mut session, _server, _id) = boot_term_session();
+    let stray = display_proto::ObjectId::new(999);
+    let err = session.attach(stray, 0, 0).unwrap_err();
+    assert!(matches!(
+        err,
+        term::SessionError::UnknownBuffer(id) if id == stray
+    ));
+}
+
+#[test]
+fn term_present_round_trips_attach_damage_commit_in_order() {
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    // Build a buffer that'll stand in for the rendered
+    // scrollback. Size = ARGB8888 320x240.
+    let pool_size = 320u32 * 240 * 4;
+    let pool_id = session.create_pool(pool_size).unwrap();
+    let buffer_id = session
+        .create_buffer(
+            pool_id,
+            0,
+            320,
+            240,
+            320 * 4,
+            display_proto::buffer_format::ARGB8888,
+        )
+        .unwrap();
+
+    // Fire attach + damage + commit via the convenience
+    // wrapper.
+    session.present(buffer_id, 320, 240).unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Server's journal shows the full pipeline in order.
+    let journal = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+    let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "create_pool",
+            "create_buffer",
+            "attach",
+            "damage",
+            "commit",
+        ]
+    );
+}
+
+#[test]
+fn term_attach_damage_commit_separately_is_equivalent_to_present() {
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    let pool_id = session.create_pool(4).unwrap();
+    let buffer_id = session
+        .create_buffer(pool_id, 0, 1, 1, 4, display_proto::buffer_format::XRGB8888)
+        .unwrap();
+
+    session.attach(buffer_id, 3, 5).unwrap();
+    session.damage(0, 0, 1, 1).unwrap();
+    session.commit().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let journal = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+    let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "create_pool",
+            "create_buffer",
+            "attach",
+            "damage",
+            "commit",
+        ]
+    );
+    // attach payload is (u32 buffer_id, i32 x, i32 y) = 12 bytes.
+    let attach_entry = &journal[2];
+    assert_eq!(attach_entry.payload_len, 12);
+    // damage payload is four i32s = 16 bytes.
+    let damage_entry = &journal[3];
+    assert_eq!(damage_entry.payload_len, 16);
+}
+
+#[test]
+fn term_multiple_frames_share_one_pool_and_buffer() {
+    // A terminal redrawing its scrollback does not need to
+    // reallocate the pool or the buffer every frame — it
+    // reattaches the same buffer after updating its pixels.
+    // This test proves the protocol-level expectation: we
+    // can fire attach/damage/commit repeatedly on the same
+    // buffer id.
+    let (mut session, mut server, server_client_id) = boot_term_session();
+
+    let pool_id = session.create_pool(64).unwrap();
+    let buffer_id = session
+        .create_buffer(pool_id, 0, 2, 2, 8, display_proto::buffer_format::ARGB8888)
+        .unwrap();
+    // Drain the pool+buffer journal so the assert below
+    // only sees the frames.
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+
+    for _ in 0..3 {
+        session.present(buffer_id, 2, 2).unwrap();
+    }
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let journal = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+    assert_eq!(journal.len(), 9); // 3 frames × (attach + damage + commit)
+    let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "attach", "damage", "commit", "attach", "damage", "commit", "attach",
+            "damage", "commit",
+        ]
+    );
+}
+
+#[test]
+fn term_attach_without_surface_returns_no_surface() {
+    let mut session = make_session();
+    session.start().unwrap();
+    let err = session
+        .attach(display_proto::ObjectId::new(99), 0, 0)
+        .unwrap_err();
+    assert!(matches!(err, term::SessionError::NoSurface));
+}
+
+#[test]
+fn term_damage_without_surface_returns_no_surface() {
+    let mut session = make_session();
+    session.start().unwrap();
+    let err = session.damage(0, 0, 10, 10).unwrap_err();
+    assert!(matches!(err, term::SessionError::NoSurface));
+}
+
 // Silence the `MessageHeader` import — referenced via
 // `display_proto::wire::MessageHeader` in `split_first_message`.
 #[allow(dead_code)]
