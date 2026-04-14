@@ -348,3 +348,91 @@ describe("fauxShellTransform", () => {
     expect(new TextDecoder().decode(out)).toBe("?\n");
   });
 });
+
+describe("MockKernel panic command", () => {
+  it("'panic <message>' calls the configured panicEmit sink", () => {
+    const panics: string[] = [];
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      panicEmit: (m) => panics.push(m),
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+
+    mock.injectInput(
+      DEV_CONSOLE_NODE,
+      new TextEncoder().encode("panic kernel exploded\n"),
+    );
+
+    expect(panics).toEqual(["kernel: kernel exploded"]);
+    // Panic short-circuits — no console:write goes out.
+    const consoleCalls = scaffold.calls.filter(
+      (c) => c.driverId === CONSOLE_DRIVER_ID,
+    );
+    expect(consoleCalls).toHaveLength(0);
+  });
+
+  it("'panic' with no message emits a default notice", () => {
+    const panics: string[] = [];
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      panicEmit: (m) => panics.push(m),
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("panic\n"));
+    expect(panics).toHaveLength(1);
+    expect(panics[0]).toContain("no message");
+  });
+
+  it("'panic' command in echo policy mode also fires the sink", () => {
+    // The panic interceptor lives at the line-flush
+    // layer, not inside the policy switch, so it works
+    // regardless of which policy is active.
+    const panics: string[] = [];
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      panicEmit: (m) => panics.push(m),
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("panic boom\n"));
+    expect(panics).toEqual(["kernel: boom"]);
+  });
+
+  it("without a panicEmit sink, 'panic' is silently swallowed", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      // No panicEmit configured.
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("panic test\n"));
+    // No console:write either — panic short-circuits.
+    expect(scaffold.calls.filter((c) => c.driverId === CONSOLE_DRIVER_ID)).toHaveLength(0);
+  });
+
+  it("a normal command after a panic still works", () => {
+    const panics: string[] = [];
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      panicEmit: (m) => panics.push(m),
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("panic first\n"));
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("echo hello\n"));
+
+    expect(panics).toEqual(["kernel: first"]);
+    const writes = scaffold.calls.filter((c) => c.driverId === CONSOLE_DRIVER_ID);
+    expect(writes).toHaveLength(1);
+    expect(new TextDecoder().decode(writes[0]?.payload)).toBe("hello\n");
+  });
+
+  it("FAUX_SHELL_HELP advertises the panic command", async () => {
+    const { FAUX_SHELL_HELP } = await import("../../src/mock-kernel");
+    const text = FAUX_SHELL_HELP.join("\n");
+    expect(text).toContain("panic");
+  });
+});

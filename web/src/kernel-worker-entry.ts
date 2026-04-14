@@ -86,6 +86,12 @@ export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
         // console input. The scaffold's fb driver routes it
         // to the main-thread FbHost.
         emitSplashOnFirstInput: msg.config.enableFramebuffer,
+        // Wire the kernel panic sink to a postMessage on
+        // the main-thread channel. This is what
+        // bootstrap.ts's panic overlay listens on.
+        panicEmit: (message: string) => {
+          messaging.postMessage({ kind: "panic", message });
+        },
       });
       scaffold = bootKernelWorker({
         kernel: mock,

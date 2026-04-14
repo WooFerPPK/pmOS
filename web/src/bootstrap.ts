@@ -441,6 +441,17 @@ function main(): void {
       repaint();
       return;
     }
+    // Surface any kernel-emitted panic through the
+    // existing #pmos-panic overlay. Panics originate
+    // inside the Worker (mock kernel `panic <msg>`
+    // command, future real-kernel `Platform::halt`
+    // call, etc.) and arrive on the ConsoleHost's
+    // lifecycle channel.
+    session.console.onLifecycle((event) => {
+      if (event.kind === "panic") {
+        showPanic(event.message);
+      }
+    });
 
     // First blit briefly paints the splash, then hands the
     // canvas over to interactive-terminal mode ~600ms later

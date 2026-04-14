@@ -176,6 +176,27 @@ describe("installWorkerEntry", () => {
     }
   });
 
+  it("'panic <message>' typed at the faux shell flows through as a panic event", () => {
+    const msg = makeMessaging();
+    installWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      config: { enableConsole: true, enableInput: false, enableFramebuffer: false },
+    });
+    msg.send({
+      kind: "console:input",
+      bytes: new TextEncoder().encode("panic kernel exploded\n"),
+    });
+
+    const panic = msg.posted.find((m) => m.kind === "panic");
+    expect(panic).toBeDefined();
+    if (panic && panic.kind === "panic") {
+      expect(panic.message).toContain("kernel exploded");
+    }
+    // No console:write was produced — panic short-circuits.
+    expect(msg.posted.some((m) => m.kind === "console:write")).toBe(false);
+  });
+
   it("boot with enableFramebuffer=false does NOT emit a splash on first input", () => {
     const msg = makeMessaging();
     installWorkerEntry(msg);

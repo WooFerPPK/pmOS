@@ -61,6 +61,21 @@ export interface MockKernelOptions {
    * false so existing tests are unaffected.
    */
   readonly emitSplashOnFirstInput?: boolean;
+  /**
+   * Optional sink for `panic` events. When set and the
+   * mock's faux shell encounters a `panic <message>`
+   * command, the message is forwarded here. Production
+   * wires this to `messaging.postMessage({kind: "panic",
+   * message})` so the bootstrap's panic overlay can show
+   * it; tests pass a capturing closure.
+   *
+   * The kernel-side analogue is `Platform::halt(reason)`.
+   * The mock doesn't actually halt — it just emits the
+   * notice and lets the caller decide what to do — but
+   * the demo's bootstrap reloads after 5s on a panic,
+   * matching the real kernel halt path's contract.
+   */
+  readonly panicEmit?: (message: string) => void;
 }
 
 /**
@@ -72,6 +87,7 @@ export class MockKernel implements Kernel {
   private scaffold: KernelWorker | undefined;
   private readonly policy: MockEchoPolicy;
   private readonly emitSplashOnFirstInput: boolean;
+  private readonly panicEmit: ((message: string) => void) | undefined;
   private splashEmitted = false;
   /** Per-devnum line buffers. Flushed on newline. */
   private readonly lineBuffers = new Map<number, number[]>();
@@ -79,6 +95,7 @@ export class MockKernel implements Kernel {
   constructor(options: MockKernelOptions) {
     this.policy = options.policy;
     this.emitSplashOnFirstInput = options.emitSplashOnFirstInput ?? false;
+    this.panicEmit = options.panicEmit;
   }
 
   /**
@@ -147,6 +164,12 @@ export class MockKernel implements Kernel {
       return;
     }
     const line = Uint8Array.from(lineBytes);
+    // The `panic <message>` command intercepts before the
+    // policy runs because panic is a kernel-level
+    // lifecycle event, not console output.
+    if (this.tryHandlePanicCommand(line)) {
+      return;
+    }
     const output = this.applyPolicy(line);
     if (output.byteLength === 0) {
       return;
@@ -155,6 +178,32 @@ export class MockKernel implements Kernel {
     // console is the only devnum we understand.
     void devnum;
     scaffold.callDriver(CONSOLE_DRIVER_ID, OP_WRITE_LINE, output);
+  }
+
+  /**
+   * If `line` is a `panic <message>` command, forward
+   * the message to `panicEmit` (if wired) and return
+   * true to short-circuit the rest of line handling.
+   * Returns false otherwise.
+   */
+  private tryHandlePanicCommand(line: Uint8Array): boolean {
+    // Strip trailing newline.
+    let end = line.byteLength;
+    if (end > 0 && line[end - 1] === 0x0a) {
+      end -= 1;
+    }
+    const body = line.subarray(0, end);
+    const text = new TextDecoder().decode(body);
+    if (text === "panic") {
+      this.panicEmit?.("kernel: panic command received with no message");
+      return true;
+    }
+    if (text.startsWith("panic ")) {
+      const message = text.slice("panic ".length);
+      this.panicEmit?.(`kernel: ${message}`);
+      return true;
+    }
+    return false;
   }
 
   private applyPolicy(line: Uint8Array): Uint8Array {
@@ -179,6 +228,7 @@ export const FAUX_SHELL_HELP: ReadonlyArray<string> = [
   "  date     — print build date",
   "  whoami   — print current user",
   "  uname    — print system banner",
+  "  panic X  — trigger a kernel panic with message X",
 ];
 
 /**
