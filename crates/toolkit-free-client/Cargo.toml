@@ -7,10 +7,22 @@ license.workspace = true
 # NO dependency on the `toolkit` crate — this fixture exists to
 # demonstrate that the display-server wire protocol is the source
 # of truth (Principle VII) and that an app can speak it directly
-# without the toolkit.
+# without the toolkit. `display-proto` IS allowed because that
+# crate is the wire-format source of truth shared between server
+# and any client; depending on it is equivalent to reading the
+# protocol spec.
+
+[lib]
+name = "toolkit_free_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "toolkit-free-client"
 path = "src/main.rs"
 
 [dependencies]
 abi = { path = "../abi" }
+display-proto = { path = "../display-proto" }
+
+[dev-dependencies]
+display-server = { path = "../display-server" }
