@@ -122,6 +122,14 @@ fn attach_damage_commit_sequence_reaches_the_server_in_order() {
     // way to create one through the public protocol is via
     // compositor.create_surface. So we walk the whole
     // bind-compositor-create-surface preamble first.
+    //
+    // Note: `attach(NULL)` is the "detach" form that
+    // bypasses the server's buffer-id validation (added
+    // with the minimal compositor slice) without needing
+    // to bind shm + allocate a real pool/buffer. This test
+    // is about wire ordering, not buffer lifecycle — the
+    // `shm_create_pool_*` conformance tests cover the
+    // real buffer path.
     let mut server = Server::new();
     let server_client_id = server.accept();
 
@@ -132,7 +140,7 @@ fn attach_damage_commit_sequence_reaches_the_server_in_order() {
         .unwrap();
     let surface = client.compositor_create_surface(compositor).unwrap();
 
-    client.surface_attach(surface, ObjectId::new(9), 0, 0).unwrap();
+    client.surface_attach(surface, ObjectId::NULL, 0, 0).unwrap();
     client.surface_damage(surface, 0, 0, 32, 32).unwrap();
     client.surface_commit(surface).unwrap();
 

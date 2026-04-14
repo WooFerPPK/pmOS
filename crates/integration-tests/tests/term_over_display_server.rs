@@ -745,6 +745,217 @@ fn server_rejects_create_buffer_that_does_not_fit_in_its_pool() {
 }
 
 #[test]
+fn server_framebuffer_receives_committed_pixels_on_surface_commit() {
+    // The big-picture end-to-end test: client writes
+    // pixels → present() → the server's global
+    // framebuffer contains the pixels at the attachment
+    // origin. This is the first slice where the full
+    // "client → display server → screen" path exists.
+    use display_server::Server as DisplayServerStateBig;
+    // Shrink the server's framebuffer so the test works
+    // with small assertions.
+    let mut server = DisplayServerStateBig::with_framebuffer_size(4, 4);
+    let server_client_id = server.accept_with_caps(APP_CAPS);
+
+    let mut session = make_session();
+    session.start().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    let registry_id = session.registry_id().unwrap();
+    {
+        let c = server.client_mut(server_client_id).unwrap();
+        c.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
+        c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
+    }
+    pump_events_into_term(&mut server, server_client_id, &mut session);
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    session.create_surface().unwrap();
+    let pool_id = session.create_pool(4 * 4 * 4).unwrap();
+    let buffer_id = session
+        .create_buffer(pool_id, 0, 2, 2, 8, display_proto::buffer_format::ARGB8888)
+        .unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Pre-paint the framebuffer so we can detect the blit.
+    server.framebuffer_mut().clear(0xFF00_0000); // black
+
+    // Simulate a client SAB write into the pool: a 2×2
+    // red-green-blue-yellow quad.
+    let bytes = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .pool_bytes_mut(pool_id)
+        .unwrap();
+    bytes[0..4].copy_from_slice(&[0x00, 0x00, 0xFF, 0xFF]); // (0,0) red
+    bytes[4..8].copy_from_slice(&[0x00, 0xFF, 0x00, 0xFF]); // (1,0) green
+    bytes[8..12].copy_from_slice(&[0xFF, 0x00, 0x00, 0xFF]); // (0,1) blue
+    bytes[12..16].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF]); // (1,1) yellow
+
+    // Attach at (1, 1) so the test also exercises the
+    // origin offset — not just (0, 0).
+    session.attach(buffer_id, 1, 1).unwrap();
+    session.damage(0, 0, 2, 2).unwrap();
+    session.commit().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // The server's framebuffer now carries the quad at
+    // (1..3, 1..3) with the rest still black.
+    let fb = server.framebuffer();
+    assert_eq!(fb.width(), 4);
+    assert_eq!(fb.height(), 4);
+    // Outside the attached rectangle — still the clear
+    // colour.
+    assert_eq!(fb.pixel(0, 0).unwrap(), &[0x00, 0x00, 0x00, 0xFF]);
+    assert_eq!(fb.pixel(3, 0).unwrap(), &[0x00, 0x00, 0x00, 0xFF]);
+    assert_eq!(fb.pixel(0, 3).unwrap(), &[0x00, 0x00, 0x00, 0xFF]);
+    // Inside — the quad.
+    assert_eq!(fb.pixel(1, 1).unwrap(), &[0x00, 0x00, 0xFF, 0xFF]);
+    assert_eq!(fb.pixel(2, 1).unwrap(), &[0x00, 0xFF, 0x00, 0xFF]);
+    assert_eq!(fb.pixel(1, 2).unwrap(), &[0xFF, 0x00, 0x00, 0xFF]);
+    assert_eq!(fb.pixel(2, 2).unwrap(), &[0x00, 0xFF, 0xFF, 0xFF]);
+}
+
+#[test]
+fn server_framebuffer_gets_new_pixels_on_each_commit_cycle() {
+    use display_server::Server as DisplayServerStateBig;
+    let mut server = DisplayServerStateBig::with_framebuffer_size(2, 2);
+    let server_client_id = server.accept_with_caps(APP_CAPS);
+    let mut session = make_session();
+    session.start().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    let registry_id = session.registry_id().unwrap();
+    {
+        let c = server.client_mut(server_client_id).unwrap();
+        c.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
+        c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
+    }
+    pump_events_into_term(&mut server, server_client_id, &mut session);
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    session.create_surface().unwrap();
+    let pool_id = session.create_pool(16).unwrap();
+    let buffer_id = session
+        .create_buffer(pool_id, 0, 2, 2, 8, display_proto::buffer_format::ARGB8888)
+        .unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    for frame in 0..4u8 {
+        // Paint every pixel the same ramp value for this
+        // frame.
+        let bytes = server
+            .client_mut(server_client_id)
+            .unwrap()
+            .pool_bytes_mut(pool_id)
+            .unwrap();
+        for px in bytes.chunks_exact_mut(4) {
+            px[0] = frame;
+            px[1] = frame;
+            px[2] = frame;
+            px[3] = 0xFF;
+        }
+        session.present(buffer_id, 2, 2).unwrap();
+        pump_requests_into_server(
+            &mut server,
+            server_client_id,
+            session.drain_outbound(),
+        );
+
+        // Every pixel on the server's framebuffer is now
+        // this frame's ramp value.
+        let fb = server.framebuffer();
+        for y in 0..2u32 {
+            for x in 0..2u32 {
+                assert_eq!(
+                    fb.pixel(x, y).unwrap(),
+                    &[frame, frame, frame, 0xFF],
+                    "frame {frame} at ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn server_commit_without_attach_does_not_touch_framebuffer() {
+    // A commit with nothing ever attached is a legal
+    // no-op. The framebuffer should stay exactly as it
+    // was before the commit.
+    use display_server::Server as DisplayServerStateBig;
+    let mut server = DisplayServerStateBig::with_framebuffer_size(2, 2);
+    let server_client_id = server.accept_with_caps(APP_CAPS);
+    let mut session = make_session();
+    session.start().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    let registry_id = session.registry_id().unwrap();
+    {
+        let c = server.client_mut(server_client_id).unwrap();
+        c.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
+        c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
+    }
+    pump_events_into_term(&mut server, server_client_id, &mut session);
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    session.create_surface().unwrap();
+
+    // Paint the framebuffer a distinctive colour.
+    server.framebuffer_mut().clear(0xFFAA_BBCC); // ARGB
+
+    // Commit without an attach.
+    session.commit().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Framebuffer is unchanged.
+    let fb = server.framebuffer();
+    for px in fb.pixels().chunks_exact(4) {
+        // 0xFFAABBCC → (B=CC, G=BB, R=AA, A=FF) in bgra.
+        assert_eq!(px, &[0xCC, 0xBB, 0xAA, 0xFF]);
+    }
+    // But the commit counter DID increment on the client
+    // side — the dispatch path ran, it just had nothing
+    // to blit.
+    let server_client = server.client(server_client_id).unwrap();
+    let surface_id = session.surface_id().unwrap();
+    assert_eq!(server_client.surface(surface_id).unwrap().commit_count, 1);
+}
+
+#[test]
 fn server_pool_storage_persists_across_multiple_present_cycles() {
     // A terminal redrawing its scrollback reuses the same
     // pool + buffer for every frame. Each frame the client

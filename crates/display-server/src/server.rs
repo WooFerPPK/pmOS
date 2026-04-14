@@ -17,6 +17,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::client::{Client, ClientError, ClientId};
+use crate::compositor::{Framebuffer, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use display_proto::objects::Interface;
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
 /// Errors surfaced by [`Server`] operations. Most of them are
@@ -50,14 +52,45 @@ impl From<ClientError> for ServerError {
 pub struct Server {
     next_client_id: u32,
     clients: BTreeMap<ClientId, Client>,
+    /// The composed output framebuffer that every committed
+    /// surface blits into. v1 is a single global output at
+    /// [`DEFAULT_WIDTH`] × [`DEFAULT_HEIGHT`]; real
+    /// multi-output support lands with the kernel-side
+    /// `Fb` driver.
+    framebuffer: Framebuffer,
 }
 
 impl Server {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Server::with_framebuffer_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+    }
+
+    /// Build a server whose composed framebuffer is
+    /// `width × height`. Tests use this to keep the
+    /// allocated pixel buffer small and to produce
+    /// deterministic clipping boundaries.
+    pub fn with_framebuffer_size(width: u32, height: u32) -> Self {
         Server {
             next_client_id: 1,
             clients: BTreeMap::new(),
+            framebuffer: Framebuffer::new(width, height),
         }
+    }
+
+    /// Borrow the composed output framebuffer. Every
+    /// committed surface's current buffer has been blitted
+    /// into this; a future `Fb` driver bridge will read
+    /// the pixels here on each frame tick.
+    pub fn framebuffer(&self) -> &Framebuffer {
+        &self.framebuffer
+    }
+
+    /// Mutable access to the framebuffer. Useful in tests
+    /// that want to pre-fill with a distinctive background
+    /// colour before asserting a blit landed in the
+    /// expected rectangle.
+    pub fn framebuffer_mut(&mut self) -> &mut Framebuffer {
+        &mut self.framebuffer
     }
 
     /// Accept a new client connection. Returns the
@@ -128,6 +161,14 @@ impl Server {
     /// message starting at offset 0; callers should frame
     /// their byte stream with [`MessageHeader::decode`] first
     /// to know how many bytes to pass.
+    ///
+    /// If the dispatched request is a `pmd_surface.commit`,
+    /// the server's minimal compositor runs after the
+    /// client-side state transition: the newly-current
+    /// buffer's pixels are blitted into [`Self::framebuffer`]
+    /// at the attachment's origin. This is how a
+    /// client-side pool write becomes a "pixel on the
+    /// screen" in the v1 skeleton.
     pub fn dispatch_request(
         &mut self,
         client_id: ClientId,
@@ -136,12 +177,73 @@ impl Server {
         let header = MessageHeader::decode(bytes)?;
         let payload_end = header.length as usize;
         let payload = &bytes[HEADER_SIZE..payload_end];
+
+        // Peek at the target object's interface BEFORE
+        // dispatch so we can tell whether this request is
+        // a surface commit. After dispatch the client's
+        // state has already been mutated.
+        let pre_interface = self
+            .clients
+            .get(&client_id)
+            .and_then(|c| c.get(header.object_id));
+
         let client = self
             .clients
             .get_mut(&client_id)
             .ok_or(ServerError::NoSuchClient { id: client_id })?;
         client.dispatch_request(header, payload)?;
+
+        if pre_interface == Some(Interface::Surface)
+            && header.opcode == 7 /* commit */
+        {
+            self.composite_surface_commit(client_id, header.object_id);
+        }
+
         Ok(())
+    }
+
+    /// Blit a surface's current buffer into the server's
+    /// framebuffer. Called by [`Server::dispatch_request`]
+    /// after a `pmd_surface.commit` has promoted the
+    /// pending buffer to current on the client side. Silently
+    /// no-ops if any of the required state is missing —
+    /// the client may have legitimately committed a surface
+    /// with nothing attached.
+    fn composite_surface_commit(
+        &mut self,
+        client_id: ClientId,
+        surface_id: display_proto::ids::ObjectId,
+    ) {
+        // Destructure `self` so the immutable borrow on
+        // `clients` and the mutable borrow on `framebuffer`
+        // are disjoint as far as the borrow checker is
+        // concerned.
+        let Server {
+            clients,
+            framebuffer,
+            ..
+        } = self;
+        let Some(client) = clients.get(&client_id) else {
+            return;
+        };
+        let Some(surface) = client.surfaces.get(&surface_id) else {
+            return;
+        };
+        let Some(attachment) = surface.current_buffer else {
+            return;
+        };
+        let Some(info) = client.buffers.get(&attachment.buffer_id) else {
+            return;
+        };
+        let Some(pool) = client.pools.get(&info.pool_id) else {
+            return;
+        };
+        let start = info.offset as usize;
+        let end = info.byte_end() as usize;
+        let Some(src_bytes) = pool.storage.get(start..end) else {
+            return;
+        };
+        framebuffer.blit_buffer(info, src_bytes, attachment.x, attachment.y);
     }
 }
 

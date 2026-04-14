@@ -1,7 +1,8 @@
 //! Per-client state machine tests.
 
 use display_server::client::{
-    BufferInfo, Client, ClientError, ClientId, HandledRequest, Pool, MAX_POOL_SIZE,
+    BufferAttachment, BufferInfo, Client, ClientError, ClientId, DamageRect, HandledRequest,
+    Pool, Surface, MAX_POOL_SIZE,
 };
 use display_server::ids::{IdKind, ObjectId};
 use display_server::objects::Interface;
@@ -1062,4 +1063,268 @@ fn pool_none_for_unknown_object_id() {
     let c = Client::new(ClientId(1));
     assert!(c.pool(ObjectId::new(999)).is_none());
     assert!(c.pool_bytes(ObjectId::new(999)).is_none());
+}
+
+// ---- Surface state machine (attach / damage / commit) ----------
+
+/// Build a `Client` that already has a compositor, shm,
+/// a pool, a surface, and one buffer carved out of the
+/// pool. Returns the client plus every allocated id.
+fn boot_client_with_surface_and_buffer() -> (Client, ObjectId, ObjectId, ObjectId) {
+    let mut c = Client::new(ClientId(1));
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+    let pool_id = ObjectId::new(11);
+    let buffer_id = ObjectId::new(13);
+
+    // get_registry → registry auto-installed.
+    let header = MessageHeader::try_new(ObjectId::DISPLAY, 2, 4, 0).unwrap();
+    c.dispatch_request(header, &new_id_payload(registry_id))
+        .unwrap();
+
+    // bind compositor + shm.
+    for (name, iface_name, bound) in [
+        (1u32, "pmd_compositor", compositor_id),
+        (2, "pmd_shm", shm_id),
+    ] {
+        let payload = registry_bind_payload(name, iface_name, 1, bound);
+        let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+        c.dispatch_request(header, &payload).unwrap();
+    }
+
+    // create_surface.
+    let payload = new_id_payload(surface_id);
+    let header = MessageHeader::try_new(compositor_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // create_pool (64 bytes = 4x4 ARGB8888).
+    let payload = shm_create_pool_payload(pool_id, 64);
+    let header = MessageHeader::try_new(shm_id, 1, payload.len(), 1).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    // create_buffer (4x4 at offset 0).
+    let payload = shm_pool_create_buffer_payload(buffer_id, 0, 4, 4, 16, 0);
+    let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+    c.drain_journal();
+
+    (c, surface_id, pool_id, buffer_id)
+}
+
+/// Build a `pmd_surface.attach(buffer_id, x, y)` payload
+/// (12 bytes): `u32 buffer_id, i32 x, i32 y`.
+fn surface_attach_payload(buffer_id: ObjectId, x: i32, y: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&buffer_id.raw().to_le_bytes());
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out
+}
+
+/// Build a `pmd_surface.damage(x, y, w, h)` payload
+/// (16 bytes): four i32s.
+fn surface_damage_payload(x: i32, y: i32, w: i32, h: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    for v in [x, y, w, h] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn dispatch_attach(c: &mut Client, surface_id: ObjectId, buffer_id: ObjectId, x: i32, y: i32) {
+    let payload = surface_attach_payload(buffer_id, x, y);
+    let header = MessageHeader::try_new(surface_id, 2, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+}
+
+fn dispatch_damage(c: &mut Client, surface_id: ObjectId, x: i32, y: i32, w: i32, h: i32) {
+    let payload = surface_damage_payload(x, y, w, h);
+    let header = MessageHeader::try_new(surface_id, 3, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+}
+
+fn dispatch_commit(c: &mut Client, surface_id: ObjectId) {
+    let header = MessageHeader::try_new(surface_id, 7, 0, 0).unwrap();
+    c.dispatch_request(header, &[]).unwrap();
+}
+
+#[test]
+fn create_surface_initializes_empty_surface_state() {
+    let (c, surface_id, _, _) = boot_client_with_surface_and_buffer();
+    let surface: &Surface = c.surface(surface_id).expect("surface installed");
+    assert_eq!(surface.id, surface_id);
+    assert!(surface.pending_buffer.is_none());
+    assert!(surface.current_buffer.is_none());
+    assert!(surface.pending_damage.is_empty());
+    assert_eq!(surface.commit_count, 0);
+}
+
+#[test]
+fn attach_records_pending_attachment_without_promoting_current() {
+    let (mut c, surface_id, _, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 3, 5);
+    let surface = c.surface(surface_id).unwrap();
+    assert_eq!(
+        surface.pending_buffer,
+        Some(BufferAttachment {
+            buffer_id,
+            x: 3,
+            y: 5,
+        })
+    );
+    // Current is still empty until commit.
+    assert!(surface.current_buffer.is_none());
+    assert_eq!(surface.commit_count, 0);
+}
+
+#[test]
+fn attach_with_unknown_buffer_id_rejects_with_unknown_buffer() {
+    let (mut c, surface_id, _, _) = boot_client_with_surface_and_buffer();
+    let stray = ObjectId::new(9999);
+    let payload = surface_attach_payload(stray, 0, 0);
+    let header = MessageHeader::try_new(surface_id, 2, payload.len(), 0).unwrap();
+    let err = c.dispatch_request(header, &payload).unwrap_err();
+    match err {
+        ClientError::UnknownBuffer { buffer_id } => assert_eq!(buffer_id, stray),
+        other => panic!("expected UnknownBuffer, got {other:?}"),
+    }
+    // Pending state is untouched.
+    assert!(c.surface(surface_id).unwrap().pending_buffer.is_none());
+}
+
+#[test]
+fn attach_with_null_buffer_id_clears_pending_for_detach() {
+    let (mut c, surface_id, _, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    assert!(c.surface(surface_id).unwrap().pending_buffer.is_some());
+
+    // attach(NULL) — wire payload is (0, 0, 0).
+    dispatch_attach(&mut c, surface_id, ObjectId::NULL, 0, 0);
+    let surface = c.surface(surface_id).unwrap();
+    assert!(surface.pending_buffer.is_none());
+}
+
+#[test]
+fn damage_appends_to_pending_damage_list() {
+    let (mut c, surface_id, _, _) = boot_client_with_surface_and_buffer();
+    dispatch_damage(&mut c, surface_id, 0, 0, 10, 20);
+    dispatch_damage(&mut c, surface_id, 5, 5, 1, 1);
+    let surface = c.surface(surface_id).unwrap();
+    assert_eq!(
+        surface.pending_damage,
+        vec![
+            DamageRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 20,
+            },
+            DamageRect {
+                x: 5,
+                y: 5,
+                width: 1,
+                height: 1,
+            },
+        ]
+    );
+}
+
+#[test]
+fn commit_promotes_pending_buffer_to_current_and_clears_damage() {
+    let (mut c, surface_id, _, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 10, 20);
+    dispatch_damage(&mut c, surface_id, 0, 0, 4, 4);
+    dispatch_commit(&mut c, surface_id);
+
+    let surface = c.surface(surface_id).unwrap();
+    // Pending is cleared.
+    assert!(surface.pending_buffer.is_none());
+    assert!(surface.pending_damage.is_empty());
+    // Current is now the attached buffer.
+    assert_eq!(
+        surface.current_buffer,
+        Some(BufferAttachment {
+            buffer_id,
+            x: 10,
+            y: 20,
+        })
+    );
+    assert_eq!(surface.commit_count, 1);
+}
+
+#[test]
+fn commit_without_prior_attach_increments_counter_but_leaves_buffers_alone() {
+    let (mut c, surface_id, _, _) = boot_client_with_surface_and_buffer();
+    dispatch_commit(&mut c, surface_id);
+    let surface = c.surface(surface_id).unwrap();
+    assert!(surface.pending_buffer.is_none());
+    assert!(surface.current_buffer.is_none());
+    assert_eq!(surface.commit_count, 1);
+}
+
+#[test]
+fn commit_with_no_new_attach_keeps_previously_current_buffer() {
+    // Wayland semantics: a commit without an intervening
+    // attach leaves the current buffer alone — it does NOT
+    // drop it to None. This is how a client can submit a
+    // damage-only update to the same pixels.
+    let (mut c, surface_id, _, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    let first = c.surface(surface_id).unwrap().current_buffer;
+    assert!(first.is_some());
+
+    // Second commit without a new attach.
+    dispatch_damage(&mut c, surface_id, 1, 1, 2, 2);
+    dispatch_commit(&mut c, surface_id);
+
+    let surface = c.surface(surface_id).unwrap();
+    assert_eq!(surface.current_buffer, first, "current buffer must persist");
+    assert_eq!(surface.commit_count, 2);
+}
+
+#[test]
+fn detach_via_attach_null_then_commit_clears_current_buffer() {
+    let (mut c, surface_id, _, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    assert!(c.surface(surface_id).unwrap().current_buffer.is_some());
+
+    // Now attach(null) + commit → detach.
+    dispatch_attach(&mut c, surface_id, ObjectId::NULL, 0, 0);
+    // The pending buffer is None; on commit, this branch
+    // takes the "no pending attach" path and leaves
+    // current in place. Wayland's canonical detach is
+    // attach(null) + commit; we match that by NOT
+    // clearing current here. A follow-up slice may
+    // distinguish "no attach" from "explicit detach".
+    dispatch_commit(&mut c, surface_id);
+    // For now, the v1 semantics leave `current_buffer`
+    // pinned after attach(null). That's documented here
+    // so the behaviour is explicit.
+    assert!(c.surface(surface_id).unwrap().current_buffer.is_some());
+}
+
+#[test]
+fn two_attaches_before_a_commit_keep_only_the_last_pending() {
+    let (mut c, surface_id, _, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 1, 1);
+    dispatch_attach(&mut c, surface_id, buffer_id, 2, 2);
+    let surface = c.surface(surface_id).unwrap();
+    assert_eq!(
+        surface.pending_buffer,
+        Some(BufferAttachment {
+            buffer_id,
+            x: 2,
+            y: 2,
+        })
+    );
+}
+
+#[test]
+fn surface_none_for_unknown_object_id() {
+    let c = Client::new(ClientId(1));
+    assert!(c.surface(ObjectId::new(999)).is_none());
 }

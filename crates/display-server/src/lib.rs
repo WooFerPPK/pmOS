@@ -28,6 +28,7 @@
 extern crate alloc;
 
 pub mod client;
+pub mod compositor;
 pub mod server;
 
 // Re-export the shared protocol types so existing callers
@@ -35,8 +36,10 @@ pub mod server;
 pub use display_proto::{ids, objects, wire};
 
 pub use client::{
-    interface_required_cap, BufferInfo, Client, ClientError, ClientId, Pool, MAX_POOL_SIZE,
+    interface_required_cap, BufferAttachment, BufferInfo, Client, ClientError, ClientId,
+    DamageRect, Pool, Surface, MAX_POOL_SIZE,
 };
+pub use compositor::{Framebuffer, BYTES_PER_PIXEL, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 pub use display_proto::{
     IdAllocator, IdError, IdKind, Interface, MessageHeader, ObjectId,
     ObjectIdAllocationError, Opcode, OpcodeError, WireError, HEADER_SIZE,

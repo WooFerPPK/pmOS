@@ -49,7 +49,7 @@ use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
 use display_proto::requests::{
     CompositorCreateSurface, DisplayGetRegistry, RegistryBind, ShmCreatePool,
-    ShmPoolCreateBuffer,
+    ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage,
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
@@ -101,6 +101,64 @@ impl BufferInfo {
     /// the caller compares against the pool's `size` as u64.
     pub fn byte_end(&self) -> u64 {
         (self.offset as u64) + (self.stride as u64) * (self.height as u64)
+    }
+}
+
+/// A pending or current `surface.attach(buffer_id, x, y)`.
+/// Stored in [`Surface::pending_buffer`] between `attach`
+/// and `commit`, then promoted to [`Surface::current_buffer`]
+/// on `commit`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BufferAttachment {
+    pub buffer_id: ObjectId,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// One damage rectangle accumulated in [`Surface::pending_damage`]
+/// since the last commit. Matches the wire format of
+/// `pmd_surface.damage(x, y, w, h)` 1:1.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Per-surface double-buffered state.
+///
+/// A surface carries two "sides":
+///
+/// * `pending_*` — changes the client has sent since the
+///   last commit. `attach` overwrites `pending_buffer`;
+///   `damage` appends to `pending_damage`.
+/// * `current_*` — what the compositor should composite.
+///   Promoted atomically from `pending_*` on `commit`.
+///
+/// `commit_count` increments on every commit (even
+/// commits with nothing pending), which is the test-
+/// facing way to detect that the commit handler ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Surface {
+    pub id: ObjectId,
+    pub pending_buffer: Option<BufferAttachment>,
+    pub pending_damage: Vec<DamageRect>,
+    pub current_buffer: Option<BufferAttachment>,
+    pub commit_count: u32,
+}
+
+impl Surface {
+    /// Build a fresh surface at `id` with no pending /
+    /// current state and zero commits.
+    pub fn new(id: ObjectId) -> Self {
+        Surface {
+            id,
+            pending_buffer: None,
+            pending_damage: Vec::new(),
+            current_buffer: None,
+            commit_count: 0,
+        }
     }
 }
 
@@ -216,6 +274,17 @@ pub enum ClientError {
     /// storage map. Indicates server-side state corruption —
     /// should be unreachable in practice.
     UnknownPool { pool_id: ObjectId },
+    /// A `pmd_surface.attach(buffer_id, ...)` named a
+    /// buffer id the client's buffer table doesn't know
+    /// about (or which has been destroyed). `NULL` is NOT
+    /// an error — it detaches — so this is only raised
+    /// for non-null unknown ids.
+    UnknownBuffer { buffer_id: ObjectId },
+    /// An attach / damage / commit targetted a `Surface`
+    /// object that exists in the object table but has no
+    /// corresponding entry in the per-client surfaces
+    /// map. Should be unreachable in practice.
+    UnknownSurface { surface_id: ObjectId },
 }
 
 impl From<WireError> for ClientError {
@@ -254,6 +323,11 @@ pub struct Client {
     /// Parallel to the entries in `objects` that carry
     /// `Interface::Buffer`.
     pub buffers: BTreeMap<ObjectId, BufferInfo>,
+    /// Per-surface double-buffered state. An entry is
+    /// created for every `compositor.create_surface` auto-
+    /// install and torn down when the surface is destroyed
+    /// (follow-up slice: `surface.destroy` → `delete_id`).
+    pub surfaces: BTreeMap<ObjectId, Surface>,
 }
 
 impl Client {
@@ -280,6 +354,7 @@ impl Client {
             capabilities,
             pools: BTreeMap::new(),
             buffers: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
         }
     }
 
@@ -425,6 +500,13 @@ impl Client {
             return Err(e);
         }
 
+        // Surface state transitions (attach / damage /
+        // commit) don't install new objects but DO mutate
+        // per-surface state on the client. Handle them
+        // after auto_install so `Surface` existence
+        // is already guaranteed by `create_surface`.
+        self.apply_surface_state(header.object_id, interface, header.opcode, payload)?;
+
         self.journal.push(HandledRequest {
             object_id: header.object_id,
             interface,
@@ -434,6 +516,106 @@ impl Client {
             fd_passing: header.fd_passing,
         });
         Ok(())
+    }
+
+    /// Apply a `pmd_surface.*` state transition. Called
+    /// from [`Client::dispatch_request`] for the three
+    /// opcodes that modify surface state without installing
+    /// new objects: `attach` (2), `damage` (3), and
+    /// `commit` (7). Returns an error on validation
+    /// failures (unknown buffer id, unknown surface); other
+    /// opcodes fall through as no-ops.
+    fn apply_surface_state(
+        &mut self,
+        surface_id: ObjectId,
+        interface: Interface,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), ClientError> {
+        if interface != Interface::Surface {
+            return Ok(());
+        }
+        match opcode {
+            2 /* attach */ => {
+                let req = SurfaceAttach::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                // Null buffer_id detaches. Non-null ids
+                // must refer to an existing buffer in
+                // this client's table.
+                if !req.buffer_id.is_null()
+                    && !self.buffers.contains_key(&req.buffer_id)
+                {
+                    return Err(ClientError::UnknownBuffer {
+                        buffer_id: req.buffer_id,
+                    });
+                }
+                let surface = self
+                    .surfaces
+                    .get_mut(&surface_id)
+                    .ok_or(ClientError::UnknownSurface { surface_id })?;
+                surface.pending_buffer = if req.buffer_id.is_null() {
+                    None
+                } else {
+                    Some(BufferAttachment {
+                        buffer_id: req.buffer_id,
+                        x: req.x,
+                        y: req.y,
+                    })
+                };
+                Ok(())
+            }
+            3 /* damage */ => {
+                let req = SurfaceDamage::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                let surface = self
+                    .surfaces
+                    .get_mut(&surface_id)
+                    .ok_or(ClientError::UnknownSurface { surface_id })?;
+                surface.pending_damage.push(DamageRect {
+                    x: req.x,
+                    y: req.y,
+                    width: req.width,
+                    height: req.height,
+                });
+                Ok(())
+            }
+            7 /* commit */ => {
+                let surface = self
+                    .surfaces
+                    .get_mut(&surface_id)
+                    .ok_or(ClientError::UnknownSurface { surface_id })?;
+                // Promote pending → current atomically.
+                // A commit with no pending attach keeps
+                // the current buffer; explicit detach
+                // happens via `attach(null)` followed by
+                // commit, which reaches this branch with
+                // `pending_buffer = None` and clears the
+                // current buffer below.
+                //
+                // Wayland semantics detail: a commit with
+                // no prior attach leaves the surface's
+                // current buffer unchanged. We encode
+                // that by only promoting when there's a
+                // pending attach OR an explicit detach.
+                if surface.pending_buffer.is_some() {
+                    surface.current_buffer = surface.pending_buffer.take();
+                }
+                surface.pending_damage.clear();
+                surface.commit_count = surface.commit_count.saturating_add(1);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Decode the payload of a request that creates a new
@@ -499,6 +681,7 @@ impl Client {
                     }
                 })?;
                 self.install_client_object(req.new_id, Interface::Surface)?;
+                self.surfaces.insert(req.new_id, Surface::new(req.new_id));
                 Ok(())
             }
             (Interface::Shm, 1 /* create_pool */) => {
@@ -586,6 +769,13 @@ impl Client {
     /// Borrow a buffer's metadata by its object id.
     pub fn buffer_info(&self, buffer_id: ObjectId) -> Option<&BufferInfo> {
         self.buffers.get(&buffer_id)
+    }
+
+    /// Borrow a surface's pending/current state by its
+    /// object id. Returns `None` if no surface exists at
+    /// that id.
+    pub fn surface(&self, surface_id: ObjectId) -> Option<&Surface> {
+        self.surfaces.get(&surface_id)
     }
 
     /// Borrow the pool-backing bytes for a buffer —
