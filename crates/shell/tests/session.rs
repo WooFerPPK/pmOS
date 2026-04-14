@@ -27,7 +27,7 @@ use display_proto::{
     wire::{MessageHeader, HEADER_SIZE},
     DisplayError, Interface, ObjectId, RegistryGlobal, RegistryGlobalRemove,
 };
-use shell::{Session, SessionError, INTERESTING_INTERFACES};
+use shell::{Session, SessionError};
 use toolkit::protocol::MemoryConnection;
 
 /// Build one framed event message.
@@ -183,7 +183,7 @@ fn pump_is_ready_only_after_every_interesting_interface_is_bound() {
         version: 1,
     };
     s.pump(&global_event(registry_id, &compositor_event)).unwrap();
-    assert!(!s.is_ready(), "shm not yet bound");
+    assert!(!s.is_ready(), "shm + shell_manager not yet bound");
 
     // Shm next.
     let shm_event = RegistryGlobal {
@@ -192,9 +192,19 @@ fn pump_is_ready_only_after_every_interesting_interface_is_bound() {
         version: 1,
     };
     s.pump(&global_event(registry_id, &shm_event)).unwrap();
+    assert!(!s.is_ready(), "shell_manager not yet bound");
+
+    // Finally shell_manager.
+    let sm_event = RegistryGlobal {
+        name: 3,
+        interface: "pmd_shell_manager".to_string(),
+        version: 1,
+    };
+    s.pump(&global_event(registry_id, &sm_event)).unwrap();
     assert!(s.is_ready());
     assert!(s.bound(Interface::Compositor).is_some());
     assert!(s.bound(Interface::Shm).is_some());
+    assert!(s.bound(Interface::ShellManager).is_some());
 }
 
 #[test]
@@ -221,6 +231,14 @@ fn pump_handles_multiple_globals_in_one_byte_stream() {
         registry_id,
         &RegistryGlobal {
             name: 3,
+            interface: "pmd_shell_manager".to_string(),
+            version: 1,
+        },
+    ));
+    stream.extend(global_event(
+        registry_id,
+        &RegistryGlobal {
+            name: 4,
             interface: "pmd_net".to_string(),
             version: 2,
         },
@@ -228,10 +246,11 @@ fn pump_handles_multiple_globals_in_one_byte_stream() {
 
     let (step, consumed) = s.pump(&stream).unwrap();
     assert_eq!(consumed, stream.len());
-    assert_eq!(step.discovered, vec![1, 2, 3]);
+    assert_eq!(step.discovered, vec![1, 2, 3, 4]);
     assert!(step.bound.contains(&Interface::Compositor));
     assert!(step.bound.contains(&Interface::Shm));
-    assert_eq!(step.bound.len(), 2);
+    assert!(step.bound.contains(&Interface::ShellManager));
+    assert_eq!(step.bound.len(), 3);
     assert!(s.is_ready());
 }
 
@@ -335,4 +354,262 @@ fn session_exposes_drain_outbound_matching_the_client() {
     // Second drain is empty.
     let bytes2 = s.drain_outbound();
     assert!(bytes2.is_empty());
+}
+
+// ---- Shell-manager + window-list tests --------------------------
+
+use display_proto::{
+    ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused, ShellWindowTitleChanged,
+};
+
+/// Walk the whole bind dance to get a session with
+/// shell_manager bound. Returns the session and the
+/// shell_manager id.
+fn shell_manager_bound(
+) -> (Session<MemoryConnection>, ObjectId) {
+    let (mut s, registry_id) = boot_started_session();
+    let sm_event = RegistryGlobal {
+        name: 1,
+        interface: "pmd_shell_manager".to_string(),
+        version: 1,
+    };
+    s.pump(&global_event(registry_id, &sm_event)).unwrap();
+    let _ = s.drain_outbound(); // discard the bind request bytes
+    let sm_id = s.bound(Interface::ShellManager).unwrap();
+    (s, sm_id)
+}
+
+fn window_created_event(
+    shell_manager_id: ObjectId,
+    event: &ShellWindowCreated,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+    let h = MessageHeader::try_new(shell_manager_id, 1, payload.len(), 0).unwrap();
+    h.encode(&mut buf[..HEADER_SIZE]).unwrap();
+    buf[HEADER_SIZE..].copy_from_slice(&payload);
+    buf
+}
+
+fn window_destroyed_event(
+    shell_manager_id: ObjectId,
+    event: &ShellWindowDestroyed,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+    let h = MessageHeader::try_new(shell_manager_id, 2, payload.len(), 0).unwrap();
+    h.encode(&mut buf[..HEADER_SIZE]).unwrap();
+    buf[HEADER_SIZE..].copy_from_slice(&payload);
+    buf
+}
+
+fn window_focused_event(
+    shell_manager_id: ObjectId,
+    event: &ShellWindowFocused,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+    let h = MessageHeader::try_new(shell_manager_id, 3, payload.len(), 0).unwrap();
+    h.encode(&mut buf[..HEADER_SIZE]).unwrap();
+    buf[HEADER_SIZE..].copy_from_slice(&payload);
+    buf
+}
+
+fn window_title_changed_event(
+    shell_manager_id: ObjectId,
+    event: &ShellWindowTitleChanged,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    event.encode(&mut payload);
+    let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
+    let h = MessageHeader::try_new(shell_manager_id, 4, payload.len(), 0).unwrap();
+    h.encode(&mut buf[..HEADER_SIZE]).unwrap();
+    buf[HEADER_SIZE..].copy_from_slice(&payload);
+    buf
+}
+
+#[test]
+fn subscribe_windows_before_shell_manager_is_bound_is_an_error() {
+    let (mut s, _) = boot_started_session();
+    let err = s.subscribe_windows().unwrap_err();
+    assert_eq!(err, shell::SessionError::ShellManagerNotBound);
+    assert!(!s.windows_subscribed());
+}
+
+#[test]
+fn subscribe_windows_after_bind_sends_the_request() {
+    let (mut s, sm_id) = shell_manager_bound();
+    s.subscribe_windows().unwrap();
+    assert!(s.windows_subscribed());
+
+    let bytes = s.drain_outbound();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, sm_id);
+    assert_eq!(header.opcode, 1 /* subscribe_windows */);
+    // Empty payload.
+    assert_eq!(header.payload_len(), 0);
+}
+
+#[test]
+fn subscribe_windows_is_idempotent() {
+    let (mut s, _) = shell_manager_bound();
+    s.subscribe_windows().unwrap();
+    let _ = s.drain_outbound();
+    s.subscribe_windows().unwrap();
+    // No new bytes — second call is a no-op.
+    assert!(s.drain_outbound().is_empty());
+}
+
+#[test]
+fn focus_window_request_carries_the_id_payload() {
+    let (mut s, sm_id) = shell_manager_bound();
+    s.subscribe_windows().unwrap();
+    let _ = s.drain_outbound();
+    s.focus_window(7).unwrap();
+
+    let bytes = s.drain_outbound();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, sm_id);
+    assert_eq!(header.opcode, 2 /* focus_window */);
+    assert_eq!(header.payload_len(), 4);
+    let id = u32::from_le_bytes(bytes[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
+    assert_eq!(id, 7);
+}
+
+#[test]
+fn close_and_minimize_window_use_distinct_opcodes() {
+    let (mut s, sm_id) = shell_manager_bound();
+    s.close_window(3).unwrap();
+    s.minimize_window(5).unwrap();
+    let bytes = s.drain_outbound();
+
+    let close_h = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(close_h.object_id, sm_id);
+    assert_eq!(close_h.opcode, 3 /* close_window */);
+    let close_end = close_h.length as usize;
+
+    let min_h = MessageHeader::decode(&bytes[close_end..]).unwrap();
+    assert_eq!(min_h.object_id, sm_id);
+    assert_eq!(min_h.opcode, 4 /* minimize_window */);
+}
+
+#[test]
+fn focus_window_before_shell_manager_is_bound_is_an_error() {
+    let (mut s, _) = boot_started_session();
+    let err = s.focus_window(1).unwrap_err();
+    assert_eq!(err, shell::SessionError::ShellManagerNotBound);
+}
+
+#[test]
+fn pump_window_created_records_the_window_in_the_table() {
+    let (mut s, sm_id) = shell_manager_bound();
+    let event = ShellWindowCreated {
+        window_id: 42,
+        title: "term".to_string(),
+        app_id: "pmos.term".to_string(),
+    };
+    let (step, _) = s.pump(&window_created_event(sm_id, &event)).unwrap();
+    assert_eq!(step.windows_created, vec![42]);
+    let w = s.windows().get(&42).unwrap();
+    assert_eq!(w.title, "term");
+    assert_eq!(w.app_id, "pmos.term");
+    assert!(!w.focused);
+}
+
+#[test]
+fn pump_window_destroyed_removes_the_window() {
+    let (mut s, sm_id) = shell_manager_bound();
+    let create = ShellWindowCreated {
+        window_id: 1,
+        title: "x".to_string(),
+        app_id: "a".to_string(),
+    };
+    s.pump(&window_created_event(sm_id, &create)).unwrap();
+    let destroy = ShellWindowDestroyed { window_id: 1 };
+    let (step, _) = s.pump(&window_destroyed_event(sm_id, &destroy)).unwrap();
+    assert_eq!(step.windows_destroyed, vec![1]);
+    assert!(s.windows().get(&1).is_none());
+}
+
+#[test]
+fn pump_window_focused_updates_focused_window_and_flag() {
+    let (mut s, sm_id) = shell_manager_bound();
+    let create_a = ShellWindowCreated {
+        window_id: 1,
+        title: "a".to_string(),
+        app_id: "a".to_string(),
+    };
+    let create_b = ShellWindowCreated {
+        window_id: 2,
+        title: "b".to_string(),
+        app_id: "b".to_string(),
+    };
+    s.pump(&window_created_event(sm_id, &create_a)).unwrap();
+    s.pump(&window_created_event(sm_id, &create_b)).unwrap();
+    assert_eq!(s.focused_window(), None);
+
+    let focus_a = ShellWindowFocused { window_id: 1 };
+    let (step, _) = s.pump(&window_focused_event(sm_id, &focus_a)).unwrap();
+    assert_eq!(step.focus_changed_to, Some(1));
+    assert_eq!(s.focused_window(), Some(1));
+    assert!(s.windows().get(&1).unwrap().focused);
+    assert!(!s.windows().get(&2).unwrap().focused);
+
+    // Switch focus. Old window's flag clears.
+    let focus_b = ShellWindowFocused { window_id: 2 };
+    s.pump(&window_focused_event(sm_id, &focus_b)).unwrap();
+    assert_eq!(s.focused_window(), Some(2));
+    assert!(!s.windows().get(&1).unwrap().focused);
+    assert!(s.windows().get(&2).unwrap().focused);
+}
+
+#[test]
+fn pump_window_destroyed_clears_focused_if_it_was_focused() {
+    let (mut s, sm_id) = shell_manager_bound();
+    let create = ShellWindowCreated {
+        window_id: 7,
+        title: "x".to_string(),
+        app_id: "a".to_string(),
+    };
+    s.pump(&window_created_event(sm_id, &create)).unwrap();
+    let focus = ShellWindowFocused { window_id: 7 };
+    s.pump(&window_focused_event(sm_id, &focus)).unwrap();
+    assert_eq!(s.focused_window(), Some(7));
+
+    let destroy = ShellWindowDestroyed { window_id: 7 };
+    s.pump(&window_destroyed_event(sm_id, &destroy)).unwrap();
+    assert_eq!(s.focused_window(), None);
+}
+
+#[test]
+fn pump_window_title_changed_updates_the_title_field() {
+    let (mut s, sm_id) = shell_manager_bound();
+    let create = ShellWindowCreated {
+        window_id: 9,
+        title: "first".to_string(),
+        app_id: "a".to_string(),
+    };
+    s.pump(&window_created_event(sm_id, &create)).unwrap();
+
+    let rename = ShellWindowTitleChanged {
+        window_id: 9,
+        new_title: "renamed".to_string(),
+    };
+    let (step, _) = s.pump(&window_title_changed_event(sm_id, &rename)).unwrap();
+    assert_eq!(step.title_changes, vec![9]);
+    assert_eq!(s.windows().get(&9).unwrap().title, "renamed");
+}
+
+#[test]
+fn pump_window_title_changed_for_unknown_window_is_silent() {
+    let (mut s, sm_id) = shell_manager_bound();
+    let rename = ShellWindowTitleChanged {
+        window_id: 999,
+        new_title: "ghost".to_string(),
+    };
+    let (step, _) = s.pump(&window_title_changed_event(sm_id, &rename)).unwrap();
+    assert!(step.title_changes.is_empty());
 }

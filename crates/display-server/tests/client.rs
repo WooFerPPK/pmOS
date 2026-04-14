@@ -399,6 +399,59 @@ fn drain_pending_events_is_empty_when_nothing_was_emitted() {
 }
 
 #[test]
+fn emit_window_created_enqueues_a_shell_window_created_event() {
+    use display_proto::{wire::MessageHeader, ShellWindowCreated};
+    let mut c = Client::new(ClientId(1));
+    let sm_id = ObjectId::new(5);
+    c.install_client_object(sm_id, Interface::ShellManager)
+        .unwrap();
+    c.emit_window_created(sm_id, 42, "term", "pmos.term").unwrap();
+
+    let bytes = c.drain_pending_events();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, sm_id);
+    assert_eq!(header.opcode, 1 /* window_created */);
+    let decoded = ShellWindowCreated::decode(&bytes[10..header.length as usize]).unwrap();
+    assert_eq!(decoded.window_id, 42);
+    assert_eq!(decoded.title, "term");
+    assert_eq!(decoded.app_id, "pmos.term");
+}
+
+#[test]
+fn emit_window_destroyed_focused_title_changed_use_distinct_opcodes() {
+    use display_proto::wire::MessageHeader;
+    let mut c = Client::new(ClientId(1));
+    let sm_id = ObjectId::new(5);
+    c.install_client_object(sm_id, Interface::ShellManager)
+        .unwrap();
+    c.emit_window_destroyed(sm_id, 1).unwrap();
+    c.emit_window_focused(sm_id, 2).unwrap();
+    c.emit_window_title_changed(sm_id, 3, "new title").unwrap();
+
+    let bytes = c.drain_pending_events();
+    let mut cursor = 0usize;
+    let h1 = MessageHeader::decode(&bytes[cursor..]).unwrap();
+    assert_eq!(h1.opcode, 2 /* window_destroyed */);
+    cursor += h1.length as usize;
+    let h2 = MessageHeader::decode(&bytes[cursor..]).unwrap();
+    assert_eq!(h2.opcode, 3 /* window_focused */);
+    cursor += h2.length as usize;
+    let h3 = MessageHeader::decode(&bytes[cursor..]).unwrap();
+    assert_eq!(h3.opcode, 4 /* window_title_changed */);
+    cursor += h3.length as usize;
+    assert_eq!(cursor, bytes.len());
+}
+
+#[test]
+fn emit_window_event_on_unknown_object_is_unknown_object() {
+    let mut c = Client::new(ClientId(1));
+    let err = c
+        .emit_window_created(ObjectId::new(99), 1, "x", "y")
+        .unwrap_err();
+    assert!(matches!(err, ClientError::UnknownObject { .. }));
+}
+
+#[test]
 fn dispatch_full_walk_display_to_compositor_to_surface_via_auto_install() {
     // Walks the same sequence a real client uses from a
     // fresh connection all the way to `surface.commit`, WITH

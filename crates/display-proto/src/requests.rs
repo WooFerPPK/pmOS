@@ -119,3 +119,61 @@ impl SurfaceDamage {
         })
     }
 }
+
+// ---- pmd_shell_manager (§15) ----------------------------------
+
+/// `pmd_shell_manager.subscribe_windows()` — spec §15. No
+/// payload. Requesting this turns on the
+/// `window_created` / `window_destroyed` / `window_focused`
+/// / `window_title_changed` event stream for the calling
+/// shell client.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShellManagerSubscribeWindows;
+
+impl ShellManagerSubscribeWindows {
+    pub fn decode(_payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShellManagerSubscribeWindows)
+    }
+}
+
+/// `pmd_shell_manager.focus_window(window_id)` — spec §15.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerFocusWindow {
+    pub window_id: u32,
+}
+
+impl ShellManagerFocusWindow {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShellManagerFocusWindow {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_shell_manager.close_window(window_id)` — spec §15.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerCloseWindow {
+    pub window_id: u32,
+}
+
+impl ShellManagerCloseWindow {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShellManagerCloseWindow {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_shell_manager.minimize_window(window_id)` — spec §15.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerMinimizeWindow {
+    pub window_id: u32,
+}
+
+impl ShellManagerMinimizeWindow {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShellManagerMinimizeWindow {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+}

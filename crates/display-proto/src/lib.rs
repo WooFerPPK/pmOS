@@ -29,11 +29,15 @@ pub mod wire;
 
 pub use decode::DecodeError;
 pub use events::{
-    BufferRelease, DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove, ShmFormat,
+    BufferRelease, DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove,
+    ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused, ShellWindowTitleChanged,
+    ShmFormat,
 };
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
 pub use requests::{
-    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, SurfaceAttach, SurfaceDamage,
+    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, ShellManagerCloseWindow,
+    ShellManagerFocusWindow, ShellManagerMinimizeWindow, ShellManagerSubscribeWindows,
+    SurfaceAttach, SurfaceDamage,
 };
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

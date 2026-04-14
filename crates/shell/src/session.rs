@@ -22,15 +22,38 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use display_proto::{Interface, ObjectId, RegistryGlobal, RegistryGlobalRemove};
+use display_proto::{
+    Interface, ObjectId, RegistryGlobal, RegistryGlobalRemove, ShellWindowCreated,
+    ShellWindowDestroyed, ShellWindowFocused, ShellWindowTitleChanged,
+};
 use toolkit::protocol::{Client, ClientError, Connection};
 
 /// Interfaces the shell wants bound as soon as the display
 /// server advertises them. Ordered so the deterministic
 /// `SessionStep::GlobalsBound` output is predictable for
 /// tests.
-pub const INTERESTING_INTERFACES: &[Interface] =
-    &[Interface::Compositor, Interface::Shm];
+///
+/// `ShellManager` is in this set because the desktop shell
+/// needs the window-list / focus / close API as soon as
+/// the server advertises it. Ordinary apps with only the
+/// `DisplayClient` cap don't get to bind it — the server's
+/// bind dispatch enforces the capability check.
+pub const INTERESTING_INTERFACES: &[Interface] = &[
+    Interface::Compositor,
+    Interface::Shm,
+    Interface::ShellManager,
+];
+
+/// One window the shell knows about. Populated by
+/// `pmd_shell_manager.window_*` events after
+/// [`Session::subscribe_windows`] has been called.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub window_id: u32,
+    pub title: String,
+    pub app_id: String,
+    pub focused: bool,
+}
 
 /// One registry global the server advertised. Either
 /// still-announced (`live == true`) or subsequently
@@ -76,6 +99,17 @@ pub struct SessionStep {
     /// Non-fatal protocol errors observed
     /// (`pmd_display.error` events).
     pub errors: Vec<ProtocolErrorNotice>,
+    /// Windows the shell discovered during this pump
+    /// (from `pmd_shell_manager.window_created`).
+    pub windows_created: Vec<u32>,
+    /// Windows removed during this pump (from
+    /// `window_destroyed`).
+    pub windows_destroyed: Vec<u32>,
+    /// New focus target during this pump, if any
+    /// (from `window_focused`).
+    pub focus_changed_to: Option<u32>,
+    /// Windows whose title changed during this pump.
+    pub title_changes: Vec<u32>,
 }
 
 impl SessionStep {
@@ -84,6 +118,10 @@ impl SessionStep {
             && self.bound.is_empty()
             && self.removed.is_empty()
             && self.errors.is_empty()
+            && self.windows_created.is_empty()
+            && self.windows_destroyed.is_empty()
+            && self.focus_changed_to.is_none()
+            && self.title_changes.is_empty()
     }
 }
 
@@ -113,6 +151,11 @@ pub enum SessionError {
     /// `start` has not been called yet and a method that
     /// requires the registry was invoked.
     NotStarted,
+    /// A `pmd_shell_manager.*` request was attempted but
+    /// the shell-manager global has not been bound — the
+    /// server hasn't advertised it yet, or the shell
+    /// doesn't hold the `Shell` capability.
+    ShellManagerNotBound,
 }
 
 impl From<ClientError> for SessionError {
@@ -134,6 +177,18 @@ pub struct Session<C: Connection> {
     /// lookup from higher layers. `HashMap` because
     /// [`Interface`] derives `Hash` but not `Ord`.
     bound_by_interface: HashMap<Interface, ObjectId>,
+    /// Set to true once the shell has sent
+    /// `shell_manager.subscribe_windows`. Until then the
+    /// server won't emit window_* events to this client.
+    windows_subscribed: bool,
+    /// Currently-known windows, keyed by window_id. The
+    /// shell populates this from window_created /
+    /// window_destroyed / window_focused /
+    /// window_title_changed events.
+    windows: BTreeMap<u32, WindowInfo>,
+    /// The window_id of the currently-focused window, if
+    /// any.
+    focused_window: Option<u32>,
 }
 
 impl<C: Connection> Session<C> {
@@ -146,6 +201,9 @@ impl<C: Connection> Session<C> {
             registry_id: None,
             known_globals: BTreeMap::new(),
             bound_by_interface: HashMap::new(),
+            windows_subscribed: false,
+            windows: BTreeMap::new(),
+            focused_window: None,
         }
     }
 
@@ -202,6 +260,84 @@ impl<C: Connection> Session<C> {
     /// Read-only access to the known-globals table.
     pub fn known_globals(&self) -> &BTreeMap<u32, GlobalEntry> {
         &self.known_globals
+    }
+
+    /// Read-only access to the known-windows table.
+    /// Populated once `subscribe_windows` has been called
+    /// and the server has emitted `window_created` events.
+    pub fn windows(&self) -> &BTreeMap<u32, WindowInfo> {
+        &self.windows
+    }
+
+    /// Currently-focused window id, if any.
+    pub fn focused_window(&self) -> Option<u32> {
+        self.focused_window
+    }
+
+    /// True iff the shell has sent
+    /// `shell_manager.subscribe_windows`.
+    pub fn windows_subscribed(&self) -> bool {
+        self.windows_subscribed
+    }
+
+    /// Send `pmd_shell_manager.subscribe_windows()`. The
+    /// shell-manager global must already be bound (this
+    /// happens automatically once the server advertises it
+    /// via registry.global). Returns
+    /// `Err(SessionError::ShellManagerNotBound)` otherwise.
+    ///
+    /// The server starts emitting `window_*` events on the
+    /// shell-manager object after this. Subsequent calls
+    /// are idempotent — the second call returns Ok without
+    /// re-sending.
+    pub fn subscribe_windows(&mut self) -> Result<(), SessionError> {
+        if self.windows_subscribed {
+            return Ok(());
+        }
+        let shell_manager_id = self
+            .bound(Interface::ShellManager)
+            .ok_or(SessionError::ShellManagerNotBound)?;
+        // No payload — opcode 1 is subscribe_windows.
+        self.client
+            .send_request(shell_manager_id, 1, &[])?;
+        self.windows_subscribed = true;
+        Ok(())
+    }
+
+    /// Send `pmd_shell_manager.focus_window(window_id)`.
+    /// Errors if the shell-manager global isn't bound.
+    /// Does NOT pre-validate that `window_id` is in the
+    /// known-windows table — the server is the authority.
+    pub fn focus_window(&mut self, window_id: u32) -> Result<(), SessionError> {
+        let shell_manager_id = self
+            .bound(Interface::ShellManager)
+            .ok_or(SessionError::ShellManagerNotBound)?;
+        let payload = window_id.to_le_bytes();
+        self.client
+            .send_request(shell_manager_id, 2, &payload)?;
+        Ok(())
+    }
+
+    /// Send `pmd_shell_manager.close_window(window_id)`.
+    pub fn close_window(&mut self, window_id: u32) -> Result<(), SessionError> {
+        let shell_manager_id = self
+            .bound(Interface::ShellManager)
+            .ok_or(SessionError::ShellManagerNotBound)?;
+        let payload = window_id.to_le_bytes();
+        self.client
+            .send_request(shell_manager_id, 3, &payload)?;
+        Ok(())
+    }
+
+    /// Send `pmd_shell_manager.minimize_window(window_id)`.
+    pub fn minimize_window(&mut self, window_id: u32) -> Result<(), SessionError> {
+        let shell_manager_id = self
+            .bound(Interface::ShellManager)
+            .ok_or(SessionError::ShellManagerNotBound)?;
+        let payload = window_id.to_le_bytes();
+        self.client
+            .send_request(shell_manager_id, 4, &payload)?;
+        Ok(())
     }
 
     /// Feed a chunk of incoming bytes from the display
@@ -285,6 +421,57 @@ impl<C: Connection> Session<C> {
                     code: parsed.code,
                     message: parsed.message,
                 });
+                Ok(())
+            }
+            (Interface::ShellManager, 1 /* window_created */) => {
+                let parsed = ShellWindowCreated::decode(&event.payload)
+                    .map_err(|e| SessionError::MalformedEvent(format!("{e:?}")))?;
+                self.windows.insert(
+                    parsed.window_id,
+                    WindowInfo {
+                        window_id: parsed.window_id,
+                        title: parsed.title,
+                        app_id: parsed.app_id,
+                        focused: false,
+                    },
+                );
+                step.windows_created.push(parsed.window_id);
+                Ok(())
+            }
+            (Interface::ShellManager, 2 /* window_destroyed */) => {
+                let parsed = ShellWindowDestroyed::decode(&event.payload)
+                    .map_err(|e| SessionError::MalformedEvent(format!("{e:?}")))?;
+                self.windows.remove(&parsed.window_id);
+                if self.focused_window == Some(parsed.window_id) {
+                    self.focused_window = None;
+                }
+                step.windows_destroyed.push(parsed.window_id);
+                Ok(())
+            }
+            (Interface::ShellManager, 3 /* window_focused */) => {
+                let parsed = ShellWindowFocused::decode(&event.payload)
+                    .map_err(|e| SessionError::MalformedEvent(format!("{e:?}")))?;
+                // Clear the focused flag on the previous
+                // focused window, set it on the new one.
+                if let Some(prev) = self.focused_window {
+                    if let Some(w) = self.windows.get_mut(&prev) {
+                        w.focused = false;
+                    }
+                }
+                if let Some(w) = self.windows.get_mut(&parsed.window_id) {
+                    w.focused = true;
+                }
+                self.focused_window = Some(parsed.window_id);
+                step.focus_changed_to = Some(parsed.window_id);
+                Ok(())
+            }
+            (Interface::ShellManager, 4 /* window_title_changed */) => {
+                let parsed = ShellWindowTitleChanged::decode(&event.payload)
+                    .map_err(|e| SessionError::MalformedEvent(format!("{e:?}")))?;
+                if let Some(w) = self.windows.get_mut(&parsed.window_id) {
+                    w.title = parsed.new_title;
+                    step.title_changes.push(parsed.window_id);
+                }
                 Ok(())
             }
             // Every other (interface, opcode) pair is

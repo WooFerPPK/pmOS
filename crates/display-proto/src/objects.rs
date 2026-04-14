@@ -22,11 +22,19 @@
 
 use core::fmt;
 
-/// The (extensible-in-v2, fixed-in-v1) set of interfaces a
-/// client can bind through `pmd_registry`. `Display` is
-/// pre-bound on every connection and is not listed here
-/// because `pmd_registry.bind` doesn't bind it — it's object 1
+/// The set of interfaces a client can bind through
+/// `pmd_registry`. `Display` is pre-bound on every
+/// connection and is not listed here because
+/// `pmd_registry.bind` doesn't bind it — it's object 1
 /// by convention.
+///
+/// **Spec §15: `pmd_shell_manager` is a privileged
+/// interface.** Only clients holding the `Shell`
+/// capability are allowed to bind it; ordinary apps
+/// that try will get `pmd_display.error(code =
+/// PERMISSION_DENIED)`. The capability check happens at
+/// the server's `registry.bind` dispatch path; this
+/// enum just records that the interface exists.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Interface {
     /// Implicit object 1.
@@ -43,6 +51,9 @@ pub enum Interface {
     Buffer,
     /// `pmd_surface` — the basic drawable.
     Surface,
+    /// `pmd_shell_manager` — desktop-shell window list /
+    /// focus / close API. Spec §15.
+    ShellManager,
 }
 
 impl Interface {
@@ -57,6 +68,7 @@ impl Interface {
             Interface::ShmPool => "pmd_shm_pool",
             Interface::Buffer => "pmd_buffer",
             Interface::Surface => "pmd_surface",
+            Interface::ShellManager => "pmd_shell_manager",
         }
     }
 
@@ -77,6 +89,7 @@ impl Interface {
             "pmd_shm_pool" => Some(Interface::ShmPool),
             "pmd_buffer" => Some(Interface::Buffer),
             "pmd_surface" => Some(Interface::Surface),
+            "pmd_shell_manager" => Some(Interface::ShellManager),
             _ => None,
         }
     }
@@ -162,6 +175,7 @@ impl Interface {
             Interface::ShmPool => SHM_POOL_REQUESTS,
             Interface::Buffer => BUFFER_REQUESTS,
             Interface::Surface => SURFACE_REQUESTS,
+            Interface::ShellManager => SHELL_MANAGER_REQUESTS,
         }
     }
 
@@ -174,6 +188,7 @@ impl Interface {
             Interface::ShmPool => SHM_POOL_EVENTS,
             Interface::Buffer => BUFFER_EVENTS,
             Interface::Surface => SURFACE_EVENTS,
+            Interface::ShellManager => SHELL_MANAGER_EVENTS,
         }
     }
 }
@@ -246,3 +261,20 @@ const SURFACE_REQUESTS: &[Opcode] = &[
 ];
 
 const SURFACE_EVENTS: &[Opcode] = &[];
+
+// pmd_shell_manager — spec §15. Privileged interface
+// (requires Cap::Shell) that lets the desktop shell observe
+// + control the open-window list.
+const SHELL_MANAGER_REQUESTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Request, name: "subscribe_windows" },
+    Opcode { number: 2, direction: Direction::Request, name: "focus_window" },
+    Opcode { number: 3, direction: Direction::Request, name: "close_window" },
+    Opcode { number: 4, direction: Direction::Request, name: "minimize_window" },
+];
+
+const SHELL_MANAGER_EVENTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Event, name: "window_created" },
+    Opcode { number: 2, direction: Direction::Event, name: "window_destroyed" },
+    Opcode { number: 3, direction: Direction::Event, name: "window_focused" },
+    Opcode { number: 4, direction: Direction::Event, name: "window_title_changed" },
+];

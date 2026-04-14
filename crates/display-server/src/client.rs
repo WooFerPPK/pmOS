@@ -41,7 +41,8 @@ use alloc::vec::Vec;
 
 use display_proto::decode::DecodeError;
 use display_proto::events::{
-    DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove,
+    DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove, ShellWindowCreated,
+    ShellWindowDestroyed, ShellWindowFocused, ShellWindowTitleChanged,
 };
 use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
@@ -432,6 +433,71 @@ impl Client {
         let mut payload = Vec::new();
         event.encode(&mut payload);
         self.emit_raw(registry_id, 2 /* global_remove */, &payload)
+    }
+
+    /// Emit `pmd_shell_manager.window_created(window_id,
+    /// title, app_id)` — spec §15. The caller has already
+    /// installed a shell-manager object at
+    /// `shell_manager_id` (typically via the `registry.bind`
+    /// auto-install path).
+    pub fn emit_window_created(
+        &mut self,
+        shell_manager_id: ObjectId,
+        window_id: u32,
+        title: &str,
+        app_id: &str,
+    ) -> Result<usize, ClientError> {
+        let event = ShellWindowCreated {
+            window_id,
+            title: title.to_string(),
+            app_id: app_id.to_string(),
+        };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(shell_manager_id, 1 /* window_created */, &payload)
+    }
+
+    /// Emit `pmd_shell_manager.window_destroyed(window_id)` —
+    /// spec §15.
+    pub fn emit_window_destroyed(
+        &mut self,
+        shell_manager_id: ObjectId,
+        window_id: u32,
+    ) -> Result<usize, ClientError> {
+        let event = ShellWindowDestroyed { window_id };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(shell_manager_id, 2 /* window_destroyed */, &payload)
+    }
+
+    /// Emit `pmd_shell_manager.window_focused(window_id)` —
+    /// spec §15.
+    pub fn emit_window_focused(
+        &mut self,
+        shell_manager_id: ObjectId,
+        window_id: u32,
+    ) -> Result<usize, ClientError> {
+        let event = ShellWindowFocused { window_id };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(shell_manager_id, 3 /* window_focused */, &payload)
+    }
+
+    /// Emit `pmd_shell_manager.window_title_changed(
+    /// window_id, new_title)` — spec §15.
+    pub fn emit_window_title_changed(
+        &mut self,
+        shell_manager_id: ObjectId,
+        window_id: u32,
+        new_title: &str,
+    ) -> Result<usize, ClientError> {
+        let event = ShellWindowTitleChanged {
+            window_id,
+            new_title: new_title.to_string(),
+        };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(shell_manager_id, 4 /* window_title_changed */, &payload)
     }
 
     /// Drain the pending-events queue and return one

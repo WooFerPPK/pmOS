@@ -192,7 +192,7 @@ fn shell_becomes_ready_after_both_compositor_and_shm_advertised() {
     );
     assert!(!session.is_ready(), "shm still missing");
 
-    // Then shm. Same dance.
+    // Shm next.
     server
         .client_mut(server_client_id)
         .unwrap()
@@ -204,15 +204,31 @@ fn shell_becomes_ready_after_both_compositor_and_shm_advertised() {
         server_client_id,
         session.drain_outbound(),
     );
+    assert!(!session.is_ready(), "shell_manager still missing");
+
+    // Finally shell_manager.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_global(registry_id, 3, "pmd_shell_manager", 1)
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
     assert!(session.is_ready());
 
-    // Server's object table has both bindings at the ids
-    // the shell chose.
+    // Server's object table has all three bindings at
+    // the ids the shell chose.
     let compositor_id = session.bound(Interface::Compositor).unwrap();
     let shm_id = session.bound(Interface::Shm).unwrap();
+    let sm_id = session.bound(Interface::ShellManager).unwrap();
     let view = server.client(server_client_id).unwrap();
     assert_eq!(view.get(compositor_id), Some(Interface::Compositor));
     assert_eq!(view.get(shm_id), Some(Interface::Shm));
+    assert_eq!(view.get(sm_id), Some(Interface::ShellManager));
 }
 
 #[test]
@@ -271,17 +287,19 @@ fn shell_receives_multiple_globals_in_one_drain_and_binds_in_order() {
         let server_client = server.client_mut(server_client_id).unwrap();
         server_client.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
         server_client.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
-        server_client.emit_global(registry_id, 3, "pmd_net", 1).unwrap();
+        server_client.emit_global(registry_id, 3, "pmd_shell_manager", 1).unwrap();
+        server_client.emit_global(registry_id, 4, "pmd_net", 1).unwrap();
     }
 
     let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
-    assert_eq!(step.discovered, vec![1, 2, 3]);
+    assert_eq!(step.discovered, vec![1, 2, 3, 4]);
     assert!(step.bound.contains(&Interface::Compositor));
     assert!(step.bound.contains(&Interface::Shm));
-    assert_eq!(step.bound.len(), 2);
+    assert!(step.bound.contains(&Interface::ShellManager));
+    assert_eq!(step.bound.len(), 3);
 
-    // Shell fired two registry.bind requests — one for
-    // compositor, one for shm. Ship them.
+    // Shell fired three registry.bind requests — one for
+    // each interesting interface. Ship them.
     pump_requests_into_server(
         &mut server,
         server_client_id,
@@ -350,3 +368,178 @@ fn server_emit_global_remove_flips_known_global_live_to_false() {
 // `use` line that shipped before this slice repurposed it.
 #[allow(dead_code)]
 fn _keep_imports_honest(_h: MessageHeader) {}
+
+// ---- Shell-manager + window list end-to-end ---------------------
+
+/// Run the shell session through the full preamble:
+///   1. start (display.get_registry)
+///   2. server emits registry.global(pmd_shell_manager)
+///   3. shell auto-binds shell_manager
+///   4. shell sends shell_manager.subscribe_windows
+/// Returns the booted session, the server, and the
+/// server-side client id for the caller to reach into.
+fn boot_shell_with_shell_manager() -> (
+    Session<MemoryConnection>,
+    DisplayServerState,
+    display_server::ClientId,
+) {
+    let mut session = Session::new(MemoryConnection::new());
+    session.start().unwrap();
+
+    let mut server = DisplayServerState::new();
+    let server_client_id = server.accept();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+
+    // Server advertises shell_manager via emit_global.
+    let registry_id = session.registry_id().unwrap();
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_global(registry_id, 1, "pmd_shell_manager", 1)
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+
+    // Shell auto-bound shell_manager. Ship the bind to
+    // the server.
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Shell sends subscribe_windows.
+    session.subscribe_windows().unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Drain the server-side journal so the caller's
+    // assertions only see what happens AFTER subscribe.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+
+    (session, server, server_client_id)
+}
+
+#[test]
+fn server_emit_window_created_reaches_the_shell_window_list() {
+    let (mut session, mut server, server_client_id) =
+        boot_shell_with_shell_manager();
+    let shell_manager_id = session.bound(Interface::ShellManager).unwrap();
+
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_window_created(shell_manager_id, 42, "term", "pmos.term")
+        .unwrap();
+    let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(step.windows_created, vec![42]);
+
+    let w = session.windows().get(&42).unwrap();
+    assert_eq!(w.title, "term");
+    assert_eq!(w.app_id, "pmos.term");
+    assert!(!w.focused);
+}
+
+#[test]
+fn full_window_lifecycle_round_trips_through_the_emit_path() {
+    let (mut session, mut server, server_client_id) =
+        boot_shell_with_shell_manager();
+    let shell_manager_id = session.bound(Interface::ShellManager).unwrap();
+
+    // 1. Create two windows.
+    {
+        let c = server.client_mut(server_client_id).unwrap();
+        c.emit_window_created(shell_manager_id, 1, "term", "pmos.term").unwrap();
+        c.emit_window_created(shell_manager_id, 2, "edit", "pmos.edit").unwrap();
+    }
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(session.windows().len(), 2);
+
+    // 2. Focus window 2.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_window_focused(shell_manager_id, 2)
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(session.focused_window(), Some(2));
+    assert!(session.windows().get(&2).unwrap().focused);
+
+    // 3. Rename window 1.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_window_title_changed(shell_manager_id, 1, "term: bash")
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(session.windows().get(&1).unwrap().title, "term: bash");
+
+    // 4. Destroy window 2 (the focused one). Focus
+    //    clears.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_window_destroyed(shell_manager_id, 2)
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert!(session.windows().get(&2).is_none());
+    assert_eq!(session.focused_window(), None);
+    assert_eq!(session.windows().len(), 1);
+}
+
+#[test]
+fn shell_focus_window_request_reaches_the_server_dispatcher() {
+    let (mut session, mut server, server_client_id) =
+        boot_shell_with_shell_manager();
+
+    session.focus_window(7).unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let journal = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].interface, Interface::ShellManager);
+    assert_eq!(journal[0].opcode_name, "focus_window");
+    assert_eq!(journal[0].payload_len, 4);
+}
+
+#[test]
+fn shell_close_and_minimize_window_requests_dispatch_with_distinct_opcodes() {
+    let (mut session, mut server, server_client_id) =
+        boot_shell_with_shell_manager();
+
+    session.close_window(3).unwrap();
+    session.minimize_window(5).unwrap();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let journal = server
+        .client_mut(server_client_id)
+        .unwrap()
+        .drain_journal();
+    assert_eq!(journal.len(), 2);
+    assert_eq!(journal[0].opcode_name, "close_window");
+    assert_eq!(journal[1].opcode_name, "minimize_window");
+}

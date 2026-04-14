@@ -11,6 +11,7 @@ fn every_interface_has_a_stable_name() {
     assert_eq!(Interface::ShmPool.name(), "pmd_shm_pool");
     assert_eq!(Interface::Buffer.name(), "pmd_buffer");
     assert_eq!(Interface::Surface.name(), "pmd_surface");
+    assert_eq!(Interface::ShellManager.name(), "pmd_shell_manager");
 }
 
 #[test]

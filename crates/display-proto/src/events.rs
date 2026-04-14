@@ -184,3 +184,97 @@ impl ShmFormat {
         write_u32(out, self.format);
     }
 }
+
+// ---- pmd_shell_manager events (§15) ---------------------------
+
+/// `pmd_shell_manager.window_created(window_id, title,
+/// app_id)` — spec §15. Fired once per window after the
+/// shell subscribes via `subscribe_windows`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellWindowCreated {
+    pub window_id: u32,
+    pub title: String,
+    pub app_id: String,
+}
+
+impl ShellWindowCreated {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let window_id = read_u32(payload, 0)?;
+        let (title, consumed_title) = read_string(payload, 4)?;
+        let after_title = 4 + consumed_title;
+        let (app_id, _) = read_string(payload, after_title)?;
+        Ok(ShellWindowCreated {
+            window_id,
+            title: title.to_string(),
+            app_id: app_id.to_string(),
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.window_id);
+        write_string(out, &self.title);
+        write_string(out, &self.app_id);
+    }
+}
+
+/// `pmd_shell_manager.window_destroyed(window_id)` — spec §15.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellWindowDestroyed {
+    pub window_id: u32,
+}
+
+impl ShellWindowDestroyed {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShellWindowDestroyed {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.window_id);
+    }
+}
+
+/// `pmd_shell_manager.window_focused(window_id)` — spec §15.
+/// Sent whenever the focused window changes; the shell
+/// uses it to update its taskbar / chrome state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellWindowFocused {
+    pub window_id: u32,
+}
+
+impl ShellWindowFocused {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShellWindowFocused {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.window_id);
+    }
+}
+
+/// `pmd_shell_manager.window_title_changed(window_id,
+/// new_title)` — spec §15.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellWindowTitleChanged {
+    pub window_id: u32,
+    pub new_title: String,
+}
+
+impl ShellWindowTitleChanged {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let window_id = read_u32(payload, 0)?;
+        let (new_title, _) = read_string(payload, 4)?;
+        Ok(ShellWindowTitleChanged {
+            window_id,
+            new_title: new_title.to_string(),
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.window_id);
+        write_string(out, &self.new_title);
+    }
+}
