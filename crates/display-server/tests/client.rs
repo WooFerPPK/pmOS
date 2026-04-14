@@ -233,6 +233,171 @@ fn drop_object_removes_the_binding() {
     assert!(!c.drop_object(ObjectId::new(3)));
 }
 
+// ---- Emit path --------------------------------------------------
+
+#[test]
+fn emit_error_enqueues_a_display_error_event() {
+    use display_proto::{wire::MessageHeader, DisplayError};
+    let mut c = Client::new(ClientId(1));
+    let n = c.emit_error(ObjectId::new(7), 42, "broken").unwrap();
+    assert_eq!(c.pending_events_len(), 1);
+
+    let bytes = c.drain_pending_events();
+    assert_eq!(bytes.len(), n);
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, ObjectId::DISPLAY);
+    assert_eq!(header.opcode, 1 /* error */);
+
+    let decoded = DisplayError::decode(&bytes[10..header.length as usize]).unwrap();
+    assert_eq!(decoded.object_id, ObjectId::new(7));
+    assert_eq!(decoded.code, 42);
+    assert_eq!(decoded.message, "broken");
+}
+
+#[test]
+fn emit_delete_id_enqueues_the_event_with_a_u32_payload() {
+    use display_proto::{wire::MessageHeader, DisplayDeleteId};
+    let mut c = Client::new(ClientId(1));
+    c.emit_delete_id(ObjectId::new(99)).unwrap();
+
+    let bytes = c.drain_pending_events();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.opcode, 2 /* delete_id */);
+    let decoded = DisplayDeleteId::decode(&bytes[10..header.length as usize]).unwrap();
+    assert_eq!(decoded.id, ObjectId::new(99));
+}
+
+#[test]
+fn emit_global_enqueues_a_registry_global_event() {
+    use display_proto::{wire::MessageHeader, RegistryGlobal};
+    let mut c = Client::new(ClientId(1));
+    // The registry object has to exist in the client's
+    // table for the server to be allowed to emit events
+    // on it. dispatch_request normally installs it on a
+    // get_registry from the client; here we install by
+    // hand.
+    let registry_id = ObjectId::new(3);
+    c.install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+    c.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
+
+    let bytes = c.drain_pending_events();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, registry_id);
+    assert_eq!(header.opcode, 1 /* global */);
+    let decoded = RegistryGlobal::decode(&bytes[10..header.length as usize]).unwrap();
+    assert_eq!(decoded.name, 1);
+    assert_eq!(decoded.interface, "pmd_compositor");
+    assert_eq!(decoded.version, 1);
+}
+
+#[test]
+fn emit_global_remove_enqueues_with_a_u32_name_payload() {
+    use display_proto::{wire::MessageHeader, RegistryGlobalRemove};
+    let mut c = Client::new(ClientId(1));
+    let registry_id = ObjectId::new(3);
+    c.install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+    c.emit_global_remove(registry_id, 7).unwrap();
+
+    let bytes = c.drain_pending_events();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, registry_id);
+    assert_eq!(header.opcode, 2 /* global_remove */);
+    let decoded = RegistryGlobalRemove::decode(&bytes[10..header.length as usize]).unwrap();
+    assert_eq!(decoded.name, 7);
+}
+
+#[test]
+fn emit_raw_rejects_unknown_object_with_unknown_object_error() {
+    let mut c = Client::new(ClientId(1));
+    let err = c.emit_raw(ObjectId::new(99), 1, &[]).unwrap_err();
+    assert_eq!(
+        err,
+        ClientError::UnknownObject {
+            id: ObjectId::new(99)
+        }
+    );
+    assert_eq!(c.pending_events_len(), 0);
+}
+
+#[test]
+fn emit_raw_rejects_request_opcode_as_wrong_direction() {
+    let mut c = Client::new(ClientId(1));
+    // display.get_registry (opcode 2) is a REQUEST, not
+    // an event. But display.delete_id is ALSO opcode 2 —
+    // as an event. So this opcode is valid in both
+    // directions and emit accepts it. Use display.sync
+    // (opcode 1, request only; the event opcode 1 on
+    // display is `error`, which IS an event, so sync 1
+    // resolves as a valid event too).
+    //
+    // Find a real request-only opcode: compositor.create_
+    // surface is opcode 1 as a request, and compositor
+    // defines NO events. Emit compositor.opcode=1 on an
+    // installed compositor → WrongDirection.
+    let compositor_id = ObjectId::new(3);
+    c.install_client_object(compositor_id, Interface::Compositor)
+        .unwrap();
+    let err = c.emit_raw(compositor_id, 1, &[0, 0, 0, 0]).unwrap_err();
+    assert_eq!(
+        err,
+        ClientError::WrongDirection {
+            interface: Interface::Compositor,
+            opcode: 1,
+        }
+    );
+}
+
+#[test]
+fn emit_raw_rejects_unknown_opcode_that_is_neither_request_nor_event() {
+    let mut c = Client::new(ClientId(1));
+    // Display has opcodes 1,2 for both directions.
+    // Opcode 99 doesn't exist either way.
+    let err = c.emit_raw(ObjectId::DISPLAY, 99, &[]).unwrap_err();
+    assert_eq!(
+        err,
+        ClientError::UnknownOpcode {
+            interface: Interface::Display,
+            opcode: 99,
+        }
+    );
+}
+
+#[test]
+fn drain_pending_events_concatenates_multiple_enqueued_messages() {
+    use display_proto::wire::MessageHeader;
+    let mut c = Client::new(ClientId(1));
+    let registry_id = ObjectId::new(3);
+    c.install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+
+    c.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
+    c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
+    c.emit_delete_id(ObjectId::new(5)).unwrap();
+    assert_eq!(c.pending_events_len(), 3);
+
+    let bytes = c.drain_pending_events();
+    assert_eq!(c.pending_events_len(), 0);
+
+    // Walk the three messages by header length.
+    let mut cursor = 0usize;
+    let mut n = 0;
+    while cursor < bytes.len() {
+        let h = MessageHeader::decode(&bytes[cursor..]).unwrap();
+        cursor += h.length as usize;
+        n += 1;
+    }
+    assert_eq!(n, 3);
+    assert_eq!(cursor, bytes.len());
+}
+
+#[test]
+fn drain_pending_events_is_empty_when_nothing_was_emitted() {
+    let mut c = Client::new(ClientId(1));
+    assert_eq!(c.drain_pending_events(), Vec::<u8>::new());
+}
+
 #[test]
 fn dispatch_full_walk_display_to_compositor_to_surface_via_auto_install() {
     // Walks the same sequence a real client uses from a

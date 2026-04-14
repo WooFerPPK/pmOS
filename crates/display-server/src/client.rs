@@ -36,16 +36,19 @@
 //!    wire; v1 just bubbles the error out.
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use display_proto::decode::DecodeError;
+use display_proto::events::{
+    DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove,
+};
 use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
 use display_proto::requests::{
     CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
 };
-use display_proto::wire::MessageHeader;
+use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
 /// Monotonic per-server identifier for a connected client.
 /// Mirrors the kernel's `Pid` in role: stable for the lifetime
@@ -99,6 +102,18 @@ pub enum ClientError {
     /// client sent so diagnostics and protocol-error events
     /// can quote it back.
     UnknownInterfaceName { name: String },
+    /// An emit-path wire-format failure — usually a payload
+    /// whose length would overflow the 16-bit `length`
+    /// field. Should be unreachable in practice for v1
+    /// events, but we propagate it so test assertions have
+    /// something specific to match on.
+    EncodeFailed(WireError),
+}
+
+impl From<WireError> for ClientError {
+    fn from(e: WireError) -> Self {
+        ClientError::EncodeFailed(e)
+    }
 }
 
 /// Per-connection state.
@@ -107,6 +122,14 @@ pub struct Client {
     pub objects: BTreeMap<ObjectId, Interface>,
     pub server_ids: IdAllocator,
     pub journal: Vec<HandledRequest>,
+    /// FIFO of framed event bytes the server has
+    /// enqueued for this client. Each entry is ONE
+    /// complete message (header + payload). The caller
+    /// drains them via [`Client::drain_pending_events`]
+    /// and ships the bytes over the transport (socket,
+    /// in-memory buffer, etc.). The queue is empty
+    /// between drains.
+    pub pending_events: Vec<Vec<u8>>,
 }
 
 impl Client {
@@ -121,6 +144,7 @@ impl Client {
             objects,
             server_ids: IdAllocator::for_server(),
             journal: Vec::new(),
+            pending_events: Vec::new(),
         }
     }
 
@@ -294,5 +318,140 @@ impl Client {
     /// Test helper: drain the dispatch journal and return it.
     pub fn drain_journal(&mut self) -> Vec<HandledRequest> {
         core::mem::take(&mut self.journal)
+    }
+
+    // ---- Event emit path ---------------------------------------
+    //
+    // Server code calls these to ship events to this client.
+    // Each helper builds a framed message (header + payload),
+    // pushes it onto `pending_events`, and trusts the caller
+    // to `drain_pending_events()` periodically and feed the
+    // bytes into the transport.
+
+    /// Low-level emit: validate that `object_id` is in the
+    /// client's table, that `opcode` is a known EVENT on
+    /// that interface, and enqueue a framed message
+    /// carrying `payload`. Returns the byte length of the
+    /// emitted message on success.
+    ///
+    /// Callers typically use one of the typed helpers
+    /// below ([`Client::emit_global`],
+    /// [`Client::emit_error`], etc.) which build the
+    /// payload for them; this method is the building block
+    /// for any v1 event the typed helpers don't cover yet.
+    pub fn emit_raw(
+        &mut self,
+        object_id: ObjectId,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<usize, ClientError> {
+        let interface = self
+            .objects
+            .get(&object_id)
+            .copied()
+            .ok_or(ClientError::UnknownObject { id: object_id })?;
+        interface
+            .lookup_event(opcode)
+            .map_err(|e| match e {
+                OpcodeError::UnknownOpcode { interface, opcode } => {
+                    if interface.lookup_request(opcode).is_ok() {
+                        ClientError::WrongDirection { interface, opcode }
+                    } else {
+                        ClientError::UnknownOpcode { interface, opcode }
+                    }
+                }
+            })?;
+        let header = MessageHeader::try_new(object_id, opcode, payload.len(), 0)?;
+        let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
+        buf.resize(HEADER_SIZE, 0);
+        header.encode(&mut buf[..HEADER_SIZE])?;
+        buf.extend_from_slice(payload);
+        let total = buf.len();
+        self.pending_events.push(buf);
+        Ok(total)
+    }
+
+    /// Emit `pmd_display.error(object_id, code, message)` —
+    /// the protocol's generic "this went wrong" event.
+    pub fn emit_error(
+        &mut self,
+        target: ObjectId,
+        code: u32,
+        message: &str,
+    ) -> Result<usize, ClientError> {
+        let event = DisplayError {
+            object_id: target,
+            code,
+            message: message.to_string(),
+        };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(ObjectId::DISPLAY, 1 /* error */, &payload)
+    }
+
+    /// Emit `pmd_display.delete_id(id)` — acknowledge to
+    /// the client that an object it destroyed is fully
+    /// torn down on the server.
+    pub fn emit_delete_id(&mut self, id: ObjectId) -> Result<usize, ClientError> {
+        let event = DisplayDeleteId { id };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(ObjectId::DISPLAY, 2 /* delete_id */, &payload)
+    }
+
+    /// Emit `pmd_registry.global(name, interface, version)`
+    /// against `registry_id`. The caller is responsible
+    /// for having installed a registry object at that id
+    /// first (typically via auto-install in
+    /// `dispatch_request` for `display.get_registry`).
+    pub fn emit_global(
+        &mut self,
+        registry_id: ObjectId,
+        name: u32,
+        interface_name: &str,
+        version: u32,
+    ) -> Result<usize, ClientError> {
+        let event = RegistryGlobal {
+            name,
+            interface: interface_name.to_string(),
+            version,
+        };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(registry_id, 1 /* global */, &payload)
+    }
+
+    /// Emit `pmd_registry.global_remove(name)` against
+    /// `registry_id`.
+    pub fn emit_global_remove(
+        &mut self,
+        registry_id: ObjectId,
+        name: u32,
+    ) -> Result<usize, ClientError> {
+        let event = RegistryGlobalRemove { name };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(registry_id, 2 /* global_remove */, &payload)
+    }
+
+    /// Drain the pending-events queue and return one
+    /// flattened `Vec<u8>` containing every enqueued
+    /// message back-to-back. The client's queue is empty
+    /// after this call.
+    ///
+    /// Returns an empty `Vec<u8>` if no events are
+    /// queued.
+    pub fn drain_pending_events(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for msg in self.pending_events.drain(..) {
+            out.extend_from_slice(&msg);
+        }
+        out
+    }
+
+    /// Number of events currently queued, without
+    /// draining. Diagnostic.
+    pub fn pending_events_len(&self) -> usize {
+        self.pending_events.len()
     }
 }

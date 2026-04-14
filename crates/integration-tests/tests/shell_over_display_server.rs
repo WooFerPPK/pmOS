@@ -1,25 +1,22 @@
 //! `shell::Session` paired with a real `display_server::Server`
-//! over in-memory transports.
+//! over a **fully bidirectional** in-memory loopback.
 //!
-//! Half of the flow is real: the shell's requests
-//! (get_registry + registry.bind) reach the display
-//! server's dispatcher and are journaled, the server's
-//! object table gets auto-populated from the bind
-//! payloads, and the shell's outbound queue drains
-//! correctly.
+//! Every byte of every event and every request traverses
+//! the real library code paths on both sides:
 //!
-//! The other half — server-to-client events — is
-//! simulated by hand-building event bytes with the
-//! `display_proto::events` encoders, because the v1
-//! display-server library does not yet have an emit
-//! path. When it does (a follow-up slice adds
-//! `Client::emit_event` on the server side), this test
-//! will grow a genuine bidirectional loopback.
+//!   * Shell → server: `session.drain_outbound()` bytes
+//!     are fed straight into `server.dispatch_request`.
+//!   * Server → shell: `server.client_mut().emit_*`
+//!     helpers build framed events into the client's
+//!     pending queue, `server.drain_client_events`
+//!     yields a flat byte buffer, and `session.pump`
+//!     parses it.
+//!
+//! Nothing is hand-built. If any layer drifts — wire
+//! format, interface tables, typed decoders on either
+//! side — one of these tests fails loudly.
 
-use display_proto::{
-    wire::{MessageHeader, HEADER_SIZE},
-    Interface, ObjectId, RegistryGlobal,
-};
+use display_proto::{wire::MessageHeader, Interface, ObjectId};
 use display_server::Server as DisplayServerState;
 use shell::Session;
 use toolkit::protocol::MemoryConnection;
@@ -50,24 +47,24 @@ fn pump_requests_into_server(
     n
 }
 
-fn global_event_bytes(
-    registry_id: ObjectId,
-    name: u32,
-    interface_name: &str,
-    version: u32,
-) -> Vec<u8> {
-    let event = RegistryGlobal {
-        name,
-        interface: interface_name.to_string(),
-        version,
-    };
-    let mut payload = Vec::new();
-    event.encode(&mut payload);
-    let mut out = vec![0u8; HEADER_SIZE + payload.len()];
-    let header = MessageHeader::try_new(registry_id, 1 /* global */, payload.len(), 0).unwrap();
-    header.encode(&mut out[..HEADER_SIZE]).unwrap();
-    out[HEADER_SIZE..].copy_from_slice(&payload);
-    out
+/// Ship whatever the server has enqueued for `client_id`
+/// into the paired shell session's pump, returning the
+/// session's step summary. Exists as a helper so tests
+/// read top-down.
+fn pump_events_into_shell(
+    server: &mut DisplayServerState,
+    server_client_id: display_server::ClientId,
+    session: &mut Session<MemoryConnection>,
+) -> shell::SessionStep {
+    let bytes = server
+        .drain_client_events(server_client_id)
+        .expect("client exists");
+    if bytes.is_empty() {
+        return shell::SessionStep::default();
+    }
+    let (step, consumed) = session.pump(&bytes).expect("pump ok");
+    assert_eq!(consumed, bytes.len(), "session consumed the full stream");
+    step
 }
 
 #[test]
@@ -109,9 +106,9 @@ fn shell_auto_bind_on_registry_global_reaches_the_server_as_registry_bind() {
     let mut server = DisplayServerState::new();
     let server_client_id = server.accept();
 
-    // Ship the initial get_registry and drain the
-    // journal so the subsequent assertion only sees the
-    // bind we care about.
+    // 1. Ship the shell's get_registry. The server's
+    //    dispatcher auto-installs the registry object on
+    //    the new_id the shell allocated.
     pump_requests_into_server(
         &mut server,
         server_client_id,
@@ -122,22 +119,31 @@ fn shell_auto_bind_on_registry_global_reaches_the_server_as_registry_bind() {
         .unwrap()
         .drain_journal();
 
-    // Now hand-build a registry.global(compositor) event
-    // for the shell to pump.
+    // 2. Server advertises a compositor global via the
+    //    new emit path. NO hand-built bytes: the server
+    //    builds the event itself.
     let registry_id = session.registry_id().unwrap();
-    let event_bytes = global_event_bytes(registry_id, 1, "pmd_compositor", 1);
-    let (step, consumed) = session.pump(&event_bytes).unwrap();
-    assert_eq!(consumed, event_bytes.len());
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_global(registry_id, 1, "pmd_compositor", 1)
+        .unwrap();
+
+    // 3. Shell pumps whatever the server enqueued. Its
+    //    auto-bind fires, recording the compositor in
+    //    known_globals and queueing a registry.bind
+    //    request on its own outbound.
+    let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
     assert_eq!(step.bound, vec![Interface::Compositor]);
 
-    // The auto-bind queued a registry.bind request on the
-    // session's connection. Ship that to the server.
+    // 4. Ship the shell's registry.bind back to the server.
     let bind_bytes = session.drain_outbound();
     assert!(!bind_bytes.is_empty());
     pump_requests_into_server(&mut server, server_client_id, bind_bytes);
 
-    // Server's journal now has exactly one new entry —
-    // the bind we just shipped.
+    // 5. Server's journal picks up exactly one new entry
+    //    (the bind). The object table has compositor at
+    //    the id the shell chose.
     let journal = server
         .client_mut(server_client_id)
         .unwrap()
@@ -171,9 +177,14 @@ fn shell_becomes_ready_after_both_compositor_and_shm_advertised() {
 
     let registry_id = session.registry_id().unwrap();
 
-    // Advertise compositor first.
-    let compositor_bytes = global_event_bytes(registry_id, 1, "pmd_compositor", 1);
-    session.pump(&compositor_bytes).unwrap();
+    // Server advertises compositor first via the emit
+    // path, shell auto-binds.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_global(registry_id, 1, "pmd_compositor", 1)
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
     pump_requests_into_server(
         &mut server,
         server_client_id,
@@ -181,9 +192,13 @@ fn shell_becomes_ready_after_both_compositor_and_shm_advertised() {
     );
     assert!(!session.is_ready(), "shm still missing");
 
-    // Then shm.
-    let shm_bytes = global_event_bytes(registry_id, 2, "pmd_shm", 1);
-    session.pump(&shm_bytes).unwrap();
+    // Then shm. Same dance.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_global(registry_id, 2, "pmd_shm", 1)
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
     pump_requests_into_server(
         &mut server,
         server_client_id,
@@ -215,8 +230,12 @@ fn shell_ignores_uninteresting_globals_but_still_records_them() {
 
     let registry_id = session.registry_id().unwrap();
     // pmd_net is a global the v1 shell doesn't auto-bind.
-    let event_bytes = global_event_bytes(registry_id, 7, "pmd_net", 1);
-    let (step, _) = session.pump(&event_bytes).unwrap();
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_global(registry_id, 7, "pmd_net", 1)
+        .unwrap();
+    let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
     assert_eq!(step.discovered, vec![7]);
     assert!(step.bound.is_empty());
     // It's in known_globals with interface == None (v1
@@ -228,3 +247,106 @@ fn shell_ignores_uninteresting_globals_but_still_records_them() {
     assert!(session.drain_outbound().is_empty());
     assert!(!session.is_ready());
 }
+
+#[test]
+fn shell_receives_multiple_globals_in_one_drain_and_binds_in_order() {
+    // Server queues several globals back-to-back via
+    // emit_global and then calls drain_client_events
+    // once. The shell's push_received_with_payload parses
+    // the whole batch in one pump and binds every
+    // interesting interface.
+    let mut session = Session::new(MemoryConnection::new());
+    session.start().unwrap();
+
+    let mut server = DisplayServerState::new();
+    let server_client_id = server.accept();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let registry_id = session.registry_id().unwrap();
+    {
+        let server_client = server.client_mut(server_client_id).unwrap();
+        server_client.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
+        server_client.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
+        server_client.emit_global(registry_id, 3, "pmd_net", 1).unwrap();
+    }
+
+    let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(step.discovered, vec![1, 2, 3]);
+    assert!(step.bound.contains(&Interface::Compositor));
+    assert!(step.bound.contains(&Interface::Shm));
+    assert_eq!(step.bound.len(), 2);
+
+    // Shell fired two registry.bind requests — one for
+    // compositor, one for shm. Ship them.
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+    assert!(session.is_ready());
+}
+
+#[test]
+fn server_emit_error_reaches_the_shell_as_protocol_error_notice() {
+    let mut session = Session::new(MemoryConnection::new());
+    session.start().unwrap();
+
+    let mut server = DisplayServerState::new();
+    let server_client_id = server.accept();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    // Server emits pmd_display.error on the display
+    // object. The shell's pump surfaces it as a
+    // ProtocolErrorNotice in the step.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_error(ObjectId::new(3), 42, "malformed request")
+        .unwrap();
+    let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(step.errors.len(), 1);
+    assert_eq!(step.errors[0].object_id, ObjectId::new(3));
+    assert_eq!(step.errors[0].code, 42);
+    assert_eq!(step.errors[0].message, "malformed request");
+}
+
+#[test]
+fn server_emit_global_remove_flips_known_global_live_to_false() {
+    let mut session = Session::new(MemoryConnection::new());
+    session.start().unwrap();
+
+    let mut server = DisplayServerState::new();
+    let server_client_id = server.accept();
+    pump_requests_into_server(
+        &mut server,
+        server_client_id,
+        session.drain_outbound(),
+    );
+
+    let registry_id = session.registry_id().unwrap();
+    {
+        let c = server.client_mut(server_client_id).unwrap();
+        c.emit_global(registry_id, 5, "pmd_net", 1).unwrap();
+        c.emit_global_remove(registry_id, 5).unwrap();
+    }
+    let step = pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(step.discovered, vec![5]);
+    assert_eq!(step.removed, vec![5]);
+
+    let entry = session.known_globals().get(&5).unwrap();
+    assert!(!entry.live, "remove should flip live to false");
+    assert_eq!(entry.interface_name, "pmd_net");
+}
+
+// Silence the `MessageHeader` import — only used in the
+// `use` line that shipped before this slice repurposed it.
+#[allow(dead_code)]
+fn _keep_imports_honest(_h: MessageHeader) {}

@@ -14,6 +14,7 @@
 //! `Server::take_pending_events`.
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use crate::client::{Client, ClientError, ClientId};
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
@@ -89,6 +90,20 @@ impl Server {
     /// Mutably borrow a client.
     pub fn client_mut(&mut self, id: ClientId) -> Option<&mut Client> {
         self.clients.get_mut(&id)
+    }
+
+    /// Drain any events the server has enqueued for a
+    /// client. Returns a single flat `Vec<u8>` containing
+    /// every pending event back-to-back, or `None` if the
+    /// client id is unknown.
+    ///
+    /// The caller typically ships the returned bytes over
+    /// the transport the client is connected on; see
+    /// `integration-tests/tests/shell_over_display_server.rs`
+    /// for a full loopback example.
+    pub fn drain_client_events(&mut self, client_id: ClientId) -> Option<Vec<u8>> {
+        let client = self.clients.get_mut(&client_id)?;
+        Some(client.drain_pending_events())
     }
 
     /// Feed one wire-format request (header + payload) through

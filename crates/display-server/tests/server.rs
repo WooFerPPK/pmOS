@@ -139,6 +139,53 @@ fn dispatch_with_unknown_object_surfaces_a_client_error() {
 }
 
 #[test]
+fn drain_client_events_returns_none_for_unknown_client() {
+    let mut s = Server::new();
+    let stray = display_server::ClientId(99);
+    assert!(s.drain_client_events(stray).is_none());
+}
+
+#[test]
+fn drain_client_events_returns_empty_for_client_with_no_pending_events() {
+    let mut s = Server::new();
+    let c = s.accept();
+    assert_eq!(s.drain_client_events(c), Some(Vec::new()));
+}
+
+#[test]
+fn drain_client_events_returns_bytes_from_a_prior_client_emit() {
+    use display_proto::wire::MessageHeader;
+    let mut s = Server::new();
+    let c = s.accept();
+    s.client_mut(c)
+        .unwrap()
+        .emit_error(ObjectId::DISPLAY, 42, "demo")
+        .unwrap();
+
+    let bytes = s.drain_client_events(c).unwrap();
+    assert!(!bytes.is_empty());
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, ObjectId::DISPLAY);
+    assert_eq!(header.opcode, 1 /* error */);
+
+    // Second drain is empty — the queue has been flushed.
+    assert_eq!(s.drain_client_events(c), Some(Vec::new()));
+}
+
+#[test]
+fn pending_events_are_per_client_not_shared_across_the_server() {
+    let mut s = Server::new();
+    let a = s.accept();
+    let b = s.accept();
+    s.client_mut(a)
+        .unwrap()
+        .emit_error(ObjectId::DISPLAY, 1, "a")
+        .unwrap();
+    assert!(!s.drain_client_events(a).unwrap().is_empty());
+    assert!(s.drain_client_events(b).unwrap().is_empty());
+}
+
+#[test]
 fn multiple_clients_have_independent_object_tables() {
     let mut s = Server::new();
     let a = s.accept();
