@@ -21,13 +21,17 @@
 //! that point the bin driver will grow from the stdin REPL
 //! below to a full window-hosted renderer.
 
-pub mod font;
 pub mod rasterizer;
 pub mod session;
 pub mod terminal;
 
 pub use sh::{Shell, ShellOutput};
-pub use font::{CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
+// Font constants live in `toolkit::draw::font` so every
+// bundled app (term, files, edit, …) shares the same
+// bitmap glyphs. Re-exported here for backwards compat
+// with the existing `term::CELL_HEIGHT` / `GLYPH_WIDTH`
+// usage sites.
+pub use toolkit::draw::font::{CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
 pub use rasterizer::{
     colors, rasterize_snapshot, rasterize_snapshot_with_palette, Palette, BYTES_PER_PIXEL,
     PADDING,

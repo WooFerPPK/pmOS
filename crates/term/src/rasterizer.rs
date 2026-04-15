@@ -4,7 +4,7 @@
 //! The rasterizer is intentionally dumb: it iterates the
 //! scrollback top-down, lays each line out at a fixed
 //! [`CELL_HEIGHT`]-pixel stride, and for each character
-//! consults the [`crate::font`] glyph table to decide
+//! consults the [`toolkit::draw::font`] glyph table to decide
 //! which pixels are foreground and which stay at the
 //! background colour. The active input line is rendered
 //! at the bottom below the scrollback.
@@ -29,7 +29,10 @@
 //! * **Cursor blink:** the input line gets a fixed solid
 //!   cursor block at the end of the buffer.
 
-use crate::font::{glyph_for, glyph_pixel, CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
+use toolkit::draw::font::{
+    glyph_for, glyph_pixel, CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH,
+};
+
 use crate::terminal::{LineKind, TerminalSnapshot};
 
 /// A mutable view of the rasterizer output: the pixel
@@ -206,7 +209,7 @@ fn draw_line(target: &mut Target, origin_x: u32, origin_y: u32, cols: u32, text:
     }
 }
 
-fn draw_glyph(target: &mut Target, glyph: &crate::font::Glyph, x0: u32, y0: u32, fg: u32) {
+fn draw_glyph(target: &mut Target, glyph: &toolkit::draw::font::Glyph, x0: u32, y0: u32, fg: u32) {
     for row in 0..GLYPH_HEIGHT {
         for col in 0..GLYPH_WIDTH {
             if !glyph_pixel(glyph, col, row) {

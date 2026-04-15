@@ -4,7 +4,9 @@
 //! the pixel layout `rasterize_snapshot` produces for a
 //! handful of representative terminal states.
 
-use term::font::{glyph_for, glyph_pixel, CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
+use toolkit::draw::font::{
+    glyph_for, glyph_pixel, CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH,
+};
 use term::rasterizer::{colors, rasterize_snapshot, Palette, PADDING};
 use term::{
     Key, LineKind, Terminal, TerminalLine, TerminalOptions, TerminalSnapshot,
