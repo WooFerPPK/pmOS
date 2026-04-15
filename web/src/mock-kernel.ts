@@ -436,6 +436,7 @@ export class MockKernel implements Kernel {
       lines: this.scrollback,
       inputBuffer: this.liveInputBuffer,
       prompt: this.prompt,
+      ...(this.pointer ? { cursor: this.pointer } : {}),
     };
     const pixels = rasterizeSnapshot(snapshot, this.fbWidth, this.fbHeight);
     scaffold.callDriver(

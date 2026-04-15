@@ -34,6 +34,16 @@ export interface RasterizerSnapshot {
   readonly lines: readonly RasterizerLine[];
   readonly inputBuffer: string;
   readonly prompt: string;
+  /**
+   * Optional mouse cursor overlay position, in framebuffer
+   * pixel coordinates. When present, the rasterizer draws
+   * a small cursor sprite at `(x, y)` on top of all other
+   * terminal content. Callers map canvas-space pointer
+   * events to framebuffer coordinates before passing them
+   * here — see `bootstrap.ts::toFbCoords` for the
+   * letterbox inverse transform.
+   */
+  readonly cursor?: { readonly x: number; readonly y: number };
 }
 
 /** Foreground + background colour assignment for each line kind. */
@@ -143,7 +153,58 @@ export function rasterizeSnapshot(
     );
   }
 
+  // Mouse cursor overlay — drawn LAST so it sits on top of
+  // everything else including the text cursor block.
+  if (snapshot.cursor) {
+    drawMouseCursor(
+      pixels,
+      width,
+      height,
+      snapshot.cursor.x,
+      snapshot.cursor.y,
+      palette.cursor,
+    );
+  }
+
   return pixels;
+}
+
+/**
+ * Mouse cursor sprite — a 5x5 plus/crosshair. Small,
+ * distinctive, and readable on top of both text and
+ * background. Coordinates in the sprite are relative to
+ * the center pixel: `[col offset, row offset]` pairs.
+ */
+const MOUSE_CURSOR_SPRITE: ReadonlyArray<readonly [number, number]> = [
+  // Horizontal bar.
+  [-2, 0],
+  [-1, 0],
+  [0, 0],
+  [1, 0],
+  [2, 0],
+  // Vertical bar (excluding center, already drawn).
+  [0, -2],
+  [0, -1],
+  [0, 1],
+  [0, 2],
+];
+
+/**
+ * Draw a mouse cursor sprite centered at `(x, y)` in
+ * framebuffer coordinates. Out-of-range pixels are
+ * silently clipped by `setPixel`.
+ */
+function drawMouseCursor(
+  pixels: Uint8Array,
+  fbWidth: number,
+  fbHeight: number,
+  x: number,
+  y: number,
+  argb: number,
+): void {
+  for (const [dx, dy] of MOUSE_CURSOR_SPRITE) {
+    setPixel(pixels, fbWidth, fbHeight, x + dx, y + dy, argb);
+  }
 }
 
 function fgForKind(p: Palette, kind: LineKind): number {

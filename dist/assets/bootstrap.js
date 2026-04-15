@@ -500,18 +500,43 @@ function main() {
     });
     const sendMouse = (msg) => session.worker.postMessage(msg);
     const canvasEl = canvas.canvas;
-    const toDeviceCoords = (event) => {
+    const toFbCoords = (event) => {
+      const frame2 = latestFrame;
+      if (!frame2) {
+        return null;
+      }
       const rect = canvasEl.getBoundingClientRect();
-      const x = Math.round((event.clientX - rect.left) * canvas.dpr);
-      const y = Math.round((event.clientY - rect.top) * canvas.dpr);
-      return [x, y];
+      const canvasCx = (event.clientX - rect.left) * canvas.dpr;
+      const canvasCy = (event.clientY - rect.top) * canvas.dpr;
+      const fbW = frame2.width;
+      const fbH = frame2.height;
+      const canvasW = canvas.canvas.width;
+      const canvasH = canvas.canvas.height;
+      const scale = Math.max(
+        1,
+        Math.floor(Math.min(canvasW / fbW, canvasH / fbH))
+      );
+      const dw = fbW * scale;
+      const dh = fbH * scale;
+      const dx = Math.floor((canvasW - dw) / 2);
+      const dy = Math.floor((canvasH - dh) / 2);
+      const fbX = Math.floor((canvasCx - dx) / scale);
+      const fbY = Math.floor((canvasCy - dy) / scale);
+      if (fbX < 0 || fbX >= fbW || fbY < 0 || fbY >= fbH) {
+        return null;
+      }
+      return [fbX, fbY];
     };
     canvasEl.addEventListener("pointermove", (event) => {
-      const [x, y] = toDeviceCoords(event);
+      const coords = toFbCoords(event);
+      if (!coords) return;
+      const [x, y] = coords;
       sendMouse({ kind: "input:mouse", bytes: packMouseMotion(x, y) });
     });
     canvasEl.addEventListener("pointerdown", (event) => {
-      const [x, y] = toDeviceCoords(event);
+      const coords = toFbCoords(event);
+      if (!coords) return;
+      const [x, y] = coords;
       const button = domButtonToProtoButton(event.button);
       sendMouse({
         kind: "input:mouse",
@@ -519,7 +544,9 @@ function main() {
       });
     });
     canvasEl.addEventListener("pointerup", (event) => {
-      const [x, y] = toDeviceCoords(event);
+      const coords = toFbCoords(event);
+      if (!coords) return;
+      const [x, y] = coords;
       const button = domButtonToProtoButton(event.button);
       sendMouse({
         kind: "input:mouse",

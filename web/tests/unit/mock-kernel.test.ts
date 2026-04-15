@@ -369,6 +369,44 @@ describe("MockKernel input device ring consumption", () => {
     expect(after - baselineBlits).toBe(1);
   });
 
+  it("blit after a motion event contains cursor pixels at the new position", () => {
+    // Default fb is 320x240. A motion event at (50, 60)
+    // should paint a white cursor pixel there. Decode the
+    // latest blit payload to pull the pixel out.
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(Devnum.InputMouse, packMouseMotion(50, 60));
+
+    const blits = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    );
+    const last = blits[blits.length - 1];
+    expect(last).toBeDefined();
+    if (!last) return;
+    // BLIT payload layout: 8-byte header (width, height
+    // little-endian) then RGBA bytes.
+    const view = new DataView(
+      last.payload.buffer,
+      last.payload.byteOffset,
+      last.payload.byteLength,
+    );
+    const width = view.getUint32(0, true);
+    const height = view.getUint32(4, true);
+    expect(width).toBe(SPLASH_WIDTH);
+    expect(height).toBe(SPLASH_HEIGHT);
+    const pixelBase = 8 + (60 * width + 50) * 4;
+    // Center of the cursor — should be white (0xFFFFFFFF)
+    // BGRA-packed as [FF, FF, FF, FF].
+    expect(last.payload[pixelBase]).toBe(0xff);
+    expect(last.payload[pixelBase + 1]).toBe(0xff);
+    expect(last.payload[pixelBase + 2]).toBe(0xff);
+    expect(last.payload[pixelBase + 3]).toBe(0xff);
+  });
+
   it("pointer events produce no fb traffic when live-terminal is off", () => {
     const mock = new MockKernel({ policy: { kind: "echo" } });
     const scaffold = makeScaffold();

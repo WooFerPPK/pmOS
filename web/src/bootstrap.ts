@@ -439,22 +439,54 @@ function main(): void {
     // driver when `enableInput` is true, and the mock
     // kernel's `injectInput` for this devnum decodes the
     // packed bytes, updates its pointer state, and (in
-    // live-terminal mode) re-blits so the next frame
-    // reflects the new position.
+    // live-terminal mode) re-blits — painting a visible
+    // cursor sprite at the new position.
     const sendMouse = (msg: MainToKernel) => session.worker.postMessage(msg);
     const canvasEl = canvas.canvas;
-    const toDeviceCoords = (event: PointerEvent): [number, number] => {
+    // Convert a DOM PointerEvent into framebuffer
+    // coordinates by inverting the letterbox transform
+    // `paintBlitToCanvasFullscreen` uses to draw the
+    // latest blit. Returns `null` if no blit has
+    // arrived yet (can't know the fb size) or if the
+    // event falls outside the blit's painted rectangle
+    // (pointer is over the letterbox margin).
+    const toFbCoords = (event: PointerEvent): [number, number] | null => {
+      const frame = latestFrame;
+      if (!frame) {
+        return null;
+      }
       const rect = canvasEl.getBoundingClientRect();
-      const x = Math.round((event.clientX - rect.left) * canvas.dpr);
-      const y = Math.round((event.clientY - rect.top) * canvas.dpr);
-      return [x, y];
+      const canvasCx = (event.clientX - rect.left) * canvas.dpr;
+      const canvasCy = (event.clientY - rect.top) * canvas.dpr;
+      const fbW = frame.width;
+      const fbH = frame.height;
+      const canvasW = canvas.canvas.width;
+      const canvasH = canvas.canvas.height;
+      const scale = Math.max(
+        1,
+        Math.floor(Math.min(canvasW / fbW, canvasH / fbH)),
+      );
+      const dw = fbW * scale;
+      const dh = fbH * scale;
+      const dx = Math.floor((canvasW - dw) / 2);
+      const dy = Math.floor((canvasH - dh) / 2);
+      const fbX = Math.floor((canvasCx - dx) / scale);
+      const fbY = Math.floor((canvasCy - dy) / scale);
+      if (fbX < 0 || fbX >= fbW || fbY < 0 || fbY >= fbH) {
+        return null;
+      }
+      return [fbX, fbY];
     };
     canvasEl.addEventListener("pointermove", (event: PointerEvent) => {
-      const [x, y] = toDeviceCoords(event);
+      const coords = toFbCoords(event);
+      if (!coords) return;
+      const [x, y] = coords;
       sendMouse({ kind: "input:mouse", bytes: packMouseMotion(x, y) });
     });
     canvasEl.addEventListener("pointerdown", (event: PointerEvent) => {
-      const [x, y] = toDeviceCoords(event);
+      const coords = toFbCoords(event);
+      if (!coords) return;
+      const [x, y] = coords;
       const button = domButtonToProtoButton(event.button);
       sendMouse({
         kind: "input:mouse",
@@ -462,7 +494,9 @@ function main(): void {
       });
     });
     canvasEl.addEventListener("pointerup", (event: PointerEvent) => {
-      const [x, y] = toDeviceCoords(event);
+      const coords = toFbCoords(event);
+      if (!coords) return;
+      const [x, y] = coords;
       const button = domButtonToProtoButton(event.button);
       sendMouse({
         kind: "input:mouse",

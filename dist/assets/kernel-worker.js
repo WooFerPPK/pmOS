@@ -461,7 +461,35 @@ function rasterizeSnapshot(snapshot, width, height, palette = DEFAULT_PALETTE) {
       palette.cursor
     );
   }
+  if (snapshot.cursor) {
+    drawMouseCursor(
+      pixels,
+      width,
+      height,
+      snapshot.cursor.x,
+      snapshot.cursor.y,
+      palette.cursor
+    );
+  }
   return pixels;
+}
+var MOUSE_CURSOR_SPRITE = [
+  // Horizontal bar.
+  [-2, 0],
+  [-1, 0],
+  [0, 0],
+  [1, 0],
+  [2, 0],
+  // Vertical bar (excluding center, already drawn).
+  [0, -2],
+  [0, -1],
+  [0, 1],
+  [0, 2]
+];
+function drawMouseCursor(pixels, fbWidth, fbHeight, x, y, argb) {
+  for (const [dx, dy] of MOUSE_CURSOR_SPRITE) {
+    setPixel(pixels, fbWidth, fbHeight, x + dx, y + dy, argb);
+  }
 }
 function fgForKind(p, kind) {
   switch (kind) {
@@ -817,7 +845,8 @@ var MockKernel = class {
     const snapshot = {
       lines: this.scrollback,
       inputBuffer: this.liveInputBuffer,
-      prompt: this.prompt
+      prompt: this.prompt,
+      ...this.pointer ? { cursor: this.pointer } : {}
     };
     const pixels = rasterizeSnapshot(snapshot, this.fbWidth, this.fbHeight);
     scaffold.callDriver(

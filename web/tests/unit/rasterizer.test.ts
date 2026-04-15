@@ -251,6 +251,99 @@ describe("rasterizeSnapshot", () => {
   });
 });
 
+describe("mouse cursor overlay", () => {
+  it("draws a 5-pixel plus at the cursor position", () => {
+    const width = 64;
+    const height = 32;
+    const cursorX = 20;
+    const cursorY = 16;
+    const snap: RasterizerSnapshot = {
+      lines: [],
+      inputBuffer: "",
+      prompt: "",
+      cursor: { x: cursorX, y: cursorY },
+    };
+    const pixels = rasterizeSnapshot(snap, width, height);
+
+    // Cursor colour is 0xFFFFFFFF → [FF, FF, FF, FF].
+    const white: [number, number, number, number] = [0xff, 0xff, 0xff, 0xff];
+    // The 5 horizontal pixels (cursorX-2 .. cursorX+2, row cursorY).
+    for (let dx = -2; dx <= 2; dx += 1) {
+      expect(
+        readPixel(pixels, width, cursorX + dx, cursorY),
+        `horizontal dx=${dx}`,
+      ).toEqual(white);
+    }
+    // The 4 vertical pixels (the center is shared with
+    // the horizontal).
+    for (const dy of [-2, -1, 1, 2]) {
+      expect(
+        readPixel(pixels, width, cursorX, cursorY + dy),
+        `vertical dy=${dy}`,
+      ).toEqual(white);
+    }
+    // A pixel not on the cross should still be background.
+    expect(readPixel(pixels, width, cursorX + 2, cursorY + 2)).toEqual([
+      ...BG_PIXEL,
+    ]);
+  });
+
+  it("does not draw a cursor when snapshot.cursor is omitted", () => {
+    const snap: RasterizerSnapshot = {
+      lines: [],
+      inputBuffer: "",
+      prompt: "",
+    };
+    const width = 64;
+    const height = 32;
+    const pixels = rasterizeSnapshot(snap, width, height);
+    // Count white pixels — without a cursor there should
+    // be none at (any, any) outside the text cursor
+    // block. The text cursor block is drawn at the
+    // input line position, so we sample a clearly-
+    // background region near the top-center.
+    const px = readPixel(pixels, width, 32, 4);
+    expect(px).toEqual([...BG_PIXEL]);
+  });
+
+  it("clips the cursor sprite at framebuffer edges", () => {
+    const snap: RasterizerSnapshot = {
+      lines: [],
+      inputBuffer: "",
+      prompt: "",
+      cursor: { x: 0, y: 0 },
+    };
+    const width = 32;
+    const height = 32;
+    // Should not panic / write out of bounds.
+    const pixels = rasterizeSnapshot(snap, width, height);
+    expect(pixels.byteLength).toBe(width * height * 4);
+    // The center pixel of the cursor lands at (0, 0) and
+    // is white. Pixels at (-1, 0), (-2, 0), (0, -1),
+    // (0, -2) are clipped away.
+    expect(readPixel(pixels, width, 0, 0)).toEqual([0xff, 0xff, 0xff, 0xff]);
+  });
+
+  it("cursor is painted ON TOP of existing content", () => {
+    // A snapshot with an output line at (0, 0) — the
+    // letter "o". The cursor at (2, 3) should overpaint
+    // any foreground pixel of the glyph at that spot.
+    const snap: RasterizerSnapshot = {
+      lines: [{ text: "o", kind: "output" }],
+      inputBuffer: "",
+      prompt: "",
+      cursor: { x: PADDING + 2, y: PADDING + 3 },
+    };
+    const width = 64;
+    const height = 32;
+    const pixels = rasterizeSnapshot(snap, width, height);
+    // That exact pixel is the center of the cursor → white.
+    expect(readPixel(pixels, width, PADDING + 2, PADDING + 3)).toEqual([
+      0xff, 0xff, 0xff, 0xff,
+    ]);
+  });
+});
+
 describe("DEFAULT_PALETTE", () => {
   it("exposes each colour via the colors namespace", () => {
     expect(DEFAULT_PALETTE.bg).toBe(colors.BG);
