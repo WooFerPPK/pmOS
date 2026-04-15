@@ -1,4 +1,4 @@
-// web/src/sw.ts
+// src/sw.ts
 var CACHE_VERSION = "pmos-v0";
 self.addEventListener("install", (event) => {
   event.waitUntil(

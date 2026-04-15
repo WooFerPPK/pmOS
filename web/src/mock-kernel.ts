@@ -29,6 +29,7 @@ import {
   OP_BLIT as FB_OP_BLIT,
   OP_SET_MODE as FB_OP_SET_MODE,
 } from "./drivers/fb";
+import { rasterizeSnapshot, type RasterizerSnapshot } from "./shared/rasterizer";
 
 /**
  * Handler invoked when the mock kernel has a completed line
@@ -150,7 +151,22 @@ export class MockKernel implements Kernel {
     if (!setModeResult.ok) {
       return;
     }
-    const pixels = generateSplashPixels(SPLASH_WIDTH, SPLASH_HEIGHT);
+    // Build a terminal snapshot for the splash — a short
+    // banner + prompt that exercises the TS-side rasterizer
+    // end-to-end (bytes produced here land on the TS
+    // `FramebufferDriver` and then on the main thread's
+    // canvas as real text pixels).
+    const snapshot: RasterizerSnapshot = {
+      lines: [
+        { text: "PMos 0.1.0-demo", kind: "banner" },
+        { text: "kernel worker ready", kind: "banner" },
+        { text: "type 'help' for commands", kind: "banner" },
+        { text: "", kind: "output" },
+      ],
+      inputBuffer: "",
+      prompt: "> ",
+    };
+    const pixels = rasterizeSnapshot(snapshot, SPLASH_WIDTH, SPLASH_HEIGHT);
     scaffold.callDriver(
       FB_DRIVER_ID,
       FB_OP_BLIT,
