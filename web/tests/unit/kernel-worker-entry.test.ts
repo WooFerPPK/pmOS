@@ -9,6 +9,12 @@ import { describe, expect, it } from "vitest";
 import { installWorkerEntry } from "../../src/kernel-worker-entry";
 import type { WorkerMessaging } from "../../src/kernel-worker-entry";
 import type { KernelToMain, MainToKernel } from "../../src/shared/worker-proto";
+import {
+  MouseButton,
+  MouseButtonState,
+  packMouseButton,
+  packMouseMotion,
+} from "../../src/shared/input-proto";
 
 interface FakeMessaging extends WorkerMessaging {
   readonly posted: KernelToMain[];
@@ -210,5 +216,80 @@ describe("installWorkerEntry", () => {
     });
     expect(msg.posted.some((m) => m.kind === "fb:set-mode")).toBe(false);
     expect(msg.posted.some((m) => m.kind === "fb:blit")).toBe(false);
+  });
+
+  it("input:mouse messages flow through the scaffold into the mock kernel's pointer state", () => {
+    // End-to-end main-thread → worker → scaffold → input
+    // driver → mock kernel. Send a motion event, then a
+    // button event, then drain the mock's pointer state
+    // via `entry.scaffold` is not sufficient here — the
+    // scaffold exposes a Kernel interface, not internal
+    // MockKernel state. For this test we check that the
+    // scaffold accepted the messages without panicking
+    // AND that no errors were posted back.
+    const msg = makeMessaging();
+    installWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: true,
+        enableFramebuffer: false,
+      },
+    });
+    // Pre-count any posted messages from boot (ready, etc.)
+    // so later assertions only see what input events produce.
+    const panicsBefore = msg.posted.filter((m) => m.kind === "panic").length;
+
+    msg.send({ kind: "input:mouse", bytes: packMouseMotion(100, 50) });
+    msg.send({
+      kind: "input:mouse",
+      bytes: packMouseButton(
+        100,
+        50,
+        MouseButton.Left,
+        MouseButtonState.Pressed,
+      ),
+    });
+
+    // No panic was posted — the scaffold routed the
+    // messages through the input driver cleanly.
+    const panicsAfter = msg.posted.filter((m) => m.kind === "panic").length;
+    expect(panicsAfter).toBe(panicsBefore);
+  });
+
+  it("input:mouse messages do not post fb blits when the framebuffer is off", () => {
+    const msg = makeMessaging();
+    installWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: true,
+        enableFramebuffer: false,
+      },
+    });
+    msg.send({ kind: "input:mouse", bytes: packMouseMotion(10, 10) });
+    expect(msg.posted.some((m) => m.kind === "fb:blit")).toBe(false);
+  });
+
+  it("live-terminal mode blits once on every input:mouse motion event", () => {
+    const msg = makeMessaging();
+    installWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: true,
+        enableFramebuffer: true,
+        liveTerminal: true,
+        terminalBanner: ["ready"],
+      },
+    });
+    // Baseline: SET_MODE + initial blit from bindScaffold.
+    const baseBlits = msg.posted.filter((m) => m.kind === "fb:blit").length;
+    msg.send({ kind: "input:mouse", bytes: packMouseMotion(1, 1) });
+    const after = msg.posted.filter((m) => m.kind === "fb:blit").length;
+    expect(after - baseBlits).toBe(1);
   });
 });

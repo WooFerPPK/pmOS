@@ -45,6 +45,10 @@ import {
   OP_WRITE_LINE,
 } from "./drivers/console";
 import {
+  DEV_INPUT_MOUSE_NODE,
+  DEV_INPUT_KBD_NODE,
+} from "./drivers/input";
+import {
   FB_DRIVER_ID,
   OP_BLIT as FB_OP_BLIT,
   OP_SET_MODE as FB_OP_SET_MODE,
@@ -54,6 +58,12 @@ import {
   type RasterizerLine,
   type RasterizerSnapshot,
 } from "./shared/rasterizer";
+import {
+  MouseEventKind,
+  unpackKbdEvent,
+  unpackMouseEvent,
+  type MouseEvent as PackedMouseEvent,
+} from "./shared/input-proto";
 
 /**
  * Handler invoked when the mock kernel has a completed line
@@ -179,6 +189,21 @@ export class MockKernel implements Kernel {
    * retry or attempt to blit.
    */
   private fbDisabled = false;
+  /** Most recent decoded pointer position. `null` until the
+   * first mouse motion event is injected.
+   */
+  private pointer: { x: number; y: number } | null = null;
+  /** Most recent button event, press or release. `null`
+   * until the first button event arrives.
+   */
+  private lastButton: PackedMouseEvent | null = null;
+  /** Total number of mouse events the kernel has consumed. */
+  private mouseEventCount = 0;
+  /** Total number of keyboard events consumed via the
+   * `/dev/input/kbd` path (distinct from the console input
+   * path the live terminal uses for scrollback).
+   */
+  private kbdEventCount = 0;
 
   constructor(options: MockKernelOptions) {
     this.policy = options.policy;
@@ -212,9 +237,16 @@ export class MockKernel implements Kernel {
   }
 
   injectInput(devnum: number, bytes: Uint8Array): void {
+    if (devnum === DEV_INPUT_MOUSE_NODE) {
+      this.injectMouseEvent(bytes);
+      return;
+    }
+    if (devnum === DEV_INPUT_KBD_NODE) {
+      this.injectKbdEvent(bytes);
+      return;
+    }
     if (devnum !== DEV_CONSOLE_NODE) {
-      // Non-console devnums are accepted but dropped in v1.
-      // Mouse + keyboard event rings land in a later slice.
+      // Unknown devnums are accepted but dropped in v1.
       return;
     }
     if (this.liveTerminal) {
@@ -237,6 +269,60 @@ export class MockKernel implements Kernel {
         this.lineBuffers.set(devnum, buf);
       }
     }
+  }
+
+  /**
+   * Decode a packed mouse event from the `/dev/input/mouse`
+   * device ring and update the tracked pointer state. A
+   * motion event updates `pointer`; a button event updates
+   * both `pointer` and `lastButton`. Malformed bytes are
+   * silently dropped (the packer + unpacker are symmetric,
+   * so the only failure mode is a length mismatch caused
+   * by a caller bug).
+   *
+   * When live-terminal mode is on and a fresh pointer
+   * position changes anything visible, the kernel re-renders
+   * so the future cursor-drawing slice can land without
+   * re-plumbing the blit trigger.
+   */
+  private injectMouseEvent(bytes: Uint8Array): void {
+    const evt = unpackMouseEvent(bytes);
+    if (!evt) {
+      return;
+    }
+    this.mouseEventCount += 1;
+    this.pointer = { x: evt.x, y: evt.y };
+    if (evt.kind === MouseEventKind.Button) {
+      this.lastButton = evt;
+    }
+    // In live-terminal mode, a click could plausibly
+    // change what the screen should look like (focus, cursor
+    // highlight, etc.). For now just re-blit so the
+    // first visible cursor-drawing slice doesn't need a
+    // new trigger path. A pure motion event also causes a
+    // re-blit for the same reason — overhead is a single
+    // frame at user-visible cadence.
+    if (this.liveTerminal) {
+      this.renderAndBlit();
+    }
+  }
+
+  /**
+   * Decode a packed keyboard event from the
+   * `/dev/input/kbd` device ring. v1 only records the
+   * event in a counter for tests; real consumption
+   * (focused-window routing, scancode → ASCII) lands with
+   * the next slice that wires this path into the live
+   * terminal. The existing `console:input` bytes path
+   * still delivers typed characters to the scrollback so
+   * the browser demo's typing behaviour is unchanged.
+   */
+  private injectKbdEvent(bytes: Uint8Array): void {
+    const evt = unpackKbdEvent(bytes);
+    if (!evt) {
+      return;
+    }
+    this.kbdEventCount += 1;
   }
 
   /**
@@ -473,6 +559,29 @@ export class MockKernel implements Kernel {
   /** Read-only view of the live-terminal input buffer. */
   get liveInput(): string {
     return this.liveInputBuffer;
+  }
+
+  /** Most recent pointer position seen via
+   * `/dev/input/mouse`, or `null` if no mouse event has
+   * been injected yet. */
+  get pointerPosition(): { x: number; y: number } | null {
+    return this.pointer === null ? null : { ...this.pointer };
+  }
+
+  /** Most recent button event, or `null` if none has
+   * been injected. */
+  get lastMouseButton(): PackedMouseEvent | null {
+    return this.lastButton;
+  }
+
+  /** Total mouse events consumed. */
+  get mouseEventsObserved(): number {
+    return this.mouseEventCount;
+  }
+
+  /** Total keyboard events consumed via `/dev/input/kbd`. */
+  get kbdEventsObserved(): number {
+    return this.kbdEventCount;
   }
 }
 

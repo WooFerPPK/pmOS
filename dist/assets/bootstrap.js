@@ -185,6 +185,40 @@ var FbHost = class {
   }
 };
 
+// src/shared/input-proto.ts
+var MOUSE_EVENT_SIZE = 20;
+var MouseEventKind = {
+  /** Pointer moved to (x, y) in screen space. */
+  Motion: 0,
+  /** A mouse button was pressed or released at (x, y). */
+  Button: 1
+};
+var MouseButtonState = {
+  Released: 0,
+  Pressed: 1
+};
+var MouseButton = {
+  Left: 1,
+  Right: 2,
+  Middle: 3
+};
+function packMouseMotion(x, y) {
+  return packMouseEvent(MouseEventKind.Motion, x, y, 0, MouseButtonState.Released);
+}
+function packMouseButton(x, y, button, state) {
+  return packMouseEvent(MouseEventKind.Button, x, y, button, state);
+}
+function packMouseEvent(kind, x, y, button, state) {
+  const out = new Uint8Array(MOUSE_EVENT_SIZE);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, kind, true);
+  view.setInt32(4, x, true);
+  view.setInt32(8, y, true);
+  view.setUint32(12, button, true);
+  view.setUint32(16, state, true);
+  return out;
+}
+
 // src/bootstrap.ts
 var BOOT_VERSION = "0.1.0-demo";
 function hasSharedArrayBuffer() {
@@ -464,7 +498,47 @@ function main() {
       event.preventDefault();
       session.console.sendInput(bytes);
     });
+    const sendMouse = (msg) => session.worker.postMessage(msg);
+    const canvasEl = canvas.canvas;
+    const toDeviceCoords = (event) => {
+      const rect = canvasEl.getBoundingClientRect();
+      const x = Math.round((event.clientX - rect.left) * canvas.dpr);
+      const y = Math.round((event.clientY - rect.top) * canvas.dpr);
+      return [x, y];
+    };
+    canvasEl.addEventListener("pointermove", (event) => {
+      const [x, y] = toDeviceCoords(event);
+      sendMouse({ kind: "input:mouse", bytes: packMouseMotion(x, y) });
+    });
+    canvasEl.addEventListener("pointerdown", (event) => {
+      const [x, y] = toDeviceCoords(event);
+      const button = domButtonToProtoButton(event.button);
+      sendMouse({
+        kind: "input:mouse",
+        bytes: packMouseButton(x, y, button, MouseButtonState.Pressed)
+      });
+    });
+    canvasEl.addEventListener("pointerup", (event) => {
+      const [x, y] = toDeviceCoords(event);
+      const button = domButtonToProtoButton(event.button);
+      sendMouse({
+        kind: "input:mouse",
+        bytes: packMouseButton(x, y, button, MouseButtonState.Released)
+      });
+    });
   };
+  function domButtonToProtoButton(domButton) {
+    switch (domButton) {
+      case 0:
+        return MouseButton.Left;
+      case 1:
+        return MouseButton.Middle;
+      case 2:
+        return MouseButton.Right;
+      default:
+        return domButton;
+    }
+  }
   step(7, 2600, () => {
     let session;
     try {
@@ -560,7 +634,12 @@ function createKernelSession() {
     worker,
     bootConfig: {
       enableConsole: true,
-      enableInput: false,
+      // Pointer/keyboard events flow through the scaffold's
+      // input driver into `/dev/input/{kbd,mouse}` rings.
+      // This slice lights up the pointer path; keyboard
+      // still rides the console:input bytes path for the
+      // live terminal, and will migrate in a follow-up.
+      enableInput: true,
       enableFramebuffer: true,
       // Live-terminal mode: the worker owns scrollback and
       // input buffer; every keystroke produces a new

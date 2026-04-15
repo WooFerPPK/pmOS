@@ -535,6 +535,60 @@ function splitArgb(argb) {
   ];
 }
 
+// src/shared/input-proto.ts
+var MOUSE_EVENT_SIZE = 20;
+var MouseEventKind = {
+  /** Pointer moved to (x, y) in screen space. */
+  Motion: 0,
+  /** A mouse button was pressed or released at (x, y). */
+  Button: 1
+};
+var MouseButtonState = {
+  Released: 0,
+  Pressed: 1
+};
+function unpackMouseEvent(bytes) {
+  if (bytes.byteLength < MOUSE_EVENT_SIZE) {
+    return null;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const kind = view.getUint32(0, true);
+  if (kind !== MouseEventKind.Motion && kind !== MouseEventKind.Button) {
+    return null;
+  }
+  const x = view.getInt32(4, true);
+  const y = view.getInt32(8, true);
+  const button = view.getUint32(12, true);
+  const stateRaw = view.getUint32(16, true);
+  if (stateRaw !== MouseButtonState.Released && stateRaw !== MouseButtonState.Pressed) {
+    return null;
+  }
+  return {
+    kind,
+    x,
+    y,
+    button,
+    state: stateRaw
+  };
+}
+var KBD_EVENT_SIZE = 8;
+var KbdKeyState = {
+  Released: 0,
+  Pressed: 1
+};
+function unpackKbdEvent(bytes) {
+  if (bytes.byteLength < KBD_EVENT_SIZE) {
+    return null;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const key = view.getUint32(0, true);
+  const stateRaw = view.getUint32(4, true);
+  if (stateRaw !== KbdKeyState.Released && stateRaw !== KbdKeyState.Pressed) {
+    return null;
+  }
+  return { key, state: stateRaw };
+}
+
 // src/mock-kernel.ts
 var MockKernel = class {
   scaffold;
@@ -559,6 +613,21 @@ var MockKernel = class {
    * retry or attempt to blit.
    */
   fbDisabled = false;
+  /** Most recent decoded pointer position. `null` until the
+   * first mouse motion event is injected.
+   */
+  pointer = null;
+  /** Most recent button event, press or release. `null`
+   * until the first button event arrives.
+   */
+  lastButton = null;
+  /** Total number of mouse events the kernel has consumed. */
+  mouseEventCount = 0;
+  /** Total number of keyboard events consumed via the
+   * `/dev/input/kbd` path (distinct from the console input
+   * path the live terminal uses for scrollback).
+   */
+  kbdEventCount = 0;
   constructor(options) {
     this.policy = options.policy;
     this.emitSplashOnFirstInput = options.emitSplashOnFirstInput ?? false;
@@ -585,6 +654,14 @@ var MockKernel = class {
     }
   }
   injectInput(devnum, bytes) {
+    if (devnum === DEV_INPUT_MOUSE_NODE) {
+      this.injectMouseEvent(bytes);
+      return;
+    }
+    if (devnum === DEV_INPUT_KBD_NODE) {
+      this.injectKbdEvent(bytes);
+      return;
+    }
     if (devnum !== DEV_CONSOLE_NODE) {
       return;
     }
@@ -608,6 +685,51 @@ var MockKernel = class {
         this.lineBuffers.set(devnum, buf);
       }
     }
+  }
+  /**
+   * Decode a packed mouse event from the `/dev/input/mouse`
+   * device ring and update the tracked pointer state. A
+   * motion event updates `pointer`; a button event updates
+   * both `pointer` and `lastButton`. Malformed bytes are
+   * silently dropped (the packer + unpacker are symmetric,
+   * so the only failure mode is a length mismatch caused
+   * by a caller bug).
+   *
+   * When live-terminal mode is on and a fresh pointer
+   * position changes anything visible, the kernel re-renders
+   * so the future cursor-drawing slice can land without
+   * re-plumbing the blit trigger.
+   */
+  injectMouseEvent(bytes) {
+    const evt = unpackMouseEvent(bytes);
+    if (!evt) {
+      return;
+    }
+    this.mouseEventCount += 1;
+    this.pointer = { x: evt.x, y: evt.y };
+    if (evt.kind === MouseEventKind.Button) {
+      this.lastButton = evt;
+    }
+    if (this.liveTerminal) {
+      this.renderAndBlit();
+    }
+  }
+  /**
+   * Decode a packed keyboard event from the
+   * `/dev/input/kbd` device ring. v1 only records the
+   * event in a counter for tests; real consumption
+   * (focused-window routing, scancode → ASCII) lands with
+   * the next slice that wires this path into the live
+   * terminal. The existing `console:input` bytes path
+   * still delivers typed characters to the scrollback so
+   * the browser demo's typing behaviour is unchanged.
+   */
+  injectKbdEvent(bytes) {
+    const evt = unpackKbdEvent(bytes);
+    if (!evt) {
+      return;
+    }
+    this.kbdEventCount += 1;
   }
   /**
    * Live-terminal per-byte keystroke processor. See
@@ -798,6 +920,25 @@ var MockKernel = class {
   /** Read-only view of the live-terminal input buffer. */
   get liveInput() {
     return this.liveInputBuffer;
+  }
+  /** Most recent pointer position seen via
+   * `/dev/input/mouse`, or `null` if no mouse event has
+   * been injected yet. */
+  get pointerPosition() {
+    return this.pointer === null ? null : { ...this.pointer };
+  }
+  /** Most recent button event, or `null` if none has
+   * been injected. */
+  get lastMouseButton() {
+    return this.lastButton;
+  }
+  /** Total mouse events consumed. */
+  get mouseEventsObserved() {
+    return this.mouseEventCount;
+  }
+  /** Total keyboard events consumed via `/dev/input/kbd`. */
+  get kbdEventsObserved() {
+    return this.kbdEventCount;
   }
 };
 var FAUX_SHELL_HELP = [

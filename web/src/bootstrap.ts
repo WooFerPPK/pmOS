@@ -21,6 +21,13 @@ import { ConsoleHost } from "./console-host";
 import { runEchoCheck } from "./console-check";
 import { FbHost } from "./fb-host";
 import type { FbFrame } from "./fb-host";
+import {
+  MouseButton,
+  MouseButtonState,
+  packMouseButton,
+  packMouseMotion,
+} from "./shared/input-proto";
+import type { MainToKernel } from "./shared/worker-proto";
 
 const BOOT_VERSION = "0.1.0-demo";
 
@@ -426,7 +433,63 @@ function main(): void {
       event.preventDefault();
       session.console.sendInput(bytes);
     });
+
+    // Pointer events → `/dev/input/mouse` via the input
+    // driver. The worker-side scaffold auto-registers the
+    // driver when `enableInput` is true, and the mock
+    // kernel's `injectInput` for this devnum decodes the
+    // packed bytes, updates its pointer state, and (in
+    // live-terminal mode) re-blits so the next frame
+    // reflects the new position.
+    const sendMouse = (msg: MainToKernel) => session.worker.postMessage(msg);
+    const canvasEl = canvas.canvas;
+    const toDeviceCoords = (event: PointerEvent): [number, number] => {
+      const rect = canvasEl.getBoundingClientRect();
+      const x = Math.round((event.clientX - rect.left) * canvas.dpr);
+      const y = Math.round((event.clientY - rect.top) * canvas.dpr);
+      return [x, y];
+    };
+    canvasEl.addEventListener("pointermove", (event: PointerEvent) => {
+      const [x, y] = toDeviceCoords(event);
+      sendMouse({ kind: "input:mouse", bytes: packMouseMotion(x, y) });
+    });
+    canvasEl.addEventListener("pointerdown", (event: PointerEvent) => {
+      const [x, y] = toDeviceCoords(event);
+      const button = domButtonToProtoButton(event.button);
+      sendMouse({
+        kind: "input:mouse",
+        bytes: packMouseButton(x, y, button, MouseButtonState.Pressed),
+      });
+    });
+    canvasEl.addEventListener("pointerup", (event: PointerEvent) => {
+      const [x, y] = toDeviceCoords(event);
+      const button = domButtonToProtoButton(event.button);
+      sendMouse({
+        kind: "input:mouse",
+        bytes: packMouseButton(x, y, button, MouseButtonState.Released),
+      });
+    });
   };
+
+  /**
+   * Translate a DOM `PointerEvent.button` value to the
+   * `MouseButton` wire constants the kernel expects. DOM
+   * numbering is 0=primary, 1=middle, 2=secondary; the
+   * protocol uses 1=left, 2=right, 3=middle. Unknown
+   * buttons pass through as their DOM numeric value.
+   */
+  function domButtonToProtoButton(domButton: number): number {
+    switch (domButton) {
+      case 0:
+        return MouseButton.Left;
+      case 1:
+        return MouseButton.Middle;
+      case 2:
+        return MouseButton.Right;
+      default:
+        return domButton;
+    }
+  }
 
   step(7, 2600, () => {
     // step() has already flipped rows[7] to "running" and
@@ -574,7 +637,12 @@ function createKernelSession(): KernelSession {
     worker,
     bootConfig: {
       enableConsole: true,
-      enableInput: false,
+      // Pointer/keyboard events flow through the scaffold's
+      // input driver into `/dev/input/{kbd,mouse}` rings.
+      // This slice lights up the pointer path; keyboard
+      // still rides the console:input bytes path for the
+      // live terminal, and will migrate in a follow-up.
+      enableInput: true,
       enableFramebuffer: true,
       // Live-terminal mode: the worker owns scrollback and
       // input buffer; every keystroke produces a new

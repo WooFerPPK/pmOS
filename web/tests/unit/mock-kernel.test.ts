@@ -30,6 +30,15 @@ import {
   OP_SET_MODE as FB_OP_SET_MODE,
 } from "../../src/drivers/fb";
 import { Devnum } from "../../src/shared/platform-constants";
+import {
+  KbdKeyState,
+  MouseButton,
+  MouseButtonState,
+  MouseEventKind,
+  packKbdEvent,
+  packMouseButton,
+  packMouseMotion,
+} from "../../src/shared/input-proto";
 
 interface CapturingScaffold extends KernelWorker {
   readonly calls: Array<{ driverId: number; op: number; payload: Uint8Array }>;
@@ -288,6 +297,105 @@ describe("MockKernel splash emission", () => {
     for (let i = 3; i < rgba.byteLength; i += 4) {
       expect(rgba[i]).toBe(255);
     }
+  });
+});
+
+// ---- /dev/input/{kbd,mouse} routing --------------------------------
+
+describe("MockKernel input device ring consumption", () => {
+  it("decodes a packed mouse motion event into pointerPosition", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    mock.bindScaffold(makeScaffold());
+    mock.injectInput(Devnum.InputMouse, packMouseMotion(42, 50));
+    expect(mock.pointerPosition).toEqual({ x: 42, y: 50 });
+    expect(mock.mouseEventsObserved).toBe(1);
+  });
+
+  it("tracks sequential motion events and exposes the latest position", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    mock.bindScaffold(makeScaffold());
+    for (const [x, y] of [
+      [0, 0],
+      [10, 10],
+      [100, -5],
+    ] as const) {
+      mock.injectInput(Devnum.InputMouse, packMouseMotion(x, y));
+    }
+    expect(mock.pointerPosition).toEqual({ x: 100, y: -5 });
+    expect(mock.mouseEventsObserved).toBe(3);
+  });
+
+  it("records the latest button event separately from motion", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    mock.bindScaffold(makeScaffold());
+    mock.injectInput(Devnum.InputMouse, packMouseMotion(20, 30));
+    mock.injectInput(
+      Devnum.InputMouse,
+      packMouseButton(20, 30, MouseButton.Left, MouseButtonState.Pressed),
+    );
+    const btn = mock.lastMouseButton;
+    expect(btn).not.toBeNull();
+    if (!btn) return;
+    expect(btn.kind).toBe(MouseEventKind.Button);
+    expect(btn.button).toBe(MouseButton.Left);
+    expect(btn.state).toBe(MouseButtonState.Pressed);
+    expect(btn.x).toBe(20);
+    expect(btn.y).toBe(30);
+  });
+
+  it("drops a malformed mouse payload without throwing", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    mock.bindScaffold(makeScaffold());
+    // Too-short buffer — unpacker returns null, kernel ignores it.
+    mock.injectInput(Devnum.InputMouse, new Uint8Array(4));
+    expect(mock.mouseEventsObserved).toBe(0);
+    expect(mock.pointerPosition).toBeNull();
+  });
+
+  it("a pointer motion event triggers a re-blit in live-terminal mode", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    const baselineBlits = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    ).length;
+    mock.injectInput(Devnum.InputMouse, packMouseMotion(50, 60));
+    const after = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    ).length;
+    expect(after - baselineBlits).toBe(1);
+  });
+
+  it("pointer events produce no fb traffic when live-terminal is off", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(Devnum.InputMouse, packMouseMotion(10, 10));
+    const fbCalls = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID,
+    );
+    expect(fbCalls).toHaveLength(0);
+  });
+
+  it("decodes a packed keyboard event into the kbd counter", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    mock.bindScaffold(makeScaffold());
+    mock.injectInput(Devnum.InputKbd, packKbdEvent(0x1e, KbdKeyState.Pressed));
+    mock.injectInput(
+      Devnum.InputKbd,
+      packKbdEvent(0x1e, KbdKeyState.Released),
+    );
+    expect(mock.kbdEventsObserved).toBe(2);
+  });
+
+  it("drops a malformed kbd payload without throwing", () => {
+    const mock = new MockKernel({ policy: { kind: "echo" } });
+    mock.bindScaffold(makeScaffold());
+    mock.injectInput(Devnum.InputKbd, new Uint8Array(3));
+    expect(mock.kbdEventsObserved).toBe(0);
   });
 });
 
