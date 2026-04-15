@@ -504,11 +504,14 @@ function fgForKind(p, kind) {
   }
 }
 function fillBg(pixels, argb) {
-  const [b, g, r, a] = splitArgb(argb);
+  const r = argb >>> 16 & 255;
+  const g = argb >>> 8 & 255;
+  const b = argb & 255;
+  const a = argb >>> 24 & 255;
   for (let i = 0; i < pixels.length; i += BYTES_PER_PIXEL) {
-    pixels[i] = b;
+    pixels[i] = r;
     pixels[i + 1] = g;
-    pixels[i + 2] = r;
+    pixels[i + 2] = b;
     pixels[i + 3] = a;
   }
 }
@@ -548,19 +551,14 @@ function setPixel(pixels, fbWidth, fbHeight, x, y, argb) {
   if (idx + BYTES_PER_PIXEL > pixels.length) {
     return;
   }
-  const [b, g, r, a] = splitArgb(argb);
-  pixels[idx] = b;
+  const r = argb >>> 16 & 255;
+  const g = argb >>> 8 & 255;
+  const b = argb & 255;
+  const a = argb >>> 24 & 255;
+  pixels[idx] = r;
   pixels[idx + 1] = g;
-  pixels[idx + 2] = r;
+  pixels[idx + 2] = b;
   pixels[idx + 3] = a;
-}
-function splitArgb(argb) {
-  return [
-    argb & 255,
-    argb >>> 8 & 255,
-    argb >>> 16 & 255,
-    argb >>> 24 & 255
-  ];
 }
 
 // src/shared/input-proto.ts

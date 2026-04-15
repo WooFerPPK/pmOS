@@ -19,8 +19,10 @@ import {
   GLYPH_WIDTH,
 } from "../../src/shared/font";
 
+// Background is 0xFF0A0E14 → (R=0A, G=0E, B=14, A=FF)
+// written in RGBA memory order for canvas ImageData.
 const BG_PIXEL: readonly [number, number, number, number] = [
-  0x14, 0x0e, 0x0a, 0xff,
+  0x0a, 0x0e, 0x14, 0xff,
 ];
 
 function readPixel(
@@ -93,7 +95,10 @@ describe("rasterizeSnapshot", () => {
     const height = 64;
     const pixels = rasterizeSnapshot(snap, width, height);
 
-    // Default output fg is 0xFFE6E6E6 → [E6, E6, E6, FF].
+    // Default output fg is 0xFFE6E6E6 → R=E6, G=E6, B=E6,
+    // A=FF (palindromic, so the byte order swap is
+    // invisible here, but the test still pins down that
+    // the channel reads from the correct shifts).
     const fg: [number, number, number, number] = [0xe6, 0xe6, 0xe6, 0xff];
     const baseX = PADDING;
     const baseY = PADDING;
@@ -133,44 +138,21 @@ describe("rasterizeSnapshot", () => {
     const height = 80;
     const pixels = rasterizeSnapshot(snap, width, height);
 
+    // Palette constants are `0xAARRGGBB`; the rasterizer
+    // writes R,G,B,A to memory, so expected pixels are
+    // `[R, G, B, A]`.
+    const toRgba = (argb: number): [number, number, number, number] => [
+      (argb >>> 16) & 0xff,
+      (argb >>> 8) & 0xff,
+      argb & 0xff,
+      (argb >>> 24) & 0xff,
+    ];
     const expected: ReadonlyArray<[number, [number, number, number, number]]> =
       [
-        [
-          0,
-          [
-            DEFAULT_PALETTE.banner & 0xff,
-            (DEFAULT_PALETTE.banner >>> 8) & 0xff,
-            (DEFAULT_PALETTE.banner >>> 16) & 0xff,
-            (DEFAULT_PALETTE.banner >>> 24) & 0xff,
-          ],
-        ],
-        [
-          1,
-          [
-            DEFAULT_PALETTE.input & 0xff,
-            (DEFAULT_PALETTE.input >>> 8) & 0xff,
-            (DEFAULT_PALETTE.input >>> 16) & 0xff,
-            (DEFAULT_PALETTE.input >>> 24) & 0xff,
-          ],
-        ],
-        [
-          2,
-          [
-            DEFAULT_PALETTE.output & 0xff,
-            (DEFAULT_PALETTE.output >>> 8) & 0xff,
-            (DEFAULT_PALETTE.output >>> 16) & 0xff,
-            (DEFAULT_PALETTE.output >>> 24) & 0xff,
-          ],
-        ],
-        [
-          3,
-          [
-            DEFAULT_PALETTE.error & 0xff,
-            (DEFAULT_PALETTE.error >>> 8) & 0xff,
-            (DEFAULT_PALETTE.error >>> 16) & 0xff,
-            (DEFAULT_PALETTE.error >>> 24) & 0xff,
-          ],
-        ],
+        [0, toRgba(DEFAULT_PALETTE.banner)],
+        [1, toRgba(DEFAULT_PALETTE.input)],
+        [2, toRgba(DEFAULT_PALETTE.output)],
+        [3, toRgba(DEFAULT_PALETTE.error)],
       ];
 
     for (const [rowIdx, fg] of expected) {

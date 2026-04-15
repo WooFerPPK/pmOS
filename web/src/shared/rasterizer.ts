@@ -63,8 +63,17 @@ export const PADDING = 4;
 export const BYTES_PER_PIXEL = 4;
 
 /**
- * ARGB8888 colours — each constant is `0xAARRGGBB`. Must
- * match `crates/term/src/rasterizer.rs::colors`.
+ * ARGB8888 colours — each constant is `0xAARRGGBB` (alpha
+ * in the high byte, then red, green, blue). `setPixel`
+ * extracts the channels and writes them to the output
+ * buffer in R,G,B,A memory order so that the bytes are
+ * directly consumable by `ImageData` / `putImageData`.
+ * The Rust rasterizer in `crates/term/src/rasterizer.rs`
+ * uses the same u32 constants but stores them in B,G,R,A
+ * memory order because its immediate consumer (the Rust
+ * compositor's framebuffer) is BGRA-internal; both
+ * layouts decode the same u32 values, just into
+ * different byte orders.
  */
 export const colors = {
   BG: 0xff0a0e14,
@@ -221,11 +230,14 @@ function fgForKind(p: Palette, kind: LineKind): number {
 }
 
 function fillBg(pixels: Uint8Array, argb: number): void {
-  const [b, g, r, a] = splitArgb(argb);
+  const r = (argb >>> 16) & 0xff;
+  const g = (argb >>> 8) & 0xff;
+  const b = argb & 0xff;
+  const a = (argb >>> 24) & 0xff;
   for (let i = 0; i < pixels.length; i += BYTES_PER_PIXEL) {
-    pixels[i] = b;
+    pixels[i] = r;
     pixels[i + 1] = g;
-    pixels[i + 2] = r;
+    pixels[i + 2] = b;
     pixels[i + 3] = a;
   }
 }
@@ -302,20 +314,15 @@ function setPixel(
   if (idx + BYTES_PER_PIXEL > pixels.length) {
     return;
   }
-  const [b, g, r, a] = splitArgb(argb);
-  pixels[idx] = b;
+  // Canvas `ImageData` expects RGBA bytes in memory
+  // order, so extract the channels from the u32 ARGB
+  // constant and write R,G,B,A to the pixel slot.
+  const r = (argb >>> 16) & 0xff;
+  const g = (argb >>> 8) & 0xff;
+  const b = argb & 0xff;
+  const a = (argb >>> 24) & 0xff;
+  pixels[idx] = r;
   pixels[idx + 1] = g;
-  pixels[idx + 2] = r;
+  pixels[idx + 2] = b;
   pixels[idx + 3] = a;
-}
-
-function splitArgb(argb: number): [number, number, number, number] {
-  // Use unsigned shifts so the alpha byte decodes
-  // correctly when argb's high bit is set.
-  return [
-    argb & 0xff,
-    (argb >>> 8) & 0xff,
-    (argb >>> 16) & 0xff,
-    (argb >>> 24) & 0xff,
-  ];
 }
