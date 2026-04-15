@@ -83,3 +83,23 @@ From `specs/001-browser-os-v1/tasks.md` Phase 2 Known Deviations block. Status a
 - Deviation notes in `tasks.md` point at real file paths with a brief reason for the drift, so a future reader grepping for the originally-planned file path can find the code.
 - Toolkit is a `std` crate (no `#![no_std]`), so `Box`, `String`, `Rc`, `Cell` are available.
 - Canvas writes **RGBA** byte order. The term rasterizer writes **BGRA** — the known bug the migration slice fixes.
+
+## Toolchain bootstrap (fresh sandbox)
+
+Captured on 2026-04-15 after the layout slice. The dev sandbox comes up with Rust but **without** `just` on `PATH`, so a brand-new Claude Code session has to do this once before `just test-*` works:
+
+- **Rust toolchain**: already installed under `~/.cargo/bin` (cargo 1.94.1, rustc 1.94.1). Not on the default `PATH` — prefix every command with `export PATH="$HOME/.cargo/bin:$PATH"` (or set it once at the top of a Bash invocation).
+- **`just`**: not preinstalled. Run `cargo install just --locked` (takes ~45 s to build on a cold cache; lands in `~/.cargo/bin`). Verified with `just --version` → `just 1.49.0`.
+- **Node + npm**: already at `/bin/node` and `/bin/npm`, on the default `PATH`. No action needed for `npx vitest run` / `npx playwright test`.
+
+Once `just` is present, per-layer targets work directly: `just test-kernel`, `just test-display-server`, `just test-toolkit`, `just test-drivers`. Use these for focused iteration.
+
+**The full `just test` target does NOT currently succeed end-to-end.** It chains `test-integration` which depends on `just build`, and `just build` fails because several userland crates target `wasm32-wasi`, which has been removed from upstream rustup (renamed to `wasm32-wasip1`) and isn't installed in the sandbox. This is the unresolved tail of T029 and is documented in `specs/001-browser-os-v1/tasks.md`. Until that's resolved, the equivalent of "the full suite" is:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo test --workspace          # all Rust crates, host target
+(cd web && npx vitest run)      # TS unit tests
+```
+
+That's what produced the 779 + 212 = 991 baseline and, after the `preferred_size` slice, 787 + 212 = 999. Note that `cargo test --workspace` covers more crates than `just test-kernel` + `just test-display-server` + `just test-toolkit` + `just test-drivers` chained together (it also runs `integration-tests`, `term`, `ring`, etc.), so when in doubt it's the authoritative count.
