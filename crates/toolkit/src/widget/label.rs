@@ -19,6 +19,20 @@ use crate::draw::text::{fit_text_to_width, text_width_px};
 use crate::draw::{Canvas, Color, Rect};
 use crate::theme::Theme;
 
+/// Total horizontal pad added by [`Label::preferred_size`]
+/// to the measured text width. 2 px on each side — enough
+/// to keep glyphs from butting up against an edge rect
+/// drawn around the label. Design default; widget setters
+/// can override later if a real app demands a tighter or
+/// looser fit.
+pub const LABEL_HPAD: u32 = 4;
+
+/// Total vertical pad added by [`Label::preferred_size`]
+/// to [`GLYPH_HEIGHT`]. 3 px above and 3 px below the
+/// glyph row. Design default; widget setters can override
+/// later.
+pub const LABEL_VPAD: u32 = 6;
+
 /// Single-line text widget.
 pub struct Label {
     bounds: Rect,
@@ -74,6 +88,26 @@ impl Label {
     /// character boundary.
     pub fn visible_text(&self) -> &str {
         fit_text_to_width(&self.text, self.bounds.width)
+    }
+
+    /// Minimum rect size that comfortably holds the label's
+    /// current text with standard padding. Advisory: the
+    /// caller either feeds the result into a layout
+    /// (e.g. [`crate::layout::Row::next`]) or ignores it.
+    /// No coupling between widget and layout.
+    ///
+    /// Width = text width + [`LABEL_HPAD`]. Empty text
+    /// returns just the pad width so a label with no text
+    /// still gets a non-zero horizontal slot.
+    ///
+    /// Height = [`GLYPH_HEIGHT`] + [`LABEL_VPAD`].
+    /// Independent of the text since every glyph in the
+    /// toolkit font is the same height.
+    pub fn preferred_size(&self) -> (u32, u32) {
+        (
+            text_width_px(&self.text) + LABEL_HPAD,
+            GLYPH_HEIGHT + LABEL_VPAD,
+        )
     }
 
     /// Paint the label into `canvas`. Does nothing if the

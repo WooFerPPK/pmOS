@@ -31,8 +31,24 @@
 
 use super::alignment::Alignment;
 use super::label::Label;
+use crate::draw::font::GLYPH_HEIGHT;
+use crate::draw::text::text_width_px;
 use crate::draw::{Canvas, Color, Rect};
 use crate::theme::Theme;
+
+/// Total horizontal pad added by [`Button::preferred_size`]
+/// to the measured caption width. 8 px on each side — enough
+/// breathing room for a button to feel clickable without
+/// looking comically wide around short captions. Design
+/// default; widget setters can override later if a real
+/// app demands different sizing.
+pub const BUTTON_HPAD: u32 = 16;
+
+/// Total vertical pad added by [`Button::preferred_size`]
+/// to [`GLYPH_HEIGHT`]. 4 px above and 4 px below the
+/// caption row. Design default; widget setters can
+/// override later.
+pub const BUTTON_VPAD: u32 = 8;
 
 /// Visual state of a [`Button`]. Controls which fill
 /// colour the button paints with when [`Button::draw`] is
@@ -100,6 +116,25 @@ impl Button {
 
     pub fn caption(&self) -> &str {
         self.caption.text()
+    }
+
+    /// Minimum rect size that comfortably holds the
+    /// button's current caption with standard padding.
+    /// Advisory: the caller either feeds the result into a
+    /// layout (e.g. [`crate::layout::Row::next`]) or
+    /// ignores it. No coupling between widget and layout.
+    ///
+    /// Width = caption width + [`BUTTON_HPAD`]. Empty
+    /// caption returns just the pad width so a button with
+    /// no caption still paints a clickable rect.
+    ///
+    /// Height = [`GLYPH_HEIGHT`] + [`BUTTON_VPAD`].
+    /// Independent of the caption.
+    pub fn preferred_size(&self) -> (u32, u32) {
+        (
+            text_width_px(self.caption.text()) + BUTTON_HPAD,
+            GLYPH_HEIGHT + BUTTON_VPAD,
+        )
     }
 
     pub fn set_caption(&mut self, caption: impl Into<String>) {

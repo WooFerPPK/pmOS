@@ -14,7 +14,7 @@ use std::rc::Rc;
 use toolkit::draw::font::{glyph_for, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
 use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::theme::Theme;
-use toolkit::widget::button::{Button, ButtonState};
+use toolkit::widget::button::{Button, ButtonState, BUTTON_HPAD, BUTTON_VPAD};
 
 // ---- helpers -------------------------------------------------------
 
@@ -309,4 +309,60 @@ fn set_caption_changes_rendered_caption() {
     button.draw(&mut canvas_second);
     assert_eq!(button.caption(), "b");
     assert_ne!(canvas_first.pixels(), canvas_second.pixels());
+}
+
+// ---- preferred_size -----------------------------------------------
+
+#[test]
+fn preferred_size_for_short_caption_returns_caption_width_plus_pad() {
+    // "ok" → 2 × CELL_WIDTH(6) = 12 px of text.
+    // Width = 12 + BUTTON_HPAD(16) = 28.
+    // Height = GLYPH_HEIGHT(7) + BUTTON_VPAD(8) = 15.
+    let button = Button::new(Rect::new(0, 0, 100, 30), "ok");
+    assert_eq!(button.preferred_size(), (28, 15));
+}
+
+#[test]
+fn preferred_size_for_empty_caption_returns_just_pad_width_and_full_height() {
+    let button = Button::new(Rect::new(0, 0, 100, 30), "");
+    assert_eq!(
+        button.preferred_size(),
+        (BUTTON_HPAD, GLYPH_HEIGHT + BUTTON_VPAD),
+    );
+    // Pad values pinned explicitly so a future edit that
+    // silently halves them trips this test.
+    assert_eq!(button.preferred_size(), (16, 15));
+}
+
+#[test]
+fn preferred_size_height_is_glyph_height_plus_vpad_regardless_of_caption_length() {
+    let short = Button::new(Rect::new(0, 0, 100, 30), "a");
+    let medium = Button::new(Rect::new(0, 0, 100, 30), "submit");
+    let long = Button::new(
+        Rect::new(0, 0, 100, 30),
+        "a long caption that is way wider than any reasonable button",
+    );
+    let empty = Button::new(Rect::new(0, 0, 100, 30), "");
+    let expected_h = GLYPH_HEIGHT + BUTTON_VPAD;
+    assert_eq!(short.preferred_size().1, expected_h);
+    assert_eq!(medium.preferred_size().1, expected_h);
+    assert_eq!(long.preferred_size().1, expected_h);
+    assert_eq!(empty.preferred_size().1, expected_h);
+}
+
+#[test]
+fn preferred_size_includes_horizontal_pad_on_both_sides() {
+    // Caption "x" is 1 × CELL_WIDTH(6) = 6 px of text.
+    // Pad is 8 each side → total BUTTON_HPAD = 16.
+    // Width = 6 + 16 = 22.
+    let button = Button::new(Rect::new(0, 0, 100, 30), "x");
+    let (w, _) = button.preferred_size();
+    assert_eq!(w, CELL_WIDTH + BUTTON_HPAD);
+    assert_eq!(w, 22);
+    // The pad splits symmetrically so a caller that centres
+    // the caption gets equal room on either side.
+    let text_w = CELL_WIDTH;
+    assert_eq!((w - text_w) % 2, 0, "pad must split symmetrically");
+    assert_eq!((w - text_w) / 2, BUTTON_HPAD / 2);
+    assert_eq!(BUTTON_HPAD / 2, 8, "8 px pad on each side");
 }

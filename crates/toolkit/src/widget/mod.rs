@@ -28,9 +28,9 @@ pub mod frame;
 pub mod label;
 
 pub use alignment::Alignment;
-pub use button::{Button, ButtonState};
+pub use button::{Button, ButtonState, BUTTON_HPAD, BUTTON_VPAD};
 pub use frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
     TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, TITLEBAR_HEIGHT,
 };
-pub use label::Label;
+pub use label::{Label, LABEL_HPAD, LABEL_VPAD};

@@ -13,7 +13,7 @@ use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::layout::Row;
 use toolkit::theme::Theme;
 use toolkit::widget::alignment::Alignment;
-use toolkit::widget::{Button, Label};
+use toolkit::widget::{Button, Label, LABEL_HPAD};
 
 fn rgba(color: Color) -> [u8; 4] {
     [color.r(), color.g(), color.b(), color.a()]
@@ -33,30 +33,43 @@ fn row_layout_places_label_button_label_at_expected_positions() {
     const PARENT: Rect = Rect::new(0, 0, 400, 40);
     const PADDING: u32 = 5;
     const SPACING: u32 = 8;
+    const CHILD_H: u32 = 20;
 
-    let label_left_w = 36; // 6 chars × CELL_WIDTH(6) = 36 → "left.."
-    let button_w = 24; // 4 chars × 6 = 24 → "ok..."
-    let label_right_w = 48; // 8 chars × 6 = 48 → "right..."
-    let child_h = 20;
+    // Widths come from each widget's preferred_size() — the
+    // whole point of this test since the Layout slice. Build
+    // probe copies with throwaway bounds to query the sizes,
+    // then rebuild with the row-assigned rects below.
+    let mut probe_label_left = Label::new(Rect::new(0, 0, 0, 0), "left  ");
+    probe_label_left.set_alignment(Alignment::Left);
+    let probe_button = Button::new(Rect::new(0, 0, 0, 0), "ok");
+    let mut probe_label_right = Label::new(Rect::new(0, 0, 0, 0), "right   ");
+    probe_label_right.set_alignment(Alignment::Right);
+
+    let (label_left_w, _) = probe_label_left.preferred_size();
+    let (button_w, _) = probe_button.preferred_size();
+    let (label_right_w, _) = probe_label_right.preferred_size();
 
     let mut row = Row::new(PARENT, PADDING, SPACING);
-    let label_left_rect = row.next(label_left_w, child_h);
-    let button_rect = row.next(button_w, child_h);
-    let label_right_rect = row.next(label_right_w, child_h);
+    let label_left_rect = row.next(label_left_w, CHILD_H);
+    let button_rect = row.next(button_w, CHILD_H);
+    let label_right_rect = row.next(label_right_w, CHILD_H);
 
     // ---- rect positions match Row's math --------------------
 
+    // label_left_w = text("left  ")(36) + LABEL_HPAD(4) = 40.
+    // button_w     = text("ok")(12)      + BUTTON_HPAD(16) = 28.
+    // label_right_w = text("right   ")(48) + LABEL_HPAD(4) = 52.
     // Interior left = 5, interior y = 5, interior height = 30.
     // Vertical centring: (30 - 20)/2 = 5 → child_y = 5 + 5 = 10.
-    assert_eq!(label_left_rect, Rect::new(5, 10, 36, 20));
+    assert_eq!(label_left_rect, Rect::new(5, 10, 40, 20));
     assert_eq!(
         button_rect,
-        Rect::new(5 + 36 + 8, 10, 24, 20),
+        Rect::new(5 + 40 + 8, 10, 28, 20),
         "button placed after label_left + spacing",
     );
     assert_eq!(
         label_right_rect,
-        Rect::new(5 + 36 + 8 + 24 + 8, 10, 48, 20),
+        Rect::new(5 + 40 + 8 + 28 + 8, 10, 52, 20),
         "label_right placed after button + spacing",
     );
 
@@ -132,10 +145,11 @@ fn row_layout_places_label_button_label_at_expected_positions() {
     );
 
     // Button's centred caption "ok" — find a lit 'o' glyph pixel.
-    // "ok" text width = 2 * CELL_WIDTH = 12. Button width = 24.
-    // Centre x offset = (24 - 12)/2 = 6 → origin at button_rect.x + 6.
+    // "ok" text width = 2 × CELL_WIDTH = 12. Button width = 28
+    // (12 text + BUTTON_HPAD(16)). Centre x offset =
+    // (28 - 12)/2 = 8 → origin at button_rect.x + 8.
     let button_text = rgba(Theme::LIGHT.button_text);
-    let button_text_origin_x = button_rect.x + 6;
+    let button_text_origin_x = button_rect.x + 8;
     let button_text_origin_y =
         button_rect.y + ((button_rect.height - GLYPH_HEIGHT) / 2) as i32;
     let glyph_o = glyph_for('o');
@@ -153,9 +167,12 @@ fn row_layout_places_label_button_label_at_expected_positions() {
     }
     assert!(found_button_glyph, "button must draw at least one 'o' glyph pixel");
 
-    // Right-aligned label: the visible text "right   " has 8 chars,
-    // exactly filling the 48-wide rect. Its first glyph 'r' therefore
-    // lands at the left edge of the label rect.
+    // Right-aligned label: "right   " is 48 px of text in a
+    // 52-wide rect (label_right_w = 48 + LABEL_HPAD(4)). The
+    // right-aligned x_offset is rect.width - text_width = 4,
+    // which is exactly LABEL_HPAD — the pad becomes a gutter
+    // on the *left* for a right-aligned preferred-sized label.
+    let right_text_origin_x = label_right_rect.x + LABEL_HPAD as i32;
     let right_text_y =
         label_right_rect.y + ((label_right_rect.height - GLYPH_HEIGHT) / 2) as i32;
     let glyph_r = glyph_for('r');
@@ -165,7 +182,7 @@ fn row_layout_places_label_button_label_at_expected_positions() {
             if (glyph_r[row_i as usize] >> (GLYPH_WIDTH - 1 - col)) & 1 == 0 {
                 continue;
             }
-            let x = label_right_rect.x + col as i32;
+            let x = right_text_origin_x + col as i32;
             let y = right_text_y + row_i as i32;
             assert_eq!(
                 px(&canvas, x, y),
@@ -192,15 +209,25 @@ fn row_layout_places_label_button_label_at_expected_positions() {
 
 #[test]
 fn row_with_all_three_widgets_at_preferred_widths_still_fits_and_reports_remaining() {
-    // Same layout as above; check that Row correctly reports remaining
-    // after three placements so a caller could reason about adding a
-    // fourth widget.
-    let mut row = Row::new(Rect::new(0, 0, 400, 40), 5, 8);
-    row.next(36, 20);
-    row.next(24, 20);
-    row.next(48, 20);
+    // Same layout as above; check that Row correctly reports
+    // remaining after three preferred_size-driven placements so
+    // a caller could reason about adding a fourth widget.
+    let label_left = Label::new(Rect::new(0, 0, 0, 0), "left  ");
+    let button = Button::new(Rect::new(0, 0, 0, 0), "ok");
+    let label_right = Label::new(Rect::new(0, 0, 0, 0), "right   ");
+    let (label_left_w, _) = label_left.preferred_size();
+    let (button_w, _) = button.preferred_size();
+    let (label_right_w, _) = label_right.preferred_size();
 
-    // Consumed: 36 + 8 + 24 + 8 + 48 + 8 = 132 pixels (including a
+    let mut row = Row::new(Rect::new(0, 0, 400, 40), 5, 8);
+    row.next(label_left_w, 20);
+    row.next(button_w, 20);
+    row.next(label_right_w, 20);
+
+    // Consumed: 40 + 8 + 28 + 8 + 52 + 8 = 144 px (including a
     // trailing spacing the cursor always appends).
-    assert_eq!(row.remaining(), 390 - (36 + 8 + 24 + 8 + 48 + 8));
+    assert_eq!(
+        row.remaining(),
+        390 - (label_left_w + 8 + button_w + 8 + label_right_w + 8),
+    );
 }

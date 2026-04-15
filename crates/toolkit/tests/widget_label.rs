@@ -6,7 +6,7 @@ use toolkit::draw::font::{glyph_for, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
 use toolkit::draw::text::{fit_text_to_width, text_width_px};
 use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::theme::Theme;
-use toolkit::widget::{Alignment, Label};
+use toolkit::widget::{Alignment, Label, LABEL_HPAD, LABEL_VPAD};
 
 // ---- helpers -------------------------------------------------------
 
@@ -297,4 +297,57 @@ fn text_width_px_is_char_count_times_cell_width() {
     assert_eq!(text_width_px("abc"), 3 * CELL_WIDTH);
     // Multi-byte char counts once (not by byte length).
     assert_eq!(text_width_px("aé"), 2 * CELL_WIDTH);
+}
+
+// ---- preferred_size ------------------------------------------------
+
+#[test]
+fn preferred_size_for_short_text_returns_text_width_plus_pad() {
+    // "abc" → 3 × CELL_WIDTH(6) = 18 px of text.
+    // Width = 18 + LABEL_HPAD(4) = 22.
+    // Height = GLYPH_HEIGHT(7) + LABEL_VPAD(6) = 13.
+    let label = Label::new(Rect::new(0, 0, 100, 30), "abc");
+    assert_eq!(label.preferred_size(), (22, 13));
+}
+
+#[test]
+fn preferred_size_for_empty_text_returns_just_pad_width_and_full_height() {
+    let label = Label::new(Rect::new(0, 0, 100, 30), "");
+    assert_eq!(
+        label.preferred_size(),
+        (LABEL_HPAD, GLYPH_HEIGHT + LABEL_VPAD),
+    );
+    // Pad values pinned explicitly so a future edit that
+    // silently halves them trips this test.
+    assert_eq!(label.preferred_size(), (4, 13));
+}
+
+#[test]
+fn preferred_size_height_is_glyph_height_plus_vpad_regardless_of_text_length() {
+    let short = Label::new(Rect::new(0, 0, 100, 30), "a");
+    let medium = Label::new(Rect::new(0, 0, 100, 30), "hello");
+    let long = Label::new(
+        Rect::new(0, 0, 100, 30),
+        "the quick brown fox jumps over the lazy dog",
+    );
+    let empty = Label::new(Rect::new(0, 0, 100, 30), "");
+    let expected_h = GLYPH_HEIGHT + LABEL_VPAD;
+    assert_eq!(short.preferred_size().1, expected_h);
+    assert_eq!(medium.preferred_size().1, expected_h);
+    assert_eq!(long.preferred_size().1, expected_h);
+    assert_eq!(empty.preferred_size().1, expected_h);
+}
+
+#[test]
+fn preferred_size_for_long_text_scales_width_proportionally() {
+    // Every additional char adds exactly CELL_WIDTH px.
+    let three = Label::new(Rect::new(0, 0, 100, 30), "abc");
+    let six = Label::new(Rect::new(0, 0, 100, 30), "abcdef");
+    let (w_three, _) = three.preferred_size();
+    let (w_six, _) = six.preferred_size();
+    // Difference = 3 chars × CELL_WIDTH(6) = 18.
+    assert_eq!(w_six - w_three, 3 * CELL_WIDTH);
+    // Absolute values spell out the formula.
+    assert_eq!(w_three, 3 * CELL_WIDTH + LABEL_HPAD);
+    assert_eq!(w_six, 6 * CELL_WIDTH + LABEL_HPAD);
 }
