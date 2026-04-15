@@ -14,7 +14,7 @@ default: build
 build:
     @echo "[just] building PMos..."
     cargo build --release --target wasm32-unknown-unknown -p kernel --no-default-features
-    cargo build --release --target wasm32-wasi \
+    cargo build --release --target wasm32-wasip1 \
         -p init -p display-server -p toolkit \
         -p shell -p sh -p term -p files -p edit -p settings -p sysmon \
         -p sample-app -p toolkit-free-client

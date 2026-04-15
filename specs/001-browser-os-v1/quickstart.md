@@ -26,7 +26,7 @@ are floors; newer is fine.
 
 - **Rust** (via rustup), stable channel, latest.
 - **Rust targets**: `rustup target add wasm32-unknown-unknown
-  wasm32-wasi`
+  wasm32-wasip1`
 - **Node.js** 20.x (for esbuild, Vitest, Playwright).
 - **just** (`cargo install just`) for the build orchestrator.
 - A modern browser: Chromium, Firefox, or Safari recent release.
@@ -51,7 +51,7 @@ Under the hood this runs:
 
 ```shell
 $ cargo build --release --target wasm32-unknown-unknown -p kernel
-$ cargo build --release --target wasm32-wasi -p init -p display-server -p toolkit -p sh -p term -p files -p edit -p settings -p sysmon -p sample-app -p toolkit-free-client
+$ cargo build --release --target wasm32-wasip1 -p init -p display-server -p toolkit -p sh -p term -p files -p edit -p settings -p sysmon -p sample-app -p toolkit-free-client
 $ cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
 $ cd web && npx esbuild src/sw.ts --bundle --outfile=../build/sw.js --format=esm
 $ cargo run -p xtask -- assemble-dist
@@ -268,9 +268,9 @@ fn main() {
 ### 5.3 Build and install
 
 ```shell
-$ cargo build --release --target wasm32-wasi -p hello-app
+$ cargo build --release --target wasm32-wasip1 -p hello-app
 $ mkdir -p build/hello-pkg/bin
-$ cp target/wasm32-wasi/release/hello.wasm build/hello-pkg/bin/
+$ cp target/wasm32-wasip1/release/hello.wasm build/hello-pkg/bin/
 $ cat > build/hello-pkg/manifest.toml <<'EOF'
 [package]
 name = "hello"
@@ -414,7 +414,7 @@ is.
 See `contracts/package-manifest.md` for the full format. The
 minimum:
 
-1. Build your app to `wasm32-wasi` → `bin/<name>.wasm`.
+1. Build your app to `wasm32-wasip1` → `bin/<name>.wasm`.
 2. Write a `manifest.toml` with `[package]`, `[exec]`,
    `[capabilities]`.
 3. `tar -cf <name>-<ver>.pmpkg.tar manifest.toml bin/`

@@ -86,15 +86,26 @@ From `specs/001-browser-os-v1/tasks.md` Phase 2 Known Deviations block. Status a
 
 ## Toolchain bootstrap (fresh sandbox)
 
-Captured on 2026-04-15 after the layout slice. The dev sandbox comes up with Rust but **without** `just` on `PATH`, so a brand-new Claude Code session has to do this once before `just test-*` works:
+Captured on 2026-04-15. The dev sandbox comes up with Rust but **without** `just` or the WASM targets on the initial PATH / rustup profile, so a brand-new Claude Code session has to do this once before `just build` / `just test-*` works:
 
 - **Rust toolchain**: already installed under `~/.cargo/bin` (cargo 1.94.1, rustc 1.94.1). Not on the default `PATH` — prefix every command with `export PATH="$HOME/.cargo/bin:$PATH"` (or set it once at the top of a Bash invocation).
+- **WASM targets**: install both via `rustup target add wasm32-unknown-unknown wasm32-wasip1`. `wasm32-unknown-unknown` is for the kernel (cdylib); `wasm32-wasip1` is for every userland crate. (The repo used to reference `wasm32-wasi`; upstream rustup renamed that target to `wasm32-wasip1`. The T029 resolution slice updated every reference.)
 - **`just`**: not preinstalled. Run `cargo install just --locked` (takes ~45 s to build on a cold cache; lands in `~/.cargo/bin`). Verified with `just --version` → `just 1.49.0`.
 - **Node + npm**: already at `/bin/node` and `/bin/npm`, on the default `PATH`. No action needed for `npx vitest run` / `npx playwright test`.
 
-Once `just` is present, per-layer targets work directly: `just test-kernel`, `just test-display-server`, `just test-toolkit`, `just test-drivers`. Use these for focused iteration.
+After the bootstrap, the following layer targets are green:
 
-**The full `just test` target does NOT currently succeed end-to-end.** It chains `test-integration` which depends on `just build`, and `just build` fails because several userland crates target `wasm32-wasi`, which has been removed from upstream rustup (renamed to `wasm32-wasip1`) and isn't installed in the sandbox. This is the unresolved tail of T029 and is documented in `specs/001-browser-os-v1/tasks.md`. Until that's resolved, the equivalent of "the full suite" is:
+- `just build` — full pipeline: kernel cdylib + 14 userland crates + esbuild + `xtask assemble-dist` → `dist/`.
+- `just test-kernel`, `just test-display-server`, `just test-toolkit`, `just test-drivers` — per-layer isolation tests.
+- `cargo test --workspace` — the authoritative full Rust count (787 as of the T029 slice). This covers crates the `just test-*` targets don't touch (integration-tests, term, ring, display-proto, etc.).
+- `(cd web && npx vitest run)` — TS unit tests (212).
+
+**The full `just test` meta-target still fails**, but the residual gaps are now downstream, not toolchain:
+
+- `just test-integration` needs Phase 3+ Playwright scaffolding (no `web/tests/integration/` directory exists and no `playwright.config.*`; T127 onward). A vitest/playwright dep conflict also surfaces when Playwright tries to run with no test files — addressing that is part of the same Phase 3 slice.
+- `just test-perf` needs T220 (`crates/integration-tests/src/bin/input-latency.rs` — the p95 input-latency harness — does not exist yet).
+
+So "the full test suite" in practice today is:
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -102,4 +113,4 @@ cargo test --workspace          # all Rust crates, host target
 (cd web && npx vitest run)      # TS unit tests
 ```
 
-That's what produced the 779 + 212 = 991 baseline and, after the `preferred_size` slice, 787 + 212 = 999. Note that `cargo test --workspace` covers more crates than `just test-kernel` + `just test-display-server` + `just test-toolkit` + `just test-drivers` chained together (it also runs `integration-tests`, `term`, `ring`, etc.), so when in doubt it's the authoritative count.
+= 787 + 212 = **999 passing, 0 failing** as of the T029 resolution slice. These are the same numbers the `preferred_size` slice landed — T029 changed build plumbing, not test code.

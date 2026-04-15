@@ -3,7 +3,7 @@
 //! The kernel is `#![no_std]` with `extern crate alloc`. It needs
 //! `Box`, `Vec`, `BTreeMap`, and `String` — which all require a
 //! global allocator. `wasm32-unknown-unknown` doesn't provide one
-//! out of the box (unlike `wasm32-wasi`), so we install a small
+//! out of the box (unlike `wasm32-wasip1`), so we install a small
 //! bump allocator that uses the WASM linear memory's `grow`
 //! instruction to obtain pages.
 //!

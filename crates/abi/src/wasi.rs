@@ -6,8 +6,8 @@
 //!
 //! PMos assigns its own numeric values; we do not promise
 //! binary compatibility with any specific WASI runtime's wire
-//! layout. Rust `wasm32-wasi` userland crates link against the
-//! WASI *function names* provided by the kernel, not these
+//! layout. Rust `wasm32-wasip1` userland crates link against
+//! the WASI *function names* provided by the kernel, not these
 //! numeric opcodes directly — the opcodes are the internal
 //! dispatch identity used by the SAB ring transport.
 //!

@@ -3,16 +3,20 @@ name = "kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Kernel has no binary target. For wasm32-unknown-unknown the cdylib
+# *is* the deployable artefact — the browser instantiates `kernel.wasm`
+# and calls exported functions; there is no `fn main()` path. For
+# native (`cargo test --features native-platform`) the rlib is what
+# the test crates link against. Disable autobin so Cargo doesn't
+# pick up a stray `src/main.rs` and reintroduce the filename
+# collision that plagued the pre-wasip1 build.
+autobins = false
 
 [lib]
 path = "src/lib.rs"
 # The kernel compiles to both a cdylib (for the WASM runtime target)
 # and a rlib (for native `cargo test` via the Platform abstraction).
 crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "kernel"
-path = "src/main.rs"
 
 [dependencies]
 abi = { path = "../abi" }

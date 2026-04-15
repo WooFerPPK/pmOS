@@ -57,12 +57,12 @@ fn run_inner() -> Result<()> {
         &mut manifest_paths,
     );
 
-    // 4. Userland WASM binaries (wasm32-wasi target). Each lives at
-    //    target/wasm32-wasi/release/<name>.wasm. Copy the ones we
+    // 4. Userland WASM binaries (wasm32-wasip1 target). Each lives at
+    //    target/wasm32-wasip1/release/<name>.wasm. Copy the ones we
     //    know about; missing is OK before Phase 2.
     for (crate_name, bin_name) in USERLAND_BINS {
         let src = repo_root
-            .join("target/wasm32-wasi/release")
+            .join("target/wasm32-wasip1/release")
             .join(format!("{bin_name}.wasm"));
         let dst = if *crate_name == "sample-app" {
             // sample-app's binary is "hello", placed outside bin/ for clarity
@@ -73,9 +73,15 @@ fn run_inner() -> Result<()> {
         copy_optional(&src, &dst, &mut manifest_paths);
     }
 
-    // 5. _headers file (Cloudflare Pages / Netlify format) with
-    //    COOP/COEP for cross-origin isolation.
-    let headers = "/*\n  Cross-Origin-Opener-Policy: same-origin\n  Cross-Origin-Embedder-Policy: require-corp\n";
+    // 5. _headers file (Cloudflare Pages / Netlify format). The full
+    //    set the demo path established: COOP/COEP for cross-origin
+    //    isolation (required for SAB + Atomics.wait), plus a
+    //    per-resource CORP so every asset explicitly opts into being
+    //    embedded, plus Cache-Control: no-store so the dev server
+    //    never serves stale bytes during iteration. Production
+    //    deployments can swap Cache-Control for a long-lived immutable
+    //    policy once asset fingerprints land.
+    let headers = "/*\n  Cross-Origin-Opener-Policy: same-origin\n  Cross-Origin-Embedder-Policy: require-corp\n  Cross-Origin-Resource-Policy: same-origin\n  Cache-Control: no-store\n";
     fs::write(dist.join("_headers"), headers)?;
     manifest_paths.push("_headers".to_string());
 

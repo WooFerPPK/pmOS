@@ -30,8 +30,9 @@ X. Testability at every layer — isolation tests before integration.
 
 - **Rust** (latest stable), two targets:
   - `wasm32-unknown-unknown` for the kernel (`no_std + alloc`).
-  - `wasm32-wasi` for init, display server, toolkit (library),
-    and every bundled app.
+  - `wasm32-wasip1` for init, display server, toolkit (library),
+    and every bundled app. (Renamed from `wasm32-wasi` upstream;
+    older docs may still say `wasm32-wasi`.)
 - **TypeScript 5.x strict** for the JS bootstrap, drivers, and
   service worker. No npm framework. `esbuild` only.
 - **Execution substrate**: WebAssembly Instances in dedicated Web
@@ -69,8 +70,8 @@ crates/
   abi/                  # syscall numbering + layouts (shared)
   ring/                 # SAB ring buffer transport
   kernel/               # wasm32-unknown-unknown, no_std + alloc
-  init/                 # wasm32-wasi, PID 1
-  display-server/       # wasm32-wasi
+  init/                 # wasm32-wasip1, PID 1
+  display-server/       # wasm32-wasip1
   toolkit/              # library, statically linked into apps
   sh term files edit settings sysmon
   sample-app/           # third-party package fixture

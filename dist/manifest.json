@@ -1,10 +1,21 @@
 {
-  "version": "0.1.0-demo",
-  "build": "bootstrap-demo",
+  "version": 0,
   "assets": [
-    "index.html",
+    "_headers",
+    "assets/bin/display-server.wasm",
+    "assets/bin/edit.wasm",
+    "assets/bin/files.wasm",
+    "assets/bin/init.wasm",
+    "assets/bin/settings.wasm",
+    "assets/bin/sh.wasm",
+    "assets/bin/shell.wasm",
+    "assets/bin/sysmon.wasm",
+    "assets/bin/term.wasm",
+    "assets/bin/toolkit-free-client.wasm",
     "assets/bootstrap.js",
-    "sw.js",
-    "_headers"
+    "assets/hello.wasm",
+    "assets/kernel.wasm",
+    "index.html",
+    "sw.js"
   ]
 }

@@ -14,7 +14,7 @@
 //!
 //! The crate is `no_std + alloc` because it has no business
 //! pulling in std: it's pure data + byte munging. Both the
-//! server (which runs as a wasm32-wasi userland process in
+//! server (which runs as a wasm32-wasip1 userland process in
 //! production) and the toolkit (which is statically linked
 //! into apps) need it to work with just `core + alloc`.
 

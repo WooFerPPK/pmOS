@@ -22,7 +22,7 @@ jobs:
       - name: Install Rust toolchain (pinned via rust-toolchain.toml)
         run: |
           rustup show active-toolchain || rustup toolchain install stable
-          rustup target add wasm32-unknown-unknown wasm32-wasi
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
           rustc --version
           cargo --version
 

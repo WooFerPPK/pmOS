@@ -27,7 +27,7 @@
 //!
 //! The library is `no_std + alloc` so it can be linked
 //! both into the userland `sh` binary (which targets
-//! wasm32-wasi) and into the kernel crate's test harness
+//! wasm32-wasip1) and into the kernel crate's test harness
 //! (which runs on the native host).
 
 extern crate alloc;

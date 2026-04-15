@@ -13,7 +13,7 @@
 //! crate changes in the same commit.
 //!
 //! `#![cfg_attr(not(test), no_std)]` is deliberate: production
-//! builds for `wasm32-unknown-unknown` (kernel) and `wasm32-wasi`
+//! builds for `wasm32-unknown-unknown` (kernel) and `wasm32-wasip1`
 //! (userland) are `no_std`; `cargo test --host` pulls `std` so the
 //! default `#[test]` harness works.
 

@@ -39,3 +39,15 @@ pub mod syscall;
 pub mod cap;
 pub mod dev;
 pub mod sys;
+
+// Panic handler for the wasm32-unknown-unknown cdylib build. Lives in
+// lib.rs (not alloc_.rs) because the #[panic_handler] attribute has
+// to be at crate-root scope, not nested inside a submodule. Routes
+// through the Platform hook so the bootstrap kernel-panic overlay
+// (FR-009a) receives the notification on the JS side.
+#[cfg(all(not(feature = "native-platform"), target_arch = "wasm32"))]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    crate::platform::current().on_panic(info);
+    crate::platform::current().halt("kernel panic")
+}
