@@ -40,6 +40,15 @@ pub mod cap;
 pub mod dev;
 pub mod sys;
 
+// wasm32-only entry points: the narrow extern "C" seam that lets
+// the kernel Worker call into the dispatcher from the TS side.
+// Gated on the same cfg as the panic handler below so native
+// tests never see it — native coverage for the dispatcher lives
+// in `tests/syscall.rs`, which calls `kernel::syscall::dispatch`
+// directly.
+#[cfg(all(not(feature = "native-platform"), target_arch = "wasm32"))]
+pub mod wasm_entry;
+
 // Panic handler for the wasm32-unknown-unknown cdylib build. Lives in
 // lib.rs (not alloc_.rs) because the #[panic_handler] attribute has
 // to be at crate-root scope, not nested inside a submodule. Routes

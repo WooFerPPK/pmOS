@@ -116,3 +116,5 @@ cargo test --workspace          # all Rust crates, host target
 = 787 + 212 = **999 passing, 0 failing** as of the T029 resolution slice. These are the same numbers the `preferred_size` slice landed — T029 changed build plumbing, not test code.
 
 After the **T073 dispatcher first landing**: 809 + 212 = **1021 passing, 0 failing** (+22 new isolation tests at `crates/kernel/tests/syscall.rs`).
+
+After the **extern-C seam slice** on top of T073: 811 + 229 = **1040 passing, 0 failing**. Rust gained +2 `abi::ring` byte-roundtrip tests; TS gained +17 `kernel-wasm-entry.test.ts` integration tests that load `kernel.wasm` from disk and drive the exports. `kernel.wasm` itself went from 86 bytes to 112 KiB — the exports pinned the whole dispatcher + `Kernel` graph alive through LLVM's dead-code elimination. A pre-existing bump-allocator bug where the cursor started at 0 (clobbering the static data section) was fixed in the same slice; initial allocations now correctly start at `__heap_base`.

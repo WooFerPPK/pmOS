@@ -116,6 +116,37 @@ impl Request {
         heap_ptr: 0,
         heap_len: 0,
     };
+
+    /// Decode a `Request` from its little-endian byte layout.
+    /// Inverse of [`Request::to_le_bytes`]. Every field is read
+    /// in the same order and with the same offsets the `ring`
+    /// crate's internal slot writer uses, so both encoders agree
+    /// on the wire format.
+    pub fn from_le_bytes(b: &[u8; SLOT_SIZE]) -> Request {
+        let mut args = [0u8; 16];
+        args.copy_from_slice(&b[8..24]);
+        Request {
+            opcode: u16::from_le_bytes([b[0], b[1]]),
+            flags: u16::from_le_bytes([b[2], b[3]]),
+            request_id: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            args,
+            heap_ptr: u32::from_le_bytes([b[24], b[25], b[26], b[27]]),
+            heap_len: u32::from_le_bytes([b[28], b[29], b[30], b[31]]),
+        }
+    }
+
+    /// Encode a `Request` into its little-endian byte layout.
+    /// Inverse of [`Request::from_le_bytes`].
+    pub fn to_le_bytes(&self) -> [u8; SLOT_SIZE] {
+        let mut b = [0u8; SLOT_SIZE];
+        b[0..2].copy_from_slice(&self.opcode.to_le_bytes());
+        b[2..4].copy_from_slice(&self.flags.to_le_bytes());
+        b[4..8].copy_from_slice(&self.request_id.to_le_bytes());
+        b[8..24].copy_from_slice(&self.args);
+        b[24..28].copy_from_slice(&self.heap_ptr.to_le_bytes());
+        b[28..32].copy_from_slice(&self.heap_len.to_le_bytes());
+        b
+    }
 }
 
 /// A syscall response as it sits in the ring.
@@ -171,6 +202,34 @@ impl Response {
             extra_len: 0,
             _pad: [0u8; 12],
         }
+    }
+
+    /// Decode a `Response` from its little-endian byte layout.
+    /// Inverse of [`Response::to_le_bytes`].
+    pub fn from_le_bytes(b: &[u8; SLOT_SIZE]) -> Response {
+        let mut pad = [0u8; 12];
+        pad.copy_from_slice(&b[20..32]);
+        Response {
+            request_id: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            status: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            value: i64::from_le_bytes([
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+            ]),
+            extra_len: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+            _pad: pad,
+        }
+    }
+
+    /// Encode a `Response` into its little-endian byte layout.
+    /// Inverse of [`Response::from_le_bytes`].
+    pub fn to_le_bytes(&self) -> [u8; SLOT_SIZE] {
+        let mut b = [0u8; SLOT_SIZE];
+        b[0..4].copy_from_slice(&self.request_id.to_le_bytes());
+        b[4..8].copy_from_slice(&self.status.to_le_bytes());
+        b[8..16].copy_from_slice(&self.value.to_le_bytes());
+        b[16..20].copy_from_slice(&self.extra_len.to_le_bytes());
+        b[20..32].copy_from_slice(&self._pad);
+        b
     }
 }
 
@@ -231,5 +290,40 @@ mod tests {
         assert_eq!(err.request_id, 42);
         assert_eq!(err.status, -crate::errno::EBADF);
         assert_eq!(err.value, 0);
+    }
+
+    #[test]
+    fn request_byte_roundtrip() {
+        // Pack every field with a distinct nonzero value so drift
+        // between from_le_bytes and to_le_bytes trips this test.
+        let mut args = [0u8; 16];
+        for (i, b) in args.iter_mut().enumerate() {
+            *b = (i as u8) + 1;
+        }
+        let r = Request {
+            opcode: 0x1234,
+            flags: 0x5678,
+            request_id: 0xdeadbeef,
+            args,
+            heap_ptr: 0xcafe0000,
+            heap_len: 0x1234_5678,
+        };
+        let bytes = r.to_le_bytes();
+        let back = Request::from_le_bytes(&bytes);
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn response_byte_roundtrip() {
+        let r = Response {
+            request_id: 0xfeed_face,
+            status: -crate::errno::EINVAL,
+            value: 0x0123_4567_89ab_cdef_i64,
+            extra_len: 0x00ff_00ff,
+            _pad: [0x11; 12],
+        };
+        let bytes = r.to_le_bytes();
+        let back = Response::from_le_bytes(&bytes);
+        assert_eq!(back, r);
     }
 }

@@ -62,8 +62,56 @@ mod bump {
         }
     }
 
+    // Linker-defined symbol marking the first byte above the
+    // kernel's data + bss sections. The heap has to start here —
+    // *not* at address 0 — or allocations overlap the static
+    // data the linker placed in low linear memory (including
+    // `#[no_mangle] static mut` scratch buffers used by
+    // `crate::wasm_entry`). Accessing the symbol's address is
+    // the standard no_std way to find the start of free memory
+    // on wasm32-unknown-unknown; the Rust/LLD toolchain emits
+    // `__heap_base` for every cdylib.
+    extern "C" {
+        static __heap_base: u8;
+    }
+
+    impl BumpAllocator {
+        /// Lazy first-touch initialisation. Called at the top of
+        /// every `alloc` but only does work the first time
+        /// `cursor` is observed as zero. Sets `cursor` to
+        /// `__heap_base` (the first free byte after the data
+        /// section) and `end` to the current memory size in
+        /// bytes. Subsequent calls short-circuit.
+        ///
+        /// Correct under the single-threaded assumption already
+        /// in the struct docs: the kernel runs in one Worker.
+        /// The `compare_exchange` is a belt-and-braces guard —
+        /// even if two calls were to race here, only one wins
+        /// the CAS and the loser's observation of a nonzero
+        /// cursor on the next load is fine.
+        unsafe fn lazy_init(&self) {
+            if self.cursor.load(Ordering::Relaxed) != 0 {
+                return;
+            }
+            let base = &__heap_base as *const u8 as usize;
+            let _ = self.cursor.compare_exchange(
+                0,
+                base,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            let end_ptr = self.end.get();
+            if *end_ptr == 0 {
+                let mem_pages = core::arch::wasm32::memory_size(0);
+                *end_ptr = mem_pages * PAGE_SIZE;
+            }
+        }
+    }
+
     unsafe impl GlobalAlloc for BumpAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            self.lazy_init();
+
             let align = layout.align().max(1);
             let size = layout.size();
 
