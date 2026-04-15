@@ -8,15 +8,20 @@
 //! a native [`crate::draw::Canvas`] with no display server
 //! in the loop (Principle X).
 //!
-//! Populated incrementally. Currently: [`frame`]
-//! ([`frame::WindowFrame`]) — the chrome drawn around every
-//! top-level window. `Label`, `Button`, `TextInput`,
-//! `List`, and `Container` (the rest of T116) land in
-//! later slices.
+//! Populated incrementally. Currently:
+//!
+//! * [`frame::WindowFrame`] — the chrome drawn around every
+//!   top-level window.
+//! * [`label::Label`] — single-line text inside a rect.
+//!
+//! `Button`, `TextInput`, `List`, and `Container` (the rest
+//! of T116) land in later slices.
 
 pub mod frame;
+pub mod label;
 
 pub use frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
     TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, TITLEBAR_HEIGHT,
 };
+pub use label::{Alignment, Label};

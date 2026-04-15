@@ -67,6 +67,11 @@ pub struct Theme {
     /// Colour of the "X" glyph drawn on top of the close
     /// button.
     pub close_button_glyph: Color,
+
+    /// Default text colour for [`crate::widget::label::Label`]
+    /// and other widgets that render body-copy strings
+    /// inside the window's content area.
+    pub label_text: Color,
 }
 
 impl Theme {
@@ -87,6 +92,7 @@ impl Theme {
         close_button: Color::rgb(0xd8, 0xdc, 0xe4),
         close_button_hover: Color::rgb(0xe8, 0x4a, 0x4a),
         close_button_glyph: Color::rgb(0x1a, 0x1a, 0x1a),
+        label_text: Color::rgb(0x20, 0x20, 0x20),
     };
 
     /// Placeholder dark theme. The titlebar / border /
@@ -107,6 +113,7 @@ impl Theme {
         close_button: Color::rgb(0x2b, 0x31, 0x3d),
         close_button_hover: Color::rgb(0xe8, 0x4a, 0x4a),
         close_button_glyph: Color::rgb(0xec, 0xec, 0xec),
+        label_text: Color::rgb(0xe6, 0xe6, 0xe6),
     };
 }
 

@@ -17,9 +17,11 @@
 
 pub mod canvas;
 pub mod font;
+pub mod text;
 
 pub use canvas::{Canvas, Color, Rect, BYTES_PER_PIXEL};
 pub use font::{
     glyph_for, glyph_pixel, Glyph, CELL_HEIGHT, CELL_WIDTH, FIRST_CHAR, GLYPH_COUNT,
     GLYPH_HEIGHT, GLYPH_WIDTH, LAST_CHAR, UNKNOWN_GLYPH,
 };
+pub use text::{fit_text_to_width, text_width_px};

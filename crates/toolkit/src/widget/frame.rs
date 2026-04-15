@@ -20,7 +20,8 @@
 //! `xdg_toplevel.close` request — but that wiring does
 //! **not** live in this slice.
 
-use crate::draw::font::{CELL_WIDTH, GLYPH_HEIGHT};
+use crate::draw::font::GLYPH_HEIGHT;
+use crate::draw::text::fit_text_to_width;
 use crate::draw::{Canvas, Color, Rect};
 use crate::theme::Theme;
 
@@ -196,11 +197,12 @@ impl WindowFrame {
         Rect::new(x, y, w, h)
     }
 
-    /// Max number of characters of the app-id that will be
-    /// drawn. Drops the tail if the text would collide with
-    /// the close button. Returns 0 if the window is too
+    /// Pixel width available to the title text between the
+    /// title's left margin and the close button (or the
+    /// right edge, when the window is too small for a
+    /// close button). Returns `0` if the window is too
     /// narrow to fit any title text at all.
-    pub fn visible_title_chars(&self) -> usize {
+    fn title_text_budget_px(&self) -> u32 {
         let text_start_x = self.bounds.x + TITLE_TEXT_MARGIN_X as i32;
         let close = self.close_button_rect();
         let text_end_limit = if close.is_empty() {
@@ -211,9 +213,20 @@ impl WindowFrame {
         if text_end_limit <= text_start_x {
             return 0;
         }
-        let available = (text_end_limit - text_start_x) as u32;
-        let fit = (available / CELL_WIDTH) as usize;
-        self.app_id.chars().count().min(fit)
+        (text_end_limit - text_start_x) as u32
+    }
+
+    /// Leading slice of the app-id that actually gets
+    /// drawn. The rest is clipped by the close button.
+    pub fn visible_title(&self) -> &str {
+        fit_text_to_width(&self.app_id, self.title_text_budget_px())
+    }
+
+    /// Number of characters of the app-id that will be
+    /// drawn. Thin wrapper over [`Self::visible_title`]
+    /// kept for callers that only care about the count.
+    pub fn visible_title_chars(&self) -> usize {
+        self.visible_title().chars().count()
     }
 
     /// True iff `(x, y)` falls inside the close button.
@@ -317,15 +330,14 @@ impl WindowFrame {
             canvas.fill_rect(fill, self.titlebar_fill_color());
         }
 
-        let visible = self.visible_title_chars();
-        if visible > 0 && self.bounds.height >= GLYPH_HEIGHT + 2 * BORDER_WIDTH {
-            let text: String = self.app_id.chars().take(visible).collect();
+        let text = self.visible_title();
+        if !text.is_empty() && self.bounds.height >= GLYPH_HEIGHT + 2 * BORDER_WIDTH {
             let text_x = self.bounds.x + TITLE_TEXT_MARGIN_X as i32;
             let titlebar_interior_h = titlebar.height.saturating_sub(BORDER_WIDTH);
             let text_y = self.bounds.y
                 + BORDER_WIDTH as i32
                 + ((titlebar_interior_h.saturating_sub(GLYPH_HEIGHT)) / 2) as i32;
-            canvas.draw_text(text_x, text_y, &text, self.title_text_color());
+            canvas.draw_text(text_x, text_y, text, self.title_text_color());
         }
 
         let close = self.close_button_rect();
