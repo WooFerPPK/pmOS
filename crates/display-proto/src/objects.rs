@@ -62,6 +62,16 @@ pub enum Interface {
     /// `pmd_xdg_toplevel` — one window. Carries title +
     /// app_id + server-assigned geometry.
     XdgToplevel,
+    /// `pmd_seat` — input device collection global.
+    /// Clients bind and then `get_pointer` / `get_keyboard`
+    /// to receive event objects.
+    Seat,
+    /// `pmd_pointer` — per-client pointer event object,
+    /// created via `pmd_seat.get_pointer(new_id)`.
+    Pointer,
+    /// `pmd_keyboard` — per-client keyboard event object,
+    /// created via `pmd_seat.get_keyboard(new_id)`.
+    Keyboard,
 }
 
 impl Interface {
@@ -79,6 +89,9 @@ impl Interface {
             Interface::ShellManager => "pmd_shell_manager",
             Interface::XdgShell => "pmd_xdg_shell",
             Interface::XdgToplevel => "pmd_xdg_toplevel",
+            Interface::Seat => "pmd_seat",
+            Interface::Pointer => "pmd_pointer",
+            Interface::Keyboard => "pmd_keyboard",
         }
     }
 
@@ -102,6 +115,9 @@ impl Interface {
             "pmd_shell_manager" => Some(Interface::ShellManager),
             "pmd_xdg_shell" => Some(Interface::XdgShell),
             "pmd_xdg_toplevel" => Some(Interface::XdgToplevel),
+            "pmd_seat" => Some(Interface::Seat),
+            "pmd_pointer" => Some(Interface::Pointer),
+            "pmd_keyboard" => Some(Interface::Keyboard),
             _ => None,
         }
     }
@@ -190,6 +206,9 @@ impl Interface {
             Interface::ShellManager => SHELL_MANAGER_REQUESTS,
             Interface::XdgShell => XDG_SHELL_REQUESTS,
             Interface::XdgToplevel => XDG_TOPLEVEL_REQUESTS,
+            Interface::Seat => SEAT_REQUESTS,
+            Interface::Pointer => POINTER_REQUESTS,
+            Interface::Keyboard => KEYBOARD_REQUESTS,
         }
     }
 
@@ -205,6 +224,9 @@ impl Interface {
             Interface::ShellManager => SHELL_MANAGER_EVENTS,
             Interface::XdgShell => XDG_SHELL_EVENTS,
             Interface::XdgToplevel => XDG_TOPLEVEL_EVENTS,
+            Interface::Seat => SEAT_EVENTS,
+            Interface::Pointer => POINTER_EVENTS,
+            Interface::Keyboard => KEYBOARD_EVENTS,
         }
     }
 }
@@ -314,3 +336,36 @@ const XDG_TOPLEVEL_REQUESTS: &[Opcode] = &[
 ];
 
 const XDG_TOPLEVEL_EVENTS: &[Opcode] = &[];
+
+// pmd_seat — narrowed Wayland wl_seat. Clients bind the
+// global and then derive per-capability objects via
+// `get_pointer` / `get_keyboard`.
+const SEAT_REQUESTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Request, name: "get_pointer" },
+    Opcode { number: 2, direction: Direction::Request, name: "get_keyboard" },
+];
+
+const SEAT_EVENTS: &[Opcode] = &[];
+
+// pmd_pointer — per-client pointer event object.
+// Events carry surface-local coordinates + the target
+// surface id so the client knows which of its surfaces
+// the event applies to. No enter/leave state machine in
+// v1 — every event is self-contained.
+const POINTER_REQUESTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Request, name: "release" },
+];
+
+const POINTER_EVENTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Event, name: "motion" },
+    Opcode { number: 2, direction: Direction::Event, name: "button" },
+];
+
+// pmd_keyboard — per-client keyboard event object.
+const KEYBOARD_REQUESTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Request, name: "release" },
+];
+
+const KEYBOARD_EVENTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Event, name: "key" },
+];

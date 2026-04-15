@@ -297,3 +297,36 @@ impl XdgToplevelSetAppId {
         })
     }
 }
+
+// ---- pmd_seat (narrowed Wayland wl_seat) ----------------------
+
+/// `pmd_seat.get_pointer(new_id pointer)` — carve a new
+/// `pmd_pointer` object out of the seat. Events on the
+/// new id deliver pointer motion and button presses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SeatGetPointer {
+    pub new_id: ObjectId,
+}
+
+impl SeatGetPointer {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(SeatGetPointer {
+            new_id: read_object_id(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_seat.get_keyboard(new_id keyboard)` — carve a new
+/// `pmd_keyboard` object out of the seat.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SeatGetKeyboard {
+    pub new_id: ObjectId,
+}
+
+impl SeatGetKeyboard {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(SeatGetKeyboard {
+            new_id: read_object_id(payload, 0)?,
+        })
+    }
+}

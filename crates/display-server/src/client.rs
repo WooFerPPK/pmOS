@@ -47,9 +47,10 @@ use display_proto::events::{
 };
 use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
+use display_proto::events::{KeyboardKey, PointerButton, PointerMotion};
 use display_proto::requests::{
-    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, ShmCreatePool,
-    ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage, XdgShellGetToplevel,
+    CompositorCreateSurface, DisplayGetRegistry, RegistryBind, SeatGetKeyboard, SeatGetPointer,
+    ShmCreatePool, ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage, XdgShellGetToplevel,
     XdgToplevelSetAppId, XdgToplevelSetTitle,
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
@@ -224,7 +225,10 @@ pub const fn interface_required_cap(interface: Interface) -> Option<Cap> {
         | Interface::Buffer
         | Interface::Surface
         | Interface::XdgShell
-        | Interface::XdgToplevel => None,
+        | Interface::XdgToplevel
+        | Interface::Seat
+        | Interface::Pointer
+        | Interface::Keyboard => None,
     }
 }
 
@@ -347,6 +351,12 @@ pub enum ClientError {
     /// the object table but has no corresponding entry
     /// in the per-client toplevels map.
     UnknownToplevel { toplevel_id: ObjectId },
+    /// `pmd_seat.get_pointer` was called when this client
+    /// already has a bound pointer object.
+    PointerAlreadyBound { existing: ObjectId },
+    /// `pmd_seat.get_keyboard` was called when this
+    /// client already has a bound keyboard object.
+    KeyboardAlreadyBound { existing: ObjectId },
 }
 
 impl From<WireError> for ClientError {
@@ -402,6 +412,13 @@ pub struct Client {
     /// Advanced by [`AUTO_LAYOUT_STEP`] each time a new
     /// toplevel is installed.
     pub next_toplevel_offset: i32,
+    /// Object id of this client's `pmd_pointer`, populated
+    /// by `pmd_seat.get_pointer` auto-install. `None` if
+    /// the client hasn't asked for one.
+    pub pointer_id: Option<ObjectId>,
+    /// Object id of this client's `pmd_keyboard`, same
+    /// semantics as [`Client::pointer_id`].
+    pub keyboard_id: Option<ObjectId>,
 }
 
 impl Client {
@@ -432,6 +449,8 @@ impl Client {
             toplevels: BTreeMap::new(),
             toplevel_by_surface: BTreeMap::new(),
             next_toplevel_offset: 0,
+            pointer_id: None,
+            keyboard_id: None,
         }
     }
 
@@ -873,6 +892,36 @@ impl Client {
                 self.buffers.insert(req.new_id, info);
                 Ok(())
             }
+            (Interface::Seat, 1 /* get_pointer */) => {
+                let req = SeatGetPointer::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                if let Some(existing) = self.pointer_id {
+                    return Err(ClientError::PointerAlreadyBound { existing });
+                }
+                self.install_client_object(req.new_id, Interface::Pointer)?;
+                self.pointer_id = Some(req.new_id);
+                Ok(())
+            }
+            (Interface::Seat, 2 /* get_keyboard */) => {
+                let req = SeatGetKeyboard::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                if let Some(existing) = self.keyboard_id {
+                    return Err(ClientError::KeyboardAlreadyBound { existing });
+                }
+                self.install_client_object(req.new_id, Interface::Keyboard)?;
+                self.keyboard_id = Some(req.new_id);
+                Ok(())
+            }
             (Interface::XdgShell, 1 /* get_toplevel */) => {
                 let req = XdgShellGetToplevel::decode(payload).map_err(|e| {
                     ClientError::Malformed {
@@ -1155,6 +1204,72 @@ impl Client {
         let mut payload = Vec::new();
         event.encode(&mut payload);
         self.emit_raw(shell_manager_id, 4 /* window_title_changed */, &payload)
+    }
+
+    /// Emit `pmd_pointer.motion(surface_id, x, y)` on
+    /// this client's pointer object, if one has been
+    /// allocated via `pmd_seat.get_pointer`.
+    pub fn emit_pointer_motion(
+        &mut self,
+        surface_id: ObjectId,
+        x: i32,
+        y: i32,
+    ) -> Result<usize, ClientError> {
+        let pointer_id = self
+            .pointer_id
+            .ok_or(ClientError::UnknownObject { id: ObjectId::NULL })?;
+        let event = PointerMotion {
+            surface_id,
+            x,
+            y,
+        };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(pointer_id, 1 /* motion */, &payload)
+    }
+
+    /// Emit `pmd_pointer.button(surface_id, x, y, button, state)`.
+    pub fn emit_pointer_button(
+        &mut self,
+        surface_id: ObjectId,
+        x: i32,
+        y: i32,
+        button: u32,
+        state: u32,
+    ) -> Result<usize, ClientError> {
+        let pointer_id = self
+            .pointer_id
+            .ok_or(ClientError::UnknownObject { id: ObjectId::NULL })?;
+        let event = PointerButton {
+            surface_id,
+            x,
+            y,
+            button,
+            state,
+        };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(pointer_id, 2 /* button */, &payload)
+    }
+
+    /// Emit `pmd_keyboard.key(surface_id, key, state)`.
+    pub fn emit_keyboard_key(
+        &mut self,
+        surface_id: ObjectId,
+        key: u32,
+        state: u32,
+    ) -> Result<usize, ClientError> {
+        let keyboard_id = self
+            .keyboard_id
+            .ok_or(ClientError::UnknownObject { id: ObjectId::NULL })?;
+        let event = KeyboardKey {
+            surface_id,
+            key,
+            state,
+        };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(keyboard_id, 1 /* key */, &payload)
     }
 
     /// Drain the pending-events queue and return one

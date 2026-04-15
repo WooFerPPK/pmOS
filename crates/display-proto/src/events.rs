@@ -30,8 +30,13 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::decode::{read_object_id, read_string, read_u32, DecodeError};
+use crate::decode::{read_i32, read_object_id, read_string, read_u32, DecodeError};
 use crate::ids::ObjectId;
+
+/// Write an `i32` to `out` in little-endian byte order.
+fn write_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
 
 /// Write a `u32` to `out` in little-endian byte order.
 fn write_u32(out: &mut Vec<u8>, value: u32) {
@@ -290,5 +295,112 @@ impl ShellWindowTitleChanged {
     pub fn encode(&self, out: &mut Vec<u8>) {
         write_u32(out, self.window_id);
         write_string(out, &self.new_title);
+    }
+}
+
+// ---- pmd_pointer / pmd_keyboard events ------------------------
+
+/// Pointer button press/release state. Matches the
+/// on-the-wire u32 encoding of `pmd_pointer.button.state`.
+pub mod pointer_button_state {
+    /// The button was pressed.
+    pub const PRESSED: u32 = 1;
+    /// The button was released.
+    pub const RELEASED: u32 = 0;
+}
+
+/// Key press/release state. Matches
+/// `pmd_keyboard.key.state` on the wire.
+pub mod key_state {
+    pub const PRESSED: u32 = 1;
+    pub const RELEASED: u32 = 0;
+}
+
+/// `pmd_pointer.motion(surface_id, x, y)` — the pointer
+/// moved over a surface. Coordinates are surface-local
+/// (i.e. relative to the toplevel's origin if the surface
+/// is wrapped in one). `surface_id` tells the client
+/// which of its surfaces the event applies to; there is
+/// no enter/leave state machine in v1.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PointerMotion {
+    pub surface_id: ObjectId,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl PointerMotion {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(PointerMotion {
+            surface_id: read_object_id(payload, 0)?,
+            x: read_i32(payload, 4)?,
+            y: read_i32(payload, 8)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_object_id(out, self.surface_id);
+        write_i32(out, self.x);
+        write_i32(out, self.y);
+    }
+}
+
+/// `pmd_pointer.button(surface_id, x, y, button, state)`.
+/// `button` is a linux-input-style code (1 = left,
+/// 2 = right, 3 = middle in v1). `state` is one of
+/// [`pointer_button_state`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PointerButton {
+    pub surface_id: ObjectId,
+    pub x: i32,
+    pub y: i32,
+    pub button: u32,
+    pub state: u32,
+}
+
+impl PointerButton {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(PointerButton {
+            surface_id: read_object_id(payload, 0)?,
+            x: read_i32(payload, 4)?,
+            y: read_i32(payload, 8)?,
+            button: read_u32(payload, 12)?,
+            state: read_u32(payload, 16)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_object_id(out, self.surface_id);
+        write_i32(out, self.x);
+        write_i32(out, self.y);
+        write_u32(out, self.button);
+        write_u32(out, self.state);
+    }
+}
+
+/// `pmd_keyboard.key(surface_id, key, state)`. `key` is a
+/// raw scancode (v1 uses the web platform's `code` values
+/// as-is; a kbd layout layer lands later). `state` is one
+/// of [`key_state`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KeyboardKey {
+    pub surface_id: ObjectId,
+    pub key: u32,
+    pub state: u32,
+}
+
+impl KeyboardKey {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(KeyboardKey {
+            surface_id: read_object_id(payload, 0)?,
+            key: read_u32(payload, 4)?,
+            state: read_u32(payload, 8)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_object_id(out, self.surface_id);
+        write_u32(out, self.key);
+        write_u32(out, self.state);
     }
 }

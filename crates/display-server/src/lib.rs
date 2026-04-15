@@ -44,4 +44,4 @@ pub use display_proto::{
     IdAllocator, IdError, IdKind, Interface, MessageHeader, ObjectId,
     ObjectIdAllocationError, Opcode, OpcodeError, WireError, HEADER_SIZE,
 };
-pub use server::{Server, ServerError};
+pub use server::{HitResult, Server, ServerError};

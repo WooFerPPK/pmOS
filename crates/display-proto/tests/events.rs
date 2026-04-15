@@ -7,10 +7,10 @@
 //! the original — the strongest form of "encoder and
 //! decoder agree" coverage.
 
-use display_proto::events::write_string;
+use display_proto::events::{key_state, pointer_button_state, write_string};
 use display_proto::{
-    BufferRelease, DecodeError, DisplayDeleteId, DisplayError, ObjectId, RegistryGlobal,
-    RegistryGlobalRemove, ShmFormat,
+    BufferRelease, DecodeError, DisplayDeleteId, DisplayError, KeyboardKey, ObjectId,
+    PointerButton, PointerMotion, RegistryGlobal, RegistryGlobalRemove, ShmFormat,
 };
 
 // ---- DisplayError -------------------------------------------------
@@ -215,4 +215,114 @@ fn write_string_padding_matches_four_byte_boundary() {
     out.clear();
     write_string(&mut out, "abcde");
     assert_eq!(out.len(), 12);
+}
+
+// ---- pointer / keyboard events ------------------------------------
+
+#[test]
+fn pointer_motion_round_trips() {
+    let original = PointerMotion {
+        surface_id: ObjectId::new(9),
+        x: 42,
+        y: -7,
+    };
+    let mut buf = Vec::new();
+    original.encode(&mut buf);
+    let decoded = PointerMotion::decode(&buf).unwrap();
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn pointer_motion_payload_is_exactly_twelve_bytes() {
+    let mut buf = Vec::new();
+    let event = PointerMotion {
+        surface_id: ObjectId::new(1),
+        x: 0,
+        y: 0,
+    };
+    event.encode(&mut buf);
+    assert_eq!(buf.len(), 12);
+}
+
+#[test]
+fn pointer_button_round_trips_with_press_state() {
+    let original = PointerButton {
+        surface_id: ObjectId::new(11),
+        x: 100,
+        y: 50,
+        button: 1,
+        state: pointer_button_state::PRESSED,
+    };
+    let mut buf = Vec::new();
+    original.encode(&mut buf);
+    let decoded = PointerButton::decode(&buf).unwrap();
+    assert_eq!(decoded, original);
+    assert_eq!(decoded.state, 1);
+}
+
+#[test]
+fn pointer_button_round_trips_with_release_state() {
+    let original = PointerButton {
+        surface_id: ObjectId::new(11),
+        x: 0,
+        y: 0,
+        button: 2,
+        state: pointer_button_state::RELEASED,
+    };
+    let mut buf = Vec::new();
+    original.encode(&mut buf);
+    let decoded = PointerButton::decode(&buf).unwrap();
+    assert_eq!(decoded, original);
+    assert_eq!(decoded.state, 0);
+}
+
+#[test]
+fn pointer_button_payload_is_exactly_twenty_bytes() {
+    let mut buf = Vec::new();
+    PointerButton {
+        surface_id: ObjectId::new(1),
+        x: 0,
+        y: 0,
+        button: 0,
+        state: 0,
+    }
+    .encode(&mut buf);
+    assert_eq!(buf.len(), 20);
+}
+
+#[test]
+fn keyboard_key_round_trips() {
+    let original = KeyboardKey {
+        surface_id: ObjectId::new(13),
+        key: 0x1e, /* 'a' scancode */
+        state: key_state::PRESSED,
+    };
+    let mut buf = Vec::new();
+    original.encode(&mut buf);
+    let decoded = KeyboardKey::decode(&buf).unwrap();
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn keyboard_key_payload_is_exactly_twelve_bytes() {
+    let mut buf = Vec::new();
+    KeyboardKey {
+        surface_id: ObjectId::new(1),
+        key: 0,
+        state: 0,
+    }
+    .encode(&mut buf);
+    assert_eq!(buf.len(), 12);
+}
+
+#[test]
+fn pointer_motion_decode_rejects_truncated_payload() {
+    let err = PointerMotion::decode(&[0u8; 8]).unwrap_err();
+    assert!(matches!(err, DecodeError::Truncated { .. }));
+}
+
+#[test]
+fn pointer_button_decode_rejects_truncated_payload() {
+    let err = PointerButton::decode(&[0u8; 16]).unwrap_err();
+    assert!(matches!(err, DecodeError::Truncated { .. }));
 }

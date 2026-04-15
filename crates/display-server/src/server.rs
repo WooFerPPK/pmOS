@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 use crate::client::{Client, ClientError, ClientId};
 use crate::compositor::{Framebuffer, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use display_proto::ids::ObjectId;
 use display_proto::objects::Interface;
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
@@ -48,6 +49,22 @@ impl From<ClientError> for ServerError {
     }
 }
 
+/// Target of a hit-test: which client + surface is at a
+/// given screen-space point. Returned by
+/// [`Server::hit_test`] and used by the input-routing
+/// path to decide which event object should receive an
+/// injected event.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HitResult {
+    pub client_id: ClientId,
+    pub surface_id: ObjectId,
+    /// The point converted to surface-local coordinates
+    /// (i.e. `(screen_x - toplevel.x, screen_y -
+    /// toplevel.y)`).
+    pub local_x: i32,
+    pub local_y: i32,
+}
+
 /// The display server.
 pub struct Server {
     next_client_id: u32,
@@ -58,6 +75,19 @@ pub struct Server {
     /// multi-output support lands with the kernel-side
     /// `Fb` driver.
     framebuffer: Framebuffer,
+    /// Current pointer position in screen space. Updated
+    /// by [`Server::inject_pointer_motion`]; consulted by
+    /// [`Server::inject_pointer_button`] when the click
+    /// needs to be routed to whatever surface the pointer
+    /// is currently over.
+    pointer_x: i32,
+    pointer_y: i32,
+    /// Currently-focused client + surface for keyboard
+    /// input. Set by
+    /// [`Server::inject_pointer_button`] on a press
+    /// (click-to-focus); cleared when the focused window
+    /// is destroyed.
+    keyboard_focus: Option<(ClientId, ObjectId)>,
 }
 
 impl Server {
@@ -74,6 +104,9 @@ impl Server {
             next_client_id: 1,
             clients: BTreeMap::new(),
             framebuffer: Framebuffer::new(width, height),
+            pointer_x: 0,
+            pointer_y: 0,
+            keyboard_focus: None,
         }
     }
 
@@ -91,6 +124,149 @@ impl Server {
     /// expected rectangle.
     pub fn framebuffer_mut(&mut self) -> &mut Framebuffer {
         &mut self.framebuffer
+    }
+
+    /// Current pointer position in screen space.
+    pub fn pointer_position(&self) -> (i32, i32) {
+        (self.pointer_x, self.pointer_y)
+    }
+
+    /// Currently-focused client + surface for keyboard
+    /// input, if any.
+    pub fn keyboard_focus(&self) -> Option<(ClientId, ObjectId)> {
+        self.keyboard_focus
+    }
+
+    /// Hit-test a screen-space point against the toplevels
+    /// in every connected client. Returns the topmost
+    /// surface whose rectangle contains `(x, y)`, or
+    /// `None` if the point doesn't land on any window.
+    ///
+    /// Z-order is "newer wins" in v1: toplevels created
+    /// later sit on top of older ones. The `BTreeMap`
+    /// iteration is by ascending `ObjectId`, and object
+    /// ids are monotonic, so walking the map in reverse
+    /// yields the most-recently-created toplevel first.
+    ///
+    /// The hit rectangle is `(top.x, top.y, top.x + w,
+    /// top.y + h)` where `(w, h)` comes from the
+    /// surface's current buffer geometry. A surface that
+    /// hasn't committed a buffer yet is invisible to the
+    /// hit-test (no rectangle → no hit).
+    pub fn hit_test(&self, x: i32, y: i32) -> Option<HitResult> {
+        for (&client_id, client) in self.clients.iter().rev() {
+            for (&toplevel_id, toplevel) in client.toplevels.iter().rev() {
+                let _ = toplevel_id;
+                let Some(surface) = client.surfaces.get(&toplevel.surface_id)
+                else {
+                    continue;
+                };
+                let Some(attachment) = surface.current_buffer else {
+                    continue;
+                };
+                let Some(info) = client.buffers.get(&attachment.buffer_id)
+                else {
+                    continue;
+                };
+                let rect_x = toplevel.x.saturating_add(attachment.x);
+                let rect_y = toplevel.y.saturating_add(attachment.y);
+                let rect_w = info.width as i32;
+                let rect_h = info.height as i32;
+                if x >= rect_x
+                    && x < rect_x.saturating_add(rect_w)
+                    && y >= rect_y
+                    && y < rect_y.saturating_add(rect_h)
+                {
+                    return Some(HitResult {
+                        client_id,
+                        surface_id: toplevel.surface_id,
+                        local_x: x - rect_x,
+                        local_y: y - rect_y,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Inject a pointer motion event in screen space.
+    /// Updates the server's pointer position, hit-tests
+    /// against the toplevels, and (if the hit client has
+    /// a bound `pmd_pointer`) emits a `motion` event on
+    /// its pointer object carrying surface-local
+    /// coordinates. Returns the hit result, or `None`
+    /// if the pointer didn't land on any window.
+    pub fn inject_pointer_motion(
+        &mut self,
+        x: i32,
+        y: i32,
+    ) -> Option<HitResult> {
+        self.pointer_x = x;
+        self.pointer_y = y;
+        let hit = self.hit_test(x, y)?;
+        let client = self.clients.get_mut(&hit.client_id)?;
+        if client.pointer_id.is_some() {
+            let _ =
+                client.emit_pointer_motion(hit.surface_id, hit.local_x, hit.local_y);
+        }
+        Some(hit)
+    }
+
+    /// Inject a pointer button event at the current
+    /// pointer position. Emits a `button` event on the
+    /// target client's pointer object (if any), and on a
+    /// press, sets keyboard focus to the hit surface.
+    /// Returns the hit result, or `None` if the click
+    /// didn't land on any window.
+    pub fn inject_pointer_button(
+        &mut self,
+        button: u32,
+        state: u32,
+    ) -> Option<HitResult> {
+        let hit = self.hit_test(self.pointer_x, self.pointer_y)?;
+        if state == display_proto::events::pointer_button_state::PRESSED {
+            self.keyboard_focus = Some((hit.client_id, hit.surface_id));
+        }
+        let client = self.clients.get_mut(&hit.client_id)?;
+        if client.pointer_id.is_some() {
+            let _ = client.emit_pointer_button(
+                hit.surface_id,
+                hit.local_x,
+                hit.local_y,
+                button,
+                state,
+            );
+        }
+        Some(hit)
+    }
+
+    /// Inject a keyboard key event. Routes to the
+    /// currently-focused client + surface (if any). The
+    /// target client must have a bound `pmd_keyboard`
+    /// object; otherwise the event is silently dropped.
+    /// Returns the (client_id, surface_id) the event was
+    /// routed to, or `None` if no window has keyboard
+    /// focus.
+    pub fn inject_keyboard_key(
+        &mut self,
+        key: u32,
+        state: u32,
+    ) -> Option<(ClientId, ObjectId)> {
+        let (client_id, surface_id) = self.keyboard_focus?;
+        let client = self.clients.get_mut(&client_id)?;
+        if client.keyboard_id.is_some() {
+            let _ = client.emit_keyboard_key(surface_id, key, state);
+        }
+        Some((client_id, surface_id))
+    }
+
+    /// Explicitly set keyboard focus. Used by tests and
+    /// by the desktop shell's click-to-focus path.
+    pub fn set_keyboard_focus(
+        &mut self,
+        focus: Option<(ClientId, ObjectId)>,
+    ) {
+        self.keyboard_focus = focus;
     }
 
     /// Accept a new client connection. Returns the
