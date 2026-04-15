@@ -114,3 +114,5 @@ cargo test --workspace          # all Rust crates, host target
 ```
 
 = 787 + 212 = **999 passing, 0 failing** as of the T029 resolution slice. These are the same numbers the `preferred_size` slice landed — T029 changed build plumbing, not test code.
+
+After the **T073 dispatcher first landing**: 809 + 212 = **1021 passing, 0 failing** (+22 new isolation tests at `crates/kernel/tests/syscall.rs`).
