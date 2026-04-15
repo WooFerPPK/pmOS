@@ -10,16 +10,28 @@
 //! rasterizer long before [`crate::app::App`] (T114) exists
 //! to wire it to real window events.
 //!
-//! Event wiring is shallow by design: the close callback is
-//! a closure supplied at construction time, and
-//! [`WindowFrame::pointer_down`] is the only input
-//! entry-point. When [`crate::app::App::connect`] lands
-//! (T114), an `App` will call `pointer_down` for every
-//! pointer event that lands on this frame's bounds and
-//! translate `PointerOutcome::Close` into a real
-//! `xdg_toplevel.close` request — but that wiring does
-//! **not** live in this slice.
+//! Composition: the close button is a real
+//! [`Button`] stored as a field, not a handful of direct
+//! draw calls. `WindowFrame` overrides the button's
+//! default `button_*` theme colours with the
+//! `close_button*` chrome slots so the close button
+//! inherits the window's focus-driven border colour while
+//! keeping the red-on-hover fill the user expects. Click
+//! handling, hit-testing, fill state, and the centred "x"
+//! caption are all [`Button`]'s job now — `WindowFrame`
+//! only decides *where* the close button lives and *what
+//! colours* it should paint with.
+//!
+//! Event wiring is shallow by design: `on_close` is sugar
+//! for `close_button.on_click`. When
+//! [`crate::app::App::connect`] lands (T114), an `App`
+//! will call `pointer_down` for every pointer event that
+//! lands on this frame's bounds and translate
+//! `PointerOutcome::Close` into a real `xdg_toplevel.close`
+//! request — but that wiring does **not** live in this
+//! slice.
 
+use super::button::{Button, ButtonState};
 use crate::draw::font::GLYPH_HEIGHT;
 use crate::draw::text::fit_text_to_width;
 use crate::draw::{Canvas, Color, Rect};
@@ -75,6 +87,25 @@ pub enum PointerOutcome {
     Outside,
 }
 
+/// Compute the close-button rectangle for a window with the
+/// given `bounds`. Returns an empty rect if the window is
+/// too small to hold the button. Exists as a free function
+/// so [`WindowFrame::new`] can call it before the struct is
+/// built.
+fn compute_close_button_rect(bounds: Rect) -> Rect {
+    if bounds.width < CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN
+        || bounds.height < TITLEBAR_HEIGHT
+    {
+        return Rect::new(bounds.x, bounds.y, 0, 0);
+    }
+    let x = bounds.x
+        + (bounds.width as i32)
+        - (CLOSE_BUTTON_MARGIN as i32)
+        - (CLOSE_BUTTON_SIZE as i32);
+    let y = bounds.y + CLOSE_BUTTON_MARGIN as i32;
+    Rect::new(x, y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE)
+}
+
 /// Chrome widget drawn around a window's content area.
 ///
 /// See the module doc-comment for design notes. Construct
@@ -87,9 +118,8 @@ pub struct WindowFrame {
     bounds: Rect,
     app_id: String,
     focused: bool,
-    close_hover: bool,
     theme: Theme,
-    close_callback: Option<Box<dyn FnMut()>>,
+    close_button: Button,
 }
 
 impl WindowFrame {
@@ -97,13 +127,28 @@ impl WindowFrame {
     /// The frame starts focused (so the active-theme
     /// colours are in effect) and has no close callback.
     pub fn new(bounds: Rect, app_id: impl Into<String>) -> Self {
+        let theme = Theme::default();
+        let close_rect = compute_close_button_rect(bounds);
+        let mut close_button = Button::new(close_rect, "x");
+        // Override Button's standalone `button_*` palette
+        // with the window-chrome `close_button*` slots.
+        // The close button's border tracks the window's
+        // focused border colour, not the standalone button
+        // border colour.
+        close_button.set_fill(theme.close_button);
+        close_button.set_fill_hover(theme.close_button_hover);
+        // No distinct pressed state for the close button —
+        // press uses the same red as hover.
+        close_button.set_fill_pressed(theme.close_button_hover);
+        close_button.set_border(theme.border_active);
+        close_button.set_caption_color(theme.close_button_glyph);
+
         WindowFrame {
             bounds,
             app_id: app_id.into(),
             focused: true,
-            close_hover: false,
-            theme: Theme::default(),
-            close_callback: None,
+            theme,
+            close_button,
         }
     }
 
@@ -125,33 +170,49 @@ impl WindowFrame {
     /// directly.
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
+        // Sync the close button's border with the window
+        // focus state so the chrome reads as one unit.
+        self.close_button.set_border(self.border_color());
     }
 
+    /// True iff the close button is currently in hover
+    /// state.
     pub fn is_close_hover(&self) -> bool {
-        self.close_hover
+        matches!(self.close_button.state(), ButtonState::Hover)
     }
 
-    /// Mark the close button as hovered (true) or not
-    /// (false). A hovered close button paints with
+    /// Mark the close button as hovered (`true`) or not
+    /// (`false`). A hovered close button paints with
     /// [`Theme::close_button_hover`] instead of
     /// [`Theme::close_button`].
     pub fn set_close_hover(&mut self, hovered: bool) {
-        self.close_hover = hovered;
+        self.close_button.set_state(if hovered {
+            ButtonState::Hover
+        } else {
+            ButtonState::Resting
+        });
     }
 
     pub fn theme(&self) -> &Theme {
         &self.theme
     }
 
+    /// Replace the active theme. Resyncs the close
+    /// button's colours from the new theme.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+        self.close_button.set_fill(theme.close_button);
+        self.close_button.set_fill_hover(theme.close_button_hover);
+        self.close_button.set_fill_pressed(theme.close_button_hover);
+        self.close_button.set_caption_color(theme.close_button_glyph);
+        self.close_button.set_border(self.border_color());
     }
 
     /// Install a close callback. Called exactly once per
     /// `pointer_down` that hits the close button. The
     /// previous callback (if any) is replaced.
     pub fn on_close<F: FnMut() + 'static>(&mut self, callback: F) {
-        self.close_callback = Some(Box::new(callback));
+        self.close_button.on_click(callback);
     }
 
     /// The titlebar rectangle, including the top 1-pixel
@@ -168,17 +229,7 @@ impl WindowFrame {
     /// The close-button rectangle. Empty if the window is
     /// too small to hold it.
     pub fn close_button_rect(&self) -> Rect {
-        if self.bounds.width < CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN
-            || self.bounds.height < TITLEBAR_HEIGHT
-        {
-            return Rect::new(self.bounds.x, self.bounds.y, 0, 0);
-        }
-        let x = self.bounds.x
-            + (self.bounds.width as i32)
-            - (CLOSE_BUTTON_MARGIN as i32)
-            - (CLOSE_BUTTON_SIZE as i32);
-        let y = self.bounds.y + CLOSE_BUTTON_MARGIN as i32;
-        Rect::new(x, y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE)
+        self.close_button.bounds()
     }
 
     /// The content rectangle — the area inside the border
@@ -231,11 +282,7 @@ impl WindowFrame {
 
     /// True iff `(x, y)` falls inside the close button.
     pub fn hit_test_close(&self, x: i32, y: i32) -> bool {
-        let cb = self.close_button_rect();
-        if cb.is_empty() {
-            return false;
-        }
-        x >= cb.x && x < cb.right() && y >= cb.y && y < cb.bottom()
+        self.close_button.hit_test(x, y)
     }
 
     /// True iff `(x, y)` falls inside the titlebar
@@ -267,10 +314,7 @@ impl WindowFrame {
         if !self.hit_test_window(x, y) {
             return PointerOutcome::Outside;
         }
-        if self.hit_test_close(x, y) {
-            if let Some(callback) = self.close_callback.as_mut() {
-                callback();
-            }
+        if self.close_button.pointer_down(x, y) {
             return PointerOutcome::Close;
         }
         if self.hit_test_titlebar(x, y) {
@@ -303,14 +347,6 @@ impl WindowFrame {
         }
     }
 
-    fn close_button_fill_color(&self) -> Color {
-        if self.close_hover {
-            self.theme.close_button_hover
-        } else {
-            self.theme.close_button
-        }
-    }
-
     /// Paint the frame's chrome into `canvas`. Does not
     /// touch the content rectangle — that's the app's
     /// responsibility.
@@ -340,14 +376,7 @@ impl WindowFrame {
             canvas.draw_text(text_x, text_y, text, self.title_text_color());
         }
 
-        let close = self.close_button_rect();
-        if !close.is_empty() {
-            canvas.fill_rect(close, self.close_button_fill_color());
-            canvas.stroke_rect(close, self.border_color());
-            let glyph_x = close.x + ((CLOSE_BUTTON_SIZE - crate::draw::font::GLYPH_WIDTH) / 2) as i32;
-            let glyph_y = close.y + ((CLOSE_BUTTON_SIZE - GLYPH_HEIGHT) / 2) as i32;
-            canvas.draw_text(glyph_x, glyph_y, "x", self.theme.close_button_glyph);
-        }
+        self.close_button.draw(canvas);
 
         canvas.stroke_rect(self.bounds, self.border_color());
     }

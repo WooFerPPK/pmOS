@@ -10,18 +10,27 @@
 //!
 //! Populated incrementally. Currently:
 //!
+//! * [`alignment::Alignment`] — horizontal placement
+//!   vocabulary shared by every widget that places
+//!   content inside its own bounds.
 //! * [`frame::WindowFrame`] — the chrome drawn around every
 //!   top-level window.
 //! * [`label::Label`] — single-line text inside a rect.
+//! * [`button::Button`] — clickable rect with a centred
+//!   caption. `WindowFrame`'s close button is a `Button`.
 //!
-//! `Button`, `TextInput`, `List`, and `Container` (the rest
-//! of T116) land in later slices.
+//! `TextInput`, `List`, and `Container` (the rest of
+//! T116) land in later slices.
 
+pub mod alignment;
+pub mod button;
 pub mod frame;
 pub mod label;
 
+pub use alignment::Alignment;
+pub use button::{Button, ButtonState};
 pub use frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
     TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, TITLEBAR_HEIGHT,
 };
-pub use label::{Alignment, Label};
+pub use label::Label;

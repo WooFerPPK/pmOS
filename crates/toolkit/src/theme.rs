@@ -72,6 +72,19 @@ pub struct Theme {
     /// and other widgets that render body-copy strings
     /// inside the window's content area.
     pub label_text: Color,
+
+    /// Default fill for a [`crate::widget::button::Button`]
+    /// in its resting state.
+    pub button_fill: Color,
+    /// Default fill when the pointer is hovering over a
+    /// button.
+    pub button_fill_hover: Color,
+    /// Default fill while a button is being pressed.
+    pub button_fill_pressed: Color,
+    /// Default 1-pixel border drawn around a button.
+    pub button_border: Color,
+    /// Default caption text colour for a button.
+    pub button_text: Color,
 }
 
 impl Theme {
@@ -93,6 +106,11 @@ impl Theme {
         close_button_hover: Color::rgb(0xe8, 0x4a, 0x4a),
         close_button_glyph: Color::rgb(0x1a, 0x1a, 0x1a),
         label_text: Color::rgb(0x20, 0x20, 0x20),
+        button_fill: Color::rgb(0xe2, 0xe4, 0xea),
+        button_fill_hover: Color::rgb(0xec, 0xee, 0xf4),
+        button_fill_pressed: Color::rgb(0xc2, 0xc6, 0xcf),
+        button_border: Color::rgb(0x8a, 0x8e, 0x96),
+        button_text: Color::rgb(0x1a, 0x1a, 0x1a),
     };
 
     /// Placeholder dark theme. The titlebar / border /
@@ -114,6 +132,11 @@ impl Theme {
         close_button_hover: Color::rgb(0xe8, 0x4a, 0x4a),
         close_button_glyph: Color::rgb(0xec, 0xec, 0xec),
         label_text: Color::rgb(0xe6, 0xe6, 0xe6),
+        button_fill: Color::rgb(0x32, 0x36, 0x3e),
+        button_fill_hover: Color::rgb(0x3e, 0x44, 0x4c),
+        button_fill_pressed: Color::rgb(0x22, 0x26, 0x2e),
+        button_border: Color::rgb(0x54, 0x58, 0x60),
+        button_text: Color::rgb(0xec, 0xec, 0xec),
     };
 }
 

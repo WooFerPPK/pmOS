@@ -13,25 +13,11 @@
 //! near-term `Button`) compose a `Label` for their caption
 //! and add hit-testing on top.
 
+use super::alignment::Alignment;
 use crate::draw::font::GLYPH_HEIGHT;
 use crate::draw::text::{fit_text_to_width, text_width_px};
 use crate::draw::{Canvas, Color, Rect};
 use crate::theme::Theme;
-
-/// Horizontal alignment of a [`Label`]'s text within its
-/// bounds. Vertical placement is always centred.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Alignment {
-    Left,
-    Center,
-    Right,
-}
-
-impl Default for Alignment {
-    fn default() -> Self {
-        Alignment::Left
-    }
-}
 
 /// Single-line text widget.
 pub struct Label {

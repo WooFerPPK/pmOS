@@ -6,7 +6,7 @@ use toolkit::draw::font::{glyph_for, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
 use toolkit::draw::text::{fit_text_to_width, text_width_px};
 use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::theme::Theme;
-use toolkit::widget::label::{Alignment, Label};
+use toolkit::widget::{Alignment, Label};
 
 // ---- helpers -------------------------------------------------------
 
