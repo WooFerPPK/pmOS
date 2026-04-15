@@ -57,7 +57,6 @@ const DEV_CONSOLE = 5;
 
 // errno — matches abi/src/errno.rs.
 const EBADF = 8;
-const EINVAL = 28;
 const ENOENT = 44;
 const ENOSYS = 52;
 

@@ -276,3 +276,36 @@ pub extern "C" fn kernel_dispatch(pid: Pid) -> i32 {
     }
     0
 }
+
+// ---- device-input injection --------------------------------------------
+//
+// The kernel's device dispatcher has internal helpers
+// (`DeviceDispatcher::inject_console_input` and friends) used by the
+// native test harness to push bytes into a device's input ring. The
+// production path uses them too: the TS console driver forwards
+// keystrokes into the kernel by writing them into the heap scratch
+// region and calling the export below.
+//
+// Input injection is the "TS driver → kernel" direction, the
+// complement of `pmos_host_driver_call`, which is the "kernel → TS
+// driver" direction.
+
+/// Push `len` bytes of console input into the kernel's `/dev/console`
+/// input ring. The bytes are read from the start of the heap scratch
+/// region (offset 0), so the host side writes them there first via a
+/// `DataView` on the exported memory, then calls this function.
+///
+/// Returns `0` on success, `-1` if `len` exceeds the heap scratch
+/// capacity.
+#[no_mangle]
+pub extern "C" fn kernel_inject_console_input(len: u32) -> i32 {
+    let len = len as usize;
+    if len > HEAP_SCRATCH_SIZE {
+        return -1;
+    }
+    let kernel = kernel_mut();
+    unsafe {
+        kernel.devs.inject_console_input(&HEAP_SCRATCH[..len]);
+    }
+    0
+}
