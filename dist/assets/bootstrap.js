@@ -185,163 +185,6 @@ var FbHost = class {
   }
 };
 
-// src/terminal.ts
-var Terminal = class {
-  maxLines;
-  lines = [];
-  inputBuffer = "";
-  /** Holds bytes from a partial output line (no trailing `\n` yet). */
-  pendingOutput = "";
-  decoder = new TextDecoder();
-  constructor(options) {
-    if (options.maxLines <= 0) {
-      throw new Error("Terminal: maxLines must be > 0");
-    }
-    this.maxLines = options.maxLines;
-    if (options.banner) {
-      for (const line of options.banner) {
-        this.pushLine({ text: line, kind: "output" });
-      }
-    }
-  }
-  /** Current input buffer (what the user has typed but not yet committed). */
-  get input() {
-    return this.inputBuffer;
-  }
-  /** Current scrollback snapshot, bounded by `maxLines`. */
-  snapshot() {
-    return {
-      lines: this.lines.slice(),
-      inputBuffer: this.inputBuffer
-    };
-  }
-  /**
-   * Feed a single keydown event. Returns the committed
-   * line bytes when the user pressed Enter (the caller
-   * forwards them to the kernel), or `null` otherwise.
-   *
-   * `key` is the DOM `KeyboardEvent.key` string:
-   *   * A single printable char → append to the input
-   *     buffer.
-   *   * `"Enter"` → commit the buffer, push it to
-   *     scrollback as an `input` line, clear the buffer,
-   *     and return the line as bytes with a trailing `\n`.
-   *   * `"Backspace"` → remove the last character from
-   *     the buffer.
-   *   * Anything else (Shift, Alt, arrow keys, ...) →
-   *     ignored.
-   */
-  feedKey(key) {
-    if (key === "Enter") {
-      const line = this.inputBuffer;
-      this.inputBuffer = "";
-      this.pushLine({ text: `> ${line}`, kind: "input" });
-      const out = new TextEncoder().encode(`${line}
-`);
-      return out;
-    }
-    if (key === "Backspace") {
-      if (this.inputBuffer.length > 0) {
-        this.inputBuffer = this.inputBuffer.slice(0, -1);
-      }
-      return null;
-    }
-    if (key.length === 1 && this.isPrintable(key)) {
-      this.inputBuffer += key;
-    }
-    return null;
-  }
-  /**
-   * Append raw output bytes from the kernel. The bytes are
-   * decoded as UTF-8 and split on `\n`. Bytes with no
-   * trailing newline land in a pending buffer until the
-   * next append completes them.
-   */
-  appendOutput(bytes) {
-    const text = this.decoder.decode(bytes, { stream: true });
-    this.pendingOutput += text;
-    while (true) {
-      const newlineIdx = this.pendingOutput.indexOf("\n");
-      if (newlineIdx < 0) {
-        break;
-      }
-      const line = this.pendingOutput.slice(0, newlineIdx);
-      this.pendingOutput = this.pendingOutput.slice(newlineIdx + 1);
-      this.pushLine({ text: line, kind: "output" });
-    }
-  }
-  /** Wipe all scrollback + any pending output, reset the input buffer. */
-  clear() {
-    this.lines.length = 0;
-    this.inputBuffer = "";
-    this.pendingOutput = "";
-  }
-  /**
-   * True iff the terminal has nothing in scrollback and no
-   * active input. Used by tests and the bootstrap's first-
-   * paint gate.
-   */
-  isEmpty() {
-    return this.lines.length === 0 && this.inputBuffer.length === 0;
-  }
-  pushLine(line) {
-    this.lines.push(line);
-    while (this.lines.length > this.maxLines) {
-      this.lines.shift();
-    }
-  }
-  isPrintable(ch) {
-    const code = ch.charCodeAt(0);
-    return code >= 32 && code !== 127;
-  }
-};
-var DEFAULT_PALETTE = {
-  bg: "#0a0e14",
-  fg: "#e6e6e6",
-  prompt: "#7cb7ff",
-  dim: "#808591"
-};
-function paintTerminal(ctx, canvasWidth, canvasHeight, terminal, options) {
-  const { palette, fontSizePx, dpr, title } = options;
-  const px = fontSizePx * dpr;
-  const lineHeight = Math.floor(px * 1.4);
-  const padX = Math.floor(32 * dpr);
-  const padY = Math.floor(32 * dpr);
-  const monoFont = `${px}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
-  ctx.fillStyle = palette.bg;
-  ctx.fillRect(0, 0, canvasWidth, canvasHeight);
-  ctx.font = `bold ${Math.floor(px * 1.15)}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
-  ctx.fillStyle = palette.prompt;
-  ctx.textBaseline = "top";
-  ctx.fillText(title, padX, padY);
-  ctx.font = `${Math.floor(px * 0.8)}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
-  ctx.fillStyle = palette.dim;
-  ctx.fillText(
-    "type a command and press Enter. 'help' for a list.",
-    padX,
-    padY + Math.floor(px * 1.4)
-  );
-  ctx.font = monoFont;
-  let y = padY + Math.floor(px * 3.2);
-  const { lines, inputBuffer } = terminal.snapshot();
-  for (const line of lines) {
-    if (y + lineHeight > canvasHeight - padY) {
-      break;
-    }
-    ctx.fillStyle = line.kind === "input" ? palette.prompt : palette.fg;
-    ctx.fillText(line.text, padX, y);
-    y += lineHeight;
-  }
-  if (y + lineHeight <= canvasHeight - padY) {
-    ctx.fillStyle = palette.prompt;
-    ctx.fillText(`> ${inputBuffer}`, padX, y);
-    const promptWidth = ctx.measureText(`> ${inputBuffer}`).width;
-    ctx.fillStyle = palette.fg;
-    ctx.fillRect(padX + promptWidth, y, Math.floor(px * 0.6), lineHeight);
-  }
-  ctx.textBaseline = "alphabetic";
-}
-
 // src/bootstrap.ts
 var BOOT_VERSION = "0.1.0-demo";
 function hasSharedArrayBuffer() {
@@ -595,6 +438,7 @@ function main() {
       repaint();
     });
   });
+  let latestFrame = null;
   let terminalStarted = false;
   const startTerminalMode = (session) => {
     if (terminalStarted) {
@@ -606,42 +450,20 @@ function main() {
       repaintInterval = null;
     }
     splashPainted = true;
-    const terminal = new Terminal({
-      maxLines: 64,
-      banner: [
-        "PMos 0.1.0-demo",
-        "kernel worker ready \u2014 type 'help' for commands",
-        ""
-      ]
-    });
-    session.console.onOutput((bytes) => {
-      terminal.appendOutput(bytes);
+    if (latestFrame) {
+      paintBlitToCanvasFullscreen(canvas, latestFrame);
+    }
+    session.fb.onFrame((frame_) => {
+      paintBlitToCanvasFullscreen(canvas, frame_);
     });
     window.addEventListener("keydown", (event) => {
-      if (shouldConsumeKey(event.key)) {
-        event.preventDefault();
+      const bytes = keyToBytes(event.key);
+      if (bytes === null) {
+        return;
       }
-      const committed = terminal.feedKey(event.key);
-      if (committed) {
-        session.console.sendInput(committed);
-      }
+      event.preventDefault();
+      session.console.sendInput(bytes);
     });
-    const paintOnce = () => {
-      paintTerminal(
-        canvas.ctx,
-        canvas.canvas.width,
-        canvas.canvas.height,
-        terminal,
-        {
-          palette: DEFAULT_PALETTE,
-          fontSizePx: 14,
-          dpr: canvas.dpr,
-          title: "PMos kernel worker \u2014 interactive console"
-        }
-      );
-    };
-    paintOnce();
-    setInterval(paintOnce, 100);
   };
   step(7, 2600, () => {
     let session;
@@ -658,6 +480,9 @@ function main() {
       if (event.kind === "panic") {
         showPanic(event.message);
       }
+    });
+    session.fb.onFrame((frame_) => {
+      latestFrame = frame_;
     });
     let splashFlashed = false;
     session.fb.onFrame((frame_) => {
@@ -736,7 +561,19 @@ function createKernelSession() {
     bootConfig: {
       enableConsole: true,
       enableInput: false,
-      enableFramebuffer: true
+      enableFramebuffer: true,
+      // Live-terminal mode: the worker owns scrollback and
+      // input buffer; every keystroke produces a new
+      // framebuffer blit. The terminal banner is seeded on
+      // the worker side so the first visible frame already
+      // carries the "kernel ready" text.
+      liveTerminal: true,
+      terminalBanner: [
+        "PMos 0.1.0-demo",
+        "kernel worker ready",
+        "type 'help' for commands",
+        ""
+      ]
     }
   });
   const fbHost = new FbHost({ worker });
@@ -748,6 +585,21 @@ function createKernelSession() {
     { once: true }
   );
   return { worker, console: consoleHost, fb: fbHost };
+}
+function keyToBytes(key) {
+  if (key === "Enter") {
+    return new Uint8Array([10]);
+  }
+  if (key === "Backspace") {
+    return new Uint8Array([127]);
+  }
+  if (key.length === 1) {
+    const code = key.charCodeAt(0);
+    if (code >= 32 && code !== 127) {
+      return new TextEncoder().encode(key);
+    }
+  }
+  return null;
 }
 function paintBlitToCanvas(c, frame_) {
   const { ctx, canvas, dpr } = c;
@@ -795,6 +647,39 @@ function paintBlitToCanvas(c, frame_) {
   );
   ctx.textAlign = "start";
 }
+function paintBlitToCanvasFullscreen(c, frame_) {
+  const { ctx, canvas } = c;
+  const W = canvas.width;
+  const H = canvas.height;
+  if (frame_.width === 0 || frame_.height === 0) {
+    return;
+  }
+  const tmp = document.createElement("canvas");
+  tmp.width = frame_.width;
+  tmp.height = frame_.height;
+  const tctx = tmp.getContext("2d");
+  if (!tctx) {
+    return;
+  }
+  const imageData = new ImageData(
+    new Uint8ClampedArray(frame_.rgba),
+    frame_.width,
+    frame_.height
+  );
+  tctx.putImageData(imageData, 0, 0);
+  const scale = Math.max(
+    1,
+    Math.floor(Math.min(W / frame_.width, H / frame_.height))
+  );
+  const dw = frame_.width * scale;
+  const dh = frame_.height * scale;
+  const dx = Math.floor((W - dw) / 2);
+  const dy = Math.floor((H - dh) / 2);
+  ctx.fillStyle = PALETTE.bg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tmp, dx, dy, dw, dh);
+}
 function showFallbackMessage(error) {
   document.body.innerHTML = `
     <div style="padding:2rem;font-family:ui-monospace,monospace;color:#e6e6e6;background:#0a0e14;height:100vh">
@@ -822,12 +707,6 @@ function showPanic(message) {
     setTimeout(tick, 1e3);
   };
   tick();
-}
-function shouldConsumeKey(key) {
-  if (key === "Enter" || key === "Backspace") {
-    return true;
-  }
-  return key.length === 1;
 }
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");

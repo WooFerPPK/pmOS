@@ -21,6 +21,22 @@ export interface BootConfig {
   readonly enableInput: boolean;
   /** When true, the framebuffer driver is registered at boot. */
   readonly enableFramebuffer: boolean;
+  /**
+   * When true, the mock kernel runs in live-terminal mode:
+   * it maintains its own scrollback + input buffer,
+   * processes keystrokes one byte at a time, and
+   * rasterizes + blits the full terminal snapshot on every
+   * state change. Defaults to false; mutually exclusive
+   * with the one-shot splash path.
+   */
+  readonly liveTerminal?: boolean;
+  /**
+   * Banner lines to pre-seed the live-terminal scrollback
+   * with. Each string becomes a `banner`-kind line. Only
+   * honoured when [`liveTerminal`] is true. Defaults to an
+   * empty list.
+   */
+  readonly terminalBanner?: readonly string[];
 }
 
 /** Main-thread → kernel-worker. */

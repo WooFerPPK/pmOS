@@ -291,6 +291,335 @@ describe("MockKernel splash emission", () => {
   });
 });
 
+// ---- Live-terminal mode --------------------------------------------
+
+describe("MockKernel live-terminal mode", () => {
+  it("emits SET_MODE and an initial BLIT on bindScaffold when scrollback is pre-seeded", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+      initialScrollback: [
+        { text: "PMos 0.1.0", kind: "banner" },
+        { text: "ready", kind: "banner" },
+      ],
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+
+    const fbCalls = scaffold.calls.filter((c) => c.driverId === FB_DRIVER_ID);
+    // SET_MODE + initial BLIT for the pre-seeded banner.
+    expect(fbCalls).toHaveLength(2);
+    expect(fbCalls[0]?.op).toBe(FB_OP_SET_MODE);
+    expect(fbCalls[1]?.op).toBe(FB_OP_BLIT);
+
+    // The BLIT carries width*height*4 bytes of pixels.
+    const blitPayload = fbCalls[1]?.payload;
+    if (blitPayload) {
+      expect(blitPayload.byteLength).toBe(
+        8 + SPLASH_WIDTH * SPLASH_HEIGHT * 4,
+      );
+    }
+  });
+
+  it("blits once per injectInput call that changes state", () => {
+    // Each `injectInput` call is one batch — the mock
+    // rasterizes + blits exactly once at the end of the
+    // batch if anything changed, not per byte. Real
+    // keyboard typing goes one key per injectInput, so
+    // the user sees a fresh frame after each keystroke;
+    // a pasted multi-char batch becomes a single frame.
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    // Baseline: SET_MODE + initial blit from bindScaffold.
+    const baseline = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID,
+    ).length;
+
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("h"));
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("i"));
+
+    const fbCalls = scaffold.calls.filter((c) => c.driverId === FB_DRIVER_ID);
+    // Two more BLITs on top of the baseline, one per call.
+    expect(fbCalls.length - baseline).toBe(2);
+    expect(fbCalls[fbCalls.length - 2]?.op).toBe(FB_OP_BLIT);
+    expect(fbCalls[fbCalls.length - 1]?.op).toBe(FB_OP_BLIT);
+  });
+
+  it("a single multi-byte injectInput batch produces exactly one blit", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    const baseline = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    ).length;
+
+    // Paste-style batch — 5 chars in a single call.
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("hello"));
+    const blits = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    ).length;
+    expect(blits - baseline).toBe(1);
+    expect(mock.liveInput).toBe("hello");
+  });
+
+  it("accumulates printable characters in the input buffer", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("echo hi"));
+    expect(mock.liveInput).toBe("echo hi");
+    expect(mock.liveScrollback).toHaveLength(0);
+  });
+
+  it("commits the input line to scrollback on newline and clears the input buffer", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(
+      DEV_CONSOLE_NODE,
+      new TextEncoder().encode("echo hi\n"),
+    );
+
+    expect(mock.liveInput).toBe("");
+    const scrollback = mock.liveScrollback;
+    // "> echo hi" as input, then "hi" as output.
+    expect(scrollback).toHaveLength(2);
+    expect(scrollback[0]?.text).toBe("> echo hi");
+    expect(scrollback[0]?.kind).toBe("input");
+    expect(scrollback[1]?.text).toBe("hi");
+    expect(scrollback[1]?.kind).toBe("output");
+
+    // And the console driver still got the output bytes
+    // so the echo round-trip test keeps working.
+    const consoleCalls = scaffold.calls.filter(
+      (c) => c.driverId === CONSOLE_DRIVER_ID,
+    );
+    expect(consoleCalls).toHaveLength(1);
+    expect(new TextDecoder().decode(consoleCalls[0]?.payload)).toBe("hi\n");
+  });
+
+  it("backspace (0x7f) pops the last character from the input buffer", () => {
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("abc"));
+    expect(mock.liveInput).toBe("abc");
+    mock.injectInput(DEV_CONSOLE_NODE, new Uint8Array([0x7f]));
+    expect(mock.liveInput).toBe("ab");
+    mock.injectInput(DEV_CONSOLE_NODE, new Uint8Array([0x7f, 0x7f]));
+    expect(mock.liveInput).toBe("");
+    // Backspacing an empty buffer is a no-op (doesn't
+    // change state, so no new blit either).
+    const blitsBefore = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    ).length;
+    mock.injectInput(DEV_CONSOLE_NODE, new Uint8Array([0x7f]));
+    const blitsAfter = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    ).length;
+    expect(blitsAfter).toBe(blitsBefore);
+  });
+
+  it("backspace 0x08 pops like 0x7f", () => {
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("ab"));
+    mock.injectInput(DEV_CONSOLE_NODE, new Uint8Array([0x08]));
+    expect(mock.liveInput).toBe("a");
+  });
+
+  it("drops non-printable bytes outside 0x20..0x7e", () => {
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    // 0x00 NUL, 0x07 BEL, 0x1b ESC — all ignored.
+    mock.injectInput(
+      DEV_CONSOLE_NODE,
+      new Uint8Array([0x00, 0x07, 0x1b, 0x61 /* 'a' */]),
+    );
+    expect(mock.liveInput).toBe("a");
+  });
+
+  it("help command spans multiple scrollback output lines", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("help\n"));
+
+    const scrollback = mock.liveScrollback;
+    // "> help" input + 7 help lines from FAUX_SHELL_HELP.
+    expect(scrollback[0]?.text).toBe("> help");
+    expect(scrollback[0]?.kind).toBe("input");
+    // The first output line is "commands:".
+    expect(scrollback[1]?.text).toBe("commands:");
+    expect(scrollback[1]?.kind).toBe("output");
+    // Full length is 1 input + 7 help lines.
+    expect(scrollback).toHaveLength(1 + 7);
+  });
+
+  it("panic command short-circuits scrollback and forwards to panicEmit", () => {
+    const panicMessages: string[] = [];
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+      panicEmit: (m) => panicMessages.push(m),
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(
+      DEV_CONSOLE_NODE,
+      new TextEncoder().encode("panic boom\n"),
+    );
+
+    expect(panicMessages).toEqual(["kernel: boom"]);
+    // Input was still added to scrollback (the user typed
+    // it) but no output was evaluated — "> panic boom" is
+    // the only scrollback entry produced by the commit.
+    const scrollback = mock.liveScrollback;
+    expect(scrollback[scrollback.length - 1]?.text).toBe("> panic boom");
+  });
+
+  it("multiple commands accumulate scrollback in order", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(
+      DEV_CONSOLE_NODE,
+      new TextEncoder().encode("echo one\necho two\n"),
+    );
+    const scrollback = mock.liveScrollback;
+    expect(scrollback.map((l) => l.text)).toEqual([
+      "> echo one",
+      "one",
+      "> echo two",
+      "two",
+    ]);
+  });
+
+  it("unknown command lands on the scrollback as the policy '?' response", () => {
+    const mock = new MockKernel({
+      policy: { kind: "faux-shell" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("wat\n"));
+    const scrollback = mock.liveScrollback;
+    expect(scrollback).toHaveLength(2);
+    expect(scrollback[0]?.text).toBe("> wat");
+    expect(scrollback[1]?.text).toBe("?");
+  });
+
+  it("bindScaffold without pre-seeded scrollback still emits SET_MODE on first input", () => {
+    // Edge case: constructor takes liveTerminal: true but
+    // no initialScrollback. bindScaffold triggers a
+    // SET_MODE + empty blit; subsequent keystrokes add to
+    // the pixel counter.
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    const setModeCalls = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_SET_MODE,
+    );
+    expect(setModeCalls).toHaveLength(1);
+  });
+
+  it("liveTerminal wins when both splash and live flags are set", () => {
+    // Mutually-exclusive flags: liveTerminal has
+    // precedence. The splash-once path never runs.
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      emitSplashOnFirstInput: true,
+      liveTerminal: true,
+    });
+    const scaffold = makeScaffold();
+    mock.bindScaffold(scaffold);
+    const setModeCount = scaffold.calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_SET_MODE,
+    ).length;
+    // Only ONE SET_MODE (from the live path's bindScaffold
+    // initial render), not two from both paths.
+    expect(setModeCount).toBe(1);
+
+    // Typing still goes through the live-terminal handler.
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("a"));
+    expect(mock.liveInput).toBe("a");
+  });
+
+  it("skips SET_MODE retries when the fb driver reports NotReady on the first attempt", () => {
+    const calls: Array<{ driverId: number; op: number; payload: Uint8Array }> =
+      [];
+    const scaffold: CapturingScaffold = {
+      calls,
+      handleMainMessage(): void {
+        /* unused */
+      },
+      callDriver(driverId: number, op: number, payload: Uint8Array): DriverResult {
+        const copy = new Uint8Array(payload.byteLength);
+        copy.set(payload);
+        calls.push({ driverId, op, payload: copy });
+        if (driverId === FB_DRIVER_ID) {
+          return { ok: false, error: DriverErrorCode.NotReady };
+        }
+        return { ok: true, value: payload.byteLength };
+      },
+      get driverCount(): number {
+        return 2;
+      },
+    };
+    const mock = new MockKernel({
+      policy: { kind: "echo" },
+      liveTerminal: true,
+    });
+    mock.bindScaffold(scaffold);
+    mock.injectInput(DEV_CONSOLE_NODE, new TextEncoder().encode("abc"));
+
+    // One SET_MODE attempt on bindScaffold, no BLIT (driver
+    // returned NotReady), and no further SET_MODE attempts
+    // on subsequent keystrokes.
+    const setModeCount = calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_SET_MODE,
+    ).length;
+    const blitCount = calls.filter(
+      (c) => c.driverId === FB_DRIVER_ID && c.op === FB_OP_BLIT,
+    ).length;
+    expect(setModeCount).toBe(1);
+    expect(blitCount).toBe(0);
+  });
+});
+
 describe("fauxShellTransform", () => {
   it("extracts the echo argument and appends a newline", () => {
     const out = fauxShellTransform(new TextEncoder().encode("echo hi\n"));

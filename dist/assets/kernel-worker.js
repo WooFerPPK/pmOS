@@ -540,14 +540,38 @@ var MockKernel = class {
   scaffold;
   policy;
   emitSplashOnFirstInput;
+  liveTerminal;
   panicEmit;
   splashEmitted = false;
-  /** Per-devnum line buffers. Flushed on newline. */
+  /** Per-devnum line buffers — default + splash modes only. */
   lineBuffers = /* @__PURE__ */ new Map();
+  /** Live-terminal state. */
+  scrollback = [];
+  liveInputBuffer = "";
+  prompt;
+  fbWidth;
+  fbHeight;
+  fbModeEmitted = false;
+  /**
+   * Sticky "we tried to start the fb driver and it rejected
+   * us" flag. Set to true after the first `SET_MODE` attempt
+   * that returns `NotReady` so subsequent keystrokes don't
+   * retry or attempt to blit.
+   */
+  fbDisabled = false;
   constructor(options) {
     this.policy = options.policy;
     this.emitSplashOnFirstInput = options.emitSplashOnFirstInput ?? false;
+    this.liveTerminal = options.liveTerminal ?? false;
     this.panicEmit = options.panicEmit;
+    this.prompt = options.prompt ?? "> ";
+    this.fbWidth = options.fbWidth ?? SPLASH_WIDTH;
+    this.fbHeight = options.fbHeight ?? SPLASH_HEIGHT;
+    if (options.initialScrollback) {
+      for (const line of options.initialScrollback) {
+        this.scrollback.push({ text: line.text, kind: line.kind });
+      }
+    }
   }
   /**
    * Bind the scaffold after boot. Called by
@@ -556,9 +580,16 @@ var MockKernel = class {
    */
   bindScaffold(scaffold) {
     this.scaffold = scaffold;
+    if (this.liveTerminal) {
+      this.renderAndBlit();
+    }
   }
   injectInput(devnum, bytes) {
     if (devnum !== DEV_CONSOLE_NODE) {
+      return;
+    }
+    if (this.liveTerminal) {
+      this.injectLiveInput(bytes);
       return;
     }
     if (this.emitSplashOnFirstInput) {
@@ -577,6 +608,101 @@ var MockKernel = class {
         this.lineBuffers.set(devnum, buf);
       }
     }
+  }
+  /**
+   * Live-terminal per-byte keystroke processor. See
+   * [`MockKernelOptions.liveTerminal`] for the wire protocol.
+   */
+  injectLiveInput(bytes) {
+    let changed = false;
+    for (const b of bytes) {
+      if (b === 10) {
+        this.commitLiveInputLine();
+        changed = true;
+      } else if (b === 127 || b === 8) {
+        if (this.liveInputBuffer.length > 0) {
+          this.liveInputBuffer = this.liveInputBuffer.slice(0, -1);
+          changed = true;
+        }
+      } else if (b >= 32 && b <= 126) {
+        this.liveInputBuffer += String.fromCharCode(b);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.renderAndBlit();
+    }
+  }
+  /**
+   * Commit the current live input line: append it to
+   * scrollback as an `input` line, run it through the
+   * policy, append the output as `output` / `error` lines,
+   * and reset the input buffer.
+   */
+  commitLiveInputLine() {
+    const input = this.liveInputBuffer;
+    this.liveInputBuffer = "";
+    this.scrollback.push({
+      text: `${this.prompt}${input}`,
+      kind: "input"
+    });
+    const inputBytesWithNewline = new TextEncoder().encode(`${input}
+`);
+    if (this.tryHandlePanicCommand(inputBytesWithNewline)) {
+      return;
+    }
+    const output = this.applyPolicy(inputBytesWithNewline);
+    if (output.byteLength > 0) {
+      this.scaffold?.callDriver(CONSOLE_DRIVER_ID, OP_WRITE_LINE, output);
+      const outputText = new TextDecoder().decode(output);
+      const trimmed = outputText.endsWith("\n") ? outputText.slice(0, -1) : outputText;
+      for (const outLine of trimmed.split("\n")) {
+        this.scrollback.push({ text: outLine, kind: "output" });
+      }
+    }
+    while (this.scrollback.length > 256) {
+      this.scrollback.shift();
+    }
+  }
+  /**
+   * Rasterize the current live-terminal snapshot and blit
+   * it through the framebuffer driver. On the first call
+   * also emits `OP_SET_MODE`. No-op if the scaffold isn't
+   * bound, the fb driver has been marked disabled after a
+   * prior `NotReady`, or the current SET_MODE attempt
+   * fails.
+   */
+  renderAndBlit() {
+    const scaffold = this.scaffold;
+    if (!scaffold) {
+      return;
+    }
+    if (this.fbDisabled) {
+      return;
+    }
+    if (!this.fbModeEmitted) {
+      const setModeResult = scaffold.callDriver(
+        FB_DRIVER_ID,
+        OP_SET_MODE,
+        packFbSetMode(this.fbWidth, this.fbHeight)
+      );
+      this.fbModeEmitted = true;
+      if (!setModeResult.ok) {
+        this.fbDisabled = true;
+        return;
+      }
+    }
+    const snapshot = {
+      lines: this.scrollback,
+      inputBuffer: this.liveInputBuffer,
+      prompt: this.prompt
+    };
+    const pixels = rasterizeSnapshot(snapshot, this.fbWidth, this.fbHeight);
+    scaffold.callDriver(
+      FB_DRIVER_ID,
+      OP_BLIT,
+      packFbBlit(this.fbWidth, this.fbHeight, pixels)
+    );
   }
   maybeEmitSplash() {
     if (this.splashEmitted) {
@@ -659,6 +785,20 @@ var MockKernel = class {
         return fauxShellTransform(line);
     }
   }
+  // ---- Test helpers -------------------------------------
+  /**
+   * Read-only view of the live-terminal scrollback. Returns
+   * an empty array when `liveTerminal` is false. Exposed so
+   * tests can assert on internal state without touching
+   * private fields.
+   */
+  get liveScrollback() {
+    return this.scrollback;
+  }
+  /** Read-only view of the live-terminal input buffer. */
+  get liveInput() {
+    return this.liveInputBuffer;
+  }
 };
 var FAUX_SHELL_HELP = [
   "commands:",
@@ -730,13 +870,19 @@ function installWorkerEntry(messaging) {
         });
         return;
       }
+      const liveTerminal = msg.config.liveTerminal === true && msg.config.enableFramebuffer;
+      const initialScrollback = liveTerminal ? (msg.config.terminalBanner ?? []).map(
+        (text) => ({ text, kind: "banner" })
+      ) : void 0;
       const mock = new MockKernel({
         policy: { kind: "faux-shell" },
-        // When the main thread asked for a framebuffer, have
-        // the mock emit a splash the first time it sees any
-        // console input. The scaffold's fb driver routes it
-        // to the main-thread FbHost.
-        emitSplashOnFirstInput: msg.config.enableFramebuffer,
+        // When the main thread asked for a framebuffer AND
+        // didn't pick live-terminal mode, fall back to the
+        // one-shot splash. The scaffold's fb driver routes
+        // the blit to the main-thread FbHost.
+        emitSplashOnFirstInput: msg.config.enableFramebuffer && !liveTerminal,
+        liveTerminal,
+        ...initialScrollback ? { initialScrollback } : {},
         // Wire the kernel panic sink to a postMessage on
         // the main-thread channel. This is what
         // bootstrap.ts's panic overlay listens on.

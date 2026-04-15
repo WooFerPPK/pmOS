@@ -79,13 +79,37 @@ export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
         });
         return;
       }
+      // Decide which framebuffer mode the mock kernel runs:
+      //
+      //   * `liveTerminal` takes precedence when enabled:
+      //     the mock owns scrollback + input buffer state
+      //     and re-rasterizes on every keystroke.
+      //   * `enableFramebuffer` without `liveTerminal` gives
+      //     the one-shot splash path (useful for the boot
+      //     screen's proof-of-fb flash).
+      //   * Neither → no framebuffer traffic at all.
+      //
+      // Banner lines arrive as plain strings on the boot
+      // config; we map them 1:1 to `banner`-kind scrollback
+      // entries so the first rendered frame already has
+      // text.
+      const liveTerminal =
+        msg.config.liveTerminal === true && msg.config.enableFramebuffer;
+      const initialScrollback = liveTerminal
+        ? (msg.config.terminalBanner ?? []).map(
+            (text) => ({ text, kind: "banner" as const }),
+          )
+        : undefined;
       const mock = new MockKernel({
         policy: { kind: "faux-shell" },
-        // When the main thread asked for a framebuffer, have
-        // the mock emit a splash the first time it sees any
-        // console input. The scaffold's fb driver routes it
-        // to the main-thread FbHost.
-        emitSplashOnFirstInput: msg.config.enableFramebuffer,
+        // When the main thread asked for a framebuffer AND
+        // didn't pick live-terminal mode, fall back to the
+        // one-shot splash. The scaffold's fb driver routes
+        // the blit to the main-thread FbHost.
+        emitSplashOnFirstInput:
+          msg.config.enableFramebuffer && !liveTerminal,
+        liveTerminal,
+        ...(initialScrollback ? { initialScrollback } : {}),
         // Wire the kernel panic sink to a postMessage on
         // the main-thread channel. This is what
         // bootstrap.ts's panic overlay listens on.

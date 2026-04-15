@@ -21,7 +21,6 @@ import { ConsoleHost } from "./console-host";
 import { runEchoCheck } from "./console-check";
 import { FbHost } from "./fb-host";
 import type { FbFrame } from "./fb-host";
-import { DEFAULT_PALETTE, Terminal, paintTerminal } from "./terminal";
 
 const BOOT_VERSION = "0.1.0-demo";
 
@@ -372,6 +371,13 @@ function main(): void {
   // is not built yet — e.g. the static site was served
   // without running `npm run build:kernel-worker` first —
   // the row stalls cleanly with the Worker load error.
+  // Every blit the worker emits is stored here so that
+  // `startTerminalMode` can paint the most recent frame
+  // immediately when it installs its fullscreen handler,
+  // regardless of how many frames were consumed by the
+  // splash handler in step 7.
+  let latestFrame: FbFrame | null = null;
+
   let terminalStarted = false;
   const startTerminalMode = (session: KernelSession): void => {
     if (terminalStarted) {
@@ -384,45 +390,42 @@ function main(): void {
     }
     splashPainted = true;
 
-    const terminal = new Terminal({
-      maxLines: 64,
-      banner: [
-        "PMos 0.1.0-demo",
-        "kernel worker ready — type 'help' for commands",
-        "",
-      ],
-    });
+    // In live-terminal mode, the worker-side mock kernel
+    // owns the terminal state (scrollback + input buffer)
+    // and re-rasterizes + blits the snapshot on every
+    // keystroke. The main thread's job is just to:
+    //
+    //   1. Send raw keystroke bytes back to the kernel via
+    //      the console driver's input channel.
+    //   2. Receive fb blits from the FbHost and paint them
+    //      onto the full-screen canvas.
+    //
+    // No main-thread Terminal, no paintTerminal loop — the
+    // Fb driver is the only path from kernel to pixels.
+    // Console output events still arrive (the mock kernel
+    // calls the console driver for backwards compat with
+    // the echo round-trip check) but we ignore them here.
 
-    session.console.onOutput((bytes: Uint8Array) => {
-      terminal.appendOutput(bytes);
+    // Paint the most recent frame immediately so the user
+    // sees the current terminal state (including any
+    // output from the echo check) instead of the stale
+    // splash captioned by step 7.
+    if (latestFrame) {
+      paintBlitToCanvasFullscreen(canvas, latestFrame);
+    }
+
+    session.fb.onFrame((frame_: FbFrame) => {
+      paintBlitToCanvasFullscreen(canvas, frame_);
     });
 
     window.addEventListener("keydown", (event: KeyboardEvent) => {
-      if (shouldConsumeKey(event.key)) {
-        event.preventDefault();
+      const bytes = keyToBytes(event.key);
+      if (bytes === null) {
+        return;
       }
-      const committed = terminal.feedKey(event.key);
-      if (committed) {
-        session.console.sendInput(committed);
-      }
+      event.preventDefault();
+      session.console.sendInput(bytes);
     });
-
-    const paintOnce = () => {
-      paintTerminal(
-        canvas.ctx,
-        canvas.canvas.width,
-        canvas.canvas.height,
-        terminal,
-        {
-          palette: DEFAULT_PALETTE,
-          fontSizePx: 14,
-          dpr: canvas.dpr,
-          title: "PMos kernel worker — interactive console",
-        },
-      );
-    };
-    paintOnce();
-    setInterval(paintOnce, 100);
   };
 
   step(7, 2600, () => {
@@ -451,6 +454,11 @@ function main(): void {
       if (event.kind === "panic") {
         showPanic(event.message);
       }
+    });
+    // Track the most recent blit so `startTerminalMode`
+    // can paint it immediately when its handler installs.
+    session.fb.onFrame((frame_: FbFrame) => {
+      latestFrame = frame_;
     });
 
     // First blit briefly paints the splash, then hands the
@@ -568,6 +576,18 @@ function createKernelSession(): KernelSession {
       enableConsole: true,
       enableInput: false,
       enableFramebuffer: true,
+      // Live-terminal mode: the worker owns scrollback and
+      // input buffer; every keystroke produces a new
+      // framebuffer blit. The terminal banner is seeded on
+      // the worker side so the first visible frame already
+      // carries the "kernel ready" text.
+      liveTerminal: true,
+      terminalBanner: [
+        "PMos 0.1.0-demo",
+        "kernel worker ready",
+        "type 'help' for commands",
+        "",
+      ],
     },
   });
   const fbHost = new FbHost({ worker });
@@ -584,6 +604,32 @@ function createKernelSession(): KernelSession {
     { once: true },
   );
   return { worker, console: consoleHost, fb: fbHost };
+}
+
+/**
+ * Translate a DOM `KeyboardEvent.key` into the raw bytes
+ * the kernel's live-terminal mode expects. Returns null if
+ * the key isn't one the terminal recognises so the caller
+ * can let the browser handle it (ctrl+R, F12, etc.).
+ *
+ *   * Printable single char → UTF-8 bytes (TextEncoder).
+ *   * `Enter` → `\n`
+ *   * `Backspace` → `\x7f` (DEL)
+ */
+function keyToBytes(key: string): Uint8Array | null {
+  if (key === "Enter") {
+    return new Uint8Array([0x0a]);
+  }
+  if (key === "Backspace") {
+    return new Uint8Array([0x7f]);
+  }
+  if (key.length === 1) {
+    const code = key.charCodeAt(0);
+    if (code >= 0x20 && code !== 0x7f) {
+      return new TextEncoder().encode(key);
+    }
+  }
+  return null;
 }
 
 /**
@@ -650,6 +696,52 @@ function paintBlitToCanvas(c: Canvas2D, frame_: FbFrame): void {
   ctx.textAlign = "start";
 }
 
+/**
+ * Paint a single fb blit full-screen onto the boot canvas,
+ * letter-boxed with the boot-screen background. Unlike
+ * [`paintBlitToCanvas`], this variant is for the live
+ * terminal — it fills as much of the canvas as possible,
+ * preserves nearest-neighbour scaling so the bitmap font
+ * stays crisp, and draws no caption.
+ */
+function paintBlitToCanvasFullscreen(c: Canvas2D, frame_: FbFrame): void {
+  const { ctx, canvas } = c;
+  const W = canvas.width;
+  const H = canvas.height;
+  if (frame_.width === 0 || frame_.height === 0) {
+    return;
+  }
+
+  const tmp = document.createElement("canvas");
+  tmp.width = frame_.width;
+  tmp.height = frame_.height;
+  const tctx = tmp.getContext("2d");
+  if (!tctx) {
+    return;
+  }
+  const imageData = new ImageData(
+    new Uint8ClampedArray(frame_.rgba),
+    frame_.width,
+    frame_.height,
+  );
+  tctx.putImageData(imageData, 0, 0);
+
+  // Fit-to-window while preserving aspect ratio.
+  // Integer-snapped so pixels don't shimmer.
+  const scale = Math.max(
+    1,
+    Math.floor(Math.min(W / frame_.width, H / frame_.height)),
+  );
+  const dw = frame_.width * scale;
+  const dh = frame_.height * scale;
+  const dx = Math.floor((W - dw) / 2);
+  const dy = Math.floor((H - dh) / 2);
+
+  ctx.fillStyle = PALETTE.bg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tmp, dx, dy, dw, dh);
+}
 
 function showFallbackMessage(error: string): void {
   document.body.innerHTML = `
@@ -679,19 +771,6 @@ function showPanic(message: string): void {
     setTimeout(tick, 1000);
   };
   tick();
-}
-
-/**
- * Should a `keydown` event be preventDefault()'d by the
- * terminal? Consume printable characters, Enter, and
- * Backspace; let browser shortcuts (ctrl+R, cmd+L, F12)
- * pass through.
- */
-function shouldConsumeKey(key: string): boolean {
-  if (key === "Enter" || key === "Backspace") {
-    return true;
-  }
-  return key.length === 1;
 }
 
 function escapeHtml(s: string): string {
