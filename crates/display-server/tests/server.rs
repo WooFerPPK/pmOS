@@ -185,6 +185,308 @@ fn pending_events_are_per_client_not_shared_across_the_server() {
     assert!(s.drain_client_events(b).unwrap().is_empty());
 }
 
+// ---- xdg-shell → framebuffer integration ------------------------
+
+/// Build a `shm.create_pool(new_id, size)` payload.
+fn shm_create_pool_payload(new_id: ObjectId, size: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&new_id.raw().to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out
+}
+
+/// Build a `shm_pool.create_buffer(...)` payload.
+fn shm_pool_create_buffer_payload(
+    new_id: ObjectId,
+    offset: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(&new_id.raw().to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&stride.to_le_bytes());
+    out.extend_from_slice(&format.to_le_bytes());
+    out
+}
+
+/// Build an `xdg_shell.get_toplevel(new_id, surface_id)` payload.
+fn xdg_get_toplevel_payload(new_id: ObjectId, surface_id: ObjectId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&new_id.raw().to_le_bytes());
+    out.extend_from_slice(&surface_id.raw().to_le_bytes());
+    out
+}
+
+/// Build a `surface.attach(buffer_id, x, y)` payload.
+fn surface_attach_payload(buffer_id: ObjectId, x: i32, y: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&buffer_id.raw().to_le_bytes());
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out
+}
+
+#[test]
+fn toplevel_blit_lands_at_server_assigned_origin_not_surface_origin() {
+    // End-to-end: a client binds every interesting global,
+    // creates a surface, wraps it in an xdg_toplevel, and
+    // commits a 2x2 red buffer. The committed pixels must
+    // appear in the framebuffer at the toplevel's
+    // auto-layout origin — which for the first toplevel is
+    // (0, 0), same as the surface-origin path — so this
+    // test mainly proves the plumbing doesn't break for a
+    // single window. The following test shows two
+    // toplevels land at DIFFERENT origins.
+    let mut s = Server::with_framebuffer_size(16, 16);
+    let c = s.accept();
+
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let xdg_shell_id = ObjectId::new(9);
+    let surface_id = ObjectId::new(11);
+    let pool_id = ObjectId::new(13);
+    let buffer_id = ObjectId::new(15);
+    let toplevel_id = ObjectId::new(17);
+
+    // get_registry + binds.
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            ObjectId::DISPLAY,
+            2,
+            &registry_id.raw().to_le_bytes(),
+        ),
+    )
+    .unwrap();
+    for (name, iface, bound) in [
+        (1u32, "pmd_compositor", compositor_id),
+        (2, "pmd_shm", shm_id),
+        (3, "pmd_xdg_shell", xdg_shell_id),
+    ] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload))
+            .unwrap();
+    }
+
+    // create_surface + pool + buffer + xdg_get_toplevel.
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes()),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(shm_id, 1, &shm_create_pool_payload(pool_id, 16)),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            pool_id,
+            1,
+            &shm_pool_create_buffer_payload(buffer_id, 0, 2, 2, 8, 0),
+        ),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            xdg_shell_id,
+            1,
+            &xdg_get_toplevel_payload(toplevel_id, surface_id),
+        ),
+    )
+    .unwrap();
+
+    // Paint the pool bright red.
+    let bytes = s.client_mut(c).unwrap().pool_bytes_mut(pool_id).unwrap();
+    for px in bytes.chunks_exact_mut(4) {
+        px[0] = 0x00; // B
+        px[1] = 0x00; // G
+        px[2] = 0xff; // R
+        px[3] = 0xff; // A
+    }
+
+    // attach + damage + commit.
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface_id, 2, &surface_attach_payload(buffer_id, 0, 0)),
+    )
+    .unwrap();
+    // damage is all zeros → full frame.
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 3, &[0u8; 16]))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 7, &[]))
+        .unwrap();
+
+    // Framebuffer now has a red 2x2 at (0, 0).
+    let fb = s.framebuffer();
+    assert_eq!(fb.pixel(0, 0).unwrap(), &[0x00, 0x00, 0xff, 0xff]);
+    assert_eq!(fb.pixel(1, 1).unwrap(), &[0x00, 0x00, 0xff, 0xff]);
+    assert_eq!(fb.pixel(2, 2).unwrap(), &[0, 0, 0, 0]); // bg
+}
+
+#[test]
+fn two_toplevels_blit_at_distinct_auto_layout_origins() {
+    // A client creates two surfaces, wraps each in an
+    // xdg_toplevel, and commits a distinct colour for
+    // each. The framebuffer should carry both windows at
+    // DIFFERENT origins — (0, 0) and (STEP, STEP).
+    let mut s = Server::with_framebuffer_size(64, 64);
+    let c = s.accept();
+
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let xdg_shell_id = ObjectId::new(9);
+
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            ObjectId::DISPLAY,
+            2,
+            &registry_id.raw().to_le_bytes(),
+        ),
+    )
+    .unwrap();
+    for (name, iface, bound) in [
+        (1u32, "pmd_compositor", compositor_id),
+        (2, "pmd_shm", shm_id),
+        (3, "pmd_xdg_shell", xdg_shell_id),
+    ] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload))
+            .unwrap();
+    }
+
+    // First window: 2x2 red at (0, 0).
+    let surface_a = ObjectId::new(11);
+    let pool_a = ObjectId::new(13);
+    let buf_a = ObjectId::new(15);
+    let top_a = ObjectId::new(17);
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(compositor_id, 1, &surface_a.raw().to_le_bytes()),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(shm_id, 1, &shm_create_pool_payload(pool_a, 16)),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            pool_a,
+            1,
+            &shm_pool_create_buffer_payload(buf_a, 0, 2, 2, 8, 0),
+        ),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            xdg_shell_id,
+            1,
+            &xdg_get_toplevel_payload(top_a, surface_a),
+        ),
+    )
+    .unwrap();
+    for px in s
+        .client_mut(c)
+        .unwrap()
+        .pool_bytes_mut(pool_a)
+        .unwrap()
+        .chunks_exact_mut(4)
+    {
+        px.copy_from_slice(&[0x00, 0x00, 0xff, 0xff]); // red
+    }
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface_a, 2, &surface_attach_payload(buf_a, 0, 0)),
+    )
+    .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_a, 3, &[0u8; 16]))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_a, 7, &[]))
+        .unwrap();
+
+    // Second window: 2x2 green at the auto-layout step.
+    let surface_b = ObjectId::new(19);
+    let pool_b = ObjectId::new(21);
+    let buf_b = ObjectId::new(23);
+    let top_b = ObjectId::new(25);
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(compositor_id, 1, &surface_b.raw().to_le_bytes()),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(shm_id, 1, &shm_create_pool_payload(pool_b, 16)),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            pool_b,
+            1,
+            &shm_pool_create_buffer_payload(buf_b, 0, 2, 2, 8, 0),
+        ),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            xdg_shell_id,
+            1,
+            &xdg_get_toplevel_payload(top_b, surface_b),
+        ),
+    )
+    .unwrap();
+    for px in s
+        .client_mut(c)
+        .unwrap()
+        .pool_bytes_mut(pool_b)
+        .unwrap()
+        .chunks_exact_mut(4)
+    {
+        px.copy_from_slice(&[0x00, 0xff, 0x00, 0xff]); // green
+    }
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface_b, 2, &surface_attach_payload(buf_b, 0, 0)),
+    )
+    .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_b, 3, &[0u8; 16]))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_b, 7, &[]))
+        .unwrap();
+
+    let fb = s.framebuffer();
+    // Window A: red at (0, 0).
+    assert_eq!(fb.pixel(0, 0).unwrap(), &[0x00, 0x00, 0xff, 0xff]);
+    assert_eq!(fb.pixel(1, 1).unwrap(), &[0x00, 0x00, 0xff, 0xff]);
+    // Window B: green at (STEP, STEP) — 32, 32 for v1.
+    let step = display_server::AUTO_LAYOUT_STEP as u32;
+    assert_eq!(
+        fb.pixel(step, step).unwrap(),
+        &[0x00, 0xff, 0x00, 0xff]
+    );
+    assert_eq!(
+        fb.pixel(step + 1, step + 1).unwrap(),
+        &[0x00, 0xff, 0x00, 0xff]
+    );
+    // Between the two windows — still background (zero).
+    assert_eq!(fb.pixel(10, 10).unwrap(), &[0, 0, 0, 0]);
+}
+
 #[test]
 fn multiple_clients_have_independent_object_tables() {
     let mut s = Server::new();

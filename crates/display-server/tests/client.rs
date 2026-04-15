@@ -2,7 +2,7 @@
 
 use display_server::client::{
     BufferAttachment, BufferInfo, Client, ClientError, ClientId, DamageRect, HandledRequest,
-    Pool, Surface, MAX_POOL_SIZE,
+    Pool, Surface, Toplevel, AUTO_LAYOUT_STEP, MAX_POOL_SIZE,
 };
 use display_server::ids::{IdKind, ObjectId};
 use display_server::objects::Interface;
@@ -1327,4 +1327,222 @@ fn two_attaches_before_a_commit_keep_only_the_last_pending() {
 fn surface_none_for_unknown_object_id() {
     let c = Client::new(ClientId(1));
     assert!(c.surface(ObjectId::new(999)).is_none());
+}
+
+// ---- pmd_xdg_shell + pmd_xdg_toplevel --------------------------
+
+/// Build an `xdg_shell.get_toplevel(new_id, surface_id)`
+/// payload: two little-endian u32 object ids back-to-back.
+fn xdg_get_toplevel_payload(new_id: ObjectId, surface_id: ObjectId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&new_id.raw().to_le_bytes());
+    out.extend_from_slice(&surface_id.raw().to_le_bytes());
+    out
+}
+
+/// Build an `xdg_toplevel.set_title(string)` payload:
+/// u32 length + bytes + NUL padding to 4-byte boundary.
+fn xdg_set_string_payload(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let pad = (4 - (bytes.len() % 4)) % 4;
+    let mut out = Vec::with_capacity(4 + bytes.len() + pad);
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out.extend(core::iter::repeat(0u8).take(pad));
+    out
+}
+
+/// Bring a fresh client to the point where it has a bound
+/// xdg_shell global + one surface, ready to exercise the
+/// toplevel dispatch. Returns the allocated surface + shell
+/// ids.
+fn boot_client_with_xdg_shell() -> (Client, ObjectId, ObjectId) {
+    let mut c = Client::new(ClientId(1));
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let xdg_shell_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+
+    // get_registry.
+    let h = MessageHeader::try_new(ObjectId::DISPLAY, 2, 4, 0).unwrap();
+    c.dispatch_request(h, &new_id_payload(registry_id)).unwrap();
+
+    // bind compositor + xdg_shell.
+    for (name, iface_name, bound) in [
+        (1u32, "pmd_compositor", compositor_id),
+        (2, "pmd_xdg_shell", xdg_shell_id),
+    ] {
+        let payload = registry_bind_payload(name, iface_name, 1, bound);
+        let h = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+        c.dispatch_request(h, &payload).unwrap();
+    }
+
+    // create_surface.
+    let payload = new_id_payload(surface_id);
+    let h = MessageHeader::try_new(compositor_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+    c.drain_journal();
+
+    (c, surface_id, xdg_shell_id)
+}
+
+#[test]
+fn dispatch_xdg_get_toplevel_installs_toplevel_with_auto_layout_origin() {
+    let (mut c, surface_id, xdg_shell_id) = boot_client_with_xdg_shell();
+    let toplevel_id = ObjectId::new(11);
+    let payload = xdg_get_toplevel_payload(toplevel_id, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    assert_eq!(c.get(toplevel_id), Some(Interface::XdgToplevel));
+    let top: &Toplevel = c.toplevel(toplevel_id).expect("toplevel exists");
+    assert_eq!(top.id, toplevel_id);
+    assert_eq!(top.surface_id, surface_id);
+    assert_eq!(top.title, "");
+    assert_eq!(top.app_id, "");
+    // First toplevel lands at (0, 0).
+    assert_eq!(top.x, 0);
+    assert_eq!(top.y, 0);
+}
+
+#[test]
+fn a_second_toplevel_is_placed_at_the_auto_layout_step() {
+    let (mut c, surface_a, xdg_shell_id) = boot_client_with_xdg_shell();
+
+    // Create one more surface so the second toplevel has
+    // something to wrap.
+    let surface_b = ObjectId::new(15);
+    let compositor_id = c
+        .objects
+        .iter()
+        .find_map(|(id, iface)| {
+            if *iface == Interface::Compositor {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let payload = new_id_payload(surface_b);
+    let h = MessageHeader::try_new(compositor_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    let top_a = ObjectId::new(11);
+    let top_b = ObjectId::new(13);
+    let payload = xdg_get_toplevel_payload(top_a, surface_a);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+    let payload = xdg_get_toplevel_payload(top_b, surface_b);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    let a = c.toplevel(top_a).unwrap();
+    let b = c.toplevel(top_b).unwrap();
+    assert_eq!((a.x, a.y), (0, 0));
+    assert_eq!((b.x, b.y), (AUTO_LAYOUT_STEP, AUTO_LAYOUT_STEP));
+}
+
+#[test]
+fn xdg_get_toplevel_rejects_a_non_existent_surface_id() {
+    let (mut c, _surface, xdg_shell_id) = boot_client_with_xdg_shell();
+    let stray = ObjectId::new(9999);
+    let top = ObjectId::new(11);
+    let payload = xdg_get_toplevel_payload(top, stray);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    let err = c.dispatch_request(h, &payload).unwrap_err();
+    match err {
+        ClientError::ToplevelSurfaceNotFound { surface_id } => {
+            assert_eq!(surface_id, stray);
+        }
+        other => panic!("expected ToplevelSurfaceNotFound, got {other:?}"),
+    }
+    // No toplevel installed.
+    assert_eq!(c.get(top), None);
+}
+
+#[test]
+fn xdg_get_toplevel_rejects_a_surface_that_already_has_one() {
+    let (mut c, surface_id, xdg_shell_id) = boot_client_with_xdg_shell();
+    let top_a = ObjectId::new(11);
+    let top_b = ObjectId::new(13);
+    let payload = xdg_get_toplevel_payload(top_a, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    // Second toplevel on the same surface → error.
+    let payload = xdg_get_toplevel_payload(top_b, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    let err = c.dispatch_request(h, &payload).unwrap_err();
+    match err {
+        ClientError::SurfaceAlreadyHasToplevel {
+            surface_id: s,
+            existing_toplevel,
+        } => {
+            assert_eq!(s, surface_id);
+            assert_eq!(existing_toplevel, top_a);
+        }
+        other => panic!("expected SurfaceAlreadyHasToplevel, got {other:?}"),
+    }
+    assert_eq!(c.get(top_b), None);
+}
+
+#[test]
+fn xdg_set_title_updates_toplevel_state() {
+    let (mut c, surface_id, xdg_shell_id) = boot_client_with_xdg_shell();
+    let top = ObjectId::new(11);
+    let payload = xdg_get_toplevel_payload(top, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    let payload = xdg_set_string_payload("term — interactive");
+    let h = MessageHeader::try_new(top, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    assert_eq!(c.toplevel(top).unwrap().title, "term — interactive");
+}
+
+#[test]
+fn xdg_set_app_id_updates_toplevel_state() {
+    let (mut c, surface_id, xdg_shell_id) = boot_client_with_xdg_shell();
+    let top = ObjectId::new(11);
+    let payload = xdg_get_toplevel_payload(top, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    let payload = xdg_set_string_payload("pmos.term");
+    let h = MessageHeader::try_new(top, 2, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    assert_eq!(c.toplevel(top).unwrap().app_id, "pmos.term");
+}
+
+#[test]
+fn toplevel_for_surface_round_trips() {
+    let (mut c, surface_id, xdg_shell_id) = boot_client_with_xdg_shell();
+    let top = ObjectId::new(11);
+    let payload = xdg_get_toplevel_payload(top, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+
+    let looked_up = c.toplevel_for_surface(surface_id).unwrap();
+    assert_eq!(looked_up.id, top);
+}
+
+#[test]
+fn xdg_toplevel_set_title_without_install_returns_unknown_toplevel() {
+    let mut c = Client::new(ClientId(1));
+    // Hand-install an xdg_toplevel object WITHOUT going
+    // through `get_toplevel`, so `toplevels` is empty but
+    // the object table has it. `set_title` should fail.
+    c.install_client_object(ObjectId::new(5), Interface::XdgToplevel)
+        .unwrap();
+    let payload = xdg_set_string_payload("hi");
+    let h = MessageHeader::try_new(ObjectId::new(5), 1, payload.len(), 0).unwrap();
+    let err = c.dispatch_request(h, &payload).unwrap_err();
+    match err {
+        ClientError::UnknownToplevel { toplevel_id } => {
+            assert_eq!(toplevel_id, ObjectId::new(5));
+        }
+        other => panic!("expected UnknownToplevel, got {other:?}"),
+    }
 }

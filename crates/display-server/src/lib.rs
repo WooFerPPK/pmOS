@@ -37,7 +37,7 @@ pub use display_proto::{ids, objects, wire};
 
 pub use client::{
     interface_required_cap, BufferAttachment, BufferInfo, Client, ClientError, ClientId,
-    DamageRect, Pool, Surface, MAX_POOL_SIZE,
+    DamageRect, Pool, Surface, Toplevel, AUTO_LAYOUT_STEP, MAX_POOL_SIZE,
 };
 pub use compositor::{Framebuffer, BYTES_PER_PIXEL, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 pub use display_proto::{

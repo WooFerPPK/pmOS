@@ -241,3 +241,59 @@ impl ShellManagerMinimizeWindow {
         })
     }
 }
+
+// ---- pmd_xdg_shell (narrowed Wayland xdg-shell) ---------------
+
+/// `pmd_xdg_shell.get_toplevel(new_id toplevel, object_id
+/// surface)` — promote an existing `pmd_surface` to a
+/// positioned, titled toplevel window. The server assigns
+/// a screen-space origin to the new toplevel via its
+/// per-client auto-layout policy at dispatch time.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct XdgShellGetToplevel {
+    pub new_id: ObjectId,
+    pub surface_id: ObjectId,
+}
+
+impl XdgShellGetToplevel {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgShellGetToplevel {
+            new_id: read_object_id(payload, 0)?,
+            surface_id: read_object_id(payload, 4)?,
+        })
+    }
+}
+
+/// `pmd_xdg_toplevel.set_title(string title)` — update the
+/// toplevel's human-readable title. The server stores it on
+/// the per-client toplevel record and (when a shell client
+/// is subscribed) emits a `window_title_changed` event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XdgToplevelSetTitle {
+    pub title: alloc::string::String,
+}
+
+impl XdgToplevelSetTitle {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let (title, _consumed) = read_string(payload, 0)?;
+        Ok(XdgToplevelSetTitle {
+            title: title.into(),
+        })
+    }
+}
+
+/// `pmd_xdg_toplevel.set_app_id(string app_id)` — update
+/// the toplevel's app identifier (e.g. `"pmos.term"`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XdgToplevelSetAppId {
+    pub app_id: alloc::string::String,
+}
+
+impl XdgToplevelSetAppId {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let (app_id, _consumed) = read_string(payload, 0)?;
+        Ok(XdgToplevelSetAppId {
+            app_id: app_id.into(),
+        })
+    }
+}

@@ -49,7 +49,8 @@ use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
 use display_proto::requests::{
     CompositorCreateSurface, DisplayGetRegistry, RegistryBind, ShmCreatePool,
-    ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage,
+    ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage, XdgShellGetToplevel,
+    XdgToplevelSetAppId, XdgToplevelSetTitle,
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
@@ -162,6 +163,49 @@ impl Surface {
     }
 }
 
+/// A narrowed-Wayland `pmd_xdg_toplevel`: a positioned,
+/// titled window wrapping a plain [`Surface`].
+///
+/// v1 stores only the fields the compositor and the
+/// shell-manager event path actually read: the backing
+/// surface id, title, app_id, and server-assigned origin.
+/// Size comes from whatever buffer the client attaches to
+/// the surface. A later slice will add a configure
+/// handshake that lets the shell propose geometry back to
+/// the client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Toplevel {
+    pub id: ObjectId,
+    pub surface_id: ObjectId,
+    pub title: String,
+    pub app_id: String,
+    /// Server-assigned screen-space origin. Set at
+    /// `get_toplevel` dispatch time via the per-client
+    /// auto-layout counter.
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Toplevel {
+    pub fn new(id: ObjectId, surface_id: ObjectId, x: i32, y: i32) -> Self {
+        Toplevel {
+            id,
+            surface_id,
+            title: String::new(),
+            app_id: String::new(),
+            x,
+            y,
+        }
+    }
+}
+
+/// Horizontal + vertical step for the per-client staircase
+/// auto-layout used in v1. Each new toplevel lands 32
+/// pixels to the right of and below the previous one.
+/// Simple, deterministic, and enough to prove multi-window
+/// composition works.
+pub const AUTO_LAYOUT_STEP: i32 = 32;
+
 /// Which capability, if any, must a connecting client
 /// hold to bind a given interface via `pmd_registry.bind`?
 /// `None` means "no restriction; any client may bind".
@@ -178,7 +222,9 @@ pub const fn interface_required_cap(interface: Interface) -> Option<Cap> {
         | Interface::Shm
         | Interface::ShmPool
         | Interface::Buffer
-        | Interface::Surface => None,
+        | Interface::Surface
+        | Interface::XdgShell
+        | Interface::XdgToplevel => None,
     }
 }
 
@@ -285,6 +331,22 @@ pub enum ClientError {
     /// corresponding entry in the per-client surfaces
     /// map. Should be unreachable in practice.
     UnknownSurface { surface_id: ObjectId },
+    /// `pmd_xdg_shell.get_toplevel` named a surface id
+    /// that either doesn't exist in the client's table OR
+    /// isn't of type `Surface`.
+    ToplevelSurfaceNotFound { surface_id: ObjectId },
+    /// `pmd_xdg_shell.get_toplevel` was called a second
+    /// time for the same surface. v1 allows at most one
+    /// toplevel per surface (the real xdg-shell rule).
+    SurfaceAlreadyHasToplevel {
+        surface_id: ObjectId,
+        existing_toplevel: ObjectId,
+    },
+    /// A `set_title` / `set_app_id` / `destroy` request
+    /// targetted an `XdgToplevel` object that exists in
+    /// the object table but has no corresponding entry
+    /// in the per-client toplevels map.
+    UnknownToplevel { toplevel_id: ObjectId },
 }
 
 impl From<WireError> for ClientError {
@@ -328,6 +390,18 @@ pub struct Client {
     /// install and torn down when the surface is destroyed
     /// (follow-up slice: `surface.destroy` → `delete_id`).
     pub surfaces: BTreeMap<ObjectId, Surface>,
+    /// Per-toplevel window state, keyed by the toplevel's
+    /// object id. Populated by `pmd_xdg_shell.get_toplevel`
+    /// auto-install and mutated by `set_title` / `set_app_id`.
+    pub toplevels: BTreeMap<ObjectId, Toplevel>,
+    /// Reverse index: surface id → toplevel id. Makes the
+    /// compositor's "does this surface have a window?"
+    /// lookup O(log N) during commit dispatch.
+    pub toplevel_by_surface: BTreeMap<ObjectId, ObjectId>,
+    /// Counter for the per-client staircase auto-layout.
+    /// Advanced by [`AUTO_LAYOUT_STEP`] each time a new
+    /// toplevel is installed.
+    pub next_toplevel_offset: i32,
 }
 
 impl Client {
@@ -355,6 +429,9 @@ impl Client {
             pools: BTreeMap::new(),
             buffers: BTreeMap::new(),
             surfaces: BTreeMap::new(),
+            toplevels: BTreeMap::new(),
+            toplevel_by_surface: BTreeMap::new(),
+            next_toplevel_offset: 0,
         }
     }
 
@@ -507,6 +584,11 @@ impl Client {
         // is already guaranteed by `create_surface`.
         self.apply_surface_state(header.object_id, interface, header.opcode, payload)?;
 
+        // `pmd_xdg_toplevel.set_title` / `set_app_id`
+        // similarly mutate per-toplevel state without
+        // installing new objects.
+        self.apply_toplevel_state(header.object_id, interface, header.opcode, payload)?;
+
         self.journal.push(HandledRequest {
             object_id: header.object_id,
             interface,
@@ -525,6 +607,56 @@ impl Client {
     /// `commit` (7). Returns an error on validation
     /// failures (unknown buffer id, unknown surface); other
     /// opcodes fall through as no-ops.
+    /// Apply a `pmd_xdg_toplevel.*` state transition. Called
+    /// from [`Client::dispatch_request`] for the two opcodes
+    /// that mutate per-toplevel state: `set_title` (1) and
+    /// `set_app_id` (2). Other opcodes fall through as
+    /// no-ops.
+    fn apply_toplevel_state(
+        &mut self,
+        toplevel_id: ObjectId,
+        interface: Interface,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<(), ClientError> {
+        if interface != Interface::XdgToplevel {
+            return Ok(());
+        }
+        match opcode {
+            1 /* set_title */ => {
+                let req = XdgToplevelSetTitle::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                let toplevel = self
+                    .toplevels
+                    .get_mut(&toplevel_id)
+                    .ok_or(ClientError::UnknownToplevel { toplevel_id })?;
+                toplevel.title = req.title;
+                Ok(())
+            }
+            2 /* set_app_id */ => {
+                let req = XdgToplevelSetAppId::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                let toplevel = self
+                    .toplevels
+                    .get_mut(&toplevel_id)
+                    .ok_or(ClientError::UnknownToplevel { toplevel_id })?;
+                toplevel.app_id = req.app_id;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn apply_surface_state(
         &mut self,
         surface_id: ObjectId,
@@ -741,6 +873,43 @@ impl Client {
                 self.buffers.insert(req.new_id, info);
                 Ok(())
             }
+            (Interface::XdgShell, 1 /* get_toplevel */) => {
+                let req = XdgShellGetToplevel::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                // The referenced surface must already
+                // exist and be of type `Surface`.
+                if self.objects.get(&req.surface_id).copied()
+                    != Some(Interface::Surface)
+                {
+                    return Err(ClientError::ToplevelSurfaceNotFound {
+                        surface_id: req.surface_id,
+                    });
+                }
+                if let Some(existing) =
+                    self.toplevel_by_surface.get(&req.surface_id).copied()
+                {
+                    return Err(ClientError::SurfaceAlreadyHasToplevel {
+                        surface_id: req.surface_id,
+                        existing_toplevel: existing,
+                    });
+                }
+                let offset = self.next_toplevel_offset;
+                self.next_toplevel_offset =
+                    self.next_toplevel_offset.saturating_add(AUTO_LAYOUT_STEP);
+                self.install_client_object(req.new_id, Interface::XdgToplevel)?;
+                self.toplevels.insert(
+                    req.new_id,
+                    Toplevel::new(req.new_id, req.surface_id, offset, offset),
+                );
+                self.toplevel_by_surface
+                    .insert(req.surface_id, req.new_id);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -776,6 +945,18 @@ impl Client {
     /// that id.
     pub fn surface(&self, surface_id: ObjectId) -> Option<&Surface> {
         self.surfaces.get(&surface_id)
+    }
+
+    /// Borrow a toplevel by object id.
+    pub fn toplevel(&self, toplevel_id: ObjectId) -> Option<&Toplevel> {
+        self.toplevels.get(&toplevel_id)
+    }
+
+    /// Reverse lookup: given a surface id, return the
+    /// toplevel that wraps it (if any).
+    pub fn toplevel_for_surface(&self, surface_id: ObjectId) -> Option<&Toplevel> {
+        let toplevel_id = self.toplevel_by_surface.get(&surface_id).copied()?;
+        self.toplevels.get(&toplevel_id)
     }
 
     /// Borrow the pool-backing bytes for a buffer —

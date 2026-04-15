@@ -54,6 +54,14 @@ pub enum Interface {
     /// `pmd_shell_manager` — desktop-shell window list /
     /// focus / close API. Spec §15.
     ShellManager,
+    /// `pmd_xdg_shell` — window-shell global. Clients bind
+    /// it to promote a plain [`Interface::Surface`] to a
+    /// positioned, titled toplevel window. Narrowed subset
+    /// of the Wayland xdg-shell protocol.
+    XdgShell,
+    /// `pmd_xdg_toplevel` — one window. Carries title +
+    /// app_id + server-assigned geometry.
+    XdgToplevel,
 }
 
 impl Interface {
@@ -69,6 +77,8 @@ impl Interface {
             Interface::Buffer => "pmd_buffer",
             Interface::Surface => "pmd_surface",
             Interface::ShellManager => "pmd_shell_manager",
+            Interface::XdgShell => "pmd_xdg_shell",
+            Interface::XdgToplevel => "pmd_xdg_toplevel",
         }
     }
 
@@ -90,6 +100,8 @@ impl Interface {
             "pmd_buffer" => Some(Interface::Buffer),
             "pmd_surface" => Some(Interface::Surface),
             "pmd_shell_manager" => Some(Interface::ShellManager),
+            "pmd_xdg_shell" => Some(Interface::XdgShell),
+            "pmd_xdg_toplevel" => Some(Interface::XdgToplevel),
             _ => None,
         }
     }
@@ -176,6 +188,8 @@ impl Interface {
             Interface::Buffer => BUFFER_REQUESTS,
             Interface::Surface => SURFACE_REQUESTS,
             Interface::ShellManager => SHELL_MANAGER_REQUESTS,
+            Interface::XdgShell => XDG_SHELL_REQUESTS,
+            Interface::XdgToplevel => XDG_TOPLEVEL_REQUESTS,
         }
     }
 
@@ -189,6 +203,8 @@ impl Interface {
             Interface::Buffer => BUFFER_EVENTS,
             Interface::Surface => SURFACE_EVENTS,
             Interface::ShellManager => SHELL_MANAGER_EVENTS,
+            Interface::XdgShell => XDG_SHELL_EVENTS,
+            Interface::XdgToplevel => XDG_TOPLEVEL_EVENTS,
         }
     }
 }
@@ -278,3 +294,23 @@ const SHELL_MANAGER_EVENTS: &[Opcode] = &[
     Opcode { number: 3, direction: Direction::Event, name: "window_focused" },
     Opcode { number: 4, direction: Direction::Event, name: "window_title_changed" },
 ];
+
+// pmd_xdg_shell — narrowed Wayland xdg-shell. A single
+// request in v1: promote a surface to a toplevel. Events
+// come later (configure handshake, close request, etc.).
+const XDG_SHELL_REQUESTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Request, name: "get_toplevel" },
+];
+
+const XDG_SHELL_EVENTS: &[Opcode] = &[];
+
+// pmd_xdg_toplevel — per-window object. Clients set the
+// title + app_id; the server assigns geometry via its
+// auto-layout policy. `destroy` tears the window down.
+const XDG_TOPLEVEL_REQUESTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Request, name: "set_title" },
+    Opcode { number: 2, direction: Direction::Request, name: "set_app_id" },
+    Opcode { number: 3, direction: Direction::Request, name: "destroy" },
+];
+
+const XDG_TOPLEVEL_EVENTS: &[Opcode] = &[];

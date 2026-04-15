@@ -39,6 +39,6 @@ pub use requests::{
     buffer_format, CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
     ShellManagerCloseWindow, ShellManagerFocusWindow, ShellManagerMinimizeWindow,
     ShellManagerSubscribeWindows, ShmCreatePool, ShmPoolCreateBuffer, SurfaceAttach,
-    SurfaceDamage,
+    SurfaceDamage, XdgShellGetToplevel, XdgToplevelSetAppId, XdgToplevelSetTitle,
 };
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

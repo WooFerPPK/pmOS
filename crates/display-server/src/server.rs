@@ -209,6 +209,13 @@ impl Server {
     /// no-ops if any of the required state is missing —
     /// the client may have legitimately committed a surface
     /// with nothing attached.
+    ///
+    /// If the surface has an associated
+    /// [`crate::client::Toplevel`], the blit lands at that
+    /// toplevel's server-assigned origin (plus any offset
+    /// the attach request supplied). Otherwise the blit
+    /// uses only the attach offset, which is what ordinary
+    /// non-toplevel surfaces want.
     fn composite_surface_commit(
         &mut self,
         client_id: ClientId,
@@ -243,7 +250,16 @@ impl Server {
         let Some(src_bytes) = pool.storage.get(start..end) else {
             return;
         };
-        framebuffer.blit_buffer(info, src_bytes, attachment.x, attachment.y);
+        let (origin_x, origin_y) =
+            if let Some(toplevel) = client.toplevel_for_surface(surface_id) {
+                (
+                    toplevel.x.saturating_add(attachment.x),
+                    toplevel.y.saturating_add(attachment.y),
+                )
+            } else {
+                (attachment.x, attachment.y)
+            };
+        framebuffer.blit_buffer(info, src_bytes, origin_x, origin_y);
     }
 }
 

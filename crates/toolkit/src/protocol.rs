@@ -434,6 +434,48 @@ impl<C: Connection> Client<C> {
         self.send_request(surface_id, 3 /* damage */, &payload)
     }
 
+    /// Send `pmd_xdg_shell.get_toplevel(new_id, surface_id)`.
+    /// Allocates a fresh toplevel id bound to
+    /// [`Interface::XdgToplevel`] and sends the framed
+    /// request. Returns the allocated id so the caller can
+    /// follow up with `set_title` / `set_app_id`.
+    pub fn xdg_shell_get_toplevel(
+        &mut self,
+        xdg_shell_id: ObjectId,
+        surface_id: ObjectId,
+    ) -> Result<ObjectId, ClientError> {
+        let toplevel_id = self.bind_new(Interface::XdgToplevel)?;
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&toplevel_id.raw().to_le_bytes());
+        payload[4..8].copy_from_slice(&surface_id.raw().to_le_bytes());
+        self.send_request(xdg_shell_id, 1 /* get_toplevel */, &payload)?;
+        Ok(toplevel_id)
+    }
+
+    /// Send `pmd_xdg_toplevel.set_title(string)`. The
+    /// string is encoded with a `u32 length` prefix
+    /// followed by the UTF-8 bytes, padded to a 4-byte
+    /// boundary — the same shape `read_string` decodes
+    /// on the server side.
+    pub fn xdg_toplevel_set_title(
+        &mut self,
+        toplevel_id: ObjectId,
+        title: &str,
+    ) -> Result<(), ClientError> {
+        let payload = encode_wire_string(title);
+        self.send_request(toplevel_id, 1 /* set_title */, &payload)
+    }
+
+    /// Send `pmd_xdg_toplevel.set_app_id(string)`.
+    pub fn xdg_toplevel_set_app_id(
+        &mut self,
+        toplevel_id: ObjectId,
+        app_id: &str,
+    ) -> Result<(), ClientError> {
+        let payload = encode_wire_string(app_id);
+        self.send_request(toplevel_id, 2 /* set_app_id */, &payload)
+    }
+
     /// Parse as many complete server-bound events out of the
     /// input byte stream as possible. Stops at the first
     /// partial message (returning the events parsed so far
@@ -544,6 +586,20 @@ impl<C: Connection> Client<C> {
 enum Direction {
     Request,
     Event,
+}
+
+/// Encode `s` as the wire-string shape the `read_string`
+/// decoder in display-proto expects: a little-endian
+/// `u32` length prefix followed by the UTF-8 bytes padded
+/// to a 4-byte boundary with NULs.
+fn encode_wire_string(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let pad = (4 - (bytes.len() % 4)) % 4;
+    let mut out = Vec::with_capacity(4 + bytes.len() + pad);
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out.resize(out.len() + pad, 0);
+    out
 }
 
 fn map_opcode_error(err: OpcodeError, expected: Direction) -> ClientError {

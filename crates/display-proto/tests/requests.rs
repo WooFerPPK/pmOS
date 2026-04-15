@@ -8,6 +8,7 @@ use display_proto::decode::DecodeError;
 use display_proto::requests::{
     buffer_format, CompositorCreateSurface, DisplayGetRegistry, RegistryBind,
     ShmCreatePool, ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage,
+    XdgShellGetToplevel, XdgToplevelSetAppId, XdgToplevelSetTitle,
 };
 use display_proto::ObjectId;
 
@@ -159,5 +160,52 @@ fn shm_pool_create_buffer_round_trips_xrgb8888_format() {
 #[test]
 fn shm_pool_create_buffer_rejects_truncated_payload() {
     let err = ShmPoolCreateBuffer::decode(&[0u8; 16]).unwrap_err();
+    assert!(matches!(err, DecodeError::Truncated { .. }));
+}
+
+#[test]
+fn xdg_shell_get_toplevel_decodes_new_id_and_surface_id() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&19u32.to_le_bytes()); // new_id
+    payload.extend_from_slice(&7u32.to_le_bytes()); // surface_id
+    let req = XdgShellGetToplevel::decode(&payload).unwrap();
+    assert_eq!(req.new_id, ObjectId::new(19));
+    assert_eq!(req.surface_id, ObjectId::new(7));
+}
+
+#[test]
+fn xdg_shell_get_toplevel_rejects_truncated_payload() {
+    let err = XdgShellGetToplevel::decode(&[0u8; 5]).unwrap_err();
+    assert!(matches!(err, DecodeError::Truncated { .. }));
+}
+
+#[test]
+fn xdg_toplevel_set_title_round_trips_a_string() {
+    // Wire layout: u32 length + bytes + 4-byte padding.
+    let mut payload = Vec::new();
+    payload.extend(wire_string("pmos.term"));
+    let req = XdgToplevelSetTitle::decode(&payload).unwrap();
+    assert_eq!(req.title, "pmos.term");
+}
+
+#[test]
+fn xdg_toplevel_set_title_handles_empty_string() {
+    let mut payload = Vec::new();
+    payload.extend(wire_string(""));
+    let req = XdgToplevelSetTitle::decode(&payload).unwrap();
+    assert_eq!(req.title, "");
+}
+
+#[test]
+fn xdg_toplevel_set_app_id_round_trips_a_string() {
+    let mut payload = Vec::new();
+    payload.extend(wire_string("pmos.files"));
+    let req = XdgToplevelSetAppId::decode(&payload).unwrap();
+    assert_eq!(req.app_id, "pmos.files");
+}
+
+#[test]
+fn xdg_toplevel_set_title_rejects_truncated_payload() {
+    let err = XdgToplevelSetTitle::decode(&[0u8; 2]).unwrap_err();
     assert!(matches!(err, DecodeError::Truncated { .. }));
 }
