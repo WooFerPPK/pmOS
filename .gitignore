@@ -37,5 +37,8 @@ Thumbs.db
 *.swo
 *~
 
+# Claude Code (user-local project config + skills cache)
+.claude/
+
 # xtask build intermediates
 build/
