@@ -6,6 +6,7 @@
     "assets/bin/edit.wasm",
     "assets/bin/files.wasm",
     "assets/bin/hello_wasi_min.wasm",
+    "assets/bin/hello_wasi_spawner.wasm",
     "assets/bin/init.wasm",
     "assets/bin/settings.wasm",
     "assets/bin/sh.wasm",

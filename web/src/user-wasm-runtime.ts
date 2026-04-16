@@ -44,7 +44,9 @@
 
 import type { KernelWasmHost, DispatchResult } from "./kernel-wasm-host";
 import {
+  encodeSpawnManifest,
   ERRNO,
+  OP_EXT,
   OP_WASI,
   type SyscallRequest,
 } from "./shared/syscall";
@@ -274,8 +276,72 @@ export class UserWasmRuntime {
       },
     } as const;
 
+    // PMos extension namespace — syscalls WASI doesn't cover.
+    // A future slice will replace these inline imports with a
+    // `pmos-rt` Rust crate every userland binary links against,
+    // but for the first few test binaries we declare the
+    // imports directly.
+    const pmosExtShim = {
+      // `proc_spawn(path_ptr, path_len, caps: u64) -> i32`
+      //
+      // Reads the binary path from user memory, packs a
+      // `PROC_SPAWN` manifest (path + caps), dispatches the
+      // opcode through the backend. Returns:
+      //
+      //   * Positive pid on success (new child process).
+      //   * Negative errno on failure — already negated on the
+      //     Rust side (`Response.status` carries `-errno`), so
+      //     we just pass it through.
+      //
+      // The child doesn't actually *run* here: the kernel's
+      // PROC_SPAWN handler queues a pending spawn via the
+      // host's default `onSpawnProcess` callback, and the
+      // runtime's caller (usually `KernelWasmHost.
+      // drainPendingSpawns`) picks it up after `_start`
+      // returns. This is the reentrancy story: a parent that
+      // calls `proc_spawn` mid-run doesn't block waiting for
+      // the child; it gets a pid back and keeps running, and
+      // the child executes once the parent exits and the drain
+      // loop moves on.
+      proc_spawn: (
+        pathPtr: number,
+        pathLen: number,
+        caps: bigint,
+      ): number => {
+        if (this.memory === undefined) {
+          return -ERRNO.EINVAL;
+        }
+        const pathBytes = new Uint8Array(
+          this.memory.buffer,
+          pathPtr,
+          pathLen,
+        );
+        const path = new TextDecoder().decode(pathBytes);
+        const manifest = encodeSpawnManifest({ path, caps });
+
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.PROC_SPAWN,
+            requestId: 0,
+            args: manifest.args,
+            heapPtr: 0,
+            heapLen: manifest.heap.length,
+          },
+          manifest.heap,
+        );
+
+        if (response.status !== 0) {
+          // Rust side already negated the errno, so `status`
+          // is already the negative form our ABI promises.
+          return response.status;
+        }
+        return Number(response.value);
+      },
+    } as const;
+
     return {
       wasi_snapshot_preview1: shim,
+      pmos_ext: pmosExtShim,
     };
   }
 }

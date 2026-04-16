@@ -18,6 +18,7 @@ members = [
     "crates/sample-app",
     "crates/toolkit-free-client",
     "crates/hello-wasi-min",
+    "crates/hello-wasi-spawner",
     "crates/integration-tests",
     "crates/xtask",
 ]

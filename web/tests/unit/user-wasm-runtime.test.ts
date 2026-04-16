@@ -53,6 +53,7 @@ import {
 
 let kernelWasmBytes: ArrayBuffer;
 let helloWasmBytes: ArrayBuffer;
+let spawnerWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -64,8 +65,12 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_wasi_min.wasm",
   );
+  const spawnerPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_wasi_spawner.wasm",
+  );
 
-  for (const p of [kernelPath, helloPath]) {
+  for (const p of [kernelPath, helloPath, spawnerPath]) {
     if (!fs.existsSync(p)) {
       throw new Error(
         `${p} not found. Run \`just build\` (or the cargo build lines from the Justfile's build target) first.`,
@@ -76,20 +81,16 @@ beforeAll(() => {
   // Copy each Node `Buffer` into a fresh `ArrayBuffer`; see
   // `kernel-wasm-host.test.ts` for the explanation of why this
   // is needed under modern TS types.
-  {
-    const raw = fs.readFileSync(kernelPath);
-    kernelWasmBytes = raw.buffer.slice(
+  const loadWasm = (p: string): ArrayBuffer => {
+    const raw = fs.readFileSync(p);
+    return raw.buffer.slice(
       raw.byteOffset,
       raw.byteOffset + raw.byteLength,
     ) as ArrayBuffer;
-  }
-  {
-    const raw = fs.readFileSync(helloPath);
-    helloWasmBytes = raw.buffer.slice(
-      raw.byteOffset,
-      raw.byteOffset + raw.byteLength,
-    ) as ArrayBuffer;
-  }
+  };
+  kernelWasmBytes = loadWasm(kernelPath);
+  helloWasmBytes = loadWasm(helloPath);
+  spawnerWasmBytes = loadWasm(spawnerPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -214,6 +215,88 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
       "hello from userland\n",
     );
+  });
+
+  it("two-level composition: spawner wasm calls proc_spawn mid-run, drainPendingSpawns reentrantly runs both", async () => {
+    // The reentrancy test. Init dispatches PROC_SPAWN for the
+    // spawner. The drain loop pops the spawner, runs it. Inside
+    // `_start`, the spawner writes "spawner alive\n" via
+    // `wasi_snapshot_preview1.fd_write` and THEN calls
+    // `pmos_ext.proc_spawn` to spawn hello. The shim translates
+    // that into a PROC_SPAWN opcode dispatched on the spawner's
+    // pid — which queues the hello spawn onto the same
+    // pendingSpawns list the drain loop is currently draining.
+    // The spawner then proc_exits. Control returns to the drain
+    // loop, which sees the queue is non-empty (hello just got
+    // added), pops hello, runs it. Hello writes its line and
+    // exits. Drain returns.
+    //
+    // Asserts: BOTH console writes appear, IN ORDER ("spawner
+    // alive\n" first, then "hello from userland\n"). That order
+    // is load-bearing: it proves the spawner fully ran before
+    // the child took over, which is the non-concurrent
+    // sequential-drain semantics we promised.
+    const consoleWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/usr/bin/hello", helloWasmBytes],
+      ["/usr/bin/spawner", spawnerWasmBytes],
+    ]);
+
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    // Virtual init process, seeded with stdio.
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    // init issues PROC_SPAWN for /usr/bin/spawner.
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/spawner",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+    const spawnerPid = Number(spawnResult.response.value);
+    expect(spawnerPid).toBeGreaterThan(init);
+
+    // One pending spawn (the spawner); hello isn't queued yet
+    // because it only gets queued when the spawner calls
+    // pmos_ext.proc_spawn during its run.
+    expect(kernel.hasPendingSpawns).toBe(true);
+
+    // Drain. The spawner runs, queues hello mid-run, exits;
+    // the loop picks up hello, runs it, exits; the loop sees
+    // an empty queue and returns.
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    // Two complete lines, in order. Any other order would
+    // indicate the child ran before the spawner finished,
+    // which would break the sequential reentrancy model.
+    const lines = consoleWrites.map((bytes) =>
+      new TextDecoder().decode(bytes),
+    );
+    expect(lines).toEqual([
+      "spawner alive\n",
+      "hello from userland\n",
+    ]);
   });
 
   it("PROC_SPAWN with a path missing from binaryRegistry returns -EIO and rolls back the pid", async () => {

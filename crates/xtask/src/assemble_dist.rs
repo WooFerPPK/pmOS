@@ -114,6 +114,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     // per Rust's wasm output convention, so the filename carried
     // across in `dist/assets/bin/` stays `hello_wasi_min.wasm`.
     ("hello-wasi-min", "hello_wasi_min"),
+    ("hello-wasi-spawner", "hello_wasi_spawner"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {

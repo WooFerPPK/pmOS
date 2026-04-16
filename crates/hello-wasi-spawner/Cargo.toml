@@ -1,0 +1,14 @@
+[package]
+name = "hello-wasi-spawner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Like `hello-wasi-min`, built as a cdylib to sidestep the
+# `crt1-command.o` `_start` collision on `wasm32-wasip1`. Imports
+# from two modules: `wasi_snapshot_preview1` for fd_write +
+# proc_exit, and `pmos_ext` for proc_spawn (the PMos extension
+# syscall).
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
