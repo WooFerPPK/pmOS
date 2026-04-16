@@ -29,6 +29,7 @@ use abi::errno::{EINVAL, ENOSYS, ESRCH};
 use abi::ext::{self as op, Pid};
 use abi::ring::{Request, Response};
 
+use crate::ipc::SocketType;
 use crate::platform;
 use crate::proc::ExitStatus;
 use crate::sys::{Kernel, SpawnArgs};
@@ -44,11 +45,17 @@ pub fn dispatch_ext(
     heap: &mut [u8],
 ) -> Response {
     match req.opcode {
+        op::IPC_SOCKET => handle_ipc_socket(kernel, pid, req),
+        op::IPC_BIND => handle_ipc_bind(kernel, pid, req, heap),
+        op::IPC_LISTEN => handle_ipc_listen(kernel, pid, req),
+        op::IPC_CONNECT => handle_ipc_connect(kernel, pid, req, heap),
+        op::IPC_ACCEPT => handle_ipc_accept(kernel, pid, req),
         op::PROC_SELF => handle_proc_self(pid, req),
         op::PROC_PARENT => handle_proc_parent(kernel, pid, req),
         op::CAP_CHECK => handle_cap_check(kernel, pid, req),
         op::CAP_LIST => handle_cap_list(kernel, pid, req),
         op::PROC_SPAWN => handle_proc_spawn(kernel, pid, req, heap),
+        op::DISPLAY_CONNECT => handle_display_connect(kernel, pid, req),
         _ => Response::err(req.request_id, ENOSYS),
     }
 }
@@ -121,6 +128,144 @@ fn handle_cap_list(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
     match kernel.caps.list(pid) {
         Ok(set) => Response::ok(req.request_id, set.0 as i64),
         Err(_) => Response::err(req.request_id, ESRCH),
+    }
+}
+
+// ---- ipc_socket --------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = socket type (u32): 0 = Stream, 1 = Dgram
+//                (matches `abi::ext::SocketType` discriminants)
+// Response:
+//   value = fresh socket fd
+//
+// No cap check — any process can create sockets. What the socket
+// can then bind or connect to is constrained by per-path cap
+// gating (today: only `/run/display` has gating via
+// `display_bind` / `display_connect`; every other path is open).
+
+fn handle_ipc_socket(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let ty_bits = args_u32(req, 0);
+    let ty = match ty_bits {
+        0 => SocketType::Stream,
+        1 => SocketType::Dgram,
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    match kernel.ipc_socket(pid, ty) {
+        Ok(fd) => Response::ok(req.request_id, fd as i64),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- ipc_bind ----------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32) referring to an unbound socket
+//   heap_ptr / heap_len = UTF-8 bind path (not a filesystem path;
+//                          lives in the IpcTable bindings map)
+// Response:
+//   value = 0 on success
+
+fn handle_ipc_bind(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
+    let fd = args_u32(req, 0);
+    let Some(path_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.ipc_bind(pid, fd, path) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- ipc_listen --------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32) referring to a bound socket
+//   args[4..8] = backlog (u32) — number of pending connections the
+//                 listener can queue before a connect is refused.
+//                 Ignored for dgram sockets (they don't listen).
+// Response:
+//   value = 0 on success
+
+fn handle_ipc_listen(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let backlog = args_u32(req, 4) as usize;
+    match kernel.ipc_listen(pid, fd, backlog) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- ipc_connect -------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32) referring to an unbound socket
+//   heap_ptr / heap_len = UTF-8 path of the target listener
+// Response:
+//   value = 0 on success
+//
+// After a successful connect, the fd can be read/written via the
+// existing FD_READ / FD_WRITE opcodes; those already handle
+// FdObject::Socket correctly.
+
+fn handle_ipc_connect(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let Some(path_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.ipc_connect(pid, fd, path) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- ipc_accept --------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = listener fd (u32)
+// Response:
+//   value = freshly-allocated server-side fd of the accepted
+//           connection, or -EAGAIN if the listener has no pending
+//           clients.
+//
+// Reuses the existing `Kernel::accept_socket` method — same thing
+// `DISPLAY_CONNECT`'s server side will eventually use.
+
+fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let listener_fd = args_u32(req, 0);
+    match kernel.accept_socket(pid, listener_fd) {
+        Ok(fd) => Response::ok(req.request_id, fd as i64),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- display_connect --------------------------------------------------
+//
+// Layout: no args, no heap.
+// Response: value = freshly-allocated fd of the client-side
+//           connection to the display server.
+//
+// This is a convenience wrapper over `ipc_socket` + `ipc_connect`
+// with a hardcoded path (`/run/display`) and a baked-in cap check
+// (`Cap::DisplayClient`). A userland toolkit that wants to draw
+// windows calls this once at startup; every subsequent message
+// goes through `fd_write` on the returned fd.
+
+fn handle_display_connect(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    match kernel.display_connect(pid) {
+        Ok(fd) => Response::ok(req.request_id, fd as i64),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 

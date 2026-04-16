@@ -527,6 +527,84 @@ impl Kernel {
         Ok(fd)
     }
 
+    // --- Generic IPC sockets -------------------------------------
+    //
+    // Thin wrappers around the `IpcTable` socket primitives that
+    // add fd-table management (allocating fds, looking them up as
+    // socket objects) to the opcode surface. No cap checks today:
+    // any process can create sockets and bind/connect arbitrary
+    // paths. The privileged `/run/display` access is gated through
+    // `display_bind` / `display_connect` above; every other path
+    // is unrestricted in v1. A future cap-granularity slice can
+    // add per-path-prefix gating here without changing the opcode
+    // wire format.
+
+    /// Create an unbound socket of the given type and install it at
+    /// a fresh fd in `pid`'s fd table. Returns the new fd number.
+    pub fn ipc_socket(&mut self, pid: Pid, ty: SocketType) -> Result<u32, KernelError> {
+        let socket_id = self.ipc.create_socket(ty);
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
+        let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
+        Ok(fd)
+    }
+
+    /// Bind `fd` (which must refer to an unbound socket) to `path`.
+    /// The path is a kernel-visible string, not a filesystem path —
+    /// it lives in a separate bindings table on `IpcTable`, not in
+    /// the VFS.
+    pub fn ipc_bind(&mut self, pid: Pid, fd: u32, path: &str) -> Result<(), KernelError> {
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        self.ipc.bind_socket(socket_id, path)?;
+        Ok(())
+    }
+
+    /// Transition a bound socket fd to listening with a caller-
+    /// supplied backlog. Only meaningful for stream sockets; dgram
+    /// sockets skip `listen` entirely and go straight to `recv`.
+    pub fn ipc_listen(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+        backlog: usize,
+    ) -> Result<(), KernelError> {
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        self.ipc.listen_socket(socket_id, backlog)?;
+        Ok(())
+    }
+
+    /// Connect `fd` (which must refer to an unbound socket) to the
+    /// listener bound at `path`. After a successful connect, the
+    /// caller uses the existing `fd_read` / `fd_write` surface to
+    /// exchange bytes — those already route through the socket via
+    /// `FdObject::Socket`, so no separate `ipc_send` / `ipc_recv`
+    /// plumbing is needed on the Rust side.
+    pub fn ipc_connect(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+        path: &str,
+    ) -> Result<(), KernelError> {
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        self.ipc.connect_socket(socket_id, path)?;
+        Ok(())
+    }
+
+    /// Helper: look up `fd` in `pid`'s fd table and return the
+    /// `SocketId` the entry refers to, or the appropriate
+    /// `KernelError` if the fd is missing / not a socket.
+    fn socket_id_from_fd(&self, pid: Pid, fd: u32) -> Result<SocketId, KernelError> {
+        let entry = self
+            .fds
+            .get(&pid)
+            .ok_or(KernelError::NoSuchPid)?
+            .get(fd)
+            .ok_or(KernelError::BadFd)?;
+        match entry.object {
+            FdObject::Socket(id) => Ok(SocketId(id)),
+            _ => Err(KernelError::NotSupportedOnFd),
+        }
+    }
+
     // --- Private helpers -----------------------------------------
 
     /// Release any per-fd-object resources on the kernel side.

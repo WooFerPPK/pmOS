@@ -687,6 +687,576 @@ fn sched_yield_returns_ok() {
     assert_eq!(resp.value, 0);
 }
 
+// ---- IPC sockets ------------------------------------------------------
+//
+// Covers the 5 new generic IPC opcodes (`IPC_SOCKET`, `IPC_BIND`,
+// `IPC_LISTEN`, `IPC_CONNECT`, `IPC_ACCEPT`) plus the bigger end-to-
+// end round trip that glues them together: server binds + listens,
+// client connects, server accepts, both ends exchange bytes through
+// the existing `FD_READ` / `FD_WRITE` opcodes (which already route
+// `FdObject::Socket` to the right `ipc.send_on_socket` /
+// `recv_on_socket` paths).
+//
+// The full round-trip test is the one that actually matters. The
+// per-opcode tests guard the argument-decoding + error-mapping
+// behaviour of each handler in isolation.
+
+/// Build a 16-byte args window with a single u32 at offset 0 and
+/// another at offset 4. Used by `ipc_listen` (fd + backlog) and
+/// anything else that packs two u32s.
+fn u32_u32_args(a: u32, b: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&a.to_le_bytes());
+    args[4..8].copy_from_slice(&b.to_le_bytes());
+    args
+}
+
+#[test]
+fn ipc_socket_allocates_a_fresh_socket_fd() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "socketeer", 0);
+    let mut heap = vec![0u8; 64];
+
+    // Type 0 = Stream.
+    let req = Request {
+        opcode: op_ext::IPC_SOCKET,
+        flags: 0,
+        request_id: 90,
+        args: u32_args(0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let fd = resp.value as u32;
+    assert!(k.fds(pid).unwrap().get(fd).is_some());
+}
+
+#[test]
+fn ipc_socket_rejects_invalid_type_with_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "socketeer", 0);
+    let mut heap = vec![0u8; 64];
+
+    // Type 99 isn't a valid SocketType discriminant.
+    let req = Request {
+        opcode: op_ext::IPC_SOCKET,
+        flags: 0,
+        request_id: 91,
+        args: u32_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn ipc_bind_and_listen_transition_a_fresh_socket() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "server", 0);
+    let mut heap = vec![0u8; 128];
+
+    // Create socket.
+    let sock_req = Request {
+        opcode: op_ext::IPC_SOCKET,
+        flags: 0,
+        request_id: 100,
+        args: u32_args(0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let fd = dispatch(&mut k, pid, &sock_req, &mut heap).value as u32;
+
+    // Bind to "/tmp/sock".
+    let path = b"/tmp/sock";
+    heap[..path.len()].copy_from_slice(path);
+    let bind_req = Request {
+        opcode: op_ext::IPC_BIND,
+        flags: 0,
+        request_id: 101,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let bind_resp = dispatch(&mut k, pid, &bind_req, &mut heap);
+    assert_eq!(bind_resp.status, 0);
+
+    // Listen with backlog 4.
+    let listen_req = Request {
+        opcode: op_ext::IPC_LISTEN,
+        flags: 0,
+        request_id: 102,
+        args: u32_u32_args(fd, 4),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let listen_resp = dispatch(&mut k, pid, &listen_req, &mut heap);
+    assert_eq!(listen_resp.status, 0);
+}
+
+#[test]
+fn ipc_bind_on_already_bound_path_returns_eaddrinuse() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "server", 0);
+    let mut heap = vec![0u8; 128];
+
+    // First server binds /tmp/x successfully.
+    let fd1 = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 110,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+    let path = b"/tmp/x";
+    heap[..path.len()].copy_from_slice(path);
+    assert_eq!(
+        dispatch(
+            &mut k,
+            pid,
+            &Request {
+                opcode: op_ext::IPC_BIND,
+                flags: 0,
+                request_id: 111,
+                args: u32_args(fd1),
+                heap_ptr: 0,
+                heap_len: path.len() as u32,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+
+    // Second socket tries to bind the same path — EADDRINUSE.
+    let fd2 = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 112,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+    heap[..path.len()].copy_from_slice(path);
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_BIND,
+            flags: 0,
+            request_id: 113,
+            args: u32_args(fd2),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EADDRINUSE);
+}
+
+#[test]
+fn ipc_connect_to_nonexistent_path_returns_econnrefused() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "client", 0);
+    let mut heap = vec![0u8; 128];
+
+    let fd = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 120,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+
+    let path = b"/nope/no-one-here";
+    heap[..path.len()].copy_from_slice(path);
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_CONNECT,
+            flags: 0,
+            request_id: 121,
+            args: u32_args(fd),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::ECONNREFUSED);
+}
+
+#[test]
+fn ipc_accept_on_empty_listener_returns_eagain() {
+    // Listener exists and is in `Listening` state, but no client
+    // has connected. accept_socket on `IpcTable` returns
+    // `IpcError::WouldBlock` which `kerr_to_errno` maps to EAGAIN.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "server", 0);
+    let mut heap = vec![0u8; 128];
+
+    let listener_fd = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 130,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+    let path = b"/tmp/lonely";
+    heap[..path.len()].copy_from_slice(path);
+    dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_BIND,
+            flags: 0,
+            request_id: 131,
+            args: u32_args(listener_fd),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_LISTEN,
+            flags: 0,
+            request_id: 132,
+            args: u32_u32_args(listener_fd, 4),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_ACCEPT,
+            flags: 0,
+            request_id: 133,
+            args: u32_args(listener_fd),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EAGAIN);
+}
+
+#[test]
+fn ipc_accept_on_non_socket_fd_returns_einval() {
+    // A process with fd 0 wired to /dev/console tries to accept on
+    // fd 0. The fd exists but it's not a Socket object, so the
+    // handler returns EINVAL (via `KernelError::NotSupportedOnFd`
+    // -> `kerr_to_errno`).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "confused", 0);
+    k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_ACCEPT,
+            flags: 0,
+            request_id: 140,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn ipc_round_trip_server_accepts_client_and_they_exchange_bytes() {
+    // The big end-to-end test. Two processes in one kernel:
+    //   server: socket + bind("/tmp/rt") + listen + accept
+    //   client: socket + connect("/tmp/rt")
+    //   server reads what the client wrote via FD_READ on the
+    //     accepted fd.
+    //   client reads what the server wrote via FD_READ on the
+    //     connected fd.
+    //
+    // This exercises every IPC opcode + proves the socket fd
+    // objects route correctly through the existing fd_read /
+    // fd_write paths.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "server", 0);
+    let client = make_running_proc(&mut k, "client", 0);
+    let mut heap = vec![0u8; 256];
+
+    let path = b"/tmp/rt";
+
+    // --- server side: socket + bind + listen ------------------
+
+    let srv_listener = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 200,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+
+    heap[..path.len()].copy_from_slice(path);
+    assert_eq!(
+        dispatch(
+            &mut k,
+            server,
+            &Request {
+                opcode: op_ext::IPC_BIND,
+                flags: 0,
+                request_id: 201,
+                args: u32_args(srv_listener),
+                heap_ptr: 0,
+                heap_len: path.len() as u32,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+    assert_eq!(
+        dispatch(
+            &mut k,
+            server,
+            &Request {
+                opcode: op_ext::IPC_LISTEN,
+                flags: 0,
+                request_id: 202,
+                args: u32_u32_args(srv_listener, 4),
+                heap_ptr: 0,
+                heap_len: 0,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+
+    // --- client side: socket + connect ------------------------
+
+    let cli_fd = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 203,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+
+    heap[..path.len()].copy_from_slice(path);
+    assert_eq!(
+        dispatch(
+            &mut k,
+            client,
+            &Request {
+                opcode: op_ext::IPC_CONNECT,
+                flags: 0,
+                request_id: 204,
+                args: u32_args(cli_fd),
+                heap_ptr: 0,
+                heap_len: path.len() as u32,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+
+    // --- server side: accept ---------------------------------
+
+    let srv_conn = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_ACCEPT,
+            flags: 0,
+            request_id: 205,
+            args: u32_args(srv_listener),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+
+    // --- client writes "hi" via FD_WRITE, server reads it ----
+
+    heap[..2].copy_from_slice(b"hi");
+    let write_resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_wasi::FD_WRITE,
+            flags: 0,
+            request_id: 210,
+            args: u32_args(cli_fd),
+            heap_ptr: 0,
+            heap_len: 2,
+        },
+        &mut heap,
+    );
+    assert_eq!(write_resp.status, 0);
+    assert_eq!(write_resp.value, 2);
+
+    // Zero the heap so FD_READ's output is unambiguous.
+    for b in heap.iter_mut() {
+        *b = 0;
+    }
+    let read_resp = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_wasi::FD_READ,
+            flags: 0,
+            request_id: 211,
+            args: u32_args(srv_conn),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert_eq!(read_resp.status, 0);
+    assert_eq!(read_resp.value, 2);
+    assert_eq!(&heap[..2], b"hi");
+}
+
+// ---- display_connect --------------------------------------------------
+
+#[test]
+fn display_connect_with_server_listening_returns_connected_fd() {
+    // Set up a display server using the semantic `Kernel::display_bind`
+    // method (which installs a listener at /run/display with
+    // DisplayServer cap). Then a DisplayClient-cap process calls
+    // DISPLAY_CONNECT via the opcode and should get back a connected
+    // fd.
+    let mut k = make_kernel();
+    let srv = k
+        .register_process(RegisterArgs {
+            name: "srv",
+            ppid: 0,
+            caps: abi::cap::initial::DISPLAY_SERVER,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(srv).unwrap();
+    k.procs.transition(srv, ProcState::Running).unwrap();
+    k.display_bind(srv).expect("display_bind");
+
+    let client = k
+        .register_process(RegisterArgs {
+            name: "cli",
+            ppid: 0,
+            caps: abi::cap::initial::DESKTOP_SHELL,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(client).unwrap();
+    k.procs.transition(client, ProcState::Running).unwrap();
+
+    let mut heap = vec![0u8; 32];
+    let resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::DISPLAY_CONNECT,
+            flags: 0,
+            request_id: 220,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, 0);
+    let fd = resp.value as u32;
+    assert!(k.fds(client).unwrap().get(fd).is_some());
+}
+
+#[test]
+fn display_connect_without_display_client_cap_returns_enotcapable() {
+    // An ordinary app without DisplayClient cap can't connect.
+    // `Kernel::display_connect` returns NotCapable, which
+    // `kerr_to_errno` maps to ENOTCAPABLE (76).
+    let mut k = make_kernel();
+    // Even simpler: register with an empty cap set.
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "capless",
+            ppid: 0,
+            caps: abi::cap::CapSet::EMPTY,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(pid).unwrap();
+    k.procs.transition(pid, ProcState::Running).unwrap();
+
+    let mut heap = vec![0u8; 32];
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::DISPLAY_CONNECT,
+            flags: 0,
+            request_id: 221,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+}
+
 // ---- proc_spawn -------------------------------------------------------
 //
 // Layout recap:
