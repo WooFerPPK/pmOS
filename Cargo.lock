@@ -52,6 +52,10 @@ name = "hello-input-echo"
 version = "0.1.0"
 
 [[package]]
+name = "hello-std"
+version = "0.1.0"
+
+[[package]]
 name = "hello-wasi-bootstrap"
 version = "0.1.0"
 

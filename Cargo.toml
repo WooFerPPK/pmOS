@@ -25,6 +25,7 @@ members = [
     "crates/hello-wasi-bootstrap",
     "crates/hello-fb-blit",
     "crates/hello-input-echo",
+    "crates/hello-std",
     "crates/integration-tests",
     "crates/xtask",
 ]

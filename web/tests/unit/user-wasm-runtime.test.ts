@@ -62,6 +62,7 @@ let displayServerLiteWasmBytes: ArrayBuffer;
 let helloWasiBootstrapWasmBytes: ArrayBuffer;
 let helloFbBlitWasmBytes: ArrayBuffer;
 let helloInputEchoWasmBytes: ArrayBuffer;
+let helloStdWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -101,6 +102,12 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_input_echo.wasm",
   );
+  // `hello-std` is a bin target (not cdylib), so cargo keeps the
+  // dashes in the output filename.
+  const helloStdPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello-std.wasm",
+  );
 
   for (const p of [
     kernelPath,
@@ -112,6 +119,7 @@ beforeAll(() => {
     helloWasiBootstrapPath,
     helloFbBlitPath,
     helloInputEchoPath,
+    helloStdPath,
   ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
@@ -139,6 +147,7 @@ beforeAll(() => {
   helloWasiBootstrapWasmBytes = loadWasm(helloWasiBootstrapPath);
   helloFbBlitWasmBytes = loadWasm(helloFbBlitPath);
   helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
+  helloStdWasmBytes = loadWasm(helloStdPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -851,6 +860,74 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // ("Hi!\n" — the console driver flushes on newline).
     expect(consoleWrites).toHaveLength(1);
     expect(Array.from(consoleWrites[0]!)).toEqual([0x48, 0x69, 0x21, 0x0a]);
+  });
+
+  it("hello-std: a real Rust `std` binary (println! + fn main) runs to completion through the PMos WASI shim", async () => {
+    // The capstone test. Unlike every other hello-* crate in this
+    // workspace, hello-std is NOT #![no_std]: it uses the full Rust
+    // `std` crate with all the libc/WASI startup machinery. The
+    // binary cargo produces is 40 KiB (vs. ~800 bytes for the
+    // no_std cdylibs) and imports exactly four WASI functions:
+    // fd_write, proc_exit, environ_get, environ_sizes_get. All
+    // four are wired on both the kernel side (handler in
+    // syscall/wasi.rs) and the TS shim side (user-wasm-runtime.ts).
+    //
+    // This test proves every opcode on the Rust std startup path
+    // works end-to-end through real user wasm. If it regresses,
+    // the regression is in one of: the kernel opcode handler, the
+    // user-runtime shim, or the kernel->TS-host driver_call
+    // routing. The failure mode of each is visible from the
+    // console output + exit code.
+    const consoleWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-std", helloStdWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-std",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    const history = kernel.spawnHistoryEntries;
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    const combined = new TextDecoder().decode(
+      new Uint8Array(
+        consoleWrites.reduce<number[]>(
+          (acc, b) => acc.concat(Array.from(b)),
+          [],
+        ),
+      ),
+    );
+    expect(combined).toBe("hello from std\n");
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {

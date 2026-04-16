@@ -1,0 +1,14 @@
+[package]
+name = "hello-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Standard `bin` target so cargo links crt1-command.o and wraps main()
+# in the usual Rust std startup. The whole point of this crate is to
+# exercise that startup path against the PMos WASI shim and kernel
+# opcode handlers.
+
+[[bin]]
+name = "hello-std"
+path = "src/main.rs"

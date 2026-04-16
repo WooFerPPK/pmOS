@@ -20,7 +20,8 @@ build:
         -p sample-app -p toolkit-free-client -p hello-wasi-min \
         -p hello-wasi-spawner -p ipc-self-test -p hello-framebuffer \
         -p display-server-lite -p hello-wasi-bootstrap \
-        -p hello-fb-blit -p hello-input-echo
+        -p hello-fb-blit -p hello-input-echo \
+        -p hello-std
     cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
     cd web && npx esbuild src/sw.ts --bundle --outfile=../build/sw.js --format=esm
     cargo run -p xtask -- assemble-dist
