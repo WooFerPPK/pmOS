@@ -45,7 +45,11 @@ import {
   KernelWasmHostBackend,
   UserWasmRuntime,
 } from "../../src/user-wasm-runtime";
-import { CAPSET_ALL } from "../../src/shared/syscall";
+import {
+  CAPSET_ALL,
+  encodeSpawnManifest,
+  OP_EXT,
+} from "../../src/shared/syscall";
 
 let kernelWasmBytes: ArrayBuffer;
 let helloWasmBytes: ArrayBuffer;
@@ -121,6 +125,144 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
       "hello from userland\n",
     );
+  });
+
+  it("PROC_SPAWN + drainPendingSpawns actually runs the child binary end-to-end", async () => {
+    // The composition test: the kernel's `PROC_SPAWN` opcode is
+    // dispatched on behalf of a "virtual parent" (no wasm; the
+    // test plays init's role), the default `onSpawnProcess` hook
+    // queues the child based on the supplied `binaryRegistry`,
+    // and `drainPendingSpawns` runs the child to completion.
+    // This proves:
+    //
+    //   * `onSpawnProcess` wiring through the host — the default
+    //     queuing callback fires on a real `PROC_SPAWN` syscall.
+    //   * Binary-registry lookup — the kernel-supplied path
+    //     resolves to wasm bytes.
+    //   * The spawned child runs against the same KernelWasmHost
+    //     that its parent was syscalling through, with the pid
+    //     allocated by the kernel's own proc_spawn path — not a
+    //     test-synthesised pid.
+    //   * Child stdio inheritance — the child's fd 1 is the same
+    //     `/dev/console` object the parent had, so its fd_write
+    //     lands on the same driver sink.
+    //   * The whole thing runs after the parent's dispatch has
+    //     returned, so the kernel's scratch region is never
+    //     contended (no nested dispatch).
+    const consoleWrites: Uint8Array[] = [];
+
+    // Map the path the parent will pass to PROC_SPAWN onto the
+    // hello-wasi-min bytes already loaded in beforeAll.
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/usr/bin/hello", helloWasmBytes],
+    ]);
+
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    // Seed a "virtual parent" process. It doesn't run any user
+    // wasm — the test dispatches PROC_SPAWN directly on its
+    // behalf, the way init will eventually do once the init
+    // slice lands. The only reason the parent has to exist in
+    // the kernel's process table is that PROC_SPAWN is issued
+    // on behalf of a specific pid, and that pid's fd 0/1/2
+    // become the child's stdio.
+    const parent = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(parent, 0);
+    kernel.installConsoleFd(parent, 1);
+    kernel.installConsoleFd(parent, 2);
+    kernel.markRunning(parent);
+
+    // Encode and dispatch a PROC_SPAWN syscall.
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/hello",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+
+    // The spawn was queued, not yet run. The response carries the
+    // new pid; the registry lookup succeeded so `onSpawnProcess`
+    // returned `{ ok: true }` and the kernel accepted the spawn.
+    expect(spawnResult.response.status).toBe(0);
+    const childPid = Number(spawnResult.response.value);
+    expect(childPid).toBeGreaterThan(parent);
+    expect(kernel.hasPendingSpawns).toBe(true);
+    expect(consoleWrites).toHaveLength(0);
+
+    // Drain the queue. The hello binary runs, writes its line,
+    // and exits. Because drainPendingSpawns is sequential, it
+    // returns only after every transitively-queued child has
+    // finished, which for this test is just the one.
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(consoleWrites).toHaveLength(1);
+    expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
+      "hello from userland\n",
+    );
+  });
+
+  it("PROC_SPAWN with a path missing from binaryRegistry returns -EIO and rolls back the pid", async () => {
+    // Missing-binary path: the default onSpawnProcess returns
+    // `{ ok: false, errno: ENOENT }`, WasmPlatform::spawn_process
+    // maps that to `DriverError::Errno`, the PROC_SPAWN opcode
+    // handler rolls back the pid and returns `-EIO`. No pending
+    // spawn is queued because the default callback returned
+    // `ok: false` before pushing.
+    const consoleWrites: Uint8Array[] = [];
+
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/usr/bin/hello", helloWasmBytes],
+    ]);
+
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    const parent = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(parent, 0);
+    kernel.installConsoleFd(parent, 1);
+    kernel.installConsoleFd(parent, 2);
+    kernel.markRunning(parent);
+
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/not-in-registry",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 10,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+
+    // -EIO per the PROC_SPAWN rollback semantics (any platform
+    // failure becomes EIO regardless of the specific errno).
+    expect(spawnResult.response.status).toBeLessThan(0);
+    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(consoleWrites).toHaveLength(0);
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {
