@@ -44,6 +44,10 @@ name = "hello-framebuffer"
 version = "0.1.0"
 
 [[package]]
+name = "hello-wasi-bootstrap"
+version = "0.1.0"
+
+[[package]]
 name = "hello-wasi-min"
 version = "0.1.0"
 

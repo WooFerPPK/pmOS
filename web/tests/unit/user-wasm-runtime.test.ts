@@ -57,6 +57,7 @@ let spawnerWasmBytes: ArrayBuffer;
 let ipcSelfTestWasmBytes: ArrayBuffer;
 let helloFramebufferWasmBytes: ArrayBuffer;
 let displayServerLiteWasmBytes: ArrayBuffer;
+let helloWasiBootstrapWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -84,6 +85,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/display_server_lite.wasm",
   );
+  const helloWasiBootstrapPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_wasi_bootstrap.wasm",
+  );
 
   for (const p of [
     kernelPath,
@@ -92,6 +97,7 @@ beforeAll(() => {
     ipcSelfTestPath,
     helloFramebufferPath,
     displayServerLitePath,
+    helloWasiBootstrapPath,
   ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
@@ -116,6 +122,7 @@ beforeAll(() => {
   ipcSelfTestWasmBytes = loadWasm(ipcSelfTestPath);
   helloFramebufferWasmBytes = loadWasm(helloFramebufferPath);
   displayServerLiteWasmBytes = loadWasm(displayServerLitePath);
+  helloWasiBootstrapWasmBytes = loadWasm(helloWasiBootstrapPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -608,6 +615,73 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       0x00, 0x00, 0xff, 0xff, // blue
       0xff, 0xff, 0xff, 0xff, // white
     ]);
+  });
+
+  it("hello-wasi-bootstrap exercises args_sizes/args_get/environ_sizes/environ_get/fd_fdstat_get/fd_prestat_get end-to-end through real wasm", async () => {
+    // All six handlers from the "kernel opcode breadth #3" slice
+    // exercised through a real user binary:
+    //
+    //   * args_sizes_get  → (0, 0)
+    //   * args_get        → success (nothing to write, argc=0)
+    //   * environ_sizes_get → (0, 0)
+    //   * environ_get     → success (nothing to write, envc=0)
+    //   * fd_fdstat_get(1) → filetype byte == 2 (CharDevice)
+    //   * fd_prestat_get(3) → errno 8 (EBADF)
+    //
+    // If any of those returns something the binary doesn't expect,
+    // `_start` calls proc_exit with a step-specific code (10..16)
+    // and the test fails. On full success the binary writes
+    // "bootstrap ok\n" to /dev/console and exits 0.
+    const consoleWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-wasi-bootstrap", helloWasiBootstrapWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-wasi-bootstrap",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    const history = kernel.spawnHistoryEntries;
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+    // The binary writes exactly one line on full success.
+    const combined = new TextDecoder().decode(
+      new Uint8Array(
+        consoleWrites.reduce<number[]>(
+          (acc, b) => acc.concat(Array.from(b)),
+          [],
+        ),
+      ),
+    );
+    expect(combined).toBe("bootstrap ok\n");
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {

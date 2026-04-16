@@ -118,6 +118,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     ("ipc-self-test", "ipc_self_test"),
     ("hello-framebuffer", "hello_framebuffer"),
     ("display-server-lite", "display_server_lite"),
+    ("hello-wasi-bootstrap", "hello_wasi_bootstrap"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {

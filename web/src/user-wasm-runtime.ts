@@ -170,6 +170,35 @@ export class UserWasmRuntime {
   }
 
   /**
+   * Shared helper for `args_sizes_get` + `environ_sizes_get`.
+   * Both opcodes return (count, buf_size) as two little-endian
+   * u32s in the kernel's heap-out window; this method dispatches,
+   * reads the pair, and writes them into user memory at the two
+   * out-pointers the WASI signature carries.
+   */
+  private sizes_get(opcode: number, countPtr: number, bufSizePtr: number): number {
+    if (this.memory === undefined) return ERRNO.EINVAL;
+    const { response, heapOut } = this.backend.dispatch({
+      opcode,
+      requestId: 0,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    if (response.status !== 0) return -response.status;
+    const readView = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    );
+    const count = readView.getUint32(0, true);
+    const bufSize = readView.getUint32(4, true);
+    const writeView = new DataView(this.memory.buffer);
+    writeView.setUint32(countPtr, count, true);
+    writeView.setUint32(bufSizePtr, bufSize, true);
+    return 0;
+  }
+
+  /**
    * Build the `wasi_snapshot_preview1` import namespace the user
    * wasm expects. Each function closes over `this` so it can
    * reach the user's memory (for iovec reads + nwritten writes)
@@ -443,6 +472,102 @@ export class UserWasmRuntime {
       // the semantics WASI specifies.
       proc_exit: (rval: number): never => {
         throw new UserProcessExited(rval);
+      },
+
+      // WASI `args_sizes_get` / `environ_sizes_get`.
+      //
+      // Signature: (argc_or_envc_ptr: i32, buf_size_ptr: i32) -> errno.
+      //
+      // Dispatches the PMos opcode with an 8-byte heap-out window,
+      // reads the two u32s the kernel wrote, and stores them at the
+      // user-memory out-pointers. v1 always reports `(0, 0)`; a
+      // future slice that attaches real argv/envp to `SpawnArgs`
+      // changes only the kernel handler — this shim stays intact.
+      args_sizes_get: (
+        argcPtr: number,
+        bufSizePtr: number,
+      ): number => {
+        return this.sizes_get(OP_WASI.ARGS_SIZES_GET, argcPtr, bufSizePtr);
+      },
+
+      environ_sizes_get: (
+        envcPtr: number,
+        bufSizePtr: number,
+      ): number => {
+        return this.sizes_get(OP_WASI.ENVIRON_SIZES_GET, envcPtr, bufSizePtr);
+      },
+
+      // WASI `args_get` / `environ_get`.
+      //
+      // Signature: (argv_ptr: i32, argv_buf_ptr: i32) -> errno.
+      //
+      // v1 returns an empty list, so there's nothing for the shim
+      // to write into user memory — the kernel handler is a no-op
+      // success. The out-pointers are accepted and ignored; when
+      // argc transitions to non-zero, the handler + this shim gain
+      // a pointer-table build step in lockstep.
+      args_get: (_argvPtr: number, _argvBufPtr: number): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.ARGS_GET,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
+      environ_get: (_envPtr: number, _envBufPtr: number): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.ENVIRON_GET,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
+      // WASI `fd_fdstat_get`.
+      //
+      // Signature: (fd: i32, buf_ptr: i32) -> errno.
+      //
+      // Dispatches FD_FDSTAT_GET with a 24-byte heap-out window,
+      // then copies the 24 bytes of fdstat_t from the heap scratch
+      // into user memory at `buf_ptr`. The bytes come out
+      // already-laid-out by the kernel handler: filetype (byte 0),
+      // _pad (1), fs_flags (2..4), _pad (4..8), fs_rights_base
+      // (8..16), fs_rights_inheriting (16..24).
+      fd_fdstat_get: (fd: number, bufPtr: number): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const { response, heapOut } = this.backend.dispatch({
+          opcode: OP_WASI.FD_FDSTAT_GET,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 24,
+        });
+        if (response.status !== 0) return -response.status;
+        const writeBuf = new Uint8Array(this.memory.buffer);
+        writeBuf.set(heapOut.subarray(0, 24), bufPtr);
+        return 0;
+      },
+
+      // WASI `fd_prestat_get`.
+      //
+      // Signature: (fd: i32, buf_ptr: i32) -> errno.
+      //
+      // The kernel always returns -EBADF (no preopens in v1). The
+      // shim doesn't touch user memory — `buf_ptr` would only be
+      // written on success. WASI's preopen-discovery loop sees
+      // EBADF at the first probe and terminates.
+      fd_prestat_get: (fd: number, _bufPtr: number): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_PRESTAT_GET,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return -response.status;
       },
     } as const;
 

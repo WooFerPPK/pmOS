@@ -22,6 +22,7 @@ members = [
     "crates/ipc-self-test",
     "crates/hello-framebuffer",
     "crates/display-server-lite",
+    "crates/hello-wasi-bootstrap",
     "crates/integration-tests",
     "crates/xtask",
 ]

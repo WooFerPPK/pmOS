@@ -119,7 +119,13 @@ export function decodeResponse(bytes: Uint8Array): SyscallResponse {
 
 /** WASI preview 1 opcodes (0x0001..0x0080). */
 export const OP_WASI = {
+  ARGS_GET: 0x0001,
+  ARGS_SIZES_GET: 0x0002,
+  ENVIRON_GET: 0x0003,
+  ENVIRON_SIZES_GET: 0x0004,
   FD_CLOSE: 0x0022,
+  FD_FDSTAT_GET: 0x0024,
+  FD_PRESTAT_GET: 0x002b,
   FD_READ: 0x002e,
   FD_WRITE: 0x0034,
   PATH_OPEN: 0x0044,
