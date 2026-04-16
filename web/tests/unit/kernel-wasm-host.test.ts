@@ -278,9 +278,22 @@ describe("dispatch: injectInput → FD_READ round trip", () => {
     ]);
   });
 
-  it("injectInput rejects non-console devnums", async () => {
+  it("injectInput accepts DEV.CONSOLE, DEV.INPUT_KBD, DEV.INPUT_MOUSE", async () => {
     const { host } = await freshHost();
-    expect(() => host.injectInput(DEV.INPUT_KBD, new Uint8Array([1, 2, 3]))).toThrow(/DEV\.CONSOLE/);
+    // All three wired input paths accept injection without throwing.
+    // (The behavioural effect is covered separately by the
+    // user-wasm-runtime tests; here we just prove the routing map.)
+    expect(() => host.injectInput(DEV.CONSOLE, new Uint8Array([1, 2, 3]))).not.toThrow();
+    expect(() => host.injectInput(DEV.INPUT_KBD, new Uint8Array([1, 2, 3]))).not.toThrow();
+    expect(() => host.injectInput(DEV.INPUT_MOUSE, new Uint8Array([1, 2, 3]))).not.toThrow();
+  });
+
+  it("injectInput rejects unrouted devnums", async () => {
+    const { host } = await freshHost();
+    // Block (200) is not an input-capable device in v1; the
+    // rejection message names all three wired devices so a reader
+    // knows what IS supported.
+    expect(() => host.injectInput(DEV.BLOCK, new Uint8Array([1, 2, 3]))).toThrow(/not supported/);
   });
 
   it("injectInput rejects payloads larger than the heap scratch capacity", async () => {

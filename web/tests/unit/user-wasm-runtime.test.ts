@@ -48,6 +48,7 @@ import {
 } from "../../src/user-wasm-runtime";
 import {
   CAPSET_ALL,
+  DEV,
   encodeSpawnManifest,
   OP_EXT,
 } from "../../src/shared/syscall";
@@ -60,6 +61,7 @@ let helloFramebufferWasmBytes: ArrayBuffer;
 let displayServerLiteWasmBytes: ArrayBuffer;
 let helloWasiBootstrapWasmBytes: ArrayBuffer;
 let helloFbBlitWasmBytes: ArrayBuffer;
+let helloInputEchoWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -95,6 +97,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_fb_blit.wasm",
   );
+  const helloInputEchoPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_input_echo.wasm",
+  );
 
   for (const p of [
     kernelPath,
@@ -105,6 +111,7 @@ beforeAll(() => {
     displayServerLitePath,
     helloWasiBootstrapPath,
     helloFbBlitPath,
+    helloInputEchoPath,
   ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
@@ -131,6 +138,7 @@ beforeAll(() => {
   displayServerLiteWasmBytes = loadWasm(displayServerLitePath);
   helloWasiBootstrapWasmBytes = loadWasm(helloWasiBootstrapPath);
   helloFbBlitWasmBytes = loadWasm(helloFbBlitPath);
+  helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -776,6 +784,73 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       0x00, 0x00, 0xff, 0xff, // blue
       0xff, 0xff, 0xff, 0xff, // white
     ]);
+  });
+
+  it("hello-input-echo reads injected keyboard bytes from /dev/input/kbd and echoes them to /dev/console", async () => {
+    // The input path end-to-end:
+    //   KernelWasmHost.injectInput(DEV.INPUT_KBD, bytes) →
+    //   kernel_inject_input_kbd → inject_kbd_event → input ring →
+    //   binary's path_open + fd_read → fd_write(stdout) →
+    //   onConsoleWrite.
+    //
+    // The sequential in-process dispatch model doesn't block reads,
+    // so this test injects the input BEFORE draining the spawn queue.
+    // The binary's fd_read finds a non-empty ring and returns
+    // immediately with the queued bytes.
+    const consoleWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-input-echo", helloInputEchoWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    // Inject the keystrokes that the child will read. The kernel's
+    // input ring is format-agnostic — any bytes round-trip verbatim.
+    // The trailing newline is mandatory: /dev/console writes are
+    // line-buffered and only flush to the driver callback on '\n',
+    // so without it the echoed bytes would sit in the kernel's line
+    // buffer and never reach onConsoleWrite.
+    const kbdBytes = new Uint8Array([0x48, 0x69, 0x21, 0x0a]); // "Hi!\n"
+    kernel.injectInput(DEV.INPUT_KBD, kbdBytes);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-input-echo",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    const history = kernel.spawnHistoryEntries;
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    // Exactly one console write, containing the four injected bytes
+    // ("Hi!\n" — the console driver flushes on newline).
+    expect(consoleWrites).toHaveLength(1);
+    expect(Array.from(consoleWrites[0]!)).toEqual([0x48, 0x69, 0x21, 0x0a]);
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {

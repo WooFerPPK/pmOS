@@ -309,3 +309,39 @@ pub extern "C" fn kernel_inject_console_input(len: u32) -> i32 {
     }
     0
 }
+
+/// Push `len` bytes of keyboard input into the kernel's
+/// `/dev/input/kbd` input ring. Same pattern as
+/// `kernel_inject_console_input`: the host writes bytes into the heap
+/// scratch region at offset 0, then calls this function.
+///
+/// Returns `0` on success, `-1` if `len` exceeds heap scratch capacity.
+#[no_mangle]
+pub extern "C" fn kernel_inject_input_kbd(len: u32) -> i32 {
+    let len = len as usize;
+    if len > HEAP_SCRATCH_SIZE {
+        return -1;
+    }
+    let kernel = kernel_mut();
+    unsafe {
+        kernel.devs.inject_kbd_event(&HEAP_SCRATCH[..len]);
+    }
+    0
+}
+
+/// Push `len` bytes of mouse input into the kernel's `/dev/input/mouse`
+/// input ring. Same shape as `kernel_inject_input_kbd`.
+///
+/// Returns `0` on success, `-1` if `len` exceeds heap scratch capacity.
+#[no_mangle]
+pub extern "C" fn kernel_inject_input_mouse(len: u32) -> i32 {
+    let len = len as usize;
+    if len > HEAP_SCRATCH_SIZE {
+        return -1;
+    }
+    let kernel = kernel_mut();
+    unsafe {
+        kernel.devs.inject_mouse_event(&HEAP_SCRATCH[..len]);
+    }
+    0
+}

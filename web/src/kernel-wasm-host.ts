@@ -82,6 +82,8 @@ interface KernelExports {
   readonly kernel_mark_running: (pid: number) => number;
   readonly kernel_dispatch: (pid: number) => number;
   readonly kernel_inject_console_input: (len: number) => number;
+  readonly kernel_inject_input_kbd: (len: number) => number;
+  readonly kernel_inject_input_mouse: (len: number) => number;
   readonly kernel_req_ptr: () => number;
   readonly kernel_resp_ptr: () => number;
   readonly kernel_heap_ptr: () => number;
@@ -630,11 +632,29 @@ export class KernelWasmHost implements Kernel {
    * will add their own exports when the input-driver slice lands.
    */
   injectInput(devnum: number, bytes: Uint8Array): void {
-    if (devnum !== DEV.CONSOLE) {
+    // Route to the kernel export that feeds the matching device's
+    // input ring. The three supported devnums cover the three input
+    // rings the kernel currently wires: `/dev/console`,
+    // `/dev/input/kbd`, `/dev/input/mouse`. Block/net input is
+    // deferred (those devices are driven by the TS drivers from the
+    // other direction and don't have a kernel-side input ring).
+    let injectFn: ((len: number) => number) | undefined;
+    let fnName: string;
+    if (devnum === DEV.CONSOLE) {
+      injectFn = this.exports.kernel_inject_console_input;
+      fnName = "kernel_inject_console_input";
+    } else if (devnum === DEV.INPUT_KBD) {
+      injectFn = this.exports.kernel_inject_input_kbd;
+      fnName = "kernel_inject_input_kbd";
+    } else if (devnum === DEV.INPUT_MOUSE) {
+      injectFn = this.exports.kernel_inject_input_mouse;
+      fnName = "kernel_inject_input_mouse";
+    } else {
       throw new Error(
-        `KernelWasmHost.injectInput: devnum ${devnum} not supported; only DEV.CONSOLE (${DEV.CONSOLE}) is wired`,
+        `KernelWasmHost.injectInput: devnum ${devnum} not supported; wired devices are DEV.CONSOLE (${DEV.CONSOLE}), DEV.INPUT_KBD (${DEV.INPUT_KBD}), DEV.INPUT_MOUSE (${DEV.INPUT_MOUSE})`,
       );
     }
+
     const heapCap = this.exports.kernel_heap_len();
     if (bytes.length > heapCap) {
       throw new Error(
@@ -647,9 +667,9 @@ export class KernelWasmHost implements Kernel {
     const heapPtr = this.exports.kernel_heap_ptr();
     new Uint8Array(buf, heapPtr, bytes.length).set(bytes);
 
-    const rc = this.exports.kernel_inject_console_input(bytes.length);
+    const rc = injectFn(bytes.length);
     if (rc !== 0) {
-      throw new Error(`KernelWasmHost.injectInput: kernel_inject_console_input returned ${rc}`);
+      throw new Error(`KernelWasmHost.injectInput: ${fnName} returned ${rc}`);
     }
   }
 }
