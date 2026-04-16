@@ -11,6 +11,8 @@ use core::panic::PanicInfo;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use abi::ext::Pid;
+
 use super::{DevId, DriverResult, Platform};
 
 /// A recorded driver invocation, kept by the mock driver registry so
@@ -20,6 +22,15 @@ pub struct DriverCall {
     pub dev: DevId,
     pub op: u32,
     pub args: Vec<u8>,
+}
+
+/// A recorded `spawn_process` request. NativePlatform appends one of
+/// these every time the kernel asks for a Worker spawn; tests read
+/// them out via [`with_state`] to assert on what was requested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnCall {
+    pub pid: Pid,
+    pub path: String,
 }
 
 /// Shared mutable state of the native platform. Tests can reset()
@@ -32,6 +43,12 @@ pub struct NativeState {
     pub last_ns: u64,
     pub halted: Option<String>,
     pub panics: Vec<String>,
+    /// Recorded `spawn_process` requests, in order.
+    pub spawn_calls: Vec<SpawnCall>,
+    /// If `Some`, the next call to `spawn_process` returns this
+    /// error and records nothing. Tests set this to exercise the
+    /// rollback path in the `PROC_SPAWN` opcode handler.
+    pub next_spawn_error: Option<super::DriverError>,
 }
 
 impl Default for NativeState {
@@ -43,6 +60,8 @@ impl Default for NativeState {
             last_ns: 0,
             halted: None,
             panics: Vec::new(),
+            spawn_calls: Vec::new(),
+            next_spawn_error: None,
         }
     }
 }
@@ -144,5 +163,18 @@ impl Platform for NativePlatform {
         let state = self.get_or_install_state();
         let mut guard = state.lock().unwrap();
         guard.panics.push(format!("{info}"));
+    }
+
+    fn spawn_process(&self, pid: Pid, path: &str) -> DriverResult<()> {
+        let state = self.get_or_install_state();
+        let mut guard = state.lock().unwrap();
+        if let Some(err) = guard.next_spawn_error.take() {
+            return Err(err);
+        }
+        guard.spawn_calls.push(SpawnCall {
+            pid,
+            path: path.to_string(),
+        });
+        Ok(())
     }
 }

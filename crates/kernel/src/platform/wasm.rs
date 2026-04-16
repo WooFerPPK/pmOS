@@ -13,6 +13,8 @@
 
 use core::panic::PanicInfo;
 
+use abi::ext::Pid;
+
 use super::{DevId, DriverError, DriverResult, Platform};
 
 #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
@@ -28,6 +30,7 @@ extern "C" {
     fn pmos_host_random_bytes(out_ptr: *mut u8, out_len: u32);
     fn pmos_host_halt(reason_ptr: *const u8, reason_len: u32) -> !;
     fn pmos_host_panic(message_ptr: *const u8, message_len: u32);
+    fn pmos_host_spawn_process(pid: i32, path_ptr: *const u8, path_len: u32) -> i32;
 }
 
 /// The singleton WasmPlatform. Zero-sized.
@@ -105,5 +108,21 @@ impl Platform for WasmPlatform {
                 pmos_host_panic(empty.as_ptr(), empty.len() as u32);
             }
         }
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn spawn_process(&self, pid: Pid, path: &str) -> DriverResult<()> {
+        #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
+        unsafe {
+            let rc = pmos_host_spawn_process(pid as i32, path.as_ptr(), path.len() as u32);
+            return if rc == 0 {
+                Ok(())
+            } else if rc < 0 {
+                Err(DriverError::Errno(-rc))
+            } else {
+                Err(DriverError::Transport)
+            };
+        }
+        Err(DriverError::NotReady)
     }
 }

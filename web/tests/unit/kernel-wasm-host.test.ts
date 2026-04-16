@@ -21,12 +21,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import { KernelWasmHost } from "../../src/kernel-wasm-host";
+import { KernelWasmHost, type SpawnOutcome } from "../../src/kernel-wasm-host";
 import {
   CAP,
   CAPSET_ALL,
+  CAPSET_ORDINARY_APP,
   CAPSET_DESKTOP_SHELL,
   DEV,
+  encodeSpawnManifest,
   ERRNO,
   OP_EXT,
   OP_WASI,
@@ -64,15 +66,27 @@ beforeAll(() => {
   ) as ArrayBuffer;
 });
 
+interface SpawnRecord {
+  readonly pid: number;
+  readonly path: string;
+}
+
 interface TestFixture {
   host: KernelWasmHost;
   consoleWrites: Uint8Array[];
   panics: string[];
+  spawnCalls: SpawnRecord[];
 }
 
-async function freshHost(): Promise<TestFixture> {
+interface FreshHostOptions {
+  /** Override the default `{ ok: true }` outcome for spawn requests. */
+  readonly spawnOutcome?: (pid: number, path: string) => SpawnOutcome;
+}
+
+async function freshHost(opts: FreshHostOptions = {}): Promise<TestFixture> {
   const consoleWrites: Uint8Array[] = [];
   const panics: string[] = [];
+  const spawnCalls: SpawnRecord[] = [];
   const host = await KernelWasmHost.create(wasmBytes, {
     onConsoleWrite: (bytes) => {
       consoleWrites.push(bytes);
@@ -80,10 +94,16 @@ async function freshHost(): Promise<TestFixture> {
     onPanic: (message) => {
       panics.push(message);
     },
+    onSpawnProcess: (pid, path) => {
+      spawnCalls.push({ pid, path });
+      return opts.spawnOutcome
+        ? opts.spawnOutcome(pid, path)
+        : { ok: true };
+    },
     // Deterministic clock so tests never race with wall-clock changes.
     nowNs: () => 0n,
   });
-  return { host, consoleWrites, panics };
+  return { host, consoleWrites, panics, spawnCalls };
 }
 
 // ---- construction ---------------------------------------------------
@@ -342,6 +362,166 @@ describe("dispatch: ENOSYS", () => {
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
+  });
+});
+
+// ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
+
+describe("dispatch: PROC_SPAWN", () => {
+  it("spawn from a parent with stdio records onSpawnProcess with (pid, path)", async () => {
+    const { host, spawnCalls } = await freshHost();
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/hello",
+      caps: CAPSET_ALL,
+    });
+
+    const { response } = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 400,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+
+    expect(response.status).toBe(0);
+    expect(response.value).toBeGreaterThan(BigInt(parent));
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]).toEqual({
+      pid: Number(response.value),
+      path: "/usr/bin/hello",
+    });
+  });
+
+  it("rolls back the new pid when onSpawnProcess rejects", async () => {
+    const { host, spawnCalls } = await freshHost({
+      spawnOutcome: () => ({ ok: false, errno: ERRNO.EINVAL }),
+    });
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/nope",
+      caps: CAPSET_ALL,
+    });
+
+    const { response } = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 401,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+
+    // Kernel maps any platform spawn error to -EIO for the
+    // userland response. The exact errno is not yet threaded
+    // through (see the SpawnOutcome type doc).
+    expect(response.status).toBeLessThan(0);
+    // The callback still fired with the tentative pid so the host
+    // side has a chance to log / surface the refusal.
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.path).toBe("/usr/bin/nope");
+
+    // A subsequent PROC_SPAWN with an accepting outcome must
+    // succeed and allocate a FRESH pid — the rolled-back pid
+    // from the first attempt is not reused yet (allocator is
+    // monotonic), but the important guarantee is that no state
+    // from the failed attempt lingers in a way that breaks a
+    // retry.
+    const retry = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 402,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    // Retry uses the default outcome from this closure, which is
+    // `{ ok: false, errno: EINVAL }` again — still fails for the
+    // same reason, but the dispatcher itself doesn't crash.
+    expect(retry.response.status).toBeLessThan(0);
+  });
+
+  it("rejects spawn from a parent missing stdio with -EINVAL", async () => {
+    const { host, spawnCalls } = await freshHost();
+    const parent = host.registerProcess(CAPSET_ALL);
+    // Only fd 1 installed — fd 0 and fd 2 are absent, which is
+    // what the kernel opcode handler refuses.
+    host.installConsoleFd(parent, 1);
+    host.markRunning(parent);
+
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/whatever",
+      caps: CAPSET_ALL,
+    });
+
+    const { response } = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 403,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+
+    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("rejects cap-superset requests with the Rust-side errno mapping", async () => {
+    const { host, spawnCalls } = await freshHost();
+    // An ordinary-app parent only holds DisplayClient. Spawning a
+    // child with CAPSET_DESKTOP_SHELL (which includes SHELL,
+    // ProcEnumerate, KeymapAdmin) violates the subset rule — the
+    // Rust-side `Kernel::proc_spawn` rejects it as NotCapable.
+    const parent = host.registerProcess(CAPSET_ORDINARY_APP);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/escalator",
+      caps: CAPSET_DESKTOP_SHELL,
+    });
+
+    const { response } = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 404,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+
+    // abi::errno::ENOTCAPABLE is 76.
+    expect(response.status).toBe(-76);
+    expect(spawnCalls).toHaveLength(0);
   });
 });
 

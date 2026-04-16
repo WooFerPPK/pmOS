@@ -130,14 +130,22 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // PROC_SPAWN is in the extension range (0x1100) but has no
-    // handler yet. Same check as the WASI case above.
+    // `PROC_WAIT` is in the extension range (0x1101) but still has
+    // no handler. Same shape as the WASI case above: decoded as a
+    // known extension opcode, routed to `dispatch_ext`'s `_ =>`
+    // arm, ENOSYS echoed back with the request_id intact.
+    //
+    // (This probe was `PROC_SPAWN` before that handler landed. When
+    // the next extension opcode — `PROC_WAIT`, `IPC_SOCKET`, etc.
+    // — gets implemented, swap this probe to whatever's still
+    // unhandled at that point, or delete the test once every
+    // extension opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::PROC_SPAWN,
+        opcode: op_ext::PROC_WAIT,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -547,6 +555,232 @@ fn cap_list_returns_full_cap_bitset() {
 
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, expected_bits);
+}
+
+// ---- proc_spawn -------------------------------------------------------
+//
+// Layout recap:
+//   args[0..4]  = path_len
+//   args[4..12] = caps bitset (u64 LE)
+//   heap[heap_ptr .. heap_ptr + path_len] = UTF-8 path
+//
+// Happy path: parent holds CAP_ALL, child gets CAP_ALL (subset rule
+// trivially satisfied), parent has fd 0/1/2 wired to /dev/console so
+// the stdio inheritance check passes, NativePlatform records the
+// spawn_process call. Result: a new pid that didn't exist before the
+// call, and a matching SpawnCall in `NativeState::spawn_calls`.
+
+/// Build a 16-byte args window for `PROC_SPAWN` with `path_len` at
+/// offset 0 and `caps_bits` packed as u64 LE at offset 4. This
+/// helper exists so the spawn-specific byte layout lives in one
+/// place and a rewording of the fields doesn't scatter through
+/// every test case.
+fn proc_spawn_args(path_len: u32, caps_bits: u64) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&path_len.to_le_bytes());
+    args[4..12].copy_from_slice(&caps_bits.to_le_bytes());
+    args
+}
+
+fn install_default_stdio(k: &mut Kernel, pid: abi::ext::Pid) {
+    k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(pid, 2, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+}
+
+#[test]
+fn proc_spawn_creates_child_and_records_platform_spawn_call() {
+    // Start from a clean NativePlatform so prior tests' spawn_calls
+    // don't leak into the assertion below.
+    kernel::platform::native::reset();
+
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+
+    let path = "/usr/bin/hello";
+    let mut heap = vec![0u8; 4096];
+    heap[..path.len()].copy_from_slice(path.as_bytes());
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 70,
+        args: proc_spawn_args(path.len() as u32, abi::cap::initial::INIT.0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+
+    assert_eq!(resp.status, 0);
+    assert!(resp.value > parent as i64, "new pid must be positive and fresh");
+    let new_pid = resp.value as i32;
+    assert!(k.procs.is_alive(new_pid));
+    assert_eq!(k.procs.get(new_pid).unwrap().ppid, parent);
+    // Child inherited the three stdio fd objects.
+    let child_fds = k.fds(new_pid).unwrap();
+    assert!(child_fds.get(0).is_some());
+    assert!(child_fds.get(1).is_some());
+    assert!(child_fds.get(2).is_some());
+
+    // Platform was asked to spawn a Worker for the new pid.
+    kernel::platform::native::with_state(|s| {
+        assert_eq!(s.spawn_calls.len(), 1);
+        let call = &s.spawn_calls[0];
+        assert_eq!(call.pid, new_pid);
+        assert_eq!(call.path, "/usr/bin/hello");
+    });
+}
+
+#[test]
+fn proc_spawn_rolls_back_when_platform_refuses() {
+    // Programme NativePlatform to fail the next spawn_process call.
+    // The PROC_SPAWN handler should roll the new pid all the way back
+    // so no child process is leaked: the pid does not exist after
+    // the call, and the kernel returns -EIO.
+    kernel::platform::native::reset();
+    kernel::platform::native::with_state(|s| {
+        s.next_spawn_error = Some(kernel::platform::DriverError::NotReady);
+    });
+
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+
+    let path = "/usr/bin/nope";
+    let mut heap = vec![0u8; 4096];
+    heap[..path.len()].copy_from_slice(path.as_bytes());
+
+    // Remember which pids exist pre-call so we can assert that NO new
+    // pid survives the rollback.
+    let before_alive: Vec<_> = (0..20)
+        .filter(|p| k.procs.is_alive(*p as i32))
+        .collect();
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 71,
+        args: proc_spawn_args(path.len() as u32, abi::cap::initial::INIT.0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EIO);
+    // No new pid in the process table: the set of alive pids is
+    // the same as before the call.
+    let after_alive: Vec<_> = (0..20)
+        .filter(|p| k.procs.is_alive(*p as i32))
+        .collect();
+    assert_eq!(before_alive, after_alive);
+    // Platform recorded no successful spawn (the error consumed the
+    // `next_spawn_error` slot without appending).
+    kernel::platform::native::with_state(|s| {
+        assert_eq!(s.spawn_calls.len(), 0);
+    });
+}
+
+#[test]
+fn proc_spawn_with_missing_stdio_returns_einval() {
+    // A parent that has no fd 0 can't inherit stdio into a child.
+    // The opcode handler refuses rather than fabricating a sentinel
+    // (see the note in the handler's docstring).
+    kernel::platform::native::reset();
+
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "stdio-less", 0);
+    // Install fd 1 and fd 2 but NOT fd 0.
+    k.install_fd(parent, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(parent, 2, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    let path = "/usr/bin/anything";
+    let mut heap = vec![0u8; 4096];
+    heap[..path.len()].copy_from_slice(path.as_bytes());
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 72,
+        args: proc_spawn_args(path.len() as u32, abi::cap::initial::INIT.0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    // No spawn call was made.
+    kernel::platform::native::with_state(|s| {
+        assert_eq!(s.spawn_calls.len(), 0);
+    });
+}
+
+#[test]
+fn proc_spawn_rejects_cap_superset() {
+    // A parent that does NOT hold `Cap::CapGrant` cannot spawn a
+    // child with it. The `Kernel::proc_spawn` subset check fires
+    // and `kerr_to_errno` maps `NotCapable` to ENOTCAPABLE.
+    kernel::platform::native::reset();
+
+    let mut k = make_kernel();
+    // Ordinary-app parent: only DisplayClient. Initial::ORDINARY_APP
+    // is `CapSet::from_caps(&[Cap::DisplayClient])`.
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "ordinary",
+            ppid: 0,
+            caps: abi::cap::initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(parent).unwrap();
+    k.procs
+        .transition(parent, ProcState::Running)
+        .unwrap();
+    install_default_stdio(&mut k, parent);
+
+    let path = "/usr/bin/escalator";
+    let mut heap = vec![0u8; 4096];
+    heap[..path.len()].copy_from_slice(path.as_bytes());
+
+    // Request CapSet::ALL for the child — parent doesn't hold it.
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 73,
+        args: proc_spawn_args(path.len() as u32, abi::cap::CapSet::ALL.0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+}
+
+#[test]
+fn proc_spawn_rejects_invalid_utf8_path() {
+    kernel::platform::native::reset();
+
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+
+    let mut heap = vec![0u8; 4096];
+    heap[..4].copy_from_slice(&[0xff, 0xfe, 0xfd, 0xfc]);
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 74,
+        args: proc_spawn_args(4, abi::cap::initial::INIT.0),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
 }
 
 // ---- request_id echo is universal -------------------------------------

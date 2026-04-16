@@ -124,6 +124,18 @@ async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }>
       pmos_host_panic: (_ptr: number, _len: number): void => {
         host.panics += 1;
       },
+      pmos_host_spawn_process: (
+        _pid: number,
+        _pathPtr: number,
+        _pathLen: number,
+      ): number => {
+        // No-op stub: this test file exercises the *direct export
+        // surface* and does not issue PROC_SPAWN. The stub exists
+        // only so instantiation succeeds after the import was added
+        // to `platform/wasm.rs`. A richer spawn test lives in
+        // `kernel-wasm-host.test.ts`.
+        return 0;
+      },
     },
   };
 

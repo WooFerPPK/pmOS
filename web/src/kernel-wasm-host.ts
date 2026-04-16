@@ -82,6 +82,24 @@ interface KernelExports {
   readonly kernel_heap_len: () => number;
 }
 
+/**
+ * Outcome of a [`KernelWasmHostOptions.onSpawnProcess`] callback. The
+ * TS host returns `{ ok: true }` when it has accepted responsibility
+ * for instantiating a Worker for the new pid, or
+ * `{ ok: false, errno }` when it cannot — in which case the kernel
+ * rolls back the new process-table entry before returning `-EIO` from
+ * the `PROC_SPAWN` syscall.
+ *
+ * `errno` is interpreted as the `DriverError::Errno` value for the
+ * Rust-side [`Platform::spawn_process`]. The kernel opcode handler
+ * currently translates ANY `spawn_process` failure to `-EIO`, so the
+ * exact errno only affects Rust-level diagnostics; a future slice may
+ * thread the precise errno through.
+ */
+export type SpawnOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly errno: number };
+
 // ---- Host-import callbacks ------------------------------------------
 
 /**
@@ -116,6 +134,21 @@ export interface KernelWasmHostOptions {
    * want deterministic time replace this with a counter.
    */
   readonly nowNs?: () => bigint;
+  /**
+   * Called when the kernel asks the host to spawn a user Worker for
+   * a newly-created pid. The callback receives the pid the kernel
+   * allocated and the UTF-8 binary path the caller passed to
+   * `PROC_SPAWN`, and returns a [`SpawnOutcome`] describing whether
+   * the host accepted the spawn request.
+   *
+   * The default is `{ ok: true }` — tests that don't care about the
+   * spawn path get a no-op accept, and production code overrides
+   * this to actually look the binary up and instantiate a new
+   * Worker. Returning `{ ok: false, errno }` triggers the kernel's
+   * roll-back path: the new pid is reaped before the `PROC_SPAWN`
+   * syscall returns `-EIO` to the caller.
+   */
+  readonly onSpawnProcess?: (pid: number, path: string) => SpawnOutcome;
 }
 
 // ---- Dispatch result -------------------------------------------------
@@ -216,6 +249,27 @@ export class KernelWasmHost implements Kernel {
           const bytes = new Uint8Array(memory.buffer, ptr, len);
           const message = new TextDecoder().decode(bytes);
           onPanic(message);
+        },
+
+        pmos_host_spawn_process: (
+          pid: number,
+          pathPtr: number,
+          pathLen: number,
+        ): number => {
+          if (memory === undefined) return 0;
+          const pathBytes = new Uint8Array(memory.buffer, pathPtr, pathLen);
+          const path = new TextDecoder().decode(pathBytes);
+          const callback = options.onSpawnProcess;
+          if (callback === undefined) return 0;
+          const outcome = callback(pid, path);
+          // Rust-side contract: 0 = success, <0 = -errno, >0 = transport error.
+          if (outcome.ok) return 0;
+          // The kernel-side `WasmPlatform::spawn_process` expects a
+          // negative return value for DriverError::Errno; positive
+          // values signal transport failures. Testers that want the
+          // rollback path always hit DriverError::Errno — pass a
+          // positive errno and it gets negated here.
+          return -outcome.errno;
         },
       },
     };

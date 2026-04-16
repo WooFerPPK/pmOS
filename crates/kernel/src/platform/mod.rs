@@ -38,6 +38,8 @@
 
 use core::panic::PanicInfo;
 
+use abi::ext::Pid;
+
 // --- Driver identifiers -------------------------------------------------
 //
 // These match the DevId namespace in contracts/driver-kernel.md §2 and
@@ -107,6 +109,28 @@ pub trait Platform: Sync + 'static {
     /// notification regardless of whether the panic originated in
     /// a `panic!()`, an `unreachable!()`, or an allocator OOM.
     fn on_panic(&self, info: &PanicInfo);
+
+    /// Ask the host to instantiate a user Worker running the binary
+    /// named `path`, bound to process id `pid`. The kernel has
+    /// already created the process-table entry, installed its cap
+    /// set, inherited fds from the parent, and marked it `Ready` by
+    /// the time this is called; `spawn_process` is the request to
+    /// the host side to actually back that pid with a running wasm
+    /// instance.
+    ///
+    /// The spawn is asynchronous from the kernel's point of view.
+    /// `Ok(())` means the host accepted the spawn request and has
+    /// started the Worker instantiation; the new process will begin
+    /// making syscalls over its dedicated SAB once the Worker has
+    /// loaded the binary and entered `_start`. Until then the
+    /// process sits on the scheduler's ready queue with no activity.
+    ///
+    /// `Err` means the spawn request was rejected *before* any
+    /// Worker was launched — the kernel MUST roll back its
+    /// process-table entry. The caller (the `PROC_SPAWN` opcode
+    /// handler) is responsible for the rollback; `spawn_process`
+    /// itself has no side effects on kernel state.
+    fn spawn_process(&self, pid: Pid, path: &str) -> DriverResult<()>;
 }
 
 // --- Active-implementation selector ------------------------------------

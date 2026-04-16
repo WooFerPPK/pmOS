@@ -111,6 +111,26 @@ pub(super) fn args_u32(req: &Request, offset: usize) -> u32 {
     ])
 }
 
+/// Read a `u64` little-endian from `req.args` at `offset`. Used by
+/// handlers that pack a 64-bit value into the inline args window
+/// (notably `PROC_SPAWN`, which carries a `CapSet` bitset).
+///
+/// Panics (debug only) if `offset + 8 > 16`.
+#[inline]
+pub(super) fn args_u64(req: &Request, offset: usize) -> u64 {
+    debug_assert!(offset + 8 <= 16);
+    u64::from_le_bytes([
+        req.args[offset],
+        req.args[offset + 1],
+        req.args[offset + 2],
+        req.args[offset + 3],
+        req.args[offset + 4],
+        req.args[offset + 5],
+        req.args[offset + 6],
+        req.args[offset + 7],
+    ])
+}
+
 /// Borrow the heap slice the request refers to via
 /// `heap_ptr` / `heap_len`. Returns `None` if the requested range
 /// is out of bounds, which the caller turns into `EINVAL`.

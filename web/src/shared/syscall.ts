@@ -185,6 +185,44 @@ export function capBit(cap: number): bigint {
   return 1n << BigInt(cap);
 }
 
+// ---- proc_spawn manifest encoding -----------------------------------
+//
+// Mirror of the [`abi::ext::SpawnManifest`] Rust type + the args /
+// heap layout `crates/kernel/src/syscall/ext.rs`'s `handle_proc_spawn`
+// parses. The current wire format is minimal: path string + caps
+// bitset, with stdio inherited implicitly from the parent's fd table.
+// Richer fields (argv, envp, cwd, extra fd dups) will be appended to
+// the heap payload in future slices; this helper will grow
+// correspondingly.
+
+/** Arguments to a `PROC_SPAWN` syscall (first-landing shape). */
+export interface SpawnManifest {
+  /** Absolute path of the binary to spawn. */
+  readonly path: string;
+  /** Capability bitset the child should hold. Must be a subset of the caller's own caps. */
+  readonly caps: bigint;
+}
+
+/**
+ * Build the `(args, heap)` pair for a [`PROC_SPAWN`] syscall from a
+ * typed manifest. `args` goes in `SyscallRequest.args` (or pack
+ * path_len into `arg0` if preferred), and `heap` goes at the offset
+ * `SyscallRequest.heapPtr` points at.
+ */
+export function encodeSpawnManifest(
+  manifest: SpawnManifest,
+): { args: Uint8Array; heap: Uint8Array } {
+  const path = new TextEncoder().encode(manifest.path);
+  const args = new Uint8Array(16);
+  const view = new DataView(args.buffer);
+  // args[0..4] = path_len
+  view.setUint32(0, path.length, true);
+  // args[4..12] = caps bitset (u64 LE)
+  view.setBigUint64(4, manifest.caps, true);
+  // args[12..16] = reserved (zero)
+  return { args, heap: path };
+}
+
 /** `abi::cap::CapSet::ALL` — every bit set. */
 export const CAPSET_ALL = 0xffff_ffff_ffff_ffffn;
 
