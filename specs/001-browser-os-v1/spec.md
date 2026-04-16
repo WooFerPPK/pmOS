@@ -98,9 +98,9 @@ visitor can see it, and the site operator cannot see it.
 later story that writes to disk depends on this working. It is also the
 core of the "private OS we cannot take down" product promise.
 
-**Independent Test**: Open the terminal. Create `/home/me/notes/hi.txt`
+**Independent Test**: Open the terminal. Create `/home/user/notes/hi.txt`
 with content "hello". Close the tab. Reopen the URL. Read
-`/home/me/notes/hi.txt`. See "hello".
+`/home/user/notes/hi.txt`. See "hello".
 
 **Acceptance Scenarios**:
 
@@ -171,15 +171,15 @@ and most visitors will try it before the terminal. It exercises the same
 VFS calls the shell uses, from a different process lineage, so it is an
 independent confidence signal.
 
-**Independent Test**: In the file manager, create `/home/me/notes`. Open
+**Independent Test**: In the file manager, create `/home/user/notes`. Open
 the text editor, type "hello world," save as
-`/home/me/notes/hi.txt`, close the editor. In the file manager see
+`/home/user/notes/hi.txt`, close the editor. In the file manager see
 `hi.txt` with size > 0. Double-click it; the text editor reopens with
 "hello world" as its content.
 
 **Acceptance Scenarios**:
 
-1. **Given** the file manager is showing `/home/me`, **When** the user
+1. **Given** the file manager is showing `/home/user`, **When** the user
    creates a new folder `notes`, **Then** `notes` appears immediately
    and is browsable.
 2. **Given** the text editor is open on a new file, **When** the user

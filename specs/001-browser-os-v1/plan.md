@@ -68,9 +68,11 @@ a Justfile that produces a static deploy directory.
 
 **Language/Version**:
 - Rust (latest stable, targeting wasm32-unknown-unknown for the
-  kernel; wasm32-wasi for userland: init, display server, toolkit,
+  kernel; wasm32-wasip1 for userland: init, display server, toolkit,
   shell, and bundled apps). Kernel is `no_std + alloc`; userland uses
-  full `std` via WASI.
+  full `std` via WASI. (Upstream rustup renamed the former `wasm32-wasi`
+  target to `wasm32-wasip1`; references elsewhere in this plan use the
+  current name.)
 - TypeScript 5.x (strict) for the JS bootstrap, drivers, and service
   worker.
 
@@ -201,7 +203,7 @@ under **Known Deviations** with justification.
 | III | Browser-only, zero backend | **PASS** | Deploy is a static file directory. No backend, no accounts, no telemetry, no origin-side dynamic behaviour. Net stack for user programs is `fetch()`+WebSocket, invoked only by user code. |
 | IV | Offline-first and persistent | **PASS** | Service worker caches the entire OS bundle; OPFS holds the root filesystem. Subsequent loads require no network. |
 | V | Process isolation is mandatory | **PASS** | Each userland process is a distinct WASM instance in its own Worker. WASM linear memory is physically separate — this is **stronger** than conventional OS process isolation because it is enforced at the execution-substrate level, not by MMU page tables a compromised kernel could tamper with. All IPC goes through the kernel ring-buffer transport and through kernel-owned pipe/socket buffers. |
-| VI | Standard syscall surface (WASI-based) | **PASS** | WASI preview 1 is the baseline. Extension syscalls are limited to: IPC endpoint/connect/send/recv with fd passing; `spawn`/`waitpid`/signal-equivalent (no `fork`); display server connect; capability query/grant. Each extension is documented in `contracts/syscalls.md` with an explicit "why WASI does not cover this" justification. |
+| VI | Standard syscall surface (WASI-based) | **PASS** | WASI preview 1 is the baseline. Extension syscalls are limited to: IPC endpoint/connect/send/recv with fd passing; `spawn`/`waitpid`/signal-equivalent (no `fork`); display server connect; capability query/grant; `mount`/`umount` (new-filesystem registration); `fs_watch` (preferences-change delivery — the settings app writes `/etc/preferences.toml`, the toolkit and desktop shell watch it, per `contracts/syscalls.md §3.7`); `host_file_recv` (the bootstrap's drag-drop / file-picker handler surfaces a host `File` to the file-manager process as a read-only fd — a JS-to-kernel driver channel, opcode 0x1500, documented in `contracts/syscalls.md §3.6`). Each extension is documented in `contracts/syscalls.md` with an explicit "why WASI does not cover this" justification. |
 | VII | Protocol over API for the display server | **PASS** | Clients connect to `/run/display` (a Unix-socket-equivalent IPC endpoint) and speak a Wayland-inspired wire protocol. The toolkit is a convenience library that speaks the same protocol. A hand-written toolkit-free client is explicitly scheduled as a v1 integration test to prove the protocol is the source of truth. |
 | VIII | Bottom-up construction | **PASS** | Task graph (built in `/speckit.tasks`) will order: kernel (tested headless) → drivers (tested with mock kernel) → display server (tested with mock client + mock framebuffer) → toolkit (tested against mock display server) → desktop shell → bundled apps. No layer starts before the layer below it is demonstrably working and covered by isolation tests. |
 | IX | Performance budget | **PASS (monitored)** | Cold < 10 s, warm < 3 s, input < 100 ms are the plan's budgets. Design choices that respect the budget: main thread reserved for driver event loop and framebuffer `putImageData` (kernel in its own Worker); SAB + Atomics.wait avoids postMessage overhead on hot syscall paths; OPFS SyncAccessHandle avoids the async overhead of IndexedDB; service worker makes warm load cache-only. Each task MUST state its expected budget impact. |
@@ -242,6 +244,7 @@ rust-toolchain.toml              # pinned stable toolchain, two targets
 crates/
 ├── abi/                         # syscall numbering + request/response layouts
 ├── ring/                        # SAB ring buffer transport (kernel & userland halves)
+├── display-proto/               # Phase-2 extraction: shared wire codec + ID rules (see Known Deviations #1)
 ├── kernel/                      # wasm32-unknown-unknown, no_std + alloc
 │   ├── src/
 │   │   ├── main.rs              # WASM entrypoint (init, main loop)
@@ -255,8 +258,8 @@ crates/
 │   │   ├── cap/                 # capability table
 │   │   └── dev/                 # device node dispatch (fb0, input, console, null, ...)
 │   └── tests/                   # native-host integration tests (no display server)
-├── init/                        # wasm32-wasi, PID 1, reads /etc/init.conf
-├── display-server/              # wasm32-wasi, owns /dev/fb0 and /dev/input/*
+├── init/                        # wasm32-wasip1, PID 1, reads /etc/init.conf
+├── display-server/              # wasm32-wasip1, owns /dev/fb0 and /dev/input/*
 │   ├── src/
 │   │   ├── main.rs
 │   │   ├── protocol/            # wire format decoder/encoder
@@ -435,10 +438,79 @@ principles during research.
 | IX | Performance budget | **PASS (monitored)** | Budgets remain cold < 10 s, warm < 3 s, input < 100 ms. Design decisions that support them: (a) kernel in its own Worker so the main thread is free for compositor presentation; (b) SAB + `Atomics.wait` avoids `postMessage` overhead on hot syscall paths; (c) OPFS `SyncAccessHandle` avoids IndexedDB async overhead for file I/O; (d) software compositor's worst case (1920×1080 ARGB blit) stays inside one frame on the target machine class; (e) service worker precache makes warm load local-only. **Task-graph obligation**: every task MUST state its expected performance impact. Any task whose estimate blows a budget is rejected or must be accompanied by an approved deviation. |
 | X | Testability at every layer | **PASS** | Four isolation test layers are named in `quickstart.md §4` and each has a `just` target. The kernel builds for the host target via its `Platform` trait. The display server runs its tests against a mock client and mock framebuffer. The toolkit runs its tests against a mock display server. Drivers run with a mock kernel ring. Integration (Playwright) is additional, never a substitute. The `layering-test.spec.ts` is called out as the Principle II acceptance gate and is part of `just test-integration`. |
 
-**Result**: all ten principles PASS on the post-design check. No
-Known Deviations. The plan is internally consistent, and each
-Phase 1 artefact reinforces (rather than relaxes) the gates from
-the pre-Phase-0 check.
+**Result**: all ten principles PASS on the post-design check. The
+plan is internally consistent, and each Phase 1 artefact reinforces
+(rather than relaxes) the gates from the pre-Phase-0 check.
+
+### Known Deviations (Phase 2 implementation drift)
+
+All ten principles still PASS. The deviations below are not
+principle violations — they are places where the Phase 2
+implementation's module layout drifted from the `plan.md`
+"Project Structure" section during bottom-up construction. They
+are recorded here (per the constitution's "Deviation log"
+requirement: deviations MUST live in the plan that introduced
+them) so that a future reader looking for the originally-planned
+structure understands where the code actually lives and why.
+Tasks.md Phase 2 carries per-T-ID deviation notes; this block
+is the deviation **register** the constitution refers to.
+
+1. **`crates/display-proto/` crate extraction** — a shared
+   protocol codec crate was extracted out of `display-server/`
+   so that `display-server/`, `toolkit/`, and
+   `toolkit-free-client/` can all depend on the same wire
+   encoding, object-ID rules, request/event enums, and
+   interface definitions. Absorbs T098 (wire framing) + T099
+   (object-ID allocator) + the message-layout work implicit in
+   T100–T105. Tests at `crates/display-proto/tests/`. **Future
+   protocol work belongs in `display-proto`.** `display-proto/`
+   is implicitly in the layer catalogue at "display server"
+   since it is just an internal split of that layer — nothing
+   above the display server may depend on it except via the
+   toolkit (which already may, per the layer catalogue).
+
+2. **`crates/kernel/src/sys.rs` + the `Kernel` struct** —
+   rather than building the syscall dispatcher first (T071 /
+   T073) and hanging semantic logic off it, the kernel exposes
+   a semantic Rust method surface on `Kernel` that native
+   tests drive directly. `Kernel::proc_spawn`, `proc_wait`,
+   `proc_kill`, `path_open`, `fd_read`, `fd_write`, `fd_close`,
+   `display_bind`, `display_connect`, `drain_signals`, etc.
+   all live there. Deliberate testability choice (Principle X):
+   the T077 headless-shell gate runs without any SAB transport
+   because `sys.rs` can be constructed and exercised in-process.
+   The opcode dispatcher (T071/T073) sits on top of this
+   surface and translates SAB ring requests into method calls;
+   it does not replace `sys.rs`.
+
+3. **`crates/toolkit/src/protocol.rs` + `theme.rs`** — the
+   toolkit has its own wire-protocol client (`protocol.rs`,
+   ~620 lines) that speaks directly to `display-proto`,
+   independent of T114's `App::connect`. T114 is now framed as
+   a thin facade extraction over `protocol.rs`, not a
+   reimplementation. `theme.rs` ships ahead of its nominal home
+   (T184, the settings app) because `WindowFrame` needs theme
+   colours to paint chrome — the theme struct + default
+   light/dark palettes live there now. Settings-app integration
+   remains T184; `theme.rs` today is just the data model +
+   defaults.
+
+4. **`crates/term/` + the TypeScript preview slice** —
+   `crates/term/` and the TS files
+   `web/src/{terminal,mock-kernel,console-host,console-check,fb-host}.ts`
+   + `web/src/shared/{rasterizer,font,worker-proto,input-proto}.ts`
+   are a visible-progress demo slice built before real kernel
+   IPC (T072) and the real `/run/display` accept loop (T110)
+   exist. The code is real and tested but the wiring is
+   **preview-only**: the TS rasterizer paints directly into
+   `fb.ts` instead of going through a
+   `display-server`→`fb` path, `mock-kernel.ts` stands in for a
+   real kernel Worker, and `term::Session` paints through a
+   bespoke `rasterize_snapshot` rather than through
+   `toolkit::draw::Canvas`. **Reconciliation required** when
+   T091 (real kernel Worker) and T110 (`/run/display` accept
+   loop) land — at that point the rasterizer/mock-kernel stubs
+   get deleted and `term` migrates onto `Canvas`.
 
 ### Planning Complete
 
