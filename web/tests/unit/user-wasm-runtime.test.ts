@@ -54,6 +54,7 @@ import {
 let kernelWasmBytes: ArrayBuffer;
 let helloWasmBytes: ArrayBuffer;
 let spawnerWasmBytes: ArrayBuffer;
+let ipcSelfTestWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -69,8 +70,12 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_wasi_spawner.wasm",
   );
+  const ipcSelfTestPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/ipc_self_test.wasm",
+  );
 
-  for (const p of [kernelPath, helloPath, spawnerPath]) {
+  for (const p of [kernelPath, helloPath, spawnerPath, ipcSelfTestPath]) {
     if (!fs.existsSync(p)) {
       throw new Error(
         `${p} not found. Run \`just build\` (or the cargo build lines from the Justfile's build target) first.`,
@@ -91,6 +96,7 @@ beforeAll(() => {
   kernelWasmBytes = loadWasm(kernelPath);
   helloWasmBytes = loadWasm(helloPath);
   spawnerWasmBytes = loadWasm(spawnerPath);
+  ipcSelfTestWasmBytes = loadWasm(ipcSelfTestPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -346,6 +352,79 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(spawnResult.response.status).toBeLessThan(0);
     expect(kernel.hasPendingSpawns).toBe(false);
     expect(consoleWrites).toHaveLength(0);
+  });
+
+  it("ipc-self-test binary exercises every IPC opcode end-to-end through real wasm", async () => {
+    // The IPC-opcode acceptance test. A single no_std binary
+    // plays both server and client via self-connection —
+    // exercises every IPC opcode (`IPC_SOCKET`, `IPC_BIND`,
+    // `IPC_LISTEN`, `IPC_CONNECT`, `IPC_ACCEPT`), the
+    // WASI-side `fd_read` shim we just added, AND the existing
+    // `fd_write` + `proc_exit` shims — in one `_start` pass.
+    //
+    // The binary's exit code is the assertion: 0 means every
+    // step succeeded. Non-zero codes (10..18, 101) point at a
+    // specific step that failed. See `ipc-self-test/src/lib.rs`
+    // for the step → code map.
+    //
+    // Side-effect assertion: the binary reads "hello via ipc\n"
+    // from the server-side socket and writes those bytes to
+    // stdout, so `onConsoleWrite` captures them. That proves
+    // the data actually flowed through the kernel's IPC state
+    // machine rather than being short-circuited somewhere.
+    const consoleWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/ipc-self-test", ipcSelfTestWasmBytes],
+    ]);
+
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    // Virtual init with stdio so the child inherits fd 0/1/2 and
+    // step 9's `fd_write(1, ...)` lands on /dev/console.
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    // init issues PROC_SPAWN.
+    const manifest = encodeSpawnManifest({
+      path: "/bin/ipc-self-test",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    // The binary exits 0 iff every IPC step succeeded. Its
+    // exit code is not directly observable from the test
+    // (drainPendingSpawns doesn't surface per-child exit
+    // codes yet), but the side effect — the received bytes
+    // landing on /dev/console via the final fd_write — is.
+    // A silent failure (no console write) would mean some
+    // step bailed early with a non-zero proc_exit before
+    // reaching the echo.
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(consoleWrites).toHaveLength(1);
+    expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
+      "hello via ipc\n",
+    );
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {

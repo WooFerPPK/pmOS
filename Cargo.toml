@@ -19,6 +19,7 @@ members = [
     "crates/toolkit-free-client",
     "crates/hello-wasi-min",
     "crates/hello-wasi-spawner",
+    "crates/ipc-self-test",
     "crates/integration-tests",
     "crates/xtask",
 ]

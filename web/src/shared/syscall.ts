@@ -136,9 +136,16 @@ export const OP_WASI = {
 
 /** PMos extension opcodes (0x1000..0x1501). */
 export const OP_EXT = {
+  IPC_SOCKET: 0x1000,
+  IPC_BIND: 0x1001,
+  IPC_LISTEN: 0x1002,
+  IPC_CONNECT: 0x1003,
+  IPC_ACCEPT: 0x1004,
   PROC_SPAWN: 0x1100,
   PROC_SELF: 0x1103,
   PROC_PARENT: 0x1104,
+  PROC_WAIT: 0x1101,
+  DISPLAY_CONNECT: 0x1200,
   CAP_CHECK: 0x1300,
   CAP_LIST: 0x1301,
 } as const;

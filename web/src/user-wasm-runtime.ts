@@ -263,6 +263,99 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // WASI `fd_read`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, iovs_ptr: i32, iovs_len: i32, nread_ptr: i32) -> errno: i32
+      //
+      // Iovec layout at `iovs_ptr + i*8`:
+      //   [0..4]  = buf (i32 pointer into user memory; writable
+      //                  destination for this iovec's slice)
+      //   [4..8]  = buf_len (u32, capacity)
+      //
+      // Strategy: sum every iovec's `buf_len` into a single total
+      // capacity, dispatch ONE `FD_READ` syscall with that
+      // capacity, and then distribute the returned bytes across
+      // the iovecs in order (filling each up to its own capacity
+      // before moving to the next). This mirrors the `fd_write`
+      // path that gather-concatenates user buffers into one
+      // payload — the PMos opcode API carries a single contiguous
+      // heap window per request, so scatter-gather lives entirely
+      // on this side.
+      //
+      // Zero-length reads (iovs_len == 0 or every buf_len == 0)
+      // short-circuit to `nread = 0` without calling the kernel,
+      // matching the WASI contract that a zero-capacity read is
+      // a trivial success.
+      fd_read: (
+        fd: number,
+        iovsPtr: number,
+        iovsLen: number,
+        nreadPtr: number,
+      ): number => {
+        if (this.memory === undefined) {
+          return ERRNO.EINVAL;
+        }
+
+        // Read the iovec list and compute total capacity. Each
+        // iovec is captured as (ptr, len) in a JS array so the
+        // distribution loop below can walk it without re-reading
+        // user memory (which could detach if the dispatch causes
+        // an unexpected grow).
+        let view = new DataView(this.memory.buffer);
+        const iovecs: Array<{ ptr: number; len: number }> = [];
+        let totalCapacity = 0;
+        for (let i = 0; i < iovsLen; i += 1) {
+          const iovBase = iovsPtr + i * 8;
+          const bufPtr = view.getUint32(iovBase, true);
+          const bufLen = view.getUint32(iovBase + 4, true);
+          iovecs.push({ ptr: bufPtr, len: bufLen });
+          totalCapacity += bufLen;
+        }
+
+        if (totalCapacity === 0) {
+          view.setUint32(nreadPtr, 0, true);
+          return 0;
+        }
+
+        // Dispatch a single FD_READ with the combined capacity.
+        const { response, heapOut } = this.backend.dispatch({
+          opcode: OP_WASI.FD_READ,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: totalCapacity,
+        });
+
+        if (response.status !== 0) {
+          return -response.status;
+        }
+
+        const nread = Number(response.value);
+        // Distribute `heapOut` across the iovecs in order.
+        // `heapOut.length` equals `response.extraLen` which equals
+        // `nread`, but we loop with `nread` to stay explicit about
+        // the byte count contract.
+        let offset = 0;
+        const writeBuf = new Uint8Array(this.memory.buffer);
+        for (const iov of iovecs) {
+          if (offset >= nread) break;
+          const chunk = Math.min(iov.len, nread - offset);
+          if (chunk === 0) continue;
+          writeBuf.set(
+            heapOut.subarray(offset, offset + chunk),
+            iov.ptr,
+          );
+          offset += chunk;
+        }
+
+        // `view` may be stale if the set() above triggered a
+        // grow. Re-fetch before writing nread.
+        view = new DataView(this.memory.buffer);
+        view.setUint32(nreadPtr, nread, true);
+        return 0;
+      },
+
       // WASI `proc_exit`.
       //
       // Signature: (rval: i32) -> never.
@@ -335,6 +428,129 @@ export class UserWasmRuntime {
           // is already the negative form our ABI promises.
           return response.status;
         }
+        return Number(response.value);
+      },
+
+      // `ipc_socket(ty: i32) -> i32`
+      //
+      // Create an unbound socket. Returns the new fd (positive)
+      // or negative errno. `ty` is 0 = Stream, 1 = Dgram; any
+      // other value returns -EINVAL.
+      ipc_socket: (ty: number): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.IPC_SOCKET,
+          requestId: 0,
+          arg0: ty,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return response.status;
+        return Number(response.value);
+      },
+
+      // `ipc_bind(fd: i32, path_ptr: i32, path_len: i32) -> i32`
+      //
+      // Bind an unbound socket fd to the kernel-visible path
+      // the caller has written into user memory at (path_ptr,
+      // path_len). Returns 0 on success, negative errno on
+      // failure (EADDRINUSE, EBADF, EINVAL for bad fd/path/state).
+      ipc_bind: (
+        fd: number,
+        pathPtr: number,
+        pathLen: number,
+      ): number => {
+        if (this.memory === undefined) return -ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(
+          this.memory.buffer,
+          pathPtr,
+          pathLen,
+        );
+        // Copy out of user memory immediately — the Rust side
+        // will read the path from its own heap scratch, not
+        // from user wasm memory.
+        const pathCopy = new Uint8Array(pathBytes);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.IPC_BIND,
+            requestId: 0,
+            arg0: fd,
+            heapPtr: 0,
+            heapLen: pathLen,
+          },
+          pathCopy,
+        );
+        return response.status;
+      },
+
+      // `ipc_listen(fd: i32, backlog: i32) -> i32`
+      //
+      // Transition a bound socket to listening. Returns 0 on
+      // success, negative errno on failure (EINVAL for bad
+      // state, EBADF for bad fd).
+      ipc_listen: (fd: number, backlog: number): number => {
+        // Pack fd + backlog as two u32s into the 16-byte args
+        // window. `args` rather than `arg0` because there are
+        // two scalar arguments.
+        const args = new Uint8Array(16);
+        const view = new DataView(args.buffer);
+        view.setUint32(0, fd, true);
+        view.setUint32(4, backlog, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.IPC_LISTEN,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status;
+      },
+
+      // `ipc_connect(fd: i32, path_ptr: i32, path_len: i32) -> i32`
+      //
+      // Connect an unbound socket to the listener at `path`.
+      // Returns 0 on success, negative errno on failure
+      // (ECONNREFUSED for unbound path, EBADF for bad fd,
+      // EINVAL for bad state).
+      ipc_connect: (
+        fd: number,
+        pathPtr: number,
+        pathLen: number,
+      ): number => {
+        if (this.memory === undefined) return -ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(
+          this.memory.buffer,
+          pathPtr,
+          pathLen,
+        );
+        const pathCopy = new Uint8Array(pathBytes);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.IPC_CONNECT,
+            requestId: 0,
+            arg0: fd,
+            heapPtr: 0,
+            heapLen: pathLen,
+          },
+          pathCopy,
+        );
+        return response.status;
+      },
+
+      // `ipc_accept(listener_fd: i32) -> i32`
+      //
+      // Accept one pending connection from the listener.
+      // Returns the new server-side fd (positive) or negative
+      // errno (EAGAIN if no client pending, EBADF for bad fd,
+      // EINVAL if the fd isn't a listening socket).
+      ipc_accept: (listenerFd: number): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.IPC_ACCEPT,
+          requestId: 0,
+          arg0: listenerFd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return response.status;
         return Number(response.value);
       },
     } as const;

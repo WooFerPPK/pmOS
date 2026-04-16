@@ -1,0 +1,12 @@
+[package]
+name = "ipc-self-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Same shape as `hello-wasi-min` and `hello-wasi-spawner`: no_std
+# cdylib, cfg-gated on `target_arch = "wasm32"` so
+# `cargo test --workspace` sees a native-target no-op.
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
