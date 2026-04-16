@@ -3,6 +3,7 @@
   "assets": [
     "_headers",
     "assets/bin/display-server.wasm",
+    "assets/bin/display_server_lite.wasm",
     "assets/bin/edit.wasm",
     "assets/bin/files.wasm",
     "assets/bin/hello_framebuffer.wasm",

@@ -1223,6 +1223,178 @@ fn display_connect_with_server_listening_returns_connected_fd() {
 }
 
 #[test]
+fn display_bind_installs_listener_at_run_display_for_display_server_cap() {
+    // Symmetric to the existing DISPLAY_CONNECT happy-path
+    // test: a process with DISPLAY_SERVER caps dispatches
+    // DISPLAY_BIND and gets back a listener fd. The kernel's
+    // `Kernel::display_bind` already creates the socket,
+    // binds `/run/display`, and transitions to Listening — the
+    // opcode handler is a trivial adapter.
+    //
+    // A subsequent DISPLAY_CONNECT call from a different
+    // DISPLAY_CLIENT process should then succeed (proving the
+    // listener really is bound at the well-known path).
+    let mut k = make_kernel();
+    let srv = k
+        .register_process(RegisterArgs {
+            name: "srv",
+            ppid: 0,
+            caps: abi::cap::initial::DISPLAY_SERVER,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(srv).unwrap();
+    k.procs.transition(srv, ProcState::Running).unwrap();
+
+    let mut heap = vec![0u8; 32];
+    let resp = dispatch(
+        &mut k,
+        srv,
+        &Request {
+            opcode: op_ext::DISPLAY_BIND,
+            flags: 0,
+            request_id: 230,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, 0);
+    let listener_fd = resp.value as u32;
+    assert!(k.fds(srv).unwrap().get(listener_fd).is_some());
+
+    // A DISPLAY_CLIENT-capable process can now connect to the
+    // freshly-bound listener.
+    let cli = k
+        .register_process(RegisterArgs {
+            name: "cli",
+            ppid: 0,
+            caps: abi::cap::initial::DESKTOP_SHELL,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(cli).unwrap();
+    k.procs.transition(cli, ProcState::Running).unwrap();
+
+    let connect_resp = dispatch(
+        &mut k,
+        cli,
+        &Request {
+            opcode: op_ext::DISPLAY_CONNECT,
+            flags: 0,
+            request_id: 231,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(connect_resp.status, 0);
+}
+
+#[test]
+fn display_bind_without_display_server_cap_returns_enotcapable() {
+    // A process with DISPLAY_CLIENT but NOT DISPLAY_SERVER
+    // can't claim ownership of /run/display. The cap check in
+    // `Kernel::display_bind` fires first, producing
+    // `KernelError::NotCapable` → `ENOTCAPABLE` via
+    // `kerr_to_errno`.
+    let mut k = make_kernel();
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "cli-only",
+            ppid: 0,
+            caps: abi::cap::initial::DESKTOP_SHELL,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(pid).unwrap();
+    k.procs.transition(pid, ProcState::Running).unwrap();
+
+    let mut heap = vec![0u8; 32];
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::DISPLAY_BIND,
+            flags: 0,
+            request_id: 232,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+}
+
+#[test]
+fn display_bind_second_caller_returns_eaddrinuse() {
+    // Only one display server can exist at a time — a second
+    // DISPLAY_BIND on /run/display while the first is still
+    // live fails with EADDRINUSE. Guards against a future bug
+    // where a misbehaving (or compromised) display-server
+    // replacement could accidentally mask the real one.
+    let mut k = make_kernel();
+    let srv_a = k
+        .register_process(RegisterArgs {
+            name: "srv-a",
+            ppid: 0,
+            caps: abi::cap::initial::DISPLAY_SERVER,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(srv_a).unwrap();
+    k.procs.transition(srv_a, ProcState::Running).unwrap();
+
+    let mut heap = vec![0u8; 32];
+    assert_eq!(
+        dispatch(
+            &mut k,
+            srv_a,
+            &Request {
+                opcode: op_ext::DISPLAY_BIND,
+                flags: 0,
+                request_id: 233,
+                args: [0u8; 16],
+                heap_ptr: 0,
+                heap_len: 0,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+
+    let srv_b = k
+        .register_process(RegisterArgs {
+            name: "srv-b",
+            ppid: 0,
+            caps: abi::cap::initial::DISPLAY_SERVER,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(srv_b).unwrap();
+    k.procs.transition(srv_b, ProcState::Running).unwrap();
+
+    let resp = dispatch(
+        &mut k,
+        srv_b,
+        &Request {
+            opcode: op_ext::DISPLAY_BIND,
+            flags: 0,
+            request_id: 234,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EADDRINUSE);
+}
+
+#[test]
 fn display_connect_without_display_client_cap_returns_enotcapable() {
     // An ordinary app without DisplayClient cap can't connect.
     // `Kernel::display_connect` returns NotCapable, which

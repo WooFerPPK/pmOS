@@ -87,6 +87,12 @@ pub mod sig {
 
 // --- 3.3 Display server ---------------------------------------------------
 pub const DISPLAY_CONNECT: u16 = 0x1200;
+/// Bind the kernel-wide `/run/display` listening socket. Requires
+/// `Cap::DisplayServer`. Returns a listener fd the caller can
+/// `ipc_accept` from; this is how a display-server userland
+/// process establishes itself as the owner of the display
+/// protocol socket.
+pub const DISPLAY_BIND: u16 = 0x1201;
 
 // --- 3.4 Capability management --------------------------------------------
 pub const CAP_CHECK: u16 = 0x1300;

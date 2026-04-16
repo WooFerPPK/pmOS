@@ -20,6 +20,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-server-lite"
+version = "0.1.0"
+
+[[package]]
 name = "edit"
 version = "0.1.0"
 dependencies = [

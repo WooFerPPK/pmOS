@@ -56,6 +56,7 @@ pub fn dispatch_ext(
         op::CAP_LIST => handle_cap_list(kernel, pid, req),
         op::PROC_SPAWN => handle_proc_spawn(kernel, pid, req, heap),
         op::DISPLAY_CONNECT => handle_display_connect(kernel, pid, req),
+        op::DISPLAY_BIND => handle_display_bind(kernel, pid, req),
         _ => Response::err(req.request_id, ENOSYS),
     }
 }
@@ -264,6 +265,33 @@ fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 
 fn handle_display_connect(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     match kernel.display_connect(pid) {
+        Ok(fd) => Response::ok(req.request_id, fd as i64),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- display_bind -----------------------------------------------------
+//
+// Layout: no args, no heap.
+// Response: value = freshly-allocated listener fd bound to
+//           `/run/display` and transitioned to `Listening` state
+//           with the kernel's `DISPLAY_LISTEN_BACKLOG` depth.
+//
+// Symmetric with `DISPLAY_CONNECT`: that opcode is
+// `socket + connect("/run/display")` with a `DisplayClient`
+// cap check. This opcode is
+// `socket + bind("/run/display") + listen(backlog)` with a
+// `DisplayServer` cap check. Only the display-server userland
+// process holds `DisplayServer`, so `/run/display` has exactly
+// one owner.
+//
+// The returned fd is a standard socket fd — the display server
+// calls `ipc_accept` on it to pop each new client, then
+// `fd_read` / `fd_write` to speak the display protocol over
+// each accepted connection.
+
+fn handle_display_bind(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    match kernel.display_bind(pid) {
         Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }

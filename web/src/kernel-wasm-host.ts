@@ -207,6 +207,13 @@ interface PendingSpawn {
   readonly bytes: BufferSource;
 }
 
+/** A finished spawn — records what ran and how it exited. */
+export interface SpawnHistoryEntry {
+  readonly pid: number;
+  readonly path: string;
+  readonly exitCode: number;
+}
+
 // ---- Dispatch result -------------------------------------------------
 
 /** Decoded response + heap output from one `dispatch` call. */
@@ -236,6 +243,9 @@ export class KernelWasmHost implements Kernel {
     private readonly exports: KernelExports,
     private readonly pendingSpawns: PendingSpawn[],
   ) {}
+
+  /** Spawn history, appended to by `drainPendingSpawns`. */
+  private readonly spawnHistory: SpawnHistoryEntry[] = [];
 
   /**
    * Load `wasmBytes`, satisfy the host imports, and call
@@ -525,8 +535,24 @@ export class KernelWasmHost implements Kernel {
       const spawn = this.pendingSpawns.shift()!;
       const backend = new KernelWasmHostBackend(this, spawn.pid);
       const runtime = new UserWasmRuntime(spawn.bytes, backend);
-      await runtime.run();
+      const exitCode = await runtime.run();
+      this.spawnHistory.push({ pid: spawn.pid, path: spawn.path, exitCode });
     }
+  }
+
+  /**
+   * History of every spawn that `drainPendingSpawns` has run,
+   * in drain order. Each entry records the spawn's pid, binary
+   * path, and exit code. Lets tests assert on per-child success
+   * without having to reach into the runtime directly — the
+   * `drainPendingSpawns` method itself doesn't return per-child
+   * codes because in the eventual cross-thread design, children
+   * run concurrently and don't have a well-ordered "return"
+   * point. This history is a test-only affordance that works
+   * for the sequential in-process model.
+   */
+  get spawnHistoryEntries(): readonly SpawnHistoryEntry[] {
+    return this.spawnHistory;
   }
 
   /** True iff at least one spawn is queued and not yet run. */

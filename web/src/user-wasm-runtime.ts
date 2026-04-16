@@ -630,6 +630,44 @@ export class UserWasmRuntime {
         if (response.status !== 0) return response.status;
         return Number(response.value);
       },
+
+      // `display_bind() -> i32`
+      //
+      // Bind the kernel-wide `/run/display` listening socket
+      // with the kernel's `Cap::DisplayServer` check. Returns
+      // the listener fd (positive) or negative errno —
+      // typically `-ENOTCAPABLE` if the caller doesn't hold
+      // `DisplayServer`, or `-EADDRINUSE` if another server
+      // is already bound.
+      display_bind: (): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.DISPLAY_BIND,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return response.status;
+        return Number(response.value);
+      },
+
+      // `display_connect() -> i32`
+      //
+      // Connect to the `/run/display` listener with the
+      // kernel's `Cap::DisplayClient` check. Returns the
+      // connected client-side fd (positive) or negative errno
+      // — typically `-ENOTCAPABLE` if the caller lacks
+      // `DisplayClient`, or `-ECONNREFUSED` if no display
+      // server is bound.
+      display_connect: (): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.DISPLAY_CONNECT,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return response.status;
+        return Number(response.value);
+      },
     } as const;
 
     return {

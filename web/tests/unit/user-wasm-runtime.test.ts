@@ -56,6 +56,7 @@ let helloWasmBytes: ArrayBuffer;
 let spawnerWasmBytes: ArrayBuffer;
 let ipcSelfTestWasmBytes: ArrayBuffer;
 let helloFramebufferWasmBytes: ArrayBuffer;
+let displayServerLiteWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -79,6 +80,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_framebuffer.wasm",
   );
+  const displayServerLitePath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/display_server_lite.wasm",
+  );
 
   for (const p of [
     kernelPath,
@@ -86,6 +91,7 @@ beforeAll(() => {
     spawnerPath,
     ipcSelfTestPath,
     helloFramebufferPath,
+    displayServerLitePath,
   ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
@@ -109,6 +115,7 @@ beforeAll(() => {
   spawnerWasmBytes = loadWasm(spawnerPath);
   ipcSelfTestWasmBytes = loadWasm(ipcSelfTestPath);
   helloFramebufferWasmBytes = loadWasm(helloFramebufferPath);
+  displayServerLiteWasmBytes = loadWasm(displayServerLitePath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -507,6 +514,93 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // No console output — the binary doesn't write to /dev/console.
     expect(consoleWrites).toHaveLength(0);
     // Exactly one framebuffer write with the 16 RGBA bytes.
+    expect(fbWrites).toHaveLength(1);
+    expect(Array.from(fbWrites[0]!)).toEqual([
+      0xff, 0x00, 0x00, 0xff, // red
+      0x00, 0xff, 0x00, 0xff, // green
+      0x00, 0x00, 0xff, 0xff, // blue
+      0xff, 0xff, 0xff, 0xff, // white
+    ]);
+  });
+
+  it("display-server-lite composes bind + connect + accept + fd_read + path_open + fd_write end-to-end, pixels reach the framebuffer via the display socket", async () => {
+    // The full-pipeline acceptance test. A single binary plays
+    // server, client, AND framebuffer-writer by:
+    //
+    //   1. display_bind() as server
+    //   2. display_connect() as client
+    //   3. ipc_accept() as server
+    //   4. fd_write(client, pixels) — pixels cross the kernel
+    //      IPC boundary
+    //   5. fd_read(server, buf) — server receives same bytes
+    //      back
+    //   6. path_open("/dev/fb0") — server opens the framebuffer
+    //      device
+    //   7. fd_write(fb_fd, buf) — server relays the pixels it
+    //      received over IPC to the framebuffer device
+    //
+    // The FB write at step 7 uses the buffer populated by step
+    // 5 (NOT the original `PIXELS` constant), so the bytes
+    // that reach `onFramebufferWrite` are proof that the IPC
+    // round-trip actually transported the payload — a
+    // regression that broke IPC but left everything else intact
+    // would produce either the wrong bytes or an exit code 14.
+    const consoleWrites: Uint8Array[] = [];
+    const fbWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/display-server-lite", displayServerLiteWasmBytes],
+    ]);
+
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onFramebufferWrite: (bytes) => {
+        fbWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    // Virtual init with CAPSET_ALL — the demo binary needs both
+    // DisplayServer (for display_bind + /dev/fb0) and DisplayClient
+    // (for display_connect) caps, which CAPSET_ALL includes.
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/display-server-lite",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    // The binary's `spawnHistoryEntries` exit code is the
+    // step-by-step diagnostic; exit 0 means every step
+    // succeeded. Codes 10..16 indicate which step bailed —
+    // see `display-server-lite/src/lib.rs` for the map.
+    const history = kernel.spawnHistoryEntries;
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+    // No console output — the binary doesn't write to /dev/console.
+    expect(consoleWrites).toHaveLength(0);
+    // Exactly one framebuffer write with the 4 RGBA pixels that
+    // traversed the IPC socket.
     expect(fbWrites).toHaveLength(1);
     expect(Array.from(fbWrites[0]!)).toEqual([
       0xff, 0x00, 0x00, 0xff, // red

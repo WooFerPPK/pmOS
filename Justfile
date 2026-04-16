@@ -18,7 +18,8 @@ build:
         -p init -p display-server -p toolkit \
         -p shell -p sh -p term -p files -p edit -p settings -p sysmon \
         -p sample-app -p toolkit-free-client -p hello-wasi-min \
-        -p hello-wasi-spawner -p ipc-self-test -p hello-framebuffer
+        -p hello-wasi-spawner -p ipc-self-test -p hello-framebuffer \
+        -p display-server-lite
     cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
     cd web && npx esbuild src/sw.ts --bundle --outfile=../build/sw.js --format=esm
     cargo run -p xtask -- assemble-dist
