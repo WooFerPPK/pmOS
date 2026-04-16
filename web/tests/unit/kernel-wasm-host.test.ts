@@ -357,8 +357,10 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
+    // `FD_SEEK` is in the WASI range (0x0031) but still has no
+    // handler; swap this probe when FD_SEEK grows one.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.CLOCK_TIME_GET,
+      opcode: OP_WASI.FD_SEEK,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);

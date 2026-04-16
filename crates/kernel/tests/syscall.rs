@@ -108,15 +108,21 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // CLOCK_TIME_GET is in the WASI range (0x0011) but has no
-    // handler in the first T073 landing. The dispatcher's _ arm
-    // in `dispatch_wasi` should catch it with ENOSYS.
+    // `FD_SEEK` is in the WASI range (0x0031) but still has no
+    // handler. Same shape as the ext-side test below: decoded as
+    // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>`
+    // arm, ENOSYS echoed back with the request_id intact.
+    //
+    // (This probe was `CLOCK_TIME_GET` before that handler
+    // landed. When `FD_SEEK` grows a real handler, swap this
+    // probe to whatever's still unhandled at that point, or
+    // delete the test once every WASI opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::CLOCK_TIME_GET,
+        opcode: op_wasi::FD_SEEK,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -555,6 +561,130 @@ fn cap_list_returns_full_cap_bitset() {
 
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, expected_bits);
+}
+
+// ---- clock_time_get --------------------------------------------------
+
+#[test]
+fn clock_time_get_returns_strictly_increasing_nanoseconds() {
+    // The `Platform::now_ns` contract is "strictly increasing even
+    // across back-to-back calls within the same nanosecond". Fire
+    // two dispatches in succession and assert the second reports a
+    // strictly larger timestamp.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req1 = Request {
+        opcode: op_wasi::CLOCK_TIME_GET,
+        flags: 0,
+        request_id: 80,
+        // clock_id = CLOCKID_MONOTONIC (1). The kernel ignores
+        // the id for now (every id maps to `now_ns`) but a future
+        // slice that splits realtime vs monotonic will care.
+        args: u32_args(abi::wasi::CLOCKID_MONOTONIC),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp1 = dispatch(&mut k, pid, &req1, &mut heap);
+    assert_eq!(resp1.status, 0);
+    assert_eq!(resp1.request_id, 80);
+    let ns1 = resp1.value;
+
+    let req2 = Request {
+        request_id: 81,
+        ..req1
+    };
+    let resp2 = dispatch(&mut k, pid, &req2, &mut heap);
+    assert_eq!(resp2.status, 0);
+    let ns2 = resp2.value;
+
+    assert!(
+        ns2 > ns1,
+        "clock_time_get must be strictly increasing: ns1={ns1}, ns2={ns2}",
+    );
+}
+
+// ---- random_get ------------------------------------------------------
+
+#[test]
+fn random_get_fills_heap_and_echoes_length() {
+    // Ask for 16 bytes of random data at a non-zero heap offset so
+    // any "assumes heap_ptr == 0" regression trips here.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rand", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::RANDOM_GET,
+        flags: 0,
+        request_id: 82,
+        args: [0u8; 16],
+        heap_ptr: 8,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 16);
+    assert_eq!(resp.extra_len, 16);
+
+    // The 16 bytes in the target window should not ALL be zero —
+    // the xorshift prng NativePlatform ships is deterministic but
+    // non-trivial, and an all-zero return would mean
+    // `random_bytes` was never called. Soft assertion.
+    let window = &heap[8..24];
+    assert!(
+        window.iter().any(|&b| b != 0),
+        "random_get left the heap window untouched",
+    );
+    // Bytes outside the window are still zero.
+    assert!(heap[..8].iter().all(|&b| b == 0));
+    assert!(heap[24..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn random_get_with_zero_length_is_a_noop_success() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rand", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::RANDOM_GET,
+        flags: 0,
+        request_id: 83,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 0);
+    // Heap untouched.
+    assert!(heap.iter().all(|&b| b == 0));
+}
+
+// ---- sched_yield -----------------------------------------------------
+
+#[test]
+fn sched_yield_returns_ok() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "yielder", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SCHED_YIELD,
+        flags: 0,
+        request_id: 84,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.request_id, 84);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
 }
 
 // ---- proc_spawn -------------------------------------------------------

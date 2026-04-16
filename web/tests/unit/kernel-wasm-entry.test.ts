@@ -102,6 +102,14 @@ async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }>
       pmos_host_halt: (_ptr: number, _len: number): never => {
         throw new Error("pmos_host_halt called from test");
       },
+      pmos_host_now_ns: (): bigint => {
+        // Deterministic monotonic clock for the direct-export
+        // test surface: returns 0 on every call. `CLOCK_TIME_GET`
+        // tests that need strict monotonicity live in the
+        // higher-level `kernel-wasm-host.test.ts` where the
+        // default `performance.now()`-based clock is in play.
+        return 0n;
+      },
       pmos_host_random_bytes: (_ptr: number, _len: number): void => {
         // No-op — none of the tested opcodes need random bytes.
       },
@@ -515,12 +523,12 @@ describe("kernel.wasm extern C entry points", () => {
     expect(resp.status).toBe(-ENOSYS);
   });
 
-  it("known WASI opcode with no handler returns -ENOSYS (CLOCK_TIME_GET)", () => {
+  it("known WASI opcode with no handler returns -ENOSYS (FD_SEEK)", () => {
     const pid = kernel.kernel_register_process(CAPSET_ALL);
     expect(kernel.kernel_mark_running(pid)).toBe(0);
 
     writeRequest(kernel, {
-      opcode: 0x0011, // CLOCK_TIME_GET — in WASI range but not implemented
+      opcode: 0x0031, // FD_SEEK — in WASI range but not implemented
       requestId: 601,
       arg0: 0,
       heapPtr: 0,

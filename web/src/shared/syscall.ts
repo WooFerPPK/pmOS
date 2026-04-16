@@ -124,8 +124,14 @@ export const OP_WASI = {
   FD_WRITE: 0x0034,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
-  /** Used only to probe the ENOSYS path in tests. */
   CLOCK_TIME_GET: 0x0011,
+  RANDOM_GET: 0x0051,
+  SCHED_YIELD: 0x0052,
+  /** Unused by the WASI shim today; the tests probe it to verify
+   * the dispatcher's `ENOSYS` path still fires for opcodes the
+   * kernel doesn't yet handle. Swap to whichever WASI opcode is
+   * still unhandled as the implementation catches up. */
+  FD_SEEK: 0x0031,
 } as const;
 
 /** PMos extension opcodes (0x1000..0x1501). */

@@ -27,6 +27,7 @@ use abi::ring::{Request, Response};
 use abi::wasi as op;
 
 use crate::fd::FdFlags;
+use crate::platform;
 use crate::proc::ExitStatus;
 use crate::sys::Kernel;
 
@@ -46,6 +47,9 @@ pub fn dispatch_wasi(
         op::FD_CLOSE => handle_fd_close(kernel, pid, req),
         op::PATH_OPEN => handle_path_open(kernel, pid, req, heap),
         op::PROC_EXIT => handle_proc_exit(kernel, pid, req),
+        op::CLOCK_TIME_GET => handle_clock_time_get(req),
+        op::RANDOM_GET => handle_random_get(req, heap),
+        op::SCHED_YIELD => handle_sched_yield(req),
         _ => Response::err(req.request_id, ENOSYS),
     }
 }
@@ -184,4 +188,93 @@ fn handle_proc_exit(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
+}
+
+// ---- clock_time_get ---------------------------------------------------
+//
+// Layout:
+//   args[0..4] = clock_id (u32)
+//   args[4..12] = precision (u64, ignored in v1 — the Platform
+//                 clock has nanosecond granularity already)
+// Response:
+//   value       = monotonic nanoseconds (u64 widened to i64;
+//                 `i64::from_ne_bytes(u64::to_ne_bytes(...))`
+//                 to preserve every bit, which userland reads
+//                 back as u64)
+//
+// WASI defines four clock IDs: realtime, monotonic, process
+// cputime, thread cputime. `Platform::now_ns` is the kernel's
+// monotonic-since-boot clock; that's the only clock source we
+// can cheaply provide. For v1 every clock_id maps to the same
+// `now_ns` — a kernel that cares about wall-clock time can grow
+// a separate `Platform::realtime_ns` later without changing the
+// opcode's wire format.
+//
+// Time, unlike every other syscall, runs forward even across
+// panics + reboots. That matters because userland's HashMap
+// seeding uses `clock_time_get` to get entropy — if the kernel
+// ever returns a constant, HashMap-based protocols degrade
+// predictably. `Platform::now_ns` is documented to be strictly
+// increasing, which is strong enough.
+
+fn handle_clock_time_get(req: &Request) -> Response {
+    let _clock_id = args_u32(req, 0);
+    // `Platform::now_ns()` returns u64; cast to i64 preserves
+    // every bit (u64::MAX becomes -1). Userland bigint code
+    // reinterprets the bits back to u64.
+    let ns = platform::current().now_ns();
+    Response::ok(req.request_id, ns as i64)
+}
+
+// ---- random_get -------------------------------------------------------
+//
+// Layout:
+//   args       = unused (the buffer is addressed entirely via
+//                 heap_ptr / heap_len)
+//   heap_ptr    = destination offset in caller's heap scratch
+//   heap_len    = number of bytes to fill
+// Response:
+//   value       = bytes filled (== heap_len on success)
+//   extra_len   = bytes filled (same value, mirrored so userland
+//                 can read it out of the response header
+//                 directly)
+//
+// Filling straight into the heap scratch region means the
+// handler doesn't need a temporary buffer. `Platform::random_bytes`
+// writes into a `&mut [u8]` slice of any length; we hand it the
+// heap window.
+
+fn handle_random_get(req: &Request, heap: &mut [u8]) -> Response {
+    let len = req.heap_len as usize;
+    let Some(buf) = heap_out_mut(req, heap, len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    platform::current().random_bytes(buf);
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: len as i64,
+        extra_len: len as u32,
+        _pad: [0u8; 12],
+    }
+}
+
+// ---- sched_yield ------------------------------------------------------
+//
+// Layout: no args, no heap.
+// Response: status = 0.
+//
+// WASI's `sched_yield` is a cooperative-scheduling hint: "I
+// have no more work to do right now; please let someone else
+// run." PMos's current scheduler is a single-threaded
+// round-robin that runs each dispatch to completion, so yield
+// has no behavioural effect — every syscall already "yields"
+// in the sense that the kernel can pick the next runnable
+// process on the next dispatch loop iteration. The handler
+// exists anyway because Rust's std WASI libc calls
+// `sched_yield` in a few spots (notably lock busy-wait loops)
+// and would panic on -ENOSYS.
+
+fn handle_sched_yield(req: &Request) -> Response {
+    Response::ok(req.request_id, 0)
 }
