@@ -36,6 +36,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hello-wasi-min"
+version = "0.1.0"
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [

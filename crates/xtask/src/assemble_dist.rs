@@ -110,6 +110,10 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     ("sysmon", "sysmon"),
     ("sample-app", "hello"),
     ("toolkit-free-client", "toolkit-free-client"),
+    // cdylib: crate name has `-` but the compiled artefact uses `_`
+    // per Rust's wasm output convention, so the filename carried
+    // across in `dist/assets/bin/` stays `hello_wasi_min.wasm`.
+    ("hello-wasi-min", "hello_wasi_min"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {

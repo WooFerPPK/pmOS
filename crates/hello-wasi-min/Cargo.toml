@@ -1,0 +1,15 @@
+[package]
+name = "hello-wasi-min"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Built as a cdylib, not a bin, because the `wasm32-wasip1`
+# `crt1-command.o` the bin target links against already exports
+# its own `_start` — and we want to own that symbol ourselves so
+# the compiled binary has exactly two imports
+# (`wasi_snapshot_preview1.fd_write` + `proc_exit`) and no Rust
+# std WASI startup pulled in behind our back.
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]

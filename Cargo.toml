@@ -17,6 +17,7 @@ members = [
     "crates/sysmon",
     "crates/sample-app",
     "crates/toolkit-free-client",
+    "crates/hello-wasi-min",
     "crates/integration-tests",
     "crates/xtask",
 ]

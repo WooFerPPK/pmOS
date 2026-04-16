@@ -17,7 +17,7 @@ build:
     cargo build --release --target wasm32-wasip1 \
         -p init -p display-server -p toolkit \
         -p shell -p sh -p term -p files -p edit -p settings -p sysmon \
-        -p sample-app -p toolkit-free-client
+        -p sample-app -p toolkit-free-client -p hello-wasi-min
     cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
     cd web && npx esbuild src/sw.ts --bundle --outfile=../build/sw.js --format=esm
     cargo run -p xtask -- assemble-dist
