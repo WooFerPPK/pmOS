@@ -23,6 +23,7 @@ members = [
     "crates/hello-framebuffer",
     "crates/display-server-lite",
     "crates/hello-wasi-bootstrap",
+    "crates/hello-fb-blit",
     "crates/integration-tests",
     "crates/xtask",
 ]

@@ -50,6 +50,7 @@
 // re-construct the view → read / write → return. Never hold a view
 // across a kernel export call.
 
+import type { Driver, DriverHost } from "./drivers/types";
 import type { Kernel } from "./kernel-worker";
 import {
   decodeResponse,
@@ -198,6 +199,38 @@ export interface KernelWasmHostOptions {
    * responsible for their own lookup).
    */
   readonly binaryRegistry?: ReadonlyMap<string, BufferSource>;
+  /**
+   * Optional [`Driver`] (typically a [`FramebufferDriver`]) the host
+   * calls whenever a `driver_call(Framebuffer, ...)` lands. The
+   * payload the kernel forwarded is interpreted as a driver-framed
+   * message: byte 0 is the device-specific op (e.g.
+   * `fb.OP_SET_MODE = 0x01`, `fb.OP_BLIT = 0x02`), the rest is the
+   * driver's own payload. The host invokes `driver.init(...)` once
+   * at construction (with a minimal [`DriverHost`] that forwards
+   * every `postToMain` to [`onFramebufferMessage`]) and then
+   * `driver.call(op, payload)` on every framebuffer write.
+   *
+   * Independent of [`onFramebufferWrite`]: when both are set, the
+   * raw-bytes callback fires first and the framed driver call fires
+   * after. Callers that only want the decoded `fb:set-mode` /
+   * `fb:blit` messages set just `framebufferDriver` +
+   * `onFramebufferMessage`; callers that want the untouched bytes
+   * (tests, tracing) use `onFramebufferWrite`.
+   *
+   * User wasm binaries that write raw RGBA (hello-framebuffer,
+   * display-server-lite) bypass this path — they only satisfy the
+   * `onFramebufferWrite` contract. Binaries that write framed
+   * payloads (hello-fb-blit, any future display server) feed this
+   * driver.
+   */
+  readonly framebufferDriver?: Driver;
+  /**
+   * Called when [`framebufferDriver`]'s `init(host)` handler uses
+   * `host.postToMain(msg)` — i.e. when the driver has decoded a
+   * `driver_call` payload into a typed main-thread message like
+   * `fb:set-mode` or `fb:blit`. No-op when unset.
+   */
+  readonly onFramebufferMessage?: (msg: unknown) => void;
 }
 
 /** One entry in the [`KernelWasmHost.drainPendingSpawns`] queue. */
@@ -305,6 +338,24 @@ export class KernelWasmHost implements Kernel {
       throw new Error(`KernelWasmHost panic: ${message}`);
     });
 
+    // Initialise the framebuffer driver (if provided) with a
+    // `DriverHost` whose `postToMain` forwards to the caller's
+    // `onFramebufferMessage` callback. The driver runs synchronously
+    // during `driver_call`, so this single host instance is safe to
+    // reuse across calls — there is no concurrent reentry in the
+    // current sequential dispatch model. `pushInputToKernel` is a
+    // no-op because the framebuffer is write-only in v1.
+    const framebufferDriver = options.framebufferDriver;
+    if (framebufferDriver !== undefined) {
+      const fbDriverHost: DriverHost = {
+        postToMain: (msg: unknown): void => {
+          options.onFramebufferMessage?.(msg);
+        },
+        pushInputToKernel: (): void => {},
+      };
+      framebufferDriver.init(fbDriverHost);
+    }
+
     const imports: WebAssembly.Imports = {
       env: {
         pmos_host_now_ns: (): bigint => nowNs(),
@@ -324,12 +375,22 @@ export class KernelWasmHost implements Kernel {
           if (dev === DEV.CONSOLE && options.onConsoleWrite !== undefined) {
             const src = new Uint8Array(memory.buffer, argsPtr, argsLen);
             options.onConsoleWrite(new Uint8Array(src));
-          } else if (
-            dev === DEV.FRAMEBUFFER &&
-            options.onFramebufferWrite !== undefined
-          ) {
+          } else if (dev === DEV.FRAMEBUFFER) {
+            // Single copy out of kernel memory; both callback paths
+            // below share it.
             const src = new Uint8Array(memory.buffer, argsPtr, argsLen);
-            options.onFramebufferWrite(new Uint8Array(src));
+            const copy = new Uint8Array(src);
+            if (options.onFramebufferWrite !== undefined) {
+              options.onFramebufferWrite(copy);
+            }
+            // Framed-driver path: byte 0 is the driver op, rest is
+            // the driver's own payload. Zero-length writes are
+            // dropped (a binary that wrote 0 bytes can't be framing
+            // anything meaningful; this matches the kernel's own
+            // tolerance of empty writes).
+            if (framebufferDriver !== undefined && copy.length >= 1) {
+              framebufferDriver.call(copy[0]!, copy.subarray(1));
+            }
           }
           // Input / block / net: not wired yet. Return 0
           // ("success") for all devs so the kernel's side of

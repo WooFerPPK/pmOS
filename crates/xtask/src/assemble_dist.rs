@@ -119,6 +119,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     ("hello-framebuffer", "hello_framebuffer"),
     ("display-server-lite", "display_server_lite"),
     ("hello-wasi-bootstrap", "hello_wasi_bootstrap"),
+    ("hello-fb-blit", "hello_fb_blit"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {

@@ -41,6 +41,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import {
   KernelWasmHost,
 } from "../../src/kernel-wasm-host";
+import { FramebufferDriver } from "../../src/drivers/fb";
 import {
   KernelWasmHostBackend,
   UserWasmRuntime,
@@ -58,6 +59,7 @@ let ipcSelfTestWasmBytes: ArrayBuffer;
 let helloFramebufferWasmBytes: ArrayBuffer;
 let displayServerLiteWasmBytes: ArrayBuffer;
 let helloWasiBootstrapWasmBytes: ArrayBuffer;
+let helloFbBlitWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -89,6 +91,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_wasi_bootstrap.wasm",
   );
+  const helloFbBlitPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_fb_blit.wasm",
+  );
 
   for (const p of [
     kernelPath,
@@ -98,6 +104,7 @@ beforeAll(() => {
     helloFramebufferPath,
     displayServerLitePath,
     helloWasiBootstrapPath,
+    helloFbBlitPath,
   ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
@@ -123,6 +130,7 @@ beforeAll(() => {
   helloFramebufferWasmBytes = loadWasm(helloFramebufferPath);
   displayServerLiteWasmBytes = loadWasm(displayServerLitePath);
   helloWasiBootstrapWasmBytes = loadWasm(helloWasiBootstrapPath);
+  helloFbBlitWasmBytes = loadWasm(helloFbBlitPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -682,6 +690,92 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       ),
     );
     expect(combined).toBe("bootstrap ok\n");
+  });
+
+  it("hello-fb-blit + FramebufferDriver decodes OP_SET_MODE + OP_BLIT into fb:set-mode + fb:blit messages through KernelWasmHost.framebufferDriver", async () => {
+    // The driver-framed framebuffer path: user wasm writes a
+    // `[op, ...payload]` buffer to /dev/fb0, KernelWasmHost's
+    // driver_call handler strips the op byte and calls
+    // `FramebufferDriver.call(op, payload)`, the driver decodes the
+    // typed message and posts it through its `DriverHost` — which
+    // the host wires to `options.onFramebufferMessage`.
+    //
+    // This closes the gap between the raw-bytes `onFramebufferWrite`
+    // callback (what hello-framebuffer + display-server-lite use)
+    // and the typed `fb:set-mode` / `fb:blit` surface that FbHost
+    // + canvas blit already consume on the mock-kernel path. After
+    // this slice, a future display-server binary can talk OP_BLIT
+    // to /dev/fb0 and its output reaches the same main-thread
+    // handler chain a MockKernel blit does.
+    const driverMessages: unknown[] = [];
+    const fbDriver = new FramebufferDriver();
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-fb-blit", helloFbBlitWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      framebufferDriver: fbDriver,
+      onFramebufferMessage: (msg) => {
+        driverMessages.push(msg);
+      },
+      binaryRegistry,
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-fb-blit",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    const history = kernel.spawnHistoryEntries;
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    // Two messages: fb:set-mode then fb:blit, in that order.
+    expect(driverMessages).toHaveLength(2);
+    const setMode = driverMessages[0] as {
+      kind: string;
+      width: number;
+      height: number;
+    };
+    expect(setMode.kind).toBe("fb:set-mode");
+    expect(setMode.width).toBe(2);
+    expect(setMode.height).toBe(2);
+
+    const blit = driverMessages[1] as {
+      kind: string;
+      width: number;
+      height: number;
+      rgba: Uint8Array;
+    };
+    expect(blit.kind).toBe("fb:blit");
+    expect(blit.width).toBe(2);
+    expect(blit.height).toBe(2);
+    expect(Array.from(blit.rgba)).toEqual([
+      0xff, 0x00, 0x00, 0xff, // red
+      0x00, 0xff, 0x00, 0xff, // green
+      0x00, 0x00, 0xff, 0xff, // blue
+      0xff, 0xff, 0xff, 0xff, // white
+    ]);
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {
