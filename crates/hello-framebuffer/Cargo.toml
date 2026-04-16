@@ -1,0 +1,11 @@
+[package]
+name = "hello-framebuffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Same pattern as the other `hello-wasi-*` / `ipc-self-test`
+# crates: no_std cdylib, cfg-gated on `target_arch = "wasm32"`.
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]

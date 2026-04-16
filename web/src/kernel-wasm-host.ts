@@ -122,6 +122,24 @@ export interface KernelWasmHostOptions {
    */
   readonly onConsoleWrite?: (bytes: Uint8Array) => void;
   /**
+   * Called when the kernel writes bytes to `/dev/fb0` via the
+   * framebuffer driver. The bytes arrive as the kernel received
+   * them — typically a chunk of raw pixel data in whatever format
+   * the caller wrote. The class copies out of the kernel's linear
+   * memory before invoking the callback, same as `onConsoleWrite`.
+   *
+   * The slow-path `driver_call`-based transport this callback
+   * serves is explicitly documented in the kernel's
+   * `framebuffer_write` as the cold path for low-frequency ioctls
+   * (SET_MODE, initial pixel dumps). The hot path for display-
+   * server commits is planned to go via shared-memory rings; that
+   * wire-up lands with a future slice and won't come through this
+   * callback. Routing the cold path through a typed callback
+   * today is enough to prove the kernel-to-host framebuffer
+   * pipeline works end-to-end.
+   */
+  readonly onFramebufferWrite?: (bytes: Uint8Array) => void;
+  /**
    * Called when the kernel triggers a panic. The default is to
    * rethrow as an `Error`; production code will post a
    * `KernelToMain.panic` message instead so the bootstrap overlay
@@ -289,16 +307,25 @@ export class KernelWasmHost implements Kernel {
           _resultPtr: number,
         ): number => {
           if (memory === undefined) return 0;
+          // Copy out of kernel memory immediately — the buffer
+          // can detach on a subsequent grow, and even within the
+          // same microtask a stored view would become invalid.
+          // Each per-device branch owns its own copy.
           if (dev === DEV.CONSOLE && options.onConsoleWrite !== undefined) {
-            // Copy out of kernel memory immediately — the buffer can
-            // detach on a subsequent grow, and even within the same
-            // microtask a stored view would become invalid.
             const src = new Uint8Array(memory.buffer, argsPtr, argsLen);
             options.onConsoleWrite(new Uint8Array(src));
+          } else if (
+            dev === DEV.FRAMEBUFFER &&
+            options.onFramebufferWrite !== undefined
+          ) {
+            const src = new Uint8Array(memory.buffer, argsPtr, argsLen);
+            options.onFramebufferWrite(new Uint8Array(src));
           }
-          // Framebuffer / input / block / net: not wired yet. Return
-          // 0 ("success") so the kernel's side of driver_call doesn't
-          // propagate a spurious error back into the dispatch path.
+          // Input / block / net: not wired yet. Return 0
+          // ("success") for all devs so the kernel's side of
+          // driver_call doesn't propagate a spurious error back
+          // into the dispatch path for devices we just don't
+          // route to a callback.
           return 0;
         },
 

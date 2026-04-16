@@ -55,6 +55,7 @@ let kernelWasmBytes: ArrayBuffer;
 let helloWasmBytes: ArrayBuffer;
 let spawnerWasmBytes: ArrayBuffer;
 let ipcSelfTestWasmBytes: ArrayBuffer;
+let helloFramebufferWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -74,8 +75,18 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/ipc_self_test.wasm",
   );
+  const helloFramebufferPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_framebuffer.wasm",
+  );
 
-  for (const p of [kernelPath, helloPath, spawnerPath, ipcSelfTestPath]) {
+  for (const p of [
+    kernelPath,
+    helloPath,
+    spawnerPath,
+    ipcSelfTestPath,
+    helloFramebufferPath,
+  ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
         `${p} not found. Run \`just build\` (or the cargo build lines from the Justfile's build target) first.`,
@@ -97,6 +108,7 @@ beforeAll(() => {
   helloWasmBytes = loadWasm(helloPath);
   spawnerWasmBytes = loadWasm(spawnerPath);
   ipcSelfTestWasmBytes = loadWasm(ipcSelfTestPath);
+  helloFramebufferWasmBytes = loadWasm(helloFramebufferPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -425,6 +437,83 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
       "hello via ipc\n",
     );
+  });
+
+  it("hello-framebuffer writes RGBA pixel bytes to /dev/fb0 and the TS host's onFramebufferWrite callback observes them", async () => {
+    // The framebuffer-pipeline acceptance test. A user wasm
+    // binary does `path_open("/dev/fb0")` (which requires the
+    // `DisplayServer` cap per `DeviceDispatcher::check_open`)
+    // and `fd_write(fd, pixels)`. The kernel routes the write
+    // through `framebuffer_write` →
+    // `platform::current().driver_call(Framebuffer, ...)` →
+    // `pmos_host_driver_call` host import → `KernelWasmHost`'s
+    // routing closure → `options.onFramebufferWrite(bytes)`.
+    //
+    // Asserts the callback received the exact 16 bytes the
+    // binary wrote (4 RGBA pixels: red, green, blue, white).
+    // Failure modes:
+    //   * binary exit code 10 = path_open failed (capability
+    //     bug or devfs regression)
+    //   * binary exit code 11 = fd_write returned nonzero or
+    //     short-wrote
+    //   * callback not invoked = the
+    //     kernel → host_driver_call → callback route broke
+    //   * bytes mismatch = the route delivered the wrong
+    //     bytes (e.g. stale buffer after a grow)
+    const consoleWrites: Uint8Array[] = [];
+    const fbWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-framebuffer", helloFramebufferWasmBytes],
+    ]);
+
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onFramebufferWrite: (bytes) => {
+        fbWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    // Virtual init with CAPSET_ALL so the child inherits
+    // `DisplayServer` (required to open /dev/fb0).
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-framebuffer",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    // No console output — the binary doesn't write to /dev/console.
+    expect(consoleWrites).toHaveLength(0);
+    // Exactly one framebuffer write with the 16 RGBA bytes.
+    expect(fbWrites).toHaveLength(1);
+    expect(Array.from(fbWrites[0]!)).toEqual([
+      0xff, 0x00, 0x00, 0xff, // red
+      0x00, 0xff, 0x00, 0xff, // green
+      0x00, 0x00, 0xff, 0xff, // blue
+      0xff, 0xff, 0xff, 0xff, // white
+    ]);
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {

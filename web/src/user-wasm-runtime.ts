@@ -356,6 +356,83 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // WASI `path_open`.
+      //
+      // Signature (lowered):
+      //   path_open(
+      //     dirfd:     i32,  // directory fd (ignored — we don't
+      //                      //   do preopens; every path is
+      //                      //   absolute)
+      //     dirflags:  i32,  // symlink-follow flags (ignored
+      //                      //   in v1)
+      //     path_ptr:  i32,
+      //     path_len:  i32,
+      //     oflags:    i32,  // CREAT / TRUNC / DIRECTORY / EXCL
+      //                      //   — not wired on the PMos kernel
+      //                      //   side (`Kernel::path_open` takes
+      //                      //   only `FdFlags`), ignored for now
+      //     rights_base:       i64, // ignored (v1 rights model)
+      //     rights_inheriting: i64, // ignored
+      //     fdflags:   i32,  // APPEND / NONBLOCK / ... WASI bits
+      //                      //   don't line up with PMos FdFlags
+      //                      //   bits (different positions);
+      //                      //   v1 userland passes 0 and the
+      //                      //   shim passes 0 through
+      //     fd_out_ptr: i32, // i32 out-pointer for the new fd
+      //   ) -> errno: i32
+      //
+      // The PMos `PATH_OPEN` opcode carries only `flags` (u32)
+      // and a UTF-8 `path` on the heap, so the shim ignores
+      // every argument WASI has that the kernel doesn't yet
+      // care about. When a future slice wires the other bits
+      // (preopens for `/home/user`, oflags for O_CREAT, the
+      // rights model for sandboxed apps), each becomes a new
+      // decode step here — no wire-format break because the
+      // kernel's `FD_READ` / `FD_WRITE` semantics are
+      // unchanged.
+      path_open: (
+        _dirfd: number,
+        _dirflags: number,
+        pathPtr: number,
+        pathLen: number,
+        _oflags: number,
+        _rightsBase: bigint,
+        _rightsInheriting: bigint,
+        _fdflags: number,
+        fdOutPtr: number,
+      ): number => {
+        if (this.memory === undefined) {
+          return ERRNO.EINVAL;
+        }
+        const pathBytes = new Uint8Array(
+          this.memory.buffer,
+          pathPtr,
+          pathLen,
+        );
+        const pathCopy = new Uint8Array(pathBytes);
+
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_OPEN,
+            requestId: 0,
+            arg0: 0, // FdFlags::EMPTY — WASI fdflags not yet wired
+            heapPtr: 0,
+            heapLen: pathLen,
+          },
+          pathCopy,
+        );
+
+        if (response.status !== 0) {
+          return -response.status;
+        }
+
+        // Write the new fd to the out-pointer. Re-fetch the
+        // memory view in case dispatch triggered a grow.
+        const view = new DataView(this.memory.buffer);
+        view.setUint32(fdOutPtr, Number(response.value), true);
+        return 0;
+      },
+
       // WASI `proc_exit`.
       //
       // Signature: (rval: i32) -> never.

@@ -20,6 +20,7 @@ members = [
     "crates/hello-wasi-min",
     "crates/hello-wasi-spawner",
     "crates/ipc-self-test",
+    "crates/hello-framebuffer",
     "crates/integration-tests",
     "crates/xtask",
 ]
