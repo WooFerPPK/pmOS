@@ -21,12 +21,12 @@
 //! `RANDOM_GET`, etc. is one `match` arm + one handler function +
 //! isolation tests.
 
-use abi::errno::{EINVAL, ENOSYS};
+use abi::errno::{EBADF, EINVAL, ENOSYS};
 use abi::ext::Pid;
 use abi::ring::{Request, Response};
 use abi::wasi as op;
 
-use crate::fd::FdFlags;
+use crate::fd::{FdFlags, FdObject};
 use crate::platform;
 use crate::proc::ExitStatus;
 use crate::sys::Kernel;
@@ -50,6 +50,12 @@ pub fn dispatch_wasi(
         op::CLOCK_TIME_GET => handle_clock_time_get(req),
         op::RANDOM_GET => handle_random_get(req, heap),
         op::SCHED_YIELD => handle_sched_yield(req),
+        op::ARGS_SIZES_GET => handle_args_sizes_get(req, heap),
+        op::ARGS_GET => handle_args_get(req),
+        op::ENVIRON_SIZES_GET => handle_environ_sizes_get(req, heap),
+        op::ENVIRON_GET => handle_environ_get(req),
+        op::FD_FDSTAT_GET => handle_fd_fdstat_get(kernel, pid, req, heap),
+        op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
     }
 }
@@ -277,4 +283,160 @@ fn handle_random_get(req: &Request, heap: &mut [u8]) -> Response {
 
 fn handle_sched_yield(req: &Request) -> Response {
     Response::ok(req.request_id, 0)
+}
+
+// ---- args_sizes_get / args_get / environ_sizes_get / environ_get ------
+//
+// PMos doesn't pass argv or envp to user wasm in v1 — every binary
+// starts with an empty argument list and an empty environment. These
+// handlers exist so that a Rust `std` binary (whose libc init probes
+// all four of these opcodes before `main` runs) doesn't panic on
+// `-ENOSYS`. Userland sees `(argc=0, buf_size=0)` and `(envc=0,
+// buf_size=0)` and moves on.
+//
+// A future slice can attach a real argv/envp to `SpawnArgs`, thread
+// them through `Kernel::proc_spawn` into the child's Process record,
+// and have these handlers read from there. The wire format stays the
+// same — *_SIZES_GET returns two u32s, *_GET writes N byte-blobs +
+// N pointers into the caller's heap scratch.
+//
+// Layout for the _SIZES_GET pair:
+//   args      = unused
+//   heap_ptr  = output offset (8 bytes: (count u32, buf_size u32) LE)
+//   heap_len  = 8 (or >=8; only the first 8 bytes are written)
+// Response:
+//   value     = 0 (success)
+//   extra_len = 8 (bytes written)
+//
+// Layout for the _GET pair (with count == 0, nothing to write):
+//   args      = unused
+//   heap_ptr  = unused
+//   heap_len  = unused
+// Response:
+//   value     = 0 (success)
+
+fn write_two_zero_u32s(req: &Request, heap: &mut [u8]) -> Response {
+    let Some(buf) = heap_out_mut(req, heap, 8) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    buf[..8].copy_from_slice(&[0u8; 8]);
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: 8,
+        _pad: [0u8; 12],
+    }
+}
+
+fn handle_args_sizes_get(req: &Request, heap: &mut [u8]) -> Response {
+    write_two_zero_u32s(req, heap)
+}
+
+fn handle_args_get(req: &Request) -> Response {
+    Response::ok(req.request_id, 0)
+}
+
+fn handle_environ_sizes_get(req: &Request, heap: &mut [u8]) -> Response {
+    write_two_zero_u32s(req, heap)
+}
+
+fn handle_environ_get(req: &Request) -> Response {
+    Response::ok(req.request_id, 0)
+}
+
+// ---- fd_fdstat_get ----------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32)
+//   heap_ptr   = output offset for the 24-byte fdstat_t
+//   heap_len   = 24 (or >=24; only 24 bytes are written)
+// Response:
+//   value     = 0 (success)
+//   extra_len = 24
+//
+// fdstat_t wire layout (matches WASI preview 1):
+//   offset 0:  filetype        u8
+//   offset 1:  _pad            u8
+//   offset 2:  fs_flags        u16
+//   offset 4:  _pad            u32  (the Rust-side generated bindings
+//                                    insist on this alignment gap)
+//   offset 8:  fs_rights_base  u64
+//   offset 16: fs_rights_inh   u64
+//
+// PMos's v1 answer: filetype is derived from the FdObject variant;
+// fs_flags = 0; rights are set to all-bits-on for stdio-style fds so
+// `println!`'s isatty-ish probes succeed without the kernel having
+// to model rights properly. When a future slice introduces real WASI
+// rights tracking, this handler becomes the single place to wire it.
+
+const FILETYPE_UNKNOWN: u8 = 0;
+const FILETYPE_CHARACTER_DEVICE: u8 = 2;
+const FILETYPE_REGULAR_FILE: u8 = 4;
+const FILETYPE_SOCKET_STREAM: u8 = 6;
+
+fn filetype_for(object: FdObject) -> u8 {
+    match object {
+        FdObject::Vnode { .. } => FILETYPE_REGULAR_FILE,
+        FdObject::CharDevice(_) => FILETYPE_CHARACTER_DEVICE,
+        FdObject::Socket(_) | FdObject::DisplayConn(_) => FILETYPE_SOCKET_STREAM,
+        FdObject::PipeRead(_)
+        | FdObject::PipeWrite(_)
+        | FdObject::SignalChannel => FILETYPE_UNKNOWN,
+    }
+}
+
+fn handle_fd_fdstat_get(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let table = match kernel.fds(pid) {
+        Ok(t) => t,
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let Some(entry) = table.get(fd) else {
+        return Response::err(req.request_id, EBADF);
+    };
+    let filetype = filetype_for(entry.object);
+
+    let Some(buf) = heap_out_mut(req, heap, 24) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    buf[..24].copy_from_slice(&[0u8; 24]);
+    buf[0] = filetype;
+    // fs_flags at offset 2 stays 0.
+    // fs_rights_base at offset 8: all-bits-on so userland doesn't
+    // reject an op on rights grounds before the kernel itself does.
+    buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    buf[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: 24,
+        _pad: [0u8; 12],
+    }
+}
+
+// ---- fd_prestat_get ---------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32)
+// Response:
+//   status    = -EBADF (always)
+//
+// WASI's preopen-dir discovery loop starts at fd 3 and walks up
+// until the runtime returns EBADF; that's how libcs know there are
+// no more preopens. PMos doesn't expose any preopen directories
+// (every path resolves through the VFS by absolute name), so the
+// honest answer for every fd is EBADF. Returning that turns a Rust
+// std binary's startup probe into a two-iteration loop that exits
+// cleanly.
+
+fn handle_fd_prestat_get(req: &Request) -> Response {
+    Response::err(req.request_id, EBADF)
 }

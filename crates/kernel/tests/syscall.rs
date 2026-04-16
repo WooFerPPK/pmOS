@@ -687,6 +687,179 @@ fn sched_yield_returns_ok() {
     assert_eq!(resp.value, 0);
 }
 
+// ---- args / environ ---------------------------------------------------
+//
+// v1 answer for all four: empty. A Rust std binary's init probe sees
+// (0, 0) on the *_SIZES_GET side and writes nothing on the *_GET side,
+// which is exactly what `std::env::args()` / `std::env::vars()`
+// degrade into.
+
+#[test]
+fn args_sizes_get_returns_zero_argc_and_zero_buf_size() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "argsy", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::ARGS_SIZES_GET,
+        flags: 0,
+        request_id: 85,
+        args: [0u8; 16],
+        heap_ptr: 16,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 8);
+    // Two zero u32s written at offset 16.
+    assert_eq!(&heap[16..24], &[0u8; 8]);
+    // Nothing else clobbered.
+    assert!(heap[..16].iter().all(|&b| b == 0));
+    assert!(heap[24..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn args_get_is_a_noop_success() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "argsy", 0);
+    let mut heap = vec![0u8; 16];
+    let req = Request {
+        opcode: op_wasi::ARGS_GET,
+        flags: 0,
+        request_id: 86,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert!(heap.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn environ_sizes_get_returns_zero_envc_and_zero_buf_size() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "environey", 0);
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::ENVIRON_SIZES_GET,
+        flags: 0,
+        request_id: 87,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 8);
+    assert_eq!(&heap[..8], &[0u8; 8]);
+}
+
+#[test]
+fn environ_get_is_a_noop_success() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "environey", 0);
+    let mut heap = vec![0u8; 16];
+    let req = Request {
+        opcode: op_wasi::ENVIRON_GET,
+        flags: 0,
+        request_id: 88,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+// ---- fd_fdstat_get ----------------------------------------------------
+//
+// The handler branches on the FdObject variant. Three tests:
+// stdio (CharDevice → 2), socket (Socket → 6), bad fd (→ EBADF).
+
+#[test]
+fn fd_fdstat_get_on_stdio_fd_returns_character_device() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "fdstater", 0);
+    // Stdout is a CharDevice(DEV_CONSOLE).
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_GET,
+        flags: 0,
+        request_id: 89,
+        args: u32_args(1),
+        heap_ptr: 8,
+        heap_len: 24,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 24);
+    // filetype (byte 0) == CHARACTER_DEVICE (2).
+    assert_eq!(heap[8], 2);
+    // _pad + fs_flags both zero.
+    assert_eq!(&heap[9..12], &[0u8; 3]);
+    // offset 4 pad zero.
+    assert_eq!(&heap[12..16], &[0u8; 4]);
+    // fs_rights_base == u64::MAX.
+    assert_eq!(&heap[16..24], &u64::MAX.to_le_bytes());
+    // fs_rights_inh == u64::MAX.
+    assert_eq!(&heap[24..32], &u64::MAX.to_le_bytes());
+}
+
+#[test]
+fn fd_fdstat_get_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "fdstater", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_GET,
+        flags: 0,
+        request_id: 90,
+        args: u32_args(99), // fd 99 is not open
+        heap_ptr: 0,
+        heap_len: 24,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+    // Heap must not have been written.
+    assert!(heap.iter().all(|&b| b == 0));
+}
+
+// ---- fd_prestat_get ---------------------------------------------------
+
+#[test]
+fn fd_prestat_get_always_returns_ebadf() {
+    // PMos has no preopen dirs; the WASI preopen-discovery loop
+    // hits EBADF at the first probe and stops. The handler ignores
+    // the fd entirely — every fd gets the same EBADF.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "prestat", 0);
+    let mut heap = vec![0u8; 16];
+
+    for fd in [3u32, 4, 7, 42] {
+        let req = Request {
+            opcode: op_wasi::FD_PRESTAT_GET,
+            flags: 0,
+            request_id: 91,
+            args: u32_args(fd),
+            heap_ptr: 0,
+            heap_len: 0,
+        };
+        let resp = dispatch(&mut k, pid, &req, &mut heap);
+        assert_eq!(resp.status, -errno::EBADF, "fd={fd}");
+    }
+}
+
 // ---- IPC sockets ------------------------------------------------------
 //
 // Covers the 5 new generic IPC opcodes (`IPC_SOCKET`, `IPC_BIND`,
