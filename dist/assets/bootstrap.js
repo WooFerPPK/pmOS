@@ -371,7 +371,8 @@ function paintBoot(c, rows, animationFrame) {
 function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
   if (!window.location.hash.includes("mock-kernel")) {
-    const bootBinary = window.location.hash.includes("input-echo") ? "/bin/hello_input_echo" : "/bin/init";
+    const hash = window.location.hash;
+    const bootBinary = hash.includes("display-server") ? "/bin/display-server" : hash.includes("input-echo") ? "/bin/hello_input_echo" : "/bin/init";
     runRealKernelMode(bootBinary);
     return;
   }

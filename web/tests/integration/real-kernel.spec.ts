@@ -122,6 +122,88 @@ test("real kernel is the default boot path and runs init -> hello-std", async ({
   expect(wakeSlotReady).toBe("1");
 });
 
+test("display-server: std binary binds, accepts a client, relays pixels to /dev/fb0", async ({ page }) => {
+  const consoleLines: string[] = [];
+  page.on("console", (msg) => {
+    consoleLines.push(msg.text());
+  });
+  page.on("pageerror", (err) => {
+    consoleLines.push(`[pageerror] ${err.message}`);
+  });
+
+  // `#display-server` selects `/bin/display-server` — the first `std`
+  // binary in the workspace to do IPC over the M1 multi-process
+  // substrate. The binary plays server, client, AND framebuffer-writer
+  // in a single boot pass (mirroring `display-server-lite`'s
+  // composition-test pattern, promoted into a real std binary spawned
+  // as a real user Worker):
+  //
+  //   display_bind() → display_connect() → ipc_accept() →
+  //   fd_write(client, pixels) → fd_read(server, buf) →
+  //   path_open("/dev/fb0") → fd_write(fb_fd, buf) → return
+  //
+  // Observable signals: two `println!` lines — `"display-server
+  // starting"` at entry and `"display-server fb blit ok"` after the
+  // final `fd_write(fb_fd)`. The latter only prints on exit code 0
+  // (every intermediate failure takes a `std::process::exit(N)` path
+  // and never reaches the final println), so its presence implicitly
+  // proves the whole chain succeeded.
+  await page.goto("/index.html#display-server");
+
+  // Wait for the user Worker to spawn. `data-pmos-peak-live-workers`
+  // bumps to `1` when the spawn router instantiates the display-server
+  // Worker in response to the kernel's `proc:spawn` — same signal the
+  // input-echo test uses.
+  await expect
+    .poll(
+      async () => {
+        const attr = await page
+          .locator("body")
+          .getAttribute("data-pmos-peak-live-workers");
+        return attr ? Number(attr) : 0;
+      },
+      { timeout: 15_000 },
+    )
+    .toBeGreaterThanOrEqual(1);
+
+  // Wait for the binary's trailing println to arrive. Cold-path on a
+  // local dev-server is ~250 ms (std startup + bind + connect + accept
+  // + two IPC round trips + path_open + fb write); the generous
+  // timeout is for cold-start CI.
+  await expect
+    .poll(
+      () =>
+        consoleLines.find((l) =>
+          l.includes("[real-kernel] display-server fb blit ok"),
+        ) ?? null,
+      { timeout: 15_000 },
+    )
+    .not.toBeNull();
+
+  // With the exit line observed, the starting line MUST already be
+  // present AND ordered before the exit line.
+  const startIdx = consoleLines.findIndex((l) =>
+    l.includes("[real-kernel] display-server starting"),
+  );
+  const blitIdx = consoleLines.findIndex((l) =>
+    l.includes("[real-kernel] display-server fb blit ok"),
+  );
+  expect(startIdx).toBeGreaterThanOrEqual(0);
+  expect(blitIdx).toBeGreaterThan(startIdx);
+
+  // DOM surface: `<pre id="pmos-real-console">` carries the same
+  // lines (bootstrap's ConsoleHost.onOutput appends every flushed
+  // `/dev/console` line to this element).
+  const domText = await page.locator("#pmos-real-console").innerText();
+  expect(domText).toContain("display-server starting");
+  expect(domText).toContain("display-server fb blit ok");
+  expect(domText.indexOf("display-server starting")).toBeLessThan(
+    domText.indexOf("display-server fb blit ok"),
+  );
+
+  expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
+});
+
 test("input round-trip: keydown in real-kernel mode echoes to console", async ({ page }) => {
   const consoleLines: string[] = [];
   page.on("console", (msg) => {
