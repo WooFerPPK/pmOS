@@ -409,6 +409,85 @@ describe("installWorkerEntry with useRealKernel", () => {
     }
   });
 
+  it("falls back to the injected fetcher to load /assets/kernel.wasm when kernelWasmBytes is absent", async () => {
+    const msg = makeMessaging();
+    const fetched: string[] = [];
+    const entry = installWorkerEntry(msg, {
+      fetcher: async (url: string): Promise<ArrayBuffer> => {
+        fetched.push(url);
+        if (url === "/assets/kernel.wasm") return kernelWasmBytes;
+        throw new Error(`unexpected fetch: ${url}`);
+      },
+    });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+    await entry.whenReady;
+    expect(fetched).toEqual(["/assets/kernel.wasm"]);
+    expect(entry.realKernel).toBeDefined();
+    expect(msg.posted.filter((m) => m.kind === "ready")).toHaveLength(1);
+  });
+
+  it("populates the binary registry from /manifest.json when binaryRegistry is absent", async () => {
+    const msg = makeMessaging();
+    const manifest = {
+      version: 0,
+      assets: [
+        "_headers",
+        "assets/bin/hello-std.wasm",
+        // Decoy assets the entry must IGNORE (kernel.wasm sits at
+        // assets/, not assets/bin/; bootstrap.js is JS not wasm).
+        "assets/bootstrap.js",
+        "assets/kernel.wasm",
+        "index.html",
+      ],
+    };
+    const fetched: string[] = [];
+    const entry = installWorkerEntry(msg, {
+      fetcher: async (url: string): Promise<ArrayBuffer> => {
+        fetched.push(url);
+        if (url === "/assets/kernel.wasm") return kernelWasmBytes;
+        if (url === "/manifest.json") {
+          return new TextEncoder().encode(JSON.stringify(manifest)).buffer as ArrayBuffer;
+        }
+        if (url === "/assets/bin/hello-std.wasm") return helloStdWasmBytes;
+        throw new Error(`unexpected fetch: ${url}`);
+      },
+    });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+        bootBinary: "/bin/hello-std",
+      },
+    });
+    await entry.whenReady;
+
+    // Manifest was fetched; only the bin/*.wasm asset was followed
+    // up with a binary fetch. bootstrap.js + decoys must not have
+    // been pulled.
+    expect(fetched).toContain("/manifest.json");
+    expect(fetched).toContain("/assets/bin/hello-std.wasm");
+    expect(fetched).not.toContain("/assets/bootstrap.js");
+
+    // hello-std actually ran via the auto-built registry.
+    const writes = msg.posted
+      .filter((m) => m.kind === "console:write")
+      .flatMap((m) =>
+        m.kind === "console:write" ? [new TextDecoder().decode(m.bytes)] : [],
+      );
+    expect(writes.join("")).toBe("hello from std\n");
+  });
+
   it("auto-spawns the configured boot binary and routes its console output through the channel", async () => {
     const msg = makeMessaging();
     const registry = new Map<string, BufferSource>([

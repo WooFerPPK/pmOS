@@ -111,6 +111,16 @@ export interface WorkerEntryOptions {
    * `assets/bin/*.wasm` listed in the deploy manifest.
    */
   readonly binaryRegistry?: ReadonlyMap<string, BufferSource>;
+  /**
+   * URL fetcher used by the Worker-scope fallback path when
+   * [`kernelWasmBytes`] or [`binaryRegistry`] is absent. Defaults
+   * to a wrapper around `globalThis.fetch` that returns the
+   * response body as `ArrayBuffer`. Tests inject a mock so the
+   * fallback path is exercised without hitting the network; the
+   * production auto-install branch leaves it unset and the
+   * default kicks in.
+   */
+  readonly fetcher?: (url: string) => Promise<ArrayBuffer>;
 }
 
 /**
@@ -241,12 +251,24 @@ async function bootRealKernel(
   config: import("./shared/worker-proto").BootConfig,
   options: WorkerEntryOptions,
 ): Promise<{ scaffold: KernelWorker; host: KernelWasmHost }> {
-  const bytes = options.kernelWasmBytes;
-  if (bytes === undefined) {
-    const message =
-      "kernel-worker: useRealKernel=true but no kernelWasmBytes injected and Worker-scope fetch is not yet wired";
+  const fetcher = options.fetcher ?? defaultFetcher;
+  let bytes: BufferSource;
+  try {
+    bytes = options.kernelWasmBytes ?? (await fetcher("/assets/kernel.wasm"));
+  } catch (e) {
+    const message = `kernel-worker: failed to load /assets/kernel.wasm: ${String(e)}`;
     messaging.postMessage({ kind: "panic", message });
-    throw new Error(message);
+    throw e;
+  }
+  let registry = options.binaryRegistry;
+  if (registry === undefined && config.bootBinary !== undefined) {
+    try {
+      registry = await fetchBinaryRegistry(fetcher);
+    } catch (e) {
+      const message = `kernel-worker: failed to populate binary registry: ${String(e)}`;
+      messaging.postMessage({ kind: "panic", message });
+      throw e;
+    }
   }
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
@@ -259,9 +281,7 @@ async function bootRealKernel(
     onPanic: (message: string) => {
       messaging.postMessage({ kind: "panic", message });
     },
-    ...(options.binaryRegistry !== undefined
-      ? { binaryRegistry: options.binaryRegistry }
-      : {}),
+    ...(registry !== undefined ? { binaryRegistry: registry } : {}),
   });
   const scaffold = bootKernelWorker({
     kernel: host,
@@ -274,6 +294,53 @@ async function bootRealKernel(
     await runBootBinary(host, config.bootBinary);
   }
   return { scaffold, host };
+}
+
+/**
+ * Default URL fetcher: wraps `globalThis.fetch` and returns the
+ * response body as `ArrayBuffer`. Throws when the response is not
+ * 2xx so the caller's error path surfaces a useful message.
+ */
+async function defaultFetcher(url: string): Promise<ArrayBuffer> {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} fetching ${url}`);
+  }
+  return res.arrayBuffer();
+}
+
+/**
+ * Fetch `/manifest.json`, walk every `assets/bin/*.wasm` entry, and
+ * return a registry mapping `/bin/<stem>` → fetched bytes. Each
+ * binary is fetched in parallel; the registry is built only after
+ * all finish so a missing binary fails cleanly with the URL in the
+ * error.
+ *
+ * The path key uses the bare basename (with extension stripped) and
+ * a `/bin/` prefix — matching the convention the kernel side
+ * already uses for spawn paths (e.g. `/bin/hello-std`,
+ * `/bin/hello_wasi_min`). The Rust side does not yet care about
+ * leading-slash normalization; the convention is kept consistent
+ * here so callers can predict the lookup key from the on-disk
+ * filename.
+ */
+async function fetchBinaryRegistry(
+  fetcher: (url: string) => Promise<ArrayBuffer>,
+): Promise<ReadonlyMap<string, BufferSource>> {
+  const manifestBuf = await fetcher("/manifest.json");
+  const manifestJson = new TextDecoder().decode(new Uint8Array(manifestBuf));
+  const manifest = JSON.parse(manifestJson) as { assets: string[] };
+  const binAssets = manifest.assets.filter(
+    (a) => a.startsWith("assets/bin/") && a.endsWith(".wasm"),
+  );
+  const entries = await Promise.all(
+    binAssets.map(async (asset): Promise<[string, ArrayBuffer]> => {
+      const stem = asset.slice("assets/bin/".length, -".wasm".length);
+      const bytes = await fetcher(`/${asset}`);
+      return [`/bin/${stem}`, bytes];
+    }),
+  );
+  return new Map(entries);
 }
 
 /**

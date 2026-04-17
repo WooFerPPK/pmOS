@@ -23,6 +23,7 @@
     "assets/bin/toolkit-free-client.wasm",
     "assets/bootstrap.js",
     "assets/hello.wasm",
+    "assets/kernel-worker.js",
     "assets/kernel.wasm",
     "index.html",
     "sw.js"
