@@ -551,6 +551,49 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // WASI `clock_time_get`.
+      //
+      // Signature (lowered):
+      //   (clock_id: i32, precision: i64, timestamp_ptr: i32) -> errno: i32
+      //
+      // `clock_id` selects the clock source (0 = REALTIME,
+      // 1 = MONOTONIC, 2/3 = cputime — ENOTSUP in v1). `precision`
+      // is the caller's advisory precision hint in ns; the PMos
+      // handler ignores it (the Platform clock is nanosecond-
+      // resolution already). `timestamp_ptr` is where to write
+      // the resulting i64 nanoseconds value in user memory.
+      //
+      // Dispatches a `CLOCK_TIME_GET` opcode packing `clock_id`
+      // as the u32 at args[0..4]. On success, writes the i64
+      // value (as little-endian bytes) to `timestamp_ptr` and
+      // returns 0. On failure, returns the positive errno (WASI
+      // convention); the Rust-side `Response.status` is already
+      // the negated errno, so the shim negates once more.
+      clock_time_get: (
+        clockId: number,
+        _precision: bigint,
+        timestampPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.CLOCK_TIME_GET,
+          requestId: 0,
+          arg0: clockId,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return -response.status;
+        // The kernel returns the i64 nanoseconds value in
+        // `response.value`. Write the bit pattern out verbatim —
+        // a u64 ns value that exceeds `Number.MAX_SAFE_INTEGER`
+        // (2^53) still survives as bigint → little-endian bytes
+        // without the precision loss that `setUint32` + Number
+        // arithmetic would introduce.
+        const view = new DataView(this.memory.buffer);
+        view.setBigInt64(timestampPtr, response.value, true);
+        return 0;
+      },
+
       // WASI `fd_prestat_get`.
       //
       // Signature: (fd: i32, buf_ptr: i32) -> errno.

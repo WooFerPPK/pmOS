@@ -21,7 +21,7 @@ build:
         -p hello-wasi-spawner -p ipc-self-test -p hello-framebuffer \
         -p display-server-lite -p hello-wasi-bootstrap \
         -p hello-fb-blit -p hello-input-echo \
-        -p hello-std
+        -p hello-std -p hello-clock
     cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
     cd web && npx esbuild src/kernel-worker-entry.ts --bundle --outfile=../build/assets/kernel-worker.js --format=esm
     cd web && npx esbuild src/user-worker-entry.ts --bundle --outfile=../build/assets/user-worker.js --format=esm

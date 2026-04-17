@@ -566,11 +566,11 @@ fn cap_list_returns_full_cap_bitset() {
 // ---- clock_time_get --------------------------------------------------
 
 #[test]
-fn clock_time_get_returns_strictly_increasing_nanoseconds() {
+fn clock_time_get_monotonic_returns_strictly_increasing_nanoseconds() {
     // The `Platform::now_ns` contract is "strictly increasing even
     // across back-to-back calls within the same nanosecond". Fire
-    // two dispatches in succession and assert the second reports a
-    // strictly larger timestamp.
+    // two dispatches in succession with clock_id = CLOCKID_MONOTONIC
+    // and assert the second reports a strictly larger timestamp.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "clock", 0);
     let mut heap = vec![0u8; 64];
@@ -579,9 +579,6 @@ fn clock_time_get_returns_strictly_increasing_nanoseconds() {
         opcode: op_wasi::CLOCK_TIME_GET,
         flags: 0,
         request_id: 80,
-        // clock_id = CLOCKID_MONOTONIC (1). The kernel ignores
-        // the id for now (every id maps to `now_ns`) but a future
-        // slice that splits realtime vs monotonic will care.
         args: u32_args(abi::wasi::CLOCKID_MONOTONIC),
         heap_ptr: 0,
         heap_len: 0,
@@ -601,8 +598,113 @@ fn clock_time_get_returns_strictly_increasing_nanoseconds() {
 
     assert!(
         ns2 > ns1,
-        "clock_time_get must be strictly increasing: ns1={ns1}, ns2={ns2}",
+        "clock_time_get(MONOTONIC) must be strictly increasing: ns1={ns1}, ns2={ns2}",
     );
+}
+
+#[test]
+fn clock_time_get_realtime_returns_wall_clock_nanoseconds() {
+    // clock_id = CLOCKID_REALTIME (0) reports the Unix-epoch-ns
+    // wall clock via `Platform::now_realtime_ns`. Under NativePlatform
+    // that's `SystemTime::now().duration_since(UNIX_EPOCH)` in ns.
+    // The assertion pins "value is after 2020-01-01 UTC" (a lower
+    // bound that is still true in 2026) to prove the handler really
+    // read the wall clock rather than returning the monotonic clock
+    // or zero.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_TIME_GET,
+        flags: 0,
+        request_id: 82,
+        args: u32_args(abi::wasi::CLOCKID_REALTIME),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.request_id, 82);
+    // 2020-01-01 00:00:00 UTC = 1577836800 s since epoch.
+    const Y2020_NS: i64 = 1_577_836_800_000_000_000;
+    assert!(
+        resp.value > Y2020_NS,
+        "clock_time_get(REALTIME) returned {}, expected > 2020-01-01 UTC ({})",
+        resp.value,
+        Y2020_NS,
+    );
+}
+
+#[test]
+fn clock_time_get_process_cputime_returns_enotsup() {
+    // CLOCKID_PROCESS_CPUTIME_ID (2) is a WASI-defined clock PMos
+    // does not implement in v1. The handler returns ENOTSUP so a
+    // userland libc that probes for cpu-time support sees a clean
+    // "no" rather than a phoney zero or a bogus monotonic value.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_TIME_GET,
+        flags: 0,
+        request_id: 83,
+        args: u32_args(abi::wasi::CLOCKID_PROCESS_CPUTIME_ID),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.request_id, 83);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn clock_time_get_thread_cputime_returns_enotsup() {
+    // CLOCKID_THREAD_CPUTIME_ID (3) — same rationale as the
+    // process-cputime test above.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_TIME_GET,
+        flags: 0,
+        request_id: 84,
+        args: u32_args(abi::wasi::CLOCKID_THREAD_CPUTIME_ID),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.request_id, 84);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn clock_time_get_unknown_clock_returns_einval() {
+    // Any clock_id outside the four WASI-defined values (0..=3)
+    // returns EINVAL. Matches POSIX's `clock_gettime(unknown_id, ...)`
+    // behavior and distinguishes "I know about this clock but don't
+    // implement it" (ENOTSUP) from "this isn't a clock id I recognise"
+    // (EINVAL).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_TIME_GET,
+        flags: 0,
+        request_id: 85,
+        args: u32_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(resp.request_id, 85);
+    assert_eq!(resp.value, 0);
 }
 
 // ---- random_get ------------------------------------------------------

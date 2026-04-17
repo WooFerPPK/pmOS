@@ -39,6 +39,7 @@ import {
   CAPSET_ALL,
   CAPSET_ORDINARY_APP,
   CAPSET_DESKTOP_SHELL,
+  CLOCKID,
   DEV,
   decodeResponse,
   encodeRequest,
@@ -95,6 +96,20 @@ interface TestFixture {
 interface FreshHostOptions {
   /** Override the default `{ ok: true }` outcome for spawn requests. */
   readonly spawnOutcome?: (pid: number, path: string) => SpawnOutcome;
+  /**
+   * Override the monotonic clock. Default `() => 0n` keeps most
+   * tests deterministic; `CLOCK_TIME_GET(MONOTONIC)` tests pass a
+   * specific value to verify the handler reads through the host
+   * import.
+   */
+  readonly nowNs?: () => bigint;
+  /**
+   * Override the wall-clock (`CLOCK_REALTIME`) host import. Default
+   * `() => 0n` keeps tests deterministic;
+   * `CLOCK_TIME_GET(REALTIME)` tests pass a specific value to
+   * verify the handler reads through the new host import.
+   */
+  readonly nowRealtimeNs?: () => bigint;
 }
 
 async function freshHost(opts: FreshHostOptions = {}): Promise<TestFixture> {
@@ -115,7 +130,8 @@ async function freshHost(opts: FreshHostOptions = {}): Promise<TestFixture> {
         : { ok: true };
     },
     // Deterministic clock so tests never race with wall-clock changes.
-    nowNs: () => 0n,
+    nowNs: opts.nowNs ?? (() => 0n),
+    nowRealtimeNs: opts.nowRealtimeNs ?? (() => 0n),
   });
   return { host, consoleWrites, panics, spawnCalls };
 }
@@ -391,6 +407,90 @@ describe("dispatch: ENOSYS", () => {
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
+  });
+});
+
+// ---- dispatch: CLOCK_TIME_GET --------------------------------------
+
+describe("dispatch: CLOCK_TIME_GET", () => {
+  it("returns the `nowNs` host import value for CLOCKID.MONOTONIC", async () => {
+    const { host } = await freshHost({
+      nowNs: () => 1_234_567_890_000n,
+      nowRealtimeNs: () => 9_999_999_999_999n,
+    });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_TIME_GET,
+      requestId: 50,
+      arg0: CLOCKID.MONOTONIC,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1_234_567_890_000n);
+    expect(response.requestId).toBe(50);
+  });
+
+  it("returns the `nowRealtimeNs` host import value for CLOCKID.REALTIME", async () => {
+    // The realtime clock value exceeds 2^53, so the BigInt path
+    // matters — an i32 ring-trip would lose bits. The 1.7e18-scale
+    // number here models a 2023-ish Unix-epoch-ns timestamp.
+    const { host } = await freshHost({
+      nowNs: () => 1n,
+      nowRealtimeNs: () => 1_700_000_000_000_000_000n,
+    });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_TIME_GET,
+      requestId: 51,
+      arg0: CLOCKID.REALTIME,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1_700_000_000_000_000_000n);
+  });
+
+  it("returns -ENOTSUP for CLOCKID.PROCESS_CPUTIME_ID", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_TIME_GET,
+      requestId: 52,
+      arg0: CLOCKID.PROCESS_CPUTIME_ID,
+    });
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -ENOTSUP for CLOCKID.THREAD_CPUTIME_ID", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_TIME_GET,
+      requestId: 53,
+      arg0: CLOCKID.THREAD_CPUTIME_ID,
+    });
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -EINVAL for an unknown clock id", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_TIME_GET,
+      requestId: 54,
+      arg0: 99,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response.value).toBe(0n);
   });
 });
 

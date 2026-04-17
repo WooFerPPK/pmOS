@@ -21,7 +21,7 @@
 //! `RANDOM_GET`, etc. is one `match` arm + one handler function +
 //! isolation tests.
 
-use abi::errno::{EBADF, EINVAL, ENOSYS};
+use abi::errno::{EBADF, EINVAL, ENOSYS, ENOTSUP};
 use abi::ext::Pid;
 use abi::ring::{Request, Response};
 use abi::wasi as op;
@@ -203,32 +203,51 @@ fn handle_proc_exit(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 //   args[4..12] = precision (u64, ignored in v1 — the Platform
 //                 clock has nanosecond granularity already)
 // Response:
-//   value       = monotonic nanoseconds (u64 widened to i64;
+//   value       = nanoseconds (u64 widened to i64;
 //                 `i64::from_ne_bytes(u64::to_ne_bytes(...))`
 //                 to preserve every bit, which userland reads
 //                 back as u64)
 //
-// WASI defines four clock IDs: realtime, monotonic, process
-// cputime, thread cputime. `Platform::now_ns` is the kernel's
-// monotonic-since-boot clock; that's the only clock source we
-// can cheaply provide. For v1 every clock_id maps to the same
-// `now_ns` — a kernel that cares about wall-clock time can grow
-// a separate `Platform::realtime_ns` later without changing the
-// opcode's wire format.
+// WASI defines four clock IDs: realtime (0), monotonic (1),
+// process cputime (2), thread cputime (3).
+//
+//   * CLOCKID_MONOTONIC → `Platform::now_ns()`, the kernel's
+//     strictly-increasing clock. Userland `Instant::now()`
+//     ultimately lands here.
+//   * CLOCKID_REALTIME  → `Platform::now_realtime_ns()`, the
+//     wall-clock-ns-since-Unix-epoch. Userland
+//     `SystemTime::now()` lands here.
+//   * CLOCKID_PROCESS_CPUTIME_ID / CLOCKID_THREAD_CPUTIME_ID →
+//     ENOTSUP. The v1 kernel doesn't model per-process CPU
+//     accounting. Returning ENOTSUP (rather than a fake value
+//     or routing to the monotonic clock) is the honest answer;
+//     a libc that probes for cpu-time support sees a clean "no"
+//     and falls back to monotonic.
+//   * Anything else → EINVAL.
 //
 // Time, unlike every other syscall, runs forward even across
 // panics + reboots. That matters because userland's HashMap
 // seeding uses `clock_time_get` to get entropy — if the kernel
 // ever returns a constant, HashMap-based protocols degrade
 // predictably. `Platform::now_ns` is documented to be strictly
-// increasing, which is strong enough.
+// increasing, which is strong enough; `Platform::now_realtime_ns`
+// is not required to be monotonic but is required to be
+// wall-clock-sourced (so it reliably seeds entropy even though
+// it may step backwards across an NTP adjustment).
 
 fn handle_clock_time_get(req: &Request) -> Response {
-    let _clock_id = args_u32(req, 0);
-    // `Platform::now_ns()` returns u64; cast to i64 preserves
-    // every bit (u64::MAX becomes -1). Userland bigint code
-    // reinterprets the bits back to u64.
-    let ns = platform::current().now_ns();
+    let clock_id = args_u32(req, 0);
+    // `Platform::now_*()` return u64; cast to i64 preserves every
+    // bit (u64::MAX becomes -1). Userland bigint code reinterprets
+    // the bits back to u64.
+    let ns = match clock_id {
+        abi::wasi::CLOCKID_MONOTONIC => platform::current().now_ns(),
+        abi::wasi::CLOCKID_REALTIME => platform::current().now_realtime_ns(),
+        abi::wasi::CLOCKID_PROCESS_CPUTIME_ID | abi::wasi::CLOCKID_THREAD_CPUTIME_ID => {
+            return Response::err(req.request_id, ENOTSUP);
+        }
+        _ => return Response::err(req.request_id, EINVAL),
+    };
     Response::ok(req.request_id, ns as i64)
 }
 

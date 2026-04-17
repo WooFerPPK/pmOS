@@ -110,6 +110,13 @@ async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }>
         // default `performance.now()`-based clock is in play.
         return 0n;
       },
+      pmos_host_now_realtime_ns: (): bigint => {
+        // Deterministic wall clock, same rationale as `now_ns`.
+        // `CLOCK_TIME_GET(REALTIME)` behaviour is covered in
+        // `kernel-wasm-host.test.ts` + the `hello-clock`
+        // acceptance test in `user-wasm-runtime.test.ts`.
+        return 0n;
+      },
       pmos_host_random_bytes: (_ptr: number, _len: number): void => {
         // No-op — none of the tested opcodes need random bytes.
       },

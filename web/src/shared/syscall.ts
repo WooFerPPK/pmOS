@@ -221,6 +221,20 @@ export const ERRNO = {
   EINVAL: 28,
   ENOENT: 44,
   ENOSYS: 52,
+  ENOTSUP: 58,
+} as const;
+
+// ---- WASI clock identifiers -----------------------------------------
+//
+// Mirror of `abi::wasi::CLOCKID_*`. Passed as the u32 at args[0..4] on
+// a `CLOCK_TIME_GET` request. REALTIME + MONOTONIC are supported in v1;
+// PROCESS_CPUTIME + THREAD_CPUTIME return -ENOTSUP.
+
+export const CLOCKID = {
+  REALTIME: 0,
+  MONOTONIC: 1,
+  PROCESS_CPUTIME_ID: 2,
+  THREAD_CPUTIME_ID: 3,
 } as const;
 
 // ---- Device identifiers ---------------------------------------------

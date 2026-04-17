@@ -9,7 +9,7 @@
 
 use core::panic::PanicInfo;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use abi::ext::Pid;
 
@@ -118,6 +118,26 @@ impl Platform for NativePlatform {
         }
         guard.last_ns = ns;
         ns
+    }
+
+    fn now_realtime_ns(&self) -> u64 {
+        // Under native tests the wall clock comes straight from
+        // `SystemTime::now()`. No strict-monotonicity fudge: the
+        // WASI `CLOCK_REALTIME` contract permits the clock to jump
+        // (NTP adjustment, manual clock change, leap-second
+        // smearing) and a caller who needs monotonicity is expected
+        // to use `CLOCK_MONOTONIC` instead. If the host clock is
+        // somehow before the Unix epoch (developer set the clock to
+        // 1969 to test something), the `duration_since` call errors
+        // out; we saturate to 0 in that case rather than panic.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| {
+                d.as_secs()
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(u64::from(d.subsec_nanos()))
+            })
+            .unwrap_or(0)
     }
 
     fn driver_call(&self, dev: DevId, op: u32, args: &[u8]) -> DriverResult<u32> {

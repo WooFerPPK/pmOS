@@ -5,7 +5,9 @@
 //! implement in pure Rust:
 //!
 //! * **Clock**: monotonic nanoseconds since kernel boot
-//!   (`clock_time_get(MONOTONIC)` implementation).
+//!   (`clock_time_get(MONOTONIC)` implementation) + wall-clock
+//!   nanoseconds since the Unix epoch
+//!   (`clock_time_get(REALTIME)` implementation).
 //! * **Driver transport**: how the kernel sends messages to, and
 //!   receives asynchronous events from, the TypeScript driver layer
 //!   — framebuffer, input, block, net, console.
@@ -78,6 +80,13 @@ pub trait Platform: Sync + 'static {
     /// underlying clock ticked less than 1 ns between calls — the
     /// Platform may add a `+1` fudge).
     fn now_ns(&self) -> u64;
+
+    /// Wall-clock nanoseconds since the Unix epoch
+    /// (1970-01-01 00:00:00 UTC). Unlike [`now_ns`] this clock is
+    /// NOT required to be monotonic — the host OS may step it
+    /// backwards across an NTP adjustment or a manual clock change.
+    /// Callers that need monotonicity use [`now_ns`] instead.
+    fn now_realtime_ns(&self) -> u64;
 
     /// Non-blocking control-channel send to a driver. Used for
     /// device-open, ioctl, and similar cold-path operations. Hot

@@ -1,0 +1,13 @@
+[package]
+name = "hello-clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Standard `bin` target. Exists to exercise the CLOCK_TIME_GET WASI
+# shim end-to-end: `Instant::now()` hits `clock_time_get(MONOTONIC)`,
+# `SystemTime::now()` hits `clock_time_get(REALTIME)`.
+
+[[bin]]
+name = "hello-clock"
+path = "src/main.rs"

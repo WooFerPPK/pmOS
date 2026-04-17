@@ -7,6 +7,7 @@
     "assets/bin/display_server_lite.wasm",
     "assets/bin/edit.wasm",
     "assets/bin/files.wasm",
+    "assets/bin/hello-clock.wasm",
     "assets/bin/hello-std.wasm",
     "assets/bin/hello_fb_blit.wasm",
     "assets/bin/hello_framebuffer.wasm",

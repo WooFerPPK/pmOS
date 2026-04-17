@@ -20,6 +20,7 @@ use super::{DevId, DriverError, DriverResult, Platform};
 #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
 extern "C" {
     fn pmos_host_now_ns() -> u64;
+    fn pmos_host_now_realtime_ns() -> u64;
     fn pmos_host_driver_call(
         dev: u32,
         op: u32,
@@ -45,6 +46,15 @@ impl Platform for WasmPlatform {
         }
         // Unreachable in real wasm32 builds; present so the crate
         // type-checks when feature-flipped inconsistently.
+        0
+    }
+
+    #[allow(unreachable_code)]
+    fn now_realtime_ns(&self) -> u64 {
+        #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
+        unsafe {
+            return pmos_host_now_realtime_ns();
+        }
         0
     }
 

@@ -347,7 +347,8 @@ var ERRNO = {
   EBADF: 8,
   EINVAL: 28,
   ENOENT: 44,
-  ENOSYS: 52
+  ENOSYS: 52,
+  ENOTSUP: 58
 };
 var DEV = {
   FRAMEBUFFER: 0,
@@ -434,6 +435,9 @@ var KernelWasmHost = class _KernelWasmHost {
     const nowNs = options.nowNs ?? (() => {
       return BigInt(Math.floor(performance.now() * 1e6));
     });
+    const nowRealtimeNs = options.nowRealtimeNs ?? (() => {
+      return BigInt(Date.now()) * 1000000n;
+    });
     const onPanic = options.onPanic ?? ((message) => {
       throw new Error(`KernelWasmHost panic: ${message}`);
     });
@@ -451,6 +455,7 @@ var KernelWasmHost = class _KernelWasmHost {
     const imports = {
       env: {
         pmos_host_now_ns: () => nowNs(),
+        pmos_host_now_realtime_ns: () => nowRealtimeNs(),
         pmos_host_driver_call: (dev, _op, argsPtr, argsLen, _resultPtr) => {
           if (memory === void 0) return 0;
           if (dev === DEV.CONSOLE && options.onConsoleWrite !== void 0) {

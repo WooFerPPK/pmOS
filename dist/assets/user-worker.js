@@ -88,7 +88,8 @@ var ERRNO = {
   EBADF: 8,
   EINVAL: 28,
   ENOENT: 44,
-  ENOSYS: 52
+  ENOSYS: 52,
+  ENOTSUP: 58
 };
 var CAP = {
   DISPLAY_CLIENT: 1,
@@ -586,6 +587,38 @@ var UserWasmRuntime = class {
         if (response.status !== 0) return -response.status;
         const writeBuf = new Uint8Array(this.memory.buffer);
         writeBuf.set(heapOut.subarray(0, 24), bufPtr);
+        return 0;
+      },
+      // WASI `clock_time_get`.
+      //
+      // Signature (lowered):
+      //   (clock_id: i32, precision: i64, timestamp_ptr: i32) -> errno: i32
+      //
+      // `clock_id` selects the clock source (0 = REALTIME,
+      // 1 = MONOTONIC, 2/3 = cputime — ENOTSUP in v1). `precision`
+      // is the caller's advisory precision hint in ns; the PMos
+      // handler ignores it (the Platform clock is nanosecond-
+      // resolution already). `timestamp_ptr` is where to write
+      // the resulting i64 nanoseconds value in user memory.
+      //
+      // Dispatches a `CLOCK_TIME_GET` opcode packing `clock_id`
+      // as the u32 at args[0..4]. On success, writes the i64
+      // value (as little-endian bytes) to `timestamp_ptr` and
+      // returns 0. On failure, returns the positive errno (WASI
+      // convention); the Rust-side `Response.status` is already
+      // the negated errno, so the shim negates once more.
+      clock_time_get: (clockId, _precision, timestampPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.CLOCK_TIME_GET,
+          requestId: 0,
+          arg0: clockId,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        if (response.status !== 0) return -response.status;
+        const view = new DataView(this.memory.buffer);
+        view.setBigInt64(timestampPtr, response.value, true);
         return 0;
       },
       // WASI `fd_prestat_get`.

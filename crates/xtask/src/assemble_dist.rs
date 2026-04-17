@@ -135,6 +135,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     // bin target (not cdylib): cargo preserves the dashes in the
     // output filename, so the assembled artefact is `hello-std.wasm`.
     ("hello-std", "hello-std"),
+    ("hello-clock", "hello-clock"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {

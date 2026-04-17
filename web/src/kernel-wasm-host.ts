@@ -176,6 +176,18 @@ export interface KernelWasmHostOptions {
    */
   readonly nowNs?: () => bigint;
   /**
+   * Overridable wall-clock (`CLOCK_REALTIME`) source. Default:
+   * `BigInt(Date.now()) * 1_000_000n` (Date.now is ms since Unix
+   * epoch; multiply to ns). Tests that want deterministic wall time
+   * — most notably `CLOCK_TIME_GET(REALTIME)` coverage — replace
+   * this with a fixed value.
+   *
+   * Not required to be monotonic; the WASI `CLOCK_REALTIME` contract
+   * permits the clock to step. Userland that needs monotonicity
+   * calls `CLOCK_TIME_GET(MONOTONIC)` which hits [`nowNs`] instead.
+   */
+  readonly nowRealtimeNs?: () => bigint;
+  /**
    * Called when the kernel asks the host to spawn a user Worker for
    * a newly-created pid. The callback receives the pid the kernel
    * allocated and the UTF-8 binary path the caller passed to
@@ -370,6 +382,12 @@ export class KernelWasmHost implements Kernel {
     const nowNs = options.nowNs ?? ((): bigint => {
       return BigInt(Math.floor(performance.now() * 1_000_000));
     });
+    const nowRealtimeNs = options.nowRealtimeNs ?? ((): bigint => {
+      // `Date.now()` is ms since the Unix epoch; multiply by 1e6 to
+      // reach ns. The product fits in i64 — the year-2262 overflow
+      // is far enough out that we don't guard for it here.
+      return BigInt(Date.now()) * 1_000_000n;
+    });
     const onPanic = options.onPanic ?? ((message: string): void => {
       throw new Error(`KernelWasmHost panic: ${message}`);
     });
@@ -395,6 +413,8 @@ export class KernelWasmHost implements Kernel {
     const imports: WebAssembly.Imports = {
       env: {
         pmos_host_now_ns: (): bigint => nowNs(),
+
+        pmos_host_now_realtime_ns: (): bigint => nowRealtimeNs(),
 
         pmos_host_driver_call: (
           dev: number,

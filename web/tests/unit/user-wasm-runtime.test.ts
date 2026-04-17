@@ -124,6 +124,7 @@ let helloWasiBootstrapWasmBytes: ArrayBuffer;
 let helloFbBlitWasmBytes: ArrayBuffer;
 let helloInputEchoWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
+let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
 let displayServerWasmBytes: ArrayBuffer;
 let displayClientDemoWasmBytes: ArrayBuffer;
@@ -172,6 +173,11 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello-std.wasm",
   );
+  // `hello-clock` is also a bin target (dashes preserved).
+  const helloClockPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello-clock.wasm",
+  );
   // `init` is also a bin target, no dash-preservation concerns.
   const initPath = path.join(
     repoRoot,
@@ -199,6 +205,7 @@ beforeAll(() => {
     helloFbBlitPath,
     helloInputEchoPath,
     helloStdPath,
+    helloClockPath,
     initPath,
     displayServerPath,
     displayClientDemoPath,
@@ -230,6 +237,7 @@ beforeAll(() => {
   helloFbBlitWasmBytes = loadWasm(helloFbBlitPath);
   helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
+  helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
   displayServerWasmBytes = loadWasm(displayServerPath);
   displayClientDemoWasmBytes = loadWasm(displayClientDemoPath);
@@ -1163,6 +1171,61 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // write step. Playwright's four-pid concurrent-Worker test is
     // the observer that captures the framebuffer payload.
     expect(fbWrites).toHaveLength(0);
+  });
+
+  it("hello-clock: std binary drives CLOCK_TIME_GET(MONOTONIC + REALTIME) through the WASI shim end-to-end", async () => {
+    // The CLOCK_TIME_GET acceptance test. `hello-clock`'s `_start`
+    // calls `Instant::now()` (which lowers to
+    // `clock_time_get(MONOTONIC, ...)`) twice and asserts
+    // non-decreasing, then calls `SystemTime::now()` (which lowers
+    // to `clock_time_get(REALTIME, ...)`) and asserts the wall
+    // clock is after 2020.
+    //
+    // The binary prints two lines ("monotonic ok", "realtime ok")
+    // and exits 0. Both lines arriving means both clock IDs route
+    // through the shim, land on the kernel handler's correct
+    // branch, read the right `Platform::now_*` source, and travel
+    // back as an 8-byte i64 the WASI shim writes into user memory.
+    //
+    // Failure modes:
+    //   * LinkError at instantiate = `clock_time_get` shim missing
+    //   * exit nonzero + panic output = one of the std asserts
+    //     tripped (monotonicity regression / realtime before 2020)
+    //   * missing "monotonic ok" = MONOTONIC branch broken
+    //   * missing "realtime ok" = REALTIME branch broken or
+    //     `nowRealtimeNs` defaulting to 0
+    const consoleWrites: Uint8Array[] = [];
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+    });
+
+    const pid = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(pid, 0);
+    kernel.installConsoleFd(pid, 1);
+    kernel.installConsoleFd(pid, 2);
+    kernel.markRunning(pid);
+
+    const backend = new KernelWasmHostBackend(kernel, pid);
+    const runtime = new UserWasmRuntime(helloClockWasmBytes, backend);
+
+    const exitCode = await runtime.run();
+
+    expect(exitCode).toBe(0);
+    const combined = new TextDecoder().decode(
+      new Uint8Array(
+        consoleWrites.reduce<number[]>(
+          (acc, b) => acc.concat(Array.from(b)),
+          [],
+        ),
+      ),
+    );
+    const lines = combined.split("\n").filter((l) => l.length > 0);
+    expect(lines).toEqual([
+      "hello-clock monotonic ok",
+      "hello-clock realtime ok",
+    ]);
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {
