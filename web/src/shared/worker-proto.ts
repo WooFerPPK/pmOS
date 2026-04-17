@@ -37,6 +37,27 @@ export interface BootConfig {
    * empty list.
    */
   readonly terminalBanner?: readonly string[];
+  /**
+   * When true, the kernel Worker constructs a real
+   * [`KernelWasmHost`] from the compiled `kernel.wasm` cdylib
+   * instead of the preview-slice [`MockKernel`]. Defaults to
+   * false so every existing caller keeps the mock path.
+   *
+   * Production callers fetch `/assets/kernel.wasm` at Worker
+   * scope; tests inject the bytes via the second argument to
+   * `installWorkerEntry` and never touch the network.
+   */
+  readonly useRealKernel?: boolean;
+  /**
+   * Optional path of a wasm binary to spawn on boot via
+   * `PROC_SPAWN`. Only honoured when [`useRealKernel`] is true
+   * and the binary path resolves through the entry's
+   * `binaryRegistry`. The boot binary runs to completion before
+   * the entry resolves its `whenReady` promise; production code
+   * should treat the boot binary as a transient sanity demo until
+   * the real init binary supersedes it.
+   */
+  readonly bootBinary?: string;
 }
 
 /** Main-thread → kernel-worker. */

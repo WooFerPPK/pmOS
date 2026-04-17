@@ -28,7 +28,13 @@
 
 import { bootKernelWorker } from "./kernel-worker";
 import type { KernelWorker } from "./kernel-worker";
+import { KernelWasmHost } from "./kernel-wasm-host";
 import { MockKernel } from "./mock-kernel";
+import {
+  CAPSET_ALL,
+  encodeSpawnManifest,
+  OP_EXT,
+} from "./shared/syscall";
 import type { KernelToMain, MainToKernel } from "./shared/worker-proto";
 
 /**
@@ -56,6 +62,55 @@ export interface WorkerMessaging {
 export interface WorkerEntry {
   /** The scaffold, once boot has happened. `undefined` pre-boot. */
   readonly scaffold: KernelWorker | undefined;
+  /**
+   * The [`KernelWasmHost`] backing the scaffold, set only when
+   * boot ran the `useRealKernel` path. `undefined` for the
+   * MockKernel path and pre-boot. Tests use this to dispatch
+   * syscalls directly against the real kernel; production code
+   * does not touch it.
+   */
+  readonly realKernel: KernelWasmHost | undefined;
+  /**
+   * Resolves once boot has completed (kernel constructed and
+   * scaffold bound). For the sync MockKernel path this resolves
+   * during the `boot` message handler; for the async KernelWasmHost
+   * path it resolves after `KernelWasmHost.create` settles.
+   *
+   * Callers that need to interact with the entry post-boot from a
+   * test context should `await whenReady` first. Production code
+   * doesn't need this — it sees `{kind: "ready"}` arrive on the
+   * main-thread channel and proceeds from there.
+   */
+  readonly whenReady: Promise<void>;
+}
+
+/**
+ * Optional per-install configuration for [`installWorkerEntry`].
+ * Production callers (the auto-install branch at the bottom of this
+ * module) pass nothing; tests inject the kernel wasm bytes here so
+ * the boot path can build a `KernelWasmHost` without a real
+ * `fetch('/assets/kernel.wasm')`.
+ */
+export interface WorkerEntryOptions {
+  /**
+   * Pre-fetched bytes for `kernel.wasm`. When the boot config has
+   * `useRealKernel: true` and this option is set, the entry uses
+   * these bytes verbatim. When the option is absent and
+   * `useRealKernel: true`, the entry falls back to fetching
+   * `/assets/kernel.wasm` from Worker scope (lands in a follow-up
+   * slice — for now, missing bytes + `useRealKernel: true` is a
+   * panic).
+   */
+  readonly kernelWasmBytes?: BufferSource;
+  /**
+   * Map from binary path to wasm bytes. Forwarded into
+   * [`KernelWasmHost.create`] so the kernel's default
+   * `onSpawnProcess` can look up paths the boot binary (or any
+   * descendant) requests via `PROC_SPAWN`. Tests inject this
+   * directly; production builds it at Worker scope from the
+   * `assets/bin/*.wasm` listed in the deploy manifest.
+   */
+  readonly binaryRegistry?: ReadonlyMap<string, BufferSource>;
 }
 
 /**
@@ -65,8 +120,16 @@ export interface WorkerEntry {
  * fake. The entry point installs its own `onmessage` handler;
  * don't install another one.
  */
-export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
+export function installWorkerEntry(
+  messaging: WorkerMessaging,
+  options: WorkerEntryOptions = {},
+): WorkerEntry {
   let scaffold: KernelWorker | undefined;
+  let realKernel: KernelWasmHost | undefined;
+  let resolveReady!: () => void;
+  const whenReady = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
 
   messaging.onmessage = (ev: { data: MainToKernel }): void => {
     const msg = ev.data;
@@ -79,52 +142,18 @@ export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
         });
         return;
       }
-      // Decide which framebuffer mode the mock kernel runs:
-      //
-      //   * `liveTerminal` takes precedence when enabled:
-      //     the mock owns scrollback + input buffer state
-      //     and re-rasterizes on every keystroke.
-      //   * `enableFramebuffer` without `liveTerminal` gives
-      //     the one-shot splash path (useful for the boot
-      //     screen's proof-of-fb flash).
-      //   * Neither → no framebuffer traffic at all.
-      //
-      // Banner lines arrive as plain strings on the boot
-      // config; we map them 1:1 to `banner`-kind scrollback
-      // entries so the first rendered frame already has
-      // text.
-      const liveTerminal =
-        msg.config.liveTerminal === true && msg.config.enableFramebuffer;
-      const initialScrollback = liveTerminal
-        ? (msg.config.terminalBanner ?? []).map(
-            (text) => ({ text, kind: "banner" as const }),
-          )
-        : undefined;
-      const mock = new MockKernel({
-        policy: { kind: "faux-shell" },
-        // When the main thread asked for a framebuffer AND
-        // didn't pick live-terminal mode, fall back to the
-        // one-shot splash. The scaffold's fb driver routes
-        // the blit to the main-thread FbHost.
-        emitSplashOnFirstInput:
-          msg.config.enableFramebuffer && !liveTerminal,
-        liveTerminal,
-        ...(initialScrollback ? { initialScrollback } : {}),
-        // Wire the kernel panic sink to a postMessage on
-        // the main-thread channel. This is what
-        // bootstrap.ts's panic overlay listens on.
-        panicEmit: (message: string) => {
-          messaging.postMessage({ kind: "panic", message });
-        },
-      });
-      scaffold = bootKernelWorker({
-        kernel: mock,
-        config: msg.config,
-        postToMain(out: KernelToMain): void {
-          messaging.postMessage(out);
-        },
-      });
-      mock.bindScaffold(scaffold);
+      if (msg.config.useRealKernel === true) {
+        void bootRealKernel(messaging, msg.config, options).then(
+          ({ scaffold: s, host }) => {
+            scaffold = s;
+            realKernel = host;
+            resolveReady();
+          },
+        );
+        return;
+      }
+      scaffold = bootMockKernel(messaging, msg.config);
+      resolveReady();
       return;
     }
     // Post-boot: forward to the scaffold. The scaffold itself
@@ -137,7 +166,162 @@ export function installWorkerEntry(messaging: WorkerMessaging): WorkerEntry {
     get scaffold(): KernelWorker | undefined {
       return scaffold;
     },
+    get realKernel(): KernelWasmHost | undefined {
+      return realKernel;
+    },
+    whenReady,
   };
+}
+
+/**
+ * The original synchronous boot path: construct a `MockKernel`
+ * with the chosen framebuffer mode, bind it into a fresh scaffold,
+ * and return the scaffold.
+ */
+function bootMockKernel(
+  messaging: WorkerMessaging,
+  config: import("./shared/worker-proto").BootConfig,
+): KernelWorker {
+  // Decide which framebuffer mode the mock kernel runs:
+  //
+  //   * `liveTerminal` takes precedence when enabled:
+  //     the mock owns scrollback + input buffer state
+  //     and re-rasterizes on every keystroke.
+  //   * `enableFramebuffer` without `liveTerminal` gives
+  //     the one-shot splash path (useful for the boot
+  //     screen's proof-of-fb flash).
+  //   * Neither → no framebuffer traffic at all.
+  //
+  // Banner lines arrive as plain strings on the boot
+  // config; we map them 1:1 to `banner`-kind scrollback
+  // entries so the first rendered frame already has
+  // text.
+  const liveTerminal =
+    config.liveTerminal === true && config.enableFramebuffer;
+  const initialScrollback = liveTerminal
+    ? (config.terminalBanner ?? []).map(
+        (text) => ({ text, kind: "banner" as const }),
+      )
+    : undefined;
+  const mock = new MockKernel({
+    policy: { kind: "faux-shell" },
+    emitSplashOnFirstInput:
+      config.enableFramebuffer && !liveTerminal,
+    liveTerminal,
+    ...(initialScrollback ? { initialScrollback } : {}),
+    panicEmit: (message: string) => {
+      messaging.postMessage({ kind: "panic", message });
+    },
+  });
+  const scaffold = bootKernelWorker({
+    kernel: mock,
+    config,
+    postToMain(out: KernelToMain): void {
+      messaging.postMessage(out);
+    },
+  });
+  mock.bindScaffold(scaffold);
+  return scaffold;
+}
+
+/**
+ * The async boot path used when `boot.config.useRealKernel === true`.
+ * Loads `kernel.wasm` (from `options.kernelWasmBytes` for tests, or
+ * `fetch('/assets/kernel.wasm')` in production), constructs a
+ * [`KernelWasmHost`], and binds it into a fresh scaffold.
+ *
+ * Posts a panic on the messaging channel and rethrows when the wasm
+ * is unavailable or instantiation fails. The caller awaits the
+ * returned promise; on rejection there is nothing left to do — the
+ * scaffold stays unset and any subsequent main-thread message lands
+ * back in the pre-boot panic branch.
+ */
+async function bootRealKernel(
+  messaging: WorkerMessaging,
+  config: import("./shared/worker-proto").BootConfig,
+  options: WorkerEntryOptions,
+): Promise<{ scaffold: KernelWorker; host: KernelWasmHost }> {
+  const bytes = options.kernelWasmBytes;
+  if (bytes === undefined) {
+    const message =
+      "kernel-worker: useRealKernel=true but no kernelWasmBytes injected and Worker-scope fetch is not yet wired";
+    messaging.postMessage({ kind: "panic", message });
+    throw new Error(message);
+  }
+  const host = await KernelWasmHost.create(bytes, {
+    // Bytes the kernel flushes from `/dev/console` ride the existing
+    // ConsoleHost main-thread channel as `console:write` messages,
+    // so the boot screen + live terminal don't need to know whether
+    // the source was MockKernel or KernelWasmHost.
+    onConsoleWrite: (bytes: Uint8Array) => {
+      messaging.postMessage({ kind: "console:write", bytes });
+    },
+    onPanic: (message: string) => {
+      messaging.postMessage({ kind: "panic", message });
+    },
+    ...(options.binaryRegistry !== undefined
+      ? { binaryRegistry: options.binaryRegistry }
+      : {}),
+  });
+  const scaffold = bootKernelWorker({
+    kernel: host,
+    config,
+    postToMain(out: KernelToMain): void {
+      messaging.postMessage(out);
+    },
+  });
+  if (config.bootBinary !== undefined) {
+    await runBootBinary(host, config.bootBinary);
+  }
+  return { scaffold, host };
+}
+
+/**
+ * Spawn the configured boot binary as a child of a freshly-allocated
+ * "init" pid and drain pending spawns until every transitive child
+ * exits. Mirrors the manual choreography that
+ * `kernel-wasm-host.test.ts` and the user-wasm-runtime composition
+ * tests perform: register a parent process holding `CAPSET_ALL` so
+ * the spawn is permitted under the cap-subset rule, install the
+ * three console fds the kernel demands of any spawn parent, mark the
+ * parent Running, then issue `PROC_SPAWN` and let the
+ * `binaryRegistry`-backed default `onSpawnProcess` queue the work.
+ *
+ * Errors at any stage propagate up: the caller's `whenReady` rejects,
+ * which the entry's pre-boot panic branch surfaces if the subsequent
+ * main-thread message arrives.
+ */
+async function runBootBinary(
+  host: KernelWasmHost,
+  bootBinary: string,
+): Promise<void> {
+  const initPid = host.registerProcess(CAPSET_ALL);
+  host.installConsoleFd(initPid, 0);
+  host.installConsoleFd(initPid, 1);
+  host.installConsoleFd(initPid, 2);
+  host.markRunning(initPid);
+
+  const manifest = encodeSpawnManifest({
+    path: bootBinary,
+    caps: CAPSET_ALL,
+  });
+  const { response } = host.dispatch(
+    initPid,
+    {
+      opcode: OP_EXT.PROC_SPAWN,
+      requestId: 1,
+      args: manifest.args,
+      heapPtr: 0,
+      heapLen: manifest.heap.length,
+    },
+    manifest.heap,
+  );
+  if (response.status !== 0) {
+    throw new Error(
+      `kernel-worker: PROC_SPAWN(${bootBinary}) failed with status ${response.status}`,
+    );
+  }
+  await host.drainPendingSpawns();
 }
 
 // ---- Worker auto-install --------------------------------------

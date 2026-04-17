@@ -5,7 +5,9 @@
 // Uses a `FakeWorkerMessaging` object instead of a real Worker
 // so the boot sequence is driven deterministically.
 
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import { beforeAll, describe, expect, it } from "vitest";
 import { installWorkerEntry } from "../../src/kernel-worker-entry";
 import type { WorkerMessaging } from "../../src/kernel-worker-entry";
 import type { KernelToMain, MainToKernel } from "../../src/shared/worker-proto";
@@ -15,6 +17,9 @@ import {
   packMouseButton,
   packMouseMotion,
 } from "../../src/shared/input-proto";
+import { CAPSET_ALL, OP_WASI } from "../../src/shared/syscall";
+
+let helloStdWasmBytes: ArrayBuffer;
 
 interface FakeMessaging extends WorkerMessaging {
   readonly posted: KernelToMain[];
@@ -291,5 +296,172 @@ describe("installWorkerEntry", () => {
     msg.send({ kind: "input:mouse", bytes: packMouseMotion(1, 1) });
     const after = msg.posted.filter((m) => m.kind === "fb:blit").length;
     expect(after - baseBlits).toBe(1);
+  });
+});
+
+// ---- useRealKernel: KernelWasmHost as the production kernel -----------
+//
+// When the boot config carries `useRealKernel: true`, the entry
+// constructs a `KernelWasmHost` from the real `kernel.wasm` cdylib
+// instead of a `MockKernel`. Production fetches the wasm at Worker
+// scope; tests inject the bytes via the optional second argument to
+// `installWorkerEntry` so the boot path is exercised without a real
+// fetch.
+
+let kernelWasmBytes: ArrayBuffer;
+
+beforeAll(() => {
+  const wasmPath = path.resolve(
+    __dirname,
+    "../../../target/wasm32-unknown-unknown/release/kernel.wasm",
+  );
+  if (!fs.existsSync(wasmPath)) {
+    throw new Error(
+      `kernel.wasm not found at ${wasmPath}. Run \`just build\` first.`,
+    );
+  }
+  const raw = fs.readFileSync(wasmPath);
+  kernelWasmBytes = raw.buffer.slice(
+    raw.byteOffset,
+    raw.byteOffset + raw.byteLength,
+  ) as ArrayBuffer;
+
+  const helloPath = path.resolve(
+    __dirname,
+    "../../../target/wasm32-wasip1/release/hello-std.wasm",
+  );
+  if (!fs.existsSync(helloPath)) {
+    throw new Error(
+      `hello-std.wasm not found at ${helloPath}. Run \`just build\` first.`,
+    );
+  }
+  const helloRaw = fs.readFileSync(helloPath);
+  helloStdWasmBytes = helloRaw.buffer.slice(
+    helloRaw.byteOffset,
+    helloRaw.byteOffset + helloRaw.byteLength,
+  ) as ArrayBuffer;
+});
+
+describe("installWorkerEntry with useRealKernel", () => {
+  it("constructs a KernelWasmHost asynchronously and posts ready once initialised", async () => {
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, { kernelWasmBytes });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+    // KernelWasmHost.create is async, so the scaffold is not yet
+    // bound the moment `boot` returns.
+    expect(entry.scaffold).toBeUndefined();
+    await entry.whenReady;
+    expect(entry.scaffold).toBeDefined();
+    expect(entry.scaffold?.driverCount).toBe(1);
+    const readyCount = msg.posted.filter((m) => m.kind === "ready").length;
+    expect(readyCount).toBe(1);
+  });
+
+  it("routes a real-kernel FD_WRITE to /dev/console as a console:write postMessage", async () => {
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, { kernelWasmBytes });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+    await entry.whenReady;
+    const host = entry.realKernel;
+    expect(host).toBeDefined();
+    if (!host) return;
+
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const message = new TextEncoder().encode("hello from slice 2\n");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 1,
+        arg0: 1,
+        heapPtr: 0,
+        heapLen: message.length,
+      },
+      message,
+    );
+    expect(response.status).toBe(0);
+
+    const writes = msg.posted.filter((m) => m.kind === "console:write");
+    expect(writes).toHaveLength(1);
+    if (writes[0]?.kind === "console:write") {
+      expect(new TextDecoder().decode(writes[0].bytes)).toBe(
+        "hello from slice 2\n",
+      );
+    }
+  });
+
+  it("auto-spawns the configured boot binary and routes its console output through the channel", async () => {
+    const msg = makeMessaging();
+    const registry = new Map<string, BufferSource>([
+      ["/bin/hello-std", helloStdWasmBytes],
+    ]);
+    const entry = installWorkerEntry(msg, {
+      kernelWasmBytes,
+      binaryRegistry: registry,
+    });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+        bootBinary: "/bin/hello-std",
+      },
+    });
+    await entry.whenReady;
+
+    // The boot binary's stdout flushed through the kernel and out
+    // as a `console:write`. hello-std's payload is exactly
+    // `"hello from std\n"`.
+    const writes = msg.posted
+      .filter((m) => m.kind === "console:write")
+      .flatMap((m) =>
+        m.kind === "console:write" ? [new TextDecoder().decode(m.bytes)] : [],
+      );
+    expect(writes.join("")).toBe("hello from std\n");
+
+    // No panic was posted along the way.
+    expect(msg.posted.some((m) => m.kind === "panic")).toBe(false);
+  });
+
+  it("falls back to MockKernel when useRealKernel is false (regression)", async () => {
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, { kernelWasmBytes });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: false,
+      },
+    });
+    // MockKernel construction is synchronous: scaffold is ready
+    // immediately, ready already posted.
+    expect(entry.scaffold).toBeDefined();
+    expect(msg.posted).toEqual([{ kind: "ready" }]);
+    // whenReady still resolves cleanly.
+    await entry.whenReady;
+    expect(entry.scaffold?.driverCount).toBe(1);
   });
 });
