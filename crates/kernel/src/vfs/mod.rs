@@ -415,6 +415,19 @@ impl Vfs {
         fs.stat(ino)
     }
 
+    /// Stat `(mount_id, ino)` directly. Mirrors [`Vfs::read_ino`] /
+    /// [`Vfs::write_ino`]: the syscall layer already carries the
+    /// pair on a `Vnode` fd, so `fd_filestat_get` skips path
+    /// resolution by calling this instead of [`Vfs::stat`].
+    pub fn stat_ino(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+    ) -> Result<FileStat, FsError> {
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.stat(ino)
+    }
+
     /// Truncate a regular file to `new_size` bytes.
     pub fn truncate(&mut self, abs_path: &str, new_size: u64) -> Result<(), FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;

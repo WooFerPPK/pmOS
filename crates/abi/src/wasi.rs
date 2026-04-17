@@ -106,6 +106,35 @@ pub enum Whence {
     End = 2,
 }
 
+/// `filestat_t` wire layout shared by `FD_FILESTAT_GET` and
+/// `PATH_FILESTAT_GET`. Matches WASI preview 1's C ABI: 64 bytes,
+/// little-endian, with the 1-byte `filetype` padded out to 8 bytes
+/// so `nlink` onwards stays u64-aligned.
+pub mod filestat {
+    pub const SIZE:         usize = 64;
+    pub const OFF_DEV:      usize = 0;
+    pub const OFF_INO:      usize = 8;
+    pub const OFF_FILETYPE: usize = 16;
+    pub const OFF_NLINK:    usize = 24;
+    pub const OFF_SIZE:     usize = 32;
+    pub const OFF_ATIM:     usize = 40;
+    pub const OFF_MTIM:     usize = 48;
+    pub const OFF_CTIM:     usize = 56;
+}
+
+/// WASI preview 1 filetype byte (first byte of `filestat_t` /
+/// `fdstat_t`). Mirrors `__wasi_filetype_t` from the C header.
+pub mod filetype {
+    pub const UNKNOWN:          u8 = 0;
+    pub const BLOCK_DEVICE:     u8 = 1;
+    pub const CHARACTER_DEVICE: u8 = 2;
+    pub const DIRECTORY:        u8 = 3;
+    pub const REGULAR_FILE:     u8 = 4;
+    pub const SOCKET_DGRAM:     u8 = 5;
+    pub const SOCKET_STREAM:    u8 = 6;
+    pub const SYMBOLIC_LINK:    u8 = 7;
+}
+
 /// The lowest opcode value that belongs to the WASI preview 1 namespace.
 pub const FIRST: u16 = 0x0001;
 /// One past the highest WASI opcode the dispatcher recognises. Extension

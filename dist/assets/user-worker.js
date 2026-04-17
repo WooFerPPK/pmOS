@@ -55,6 +55,7 @@ var OP_WASI = {
   ENVIRON_SIZES_GET: 4,
   FD_CLOSE: 34,
   FD_FDSTAT_GET: 36,
+  FD_FILESTAT_GET: 39,
   FD_PRESTAT_GET: 43,
   FD_READ: 46,
   FD_WRITE: 52,
@@ -606,6 +607,33 @@ var UserWasmRuntime = class {
         if (response.status !== 0) return -response.status;
         const writeBuf = new Uint8Array(this.memory.buffer);
         writeBuf.set(heapOut.subarray(0, 24), bufPtr);
+        return 0;
+      },
+      // WASI `fd_filestat_get`.
+      //
+      // Signature: (fd: i32, buf_ptr: i32) -> errno.
+      //
+      // Dispatches FD_FILESTAT_GET with a 64-byte heap-out window,
+      // then copies the 64 bytes of filestat_t from the heap scratch
+      // into user memory at `buf_ptr`. The bytes come out already-
+      // laid-out by the kernel handler: dev (0..8), ino (8..16),
+      // filetype (16) + 7 bytes alignment padding (17..24), nlink
+      // (24..32), size (32..40), atim (40..48), mtim (48..56), ctim
+      // (56..64) — all little-endian u64s except filetype's single
+      // byte. Unblocks `std::fs::File::metadata` + `std::fs::metadata`
+      // for std binaries.
+      fd_filestat_get: (fd, bufPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const { response, heapOut } = this.backend.dispatch({
+          opcode: OP_WASI.FD_FILESTAT_GET,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 64
+        });
+        if (response.status !== 0) return -response.status;
+        const writeBuf = new Uint8Array(this.memory.buffer);
+        writeBuf.set(heapOut.subarray(0, 64), bufPtr);
         return 0;
       },
       // WASI `clock_time_get`.

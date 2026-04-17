@@ -1056,6 +1056,234 @@ fn fd_fdstat_get_on_invalid_fd_returns_ebadf() {
     assert!(heap.iter().all(|&b| b == 0));
 }
 
+// ---- fd_filestat_get --------------------------------------------------
+//
+// Writes a 64-byte `filestat_t` (dev/ino/filetype/nlink/size/atim/
+// mtim/ctim — little-endian u64s with the filetype crammed into
+// the first byte of the 8-byte nlink-alignment window, per WASI
+// preview 1's C ABI) into the caller's heap-scratch out window.
+//
+// For `Vnode` fds the handler queries `Vfs::stat_ino` so a directory
+// vnode reports filetype=3 (DIRECTORY), not the "regular file"
+// default `fd_fdstat_get` hardcodes for every Vnode. For non-Vnode
+// fds dev/ino/size/times are synthesised: filetype from the
+// FdObject variant, size=0, nlink=1, dev=0, ino=<opaque id>, times=0.
+//
+// Seven tests: one per FdObject variant the handler can see
+// (CharDevice → 2, Socket → 6, Vnode regular → 4 with size, Vnode
+// directory → 3, PipeRead → 0, SignalChannel → 0) plus the EBADF
+// bad-fd path.
+
+/// Decode the 8-byte little-endian u64 at `off` in the 64-byte
+/// filestat window. Shared by every fd_filestat_get test.
+fn filestat_u64(heap: &[u8], base: usize, off: usize) -> u64 {
+    u64::from_le_bytes([
+        heap[base + off],
+        heap[base + off + 1],
+        heap[base + off + 2],
+        heap[base + off + 3],
+        heap[base + off + 4],
+        heap[base + off + 5],
+        heap[base + off + 6],
+        heap[base + off + 7],
+    ])
+}
+
+#[test]
+fn fd_filestat_get_on_char_device_fd_returns_filetype_char_device() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "stater", 0);
+    // Stdout is a CharDevice(DEV_CONSOLE); filetype=2 (character
+    // device). dev=0, ino=DEV_CONSOLE, size=0, nlink=1, times=0.
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_GET,
+        flags: 0,
+        request_id: 700,
+        args: u32_args(1),
+        heap_ptr: 8,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 64);
+
+    let base = 8;
+    assert_eq!(filestat_u64(&heap, base, 0), 0, "dev");
+    assert_eq!(filestat_u64(&heap, base, 8), DEV_CONSOLE as u64, "ino");
+    assert_eq!(heap[base + 16], 2, "filetype = character_device");
+    assert_eq!(&heap[base + 17..base + 24], &[0u8; 7], "filetype padding");
+    assert_eq!(filestat_u64(&heap, base, 24), 1, "nlink");
+    assert_eq!(filestat_u64(&heap, base, 32), 0, "size");
+    assert_eq!(filestat_u64(&heap, base, 40), 0, "atim");
+    assert_eq!(filestat_u64(&heap, base, 48), 0, "mtim");
+    assert_eq!(filestat_u64(&heap, base, 56), 0, "ctim");
+}
+
+#[test]
+fn fd_filestat_get_on_socket_fd_returns_filetype_socket_stream() {
+    use kernel::ipc::SocketType;
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sockstater", 0);
+    let fd = k.ipc_socket(pid, SocketType::Stream).expect("ipc_socket");
+    let mut heap = vec![0u8; 128];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_GET,
+        flags: 0,
+        request_id: 701,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.extra_len, 64);
+    assert_eq!(heap[16], 6, "filetype = socket_stream");
+    assert_eq!(filestat_u64(&heap, 0, 24), 1, "nlink");
+    assert_eq!(filestat_u64(&heap, 0, 32), 0, "size");
+}
+
+#[test]
+fn fd_filestat_get_on_regular_file_vnode_returns_filetype_and_size() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filestater", 0);
+    // Pre-create a tmpfs regular file with a known size.
+    let bytes: &[u8] = b"hello, fd_filestat_get";
+    k.vfs.create("/probe.txt", 0o644).expect("create");
+    let wrote = k.vfs.write("/probe.txt", 0, bytes).expect("write");
+    assert_eq!(wrote, bytes.len());
+    let (mount_id, ino) = k.vfs.resolve("/probe.txt").expect("resolve");
+    k.install_fd(
+        pid,
+        10,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    let mut heap = vec![0u8; 128];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_GET,
+        flags: 0,
+        request_id: 702,
+        args: u32_args(10),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.extra_len, 64);
+    assert_eq!(filestat_u64(&heap, 0, 0), mount_id.0 as u64, "dev");
+    assert_eq!(filestat_u64(&heap, 0, 8), ino, "ino");
+    assert_eq!(heap[16], 4, "filetype = regular_file");
+    assert_eq!(filestat_u64(&heap, 0, 24), 1, "nlink");
+    assert_eq!(filestat_u64(&heap, 0, 32), bytes.len() as u64, "size");
+}
+
+#[test]
+fn fd_filestat_get_on_directory_vnode_returns_filetype_directory() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "dirstater", 0);
+    // Pre-create a tmpfs directory. `Vfs::mkdir` returns the ino;
+    // resolving the path afterwards gives us the (mount_id, ino)
+    // pair the Vnode fd needs.
+    k.vfs.mkdir("/adir", 0o755).expect("mkdir");
+    let (mount_id, ino) = k.vfs.resolve("/adir").expect("resolve");
+    k.install_fd(
+        pid,
+        11,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    let mut heap = vec![0u8; 128];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_GET,
+        flags: 0,
+        request_id: 703,
+        args: u32_args(11),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(heap[16], 3, "filetype = directory");
+    assert_eq!(filestat_u64(&heap, 0, 32), 0, "size (directory)");
+}
+
+#[test]
+fn fd_filestat_get_on_pipe_read_fd_returns_filetype_unknown() {
+    // Pipes have no WASI filetype; WASI returns UNKNOWN (0) for
+    // FIFOs/pipes. `nlink=1, size=0, times=0` are synthesised.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "piper", 0);
+    k.install_fd(pid, 3, FdObject::PipeRead(7), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_GET,
+        flags: 0,
+        request_id: 704,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(heap[16], 0, "filetype = unknown");
+    assert_eq!(filestat_u64(&heap, 0, 8), 7, "ino = opaque pipe id");
+}
+
+#[test]
+fn fd_filestat_get_on_signal_channel_fd_returns_filetype_unknown() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "signaler", 0);
+    k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_GET,
+        flags: 0,
+        request_id: 705,
+        args: u32_args(5),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(heap[16], 0, "filetype = unknown");
+    assert_eq!(filestat_u64(&heap, 0, 0), 0, "dev");
+    assert_eq!(filestat_u64(&heap, 0, 8), 0, "ino");
+}
+
+#[test]
+fn fd_filestat_get_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "stater", 0);
+    let mut heap = vec![0u8; 128];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_GET,
+        flags: 0,
+        request_id: 706,
+        args: u32_args(99), // fd 99 is not open
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+    // Heap must not have been written.
+    assert!(heap.iter().all(|&b| b == 0));
+}
+
 // ---- fd_prestat_get ---------------------------------------------------
 
 #[test]

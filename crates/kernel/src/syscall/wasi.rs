@@ -25,11 +25,13 @@ use abi::errno::{EBADF, EINVAL, ENOSYS, ENOTSUP};
 use abi::ext::Pid;
 use abi::ring::{Request, Response};
 use abi::wasi as op;
+use abi::wasi::filestat as fs_off;
 
 use crate::fd::{FdFlags, FdObject};
 use crate::platform;
 use crate::proc::ExitStatus;
-use crate::sys::Kernel;
+use crate::sys::{Kernel, KernelError};
+use crate::vfs::NodeType;
 
 use super::dispatch::{args_u32, heap_in, heap_out_mut, kerr_to_errno};
 
@@ -56,6 +58,7 @@ pub fn dispatch_wasi(
         op::ENVIRON_SIZES_GET => handle_environ_sizes_get(req, heap),
         op::ENVIRON_GET => handle_environ_get(req),
         op::FD_FDSTAT_GET => handle_fd_fdstat_get(kernel, pid, req, heap),
+        op::FD_FILESTAT_GET => handle_fd_filestat_get(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
     }
@@ -431,19 +434,28 @@ fn handle_environ_get(req: &Request) -> Response {
 // to model rights properly. When a future slice introduces real WASI
 // rights tracking, this handler becomes the single place to wire it.
 
-const FILETYPE_UNKNOWN: u8 = 0;
-const FILETYPE_CHARACTER_DEVICE: u8 = 2;
-const FILETYPE_REGULAR_FILE: u8 = 4;
-const FILETYPE_SOCKET_STREAM: u8 = 6;
+use abi::wasi::filetype as ft;
 
 fn filetype_for(object: FdObject) -> u8 {
     match object {
-        FdObject::Vnode { .. } => FILETYPE_REGULAR_FILE,
-        FdObject::CharDevice(_) => FILETYPE_CHARACTER_DEVICE,
-        FdObject::Socket(_) | FdObject::DisplayConn(_) => FILETYPE_SOCKET_STREAM,
+        FdObject::Vnode { .. } => ft::REGULAR_FILE,
+        FdObject::CharDevice(_) => ft::CHARACTER_DEVICE,
+        FdObject::Socket(_) | FdObject::DisplayConn(_) => ft::SOCKET_STREAM,
         FdObject::PipeRead(_)
         | FdObject::PipeWrite(_)
-        | FdObject::SignalChannel => FILETYPE_UNKNOWN,
+        | FdObject::SignalChannel => ft::UNKNOWN,
+    }
+}
+
+fn filetype_from_nodetype(ty: NodeType) -> u8 {
+    match ty {
+        NodeType::RegularFile     => ft::REGULAR_FILE,
+        NodeType::Directory       => ft::DIRECTORY,
+        NodeType::CharDevice(_)   => ft::CHARACTER_DEVICE,
+        NodeType::Socket          => ft::SOCKET_STREAM,
+        NodeType::SymLink         => ft::SYMBOLIC_LINK,
+        // WASI has no FIFO filetype; UNKNOWN is the honest answer.
+        NodeType::Fifo            => ft::UNKNOWN,
     }
 }
 
@@ -479,6 +491,113 @@ fn handle_fd_fdstat_get(
         status: 0,
         value: 0,
         extra_len: 24,
+        _pad: [0u8; 12],
+    }
+}
+
+// ---- fd_filestat_get --------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32)
+//   heap_ptr   = output offset for the 64-byte filestat_t
+//   heap_len   = 64
+// Response:
+//   value     = 0
+//   extra_len = 64
+//
+// Writes a 64-byte WASI preview 1 `filestat_t`:
+//
+//   offset  0: dev       u64
+//   offset  8: ino       u64
+//   offset 16: filetype  u8   (+ 7 bytes of struct-alignment padding
+//                               before nlink — kept at zero)
+//   offset 24: nlink     u64
+//   offset 32: size      u64
+//   offset 40: atim      u64  (nanoseconds since the epoch)
+//   offset 48: mtim      u64
+//   offset 56: ctim      u64
+//
+// For `Vnode` fds the handler queries [`Vfs::stat_ino`] so a vnode
+// that points at a directory reports filetype=3 (DIRECTORY) and
+// propagates the filesystem-reported size/ino/times. `dev` is the
+// mount id — a stable v1-wide filesystem identifier.
+//
+// For non-Vnode fds the handler synthesises the fields: filetype
+// comes from [`filetype_for`], `nlink=1`, `dev=0`, `ino=<opaque id>`
+// (the devnum for `CharDevice`, socket/pipe id for sockets/pipes,
+// 0 for `SignalChannel`), `size=0`, times zero. This is honest
+// behaviour for v1 — a future slice that threads Platform timestamps
+// into vnode metadata via a vfs side-channel is what grows real
+// mtime/atime/ctime numbers.
+fn handle_fd_filestat_get(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+
+    let (filetype, dev, ino, size, nlink, atim, mtim, ctim) = match entry.object {
+        FdObject::Vnode { mount_id, ino } => {
+            let st = match kernel.vfs.stat_ino(mount_id, ino) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Response::err(
+                        req.request_id,
+                        kerr_to_errno(KernelError::Fs(e)),
+                    )
+                }
+            };
+            (
+                filetype_from_nodetype(st.ty),
+                mount_id.0 as u64,
+                st.ino,
+                st.size,
+                st.nlink as u64,
+                st.atime_ns,
+                st.mtime_ns,
+                st.ctime_ns,
+            )
+        }
+        FdObject::CharDevice(devnum) => {
+            (ft::CHARACTER_DEVICE, 0, devnum as u64, 0, 1, 0, 0, 0)
+        }
+        FdObject::Socket(id) | FdObject::DisplayConn(id) => {
+            (ft::SOCKET_STREAM, 0, id as u64, 0, 1, 0, 0, 0)
+        }
+        FdObject::PipeRead(id) | FdObject::PipeWrite(id) => {
+            (ft::UNKNOWN, 0, id as u64, 0, 1, 0, 0, 0)
+        }
+        FdObject::SignalChannel => (ft::UNKNOWN, 0, 0, 0, 1, 0, 0, 0),
+    };
+
+    let Some(buf) = heap_out_mut(req, heap, fs_off::SIZE) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    buf[..fs_off::SIZE].copy_from_slice(&[0u8; fs_off::SIZE]);
+    buf[fs_off::OFF_DEV..fs_off::OFF_DEV + 8].copy_from_slice(&dev.to_le_bytes());
+    buf[fs_off::OFF_INO..fs_off::OFF_INO + 8].copy_from_slice(&ino.to_le_bytes());
+    buf[fs_off::OFF_FILETYPE] = filetype;
+    // bytes fs_off::OFF_FILETYPE+1 .. fs_off::OFF_NLINK stay zero
+    // (struct-alignment padding before the next u64 field).
+    buf[fs_off::OFF_NLINK..fs_off::OFF_NLINK + 8].copy_from_slice(&nlink.to_le_bytes());
+    buf[fs_off::OFF_SIZE..fs_off::OFF_SIZE + 8].copy_from_slice(&size.to_le_bytes());
+    buf[fs_off::OFF_ATIM..fs_off::OFF_ATIM + 8].copy_from_slice(&atim.to_le_bytes());
+    buf[fs_off::OFF_MTIM..fs_off::OFF_MTIM + 8].copy_from_slice(&mtim.to_le_bytes());
+    buf[fs_off::OFF_CTIM..fs_off::OFF_CTIM + 8].copy_from_slice(&ctim.to_le_bytes());
+
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: fs_off::SIZE as u32,
         _pad: [0u8; 12],
     }
 }

@@ -45,6 +45,7 @@ import {
   encodeRequest,
   encodeSpawnManifest,
   ERRNO,
+  FILETYPE,
   OP_EXT,
   OP_WASI,
 } from "../../src/shared/syscall";
@@ -572,6 +573,149 @@ describe("dispatch: CLOCK_RES_GET", () => {
     });
     expect(response.status).toBe(-ERRNO.EINVAL);
     expect(response.value).toBe(0n);
+  });
+});
+
+// ---- dispatch: FD_FILESTAT_GET --------------------------------------
+//
+// The kernel handler writes a 64-byte `filestat_t` into the heap-out
+// window. The TS tests exercise the kernel-wasm dispatch path end-to-
+// end through `host.dispatch()`, mirroring the Rust-level coverage:
+// one test per reachable FdObject variant (CharDevice → 2, Socket →
+// 6, invalid fd → -EBADF). The Vnode paths (filetype=3 / 4) are
+// kernel-side synthesis that TS cannot reach without standing up a
+// tmpfs file through the dispatch surface; the Rust tests already
+// pin those branches end-to-end.
+
+describe("dispatch: FD_FILESTAT_GET", () => {
+  function decodeFilestat(heapOut: Uint8Array): {
+    dev: bigint;
+    ino: bigint;
+    filetype: number;
+    nlink: bigint;
+    size: bigint;
+    atim: bigint;
+    mtim: bigint;
+    ctim: bigint;
+  } {
+    const view = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    );
+    return {
+      dev: view.getBigUint64(0, true),
+      ino: view.getBigUint64(8, true),
+      filetype: view.getUint8(16),
+      nlink: view.getBigUint64(24, true),
+      size: view.getBigUint64(32, true),
+      atim: view.getBigUint64(40, true),
+      mtim: view.getBigUint64(48, true),
+      ctim: view.getBigUint64(56, true),
+    };
+  }
+
+  it("returns filetype=CHARACTER_DEVICE for a /dev/console fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_GET,
+      requestId: 710,
+      arg0: 1,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(response.status).toBe(0);
+    expect(response.extraLen).toBe(64);
+    const st = decodeFilestat(heapOut);
+    expect(st.filetype).toBe(FILETYPE.CHARACTER_DEVICE);
+    expect(st.nlink).toBe(1n);
+    expect(st.size).toBe(0n);
+    expect(st.dev).toBe(0n);
+    // The first 17 bytes are dev (0..8) + ino (8..16) + filetype (16);
+    // bytes 17..24 must stay zero for struct-alignment compliance.
+    const view = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    );
+    for (let i = 17; i < 24; i++) {
+      expect(view.getUint8(i)).toBe(0);
+    }
+  });
+
+  it("returns filetype=SOCKET_STREAM for an IPC socket fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Stand up a socket fd via IPC_SOCKET(Stream=0). Response.value
+    // carries the newly allocated fd number.
+    const sockResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 711,
+      arg0: 0,
+    });
+    expect(sockResp.response.status).toBe(0);
+    const sockFd = Number(sockResp.response.value);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_GET,
+      requestId: 712,
+      arg0: sockFd,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(response.status).toBe(0);
+    expect(response.extraLen).toBe(64);
+    const st = decodeFilestat(heapOut);
+    expect(st.filetype).toBe(FILETYPE.SOCKET_STREAM);
+    expect(st.nlink).toBe(1n);
+    expect(st.size).toBe(0n);
+  });
+
+  it("returns -EBADF for an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_GET,
+      requestId: 713,
+      arg0: 99,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response.extraLen).toBe(0);
+  });
+
+  it("reports the heap-out layout with times and size defaulting to 0 for non-Vnode fds", async () => {
+    // Pinning the WASI wire layout: dev/ino/nlink/size/atim/mtim/ctim
+    // are u64 LE at their documented offsets; filetype is a single
+    // byte at offset 16; the 7 bytes between filetype and nlink are
+    // struct-alignment padding and stay zero.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 0);
+    host.markRunning(pid);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_GET,
+      requestId: 714,
+      arg0: 0,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(response.status).toBe(0);
+    const st = decodeFilestat(heapOut);
+    expect(st.atim).toBe(0n);
+    expect(st.mtim).toBe(0n);
+    expect(st.ctim).toBe(0n);
+    expect(st.filetype).toBe(FILETYPE.CHARACTER_DEVICE);
   });
 });
 

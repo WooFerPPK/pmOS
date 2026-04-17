@@ -179,6 +179,7 @@ export const OP_WASI = {
   ENVIRON_SIZES_GET: 0x0004,
   FD_CLOSE: 0x0022,
   FD_FDSTAT_GET: 0x0024,
+  FD_FILESTAT_GET: 0x0027,
   FD_PRESTAT_GET: 0x002b,
   FD_READ: 0x002e,
   FD_WRITE: 0x0034,
@@ -238,6 +239,23 @@ export const CLOCKID = {
   MONOTONIC: 1,
   PROCESS_CPUTIME_ID: 2,
   THREAD_CPUTIME_ID: 3,
+} as const;
+
+// ---- WASI filetype bytes --------------------------------------------
+//
+// Mirror of `abi::wasi::filetype::*`. First byte of the 24-byte
+// `fdstat_t` and of the 64-byte `filestat_t` (at its byte-16 offset).
+// WASI has no FIFO filetype; PMos maps FIFO vnodes to UNKNOWN.
+
+export const FILETYPE = {
+  UNKNOWN: 0,
+  BLOCK_DEVICE: 1,
+  CHARACTER_DEVICE: 2,
+  DIRECTORY: 3,
+  REGULAR_FILE: 4,
+  SOCKET_DGRAM: 5,
+  SOCKET_STREAM: 6,
+  SYMBOLIC_LINK: 7,
 } as const;
 
 // ---- Device identifiers ---------------------------------------------
