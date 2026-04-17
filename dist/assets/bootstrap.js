@@ -792,6 +792,7 @@ function paintBlitToCanvasFullscreen(c, frame_) {
 }
 function runRealKernelMode() {
   console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
+  const consoleEl = mountRealKernelConsole();
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
   const consoleHost = new ConsoleHost({
     worker,
@@ -804,16 +805,46 @@ function runRealKernelMode() {
     }
   });
   consoleHost.onOutput((bytes) => {
-    const text = new TextDecoder().decode(bytes).replace(/\n$/, "");
-    console.log(`[real-kernel] ${text}`);
+    const text = new TextDecoder().decode(bytes);
+    consoleEl.textContent += text;
+    console.log(`[real-kernel] ${text.replace(/\n$/, "")}`);
   });
   consoleHost.onLifecycle((event) => {
     if (event.kind === "ready") {
       console.log("[pmos-bootstrap] real kernel ready");
     } else if (event.kind === "panic") {
       console.error(`[pmos-bootstrap] real kernel panic: ${event.message}`);
+      consoleEl.textContent += `
+[panic] ${event.message}
+`;
     }
   });
+}
+function mountRealKernelConsole() {
+  const existing = document.getElementById("pmos-real-console");
+  if (existing instanceof HTMLPreElement) {
+    return existing;
+  }
+  const canvas = document.getElementById("pmos-fb");
+  if (canvas instanceof HTMLElement) {
+    canvas.style.display = "none";
+  }
+  const pre = document.createElement("pre");
+  pre.id = "pmos-real-console";
+  pre.style.cssText = [
+    "margin: 0",
+    "padding: 1.5rem",
+    'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+    "font-size: 14px",
+    "line-height: 1.5",
+    "color: #e6e6e6",
+    "background: #0a0e14",
+    "min-height: 100vh",
+    "white-space: pre-wrap",
+    "overflow-wrap: anywhere"
+  ].join("; ");
+  document.body.appendChild(pre);
+  return pre;
 }
 function showFallbackMessage(error) {
   document.body.innerHTML = `

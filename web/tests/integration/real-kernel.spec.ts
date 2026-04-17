@@ -61,4 +61,18 @@ test("real kernel boots init, init spawns hello-std, both reach the page console
 
   expect(consoleLines.some((l) => l.includes("real kernel ready"))).toBe(true);
   expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
+
+  // DOM surface: real-kernel mode renders each captured line into a
+  // `<pre id="pmos-real-console">` so the page itself shows the
+  // boot output (not just dev tools). The element's text must
+  // include every line hello-std + init produced, in the same
+  // order as the page-console capture above.
+  const domText = await page.locator("#pmos-real-console").innerText();
+  expect(domText).toContain("init starting");
+  expect(domText).toMatch(/init spawned hello-std pid=\d+/);
+  expect(domText).toContain("init exiting");
+  expect(domText).toContain("hello from std");
+  expect(domText.indexOf("init starting")).toBeLessThan(
+    domText.indexOf("hello from std"),
+  );
 });
