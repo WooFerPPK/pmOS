@@ -883,6 +883,58 @@ function runRealKernelMode(): void {
   console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
   const consoleEl = mountRealKernelConsole();
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+
+  // T234: track the kernel wake-slot buffer as it arrives (kernel
+  // posts `kernel:wake-slot` exactly once after `KernelWasmHost.
+  // create`, before the first `proc:spawn`). The spawn router reads
+  // it lazily via `getKernelWakeSlot` so each new user Worker's
+  // boot message can include the wake slot for the production wake
+  // protocol.
+  let kernelWakeSlot: ArrayBufferLike | null = null;
+  // Test affordance: peak count of live user Workers at any moment
+  // during boot. The Playwright `real-kernel.spec.ts` reads this off
+  // `<body>`'s `data-pmos-peak-live-workers` attribute to assert
+  // that init + hello-std actually ran in different Workers (>= 2).
+  let peakLiveWorkers = 0;
+
+  const router = createSpawnRouter({
+    kernelWorker: worker,
+    workerFactory: () =>
+      new Worker("/assets/user-worker.js", { type: "module" }),
+    allocSab: (): ArrayBufferLike => {
+      try {
+        return new SharedArrayBuffer(SAB_SIZE);
+      } catch {
+        return new ArrayBuffer(SAB_SIZE);
+      }
+    },
+    getKernelWakeSlot: () => kernelWakeSlot,
+  });
+
+  // Listen for kernel-Worker messages alongside ConsoleHost. ConsoleHost
+  // also installs an `addEventListener("message", ...)` on the same
+  // worker, but Worker message events fan out to every listener; they
+  // don't compete. This handler skims off the multi-process control
+  // messages (`kernel:wake-slot`, `proc:spawn`) and lets ConsoleHost
+  // handle the rest (`ready`, `console:write`, `panic`).
+  worker.addEventListener("message", (ev) => {
+    const msg = ev.data as KernelToMain;
+    if (msg.kind === "kernel:wake-slot") {
+      kernelWakeSlot = msg.sab;
+      // Tests can wait for this attribute before asserting on
+      // anything wake-slot-dependent; production code doesn't
+      // observe it.
+      document.body.dataset["pmosWakeSlotReady"] = "1";
+      return;
+    }
+    router.handleKernelMessage(msg);
+    // Track peak after the router applied any state change.
+    if (router.liveWorkers.size > peakLiveWorkers) {
+      peakLiveWorkers = router.liveWorkers.size;
+      document.body.dataset["pmosPeakLiveWorkers"] = String(peakLiveWorkers);
+    }
+  });
+
   const consoleHost = new ConsoleHost({
     worker,
     bootConfig: {
@@ -891,6 +943,14 @@ function runRealKernelMode(): void {
       enableFramebuffer: false,
       useRealKernel: true,
       bootBinary: "/bin/init",
+      // T234: opt into the multi-process spawn path so the kernel's
+      // default `onSpawnProcess` posts `proc:spawn` for the spawn
+      // router to handle (allocate SAB → spawn `/assets/user-worker.
+      // js` Worker → forward boot + wake slot → register with
+      // kernel via `proc:sab`). The synthetic bootstrap pid that
+      // dispatches PROC_SPAWN(/bin/init) stays in-process inside
+      // the kernel Worker — every later pid is a real user Worker.
+      enableMultiProcessSpawn: true,
     },
   });
   consoleHost.onOutput((bytes: Uint8Array) => {
@@ -1047,6 +1107,21 @@ export interface SpawnRouterDeps {
    * math the router cares about is byte-identical against either.
    */
   readonly allocSab: () => ArrayBufferLike;
+  /**
+   * T234: production wake-slot accessor. Returns the kernel's
+   * 32-byte wake-slot buffer (allocated by `KernelWasmHost.create`
+   * and forwarded to main via the `kernel:wake-slot` message), or
+   * `null` if the wake slot hasn't arrived yet. When non-null, the
+   * router includes the buffer in the `boot` message it posts to
+   * each freshly-spawned user Worker; the user-worker entry
+   * constructs an `Int32Array` view and hands it to `SabBackend`
+   * for the production wake protocol. When the option is unset
+   * (T232 vitest harness — the spawn-router unit tests don't
+   * exercise the wake protocol), the boot message omits
+   * `kernelWakeSlot` and `SabBackend` falls back to its synchronous
+   * `serviceHook` path.
+   */
+  readonly getKernelWakeSlot?: () => ArrayBufferLike | null;
 }
 
 /** A live entry in the router's pid → user-Worker map. */
@@ -1111,12 +1186,32 @@ export function createSpawnRouter(deps: SpawnRouterDeps): SpawnRouter {
       worker.addEventListener("error", (ev) => {
         reap(msg.pid, -1, ev.message ?? "user worker error");
       });
-      worker.postMessage({
-        kind: "boot",
-        pid: msg.pid,
-        sab,
-        wasmBytes: msg.wasmBytes,
-      });
+      // T234: forward the kernel's wake-slot buffer when the host
+      // exposed one. The user-worker entry constructs an
+      // `Int32Array` view and hands it to `SabBackend`; the
+      // production wake protocol lights up. When `getKernelWakeSlot`
+      // is unset (T232 unit tests) or returns `null` (production
+      // raced ahead of the kernel:wake-slot arrival, which our
+      // protocol prevents by posting wake-slot before the first
+      // proc:spawn — but defensive), the boot message omits the
+      // field and `SabBackend` stays on the legacy path.
+      const kernelWakeSlot = deps.getKernelWakeSlot?.() ?? null;
+      worker.postMessage(
+        kernelWakeSlot !== null
+          ? {
+              kind: "boot",
+              pid: msg.pid,
+              sab,
+              wasmBytes: msg.wasmBytes,
+              kernelWakeSlot,
+            }
+          : {
+              kind: "boot",
+              pid: msg.pid,
+              sab,
+              wasmBytes: msg.wasmBytes,
+            },
+      );
       deps.kernelWorker.postMessage({ kind: "proc:sab", pid: msg.pid, sab });
     },
     terminateAll(): void {

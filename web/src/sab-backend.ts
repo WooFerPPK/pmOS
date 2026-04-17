@@ -56,9 +56,11 @@ import {
   OFF_RES_HEAD,
   OFF_RES_RING,
   OFF_RES_TAIL,
+  OFF_USER_WAIT_SLOT,
   REQ_SLOT_COUNT,
   RES_SLOT_COUNT,
   SAB_SIZE,
+  STATUS_REQUESTED,
 } from "./shared/sab-layout";
 import {
   decodeResponse,
@@ -86,10 +88,43 @@ export interface SabBackendOptions {
    * uses it to call [`KernelWasmHost.serviceSab`] in the same tick
    * so the response is in the ring by the time `dispatch` reads it.
    *
-   * In T233+ this option goes away and `dispatch` orchestrates the
-   * real wait/notify pair on the SAB's wake slots.
+   * Wins over [`kernelWakeSlot`] when both are set so existing
+   * vitest harnesses keep their synchronous semantics. T235 deletes
+   * the option once the legacy in-process composition tests have
+   * migrated; until then the two coexist.
    */
   readonly serviceHook?: () => void;
+  /**
+   * Production wake-slot view: a shared `Int32Array` over the
+   * kernel's 32-byte wake buffer. When set AND [`serviceHook`] is
+   * unset, `dispatch` runs the production wake protocol described
+   * in [`multi-process-plan.md §3`](../../specs/001-browser-os-v1/multi-process-plan.md):
+   *
+   *   1. `Atomics.store(header, OFF_USER_WAIT_SLOT/4, STATUS_REQUESTED)`
+   *      — pre-stage the wait sentinel BEFORE the push so a kernel
+   *      that pops + services + writes `STATUS_READY` before we even
+   *      reach `Atomics.wait` makes the wait return "not-equal"
+   *      immediately (race-free).
+   *   2. Push request into the SAB request ring (existing path).
+   *   3. `Atomics.add(kernelWakeSlot, 0, 1) +
+   *      Atomics.notify(kernelWakeSlot, 0)` — wake the kernel's
+   *      `Atomics.waitAsync` parker.
+   *   4. `Atomics.wait(header, OFF_USER_WAIT_SLOT/4, STATUS_REQUESTED)`
+   *      — block the user Worker thread until the kernel writes
+   *      `STATUS_READY` + notifies (or returns immediately if the
+   *      kernel already wrote `STATUS_READY` in step 3 above).
+   *   5. Pop the response from the SAB response ring (existing path).
+   *
+   * `Atomics.notify` and the synchronous `Atomics.wait` only work
+   * on `SharedArrayBuffer`-backed views; when the SAB is a plain
+   * `ArrayBuffer` (vitest in environments without cross-origin
+   * isolation) the notify silently no-ops and the wait is skipped
+   * — the response ring will still have the kernel's reply when the
+   * caller drove the kernel synchronously through some other channel
+   * (e.g. the legacy `serviceHook` path), or `dispatch` will throw
+   * with the existing "response ring empty" message.
+   */
+  readonly kernelWakeSlot?: Int32Array;
 }
 
 export class SabBackend implements KernelBackend {
@@ -100,6 +135,18 @@ export class SabBackend implements KernelBackend {
   private readonly header: Int32Array;
   private readonly pid: number;
   private readonly serviceHook: (() => void) | undefined;
+  private readonly kernelWakeSlot: Int32Array | undefined;
+  /** True iff `header.buffer` is a real `SharedArrayBuffer` (the only
+   * backing on which `Atomics.notify` + `Atomics.wait` are legal).
+   * Captured at construction so the per-call `dispatch` doesn't have
+   * to re-check on every syscall. */
+  private readonly headerIsShared: boolean;
+  /** True iff `kernelWakeSlot.buffer` is a real `SharedArrayBuffer`.
+   * Same rationale as `headerIsShared`; the two backings can in
+   * principle differ — the kernel-wake buffer is allocated by
+   * `KernelWasmHost.create` and the per-pid SAB by the main-thread
+   * router, so a partial fallback is possible. */
+  private readonly wakeSlotIsShared: boolean;
 
   constructor(options: SabBackendOptions) {
     if (options.sab.byteLength < SAB_SIZE) {
@@ -116,6 +163,14 @@ export class SabBackend implements KernelBackend {
     );
     this.pid = options.pid;
     this.serviceHook = options.serviceHook;
+    this.kernelWakeSlot = options.kernelWakeSlot;
+    this.headerIsShared =
+      typeof SharedArrayBuffer !== "undefined" &&
+      this.buffer instanceof SharedArrayBuffer;
+    this.wakeSlotIsShared =
+      this.kernelWakeSlot !== undefined &&
+      typeof SharedArrayBuffer !== "undefined" &&
+      this.kernelWakeSlot.buffer instanceof SharedArrayBuffer;
   }
 
   /**
@@ -154,6 +209,17 @@ export class SabBackend implements KernelBackend {
       ).set(heapIn);
     }
 
+    // T234 production wake protocol step 1: pre-stage `STATUS_REQUESTED`
+    // BEFORE the push so a kernel that pops + services + writes
+    // `STATUS_READY` before we reach `Atomics.wait` makes the wait
+    // return "not-equal" immediately (the standard double-check pattern
+    // applied to the wait sentinel itself). Skipped on the
+    // `serviceHook` path because that path is purely synchronous and
+    // never blocks on the wait slot.
+    if (this.serviceHook === undefined && this.kernelWakeSlot !== undefined) {
+      Atomics.store(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+    }
+
     // Producer-push. Mirrors `ring::Sab::try_push_request` in
     // `crates/ring/src/lib.rs`: load HEAD (this side is the only
     // writer for this pid; Atomics.load is SeqCst in JS — strictly
@@ -176,13 +242,42 @@ export class SabBackend implements KernelBackend {
     new Uint8Array(this.buffer, reqSlotOffset, SLOT_SIZE).set(reqBytes);
     Atomics.store(this.header, OFF_REQ_HEAD / 4, nextReqHead);
 
-    // T231: synchronous service stand-in. T233 replaces this with:
-    //   Atomics.store(userWaitSlot, REQUESTED, ... )
-    //   Atomics.notify(kernelWakeSlot, 0)
-    //   Atomics.wait(userWaitSlot, REQUESTED)
-    // The kernel Worker's poll loop calls `KernelWasmHost.serviceSab`
-    // and notifies the user wait slot when the response is ready.
-    this.serviceHook?.();
+    if (this.serviceHook !== undefined) {
+      // T231/T232 stand-in: the harness services the request inline so
+      // the response is in the ring by the time we read it below. Stays
+      // alive for legacy composition tests until T235 retires them.
+      this.serviceHook();
+    } else if (this.kernelWakeSlot !== undefined) {
+      // T234 production wake protocol steps 3-4. Step 1 (the
+      // `STATUS_REQUESTED` pre-stage) ran above, step 2 was the push.
+      //
+      // Bump the kernel-wake counter monotonically. The kernel's
+      // parker (`KernelWasmHost.defaultPark`) compares against the
+      // value it loaded before parking; any change wakes it.
+      Atomics.add(this.kernelWakeSlot, 0, 1);
+      if (this.wakeSlotIsShared) {
+        // `Atomics.notify` only accepts views over a real
+        // `SharedArrayBuffer`. On a plain `ArrayBuffer` (vitest in a
+        // non-cross-origin-isolated env) the notify is unreachable
+        // anyway because the kernel can't be parked across threads.
+        Atomics.notify(this.kernelWakeSlot, 0);
+      }
+      if (this.headerIsShared) {
+        // `Atomics.wait` is sync — legal in dedicated Worker scope (the
+        // user-worker bundle's runtime). Returns when the kernel writes
+        // any value other than `STATUS_REQUESTED` to the wait slot;
+        // returns "not-equal" immediately if the kernel already wrote
+        // such a value before we reached this call.
+        Atomics.wait(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+      }
+      // No wait possible on a plain ArrayBuffer header — fall through
+      // to the response pop, which will throw "ring empty" if the
+      // caller forgot to pre-service.
+    }
+    // No serviceHook, no kernelWakeSlot: the caller is driving both
+    // ends of the ring synchronously (e.g. byte-equivalence tests
+    // against `KernelWasmHostBackend`). The response pop below will
+    // throw "ring empty" if it isn't there.
 
     // Consumer-pop. Mirrors `ring::Sab::try_pop_response`. The user
     // is the only consumer for this pid's response ring, so an

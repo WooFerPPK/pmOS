@@ -40,7 +40,10 @@ import {
   OFF_RES_HEAD,
   OFF_RES_RING,
   OFF_RES_TAIL,
+  OFF_USER_WAIT_SLOT,
   SAB_SIZE,
+  STATUS_READY,
+  STATUS_REQUESTED,
 } from "../../src/shared/sab-layout";
 import {
   CAPSET_ALL,
@@ -401,5 +404,107 @@ describe("startDispatchLoop: termination", () => {
     expect(new TextDecoder().decode(consoleWrites[0]!)).toBe("once\n");
     // No parks happened — halt fired before the first would-be park.
     expect(parkCalls).toBe(0);
+  });
+});
+
+// ---- T234 production wake protocol (kernel side) -------------------
+
+describe("startDispatchLoop: production wake protocol", () => {
+  it("writes user_wait_slot = STATUS_READY after each successful serviceSab so the user's Atomics.wait returns", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const sab = freshSab();
+    const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+    // Pre-stage `STATUS_REQUESTED` the way `SabBackend` does at the top
+    // of every dispatch — so the assertion below proves the loop wrote
+    // a NEW value rather than just observing the initial zero.
+    Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+
+    const line = new TextEncoder().encode("hi\n");
+    seedRequests(sab, [
+      {
+        request: {
+          opcode: OP_WASI.FD_WRITE,
+          requestId: 1,
+          arg0: 1,
+          heapPtr: 0,
+          heapLen: line.length,
+        },
+        heap: line,
+      },
+    ]);
+
+    const pidMap = new Map<number, ArrayBufferLike>([[pid, sab]]);
+    let parks = 0;
+    await host.startDispatchLoop({
+      pidSource: () => pidMap,
+      halted: () => parks > 0,
+      parkFn: async (): Promise<void> => {
+        parks += 1;
+      },
+    });
+
+    // The serviceSab landed a response — request ring drained, response
+    // ring head advanced.
+    expect(requestRingTail(sab)).toBe(1);
+    expect(responseRingHead(sab)).toBe(1);
+    // T234: user_wait_slot transitioned from STATUS_REQUESTED (the
+    // pre-stage above) to STATUS_READY. A waiter on
+    // Atomics.wait(header, OFF_USER_WAIT_SLOT/4, STATUS_REQUESTED) sees
+    // the new value and returns "not-equal" immediately, OR was woken
+    // by the notify the loop also issues (no-op on a plain ArrayBuffer
+    // here; real behavior covered by Playwright in real-kernel.spec.ts).
+    expect(Atomics.load(header, OFF_USER_WAIT_SLOT / 4)).toBe(STATUS_READY);
+  });
+
+  it("writes user_wait_slot = STATUS_READY for every serviced request in a multi-budget pass", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const sab = freshSab();
+    const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+    // Three FD_WRITEs in the ring at once — the loop services them
+    // back-to-back inside the same per-pid budget block. The wake-slot
+    // store must happen on every iteration, not just the last one,
+    // otherwise an early-iteration user that's parked between syscalls
+    // would never wake.
+    const requests: Array<{ request: SyscallRequest; heap?: Uint8Array }> = [];
+    for (let i = 0; i < 3; i++) {
+      const heap = new TextEncoder().encode(`r${i}\n`);
+      requests.push({
+        request: {
+          opcode: OP_WASI.FD_WRITE,
+          requestId: 10 + i,
+          arg0: 1,
+          heapPtr: i * 16,
+          heapLen: heap.length,
+        },
+        heap,
+      });
+    }
+    seedRequests(sab, requests);
+
+    const pidMap = new Map<number, ArrayBufferLike>([[pid, sab]]);
+    let parks = 0;
+    await host.startDispatchLoop({
+      pidSource: () => pidMap,
+      halted: () => parks > 0,
+      parkFn: async (): Promise<void> => {
+        parks += 1;
+      },
+    });
+
+    // All three requests serviced.
+    expect(requestRingTail(sab)).toBe(3);
+    expect(responseRingHead(sab)).toBe(3);
+    // user_wait_slot landed on STATUS_READY (the final write of the
+    // three iterations; equality after the last write is what the
+    // protocol commits to).
+    expect(Atomics.load(header, OFF_USER_WAIT_SLOT / 4)).toBe(STATUS_READY);
   });
 });

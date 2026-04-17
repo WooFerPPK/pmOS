@@ -80,4 +80,33 @@ test("real kernel is the default boot path and runs init -> hello-std", async ({
   expect(domText.indexOf("init starting")).toBeLessThan(
     domText.indexOf("hello from std"),
   );
+
+  // T234: init and hello-std MUST run in different user Workers, not
+  // sequentially in the kernel Worker's in-process drain loop. The
+  // bootstrap exposes the spawn router's peak `liveWorkers.size` via
+  // `<body data-pmos-peak-live-workers="N">`; init plus hello-std
+  // overlap (init is still printing "init exiting" while hello-std's
+  // Worker is already alive and parked on its first FD_WRITE), so
+  // peak is at least 2. The kernel Worker is NOT counted — only user
+  // Workers under `createSpawnRouter`'s management are.
+  const peakAttr = await page
+    .locator("body")
+    .getAttribute("data-pmos-peak-live-workers");
+  expect(peakAttr).not.toBeNull();
+  expect(Number(peakAttr)).toBeGreaterThanOrEqual(2);
+
+  // T234: the kernel-wake-slot transport landed before any user Worker
+  // spawned. Without this, every spawn would race the SAB-allocation
+  // path. The bootstrap stamps `data-pmos-wake-slot-ready="1"` on
+  // `<body>` the moment the `kernel:wake-slot` message arrives — the
+  // ordering with the four-line console output above implicitly
+  // proves it landed first (the FIRST proc:spawn happens AFTER
+  // bootRealKernel posts kernel:wake-slot and BEFORE init's println
+  // even runs), but checking it explicitly is cheap and forces a
+  // clear failure mode if the kernel-worker entry's posting order
+  // ever regresses.
+  const wakeSlotReady = await page
+    .locator("body")
+    .getAttribute("data-pmos-wake-slot-ready");
+  expect(wakeSlotReady).toBe("1");
 });

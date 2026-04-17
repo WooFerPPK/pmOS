@@ -312,16 +312,18 @@ async function bootRealKernel(
       throw e;
     }
   }
-  // T233: when `enableMultiProcessSpawn` is set the entry wires the
-  // kernel's default `onSpawnProcess` to post `proc:spawn` on the
-  // messaging channel so main's spawn router can allocate a SAB and
-  // spawn a user Worker. Without the flag, the kernel falls back to
-  // the legacy `binaryRegistry`-backed queue-into-pendingSpawns path
-  // that `drainPendingSpawns` consumes. The flag is opt-in for this
-  // slice so the existing `real-kernel.spec.ts` Playwright test +
-  // the auto-drain vitest tests continue to work; T234 flips the
-  // production wiring and T235 rips out the legacy drain.
-  const useMultiProcess = options.enableMultiProcessSpawn === true;
+  // T233/T234: opt-in for the proc:spawn routing path. Either the
+  // BootConfig (production, set by `bootstrap.ts`'s
+  // `runRealKernelMode`) OR the WorkerEntryOptions (vitest tests
+  // that drive `installWorkerEntry` directly with their own options
+  // bag) can flip this on. Without it, the kernel falls back to the
+  // legacy `binaryRegistry`-backed queue-into-pendingSpawns path
+  // that `drainPendingSpawns` consumes — kept alive for the
+  // composition tests that still use it. T235 rips the legacy drain
+  // out and removes both flags.
+  const useMultiProcess =
+    config.enableMultiProcessSpawn === true ||
+    options.enableMultiProcessSpawn === true;
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -351,6 +353,20 @@ async function bootRealKernel(
       messaging.postMessage(out);
     },
   });
+  if (useMultiProcess) {
+    // T234: hand main the kernel's wake slot so every user Worker
+    // main spawns from now on can bump it via Atomics.notify to wake
+    // the kernel's dispatch loop. Posted exactly once per kernel
+    // boot, immediately after the host is constructed and the
+    // scaffold is ready, so it lands at main BEFORE the first
+    // `proc:spawn` the kernel will emit during `runBootBinary`'s
+    // PROC_SPAWN dispatch. Skipped on the legacy path because the
+    // legacy in-process drain doesn't park on the wake slot.
+    messaging.postMessage({
+      kind: "kernel:wake-slot",
+      sab: host.wakeSlot.buffer,
+    });
+  }
   if (config.bootBinary !== undefined) {
     await runBootBinary(host, config.bootBinary, pidMap, lifecycle, useMultiProcess);
   }

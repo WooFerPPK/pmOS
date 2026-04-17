@@ -4,12 +4,14 @@ var OFF_REQ_HEAD = 0;
 var OFF_REQ_TAIL = 4;
 var OFF_RES_HEAD = 8;
 var OFF_RES_TAIL = 12;
+var OFF_USER_WAIT_SLOT = 16;
 var OFF_REQ_RING = 64;
 var OFF_RES_RING = 16384;
 var OFF_HEAP_SCRATCH = 32768;
 var HEAP_SCRATCH_BYTES = 32768;
 var REQ_SLOT_COUNT = 510;
 var RES_SLOT_COUNT = 510;
+var STATUS_REQUESTED = 1;
 
 // src/shared/syscall.ts
 var SLOT_SIZE = 32;
@@ -123,6 +125,18 @@ var SabBackend = class {
   header;
   pid;
   serviceHook;
+  kernelWakeSlot;
+  /** True iff `header.buffer` is a real `SharedArrayBuffer` (the only
+   * backing on which `Atomics.notify` + `Atomics.wait` are legal).
+   * Captured at construction so the per-call `dispatch` doesn't have
+   * to re-check on every syscall. */
+  headerIsShared;
+  /** True iff `kernelWakeSlot.buffer` is a real `SharedArrayBuffer`.
+   * Same rationale as `headerIsShared`; the two backings can in
+   * principle differ — the kernel-wake buffer is allocated by
+   * `KernelWasmHost.create` and the per-pid SAB by the main-thread
+   * router, so a partial fallback is possible. */
+  wakeSlotIsShared;
   constructor(options) {
     if (options.sab.byteLength < SAB_SIZE) {
       throw new Error(
@@ -138,6 +152,9 @@ var SabBackend = class {
     );
     this.pid = options.pid;
     this.serviceHook = options.serviceHook;
+    this.kernelWakeSlot = options.kernelWakeSlot;
+    this.headerIsShared = typeof SharedArrayBuffer !== "undefined" && this.buffer instanceof SharedArrayBuffer;
+    this.wakeSlotIsShared = this.kernelWakeSlot !== void 0 && typeof SharedArrayBuffer !== "undefined" && this.kernelWakeSlot.buffer instanceof SharedArrayBuffer;
   }
   /**
    * Translate `request` (+ optional `heapIn`) into an SAB ring
@@ -165,6 +182,9 @@ var SabBackend = class {
         heapIn.length
       ).set(heapIn);
     }
+    if (this.serviceHook === void 0 && this.kernelWakeSlot !== void 0) {
+      Atomics.store(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+    }
     const reqHead = Atomics.load(this.header, OFF_REQ_HEAD / 4);
     const reqTail = Atomics.load(this.header, OFF_REQ_TAIL / 4);
     const nextReqHead = (reqHead + 1 >>> 0) % REQ_SLOT_COUNT;
@@ -178,7 +198,17 @@ var SabBackend = class {
     const reqBytes = encodeRequest(request);
     new Uint8Array(this.buffer, reqSlotOffset, SLOT_SIZE).set(reqBytes);
     Atomics.store(this.header, OFF_REQ_HEAD / 4, nextReqHead);
-    this.serviceHook?.();
+    if (this.serviceHook !== void 0) {
+      this.serviceHook();
+    } else if (this.kernelWakeSlot !== void 0) {
+      Atomics.add(this.kernelWakeSlot, 0, 1);
+      if (this.wakeSlotIsShared) {
+        Atomics.notify(this.kernelWakeSlot, 0);
+      }
+      if (this.headerIsShared) {
+        Atomics.wait(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+      }
+    }
     const resHead = Atomics.load(this.header, OFF_RES_HEAD / 4);
     const resTail = Atomics.load(this.header, OFF_RES_TAIL / 4);
     if (resHead === resTail) {
@@ -802,10 +832,12 @@ function installUserWorkerEntry(messaging, options = {}) {
 }
 async function runOnce(messaging, boot, options) {
   const sabView = new Uint8Array(boot.sab);
+  const kernelWakeSlot = boot.kernelWakeSlot !== void 0 ? new Int32Array(boot.kernelWakeSlot, 0, 8) : void 0;
   const backend = new SabBackend({
     sab: sabView,
     pid: boot.pid,
-    ...options.serviceHook ? { serviceHook: options.serviceHook } : {}
+    ...options.serviceHook ? { serviceHook: options.serviceHook } : {},
+    ...kernelWakeSlot !== void 0 ? { kernelWakeSlot } : {}
   });
   const runtime = new UserWasmRuntime(boot.wasmBytes, backend);
   try {

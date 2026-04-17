@@ -261,12 +261,14 @@ var OFF_REQ_HEAD = 0;
 var OFF_REQ_TAIL = 4;
 var OFF_RES_HEAD = 8;
 var OFF_RES_TAIL = 12;
+var OFF_USER_WAIT_SLOT = 16;
 var OFF_REQ_RING = 64;
 var OFF_RES_RING = 16384;
 var OFF_HEAP_SCRATCH = 32768;
 var HEAP_SCRATCH_BYTES = 32768;
 var REQ_SLOT_COUNT = 510;
 var RES_SLOT_COUNT = 510;
+var STATUS_READY = 3;
 
 // src/shared/syscall.ts
 var SLOT_SIZE = 32;
@@ -1449,15 +1451,22 @@ var KernelWasmHost = class _KernelWasmHost {
   async startDispatchLoop(args) {
     const budget = args.budget ?? 8;
     const parkFn = args.parkFn ?? (() => this.defaultPark());
+    const haveSharedArrayBuffer = typeof SharedArrayBuffer !== "undefined";
     while (!args.halted()) {
       let anyServiced = false;
       const pids = args.pidSource();
       for (const [pid, sab] of pids) {
         const view = new Uint8Array(sab);
+        const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+        const sabIsShared = haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
         for (let i = 0; i < budget; i++) {
           const rc = this.serviceSab(pid, view);
           if (rc === 1) break;
           anyServiced = true;
+          Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+          if (sabIsShared) {
+            Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+          }
         }
       }
       if (args.halted()) return;
@@ -2363,7 +2372,7 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
       throw e;
     }
   }
-  const useMultiProcess = options.enableMultiProcessSpawn === true;
+  const useMultiProcess = config.enableMultiProcessSpawn === true || options.enableMultiProcessSpawn === true;
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -2391,6 +2400,12 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
       messaging.postMessage(out);
     }
   });
+  if (useMultiProcess) {
+    messaging.postMessage({
+      kind: "kernel:wake-slot",
+      sab: host.wakeSlot.buffer
+    });
+  }
   if (config.bootBinary !== void 0) {
     await runBootBinary(host, config.bootBinary, pidMap, lifecycle, useMultiProcess);
   }

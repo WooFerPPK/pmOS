@@ -61,9 +61,11 @@ import {
   OFF_RES_HEAD,
   OFF_RES_RING,
   OFF_RES_TAIL,
+  OFF_USER_WAIT_SLOT,
   REQ_SLOT_COUNT,
   RES_SLOT_COUNT,
   SAB_SIZE,
+  STATUS_READY,
 } from "./shared/sab-layout";
 import type { KernelToMain } from "./shared/worker-proto";
 import {
@@ -940,15 +942,38 @@ export class KernelWasmHost implements Kernel {
   async startDispatchLoop(args: StartDispatchLoopArgs): Promise<void> {
     const budget = args.budget ?? 8;
     const parkFn = args.parkFn ?? ((): Promise<void> => this.defaultPark());
+    const haveSharedArrayBuffer = typeof SharedArrayBuffer !== "undefined";
     while (!args.halted()) {
       let anyServiced = false;
       const pids = args.pidSource();
       for (const [pid, sab] of pids) {
         const view = new Uint8Array(sab);
+        // Shared header view for the user-wake protocol step (T234).
+        // Constructed once per pid per pass; cheap, but pulled out of
+        // the inner loop to avoid an extra allocation per syscall.
+        const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+        const sabIsShared =
+          haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
         for (let i = 0; i < budget; i++) {
           const rc = this.serviceSab(pid, view);
           if (rc === 1) break;
           anyServiced = true;
+          // T234 production wake protocol step 5: now that `serviceSab`
+          // has pushed the response into the ring, wake the user
+          // Worker's `Atomics.wait(header, OFF_USER_WAIT_SLOT/4,
+          // STATUS_REQUESTED)`. Storing any value other than
+          // `STATUS_REQUESTED` makes a pre-existing waiter return "ok"
+          // on the subsequent notify, AND makes a not-yet-parked waiter
+          // return "not-equal" immediately when it does call `wait`.
+          // Both paths land in the same place: the user pops the
+          // response. `Atomics.notify` only accepts `SharedArrayBuffer`-
+          // backed views, so guard it; the `Atomics.store` itself is
+          // legal on either backing and is harmless when the user
+          // Worker is the legacy synchronous `serviceHook` path.
+          Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+          if (sabIsShared) {
+            Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+          }
         }
       }
       // Check again after the pass so a caller whose halt condition

@@ -148,4 +148,62 @@ describe("installUserWorkerEntry", () => {
       expect(e.trap).toMatch(/before boot/);
     }
   });
+
+  it("forwards boot.kernelWakeSlot from the boot message into the user-side SabBackend (T234)", async () => {
+    // Drive the entry with NO `serviceHook` AND a `kernelWakeSlot`
+    // in the boot message. SabBackend's production wake protocol is
+    // active: every dispatch (a) pre-stages STATUS_REQUESTED in the
+    // SAB's user_wait_slot before push, and (b) bumps `kernelWakeSlot
+    // [0]` via `Atomics.add` after push. On a plain ArrayBuffer SAB +
+    // plain ArrayBuffer wake slot (vitest under node, no COI), the
+    // gated `Atomics.notify` and `Atomics.wait` are skipped; the
+    // dispatch then falls through to the response-pop, finds the ring
+    // empty, and throws — `UserWasmRuntime` catches the throw and
+    // posts `exited(code: -1, trap: ...)`. The wake slot was
+    // incremented BEFORE the throw — its non-zero value proves
+    // `boot.kernelWakeSlot` made it into the SabBackend ctor and
+    // `dispatch`'s wake-protocol writes ran.
+    const host = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (): void => {},
+      nowNs: () => 0n,
+    });
+    const pid = host.registerProcess(0xffff_ffff_ffff_ffffn);
+    host.installConsoleFd(pid, 0);
+    host.installConsoleFd(pid, 1);
+    host.installConsoleFd(pid, 2);
+    host.markRunning(pid);
+
+    const sab = new ArrayBuffer(SAB_SIZE);
+    const wakeSlotBuf = new ArrayBuffer(32);
+    const wakeSlot = new Int32Array(wakeSlotBuf, 0, 8);
+
+    const msg = makeMessaging();
+    const entry = installUserWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      pid,
+      sab,
+      wasmBytes: helloStdWasmBytes,
+      kernelWakeSlot: wakeSlotBuf,
+    });
+    await entry.whenExited;
+
+    // The runtime crashed on its first syscall (no kernel servicing
+    // available without a serviceHook + no real Atomics.wait on a
+    // plain ArrayBuffer). The crash is the expected outcome here —
+    // we only care that the wake-slot path was exercised.
+    expect(msg.posted).toHaveLength(1);
+    const exited = msg.posted[0];
+    expect(exited?.kind).toBe("exited");
+    if (exited?.kind === "exited") {
+      expect(exited.pid).toBe(pid);
+      expect(exited.code).toBe(-1);
+      expect(exited.trap).toBeDefined();
+    }
+    // The key assertion: SabBackend bumped the wake slot at least once
+    // before the dispatch crashed — proving the `kernelWakeSlot` from
+    // the boot message reached the SabBackend ctor + the production
+    // wake protocol ran.
+    expect(Atomics.load(wakeSlot, 0)).toBeGreaterThan(0);
+  });
 });

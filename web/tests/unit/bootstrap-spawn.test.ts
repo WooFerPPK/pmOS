@@ -200,4 +200,71 @@ describe("createSpawnRouter", () => {
       expect(m.trap).toBe("boom from worker");
     }
   });
+
+  it("when getKernelWakeSlot returns a buffer, includes it in the boot message posted to the user Worker (T234)", () => {
+    // Production wires `getKernelWakeSlot: () => kernelWakeSlot` so
+    // the router can stamp each new boot message with the kernel's
+    // wake-slot buffer (allocated by `KernelWasmHost.create`,
+    // forwarded to main via the `kernel:wake-slot` message). The
+    // user-worker entry constructs an `Int32Array` view and hands it
+    // to `SabBackend` for the production wake protocol.
+    const kernel = makeFakeKernel();
+    const workers: FakeUserWorker[] = [];
+    const sabs: ArrayBuffer[] = [];
+    const wakeSlotBuf = new ArrayBuffer(32);
+    const router = createSpawnRouter({
+      kernelWorker: kernel,
+      workerFactory: () => {
+        const w = new FakeUserWorker();
+        workers.push(w);
+        return w;
+      },
+      allocSab: () => {
+        const sab = new ArrayBuffer(SAB_SIZE);
+        sabs.push(sab);
+        return sab;
+      },
+      getKernelWakeSlot: () => wakeSlotBuf,
+    });
+    router.handleKernelMessage(sampleSpawn(21));
+
+    expect(workers).toHaveLength(1);
+    const w = workers[0]!;
+    expect(w.posted).toHaveLength(1);
+    const boot = w.posted[0];
+    expect(boot?.kind).toBe("boot");
+    if (boot?.kind === "boot") {
+      expect(boot.pid).toBe(21);
+      expect(boot.sab).toBe(sabs[0]);
+      expect(boot.kernelWakeSlot).toBe(wakeSlotBuf);
+    }
+  });
+
+  it("when getKernelWakeSlot returns null (wake slot hasn't arrived yet), boot message omits kernelWakeSlot", () => {
+    // Defensive: production posts `kernel:wake-slot` BEFORE the first
+    // `proc:spawn` so a null reading shouldn't happen, but the router
+    // tolerates it by omitting the field. SabBackend's serviceHook
+    // path stays viable for tests that drive the entry without a
+    // production wake slot.
+    const kernel = makeFakeKernel();
+    const workers: FakeUserWorker[] = [];
+    const router = createSpawnRouter({
+      kernelWorker: kernel,
+      workerFactory: () => {
+        const w = new FakeUserWorker();
+        workers.push(w);
+        return w;
+      },
+      allocSab: () => new ArrayBuffer(SAB_SIZE),
+      getKernelWakeSlot: () => null,
+    });
+    router.handleKernelMessage(sampleSpawn(22));
+
+    const w = workers[0]!;
+    const boot = w.posted[0];
+    expect(boot?.kind).toBe("boot");
+    if (boot?.kind === "boot") {
+      expect(boot.kernelWakeSlot).toBeUndefined();
+    }
+  });
 });

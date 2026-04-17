@@ -123,10 +123,22 @@ async function runOnce(
   options: UserWorkerEntryOptions,
 ): Promise<void> {
   const sabView = new Uint8Array(boot.sab);
+  // Production wake-slot view: a shared `Int32Array` over the kernel's
+  // 32-byte wake buffer. The kernel allocates this in
+  // `KernelWasmHost.create` and main forwards it via the boot message
+  // (see `MainToUser.boot.kernelWakeSlot` in `shared/worker-proto.ts`).
+  // Tests that drive the entry through a `serviceHook` keep `boot.
+  // kernelWakeSlot` undefined; `SabBackend` then takes the legacy
+  // synchronous path.
+  const kernelWakeSlot =
+    boot.kernelWakeSlot !== undefined
+      ? new Int32Array(boot.kernelWakeSlot, 0, 8)
+      : undefined;
   const backend = new SabBackend({
     sab: sabView,
     pid: boot.pid,
     ...(options.serviceHook ? { serviceHook: options.serviceHook } : {}),
+    ...(kernelWakeSlot !== undefined ? { kernelWakeSlot } : {}),
   });
   const runtime = new UserWasmRuntime(boot.wasmBytes, backend);
   try {

@@ -58,6 +58,20 @@ export interface BootConfig {
    * the real init binary supersedes it.
    */
   readonly bootBinary?: string;
+  /**
+   * Opt into the T233 (M1.4) proc:spawn routing path from a
+   * production boot. Only honoured when [`useRealKernel`] is true.
+   * When set, the kernel-worker entry wires
+   * [`KernelWasmHostOptions.kernelWorkerChannel`] and
+   * `runBootBinary` drives [`KernelWasmHost.startDispatchLoop`]
+   * over the per-pid SAB map (populated by `proc:sab`, drained by
+   * `proc:exited`) instead of the legacy in-process
+   * [`KernelWasmHost.drainPendingSpawns`]. Production's
+   * `runRealKernelMode()` sets this true (T234); the legacy in-
+   * process drain remains the default for callers that don't opt
+   * in. T235 deletes both this flag and the legacy drain.
+   */
+  readonly enableMultiProcessSpawn?: boolean;
 }
 
 /** Main-thread → kernel-worker. */
@@ -103,6 +117,22 @@ export type KernelToMain =
       readonly pid: number;
       readonly path: string;
       readonly wasmBytes: ArrayBufferLike;
+    }
+  | {
+      // Kernel hands main its 32-byte wake-slot buffer so main can
+      // forward it to every user Worker it spawns. Each user Worker's
+      // `SabBackend` bumps `index 0` of this slot via `Atomics.add` +
+      // `Atomics.notify` to wake the kernel's dispatch loop from its
+      // park. Posted exactly once per kernel boot, immediately after
+      // `KernelWasmHost.create` and BEFORE the first `proc:spawn` so
+      // main never spawns a user Worker without the wake slot in
+      // hand. The `sab` is the underlying buffer (typically a
+      // `SharedArrayBuffer`; falls back to a plain `ArrayBuffer` in
+      // non-cross-origin-isolated environments — `SabBackend`'s
+      // production wake path no-ops on the latter, mirroring the
+      // kernel's `defaultPark` fallback).
+      readonly kind: "kernel:wake-slot";
+      readonly sab: ArrayBufferLike;
     };
 
 /**
@@ -116,6 +146,16 @@ export type MainToUser = {
   readonly pid: number;
   readonly sab: ArrayBufferLike;
   readonly wasmBytes: ArrayBufferLike;
+  /**
+   * The kernel's shared 32-byte wake-slot buffer. `SabBackend`
+   * constructs an `Int32Array` view over this and bumps index 0
+   * via `Atomics.add` + `Atomics.notify` to wake the kernel's
+   * dispatch loop from its park (the production wake protocol).
+   * Optional so vitest tests that drive the user-worker entry
+   * with a `serviceHook` (the T231/T232 stand-in) can omit it;
+   * production always sets it.
+   */
+  readonly kernelWakeSlot?: ArrayBufferLike;
 };
 
 /**

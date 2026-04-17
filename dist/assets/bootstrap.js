@@ -797,6 +797,33 @@ function runRealKernelMode() {
   console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
   const consoleEl = mountRealKernelConsole();
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  let kernelWakeSlot = null;
+  let peakLiveWorkers = 0;
+  const router = createSpawnRouter({
+    kernelWorker: worker,
+    workerFactory: () => new Worker("/assets/user-worker.js", { type: "module" }),
+    allocSab: () => {
+      try {
+        return new SharedArrayBuffer(SAB_SIZE);
+      } catch {
+        return new ArrayBuffer(SAB_SIZE);
+      }
+    },
+    getKernelWakeSlot: () => kernelWakeSlot
+  });
+  worker.addEventListener("message", (ev) => {
+    const msg = ev.data;
+    if (msg.kind === "kernel:wake-slot") {
+      kernelWakeSlot = msg.sab;
+      document.body.dataset["pmosWakeSlotReady"] = "1";
+      return;
+    }
+    router.handleKernelMessage(msg);
+    if (router.liveWorkers.size > peakLiveWorkers) {
+      peakLiveWorkers = router.liveWorkers.size;
+      document.body.dataset["pmosPeakLiveWorkers"] = String(peakLiveWorkers);
+    }
+  });
   const consoleHost = new ConsoleHost({
     worker,
     bootConfig: {
@@ -804,7 +831,15 @@ function runRealKernelMode() {
       enableInput: false,
       enableFramebuffer: false,
       useRealKernel: true,
-      bootBinary: "/bin/init"
+      bootBinary: "/bin/init",
+      // T234: opt into the multi-process spawn path so the kernel's
+      // default `onSpawnProcess` posts `proc:spawn` for the spawn
+      // router to handle (allocate SAB → spawn `/assets/user-worker.
+      // js` Worker → forward boot + wake slot → register with
+      // kernel via `proc:sab`). The synthetic bootstrap pid that
+      // dispatches PROC_SPAWN(/bin/init) stays in-process inside
+      // the kernel Worker — every later pid is a real user Worker.
+      enableMultiProcessSpawn: true
     }
   });
   consoleHost.onOutput((bytes) => {
@@ -911,12 +946,21 @@ function createSpawnRouter(deps) {
       worker.addEventListener("error", (ev) => {
         reap(msg.pid, -1, ev.message ?? "user worker error");
       });
-      worker.postMessage({
-        kind: "boot",
-        pid: msg.pid,
-        sab,
-        wasmBytes: msg.wasmBytes
-      });
+      const kernelWakeSlot = deps.getKernelWakeSlot?.() ?? null;
+      worker.postMessage(
+        kernelWakeSlot !== null ? {
+          kind: "boot",
+          pid: msg.pid,
+          sab,
+          wasmBytes: msg.wasmBytes,
+          kernelWakeSlot
+        } : {
+          kind: "boot",
+          pid: msg.pid,
+          sab,
+          wasmBytes: msg.wasmBytes
+        }
+      );
       deps.kernelWorker.postMessage({ kind: "proc:sab", pid: msg.pid, sab });
     },
     terminateAll() {
