@@ -494,6 +494,87 @@ describe("dispatch: CLOCK_TIME_GET", () => {
   });
 });
 
+// ---- dispatch: CLOCK_RES_GET ---------------------------------------
+
+describe("dispatch: CLOCK_RES_GET", () => {
+  it("returns 1 ns for CLOCKID.MONOTONIC", async () => {
+    // The monotonic clock's resolution is 1 ns — PMos's Platform
+    // clock is nanosecond-granular on every supported host. The
+    // `nowNs` / `nowRealtimeNs` overrides are irrelevant here (the
+    // handler is a compile-time constant per clock id, not a read
+    // through Platform), but we set them anyway to match the rest
+    // of the clock suite's setup style.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_RES_GET,
+      requestId: 60,
+      arg0: CLOCKID.MONOTONIC,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+    expect(response.requestId).toBe(60);
+  });
+
+  it("returns 1 ns for CLOCKID.REALTIME", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_RES_GET,
+      requestId: 61,
+      arg0: CLOCKID.REALTIME,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+  });
+
+  it("returns -ENOTSUP for CLOCKID.PROCESS_CPUTIME_ID", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_RES_GET,
+      requestId: 62,
+      arg0: CLOCKID.PROCESS_CPUTIME_ID,
+    });
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -ENOTSUP for CLOCKID.THREAD_CPUTIME_ID", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_RES_GET,
+      requestId: 63,
+      arg0: CLOCKID.THREAD_CPUTIME_ID,
+    });
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -EINVAL for an unknown clock id", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.CLOCK_RES_GET,
+      requestId: 64,
+      arg0: 99,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response.value).toBe(0n);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {

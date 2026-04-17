@@ -1,4 +1,5 @@
-//! End-to-end exercise of the CLOCK_TIME_GET WASI shim.
+//! End-to-end exercise of the CLOCK_TIME_GET + CLOCK_RES_GET WASI
+//! shims.
 //!
 //! `std::time::Instant::now()` lowers to
 //! `wasi_snapshot_preview1::clock_time_get(MONOTONIC, ...)`, and
@@ -7,6 +8,13 @@
 //! returns garbage, this binary either fails to instantiate
 //! (missing import → LinkError), panics (assert), or prints a
 //! different message than the test expects.
+//!
+//! The third probe exercises `clock_res_get` directly via a
+//! `wasi_snapshot_preview1` extern block — std doesn't expose
+//! `clock_getres` at the std level, so the binary does the FFI
+//! itself. The probe is gated to `target_arch = "wasm32"` so the
+//! native-target build (driven by `cargo build --workspace`)
+//! still links cleanly.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,4 +43,41 @@ fn main() {
         epoch,
     );
     println!("hello-clock realtime ok");
+
+    // Clock resolution: PMos's nanosecond-granular Platform clock
+    // reports 1 ns for both MONOTONIC + REALTIME. A regression
+    // that broke the CLOCK_RES_GET shim or the kernel handler
+    // surfaces here as a LinkError at instantiation (shim
+    // missing), a nonzero errno (handler broken), or a wrong
+    // resolution value (a bug in the handler's match arms or in
+    // the shim's bigint round-trip).
+    #[cfg(target_arch = "wasm32")]
+    {
+        const CLOCKID_MONOTONIC: i32 = 1;
+        const CLOCKID_REALTIME: i32 = 0;
+
+        #[link(wasm_import_module = "wasi_snapshot_preview1")]
+        extern "C" {
+            fn clock_res_get(clock_id: i32, resolution_out: *mut u64) -> i32;
+        }
+
+        let mut res: u64 = 0;
+        let rc = unsafe { clock_res_get(CLOCKID_MONOTONIC, &mut res as *mut u64) };
+        assert_eq!(rc, 0, "clock_res_get(MONOTONIC) errno: {}", rc);
+        assert_eq!(
+            res, 1,
+            "clock_res_get(MONOTONIC) resolution: {}, expected 1 ns",
+            res,
+        );
+
+        let mut res_rt: u64 = 0;
+        let rc_rt = unsafe { clock_res_get(CLOCKID_REALTIME, &mut res_rt as *mut u64) };
+        assert_eq!(rc_rt, 0, "clock_res_get(REALTIME) errno: {}", rc_rt);
+        assert_eq!(
+            res_rt, 1,
+            "clock_res_get(REALTIME) resolution: {}, expected 1 ns",
+            res_rt,
+        );
+    }
+    println!("hello-clock res ok");
 }

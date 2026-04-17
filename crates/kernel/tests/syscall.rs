@@ -707,6 +707,125 @@ fn clock_time_get_unknown_clock_returns_einval() {
     assert_eq!(resp.value, 0);
 }
 
+// ---- clock_res_get ---------------------------------------------------
+
+#[test]
+fn clock_res_get_monotonic_returns_nanosecond_resolution() {
+    // The WASI `clock_res_get(MONOTONIC, ...)` contract: report the
+    // finest resolution the monotonic clock can resolve. PMos's
+    // `Platform::now_ns` is nanosecond-granular already (both
+    // `SystemTime::now()` on native and `performance.now()` * 1_000_000
+    // on the browser floor), so 1 ns is the honest answer. Userland
+    // libc takes that as "every call can return a distinct value
+    // even at the fastest measurable tick".
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_RES_GET,
+        flags: 0,
+        request_id: 90,
+        args: u32_args(abi::wasi::CLOCKID_MONOTONIC),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.request_id, 90);
+    assert_eq!(resp.value, 1);
+}
+
+#[test]
+fn clock_res_get_realtime_returns_nanosecond_resolution() {
+    // Realtime resolution mirrors monotonic — both clocks sit on
+    // top of the same nanosecond-granular Platform clock, so they
+    // share the 1 ns resolution answer. The split only matters for
+    // values + monotonicity guarantees, not for precision.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_RES_GET,
+        flags: 0,
+        request_id: 91,
+        args: u32_args(abi::wasi::CLOCKID_REALTIME),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.request_id, 91);
+    assert_eq!(resp.value, 1);
+}
+
+#[test]
+fn clock_res_get_process_cputime_returns_enotsup() {
+    // Same ENOTSUP split as the time handler — "known clock id,
+    // not implemented here" returns ENOTSUP rather than a bogus
+    // value. A libc probing for cpu-time support sees a clean "no"
+    // and falls back to monotonic.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_RES_GET,
+        flags: 0,
+        request_id: 92,
+        args: u32_args(abi::wasi::CLOCKID_PROCESS_CPUTIME_ID),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.request_id, 92);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn clock_res_get_thread_cputime_returns_enotsup() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_RES_GET,
+        flags: 0,
+        request_id: 93,
+        args: u32_args(abi::wasi::CLOCKID_THREAD_CPUTIME_ID),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.request_id, 93);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn clock_res_get_unknown_clock_returns_einval() {
+    // Same ENOTSUP/EINVAL split as clock_time_get: unknown clock id
+    // is EINVAL (distinct from "known but unsupported" = ENOTSUP).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "clock", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::CLOCK_RES_GET,
+        flags: 0,
+        request_id: 94,
+        args: u32_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(resp.request_id, 94);
+    assert_eq!(resp.value, 0);
+}
+
 // ---- random_get ------------------------------------------------------
 
 #[test]

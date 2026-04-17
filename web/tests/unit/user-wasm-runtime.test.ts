@@ -1173,27 +1173,34 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(fbWrites).toHaveLength(0);
   });
 
-  it("hello-clock: std binary drives CLOCK_TIME_GET(MONOTONIC + REALTIME) through the WASI shim end-to-end", async () => {
-    // The CLOCK_TIME_GET acceptance test. `hello-clock`'s `_start`
-    // calls `Instant::now()` (which lowers to
-    // `clock_time_get(MONOTONIC, ...)`) twice and asserts
+  it("hello-clock: std binary drives CLOCK_TIME_GET(MONOTONIC + REALTIME) + CLOCK_RES_GET through the WASI shim end-to-end", async () => {
+    // The CLOCK_TIME_GET + CLOCK_RES_GET acceptance test.
+    // `hello-clock`'s `_start` calls `Instant::now()` (which lowers
+    // to `clock_time_get(MONOTONIC, ...)`) twice and asserts
     // non-decreasing, then calls `SystemTime::now()` (which lowers
     // to `clock_time_get(REALTIME, ...)`) and asserts the wall
-    // clock is after 2020.
+    // clock is after 2020, then directly calls
+    // `clock_res_get(MONOTONIC)` + `clock_res_get(REALTIME)` via
+    // a hand-written FFI extern block (std doesn't expose
+    // `clock_getres`) and asserts both report 1 ns.
     //
-    // The binary prints two lines ("monotonic ok", "realtime ok")
-    // and exits 0. Both lines arriving means both clock IDs route
-    // through the shim, land on the kernel handler's correct
-    // branch, read the right `Platform::now_*` source, and travel
-    // back as an 8-byte i64 the WASI shim writes into user memory.
+    // The binary prints three lines ("monotonic ok", "realtime ok",
+    // "res ok") and exits 0. All three lines arriving means every
+    // clock_id routes through its shim, lands on the kernel
+    // handler's correct branch, and travels back as an 8-byte i64
+    // the shim writes into user memory.
     //
     // Failure modes:
-    //   * LinkError at instantiate = `clock_time_get` shim missing
+    //   * LinkError at instantiate = `clock_time_get` or
+    //     `clock_res_get` shim missing
     //   * exit nonzero + panic output = one of the std asserts
-    //     tripped (monotonicity regression / realtime before 2020)
-    //   * missing "monotonic ok" = MONOTONIC branch broken
-    //   * missing "realtime ok" = REALTIME branch broken or
-    //     `nowRealtimeNs` defaulting to 0
+    //     tripped (monotonicity regression / realtime before 2020
+    //     / clock_res_get wrong value or errno)
+    //   * missing "monotonic ok" = CLOCK_TIME_GET(MONOTONIC) broken
+    //   * missing "realtime ok" = CLOCK_TIME_GET(REALTIME) broken
+    //     or `nowRealtimeNs` defaulting to 0
+    //   * missing "res ok" = CLOCK_RES_GET handler broken or shim
+    //     not writing the resolution value
     const consoleWrites: Uint8Array[] = [];
     const kernel = await KernelWasmHost.create(kernelWasmBytes, {
       onConsoleWrite: (bytes) => {
@@ -1225,6 +1232,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(lines).toEqual([
       "hello-clock monotonic ok",
       "hello-clock realtime ok",
+      "hello-clock res ok",
     ]);
   });
 

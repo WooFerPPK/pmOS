@@ -184,6 +184,7 @@ export const OP_WASI = {
   FD_WRITE: 0x0034,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
+  CLOCK_RES_GET: 0x0010,
   CLOCK_TIME_GET: 0x0011,
   RANDOM_GET: 0x0051,
   SCHED_YIELD: 0x0052,
@@ -228,8 +229,9 @@ export const ERRNO = {
 // ---- WASI clock identifiers -----------------------------------------
 //
 // Mirror of `abi::wasi::CLOCKID_*`. Passed as the u32 at args[0..4] on
-// a `CLOCK_TIME_GET` request. REALTIME + MONOTONIC are supported in v1;
-// PROCESS_CPUTIME + THREAD_CPUTIME return -ENOTSUP.
+// `CLOCK_TIME_GET` + `CLOCK_RES_GET` requests. REALTIME + MONOTONIC are
+// supported in v1; PROCESS_CPUTIME + THREAD_CPUTIME return -ENOTSUP on
+// both opcodes.
 
 export const CLOCKID = {
   REALTIME: 0,

@@ -60,6 +60,7 @@ var OP_WASI = {
   FD_WRITE: 52,
   PATH_OPEN: 68,
   PROC_EXIT: 96,
+  CLOCK_RES_GET: 16,
   CLOCK_TIME_GET: 17,
   RANDOM_GET: 81,
   SCHED_YIELD: 82,
@@ -637,6 +638,36 @@ var UserWasmRuntime = class {
         if (response.status !== 0) return -response.status;
         const view = new DataView(this.memory.buffer);
         view.setBigInt64(timestampPtr, response.value, true);
+        return 0;
+      },
+      // WASI `clock_res_get`.
+      //
+      // Signature (lowered):
+      //   (clock_id: i32, resolution_ptr: i32) -> errno: i32
+      //
+      // The precision-query sibling to `clock_time_get`. Given a
+      // clock id, report the finest tick the clock can resolve.
+      // PMos's `Platform::now_*` are nanosecond-granular, so the
+      // kernel handler returns 1 ns for both MONOTONIC + REALTIME
+      // and -ENOTSUP for the two cputime clocks — same split the
+      // time handler uses.
+      //
+      // Dispatches `CLOCK_RES_GET` packing `clock_id` as the u32
+      // at args[0..4]. On success, writes the i64 resolution value
+      // to `resolution_ptr` (little-endian) and returns 0. On
+      // failure, returns the positive errno.
+      clock_res_get: (clockId, resolutionPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.CLOCK_RES_GET,
+          requestId: 0,
+          arg0: clockId,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        if (response.status !== 0) return -response.status;
+        const view = new DataView(this.memory.buffer);
+        view.setBigInt64(resolutionPtr, response.value, true);
         return 0;
       },
       // WASI `fd_prestat_get`.

@@ -48,6 +48,7 @@ pub fn dispatch_wasi(
         op::PATH_OPEN => handle_path_open(kernel, pid, req, heap),
         op::PROC_EXIT => handle_proc_exit(kernel, pid, req),
         op::CLOCK_TIME_GET => handle_clock_time_get(req),
+        op::CLOCK_RES_GET => handle_clock_res_get(req),
         op::RANDOM_GET => handle_random_get(req, heap),
         op::SCHED_YIELD => handle_sched_yield(req),
         op::ARGS_SIZES_GET => handle_args_sizes_get(req, heap),
@@ -249,6 +250,47 @@ fn handle_clock_time_get(req: &Request) -> Response {
         _ => return Response::err(req.request_id, EINVAL),
     };
     Response::ok(req.request_id, ns as i64)
+}
+
+// ---- clock_res_get ----------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = clock_id (u32)
+// Response:
+//   value       = resolution in nanoseconds (u64 widened to i64)
+//
+// The precision-query sibling to `clock_time_get`. Given a clock
+// id, report the finest tick the clock can resolve. PMos's
+// `Platform::now_ns` + `Platform::now_realtime_ns` both sit on top
+// of nanosecond-granular sources (native: `Instant::now()` +
+// `SystemTime::now()`; wasm host: `performance.now()` * 1_000_000
+// + `Date.now()` * 1_000_000), so 1 ns is the honest answer for
+// both supported clocks.
+//
+//   * CLOCKID_MONOTONIC / CLOCKID_REALTIME → 1 ns.
+//   * CLOCKID_PROCESS_CPUTIME_ID / CLOCKID_THREAD_CPUTIME_ID →
+//     ENOTSUP. Same split as the time handler: known clock id,
+//     not implemented here.
+//   * Anything else → EINVAL.
+//
+// Unlike `clock_time_get`, the result is a compile-time constant
+// per clock id — the handler doesn't touch any Platform method.
+// That is a deliberate property of v1: if the Platform clock's
+// underlying resolution ever degrades (e.g. a future `wasm32` host
+// that only exposes microseconds), the handler is the single place
+// to widen the answer without rippling through every userland
+// binary that pre-computed 1 ns.
+
+fn handle_clock_res_get(req: &Request) -> Response {
+    let clock_id = args_u32(req, 0);
+    let resolution_ns: u64 = match clock_id {
+        abi::wasi::CLOCKID_MONOTONIC | abi::wasi::CLOCKID_REALTIME => 1,
+        abi::wasi::CLOCKID_PROCESS_CPUTIME_ID | abi::wasi::CLOCKID_THREAD_CPUTIME_ID => {
+            return Response::err(req.request_id, ENOTSUP);
+        }
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    Response::ok(req.request_id, resolution_ns as i64)
 }
 
 // ---- random_get -------------------------------------------------------
