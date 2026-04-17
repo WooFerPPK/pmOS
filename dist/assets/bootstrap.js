@@ -367,7 +367,7 @@ function paintBoot(c, rows, animationFrame) {
 }
 function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
-  if (window.location.hash.includes("real-kernel")) {
+  if (!window.location.hash.includes("mock-kernel")) {
     runRealKernelMode();
     return;
   }

@@ -1,6 +1,6 @@
 // First Playwright integration test: a real browser loads the
-// served `dist/`, the bundled `bootstrap.js` opts into
-// real-kernel mode via the URL hash, the kernel Worker fetches
+// served `dist/`, the bundled `bootstrap.js` picks real-kernel
+// mode as its default boot path, the kernel Worker fetches
 // `/assets/kernel.wasm` + every `/assets/bin/*.wasm` listed in
 // `/manifest.json`, registers a synthetic boot-loader pid,
 // dispatches `PROC_SPAWN(/bin/init)`, and `init` runs to
@@ -14,10 +14,15 @@
 // line with `[real-kernel]`. The test scrapes those lines via
 // `page.on('console', ...)` and asserts the expected ordered
 // sequence from init + hello-std reaches the browser.
+//
+// The bare URL `/index.html` (no hash) is what a fresh visitor
+// hits, so the test deliberately uses that: if real-kernel is
+// no longer the default, the test fails even when the
+// explicit `#real-kernel` hash continues to work.
 
 import { expect, test } from "@playwright/test";
 
-test("real kernel boots init, init spawns hello-std, both reach the page console", async ({ page }) => {
+test("real kernel is the default boot path and runs init -> hello-std", async ({ page }) => {
   const consoleLines: string[] = [];
   page.on("console", (msg) => {
     consoleLines.push(msg.text());
@@ -26,7 +31,7 @@ test("real kernel boots init, init spawns hello-std, both reach the page console
     consoleLines.push(`[pageerror] ${err.message}`);
   });
 
-  await page.goto("/index.html#real-kernel");
+  await page.goto("/index.html");
 
   // Poll until hello-std's line reaches the page. On a local
   // dev-server the full boot (init → proc_spawn → drain →

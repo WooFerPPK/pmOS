@@ -244,11 +244,13 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
 function main(): void {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
 
-  // Real-kernel mode is opt-in via URL hash (e.g. `index.html#real-kernel`)
-  // for the duration of the slice that wires `KernelWasmHost` into the
-  // production Worker. The mock-shell + live-terminal flow stays the
-  // default for every other URL.
-  if (window.location.hash.includes("real-kernel")) {
+  // Real-kernel mode is the default boot path. The legacy
+  // MockKernel demo (faux shell + live terminal + boot-screen
+  // check rows) is kept accessible via `#mock-kernel` so existing
+  // bookmarks + the preview-era demo story still work; `#real-kernel`
+  // continues to force the new path for anyone who was using that
+  // hash explicitly.
+  if (!window.location.hash.includes("mock-kernel")) {
     runRealKernelMode();
     return;
   }
