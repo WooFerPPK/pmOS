@@ -2,6 +2,7 @@
   "version": 0,
   "assets": [
     "_headers",
+    "assets/bin/display-client-demo.wasm",
     "assets/bin/display-server.wasm",
     "assets/bin/display_server_lite.wasm",
     "assets/bin/edit.wasm",

@@ -1,0 +1,15 @@
+[package]
+name = "display-client-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Standard `bin` target so cargo links crt1-command.o and wraps
+# main() in the usual Rust std startup. Paired with `display-server`
+# as the first slice where two separate user Workers actually talk
+# to each other over a PMos IPC socket (rather than one binary
+# playing both roles via self-connect).
+
+[[bin]]
+name = "display-client-demo"
+path = "src/main.rs"

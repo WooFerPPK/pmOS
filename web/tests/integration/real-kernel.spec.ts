@@ -4,23 +4,36 @@
 // `/assets/kernel.wasm` + every `/assets/bin/*.wasm` listed in
 // `/manifest.json`, registers a synthetic boot-loader pid,
 // dispatches `PROC_SPAWN(/bin/init)`, and `init` runs to
-// completion through the real Rust kernel. Init itself then
-// fires TWO fire-and-forget `pmos_ext.proc_spawn` calls — first
-// `/bin/hello-std`, then `/bin/display-server` — and exits.
-// The substrate's spawn router creates a dedicated user Worker
-// per child, so init + hello-std + display-server overlap:
-// three concurrent pids, three distinct linear memories, three
+// completion through the real Rust kernel. Init itself fires
+// THREE fire-and-forget `pmos_ext.proc_spawn` calls — first
+// `/bin/hello-std`, then `/bin/display-server`, then
+// `/bin/display-client-demo` — and exits. The substrate's spawn
+// router creates a dedicated user Worker per child, so init +
+// hello-std + display-server + display-client-demo overlap:
+// four concurrent pids, four distinct linear memories, four
 // per-pid SAB rings serviced round-robin by the kernel Worker's
 // dispatch loop.
+//
+// This is the first slice where two separate WASM binaries in
+// separate user Workers actually exchange bytes through a PMos
+// IPC socket: display-server binds `/run/display` and spins on
+// `ipc_accept` (EAGAIN poll), display-client-demo connects
+// (ECONNREFUSED poll) + `fd_write(PIXELS)` + exits, and
+// display-server's next accept returns a real server fd → reads
+// the 16-byte RGBA payload → relays it to `/dev/fb0` → prints
+// `"fb blit ok"` → exits.
 //
 // The observable signal is the page console — `bootstrap.ts`
 // in real-kernel mode prefixes every flushed `/dev/console`
 // line with `[real-kernel]`. The test scrapes those lines via
 // `page.on('console', ...)` and asserts the expected sequence
-// from init + hello-std + display-server reaches the browser.
-// Ordering is pinned only within each pid (and within init →
-// child, since children start only after `proc_spawn` returns);
-// between the two children, interleaving is expected.
+// from all four pids reaches the browser. Ordering is pinned
+// within each pid (and within init → child, since children can
+// only start after `proc_spawn` returns); between children,
+// interleaving is expected EXCEPT for the protocol-ordered pair
+// — `display-server fb blit ok` MUST come after
+// `display-client-demo sent pixels` because the server's
+// `fd_read` unblocks only after the client's `fd_write` lands.
 //
 // The bare URL `/index.html` (no hash) is what a fresh visitor
 // hits, so the test deliberately uses that: if real-kernel is
@@ -40,7 +53,7 @@
 
 import { expect, test } from "@playwright/test";
 
-test("real kernel is the default boot path and runs init -> hello-std + display-server", async ({ page }) => {
+test("real kernel is the default boot path and runs init -> hello-std + display-server <-> display-client-demo", async ({ page }) => {
   const consoleLines: string[] = [];
   page.on("console", (msg) => {
     consoleLines.push(msg.text());
@@ -53,11 +66,12 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
 
   // Poll until display-server's trailing "fb blit ok" line arrives
   // — that's the last observable signal of a successful boot (it
-  // only prints after every step 1..7 of the display-server flow
-  // succeeds, so its presence implies hello-std's line and every
-  // init line have already landed). On a local dev-server the full
-  // three-pid boot completes in ~300 ms cold; the 15 s timeout is
-  // for cold-start CI.
+  // only prints after the full IPC round-trip has traversed
+  // display-client-demo's connect + fd_write(PIXELS) AND
+  // display-server's accept + fd_read + path_open("/dev/fb0") +
+  // fd_write(fb_fd), so its presence implies every earlier line has
+  // already landed). On a local dev-server the full four-pid boot
+  // completes in ~400 ms cold; the 15 s timeout is for cold-start CI.
   const blitOkLine = () =>
     consoleLines.find((l) =>
       l.includes("[real-kernel] display-server fb blit ok"),
@@ -66,9 +80,10 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
 
   // With the trailing display-server line observed, every other
   // line MUST already be present. Pull the indices and assert the
-  // ordering that IS stable (within a single pid + init → child).
-  // Ordering BETWEEN hello-std and display-server is NOT asserted —
-  // they run concurrently in separate Workers.
+  // ordering that IS stable (within a single pid + init → child,
+  // plus the protocol-ordered pair client-sent → server-blit).
+  // Ordering BETWEEN hello-std and the display pair is NOT asserted
+  // — they run concurrently in separate Workers.
   const initStartIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] init starting"),
   );
@@ -77,6 +92,9 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   );
   const initSpawnDisplayServerIdx = consoleLines.findIndex((l) =>
     /\[real-kernel\] init spawned display-server pid=\d+/.test(l),
+  );
+  const initSpawnDisplayClientIdx = consoleLines.findIndex((l) =>
+    /\[real-kernel\] init spawned display-client-demo pid=\d+/.test(l),
   );
   const initExitIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] init exiting"),
@@ -90,19 +108,36 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   const displayServerBlitIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] display-server fb blit ok"),
   );
+  const displayClientStartIdx = consoleLines.findIndex((l) =>
+    l.includes("[real-kernel] display-client-demo starting"),
+  );
+  const displayClientSentIdx = consoleLines.findIndex((l) =>
+    l.includes("[real-kernel] display-client-demo sent pixels"),
+  );
 
   expect(initStartIdx).toBeGreaterThanOrEqual(0);
   expect(initSpawnHelloStdIdx).toBeGreaterThan(initStartIdx);
   expect(initSpawnDisplayServerIdx).toBeGreaterThan(initSpawnHelloStdIdx);
-  expect(initExitIdx).toBeGreaterThan(initSpawnDisplayServerIdx);
+  expect(initSpawnDisplayClientIdx).toBeGreaterThan(initSpawnDisplayServerIdx);
+  expect(initExitIdx).toBeGreaterThan(initSpawnDisplayClientIdx);
   // Children start only after init's proc_spawn returns — init's
-  // "exiting" line is just three more fd_writes + proc_exit, which
-  // finishes long before either child's std startup completes.
+  // remaining fd_writes + proc_exit finishes long before any
+  // child's std startup completes.
   expect(helloStdIdx).toBeGreaterThan(initExitIdx);
   expect(displayServerStartIdx).toBeGreaterThan(initExitIdx);
+  expect(displayClientStartIdx).toBeGreaterThan(initExitIdx);
   // Within display-server's own output, "starting" must precede
   // "fb blit ok" (single pid, sequential prints).
   expect(displayServerBlitIdx).toBeGreaterThan(displayServerStartIdx);
+  // Within display-client-demo's own output, "starting" must precede
+  // "sent pixels" (single pid, sequential prints).
+  expect(displayClientSentIdx).toBeGreaterThan(displayClientStartIdx);
+  // Protocol ordering: display-server's fd_read unblocks only after
+  // display-client-demo's fd_write lands. display-server prints
+  // "fb blit ok" immediately after the fb write, display-client-demo
+  // prints "sent pixels" immediately after its fd_write. So the
+  // client's "sent pixels" MUST come before the server's "fb blit ok".
+  expect(displayServerBlitIdx).toBeGreaterThan(displayClientSentIdx);
 
   expect(consoleLines.some((l) => l.includes("real kernel ready"))).toBe(true);
   expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
@@ -110,36 +145,46 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   // DOM surface: real-kernel mode renders each captured line into a
   // `<pre id="pmos-real-console">` so the page itself shows the
   // boot output (not just dev tools). The element's text must
-  // include every line all three pids produced.
+  // include every line all four pids produced.
   const domText = await page.locator("#pmos-real-console").innerText();
   expect(domText).toContain("init starting");
   expect(domText).toMatch(/init spawned hello-std pid=\d+/);
   expect(domText).toMatch(/init spawned display-server pid=\d+/);
+  expect(domText).toMatch(/init spawned display-client-demo pid=\d+/);
   expect(domText).toContain("init exiting");
   expect(domText).toContain("hello from std");
   expect(domText).toContain("display-server starting");
   expect(domText).toContain("display-server fb blit ok");
+  expect(domText).toContain("display-client-demo starting");
+  expect(domText).toContain("display-client-demo sent pixels");
   expect(domText.indexOf("init starting")).toBeLessThan(
     domText.indexOf("hello from std"),
   );
   expect(domText.indexOf("display-server starting")).toBeLessThan(
     domText.indexOf("display-server fb blit ok"),
   );
+  expect(domText.indexOf("display-client-demo starting")).toBeLessThan(
+    domText.indexOf("display-client-demo sent pixels"),
+  );
+  expect(domText.indexOf("display-client-demo sent pixels")).toBeLessThan(
+    domText.indexOf("display-server fb blit ok"),
+  );
 
-  // Three concurrent pids (init + hello-std + display-server) MUST
-  // each live in their own user Worker under `createSpawnRouter`'s
-  // management. `peakLiveWorkers` is the high-water mark of
-  // `router.liveWorkers.size` across every message the bootstrap's
-  // listener observes. The peak reaches 3 during the window where
-  // init has spawned both children and neither has exited yet; this
-  // is the load-bearing evidence that the substrate round-robins
-  // across THREE per-pid SAB rings, not just two. The kernel Worker
-  // is NOT counted — only user Workers under the router's management.
+  // Four concurrent pids (init + hello-std + display-server +
+  // display-client-demo) MUST each live in their own user Worker
+  // under `createSpawnRouter`'s management. `peakLiveWorkers` is
+  // the high-water mark of `router.liveWorkers.size` across every
+  // message the bootstrap's listener observes. The peak reaches 4
+  // during the window where init has spawned all three children
+  // and none have exited yet; this is the load-bearing evidence
+  // that the substrate round-robins across FOUR per-pid SAB rings,
+  // not just three. The kernel Worker is NOT counted — only user
+  // Workers under the router's management.
   const peakAttr = await page
     .locator("body")
     .getAttribute("data-pmos-peak-live-workers");
   expect(peakAttr).not.toBeNull();
-  expect(Number(peakAttr)).toBeGreaterThanOrEqual(3);
+  expect(Number(peakAttr)).toBeGreaterThanOrEqual(4);
 
   // T234: the kernel-wake-slot transport landed before any user Worker
   // spawned. Without this, every spawn would race the SAB-allocation
@@ -155,88 +200,6 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
     .locator("body")
     .getAttribute("data-pmos-wake-slot-ready");
   expect(wakeSlotReady).toBe("1");
-});
-
-test("display-server: std binary binds, accepts a client, relays pixels to /dev/fb0", async ({ page }) => {
-  const consoleLines: string[] = [];
-  page.on("console", (msg) => {
-    consoleLines.push(msg.text());
-  });
-  page.on("pageerror", (err) => {
-    consoleLines.push(`[pageerror] ${err.message}`);
-  });
-
-  // `#display-server` selects `/bin/display-server` — the first `std`
-  // binary in the workspace to do IPC over the M1 multi-process
-  // substrate. The binary plays server, client, AND framebuffer-writer
-  // in a single boot pass (mirroring `display-server-lite`'s
-  // composition-test pattern, promoted into a real std binary spawned
-  // as a real user Worker):
-  //
-  //   display_bind() → display_connect() → ipc_accept() →
-  //   fd_write(client, pixels) → fd_read(server, buf) →
-  //   path_open("/dev/fb0") → fd_write(fb_fd, buf) → return
-  //
-  // Observable signals: two `println!` lines — `"display-server
-  // starting"` at entry and `"display-server fb blit ok"` after the
-  // final `fd_write(fb_fd)`. The latter only prints on exit code 0
-  // (every intermediate failure takes a `std::process::exit(N)` path
-  // and never reaches the final println), so its presence implicitly
-  // proves the whole chain succeeded.
-  await page.goto("/index.html#display-server");
-
-  // Wait for the user Worker to spawn. `data-pmos-peak-live-workers`
-  // bumps to `1` when the spawn router instantiates the display-server
-  // Worker in response to the kernel's `proc:spawn` — same signal the
-  // input-echo test uses.
-  await expect
-    .poll(
-      async () => {
-        const attr = await page
-          .locator("body")
-          .getAttribute("data-pmos-peak-live-workers");
-        return attr ? Number(attr) : 0;
-      },
-      { timeout: 15_000 },
-    )
-    .toBeGreaterThanOrEqual(1);
-
-  // Wait for the binary's trailing println to arrive. Cold-path on a
-  // local dev-server is ~250 ms (std startup + bind + connect + accept
-  // + two IPC round trips + path_open + fb write); the generous
-  // timeout is for cold-start CI.
-  await expect
-    .poll(
-      () =>
-        consoleLines.find((l) =>
-          l.includes("[real-kernel] display-server fb blit ok"),
-        ) ?? null,
-      { timeout: 15_000 },
-    )
-    .not.toBeNull();
-
-  // With the exit line observed, the starting line MUST already be
-  // present AND ordered before the exit line.
-  const startIdx = consoleLines.findIndex((l) =>
-    l.includes("[real-kernel] display-server starting"),
-  );
-  const blitIdx = consoleLines.findIndex((l) =>
-    l.includes("[real-kernel] display-server fb blit ok"),
-  );
-  expect(startIdx).toBeGreaterThanOrEqual(0);
-  expect(blitIdx).toBeGreaterThan(startIdx);
-
-  // DOM surface: `<pre id="pmos-real-console">` carries the same
-  // lines (bootstrap's ConsoleHost.onOutput appends every flushed
-  // `/dev/console` line to this element).
-  const domText = await page.locator("#pmos-real-console").innerText();
-  expect(domText).toContain("display-server starting");
-  expect(domText).toContain("display-server fb blit ok");
-  expect(domText.indexOf("display-server starting")).toBeLessThan(
-    domText.indexOf("display-server fb blit ok"),
-  );
-
-  expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
 });
 
 test("input round-trip: keydown in real-kernel mode echoes to console", async ({ page }) => {

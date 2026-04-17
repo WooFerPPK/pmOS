@@ -1,18 +1,29 @@
 //! PID 1 — the first userland program the kernel spawns on boot.
 //!
 //! In v1 the responsibility is deliberately tiny: announce that
-//! init is alive, spawn two fire-and-forget demo children via
+//! init is alive, spawn three fire-and-forget demo children via
 //! the PMos extension `proc_spawn` syscall — first
-//! `/bin/hello-std`, then `/bin/display-server` — and exit
-//! cleanly so the dispatch loop can pick both children up. A
-//! real OS init would loop, reap children, and supervise
-//! long-lived services; PMos now has the substrate for that
-//! (Worker-per-pid + per-pid SAB rings landed in T230–T235), but
-//! the kernel-side `proc_wait` / signal-delivery semantics
-//! (T075) are still partial, so this slice's init stays a
-//! single-shot launcher. The looping / supervision behaviour
-//! lands when `proc_wait` + the user-visible `SignalChannel` fd
-//! are wired through.
+//! `/bin/hello-std`, then `/bin/display-server`, then
+//! `/bin/display-client-demo` — and exit cleanly so the dispatch
+//! loop can pick every child up. A real OS init would loop, reap
+//! children, and supervise long-lived services; PMos now has the
+//! substrate for that (Worker-per-pid + per-pid SAB rings landed
+//! in T230–T235), but the kernel-side `proc_wait` /
+//! signal-delivery semantics (T075) are still partial, so this
+//! slice's init stays a single-shot launcher. The looping /
+//! supervision behaviour lands when `proc_wait` + the
+//! user-visible `SignalChannel` fd are wired through.
+//!
+//! The second and third spawns — display-server and its sibling
+//! display-client-demo — are the first pair in the workspace
+//! whose raison d'être is to talk to each other over a PMos IPC
+//! socket (display-server binds `/run/display`, display-client-demo
+//! connects + writes a pixel payload). Init spawns both so the
+//! client has a server to find; the order is chosen so
+//! display-server reaches `display_bind` before
+//! display-client-demo reaches `display_connect` under normal
+//! Worker scheduling (spawn order matches pid map iteration
+//! order, which is the dispatch loop's round-robin order).
 //!
 //! The crate is a `std` binary: we lean on `println!` for output
 //! and on Rust's normal libc/WASI startup path for argv/environ
@@ -59,6 +70,23 @@ fn main() {
         println!("init: proc_spawn /bin/display-server failed errno={}", -rc);
     } else {
         println!("init spawned display-server pid={}", rc);
+    }
+
+    const DISPLAY_CLIENT_DEMO: &[u8] = b"/bin/display-client-demo";
+    let rc = unsafe {
+        proc_spawn(
+            DISPLAY_CLIENT_DEMO.as_ptr(),
+            DISPLAY_CLIENT_DEMO.len() as u32,
+            u64::MAX,
+        )
+    };
+    if rc < 0 {
+        println!(
+            "init: proc_spawn /bin/display-client-demo failed errno={}",
+            -rc
+        );
+    } else {
+        println!("init spawned display-client-demo pid={}", rc);
     }
 
     println!("init exiting");

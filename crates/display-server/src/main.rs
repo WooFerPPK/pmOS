@@ -1,41 +1,41 @@
-//! PMos display server binary — minimum viable std binary.
+//! PMos display server binary — persistent-accept-loop std binary.
 //!
-//! First `std` binary in the workspace to do IPC over the M1
-//! multi-process substrate. Self-connects (plays server, client,
-//! AND framebuffer-writer in one boot pass, mirroring
-//! `display-server-lite`'s single-binary composition pattern)
-//! to prove a real long-running std binary can traverse the full
-//! display path through a real user Worker + real SAB + real
-//! `Atomics.wait`/`notify` wake protocol.
+//! Long-running server over the M1 multi-process substrate. Binds
+//! `/run/display`, then parks on an `ipc_accept` poll loop waiting
+//! for a real client process (not a self-connect). First client's
+//! pixel payload is relayed to `/dev/fb0`; the binary then exits
+//! cleanly so the dispatch loop can reap it alongside init's other
+//! children. The companion client this slice ships is
+//! `/bin/display-client-demo` (see `crates/display-client-demo/`);
+//! init spawns both so display-server has a real peer to accept
+//! from.
 //!
 //! Flow:
-//!   1. `display_bind()`                    — claim `/run/display`.
-//!   2. `display_connect()`                  — open a client fd.
-//!   3. `ipc_accept(listener)`               — server fd paired with client.
-//!   4. `fd_write(client, PIXELS)`           — 16 bytes RGBA cross the socket.
-//!   5. `fd_read(server, buf)`               — server reads same bytes back.
-//!   6. `path_open("/dev/fb0")`              — open the framebuffer.
-//!   7. `fd_write(fb_fd, buf)`               — relay bytes to `/dev/fb0`.
-//!   8. fall off the end of `main`           — std emits `__wasi_proc_exit(0)`.
+//!   1. `display_bind()`                        — claim `/run/display`.
+//!   2. `ipc_accept(listener)` (EAGAIN poll)   — wait for a client.
+//!   3. `fd_read(server, buf)` (EAGAIN poll)   — read pixel payload.
+//!   4. `path_open("/dev/fb0")`                  — open framebuffer.
+//!   5. `fd_write(fb_fd, buf)`                   — relay to `/dev/fb0`.
+//!   6. fall off the end of `main`               — std emits `__wasi_proc_exit(0)`.
 //!
-//! A future slice swaps this single-shot self-connect pattern for a
-//! persistent accept loop paired with a second binary as the client.
-//! That's blocked on `ipc_accept` blocking semantics (today it
-//! returns `EAGAIN` on an empty backlog) and on `proc_wait` for
-//! init-side supervision.
+//! The accept poll loop is bounded so the vitest in-process
+//! composition helper (`runAllSpawns`) doesn't hang when no
+//! real-Worker client ever connects. Under production Playwright
+//! a `/bin/display-client-demo` sibling lands a connection within
+//! the first few dispatch passes. Same shape as
+//! `hello-input-echo`'s EAGAIN poll on `fd_read` — precedent for
+//! bounded polling exists in the workspace.
 //!
-//! Exit codes (match `display-server-lite`'s numbering so a
-//! regression in a shared step surfaces with the same code on both
-//! binaries):
+//! Exit codes:
 //!
 //!   * 0  = success
 //!   * 10 = `display_bind` failed
-//!   * 11 = `display_connect` failed
-//!   * 12 = `ipc_accept` failed
-//!   * 13 = client-side `fd_write` failed or short-wrote
-//!   * 14 = server-side `fd_read` failed or short-read
+//!   * 12 = `ipc_accept` returned a non-EAGAIN error
+//!   * 14 = `fd_read` returned a non-EAGAIN error or read 0 bytes
 //!   * 15 = `path_open("/dev/fb0")` failed
 //!   * 16 = framebuffer `fd_write` failed or short-wrote
+//!   * 17 = `ipc_accept` poll loop exhausted (no client arrived)
+//!   * 18 = `fd_read` poll loop exhausted (client never wrote)
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
@@ -69,7 +69,6 @@ extern "C" {
 #[link(wasm_import_module = "pmos_ext")]
 extern "C" {
     fn display_bind() -> i32;
-    fn display_connect() -> i32;
     fn ipc_accept(listener_fd: i32) -> i32;
 }
 
@@ -87,18 +86,22 @@ struct Iovec {
     buf_len: u32,
 }
 
-/// Four RGBA pixels: red, green, blue, white — the same payload
-/// `display-server-lite`'s composition test pins on the framebuffer.
-const PIXELS: [u8; 16] = [
-    0xff, 0x00, 0x00, 0xff, // red
-    0x00, 0xff, 0x00, 0xff, // green
-    0x00, 0x00, 0xff, 0xff, // blue
-    0xff, 0xff, 0xff, 0xff, // white
-];
-
 #[cfg(target_arch = "wasm32")]
 fn main() {
     println!("display-server starting");
+
+    // EAGAIN is positive `abi::errno::EAGAIN = 6`. WASI syscalls
+    // (`fd_read`, `fd_write`, `path_open`) surface errno directly
+    // as positive on error; PMos extension syscalls (`ipc_accept`,
+    // `display_bind`) negate into `-errno`. Both conventions
+    // agree on the numeric value.
+    const EAGAIN: i32 = 6;
+    // Safety valve: bounded iteration count so the vitest
+    // in-process composition test (`runAllSpawns`, strictly
+    // sequential) doesn't spin forever when no sibling client
+    // process exists. Real Playwright (concurrent Workers) lands
+    // a connection within the first handful of passes.
+    const MAX_POLLS: u32 = 10_000;
 
     unsafe {
         let listener = display_bind();
@@ -106,24 +109,20 @@ fn main() {
             std::process::exit(10);
         }
 
-        let client = display_connect();
-        if client < 0 {
-            std::process::exit(11);
-        }
-
-        let server = ipc_accept(listener);
-        if server < 0 {
+        let mut server: i32 = -1;
+        for _ in 0..MAX_POLLS {
+            let rc = ipc_accept(listener);
+            if rc >= 0 {
+                server = rc;
+                break;
+            }
+            if rc == -EAGAIN {
+                continue;
+            }
             std::process::exit(12);
         }
-
-        let write_iov = Ciovec {
-            buf: PIXELS.as_ptr(),
-            buf_len: PIXELS.len() as u32,
-        };
-        let mut nwritten: u32 = 0;
-        let rc = fd_write(client, &write_iov, 1, &mut nwritten);
-        if rc != 0 || nwritten != PIXELS.len() as u32 {
-            std::process::exit(13);
+        if server < 0 {
+            std::process::exit(17);
         }
 
         let mut recv_buf = [0u8; 32];
@@ -132,9 +131,21 @@ fn main() {
             buf_len: recv_buf.len() as u32,
         };
         let mut nread: u32 = 0;
-        let rc = fd_read(server, &read_iov, 1, &mut nread);
-        if rc != 0 || nread as usize != PIXELS.len() {
+        let mut got_bytes = false;
+        for _ in 0..MAX_POLLS {
+            let rc = fd_read(server, &read_iov, 1, &mut nread);
+            if rc == 0 && nread > 0 {
+                got_bytes = true;
+                break;
+            }
+            if rc == 0 || rc == EAGAIN {
+                nread = 0;
+                continue;
+            }
             std::process::exit(14);
+        }
+        if !got_bytes {
+            std::process::exit(18);
         }
 
         const FB_PATH: &[u8] = b"/dev/fb0";
@@ -154,7 +165,7 @@ fn main() {
             std::process::exit(15);
         }
 
-        // Writing from `recv_buf` (not the `PIXELS` constant) is
+        // Writing from `recv_buf` (not a local constant) is
         // deliberate: it pins the IPC round-trip as load-bearing,
         // so a regression that broke `fd_read` but left everything
         // else intact surfaces as wrong framebuffer bytes rather

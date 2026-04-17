@@ -255,22 +255,19 @@ function main(): void {
   // check rows) is kept accessible via `#mock-kernel` so existing
   // bookmarks + the preview-era demo story still work; `#real-kernel`
   // continues to force the new path for anyone who was using that
-  // hash explicitly. Demo-binary hashes:
-  //   * `#input-echo`     → `/bin/hello_input_echo` (no_std cdylib
+  // hash explicitly. Demo-binary hash:
+  //   * `#input-echo` → `/bin/hello_input_echo` (no_std cdylib
   //     that polls `/dev/input_kbd` + echoes to stdout — the
   //     browser-side proof of the input round-trip)
-  //   * `#display-server` → `/bin/display-server` (std binary that
-  //     self-connects over `/run/display`, relays RGBA pixels to
-  //     `/dev/fb0`, and exits — the browser-side proof that a std
-  //     binary can do IPC over the M1 substrate)
-  // Anything else (bare URL, `#real-kernel`) → `/bin/init` default.
+  // Anything else (bare URL, `#real-kernel`) → `/bin/init` default,
+  // which boots a four-pid tree (init + hello-std + display-server
+  // + display-client-demo) and exercises the full display-server
+  // IPC round-trip end-to-end through real concurrent user Workers.
   if (!window.location.hash.includes("mock-kernel")) {
     const hash = window.location.hash;
-    const bootBinary = hash.includes("display-server")
-      ? "/bin/display-server"
-      : hash.includes("input-echo")
-        ? "/bin/hello_input_echo"
-        : "/bin/init";
+    const bootBinary = hash.includes("input-echo")
+      ? "/bin/hello_input_echo"
+      : "/bin/init";
     runRealKernelMode(bootBinary);
     return;
   }

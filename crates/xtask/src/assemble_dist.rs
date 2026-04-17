@@ -111,6 +111,7 @@ fn run_inner() -> Result<()> {
 const USERLAND_BINS: &[(&str, &str)] = &[
     ("init", "init"),
     ("display-server", "display-server"),
+    ("display-client-demo", "display-client-demo"),
     ("shell", "shell"),
     ("sh", "sh"),
     ("term", "term"),
