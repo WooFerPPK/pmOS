@@ -65,6 +65,7 @@ import {
   RES_SLOT_COUNT,
   SAB_SIZE,
 } from "./shared/sab-layout";
+import type { KernelToMain } from "./shared/worker-proto";
 import {
   decodeRequest,
   decodeResponse,
@@ -217,6 +218,28 @@ export interface KernelWasmHostOptions {
    */
   readonly binaryRegistry?: ReadonlyMap<string, BufferSource>;
   /**
+   * Optional channel back to the main thread. When present AND
+   * [`binaryRegistry`] is also set AND no explicit [`onSpawnProcess`]
+   * is given, the default spawn handler switches from queuing into
+   * the in-process [`drainPendingSpawns`] to posting a
+   * `{kind:"proc:spawn", pid, path, wasmBytes}` message on this
+   * channel and returning `{ ok: true }` synchronously to the
+   * kernel.
+   *
+   * The receiver (the main-thread spawn router from
+   * [`bootstrap.ts`]) allocates a fresh SAB, instantiates a user
+   * Worker against it, and posts `{kind:"proc:sab", pid, sab}` back
+   * to the kernel Worker — which the kernel-worker-entry adds to
+   * the dispatch loop's pidMap.
+   *
+   * Production's `/assets/kernel-worker.js` sets this to a thin
+   * wrapper over `self.postMessage`; tests pass a fake that
+   * captures every post. When unset, the legacy in-process drain
+   * path stays live so existing callers don't regress. T235 deletes
+   * the legacy path along with [`drainPendingSpawns`].
+   */
+  readonly kernelWorkerChannel?: { postMessage(msg: KernelToMain): void };
+  /**
    * Optional [`Driver`] (typically a [`FramebufferDriver`]) the host
    * calls whenever a `driver_call(Framebuffer, ...)` lands. The
    * payload the kernel forwarded is interpreted as a driver-framed
@@ -284,18 +307,22 @@ export class KernelWasmHost implements Kernel {
   // `KernelWasmHostOptions` past construction. Every field of that
   // options bag is captured by the host-import closures built in
   // `create()`. The only state the class itself owns is the WASM
-  // exports record and — when a `binaryRegistry` is in play — the
-  // pending-spawn queue that the default `onSpawnProcess` pushes
-  // into. The queue lives on the class (instead of being closed
-  // over) because `drainPendingSpawns` needs to pop from the same
-  // array the closure pushes to.
+  // exports record, the pending-spawn queue (legacy; populated by the
+  // binaryRegistry-only default `onSpawnProcess`), and the shared
+  // 32-byte wake slot every user Worker + the main thread bumps to
+  // wake the kernel's dispatch loop.
   private constructor(
     private readonly exports: KernelExports,
     private readonly pendingSpawns: PendingSpawn[],
-  ) {}
+    private readonly wakeBuffer: ArrayBufferLike,
+  ) {
+    this.wakeView = new Int32Array(wakeBuffer, 0, 8);
+  }
 
   /** Spawn history, appended to by `drainPendingSpawns`. */
   private readonly spawnHistory: SpawnHistoryEntry[] = [];
+  /** `Int32Array` view over [`wakeBuffer`]; index 0 is the wake slot. */
+  private readonly wakeView: Int32Array;
 
   /**
    * Load `wasmBytes`, satisfy the host imports, and call
@@ -324,26 +351,62 @@ export class KernelWasmHost implements Kernel {
 
     // Resolve the `onSpawnProcess` callback. Priority:
     //   1. Explicit `options.onSpawnProcess` wins if provided.
-    //   2. Otherwise, if `options.binaryRegistry` is set, install
-    //      the default queuing callback that looks the path up in
-    //      the registry.
-    //   3. Otherwise, leave unset (the host import closure treats
-    //      "no callback" as accept-and-do-nothing).
+    //   2. Otherwise, if `options.binaryRegistry` is set AND
+    //      `options.kernelWorkerChannel` is also set, install the
+    //      proc:spawn-posting callback: look up the bytes, post
+    //      `{kind:"proc:spawn", pid, path, wasmBytes}` to main, and
+    //      return `{ ok: true }` synchronously. The caller
+    //      (kernel-worker-entry) then picks up a `proc:sab` response
+    //      from main and adds the pid to its dispatch loop.
+    //   3. Otherwise, if `options.binaryRegistry` is set alone, install
+    //      the legacy queuing callback that looks the path up in the
+    //      registry and pushes into `pendingSpawns` for
+    //      `drainPendingSpawns` to execute. Kept for tests + in-process
+    //      composition paths that predate the multi-Worker model.
+    //   4. Otherwise, leave unset (the host import closure treats "no
+    //      callback" as accept-and-do-nothing).
     const binaryRegistry = options.binaryRegistry;
+    const kernelWorkerChannel = options.kernelWorkerChannel;
     const resolvedOnSpawnProcess:
       | ((pid: number, path: string) => SpawnOutcome)
       | undefined =
       options.onSpawnProcess ??
-      (binaryRegistry !== undefined
+      (binaryRegistry !== undefined && kernelWorkerChannel !== undefined
         ? (pid: number, path: string): SpawnOutcome => {
             const bytes = binaryRegistry.get(path);
             if (bytes === undefined) {
               return { ok: false, errno: ERRNO.ENOENT };
             }
-            pendingSpawns.push({ pid, path, bytes });
+            // The proc:spawn message must carry a plain
+            // `ArrayBufferLike` so the receiver can wrap a
+            // `Uint8Array` / pass to `postMessage` without copying.
+            const wasmBytes =
+              bytes instanceof ArrayBuffer
+                ? bytes
+                : ArrayBuffer.isView(bytes)
+                  ? bytes.buffer.slice(
+                      bytes.byteOffset,
+                      bytes.byteOffset + bytes.byteLength,
+                    )
+                  : bytes;
+            kernelWorkerChannel.postMessage({
+              kind: "proc:spawn",
+              pid,
+              path,
+              wasmBytes,
+            });
             return { ok: true };
           }
-        : undefined);
+        : binaryRegistry !== undefined
+          ? (pid: number, path: string): SpawnOutcome => {
+              const bytes = binaryRegistry.get(path);
+              if (bytes === undefined) {
+                return { ok: false, errno: ERRNO.ENOENT };
+              }
+              pendingSpawns.push({ pid, path, bytes });
+              return { ok: true };
+            }
+          : undefined);
 
     const randomBytes = options.randomBytes ?? ((out: Uint8Array): void => {
       crypto.getRandomValues(out);
@@ -473,7 +536,20 @@ export class KernelWasmHost implements Kernel {
       throw new Error(`KernelWasmHost: kernel_init returned ${rc}`);
     }
 
-    return new KernelWasmHost(exports, pendingSpawns);
+    // Allocate the shared kernel wake slot. Production Worker scope
+    // has `SharedArrayBuffer` available (COOP/COEP); vitest under node
+    // without cross-origin-isolation falls back to a plain
+    // `ArrayBuffer`, which `Atomics.load`/`store` both accept (but
+    // `Atomics.wait`/`waitAsync` do not — the default park path
+    // detects this and falls back to a microtask yield).
+    let wakeBuffer: ArrayBufferLike;
+    try {
+      wakeBuffer = new SharedArrayBuffer(32);
+    } catch {
+      wakeBuffer = new ArrayBuffer(32);
+    }
+
+    return new KernelWasmHost(exports, pendingSpawns, wakeBuffer);
   }
 
   // ---- process lifecycle --------------------------------------------
@@ -816,4 +892,135 @@ export class KernelWasmHost implements Kernel {
       throw new Error(`KernelWasmHost.injectInput: ${fnName} returned ${rc}`);
     }
   }
+
+  // ---- dispatch loop -------------------------------------------------
+
+  /**
+   * Shared kernel wake slot. 32 bytes backed by a `SharedArrayBuffer`
+   * when the environment allows; a plain `ArrayBuffer` otherwise
+   * (vitest under node). Every user Worker's `SabBackend` and the
+   * main thread's `injectInput` routing bumps `index 0` via
+   * `Atomics.add` + `Atomics.notify` so the kernel's dispatch loop
+   * wakes from its `Atomics.waitAsync` park.
+   *
+   * The slot is semantically "wake counter": notifiers increment it,
+   * the parker reads it before waiting, and a spurious-wake-free
+   * park returns as soon as the counter changes. Production code
+   * should NEVER mutate the counter directly — use `Atomics.add` +
+   * `Atomics.notify` via a helper when that helper lands in T234.
+   */
+  get wakeSlot(): Int32Array {
+    return this.wakeView;
+  }
+
+  /**
+   * Round-robin dispatch loop. Services every live pid's SAB ring up
+   * to `budget` requests per pass; parks on `parkFn` when a pass
+   * completes without work; exits when `halted()` returns true.
+   *
+   * The dispatch loop is the kernel Worker's steady-state after boot
+   * (T233 / M1.4): the bootstrap pid (synthetic parent of init) runs
+   * one in-process `dispatch(PROC_SPAWN init)` to kick the system
+   * into motion, then the loop takes over. Spawned children arrive
+   * via `proc:sab` messages from main (router in `bootstrap.ts`),
+   * exits arrive via `proc:exited` — both bump the pidMap the caller
+   * passes through `pidSource`, so the loop picks up every
+   * lifecycle change at the start of the next pass.
+   *
+   * `parkFn` defaults to a `SharedArrayBuffer`-backed
+   * `Atomics.waitAsync` on the shared wake slot with a 50 ms timeout.
+   * Under vitest (no cross-origin-isolated context), tests pass a
+   * microtask-yield stub so the loop never actually blocks — the
+   * test seeds the rings synchronously anyway.
+   *
+   * The loop is purely cooperative: a user Worker that never calls
+   * a syscall ties up only its own Worker thread. That matches
+   * `multi-process-plan.md §1` "Non-goals: pre-emption".
+   */
+  async startDispatchLoop(args: StartDispatchLoopArgs): Promise<void> {
+    const budget = args.budget ?? 8;
+    const parkFn = args.parkFn ?? ((): Promise<void> => this.defaultPark());
+    while (!args.halted()) {
+      let anyServiced = false;
+      const pids = args.pidSource();
+      for (const [pid, sab] of pids) {
+        const view = new Uint8Array(sab);
+        for (let i = 0; i < budget; i++) {
+          const rc = this.serviceSab(pid, view);
+          if (rc === 1) break;
+          anyServiced = true;
+        }
+      }
+      // Check again after the pass so a caller whose halt condition
+      // becomes true during servicing (e.g. init's `proc:exited`
+      // arrived mid-pass and emptied the pidMap) exits without a
+      // wasted park.
+      if (args.halted()) return;
+      if (!anyServiced) {
+        await parkFn();
+      }
+    }
+  }
+
+  /**
+   * Default [`startDispatchLoop`] park. `Atomics.waitAsync` on the
+   * shared wake slot with a 50 ms timeout when the wake buffer is a
+   * real `SharedArrayBuffer` and `Atomics.waitAsync` is available;
+   * otherwise a microtask yield (`setTimeout(0)`) so the event loop
+   * still gets a chance to drain messages between busy-spin passes.
+   *
+   * The 50 ms timeout exists as a belt-and-suspenders against lost
+   * notifications; `Atomics.notify` never drops under contention, but
+   * a caller that writes the wake slot before the kernel parks would
+   * be a lost wake if the kernel waited forever. The plan §10 notes
+   * 50 ms keeps well below the Principle IX 100 ms input budget.
+   */
+  private async defaultPark(): Promise<void> {
+    if (
+      typeof SharedArrayBuffer !== "undefined" &&
+      this.wakeBuffer instanceof SharedArrayBuffer &&
+      typeof Atomics.waitAsync === "function"
+    ) {
+      const last = Atomics.load(this.wakeView, 0);
+      const r = Atomics.waitAsync(this.wakeView, 0, last, 50);
+      if (r.async) {
+        await r.value;
+      }
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+}
+
+/** Arguments to [`KernelWasmHost.startDispatchLoop`]. */
+export interface StartDispatchLoopArgs {
+  /**
+   * Snapshot of currently-live pids and their per-pid SAB views. The
+   * loop re-reads this on every pass, so the caller's map mutations
+   * (from `proc:sab` / `proc:exited`) are picked up without
+   * restarting the loop.
+   */
+  readonly pidSource: () => ReadonlyMap<number, ArrayBufferLike>;
+  /**
+   * Caller's halt condition. Checked at the start AND end of every
+   * pass; returning `true` exits the loop. Production boot path
+   * typically passes `() => pidsHaveSpawned && pidMap.size === 0`.
+   */
+  readonly halted: () => boolean;
+  /**
+   * Invoked when a pass completed without servicing any request.
+   * Defaults to a shared-wake-slot `Atomics.waitAsync` with a 50 ms
+   * timeout (see [`KernelWasmHost.wakeSlot`]); tests pass a
+   * microtask-yield stub so the loop never actually blocks.
+   */
+  readonly parkFn?: () => Promise<void>;
+  /**
+   * Maximum requests serviced per pid per pass. Defaults to 8; the
+   * value keeps one chatty process from starving the others. Tuned
+   * by the perf harness (T220). Tests use a smaller value to keep
+   * the round-robin visible.
+   */
+  readonly budget?: number;
 }

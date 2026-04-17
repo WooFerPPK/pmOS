@@ -986,17 +986,20 @@ var KernelWasmHost = class _KernelWasmHost {
   // `KernelWasmHostOptions` past construction. Every field of that
   // options bag is captured by the host-import closures built in
   // `create()`. The only state the class itself owns is the WASM
-  // exports record and — when a `binaryRegistry` is in play — the
-  // pending-spawn queue that the default `onSpawnProcess` pushes
-  // into. The queue lives on the class (instead of being closed
-  // over) because `drainPendingSpawns` needs to pop from the same
-  // array the closure pushes to.
-  constructor(exports, pendingSpawns) {
+  // exports record, the pending-spawn queue (legacy; populated by the
+  // binaryRegistry-only default `onSpawnProcess`), and the shared
+  // 32-byte wake slot every user Worker + the main thread bumps to
+  // wake the kernel's dispatch loop.
+  constructor(exports, pendingSpawns, wakeBuffer) {
     this.exports = exports;
     this.pendingSpawns = pendingSpawns;
+    this.wakeBuffer = wakeBuffer;
+    this.wakeView = new Int32Array(wakeBuffer, 0, 8);
   }
   /** Spawn history, appended to by `drainPendingSpawns`. */
   spawnHistory = [];
+  /** `Int32Array` view over [`wakeBuffer`]; index 0 is the wake slot. */
+  wakeView;
   /**
    * Load `wasmBytes`, satisfy the host imports, and call
    * `kernel_init`. Returns a ready-to-use host.
@@ -1008,7 +1011,24 @@ var KernelWasmHost = class _KernelWasmHost {
     let memory;
     const pendingSpawns = [];
     const binaryRegistry = options.binaryRegistry;
-    const resolvedOnSpawnProcess = options.onSpawnProcess ?? (binaryRegistry !== void 0 ? (pid, path) => {
+    const kernelWorkerChannel = options.kernelWorkerChannel;
+    const resolvedOnSpawnProcess = options.onSpawnProcess ?? (binaryRegistry !== void 0 && kernelWorkerChannel !== void 0 ? (pid, path) => {
+      const bytes = binaryRegistry.get(path);
+      if (bytes === void 0) {
+        return { ok: false, errno: ERRNO.ENOENT };
+      }
+      const wasmBytes2 = bytes instanceof ArrayBuffer ? bytes : ArrayBuffer.isView(bytes) ? bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength
+      ) : bytes;
+      kernelWorkerChannel.postMessage({
+        kind: "proc:spawn",
+        pid,
+        path,
+        wasmBytes: wasmBytes2
+      });
+      return { ok: true };
+    } : binaryRegistry !== void 0 ? (pid, path) => {
       const bytes = binaryRegistry.get(path);
       if (bytes === void 0) {
         return { ok: false, errno: ERRNO.ENOENT };
@@ -1094,7 +1114,13 @@ var KernelWasmHost = class _KernelWasmHost {
     if (rc !== 0) {
       throw new Error(`KernelWasmHost: kernel_init returned ${rc}`);
     }
-    return new _KernelWasmHost(exports, pendingSpawns);
+    let wakeBuffer;
+    try {
+      wakeBuffer = new SharedArrayBuffer(32);
+    } catch {
+      wakeBuffer = new ArrayBuffer(32);
+    }
+    return new _KernelWasmHost(exports, pendingSpawns, wakeBuffer);
   }
   // ---- process lifecycle --------------------------------------------
   /**
@@ -1377,6 +1403,94 @@ var KernelWasmHost = class _KernelWasmHost {
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.injectInput: ${fnName} returned ${rc}`);
     }
+  }
+  // ---- dispatch loop -------------------------------------------------
+  /**
+   * Shared kernel wake slot. 32 bytes backed by a `SharedArrayBuffer`
+   * when the environment allows; a plain `ArrayBuffer` otherwise
+   * (vitest under node). Every user Worker's `SabBackend` and the
+   * main thread's `injectInput` routing bumps `index 0` via
+   * `Atomics.add` + `Atomics.notify` so the kernel's dispatch loop
+   * wakes from its `Atomics.waitAsync` park.
+   *
+   * The slot is semantically "wake counter": notifiers increment it,
+   * the parker reads it before waiting, and a spurious-wake-free
+   * park returns as soon as the counter changes. Production code
+   * should NEVER mutate the counter directly — use `Atomics.add` +
+   * `Atomics.notify` via a helper when that helper lands in T234.
+   */
+  get wakeSlot() {
+    return this.wakeView;
+  }
+  /**
+   * Round-robin dispatch loop. Services every live pid's SAB ring up
+   * to `budget` requests per pass; parks on `parkFn` when a pass
+   * completes without work; exits when `halted()` returns true.
+   *
+   * The dispatch loop is the kernel Worker's steady-state after boot
+   * (T233 / M1.4): the bootstrap pid (synthetic parent of init) runs
+   * one in-process `dispatch(PROC_SPAWN init)` to kick the system
+   * into motion, then the loop takes over. Spawned children arrive
+   * via `proc:sab` messages from main (router in `bootstrap.ts`),
+   * exits arrive via `proc:exited` — both bump the pidMap the caller
+   * passes through `pidSource`, so the loop picks up every
+   * lifecycle change at the start of the next pass.
+   *
+   * `parkFn` defaults to a `SharedArrayBuffer`-backed
+   * `Atomics.waitAsync` on the shared wake slot with a 50 ms timeout.
+   * Under vitest (no cross-origin-isolated context), tests pass a
+   * microtask-yield stub so the loop never actually blocks — the
+   * test seeds the rings synchronously anyway.
+   *
+   * The loop is purely cooperative: a user Worker that never calls
+   * a syscall ties up only its own Worker thread. That matches
+   * `multi-process-plan.md §1` "Non-goals: pre-emption".
+   */
+  async startDispatchLoop(args) {
+    const budget = args.budget ?? 8;
+    const parkFn = args.parkFn ?? (() => this.defaultPark());
+    while (!args.halted()) {
+      let anyServiced = false;
+      const pids = args.pidSource();
+      for (const [pid, sab] of pids) {
+        const view = new Uint8Array(sab);
+        for (let i = 0; i < budget; i++) {
+          const rc = this.serviceSab(pid, view);
+          if (rc === 1) break;
+          anyServiced = true;
+        }
+      }
+      if (args.halted()) return;
+      if (!anyServiced) {
+        await parkFn();
+      }
+    }
+  }
+  /**
+   * Default [`startDispatchLoop`] park. `Atomics.waitAsync` on the
+   * shared wake slot with a 50 ms timeout when the wake buffer is a
+   * real `SharedArrayBuffer` and `Atomics.waitAsync` is available;
+   * otherwise a microtask yield (`setTimeout(0)`) so the event loop
+   * still gets a chance to drain messages between busy-spin passes.
+   *
+   * The 50 ms timeout exists as a belt-and-suspenders against lost
+   * notifications; `Atomics.notify` never drops under contention, but
+   * a caller that writes the wake slot before the kernel parks would
+   * be a lost wake if the kernel waited forever. The plan §10 notes
+   * 50 ms keeps well below the Principle IX 100 ms input budget.
+   */
+  async defaultPark() {
+    if (typeof SharedArrayBuffer !== "undefined" && this.wakeBuffer instanceof SharedArrayBuffer && typeof Atomics.waitAsync === "function") {
+      const last = Atomics.load(this.wakeView, 0);
+      const r = Atomics.waitAsync(this.wakeView, 0, last, 50);
+      if (r.async) {
+        await r.value;
+      }
+      return;
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
   }
 };
 
@@ -2158,8 +2272,19 @@ function installWorkerEntry(messaging, options = {}) {
   const whenReady = new Promise((resolve) => {
     resolveReady = resolve;
   });
+  const pidMap = /* @__PURE__ */ new Map();
+  const lifecycle = { hasEverSpawned: false };
   messaging.onmessage = (ev) => {
     const msg = ev.data;
+    if (msg.kind === "proc:sab") {
+      pidMap.set(msg.pid, msg.sab);
+      lifecycle.hasEverSpawned = true;
+      return;
+    }
+    if (msg.kind === "proc:exited") {
+      pidMap.delete(msg.pid);
+      return;
+    }
     if (scaffold === void 0) {
       if (msg.kind !== "boot") {
         messaging.postMessage({
@@ -2169,7 +2294,7 @@ function installWorkerEntry(messaging, options = {}) {
         return;
       }
       if (msg.config.useRealKernel === true) {
-        void bootRealKernel(messaging, msg.config, options).then(
+        void bootRealKernel(messaging, msg.config, options, pidMap, lifecycle).then(
           ({ scaffold: s, host }) => {
             scaffold = s;
             realKernel = host;
@@ -2218,7 +2343,7 @@ function bootMockKernel(messaging, config) {
   mock.bindScaffold(scaffold);
   return scaffold;
 }
-async function bootRealKernel(messaging, config, options) {
+async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
   const fetcher = options.fetcher ?? defaultFetcher;
   let bytes;
   try {
@@ -2238,6 +2363,7 @@ async function bootRealKernel(messaging, config, options) {
       throw e;
     }
   }
+  const useMultiProcess = options.enableMultiProcessSpawn === true;
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -2249,7 +2375,14 @@ async function bootRealKernel(messaging, config, options) {
     onPanic: (message) => {
       messaging.postMessage({ kind: "panic", message });
     },
-    ...registry !== void 0 ? { binaryRegistry: registry } : {}
+    ...registry !== void 0 ? { binaryRegistry: registry } : {},
+    ...useMultiProcess ? {
+      kernelWorkerChannel: {
+        postMessage: (msg) => {
+          messaging.postMessage(msg);
+        }
+      }
+    } : {}
   });
   const scaffold = bootKernelWorker({
     kernel: host,
@@ -2259,7 +2392,7 @@ async function bootRealKernel(messaging, config, options) {
     }
   });
   if (config.bootBinary !== void 0) {
-    await runBootBinary(host, config.bootBinary);
+    await runBootBinary(host, config.bootBinary, pidMap, lifecycle, useMultiProcess);
   }
   return { scaffold, host };
 }
@@ -2286,18 +2419,18 @@ async function fetchBinaryRegistry(fetcher) {
   );
   return new Map(entries);
 }
-async function runBootBinary(host, bootBinary) {
-  const initPid = host.registerProcess(CAPSET_ALL);
-  host.installConsoleFd(initPid, 0);
-  host.installConsoleFd(initPid, 1);
-  host.installConsoleFd(initPid, 2);
-  host.markRunning(initPid);
+async function runBootBinary(host, bootBinary, pidMap, lifecycle, useMultiProcess) {
+  const bootstrapPid = host.registerProcess(CAPSET_ALL);
+  host.installConsoleFd(bootstrapPid, 0);
+  host.installConsoleFd(bootstrapPid, 1);
+  host.installConsoleFd(bootstrapPid, 2);
+  host.markRunning(bootstrapPid);
   const manifest = encodeSpawnManifest({
     path: bootBinary,
     caps: CAPSET_ALL
   });
   const { response } = host.dispatch(
-    initPid,
+    bootstrapPid,
     {
       opcode: OP_EXT.PROC_SPAWN,
       requestId: 1,
@@ -2312,7 +2445,14 @@ async function runBootBinary(host, bootBinary) {
       `kernel-worker: PROC_SPAWN(${bootBinary}) failed with status ${response.status}`
     );
   }
-  await host.drainPendingSpawns();
+  if (!useMultiProcess) {
+    await host.drainPendingSpawns();
+    return;
+  }
+  await host.startDispatchLoop({
+    pidSource: () => pidMap,
+    halted: () => lifecycle.hasEverSpawned && pidMap.size === 0
+  });
 }
 if (typeof DedicatedWorkerGlobalScope !== "undefined" && typeof self !== "undefined" && self instanceof DedicatedWorkerGlobalScope) {
   installWorkerEntry(self);

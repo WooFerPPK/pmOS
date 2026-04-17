@@ -121,6 +121,18 @@ export interface WorkerEntryOptions {
    * default kicks in.
    */
   readonly fetcher?: (url: string) => Promise<ArrayBuffer>;
+  /**
+   * Opt into the T233 (M1.4) proc:spawn routing path. When true, the
+   * entry sets [`KernelWasmHostOptions.kernelWorkerChannel`] and
+   * `runBootBinary` drives [`KernelWasmHost.startDispatchLoop`] over
+   * the per-pid SAB map (populated by `proc:sab`, drained by
+   * `proc:exited`) instead of the legacy in-process
+   * [`KernelWasmHost.drainPendingSpawns`]. Defaults to false so
+   * existing vitest composition tests + the current Playwright
+   * `real-kernel.spec.ts` keep working. T234 flips the production
+   * wiring; T235 deletes this flag along with the legacy drain.
+   */
+  readonly enableMultiProcessSpawn?: boolean;
 }
 
 /**
@@ -141,8 +153,36 @@ export function installWorkerEntry(
     resolveReady = resolve;
   });
 
+  // T233 (M1.4): per-pid SAB views the kernel's dispatch loop iterates.
+  // `proc:sab` from main adds an entry; `proc:exited` removes one.
+  // The dispatch loop re-reads this map on every pass so lifecycle
+  // changes are picked up without restarting the loop.
+  //
+  // `lifecycle.hasEverSpawned` flips to true on the first `proc:sab`
+  // — the dispatch loop's halt predicate uses it to distinguish "no
+  // pid has landed yet" (wait longer) from "every pid has exited"
+  // (halt). Tracking the flip at message-receipt time (rather than
+  // inside the halt check) closes a race where a pid arrives and
+  // exits between halt probes.
+  const pidMap = new Map<number, ArrayBufferLike>();
+  const lifecycle = { hasEverSpawned: false };
+
   messaging.onmessage = (ev: { data: MainToKernel }): void => {
     const msg = ev.data;
+    // Multi-process lifecycle messages are handled directly by the
+    // entry — they target the dispatch loop's pidMap, not the
+    // scaffold. Arrive-out-of-order is fine: the kernel's
+    // `drainPendingSpawns` fallback handles the pre-M1 path, and the
+    // new dispatch loop picks up entries on its next pass.
+    if (msg.kind === "proc:sab") {
+      pidMap.set(msg.pid, msg.sab);
+      lifecycle.hasEverSpawned = true;
+      return;
+    }
+    if (msg.kind === "proc:exited") {
+      pidMap.delete(msg.pid);
+      return;
+    }
     if (scaffold === undefined) {
       // Pre-boot: the only message we accept is a boot.
       if (msg.kind !== "boot") {
@@ -153,7 +193,7 @@ export function installWorkerEntry(
         return;
       }
       if (msg.config.useRealKernel === true) {
-        void bootRealKernel(messaging, msg.config, options).then(
+        void bootRealKernel(messaging, msg.config, options, pidMap, lifecycle).then(
           ({ scaffold: s, host }) => {
             scaffold = s;
             realKernel = host;
@@ -250,6 +290,8 @@ async function bootRealKernel(
   messaging: WorkerMessaging,
   config: import("./shared/worker-proto").BootConfig,
   options: WorkerEntryOptions,
+  pidMap: Map<number, ArrayBufferLike>,
+  lifecycle: { hasEverSpawned: boolean },
 ): Promise<{ scaffold: KernelWorker; host: KernelWasmHost }> {
   const fetcher = options.fetcher ?? defaultFetcher;
   let bytes: BufferSource;
@@ -270,6 +312,16 @@ async function bootRealKernel(
       throw e;
     }
   }
+  // T233: when `enableMultiProcessSpawn` is set the entry wires the
+  // kernel's default `onSpawnProcess` to post `proc:spawn` on the
+  // messaging channel so main's spawn router can allocate a SAB and
+  // spawn a user Worker. Without the flag, the kernel falls back to
+  // the legacy `binaryRegistry`-backed queue-into-pendingSpawns path
+  // that `drainPendingSpawns` consumes. The flag is opt-in for this
+  // slice so the existing `real-kernel.spec.ts` Playwright test +
+  // the auto-drain vitest tests continue to work; T234 flips the
+  // production wiring and T235 rips out the legacy drain.
+  const useMultiProcess = options.enableMultiProcessSpawn === true;
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -282,6 +334,15 @@ async function bootRealKernel(
       messaging.postMessage({ kind: "panic", message });
     },
     ...(registry !== undefined ? { binaryRegistry: registry } : {}),
+    ...(useMultiProcess
+      ? {
+          kernelWorkerChannel: {
+            postMessage: (msg: KernelToMain): void => {
+              messaging.postMessage(msg);
+            },
+          },
+        }
+      : {}),
   });
   const scaffold = bootKernelWorker({
     kernel: host,
@@ -291,7 +352,7 @@ async function bootRealKernel(
     },
   });
   if (config.bootBinary !== undefined) {
-    await runBootBinary(host, config.bootBinary);
+    await runBootBinary(host, config.bootBinary, pidMap, lifecycle, useMultiProcess);
   }
   return { scaffold, host };
 }
@@ -345,35 +406,55 @@ async function fetchBinaryRegistry(
 
 /**
  * Spawn the configured boot binary as a child of a freshly-allocated
- * "init" pid and drain pending spawns until every transitive child
- * exits. Mirrors the manual choreography that
+ * bootstrap pid, then hand control to the kernel-Worker dispatch
+ * loop. Mirrors the manual choreography that
  * `kernel-wasm-host.test.ts` and the user-wasm-runtime composition
  * tests perform: register a parent process holding `CAPSET_ALL` so
  * the spawn is permitted under the cap-subset rule, install the
- * three console fds the kernel demands of any spawn parent, mark the
- * parent Running, then issue `PROC_SPAWN` and let the
- * `binaryRegistry`-backed default `onSpawnProcess` queue the work.
+ * three console fds the kernel demands of any spawn parent, mark
+ * the parent Running, then issue `PROC_SPAWN`.
  *
- * Errors at any stage propagate up: the caller's `whenReady` rejects,
- * which the entry's pre-boot panic branch surfaces if the subsequent
- * main-thread message arrives.
+ * After the PROC_SPAWN dispatch returns, the `kernelWorkerChannel`-
+ * backed default `onSpawnProcess` has already posted a
+ * `{kind:"proc:spawn", pid, path, wasmBytes}` message on the
+ * messaging channel. Main's spawn router allocates a SAB, spins up
+ * a user Worker, and posts `{kind:"proc:sab", pid, sab}` back to
+ * the kernel — the entry's onmessage handler adds the pair to
+ * `pidMap` and the dispatch loop picks it up on its next pass.
+ *
+ * The bootstrap pid stays in-process (never enters `pidMap`) because
+ * its only syscall is the one PROC_SPAWN above; it never needs a
+ * SAB. Only spawned children (init + descendants) live in the
+ * dispatch loop.
+ *
+ * The loop terminates when `pidMap` is empty AND at least one pid
+ * has been registered through it. Production: init exits, main
+ * posts `proc:exited`, pidMap becomes empty, `halted()` returns
+ * true, the loop returns.
+ *
+ * Errors at any stage propagate up: the caller's `whenReady`
+ * rejects, which the entry's pre-boot panic branch surfaces if the
+ * subsequent main-thread message arrives.
  */
 async function runBootBinary(
   host: KernelWasmHost,
   bootBinary: string,
+  pidMap: Map<number, ArrayBufferLike>,
+  lifecycle: { hasEverSpawned: boolean },
+  useMultiProcess: boolean,
 ): Promise<void> {
-  const initPid = host.registerProcess(CAPSET_ALL);
-  host.installConsoleFd(initPid, 0);
-  host.installConsoleFd(initPid, 1);
-  host.installConsoleFd(initPid, 2);
-  host.markRunning(initPid);
+  const bootstrapPid = host.registerProcess(CAPSET_ALL);
+  host.installConsoleFd(bootstrapPid, 0);
+  host.installConsoleFd(bootstrapPid, 1);
+  host.installConsoleFd(bootstrapPid, 2);
+  host.markRunning(bootstrapPid);
 
   const manifest = encodeSpawnManifest({
     path: bootBinary,
     caps: CAPSET_ALL,
   });
   const { response } = host.dispatch(
-    initPid,
+    bootstrapPid,
     {
       opcode: OP_EXT.PROC_SPAWN,
       requestId: 1,
@@ -388,7 +469,31 @@ async function runBootBinary(
       `kernel-worker: PROC_SPAWN(${bootBinary}) failed with status ${response.status}`,
     );
   }
-  await host.drainPendingSpawns();
+
+  if (!useMultiProcess) {
+    // Legacy in-process drain. T235 removes this branch.
+    await host.drainPendingSpawns();
+    return;
+  }
+
+  // Multi-process path: the host's default `onSpawnProcess` already
+  // posted `proc:spawn` via the messaging channel. Main allocates a
+  // SAB, spawns a user Worker, and posts `proc:sab` back — which the
+  // entry's onmessage handler routes into `pidMap` and flips
+  // `lifecycle.hasEverSpawned`. The dispatch loop picks the new pid
+  // up on its next pass; halts when every landed pid has been
+  // reaped.
+  //
+  // The halt predicate uses `lifecycle.hasEverSpawned` tracked at
+  // message-receipt time rather than inside the predicate itself to
+  // close a race where a pid arrives and exits between halt probes
+  // (the parker's 50 ms timeout is longer than a typical short-lived
+  // child's lifetime under vitest).
+  await host.startDispatchLoop({
+    pidSource: () => pidMap,
+    halted: (): boolean =>
+      lifecycle.hasEverSpawned && pidMap.size === 0,
+  });
 }
 
 // ---- Worker auto-install --------------------------------------

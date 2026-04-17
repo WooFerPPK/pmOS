@@ -544,3 +544,187 @@ describe("installWorkerEntry with useRealKernel", () => {
     expect(entry.scaffold?.driverCount).toBe(1);
   });
 });
+
+// ---- T233: kernel-Worker dispatch loop choreography -----------------
+//
+// These tests exercise the full spawn-via-proc:spawn path that lands
+// in T233 (M1.4): the entry's `runBootBinary` collapses to a single
+// in-process `PROC_SPAWN init + startDispatchLoop`, the default
+// `onSpawnProcess` posts `proc:spawn` on the messaging channel
+// instead of queuing an in-process spawn, and the entry's onmessage
+// handler routes main-thread `proc:sab` / `proc:exited` messages
+// into the dispatch loop's pidMap.
+//
+// FakeMessaging stands in for the kernel Worker's real
+// `DedicatedWorkerGlobalScope`. Each test pre-seeds a SAB with the
+// user's first syscall (since there's no real user Worker running
+// against the SAB here), sends `proc:sab` to hand the SAB to the
+// kernel, waits for the dispatch loop to service the pre-seeded
+// request, and then sends `proc:exited` to drain the pid from the
+// loop.
+
+import {
+  OFF_HEAP_SCRATCH,
+  OFF_REQ_HEAD,
+  OFF_REQ_RING,
+  OFF_RES_HEAD,
+  OFF_RES_RING,
+  SAB_SIZE,
+  SLOT_SIZE as SAB_SLOT_SIZE,
+} from "../../src/shared/sab-layout";
+import { decodeResponse, encodeRequest } from "../../src/shared/syscall";
+
+/**
+ * Seed one FD_WRITE-to-/dev/console request into the SAB's request
+ * ring and advance REQ_HEAD to 1 so the dispatch loop sees it.
+ * Returns the line of bytes that the kernel will end up writing out
+ * as a `console:write`.
+ */
+function seedFdWriteOnce(sab: ArrayBuffer, text: string, requestId: number): Uint8Array {
+  const line = new TextEncoder().encode(text);
+  const reqBytes = encodeRequest({
+    opcode: OP_WASI.FD_WRITE,
+    requestId,
+    arg0: 1,
+    heapPtr: 0,
+    heapLen: line.length,
+  });
+  new Uint8Array(sab, OFF_REQ_RING, SAB_SLOT_SIZE).set(reqBytes);
+  new Uint8Array(sab, OFF_HEAP_SCRATCH, line.length).set(line);
+  const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+  Atomics.store(header, OFF_REQ_HEAD / 4, 1);
+  return line;
+}
+
+/** Poll `predicate` at microtask + setTimeout cadence until it returns
+ * truthy, then resolve. Used by the spawn-choreography tests to wait
+ * for async-posted messages without blocking on a real `Atomics.wait`.
+ * Throws after `timeoutMs` so a stuck test surfaces a useful error. */
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs: number = 2000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error(`waitFor: predicate did not become truthy within ${timeoutMs}ms`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+describe("installWorkerEntry with useRealKernel + proc:spawn routing", () => {
+  it("PROC_SPAWN init posts proc:spawn to the messaging channel and the dispatch loop services proc:sab-supplied SAB rings", async () => {
+    const msg = makeMessaging();
+    const registry = new Map<string, BufferSource>([
+      ["/bin/hello-std", helloStdWasmBytes],
+    ]);
+    const entry = installWorkerEntry(msg, {
+      kernelWasmBytes,
+      binaryRegistry: registry,
+      enableMultiProcessSpawn: true,
+    });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+        bootBinary: "/bin/hello-std",
+      },
+    });
+
+    // Step 1: wait for proc:spawn to arrive on the messaging channel.
+    // The boot binary was spawned via in-process PROC_SPAWN dispatch;
+    // the default onSpawnProcess posted proc:spawn to the channel.
+    await waitFor(() => msg.posted.some((m) => m.kind === "proc:spawn"));
+    const spawn = msg.posted.find((m) => m.kind === "proc:spawn");
+    expect(spawn).toBeDefined();
+    if (!spawn || spawn.kind !== "proc:spawn") throw new Error("unreachable");
+    expect(spawn.path).toBe("/bin/hello-std");
+    expect(spawn.pid).toBeGreaterThan(0);
+
+    // Step 2: simulate main allocating a SAB and pre-seeding it with
+    // a FD_WRITE request. Real main would post `boot {sab, ...}` to a
+    // user Worker and the user wasm would drive the SAB; we skip the
+    // user side and hand the kernel a SAB that already has work.
+    const sab = new ArrayBuffer(SAB_SIZE);
+    seedFdWriteOnce(sab, "hello from fake user\n", 42);
+
+    msg.send({ kind: "proc:sab", pid: spawn.pid, sab });
+
+    // Step 3: wait for the FD_WRITE to land — the kernel's dispatch
+    // loop services the pid's ring and the kernel posts a console
+    // line out through the existing `console:write` channel.
+    await waitFor(() =>
+      msg.posted.some((m) => {
+        return (
+          m.kind === "console:write" &&
+          new TextDecoder().decode(m.bytes) === "hello from fake user\n"
+        );
+      }),
+    );
+
+    // The response slot is now populated in the SAB.
+    const resBytes = new Uint8Array(
+      new Uint8Array(sab, OFF_RES_RING, SAB_SLOT_SIZE),
+    );
+    const resp = decodeResponse(resBytes);
+    expect(resp.requestId).toBe(42);
+    expect(resp.status).toBe(0);
+    const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+    expect(Atomics.load(header, OFF_RES_HEAD / 4)).toBe(1);
+
+    // Step 4: simulate the user Worker exiting. The kernel's
+    // proc:exited handler drops the pid from the dispatch loop's
+    // pidMap, and since it was the last pid the loop halts.
+    msg.send({ kind: "proc:exited", pid: spawn.pid, code: 0 });
+
+    await entry.whenReady;
+    // No panic posted along the way.
+    expect(msg.posted.some((m) => m.kind === "panic")).toBe(false);
+  });
+
+  it("proc:exited for an unknown pid is ignored; the loop keeps running until a real pid exits", async () => {
+    const msg = makeMessaging();
+    const registry = new Map<string, BufferSource>([
+      ["/bin/hello-std", helloStdWasmBytes],
+    ]);
+    const entry = installWorkerEntry(msg, {
+      kernelWasmBytes,
+      binaryRegistry: registry,
+      enableMultiProcessSpawn: true,
+    });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+        bootBinary: "/bin/hello-std",
+      },
+    });
+
+    await waitFor(() => msg.posted.some((m) => m.kind === "proc:spawn"));
+    const spawn = msg.posted.find((m) => m.kind === "proc:spawn");
+    if (!spawn || spawn.kind !== "proc:spawn") throw new Error("unreachable");
+
+    // Spurious proc:exited for a pid the kernel never spawned: must
+    // NOT terminate the loop (otherwise whenReady resolves before the
+    // real child exits; the system would look alive-but-dead).
+    msg.send({ kind: "proc:exited", pid: 9999, code: -1 });
+
+    // Loop still waiting. Hand it a SAB, let it service a no-op
+    // (empty ring), and then send the real exit.
+    const sab = new ArrayBuffer(SAB_SIZE);
+    msg.send({ kind: "proc:sab", pid: spawn.pid, sab });
+    // Tiny pause so the dispatch loop gets a tick (parkFn).
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    msg.send({ kind: "proc:exited", pid: spawn.pid, code: 0 });
+
+    await entry.whenReady;
+    expect(msg.posted.some((m) => m.kind === "panic")).toBe(false);
+  });
+});
