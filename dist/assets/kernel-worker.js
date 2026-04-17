@@ -703,25 +703,30 @@ var KernelWasmHost = class _KernelWasmHost {
    * Push bytes into a kernel device's input ring. Implements the
    * tight `Kernel` interface the existing driver scaffold uses.
    *
-   * Today only `DEV.CONSOLE` is supported because the kernel only
-   * exports `kernel_inject_console_input`. Keyboard / mouse paths
-   * will add their own exports when the input-driver slice lands.
+   * `devnum` is a [`Devnum`] value (`kernel::fs::devfs::DEV_*`) —
+   * one per device NODE. This matches the convention the driver
+   * scaffold's `pushInputToKernel` passes through and the
+   * preview-slice `MockKernel.injectInput` also uses. The three
+   * wired nodes are `/dev/console`, `/dev/input_kbd`, and
+   * `/dev/input_mouse`; block/net input is deferred (those devices
+   * are driven by the TS drivers from the other direction and don't
+   * have a kernel-side input ring).
    */
   injectInput(devnum, bytes) {
     let injectFn;
     let fnName;
-    if (devnum === DEV.CONSOLE) {
+    if (devnum === Devnum.Console) {
       injectFn = this.exports.kernel_inject_console_input;
       fnName = "kernel_inject_console_input";
-    } else if (devnum === DEV.INPUT_KBD) {
+    } else if (devnum === Devnum.InputKbd) {
       injectFn = this.exports.kernel_inject_input_kbd;
       fnName = "kernel_inject_input_kbd";
-    } else if (devnum === DEV.INPUT_MOUSE) {
+    } else if (devnum === Devnum.InputMouse) {
       injectFn = this.exports.kernel_inject_input_mouse;
       fnName = "kernel_inject_input_mouse";
     } else {
       throw new Error(
-        `KernelWasmHost.injectInput: devnum ${devnum} not supported; wired devices are DEV.CONSOLE (${DEV.CONSOLE}), DEV.INPUT_KBD (${DEV.INPUT_KBD}), DEV.INPUT_MOUSE (${DEV.INPUT_MOUSE})`
+        `KernelWasmHost.injectInput: devnum ${devnum} not supported; wired device nodes are Devnum.Console (${Devnum.Console}), Devnum.InputKbd (${Devnum.InputKbd}), Devnum.InputMouse (${Devnum.InputMouse})`
       );
     }
     const heapCap = this.exports.kernel_heap_len();
@@ -1636,13 +1641,17 @@ function installWorkerEntry(messaging, options = {}) {
         return;
       }
       if (msg.config.useRealKernel === true) {
-        void bootRealKernel(messaging, msg.config, options, pidMap, lifecycle).then(
-          ({ scaffold: s, host }) => {
+        void bootRealKernel(
+          messaging,
+          msg.config,
+          options,
+          pidMap,
+          lifecycle,
+          (s, h) => {
             scaffold = s;
-            realKernel = host;
-            resolveReady();
+            realKernel = h;
           }
-        );
+        ).then(() => resolveReady());
         return;
       }
       scaffold = bootMockKernel(messaging, msg.config);
@@ -1685,7 +1694,7 @@ function bootMockKernel(messaging, config) {
   mock.bindScaffold(scaffold);
   return scaffold;
 }
-async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
+async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onScaffoldReady) {
   const fetcher = options.fetcher ?? defaultFetcher;
   let bytes;
   try {
@@ -1730,6 +1739,7 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
       messaging.postMessage(out);
     }
   });
+  onScaffoldReady(scaffold, host);
   messaging.postMessage({
     kind: "kernel:wake-slot",
     sab: host.wakeSlot.buffer
@@ -1737,7 +1747,6 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
   if (config.bootBinary !== void 0) {
     await runBootBinary(host, config.bootBinary, pidMap, lifecycle);
   }
-  return { scaffold, host };
 }
 async function defaultFetcher(url) {
   const res = await fetch(url);

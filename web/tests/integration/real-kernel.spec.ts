@@ -19,6 +19,17 @@
 // hits, so the test deliberately uses that: if real-kernel is
 // no longer the default, the test fails even when the
 // explicit `#real-kernel` hash continues to work.
+//
+// The second test exercises the input round-trip: under
+// `/index.html#input-echo` the bootstrap swaps its boot binary
+// to `/bin/hello_input_echo`, which polls `/dev/input_kbd` in a
+// tight EAGAIN loop. The test drives `page.keyboard.press(...)`
+// to synthesise keydown events, the bootstrap's DOM keydown
+// handler posts `input:kbd` messages to the kernel Worker, the
+// kernel worker's InputDriver calls `KernelWasmHost.injectInput`
+// to deposit the bytes into the kbd ring, and the user Worker's
+// next `fd_read` iteration picks them up and echoes them to
+// `/dev/console`.
 
 import { expect, test } from "@playwright/test";
 
@@ -109,4 +120,62 @@ test("real kernel is the default boot path and runs init -> hello-std", async ({
     .locator("body")
     .getAttribute("data-pmos-wake-slot-ready");
   expect(wakeSlotReady).toBe("1");
+});
+
+test("input round-trip: keydown in real-kernel mode echoes to console", async ({ page }) => {
+  const consoleLines: string[] = [];
+  page.on("console", (msg) => {
+    consoleLines.push(msg.text());
+  });
+  page.on("pageerror", (err) => {
+    consoleLines.push(`[pageerror] ${err.message}`);
+  });
+
+  // `#input-echo` opts the bootstrap into `bootBinary = /bin/hello_input_echo`
+  // (the no_std cdylib under `crates/hello-input-echo/`) instead of `/bin/init`.
+  // The binary polls `/dev/input_kbd` in an EAGAIN loop, so the first
+  // iteration that finds bytes echoes them straight to stdout and exits.
+  await page.goto("/index.html#input-echo");
+
+  // Wait for the wake slot to arrive AND for the user Worker to spawn. The
+  // `data-pmos-peak-live-workers` attribute flips to "1" (or higher) once the
+  // router instantiates hello-input-echo's Worker in response to the kernel's
+  // `proc:spawn`. That's the signal the DOM keydown handler has somewhere to
+  // send bytes.
+  await expect
+    .poll(
+      async () => {
+        const attr = await page
+          .locator("body")
+          .getAttribute("data-pmos-peak-live-workers");
+        return attr ? Number(attr) : 0;
+      },
+      { timeout: 15_000 },
+    )
+    .toBeGreaterThanOrEqual(1);
+
+  // Press "x" then Enter. The bootstrap's keydown listener converts each key
+  // to a byte (via the existing `keyToBytes` helper: printable ASCII → UTF-8,
+  // Enter → 0x0a) and posts an `input:kbd` message on each. The kernel's
+  // console driver line-buffers, so the newline is what forces a flush of the
+  // full "x\n" payload to `onConsoleWrite`.
+  await page.keyboard.press("x");
+  await page.keyboard.press("Enter");
+
+  // hello-input-echo's fd_read picks the queued bytes up on its next loop
+  // iteration, writes them all in one fd_write, and exits. bootstrap's
+  // ConsoleHost.onOutput appends the decoded text to `#pmos-real-console` AND
+  // logs a `[real-kernel] x` line to the page console.
+  await expect
+    .poll(
+      () => consoleLines.find((l) => l === "[real-kernel] x") ?? null,
+      { timeout: 10_000 },
+    )
+    .not.toBeNull();
+
+  // DOM surface: the pre element shows the echoed character too.
+  const domText = await page.locator("#pmos-real-console").innerText();
+  expect(domText).toContain("x");
+
+  expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
 });

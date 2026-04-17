@@ -371,7 +371,8 @@ function paintBoot(c, rows, animationFrame) {
 function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
   if (!window.location.hash.includes("mock-kernel")) {
-    runRealKernelMode();
+    const bootBinary = window.location.hash.includes("input-echo") ? "/bin/hello_input_echo" : "/bin/init";
+    runRealKernelMode(bootBinary);
     return;
   }
   const rows = [
@@ -793,8 +794,10 @@ function paintBlitToCanvasFullscreen(c, frame_) {
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tmp, dx, dy, dw, dh);
 }
-function runRealKernelMode() {
-  console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
+function runRealKernelMode(bootBinary) {
+  console.log(
+    `[pmos-bootstrap] real-kernel mode enabled via URL (bootBinary=${bootBinary})`
+  );
   const consoleEl = mountRealKernelConsole();
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
   let kernelWakeSlot = null;
@@ -828,10 +831,16 @@ function runRealKernelMode() {
     worker,
     bootConfig: {
       enableConsole: true,
-      enableInput: false,
+      // Register the InputDriver so `input:kbd` / `input:mouse`
+      // messages posted by the keydown listener below route through
+      // the scaffold to `KernelWasmHost.injectInput`. The driver is
+      // shared with the preview-slice MockKernel path; real-kernel
+      // mode wires it to the real kernel's `kernel_inject_input_kbd`
+      // export.
+      enableInput: true,
       enableFramebuffer: false,
       useRealKernel: true,
-      bootBinary: "/bin/init"
+      bootBinary
     }
   });
   consoleHost.onOutput((bytes) => {
@@ -848,6 +857,18 @@ function runRealKernelMode() {
 [panic] ${event.message}
 `;
     }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      return;
+    }
+    const bytes = keyToBytes(event.key);
+    if (bytes === null) {
+      return;
+    }
+    event.preventDefault();
+    const msg = { kind: "input:kbd", bytes };
+    worker.postMessage(msg);
   });
 }
 function mountRealKernelConsole() {

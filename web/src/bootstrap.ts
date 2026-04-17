@@ -255,9 +255,15 @@ function main(): void {
   // check rows) is kept accessible via `#mock-kernel` so existing
   // bookmarks + the preview-era demo story still work; `#real-kernel`
   // continues to force the new path for anyone who was using that
-  // hash explicitly.
+  // hash explicitly. `#input-echo` points the boot path at
+  // `/bin/hello_input_echo` (the no_std cdylib that polls
+  // /dev/input_kbd and echoes to stdout) instead of the default
+  // `/bin/init` — it's the browser-side proof of the input round-trip.
   if (!window.location.hash.includes("mock-kernel")) {
-    runRealKernelMode();
+    const bootBinary = window.location.hash.includes("input-echo")
+      ? "/bin/hello_input_echo"
+      : "/bin/init";
+    runRealKernelMode(bootBinary);
     return;
   }
 
@@ -865,7 +871,7 @@ function paintBlitToCanvasFullscreen(c: Canvas2D, frame_: FbFrame): void {
 
 /**
  * Real-kernel boot path: spawns the kernel Worker with
- * `useRealKernel: true` + `bootBinary: "/bin/init"`, then
+ * `useRealKernel: true` + the caller-chosen `bootBinary`, then
  * forwards every byte the kernel flushes from `/dev/console` to
  * the page console with a `[real-kernel]` prefix. Playwright
  * scrapes the page console to assert on the boot binary's
@@ -873,14 +879,24 @@ function paintBlitToCanvasFullscreen(c: Canvas2D, frame_: FbFrame): void {
  * goes away and the bytes flow into the visible terminal
  * surface instead.
  *
- * `init` is a real Rust `std` binary (`crates/init/`) that
+ * `/bin/init` is a real Rust `std` binary (`crates/init/`) that
  * announces itself, spawns `/bin/hello-std` via
  * `pmos_ext.proc_spawn`, and exits — the drain loop picks up
  * hello-std next and runs it to completion. Both binaries'
  * output reach the page console in order.
+ *
+ * `/bin/hello_input_echo` is an alternative boot binary wired
+ * via `#input-echo`: it polls `/dev/input_kbd` in an EAGAIN
+ * loop, so pressing a key on the page posts an `input:kbd`
+ * message to the kernel Worker (via the keydown listener this
+ * function installs), the kernel writes the bytes into the kbd
+ * ring, and hello_input_echo's next `fd_read` iteration echoes
+ * them to `/dev/console` and exits.
  */
-function runRealKernelMode(): void {
-  console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
+function runRealKernelMode(bootBinary: string): void {
+  console.log(
+    `[pmos-bootstrap] real-kernel mode enabled via URL (bootBinary=${bootBinary})`,
+  );
   const consoleEl = mountRealKernelConsole();
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
 
@@ -939,10 +955,16 @@ function runRealKernelMode(): void {
     worker,
     bootConfig: {
       enableConsole: true,
-      enableInput: false,
+      // Register the InputDriver so `input:kbd` / `input:mouse`
+      // messages posted by the keydown listener below route through
+      // the scaffold to `KernelWasmHost.injectInput`. The driver is
+      // shared with the preview-slice MockKernel path; real-kernel
+      // mode wires it to the real kernel's `kernel_inject_input_kbd`
+      // export.
+      enableInput: true,
       enableFramebuffer: false,
       useRealKernel: true,
-      bootBinary: "/bin/init",
+      bootBinary,
     },
   });
   consoleHost.onOutput((bytes: Uint8Array) => {
@@ -957,6 +979,33 @@ function runRealKernelMode(): void {
       console.error(`[pmos-bootstrap] real kernel panic: ${event.message}`);
       consoleEl.textContent += `\n[panic] ${event.message}\n`;
     }
+  });
+
+  // Keyboard input: a `keydown` on `document` so the handler fires
+  // regardless of which element has focus (real-kernel mode hides the
+  // canvas and the DOM console pre-element is non-interactive by
+  // default). Each keydown is converted to the raw bytes the kernel's
+  // input ring expects and posted as an `input:kbd` message on the
+  // kernel Worker channel. The kernel worker's scaffold routes these
+  // through `InputDriver.onHostMessage` into
+  // `KernelWasmHost.injectInput(Devnum.InputKbd, bytes)`, which lands
+  // the bytes in `/dev/input_kbd`. A user process polling `fd_read` on
+  // the node (e.g. `/bin/hello_input_echo` under `#input-echo`) picks
+  // them up on its next iteration.
+  document.addEventListener("keydown", (event: KeyboardEvent) => {
+    // Ignore modifier-heavy chords (Ctrl+R, Cmd+S, etc.) so the
+    // browser shortcut path still works. F-keys and similar non-
+    // printable keys fall through `keyToBytes` as `null` too.
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      return;
+    }
+    const bytes = keyToBytes(event.key);
+    if (bytes === null) {
+      return;
+    }
+    event.preventDefault();
+    const msg: MainToKernel = { kind: "input:kbd", bytes };
+    worker.postMessage(msg);
   });
 }
 

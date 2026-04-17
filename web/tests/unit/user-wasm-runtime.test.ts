@@ -43,6 +43,7 @@ import {
   type SpawnOutcome,
 } from "../../src/kernel-wasm-host";
 import { FramebufferDriver } from "../../src/drivers/fb";
+import { Devnum } from "../../src/shared/platform-constants";
 import {
   KernelWasmHostBackend,
   UserWasmRuntime,
@@ -912,7 +913,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // so without it the echoed bytes would sit in the kernel's line
     // buffer and never reach onConsoleWrite.
     const kbdBytes = new Uint8Array([0x48, 0x69, 0x21, 0x0a]); // "Hi!\n"
-    kernel.injectInput(DEV.INPUT_KBD, kbdBytes);
+    kernel.injectInput(Devnum.InputKbd, kbdBytes);
 
     const manifest = encodeSpawnManifest({
       path: "/bin/hello-input-echo",

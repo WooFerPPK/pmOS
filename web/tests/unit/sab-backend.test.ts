@@ -29,6 +29,7 @@ import {
   type DispatchResult,
 } from "../../src/kernel-wasm-host";
 import { SabBackend } from "../../src/sab-backend";
+import { Devnum } from "../../src/shared/platform-constants";
 import {
   OFF_HEAP_SCRATCH,
   OFF_USER_WAIT_SLOT,
@@ -175,7 +176,7 @@ describe("SabBackend: FD_READ with pre-seeded console input", () => {
     };
 
     const ref = await freshHost();
-    ref.host.injectInput(DEV.CONSOLE, seed);
+    ref.host.injectInput(Devnum.Console, seed);
     const refPid = ref.host.registerProcess(CAPSET_ALL);
     ref.host.installConsoleFd(refPid, 0);
     ref.host.markRunning(refPid);
@@ -184,7 +185,7 @@ describe("SabBackend: FD_READ with pre-seeded console input", () => {
     );
 
     const sub = await freshHost();
-    sub.host.injectInput(DEV.CONSOLE, seed);
+    sub.host.injectInput(Devnum.Console, seed);
     const subPid = sub.host.registerProcess(CAPSET_ALL);
     sub.host.installConsoleFd(subPid, 0);
     sub.host.markRunning(subPid);

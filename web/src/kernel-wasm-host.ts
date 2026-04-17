@@ -52,6 +52,7 @@
 
 import type { Driver, DriverHost } from "./drivers/types";
 import type { Kernel } from "./kernel-worker";
+import { Devnum } from "./shared/platform-constants";
 import {
   HEAP_SCRATCH_BYTES,
   OFF_HEAP_SCRATCH,
@@ -741,31 +742,30 @@ export class KernelWasmHost implements Kernel {
    * Push bytes into a kernel device's input ring. Implements the
    * tight `Kernel` interface the existing driver scaffold uses.
    *
-   * Today only `DEV.CONSOLE` is supported because the kernel only
-   * exports `kernel_inject_console_input`. Keyboard / mouse paths
-   * will add their own exports when the input-driver slice lands.
+   * `devnum` is a [`Devnum`] value (`kernel::fs::devfs::DEV_*`) —
+   * one per device NODE. This matches the convention the driver
+   * scaffold's `pushInputToKernel` passes through and the
+   * preview-slice `MockKernel.injectInput` also uses. The three
+   * wired nodes are `/dev/console`, `/dev/input_kbd`, and
+   * `/dev/input_mouse`; block/net input is deferred (those devices
+   * are driven by the TS drivers from the other direction and don't
+   * have a kernel-side input ring).
    */
   injectInput(devnum: number, bytes: Uint8Array): void {
-    // Route to the kernel export that feeds the matching device's
-    // input ring. The three supported devnums cover the three input
-    // rings the kernel currently wires: `/dev/console`,
-    // `/dev/input/kbd`, `/dev/input/mouse`. Block/net input is
-    // deferred (those devices are driven by the TS drivers from the
-    // other direction and don't have a kernel-side input ring).
     let injectFn: ((len: number) => number) | undefined;
     let fnName: string;
-    if (devnum === DEV.CONSOLE) {
+    if (devnum === Devnum.Console) {
       injectFn = this.exports.kernel_inject_console_input;
       fnName = "kernel_inject_console_input";
-    } else if (devnum === DEV.INPUT_KBD) {
+    } else if (devnum === Devnum.InputKbd) {
       injectFn = this.exports.kernel_inject_input_kbd;
       fnName = "kernel_inject_input_kbd";
-    } else if (devnum === DEV.INPUT_MOUSE) {
+    } else if (devnum === Devnum.InputMouse) {
       injectFn = this.exports.kernel_inject_input_mouse;
       fnName = "kernel_inject_input_mouse";
     } else {
       throw new Error(
-        `KernelWasmHost.injectInput: devnum ${devnum} not supported; wired devices are DEV.CONSOLE (${DEV.CONSOLE}), DEV.INPUT_KBD (${DEV.INPUT_KBD}), DEV.INPUT_MOUSE (${DEV.INPUT_MOUSE})`,
+        `KernelWasmHost.injectInput: devnum ${devnum} not supported; wired device nodes are Devnum.Console (${Devnum.Console}), Devnum.InputKbd (${Devnum.InputKbd}), Devnum.InputMouse (${Devnum.InputMouse})`,
       );
     }
 

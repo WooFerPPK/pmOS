@@ -1,23 +1,24 @@
 //! Reads one keyboard event from `/dev/input_kbd` and echoes the
 //! bytes to `/dev/console`. Proves the input path end-to-end:
 //!
-//!   TS `KernelWasmHost.injectInput(DEV.INPUT_KBD, bytes)` →
+//!   TS `KernelWasmHost.injectInput(Devnum.InputKbd, bytes)` →
 //!   `kernel_inject_input_kbd` → `DeviceDispatcher::inject_kbd_event` →
 //!   `/dev/input_kbd` input ring → user wasm `fd_read` →
 //!   `fd_write(1, ...)` → `onConsoleWrite`.
 //!
-//! Because the in-process sequential test harness doesn't block reads,
-//! the TS composition test injects the bytes BEFORE spawning this
-//! binary. The binary's `fd_read` finds the ring non-empty and returns
-//! the pending bytes immediately.
+//! The binary polls `fd_read` on EAGAIN so it survives the race where
+//! input arrives after the process starts — the browser keydown path
+//! injects bytes asynchronously, and the user Worker may run `fd_read`
+//! before the first keypress reaches the kernel. Existing in-process
+//! composition tests inject bytes BEFORE spawning, so their first
+//! `fd_read` finds the ring non-empty and returns immediately; the
+//! polling loop is a no-op in that path.
 //!
 //! Exit codes:
 //!
 //!   * 0  = success — read N bytes, echoed all of them
 //!   * 10 = path_open("/dev/input_kbd") failed (missing cap?)
-//!   * 11 = fd_read returned non-zero errno
-//!   * 12 = fd_read returned zero bytes (EOF on an input ring means the
-//!          test forgot to inject)
+//!   * 11 = fd_read returned a non-EAGAIN, non-zero errno
 //!   * 13 = fd_write to stdout failed or short-wrote
 //!   * 101 = panic
 
@@ -94,13 +95,22 @@ pub extern "C" fn _start() {
             buf: buf.as_mut_ptr(),
             buf_len: buf.len() as u32,
         };
+        // EAGAIN is errno 6 per `abi::errno` — keeping the literal here
+        // avoids pulling in an extra crate for a single constant in a
+        // no_std cdylib. The kernel returns EAGAIN on an empty input
+        // ring; the loop retries until bytes land.
+        const EAGAIN: i32 = 6;
         let mut nread: u32 = 0;
-        let rc = fd_read(kbd_fd as i32, &read_iov, 1, &mut nread);
-        if rc != 0 {
+        loop {
+            let rc = fd_read(kbd_fd as i32, &read_iov, 1, &mut nread);
+            if rc == 0 && nread > 0 {
+                break;
+            }
+            if rc == 0 || rc == EAGAIN {
+                nread = 0;
+                continue;
+            }
             proc_exit(11);
-        }
-        if nread == 0 {
-            proc_exit(12);
         }
 
         // Echo the exact bytes we read back to stdout.

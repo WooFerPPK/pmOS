@@ -180,13 +180,22 @@ export function installWorkerEntry(
         return;
       }
       if (msg.config.useRealKernel === true) {
-        void bootRealKernel(messaging, msg.config, options, pidMap, lifecycle).then(
-          ({ scaffold: s, host }) => {
+        void bootRealKernel(
+          messaging,
+          msg.config,
+          options,
+          pidMap,
+          lifecycle,
+          (s, h) => {
+            // Publish the scaffold + host eagerly — before `runBootBinary`
+            // enters its long-running dispatch loop — so `input:kbd` and
+            // other driver messages posted during the boot binary's
+            // execution find the scaffold and route to the driver layer
+            // instead of hitting the pre-boot panic branch.
             scaffold = s;
-            realKernel = host;
-            resolveReady();
+            realKernel = h;
           },
-        );
+        ).then(() => resolveReady());
         return;
       }
       scaffold = bootMockKernel(messaging, msg.config);
@@ -279,7 +288,8 @@ async function bootRealKernel(
   options: WorkerEntryOptions,
   pidMap: Map<number, ArrayBufferLike>,
   lifecycle: { hasEverSpawned: boolean },
-): Promise<{ scaffold: KernelWorker; host: KernelWasmHost }> {
+  onScaffoldReady: (scaffold: KernelWorker, host: KernelWasmHost) => void,
+): Promise<void> {
   const fetcher = options.fetcher ?? defaultFetcher;
   let bytes: BufferSource;
   try {
@@ -324,6 +334,13 @@ async function bootRealKernel(
       messaging.postMessage(out);
     },
   });
+  // Publish the scaffold + host to the caller NOW, before
+  // `runBootBinary` enters the long-running dispatch loop. The caller's
+  // `onmessage` handler uses these to route driver messages (e.g.
+  // `input:kbd` from the keydown listener) through to the scaffold's
+  // `handleMainMessage` instead of letting them fall into the pre-boot
+  // panic branch.
+  onScaffoldReady(scaffold, host);
   // Hand main the kernel's wake slot so every user Worker main spawns
   // from now on can bump it via Atomics.notify to wake the kernel's
   // dispatch loop. Posted exactly once per kernel boot, immediately
@@ -337,7 +354,6 @@ async function bootRealKernel(
   if (config.bootBinary !== undefined) {
     await runBootBinary(host, config.bootBinary, pidMap, lifecycle);
   }
-  return { scaffold, host };
 }
 
 /**

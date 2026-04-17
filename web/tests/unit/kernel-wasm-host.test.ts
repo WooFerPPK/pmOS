@@ -22,6 +22,7 @@ import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { KernelWasmHost, type SpawnOutcome } from "../../src/kernel-wasm-host";
+import { Devnum } from "../../src/shared/platform-constants";
 import {
   OFF_HEAP_SCRATCH,
   OFF_REQ_HEAD,
@@ -267,7 +268,7 @@ describe("dispatch: FD_WRITE → /dev/console → onConsoleWrite", () => {
 describe("dispatch: injectInput → FD_READ round trip", () => {
   it("delivers injected console input bytes through FD_READ", async () => {
     const { host } = await freshHost();
-    host.injectInput(DEV.CONSOLE, new TextEncoder().encode("abc"));
+    host.injectInput(Devnum.Console, new TextEncoder().encode("abc"));
 
     const pid = host.registerProcess(CAPSET_ALL);
     host.installConsoleFd(pid, 0);
@@ -291,28 +292,28 @@ describe("dispatch: injectInput → FD_READ round trip", () => {
     ]);
   });
 
-  it("injectInput accepts DEV.CONSOLE, DEV.INPUT_KBD, DEV.INPUT_MOUSE", async () => {
+  it("injectInput accepts Devnum.Console, Devnum.InputKbd, Devnum.InputMouse", async () => {
     const { host } = await freshHost();
     // All three wired input paths accept injection without throwing.
     // (The behavioural effect is covered separately by the
     // user-wasm-runtime tests; here we just prove the routing map.)
-    expect(() => host.injectInput(DEV.CONSOLE, new Uint8Array([1, 2, 3]))).not.toThrow();
-    expect(() => host.injectInput(DEV.INPUT_KBD, new Uint8Array([1, 2, 3]))).not.toThrow();
-    expect(() => host.injectInput(DEV.INPUT_MOUSE, new Uint8Array([1, 2, 3]))).not.toThrow();
+    expect(() => host.injectInput(Devnum.Console, new Uint8Array([1, 2, 3]))).not.toThrow();
+    expect(() => host.injectInput(Devnum.InputKbd, new Uint8Array([1, 2, 3]))).not.toThrow();
+    expect(() => host.injectInput(Devnum.InputMouse, new Uint8Array([1, 2, 3]))).not.toThrow();
   });
 
   it("injectInput rejects unrouted devnums", async () => {
     const { host } = await freshHost();
-    // Block (200) is not an input-capable device in v1; the
-    // rejection message names all three wired devices so a reader
-    // knows what IS supported.
-    expect(() => host.injectInput(DEV.BLOCK, new Uint8Array([1, 2, 3]))).toThrow(/not supported/);
+    // Fb0 (Devnum.Fb0 = 10) is write-only from the user side — no
+    // input-ring path. The rejection message names the three wired
+    // device nodes so a reader knows what IS supported.
+    expect(() => host.injectInput(Devnum.Fb0, new Uint8Array([1, 2, 3]))).toThrow(/not supported/);
   });
 
   it("injectInput rejects payloads larger than the heap scratch capacity", async () => {
     const { host } = await freshHost();
     const tooMuch = new Uint8Array(4097); // heap scratch is 4096
-    expect(() => host.injectInput(DEV.CONSOLE, tooMuch)).toThrow(/capacity/);
+    expect(() => host.injectInput(Devnum.Console, tooMuch)).toThrow(/capacity/);
   });
 });
 
