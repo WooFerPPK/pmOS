@@ -86,6 +86,7 @@ var OP_EXT = {
 };
 var ERRNO = {
   EBADF: 8,
+  ECONNREFUSED: 14,
   EINVAL: 28,
   ENOENT: 44,
   ENOSYS: 52,
@@ -516,11 +517,28 @@ var UserWasmRuntime = class {
       //
       // Signature: (rval: i32) -> never.
       //
-      // Throws a `UserProcessExited` sentinel that the runtime's
-      // `run()` method catches. The wasm instance's _start frame
-      // is torn down as the throw unwinds through it — exactly
-      // the semantics WASI specifies.
+      // First dispatches the PMos `PROC_EXIT` opcode so the kernel
+      // can record the exit status on the process table, release
+      // the fd-table-owned resources (IPC bindings, pipe refs),
+      // and remove the pid from the scheduler. Without this
+      // round-trip the kernel would keep treating the exited pid
+      // as Running — its `/run/*` bindings would live forever and
+      // a follow-up `ipc_connect` on the same path would succeed
+      // against an orphan listener instead of cleanly returning
+      // `ConnectionRefused`. The kernel's response is ignored; a
+      // process that is exiting no longer has a way to observe it,
+      // and `PROC_EXIT` is contractually infallible from userland.
+      //
+      // Then throws the `UserProcessExited` sentinel that the
+      // runtime's `run()` method catches. The wasm instance's
+      // `_start` frame is torn down as the throw unwinds through
+      // it — exactly the semantics WASI specifies.
       proc_exit: (rval) => {
+        this.backend.dispatch({
+          opcode: OP_WASI.PROC_EXIT,
+          requestId: 0,
+          arg0: rval >>> 0
+        });
         throw new UserProcessExited(rval);
       },
       // WASI `args_sizes_get` / `environ_sizes_get`.

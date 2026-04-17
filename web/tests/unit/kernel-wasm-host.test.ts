@@ -835,4 +835,71 @@ describe("serviceSab: PROC_EXIT", () => {
     expect(Atomics.load(header, OFF_REQ_TAIL / 4)).toBe(1);
     expect(Atomics.load(header, OFF_RES_HEAD / 4)).toBe(1);
   });
+
+  it("releases the exiting process's /run/display binding so a later DISPLAY_CONNECT returns -ECONNREFUSED", async () => {
+    // Kernel-correctness contract for the proc_exit cleanup slice:
+    // a display-server-like process that holds a `/run/display`
+    // binding has that binding released the instant its PROC_EXIT
+    // is serviced, not lazily at parent-side `proc_wait` (which is
+    // still deferred). A follow-up DISPLAY_CONNECT from a sibling
+    // pid therefore lands on an empty path and returns
+    // `-ECONNREFUSED`, instead of succeeding against the orphan
+    // listener it used to inherit when socket cleanup was deferred.
+    const { host } = await freshHost();
+
+    const ds = host.registerProcess(CAPSET_ALL);
+    host.markRunning(ds);
+    const bindResult = host.dispatch(ds, {
+      opcode: OP_EXT.DISPLAY_BIND,
+      requestId: 300,
+    });
+    expect(bindResult.response.status).toBe(0);
+
+    const exitResult = host.dispatch(ds, {
+      opcode: OP_WASI.PROC_EXIT,
+      requestId: 301,
+      arg0: 0,
+    });
+    expect(exitResult.response.status).toBe(0);
+
+    const client = host.registerProcess(CAPSET_ALL);
+    host.markRunning(client);
+    const connectResult = host.dispatch(client, {
+      opcode: OP_EXT.DISPLAY_CONNECT,
+      requestId: 302,
+    });
+    expect(connectResult.response.status).toBe(-ERRNO.ECONNREFUSED);
+  });
+
+  it("frees the display-server path so a second pid can rebind it", async () => {
+    // Companion to the ECONNREFUSED check above: when the binding is
+    // truly released, another DisplayServer-capable pid can bind the
+    // same path fresh. Before the cleanup slice this would fail with
+    // -EADDRINUSE because the orphan binding held the path until a
+    // (deferred) reap.
+    const { host } = await freshHost();
+
+    const first = host.registerProcess(CAPSET_ALL);
+    host.markRunning(first);
+    const firstBind = host.dispatch(first, {
+      opcode: OP_EXT.DISPLAY_BIND,
+      requestId: 400,
+    });
+    expect(firstBind.response.status).toBe(0);
+
+    const firstExit = host.dispatch(first, {
+      opcode: OP_WASI.PROC_EXIT,
+      requestId: 401,
+      arg0: 0,
+    });
+    expect(firstExit.response.status).toBe(0);
+
+    const second = host.registerProcess(CAPSET_ALL);
+    host.markRunning(second);
+    const secondBind = host.dispatch(second, {
+      opcode: OP_EXT.DISPLAY_BIND,
+      requestId: 402,
+    });
+    expect(secondBind.response.status).toBe(0);
+  });
 });

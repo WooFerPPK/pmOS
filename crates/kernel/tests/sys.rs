@@ -1340,3 +1340,212 @@ fn multiple_clients_accept_into_distinct_server_side_fds() {
     let n = k.fd_read(ds, b_server, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"from b");
 }
+
+// ---- proc_exit cleanup ---------------------------------------------
+//
+// `proc_exit` is the moment a process's kernel-side resources
+// become stale to the rest of the system. `reap` (via
+// `proc_wait`) is where the per-pid fd table is formally drained,
+// but with `proc_wait` still deferred (T075) there is no "parent
+// reaps the child" event during normal M1 userland execution:
+// every userland pid that exits sits as a zombie forever. If
+// resource release only happened at reap, an exited display
+// server would leave its `/run/display` binding behind for the
+// lifetime of the kernel — a new `display_connect` would
+// succeed-but-hang against an orphan listener that no one will
+// ever accept from, instead of returning a clean
+// `ConnectionRefused`.
+//
+// The fix is to drain the exiting process's fd table at
+// `proc_exit`, calling each object's release hook exactly as
+// `reap` later would. Resource release at `proc_exit` is the
+// single source of truth; `reap` still runs but walks an empty
+// fd table (no-op on the object side) and removes the now-empty
+// table from the per-pid map. The tests below pin both halves:
+// cleanup is observable the instant `proc_exit` returns, and the
+// subsequent `reap` still fully tears down the process.
+
+#[test]
+fn proc_exit_releases_display_server_socket_binding_immediately() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _listener_fd = k.display_bind(ds).unwrap();
+    assert!(k.ipc.lookup_binding(DISPLAY_SOCKET_PATH).is_some());
+
+    k.proc_exit(ds, ExitStatus::Exited(0)).unwrap();
+
+    // The binding is gone before any parent `proc_wait` has
+    // fired. A fresh `display_connect` from an unrelated process
+    // must return ConnectionRefused, not succeed against an
+    // orphan listener.
+    assert!(k.ipc.lookup_binding(DISPLAY_SOCKET_PATH).is_none());
+    let app = register_display_client(&mut k, "client");
+    let err = k.display_connect(app).unwrap_err();
+    assert_eq!(err, KernelError::ConnectionRefused);
+}
+
+#[test]
+fn proc_exit_allows_another_process_to_rebind_the_freed_path() {
+    let mut k = make_kernel();
+    let ds_first = register_display_server(&mut k);
+    k.procs
+        .transition(ds_first, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.display_bind(ds_first).unwrap();
+
+    k.proc_exit(ds_first, ExitStatus::Exited(0)).unwrap();
+
+    // A fresh display server can now bind the same path. Before
+    // the proc_exit cleanup, this would fail with AddressInUse
+    // because the old binding survived.
+    let ds_second = register_display_server(&mut k);
+    k.procs
+        .transition(ds_second, kernel::proc::ProcState::Running)
+        .unwrap();
+    let fd = k.display_bind(ds_second).unwrap();
+    assert!(matches!(
+        k.fds(ds_second).unwrap().get(fd).unwrap().object,
+        FdObject::Socket(_),
+    ));
+}
+
+#[test]
+fn proc_exit_releases_generic_ipc_bindings_too() {
+    // `display_bind` is a capability-gated alias for
+    // `ipc_bind(path = "/run/display")`; the same cleanup must
+    // apply to any bound path, not just the display-server one.
+    let mut k = make_kernel();
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "svc",
+            ppid: 0,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(pid).unwrap();
+    k.procs
+        .transition(pid, kernel::proc::ProcState::Running)
+        .unwrap();
+    let sock_fd = k
+        .ipc_socket(pid, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    k.ipc_bind(pid, sock_fd, "/run/greeter").unwrap();
+    assert!(k.ipc.lookup_binding("/run/greeter").is_some());
+
+    k.proc_exit(pid, ExitStatus::Exited(0)).unwrap();
+    assert!(k.ipc.lookup_binding("/run/greeter").is_none());
+}
+
+#[test]
+fn proc_exit_drops_pipe_writer_refcount_before_reap() {
+    // With `proc_wait` still deferred, `reap` does not run as
+    // part of normal userland execution. Pipe refcounts must
+    // therefore decrement on `proc_exit`, otherwise every
+    // exited child leaks a reader / writer reference to a shared
+    // pipe and the last holder can never observe EOF.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+
+    let pid = k.ipc.create_pipe();
+    k.install_fd(init, 10, FdObject::PipeRead(pid.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(init, 11, FdObject::PipeWrite(pid.0), FdFlags::EMPTY)
+        .unwrap();
+
+    // A child inherits the writer half — refcount bumps to 2.
+    let child = k
+        .proc_spawn(
+            init,
+            SpawnArgs {
+                name: "producer",
+                caps: initial::ORDINARY_APP,
+                cwd: "/",
+                argv: alloc::vec::Vec::new(),
+                envp: alloc::collections::BTreeMap::new(),
+                stdin: FdObject::CharDevice(DEV_CONSOLE),
+                stdout: FdObject::PipeWrite(pid.0),
+                stderr: FdObject::CharDevice(DEV_CONSOLE),
+            },
+        )
+        .unwrap();
+    assert_eq!(k.ipc.pipe_mut(PipeId(pid.0)).unwrap().writer_count(), 2);
+
+    // Child exits. The refcount must drop to 1 immediately, not
+    // wait for a subsequent `reap`.
+    k.procs
+        .transition(child, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child, ExitStatus::Exited(0)).unwrap();
+    assert_eq!(k.ipc.pipe_mut(PipeId(pid.0)).unwrap().writer_count(), 1);
+
+    // Subsequent `reap` is still valid and idempotent on the
+    // already-drained fd table — it finalises the pid-table and
+    // cap-table cleanup without double-dropping the pipe ref.
+    let status = k.reap(child).unwrap();
+    assert_eq!(status, ExitStatus::Exited(0));
+    assert_eq!(k.ipc.pipe_mut(PipeId(pid.0)).unwrap().writer_count(), 1);
+}
+
+#[test]
+fn proc_exit_clears_the_exited_processs_fd_table_entries() {
+    // Eager fd-table drain is observable from the outside: the
+    // zombie's fd table is empty after `proc_exit`, not just
+    // after `reap`. This lets a diagnostic caller (procfs / a
+    // future `ps`-equivalent) tell "this pid is mid-teardown"
+    // from "this pid still holds open fds".
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _listener_fd = k.display_bind(ds).unwrap();
+    assert_eq!(k.fds(ds).unwrap().open_count(), 1);
+
+    k.proc_exit(ds, ExitStatus::Exited(0)).unwrap();
+    assert_eq!(k.fds(ds).unwrap().open_count(), 0);
+}
+
+#[test]
+fn proc_exit_of_pending_client_leaves_listener_intact() {
+    // Symmetric to the display-server cleanup: when the *client*
+    // of an in-flight connect exits, the listener it queued on
+    // must still be usable. The client-side socket is dropped,
+    // but the listener's bindings and backlog stay live so the
+    // display server can keep accepting other clients.
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _listener_fd = k.display_bind(ds).unwrap();
+
+    let app = register_display_client(&mut k, "app");
+    k.procs
+        .transition(app, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _client_fd = k.display_connect(app).unwrap();
+
+    k.proc_exit(app, ExitStatus::Exited(0)).unwrap();
+
+    // Listener's binding is still there — the display server has
+    // not exited.
+    assert!(k.ipc.lookup_binding(DISPLAY_SOCKET_PATH).is_some());
+    // Another client can still connect.
+    let app_b = register_display_client(&mut k, "app_b");
+    k.procs
+        .transition(app_b, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _fd_b = k.display_connect(app_b).unwrap();
+}

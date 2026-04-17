@@ -218,6 +218,7 @@ export const OP_EXT = {
 
 export const ERRNO = {
   EBADF: 8,
+  ECONNREFUSED: 14,
   EINVAL: 28,
   ENOENT: 44,
   ENOSYS: 52,

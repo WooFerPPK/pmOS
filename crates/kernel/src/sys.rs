@@ -271,22 +271,24 @@ impl Kernel {
         self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)
     }
 
-    /// Reap a process's kernel-side state once it has exited. This
-    /// is the single place where per-process resources are
-    /// released; it drains the fd table first so every
-    /// object-side resource (pipe reader, socket, display conn)
-    /// is freed before the process table entry goes away.
+    /// Reap a process's kernel-side state once it has exited.
+    /// Removes the per-pid fd table, cap-table entry, and
+    /// signal inbox, then promotes the zombie to dead on the
+    /// process table. Object-side resources are released
+    /// eagerly at `proc_exit`, so the fd-table drain here is
+    /// normally a no-op; it still runs as a safety net for
+    /// callers that bypass the standard `proc_exit → reap`
+    /// flow (e.g. a test that reaps a process registered for
+    /// bookkeeping only and never transitioned to Running).
     ///
     /// Returns the exit status recorded on the zombie, or
-    /// `NoSuchPid` if the pid is unknown or not a zombie.
+    /// `NoSuchPid` if the pid is unknown.
     pub fn reap(&mut self, pid: Pid) -> Result<ExitStatus, KernelError> {
-        let Some(mut table) = self.fds.remove(&pid) else {
+        if !self.fds.contains_key(&pid) {
             return Err(KernelError::NoSuchPid);
-        };
-        let dropped = table.drain_all();
-        for (_fd, entry) in dropped {
-            self.release_object(entry.object);
         }
+        self.release_fd_table_resources(pid);
+        self.fds.remove(&pid);
         self.caps.remove(pid);
         self.signal_inboxes.remove(&pid);
         self.procs.reap(pid).ok_or(KernelError::NoSuchPid)
@@ -645,13 +647,49 @@ impl Kernel {
     }
 
     /// Record an exit status on a running or blocked process and
-    /// move it to `Zombie`. Does NOT reap — that's a separate
-    /// call made by the parent's `proc_wait`.
+    /// move it to `Zombie`. Does NOT remove the per-pid fd table
+    /// or process-table entry — that is what `reap` (via the
+    /// parent's `proc_wait`) does. Does, however, release every
+    /// object-side resource the fd table refers to (IPC socket
+    /// bindings, pipe reader / writer refs, etc.) eagerly, so
+    /// stale kernel state does not survive until a parent
+    /// happens to reap the zombie.
+    ///
+    /// The fd-table drain at exit matters because `proc_wait`
+    /// (T075) is still deferred: in the current M1 substrate
+    /// nothing reaps. Without this eager release, a display
+    /// server that `proc_exit`s would leave its `/run/display`
+    /// binding behind forever — a follow-up client's
+    /// `display_connect` would succeed against that orphan
+    /// listener and then hang, instead of returning
+    /// `ConnectionRefused` cleanly. Draining here makes exit the
+    /// single source of truth for "this process no longer owns
+    /// any kernel resources"; the subsequent `reap` walks an
+    /// already-empty fd table and is effectively a pid-table +
+    /// cap-table + signal-inbox sweep.
     pub fn proc_exit(&mut self, pid: Pid, status: ExitStatus) -> Result<(), KernelError> {
         self.sched.remove(pid);
+        self.release_fd_table_resources(pid);
         self.procs
             .exit(pid, status)
             .map_err(|_| KernelError::NoSuchPid)
+    }
+
+    /// Drain the named process's fd table, releasing every
+    /// object-side resource (pipe ref, socket, display conn)
+    /// held by the open fds. The fd table itself is left in
+    /// place (now empty) so `reap` still finds it. Called
+    /// once by `proc_exit` and once again by `reap`; the second
+    /// call is a no-op on the already-empty table.
+    fn release_fd_table_resources(&mut self, pid: Pid) {
+        let dropped = self
+            .fds
+            .get_mut(&pid)
+            .map(FdTable::drain_all)
+            .unwrap_or_default();
+        for (_fd, entry) in dropped {
+            self.release_object(entry.object);
+        }
     }
 
     // --- Spawn / wait / kill -------------------------------------

@@ -345,6 +345,7 @@ var OP_EXT = {
 };
 var ERRNO = {
   EBADF: 8,
+  ECONNREFUSED: 14,
   EINVAL: 28,
   ENOENT: 44,
   ENOSYS: 52,

@@ -1126,20 +1126,20 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // table.
     expect(history[2]!.path).toBe("/bin/display-server");
     expect(history[2]!.exitCode).toBe(17);
-    // display-client-demo's fd_write retry loop exhausts, exiting
-    // with code 11. Under sequential `runAllSpawns`, display-server
-    // has already exited by the time display-client-demo runs, but
-    // the kernel's `/run/display` path binding survives across
-    // display-server's proc_exit (socket cleanup is a future
-    // slice), so `display_connect` succeeds + moves the client
-    // socket into `Connecting` state. `fd_write` then gets stuck
-    // returning EINVAL (client state != Connected) for every
-    // retry iteration because nothing is there to `ipc_accept`
-    // and promote it to `Connected`. Bounded loop exhausts and
-    // exits 11. See `crates/display-client-demo/src/main.rs` for
-    // the exit-code table.
+    // display-client-demo's `display_connect` poll loop exhausts,
+    // exiting with code 10. Under sequential `runAllSpawns`,
+    // display-server has already exited by the time
+    // display-client-demo runs; the kernel releases display-server's
+    // `/run/display` binding at `proc_exit` (the socket-cleanup
+    // slice), so every `display_connect` iteration here returns
+    // `-ECONNREFUSED` against a now-empty path. The bounded poll
+    // exhausts without ever promoting the client socket past
+    // `Unbound`, so the downstream `fd_write` retry loop is
+    // unreachable in this flow. See
+    // `crates/display-client-demo/src/main.rs` for the exit-code
+    // table.
     expect(history[3]!.path).toBe("/bin/display-client-demo");
-    expect(history[3]!.exitCode).toBe(11);
+    expect(history[3]!.exitCode).toBe(10);
 
     const combined = new TextDecoder().decode(
       new Uint8Array(
