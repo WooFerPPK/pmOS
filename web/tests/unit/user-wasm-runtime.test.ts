@@ -63,6 +63,7 @@ let helloWasiBootstrapWasmBytes: ArrayBuffer;
 let helloFbBlitWasmBytes: ArrayBuffer;
 let helloInputEchoWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
+let initWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -108,6 +109,11 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello-std.wasm",
   );
+  // `init` is also a bin target, no dash-preservation concerns.
+  const initPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/init.wasm",
+  );
 
   for (const p of [
     kernelPath,
@@ -120,6 +126,7 @@ beforeAll(() => {
     helloFbBlitPath,
     helloInputEchoPath,
     helloStdPath,
+    initPath,
   ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
@@ -148,6 +155,7 @@ beforeAll(() => {
   helloFbBlitWasmBytes = loadWasm(helloFbBlitPath);
   helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
+  initWasmBytes = loadWasm(initPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -928,6 +936,89 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       ),
     );
     expect(combined).toBe("hello from std\n");
+  });
+
+  it("init (std) spawns hello-std via pmos_ext.proc_spawn, child runs after init exits", async () => {
+    // The first proof that a real Rust `std` binary can issue a
+    // PMos extension syscall (not just WASI) and reach a second
+    // std binary through the drain loop. The two-level
+    // composition was already proven with no_std cdylibs in the
+    // earlier `hello-wasi-spawner` test; this is the "both sides
+    // are std" progression: init uses `println!` for every line,
+    // calls `pmos_ext.proc_spawn` through an `extern "C"` block,
+    // and the spawned child is itself a std binary (hello-std)
+    // linking its own libc + WASI startup machinery.
+    //
+    // Ordering is load-bearing: drainPendingSpawns is sequential
+    // in v1, so hello-std can only start running after init's
+    // `main()` returns. The assertion on the console-line order
+    // is what certifies that guarantee; a concurrent drain loop
+    // would surface as interleaved output.
+    const consoleWrites: Uint8Array[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/init", initWasmBytes],
+      ["/bin/hello-std", helloStdWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      binaryRegistry,
+    });
+
+    // Kernel-side synthetic parent that dispatches PROC_SPAWN on
+    // behalf of an imaginary "boot loader" — the real boot path
+    // uses `kernel-worker-entry.ts`'s `runBootBinary`, which does
+    // the same choreography.
+    const bootLoader = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(bootLoader, 0);
+    kernel.installConsoleFd(bootLoader, 1);
+    kernel.installConsoleFd(bootLoader, 2);
+    kernel.markRunning(bootLoader);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/init",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      bootLoader,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    await kernel.drainPendingSpawns();
+
+    expect(kernel.hasPendingSpawns).toBe(false);
+    const history = kernel.spawnHistoryEntries;
+    expect(history).toHaveLength(2);
+    expect(history[0]!.path).toBe("/bin/init");
+    expect(history[0]!.exitCode).toBe(0);
+    expect(history[1]!.path).toBe("/bin/hello-std");
+    expect(history[1]!.exitCode).toBe(0);
+
+    const combined = new TextDecoder().decode(
+      new Uint8Array(
+        consoleWrites.reduce<number[]>(
+          (acc, b) => acc.concat(Array.from(b)),
+          [],
+        ),
+      ),
+    );
+    // init writes three lines; hello-std writes one. The pid the
+    // kernel allocates is dynamic, so line 2 matches on prefix.
+    const lines = combined.split("\n").filter((l) => l.length > 0);
+    expect(lines[0]).toBe("init starting");
+    expect(lines[1]).toMatch(/^init spawned hello-std pid=\d+$/);
+    expect(lines[2]).toBe("init exiting");
+    expect(lines[3]).toBe("hello from std");
+    expect(lines).toHaveLength(4);
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {

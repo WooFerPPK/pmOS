@@ -857,13 +857,19 @@ function paintBlitToCanvasFullscreen(c: Canvas2D, frame_: FbFrame): void {
 
 /**
  * Real-kernel boot path: spawns the kernel Worker with
- * `useRealKernel: true` + `bootBinary: "/bin/hello-std"`, then
+ * `useRealKernel: true` + `bootBinary: "/bin/init"`, then
  * forwards every byte the kernel flushes from `/dev/console` to
  * the page console with a `[real-kernel]` prefix. Playwright
  * scrapes the page console to assert on the boot binary's
  * output; once a real terminal-mode wiring lands the prefix
  * goes away and the bytes flow into the visible terminal
  * surface instead.
+ *
+ * `init` is a real Rust `std` binary (`crates/init/`) that
+ * announces itself, spawns `/bin/hello-std` via
+ * `pmos_ext.proc_spawn`, and exits — the drain loop picks up
+ * hello-std next and runs it to completion. Both binaries'
+ * output reach the page console in order.
  */
 function runRealKernelMode(): void {
   console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
@@ -875,7 +881,7 @@ function runRealKernelMode(): void {
       enableInput: false,
       enableFramebuffer: false,
       useRealKernel: true,
-      bootBinary: "/bin/hello-std",
+      bootBinary: "/bin/init",
     },
   });
   consoleHost.onOutput((bytes: Uint8Array) => {

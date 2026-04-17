@@ -800,7 +800,7 @@ function runRealKernelMode() {
       enableInput: false,
       enableFramebuffer: false,
       useRealKernel: true,
-      bootBinary: "/bin/hello-std"
+      bootBinary: "/bin/init"
     }
   });
   consoleHost.onOutput((bytes) => {
