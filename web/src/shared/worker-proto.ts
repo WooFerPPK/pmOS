@@ -58,20 +58,6 @@ export interface BootConfig {
    * the real init binary supersedes it.
    */
   readonly bootBinary?: string;
-  /**
-   * Opt into the T233 (M1.4) proc:spawn routing path from a
-   * production boot. Only honoured when [`useRealKernel`] is true.
-   * When set, the kernel-worker entry wires
-   * [`KernelWasmHostOptions.kernelWorkerChannel`] and
-   * `runBootBinary` drives [`KernelWasmHost.startDispatchLoop`]
-   * over the per-pid SAB map (populated by `proc:sab`, drained by
-   * `proc:exited`) instead of the legacy in-process
-   * [`KernelWasmHost.drainPendingSpawns`]. Production's
-   * `runRealKernelMode()` sets this true (T234); the legacy in-
-   * process drain remains the default for callers that don't opt
-   * in. T235 deletes both this flag and the legacy drain.
-   */
-  readonly enableMultiProcessSpawn?: boolean;
 }
 
 /** Main-thread → kernel-worker. */

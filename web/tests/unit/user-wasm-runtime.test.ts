@@ -40,6 +40,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   KernelWasmHost,
+  type SpawnOutcome,
 } from "../../src/kernel-wasm-host";
 import { FramebufferDriver } from "../../src/drivers/fb";
 import {
@@ -50,8 +51,67 @@ import {
   CAPSET_ALL,
   DEV,
   encodeSpawnManifest,
+  ERRNO,
   OP_EXT,
 } from "../../src/shared/syscall";
+
+/**
+ * Test-local replacement for the preview-era
+ * `KernelWasmHost.drainPendingSpawns` (removed in T235). Composition
+ * tests accumulate each spawn the kernel hands out into `captures`
+ * via a custom [`onSpawnProcess`] callback, then call `runAllSpawns`
+ * once to run every captured child to completion via a fresh
+ * `UserWasmRuntime + KernelWasmHostBackend` per pid. Reentrant: if a
+ * running child issues its own `PROC_SPAWN` syscalls mid-run, the
+ * kernel's `onSpawnProcess` appends to the SAME `captures` array
+ * that the drain loop is currently popping from, so transitive
+ * spawns are picked up on subsequent loop iterations — exactly the
+ * behaviour the old production drain had. Sequential by design, one
+ * runtime at a time. Returns a per-child history with pid/path/
+ * exitCode.
+ */
+interface CapturedSpawn {
+  readonly pid: number;
+  readonly path: string;
+  readonly bytes: BufferSource;
+}
+async function runAllSpawns(
+  kernel: KernelWasmHost,
+  captures: CapturedSpawn[],
+): Promise<Array<{ pid: number; path: string; exitCode: number }>> {
+  const history: Array<{ pid: number; path: string; exitCode: number }> = [];
+  while (captures.length > 0) {
+    const spawn = captures.shift()!;
+    const backend = new KernelWasmHostBackend(kernel, spawn.pid);
+    const runtime = new UserWasmRuntime(spawn.bytes, backend);
+    const exitCode = await runtime.run();
+    history.push({ pid: spawn.pid, path: spawn.path, exitCode });
+  }
+  return history;
+}
+
+/**
+ * Build an `onSpawnProcess` callback that resolves `path` against
+ * `registry`, pushes `{pid, path, bytes}` into `captures`, and
+ * returns `{ ok: true }` on hit or `{ ok: false, errno: ENOENT }`
+ * on miss. The kernel maps the miss to `-EIO` on the `PROC_SPAWN`
+ * response and rolls back the pid, matching the production path's
+ * missing-binary semantics (bootstrap.ts's spawn router exposes the
+ * same failure shape).
+ */
+function captureSpawn(
+  registry: ReadonlyMap<string, BufferSource>,
+  captures: CapturedSpawn[],
+): (pid: number, path: string) => SpawnOutcome {
+  return (pid: number, path: string): SpawnOutcome => {
+    const bytes = registry.get(path);
+    if (bytes === undefined) {
+      return { ok: false, errno: ERRNO.ENOENT };
+    }
+    captures.push({ pid, path, bytes });
+    return { ok: true };
+  };
+}
 
 let kernelWasmBytes: ArrayBuffer;
 let helloWasmBytes: ArrayBuffer;
@@ -193,18 +253,17 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
   });
 
-  it("PROC_SPAWN + drainPendingSpawns actually runs the child binary end-to-end", async () => {
+  it("PROC_SPAWN + runAllSpawns actually runs the child binary end-to-end", async () => {
     // The composition test: the kernel's `PROC_SPAWN` opcode is
     // dispatched on behalf of a "virtual parent" (no wasm; the
-    // test plays init's role), the default `onSpawnProcess` hook
-    // queues the child based on the supplied `binaryRegistry`,
-    // and `drainPendingSpawns` runs the child to completion.
+    // test plays init's role), a caller-supplied `onSpawnProcess`
+    // captures the spawn, and the test's `runAllSpawns` helper
+    // runs the child to completion via `KernelWasmHostBackend`.
     // This proves:
     //
-    //   * `onSpawnProcess` wiring through the host — the default
-    //     queuing callback fires on a real `PROC_SPAWN` syscall.
-    //   * Binary-registry lookup — the kernel-supplied path
-    //     resolves to wasm bytes.
+    //   * `onSpawnProcess` wiring through the host — the callback
+    //     fires on a real `PROC_SPAWN` syscall with the kernel-
+    //     allocated pid and the caller's path.
     //   * The spawned child runs against the same KernelWasmHost
     //     that its parent was syscalling through, with the pid
     //     allocated by the kernel's own proc_spawn path — not a
@@ -216,6 +275,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     //     returned, so the kernel's scratch region is never
     //     contended (no nested dispatch).
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
 
     // Map the path the parent will pass to PROC_SPAWN onto the
     // hello-wasi-min bytes already loaded in beforeAll.
@@ -227,7 +287,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     // Seed a "virtual parent" process. It doesn't run any user
@@ -260,39 +320,43 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       manifest.heap,
     );
 
-    // The spawn was queued, not yet run. The response carries the
-    // new pid; the registry lookup succeeded so `onSpawnProcess`
-    // returned `{ ok: true }` and the kernel accepted the spawn.
+    // The spawn was captured, not yet run. The response carries
+    // the new pid; the capture callback returned `{ ok: true }`
+    // so the kernel accepted the spawn.
     expect(spawnResult.response.status).toBe(0);
     const childPid = Number(spawnResult.response.value);
     expect(childPid).toBeGreaterThan(parent);
-    expect(kernel.hasPendingSpawns).toBe(true);
+    expect(captures).toHaveLength(1);
+    expect(captures[0]!.pid).toBe(childPid);
+    expect(captures[0]!.path).toBe("/usr/bin/hello");
     expect(consoleWrites).toHaveLength(0);
 
-    // Drain the queue. The hello binary runs, writes its line,
-    // and exits. Because drainPendingSpawns is sequential, it
-    // returns only after every transitively-queued child has
-    // finished, which for this test is just the one.
-    await kernel.drainPendingSpawns();
+    // Drain the captures. The hello binary runs, writes its line,
+    // and exits. `runAllSpawns` is sequential: it returns only
+    // after every transitively-captured child has finished, which
+    // for this test is just the one.
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(captures).toHaveLength(0);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
     expect(consoleWrites).toHaveLength(1);
     expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
       "hello from userland\n",
     );
   });
 
-  it("two-level composition: spawner wasm calls proc_spawn mid-run, drainPendingSpawns reentrantly runs both", async () => {
+  it("two-level composition: spawner wasm calls proc_spawn mid-run, runAllSpawns reentrantly runs both", async () => {
     // The reentrancy test. Init dispatches PROC_SPAWN for the
-    // spawner. The drain loop pops the spawner, runs it. Inside
+    // spawner. `runAllSpawns` pops the spawner, runs it. Inside
     // `_start`, the spawner writes "spawner alive\n" via
     // `wasi_snapshot_preview1.fd_write` and THEN calls
     // `pmos_ext.proc_spawn` to spawn hello. The shim translates
     // that into a PROC_SPAWN opcode dispatched on the spawner's
-    // pid — which queues the hello spawn onto the same
-    // pendingSpawns list the drain loop is currently draining.
-    // The spawner then proc_exits. Control returns to the drain
-    // loop, which sees the queue is non-empty (hello just got
+    // pid — which appends the hello spawn onto the same
+    // `captures` array the loop is currently draining. The
+    // spawner then proc_exits. Control returns to the drain
+    // loop, which sees the array is non-empty (hello just got
     // added), pops hello, runs it. Hello writes its line and
     // exits. Drain returns.
     //
@@ -300,8 +364,9 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // alive\n" first, then "hello from userland\n"). That order
     // is load-bearing: it proves the spawner fully ran before
     // the child took over, which is the non-concurrent
-    // sequential-drain semantics we promised.
+    // sequential-drain semantics the helper preserves.
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/usr/bin/hello", helloWasmBytes],
       ["/usr/bin/spawner", spawnerWasmBytes],
@@ -311,7 +376,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     // Virtual init process, seeded with stdio.
@@ -341,17 +406,21 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     const spawnerPid = Number(spawnResult.response.value);
     expect(spawnerPid).toBeGreaterThan(init);
 
-    // One pending spawn (the spawner); hello isn't queued yet
-    // because it only gets queued when the spawner calls
+    // One captured spawn (the spawner); hello isn't captured yet
+    // because it only gets captured when the spawner calls
     // pmos_ext.proc_spawn during its run.
-    expect(kernel.hasPendingSpawns).toBe(true);
+    expect(captures).toHaveLength(1);
 
-    // Drain. The spawner runs, queues hello mid-run, exits;
+    // Drain. The spawner runs, appends hello mid-run, exits;
     // the loop picks up hello, runs it, exits; the loop sees
-    // an empty queue and returns.
-    await kernel.drainPendingSpawns();
+    // an empty array and returns.
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(captures).toHaveLength(0);
+    expect(history.map((h) => h.path)).toEqual([
+      "/usr/bin/spawner",
+      "/usr/bin/hello",
+    ]);
     // Two complete lines, in order. Any other order would
     // indicate the child ran before the spawner finished,
     // which would break the sequential reentrancy model.
@@ -364,14 +433,15 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ]);
   });
 
-  it("PROC_SPAWN with a path missing from binaryRegistry returns -EIO and rolls back the pid", async () => {
-    // Missing-binary path: the default onSpawnProcess returns
+  it("PROC_SPAWN with a path missing from the capture registry returns -EIO and rolls back the pid", async () => {
+    // Missing-binary path: `captureSpawn` returns
     // `{ ok: false, errno: ENOENT }`, WasmPlatform::spawn_process
     // maps that to `DriverError::Errno`, the PROC_SPAWN opcode
-    // handler rolls back the pid and returns `-EIO`. No pending
-    // spawn is queued because the default callback returned
-    // `ok: false` before pushing.
+    // handler rolls back the pid and returns `-EIO`. Nothing is
+    // pushed into `captures` because the callback returned
+    // `ok: false` before appending.
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
 
     const binaryRegistry = new Map<string, BufferSource>([
       ["/usr/bin/hello", helloWasmBytes],
@@ -381,7 +451,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     const parent = kernel.registerProcess(CAPSET_ALL);
@@ -409,7 +479,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // -EIO per the PROC_SPAWN rollback semantics (any platform
     // failure becomes EIO regardless of the specific errno).
     expect(spawnResult.response.status).toBeLessThan(0);
-    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(captures).toHaveLength(0);
     expect(consoleWrites).toHaveLength(0);
   });
 
@@ -432,6 +502,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // the data actually flowed through the kernel's IPC state
     // machine rather than being short-circuited somewhere.
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/ipc-self-test", ipcSelfTestWasmBytes],
     ]);
@@ -440,7 +511,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     // Virtual init with stdio so the child inherits fd 0/1/2 and
@@ -469,17 +540,17 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    // The binary exits 0 iff every IPC step succeeded. Its
-    // exit code is not directly observable from the test
-    // (drainPendingSpawns doesn't surface per-child exit
-    // codes yet), but the side effect — the received bytes
-    // landing on /dev/console via the final fd_write — is.
-    // A silent failure (no console write) would mean some
-    // step bailed early with a non-zero proc_exit before
-    // reaching the echo.
-    await kernel.drainPendingSpawns();
+    // The binary exits 0 iff every IPC step succeeded. The exit
+    // code shows up in `history` below; the side effect — the
+    // received bytes landing on /dev/console via the final
+    // fd_write — is the primary acceptance assertion. A silent
+    // failure (no console write) would mean some step bailed
+    // early with a non-zero proc_exit before reaching the echo.
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(captures).toHaveLength(0);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
     expect(consoleWrites).toHaveLength(1);
     expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
       "hello via ipc\n",
@@ -509,6 +580,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     //     bytes (e.g. stale buffer after a grow)
     const consoleWrites: Uint8Array[] = [];
     const fbWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/hello-framebuffer", helloFramebufferWasmBytes],
     ]);
@@ -520,7 +592,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onFramebufferWrite: (bytes) => {
         fbWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     // Virtual init with CAPSET_ALL so the child inherits
@@ -548,9 +620,11 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    await kernel.drainPendingSpawns();
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
+    expect(captures).toHaveLength(0);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
     // No console output — the binary doesn't write to /dev/console.
     expect(consoleWrites).toHaveLength(0);
     // Exactly one framebuffer write with the 16 RGBA bytes.
@@ -587,6 +661,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // would produce either the wrong bytes or an exit code 14.
     const consoleWrites: Uint8Array[] = [];
     const fbWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/display-server-lite", displayServerLiteWasmBytes],
     ]);
@@ -598,7 +673,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onFramebufferWrite: (bytes) => {
         fbWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     // Virtual init with CAPSET_ALL — the demo binary needs both
@@ -627,14 +702,12 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    await kernel.drainPendingSpawns();
-
-    expect(kernel.hasPendingSpawns).toBe(false);
-    // The binary's `spawnHistoryEntries` exit code is the
-    // step-by-step diagnostic; exit 0 means every step
-    // succeeded. Codes 10..16 indicate which step bailed —
+    // Exit code is the step-by-step diagnostic; exit 0 means every
+    // step succeeded. Codes 10..16 indicate which step bailed —
     // see `display-server-lite/src/lib.rs` for the map.
-    const history = kernel.spawnHistoryEntries;
+    const history = await runAllSpawns(kernel, captures);
+
+    expect(captures).toHaveLength(0);
     expect(history).toHaveLength(1);
     expect(history[0]!.exitCode).toBe(0);
     // No console output — the binary doesn't write to /dev/console.
@@ -666,6 +739,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // and the test fails. On full success the binary writes
     // "bootstrap ok\n" to /dev/console and exits 0.
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/hello-wasi-bootstrap", helloWasiBootstrapWasmBytes],
     ]);
@@ -673,7 +747,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     const init = kernel.registerProcess(CAPSET_ALL);
@@ -699,10 +773,9 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    await kernel.drainPendingSpawns();
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
-    const history = kernel.spawnHistoryEntries;
+    expect(captures).toHaveLength(0);
     expect(history).toHaveLength(1);
     expect(history[0]!.exitCode).toBe(0);
     // The binary writes exactly one line on full success.
@@ -734,6 +807,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // handler chain a MockKernel blit does.
     const driverMessages: unknown[] = [];
     const fbDriver = new FramebufferDriver();
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/hello-fb-blit", helloFbBlitWasmBytes],
     ]);
@@ -742,7 +816,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onFramebufferMessage: (msg) => {
         driverMessages.push(msg);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     const init = kernel.registerProcess(CAPSET_ALL);
@@ -768,10 +842,9 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    await kernel.drainPendingSpawns();
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
-    const history = kernel.spawnHistoryEntries;
+    expect(captures).toHaveLength(0);
     expect(history).toHaveLength(1);
     expect(history[0]!.exitCode).toBe(0);
 
@@ -810,11 +883,12 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     //   binary's path_open + fd_read → fd_write(stdout) →
     //   onConsoleWrite.
     //
-    // The sequential in-process dispatch model doesn't block reads,
-    // so this test injects the input BEFORE draining the spawn queue.
-    // The binary's fd_read finds a non-empty ring and returns
+    // `fd_read` on an empty input ring returns EAGAIN rather than
+    // parking, so this test injects the input BEFORE running the
+    // child. The binary's fd_read finds a non-empty ring and returns
     // immediately with the queued bytes.
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/hello-input-echo", helloInputEchoWasmBytes],
     ]);
@@ -822,7 +896,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     const init = kernel.registerProcess(CAPSET_ALL);
@@ -857,10 +931,9 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    await kernel.drainPendingSpawns();
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
-    const history = kernel.spawnHistoryEntries;
+    expect(captures).toHaveLength(0);
     expect(history).toHaveLength(1);
     expect(history[0]!.exitCode).toBe(0);
 
@@ -887,6 +960,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // routing. The failure mode of each is visible from the
     // console output + exit code.
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/hello-std", helloStdWasmBytes],
     ]);
@@ -894,7 +968,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     const init = kernel.registerProcess(CAPSET_ALL);
@@ -920,10 +994,9 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    await kernel.drainPendingSpawns();
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
-    const history = kernel.spawnHistoryEntries;
+    expect(captures).toHaveLength(0);
     expect(history).toHaveLength(1);
     expect(history[0]!.exitCode).toBe(0);
 
@@ -949,12 +1022,16 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // and the spawned child is itself a std binary (hello-std)
     // linking its own libc + WASI startup machinery.
     //
-    // Ordering is load-bearing: drainPendingSpawns is sequential
-    // in v1, so hello-std can only start running after init's
-    // `main()` returns. The assertion on the console-line order
-    // is what certifies that guarantee; a concurrent drain loop
-    // would surface as interleaved output.
+    // Ordering is load-bearing: `runAllSpawns` is sequential (one
+    // runtime at a time), so hello-std can only start running after
+    // init's `main()` returns. The assertion on the console-line
+    // order is what certifies that guarantee; a concurrent drain
+    // would surface as interleaved output. (Production, post-T234,
+    // uses real user Workers that DO run concurrently — the
+    // composition-test semantics live only in this in-process
+    // `runAllSpawns` helper.)
     const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/init", initWasmBytes],
       ["/bin/hello-std", helloStdWasmBytes],
@@ -963,7 +1040,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      binaryRegistry,
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
     // Kernel-side synthetic parent that dispatches PROC_SPAWN on
@@ -993,10 +1070,9 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     );
     expect(spawnResult.response.status).toBe(0);
 
-    await kernel.drainPendingSpawns();
+    const history = await runAllSpawns(kernel, captures);
 
-    expect(kernel.hasPendingSpawns).toBe(false);
-    const history = kernel.spawnHistoryEntries;
+    expect(captures).toHaveLength(0);
     expect(history).toHaveLength(2);
     expect(history[0]!.path).toBe("/bin/init");
     expect(history[0]!.exitCode).toBe(0);

@@ -3,13 +3,13 @@
 //! syscall, then exits.
 //!
 //! Used by the `user-wasm-runtime.test.ts` composition test to
-//! prove that `drainPendingSpawns` is reentrant under real wasm
-//! execution: a running parent wasm calls `PROC_SPAWN` mid-run,
-//! the host's default `onSpawnProcess` callback queues the
-//! child, the parent returns from `_start`, `drainPendingSpawns`
-//! pops the child and runs it, the child writes its line and
-//! exits. The test asserts both the parent's and the child's
-//! output appear in the capture in order.
+//! prove that the test-harness `runAllSpawns` helper is reentrant
+//! under real wasm execution: a running parent wasm calls
+//! `PROC_SPAWN` mid-run, the host's `onSpawnProcess` callback
+//! captures the child, the parent returns from `_start`,
+//! `runAllSpawns` pops the child and runs it, the child writes
+//! its line and exits. The test asserts both the parent's and
+//! the child's output appear in the capture in order.
 //!
 //! ## Import namespaces
 //!
@@ -89,17 +89,17 @@ pub extern "C" fn _start() {
     if rc < 0 {
         // Propagate the errno to the test harness via proc_exit's
         // code. rc is already negative, which means we exit with
-        // that value and `drainPendingSpawns` observes a
-        // non-zero exit — pointing at where the failure was.
+        // that value and `runAllSpawns` records a non-zero exit
+        // in its history — pointing at where the failure was.
         unsafe { proc_exit(rc) }
     }
 
     // 3. Exit cleanly. The child has NOT run yet — it's sitting
-    //    in `pendingSpawns` waiting for this `run()` call to
-    //    return so `drainPendingSpawns` can pop it and start
-    //    its own runtime. That ordering is the whole point of
-    //    the reentrancy test: the child runs after the parent
-    //    exits, not during.
+    //    in the test harness's `captures` array waiting for
+    //    this `run()` call to return so `runAllSpawns` can pop
+    //    it and start its own runtime. That ordering is the
+    //    whole point of the reentrancy test: the child runs
+    //    after the parent exits, not during.
     unsafe { proc_exit(0) }
 }
 

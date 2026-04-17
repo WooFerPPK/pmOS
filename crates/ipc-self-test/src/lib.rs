@@ -13,10 +13,11 @@
 //! indexes sockets by `SocketId`, not by pid, so client and
 //! listener can live in the same address space without the
 //! kernel caring. This avoids the ordering problem that a
-//! two-binary (client + server) split would hit under
-//! `drainPendingSpawns`'s sequential execution: the binary that
-//! runs second would have a listener that no longer has a client
-//! waiting for it, because the client already exited.
+//! two-binary (client + server) split would hit under the
+//! composition test harness's sequential `runAllSpawns` loop:
+//! the binary that runs second would have a listener that no
+//! longer has a client waiting for it, because the client
+//! already exited.
 //!
 //! Sequence:
 //!

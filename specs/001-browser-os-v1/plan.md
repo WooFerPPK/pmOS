@@ -509,8 +509,37 @@ is the deviation **register** the constitution refers to.
    bespoke `rasterize_snapshot` rather than through
    `toolkit::draw::Canvas`. **Reconciliation required** when
    T091 (real kernel Worker) and T110 (`/run/display` accept
-   loop) land — at that point the rasterizer/mock-kernel stubs
-   get deleted and `term` migrates onto `Canvas`.
+   loop) land. The T091 arm has landed via T230–T235 (see
+   deviation #5 below); the T110 arm + the `term` → `Canvas`
+   migration remain.
+
+5. **Multi-process substrate (M1) sub-slices T230–T235** —
+   an earlier Phase 2 implementation ran every user wasm
+   instance inside the kernel Worker's global scope, with a
+   `KernelWasmHost.drainPendingSpawns()` queue-and-drain loop
+   executing children sequentially against the kernel's own
+   linear memory. That was a preview stand-in: the plan's
+   intended substrate was Worker-per-pid + per-pid SAB ring
+   bridge. Sub-slices T230–T235 migrated the code onto the
+   plan's intended model: `KernelWasmHost.startDispatchLoop`
+   round-robins over a `Map<pid, SAB>` populated by main-thread
+   `proc:sab` messages (T233); `SabBackend` implements
+   `KernelBackend` over the per-pid SAB ring + wake-slot
+   Atomics protocol (T231 + T234); a new
+   [`web/src/user-worker-entry.ts`](../../web/src/user-worker-entry.ts)
+   bundle is the dedicated user-Worker entry, shipped as
+   `dist/assets/user-worker.js` alongside
+   `dist/assets/kernel-worker.js` (T232). T235 then deleted
+   `drainPendingSpawns` + the `pendingSpawns` queue + the
+   legacy conditional boot paths, making the dispatch-loop path
+   the only path. **Principle V's isolation is now physical**
+   (each pid is a dedicated Web Worker with a distinct WASM
+   linear memory; user wasm in pid A cannot access pid B's
+   bytes through any non-IPC channel), not conventional (where
+   all user wasm shared one linear memory inside the kernel
+   Worker and isolation was a property honoured by callers).
+   This is the single biggest Principle V delta in the
+   project's history.
 
 ### Planning Complete
 

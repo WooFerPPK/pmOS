@@ -589,15 +589,14 @@ export class UserWasmRuntime {
       //     we just pass it through.
       //
       // The child doesn't actually *run* here: the kernel's
-      // PROC_SPAWN handler queues a pending spawn via the
-      // host's default `onSpawnProcess` callback, and the
-      // runtime's caller (usually `KernelWasmHost.
-      // drainPendingSpawns`) picks it up after `_start`
-      // returns. This is the reentrancy story: a parent that
-      // calls `proc_spawn` mid-run doesn't block waiting for
-      // the child; it gets a pid back and keeps running, and
-      // the child executes once the parent exits and the drain
-      // loop moves on.
+      // PROC_SPAWN handler invokes the host's `onSpawnProcess`
+      // callback, which typically posts `proc:spawn` to the
+      // main-thread spawn router. The router spins up a user
+      // Worker that instantiates the child wasm against a fresh
+      // per-pid SAB; the parent gets a pid back immediately and
+      // keeps running. A parent that calls `proc_spawn` mid-run
+      // is unblocked the moment the callback returns — the
+      // child runs concurrently in its own Worker.
       proc_spawn: (
         pathPtr: number,
         pathLen: number,

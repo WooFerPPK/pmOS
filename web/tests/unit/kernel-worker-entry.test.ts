@@ -428,6 +428,9 @@ describe("installWorkerEntry with useRealKernel", () => {
         useRealKernel: true,
       },
     });
+    // No bootBinary was configured, so no PROC_SPAWN + proc:spawn
+    // fires. `runBootBinary` is skipped entirely; the entry's
+    // `whenReady` resolves after `bootKernelWorker` posts `ready`.
     await entry.whenReady;
     expect(fetched).toEqual(["/assets/kernel.wasm"]);
     expect(entry.realKernel).toBeDefined();
@@ -470,6 +473,31 @@ describe("installWorkerEntry with useRealKernel", () => {
         bootBinary: "/bin/hello-std",
       },
     });
+
+    // After T235 the kernel-worker-entry unconditionally routes
+    // PROC_SPAWN through `proc:spawn` + awaits the main-thread
+    // spawn router's `proc:sab` + `proc:exited` handshake. No real
+    // user Worker runs in vitest, so we simulate main by pre-seeding
+    // the SAB with a FD_WRITE of the expected "hello from std\n"
+    // payload and posting proc:sab+proc:exited ourselves. The
+    // kernel's dispatch loop services the ring the way it would for
+    // a real user Worker, producing the same `console:write` the
+    // pre-T235 in-process drain used to produce.
+    await waitFor(() => msg.posted.some((m) => m.kind === "proc:spawn"));
+    const spawn = msg.posted.find((m) => m.kind === "proc:spawn");
+    if (!spawn || spawn.kind !== "proc:spawn") throw new Error("unreachable");
+    expect(spawn.path).toBe("/bin/hello-std");
+    const sab = new ArrayBuffer(SAB_SIZE);
+    seedFdWriteOnce(sab, "hello from std\n", 1);
+    msg.send({ kind: "proc:sab", pid: spawn.pid, sab });
+    await waitFor(() =>
+      msg.posted.some(
+        (m) =>
+          m.kind === "console:write" &&
+          new TextDecoder().decode(m.bytes) === "hello from std\n",
+      ),
+    );
+    msg.send({ kind: "proc:exited", pid: spawn.pid, code: 0 });
     await entry.whenReady;
 
     // Manifest was fetched; only the bin/*.wasm asset was followed
@@ -479,7 +507,8 @@ describe("installWorkerEntry with useRealKernel", () => {
     expect(fetched).toContain("/assets/bin/hello-std.wasm");
     expect(fetched).not.toContain("/assets/bootstrap.js");
 
-    // hello-std actually ran via the auto-built registry.
+    // The seeded FD_WRITE emerged on the `console:write` channel
+    // (byte-for-byte what a real hello-std run would produce).
     const writes = msg.posted
       .filter((m) => m.kind === "console:write")
       .flatMap((m) =>
@@ -507,6 +536,26 @@ describe("installWorkerEntry with useRealKernel", () => {
         bootBinary: "/bin/hello-std",
       },
     });
+
+    // Same main-thread spawn-router simulation as the manifest test
+    // above — the boot binary's PROC_SPAWN lands as `proc:spawn`,
+    // the test hands the kernel a pre-seeded SAB with hello-std's
+    // expected fd_write payload, and the dispatch loop services it.
+    await waitFor(() => msg.posted.some((m) => m.kind === "proc:spawn"));
+    const spawn = msg.posted.find((m) => m.kind === "proc:spawn");
+    if (!spawn || spawn.kind !== "proc:spawn") throw new Error("unreachable");
+    expect(spawn.path).toBe("/bin/hello-std");
+    const sab = new ArrayBuffer(SAB_SIZE);
+    seedFdWriteOnce(sab, "hello from std\n", 1);
+    msg.send({ kind: "proc:sab", pid: spawn.pid, sab });
+    await waitFor(() =>
+      msg.posted.some(
+        (m) =>
+          m.kind === "console:write" &&
+          new TextDecoder().decode(m.bytes) === "hello from std\n",
+      ),
+    );
+    msg.send({ kind: "proc:exited", pid: spawn.pid, code: 0 });
     await entry.whenReady;
 
     // The boot binary's stdout flushed through the kernel and out
@@ -622,7 +671,6 @@ describe("installWorkerEntry with useRealKernel + proc:spawn routing", () => {
     const entry = installWorkerEntry(msg, {
       kernelWasmBytes,
       binaryRegistry: registry,
-      enableMultiProcessSpawn: true,
     });
     msg.send({
       kind: "boot",
@@ -694,7 +742,6 @@ describe("installWorkerEntry with useRealKernel + proc:spawn routing", () => {
     const entry = installWorkerEntry(msg, {
       kernelWasmBytes,
       binaryRegistry: registry,
-      enableMultiProcessSpawn: true,
     });
     msg.send({
       kind: "boot",

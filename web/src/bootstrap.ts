@@ -943,14 +943,6 @@ function runRealKernelMode(): void {
       enableFramebuffer: false,
       useRealKernel: true,
       bootBinary: "/bin/init",
-      // T234: opt into the multi-process spawn path so the kernel's
-      // default `onSpawnProcess` posts `proc:spawn` for the spawn
-      // router to handle (allocate SAB → spawn `/assets/user-worker.
-      // js` Worker → forward boot + wake slot → register with
-      // kernel via `proc:sab`). The synthetic bootstrap pid that
-      // dispatches PROC_SPAWN(/bin/init) stays in-process inside
-      // the kernel Worker — every later pid is a real user Worker.
-      enableMultiProcessSpawn: true,
     },
   });
   consoleHost.onOutput((bytes: Uint8Array) => {

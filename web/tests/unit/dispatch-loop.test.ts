@@ -1,11 +1,12 @@
 // Tests for `KernelWasmHost.startDispatchLoop` — the kernel-side
 // round-robin dispatch loop that services every live pid's SAB ring
 // on each pass. T233 (M1.4) lands the loop alongside its test gate;
-// the loop replaces the in-process `drainPendingSpawns` for
-// multi-process boots. Today vitest drives it through a plain-
-// ArrayBuffer pidMap + a `parkFn` stub that yields microtasks instead
-// of blocking on `Atomics.wait` — node under vitest has no cross-
-// origin-isolated context for a real SAB-backed wait.
+// T235 (M1.6) made it the only scheduler by deleting the preview
+// `drainPendingSpawns` in-process drain. Today vitest drives it
+// through a plain-ArrayBuffer pidMap + a `parkFn` stub that yields
+// microtasks instead of blocking on `Atomics.wait` — node under
+// vitest has no cross-origin-isolated context for a real SAB-backed
+// wait.
 //
 // What this file pins down:
 //

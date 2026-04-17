@@ -328,27 +328,6 @@ function decodeRequest(bytes) {
     heapLen: view.getUint32(28, true)
   };
 }
-var OP_WASI = {
-  ARGS_GET: 1,
-  ARGS_SIZES_GET: 2,
-  ENVIRON_GET: 3,
-  ENVIRON_SIZES_GET: 4,
-  FD_CLOSE: 34,
-  FD_FDSTAT_GET: 36,
-  FD_PRESTAT_GET: 43,
-  FD_READ: 46,
-  FD_WRITE: 52,
-  PATH_OPEN: 68,
-  PROC_EXIT: 96,
-  CLOCK_TIME_GET: 17,
-  RANDOM_GET: 81,
-  SCHED_YIELD: 82,
-  /** Unused by the WASI shim today; the tests probe it to verify
-   * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Swap to whichever WASI opcode is
-   * still unhandled as the implementation catches up. */
-  FD_SEEK: 49
-};
 var OP_EXT = {
   IPC_SOCKET: 4096,
   IPC_BIND: 4097,
@@ -405,601 +384,20 @@ var CAPSET_ALL = 0xffffffffffffffffn;
 var CAPSET_DESKTOP_SHELL = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.SHELL) | capBit(CAP.PROC_ENUMERATE) | capBit(CAP.KEYMAP_ADMIN);
 var CAPSET_ORDINARY_APP = capBit(CAP.DISPLAY_CLIENT);
 
-// src/user-wasm-runtime.ts
-var KernelWasmHostBackend = class {
-  constructor(host, pid) {
-    this.host = host;
-    this.pid = pid;
-  }
-  dispatch(request, heapIn) {
-    return this.host.dispatch(this.pid, request, heapIn);
-  }
-};
-var UserProcessExited = class extends Error {
-  constructor(exitCode) {
-    super(`user process exited with code ${exitCode}`);
-    this.exitCode = exitCode;
-    this.name = "UserProcessExited";
-  }
-};
-var UserWasmRuntime = class {
-  constructor(wasmBytes, backend) {
-    this.wasmBytes = wasmBytes;
-    this.backend = backend;
-  }
-  /** Populated when `run()` begins instantiation. */
-  memory;
-  /**
-   * Instantiate the user wasm, satisfy its WASI imports with the
-   * shim, call `_start`, and return the exit code.
-   *
-   * Returns `0` if `_start` runs to completion via
-   * `proc_exit(0)` (the normal path). Returns whatever code the
-   * user passed to `proc_exit` otherwise. If `_start` returns
-   * without ever calling `proc_exit` — which the hello-wasi-min
-   * fixture never does — returns `0` as well (matches WASI's
-   * "main returning is equivalent to proc_exit(0)" convention).
-   *
-   * Any error that is NOT a [`UserProcessExited`] sentinel
-   * bubbles up to the caller.
-   */
-  async run() {
-    const imports = this.buildImports();
-    const { instance } = await WebAssembly.instantiate(this.wasmBytes, imports);
-    const exports = instance.exports;
-    if (typeof exports._start !== "function") {
-      throw new Error("UserWasmRuntime: user wasm has no `_start` export");
-    }
-    if (!(exports.memory instanceof WebAssembly.Memory)) {
-      throw new Error("UserWasmRuntime: user wasm does not export `memory`");
-    }
-    this.memory = exports.memory;
-    try {
-      exports._start();
-      return 0;
-    } catch (err) {
-      if (err instanceof UserProcessExited) {
-        return err.exitCode;
-      }
-      throw err;
-    }
-  }
-  /**
-   * Shared helper for `args_sizes_get` + `environ_sizes_get`.
-   * Both opcodes return (count, buf_size) as two little-endian
-   * u32s in the kernel's heap-out window; this method dispatches,
-   * reads the pair, and writes them into user memory at the two
-   * out-pointers the WASI signature carries.
-   */
-  sizes_get(opcode, countPtr, bufSizePtr) {
-    if (this.memory === void 0) return ERRNO.EINVAL;
-    const { response, heapOut } = this.backend.dispatch({
-      opcode,
-      requestId: 0,
-      heapPtr: 0,
-      heapLen: 8
-    });
-    if (response.status !== 0) return -response.status;
-    const readView = new DataView(
-      heapOut.buffer,
-      heapOut.byteOffset,
-      heapOut.byteLength
-    );
-    const count = readView.getUint32(0, true);
-    const bufSize = readView.getUint32(4, true);
-    const writeView = new DataView(this.memory.buffer);
-    writeView.setUint32(countPtr, count, true);
-    writeView.setUint32(bufSizePtr, bufSize, true);
-    return 0;
-  }
-  /**
-   * Build the `wasi_snapshot_preview1` import namespace the user
-   * wasm expects. Each function closes over `this` so it can
-   * reach the user's memory (for iovec reads + nwritten writes)
-   * and the backend (for syscall dispatch).
-   */
-  buildImports() {
-    const shim = {
-      // WASI `fd_write`.
-      //
-      // Signature (lowered):
-      //   (fd: i32, iovs_ptr: i32, iovs_len: i32, nwritten_ptr: i32) -> errno: i32
-      //
-      // Iovec layout at `iovs_ptr + i*8`:
-      //   [0..4]  = buf (i32 pointer into user memory)
-      //   [4..8]  = buf_len (u32)
-      //
-      // We concatenate every iov's bytes into one flat Uint8Array
-      // and submit as a single PMos `FD_WRITE` syscall. The kernel
-      // can't see the gather list because the PMos opcode API
-      // carries a single contiguous heap payload per request; the
-      // shim absorbs the scatter-gather complexity on this side.
-      //
-      // Errno mapping: PMos `Response.status` is the negated
-      // errno (-EBADF, -EINVAL, ...). WASI expects the positive
-      // errno. We negate back.
-      fd_write: (fd, iovsPtr, iovsLen, nwrittenPtr) => {
-        if (this.memory === void 0) {
-          return ERRNO.EINVAL;
-        }
-        const readView = new DataView(this.memory.buffer);
-        const gathered = [];
-        let total = 0;
-        for (let i = 0; i < iovsLen; i += 1) {
-          const iovBase = iovsPtr + i * 8;
-          const bufPtr = readView.getUint32(iovBase, true);
-          const bufLen = readView.getUint32(iovBase + 4, true);
-          const src = new Uint8Array(this.memory.buffer, bufPtr, bufLen);
-          gathered.push(new Uint8Array(src));
-          total += bufLen;
-        }
-        const payload = new Uint8Array(total);
-        {
-          let offset = 0;
-          for (const buf of gathered) {
-            payload.set(buf, offset);
-            offset += buf.length;
-          }
-        }
-        const request = {
-          opcode: OP_WASI.FD_WRITE,
-          // The runtime doesn't yet track per-syscall ids. A
-          // future slice with concurrent in-flight requests will
-          // need a monotonic counter here.
-          requestId: 0,
-          arg0: fd,
-          heapPtr: 0,
-          heapLen: total
-        };
-        const { response } = this.backend.dispatch(request, payload);
-        if (response.status !== 0) {
-          return -response.status;
-        }
-        const writeView = new DataView(this.memory.buffer);
-        writeView.setUint32(nwrittenPtr, Number(response.value), true);
-        return 0;
-      },
-      // WASI `fd_read`.
-      //
-      // Signature (lowered):
-      //   (fd: i32, iovs_ptr: i32, iovs_len: i32, nread_ptr: i32) -> errno: i32
-      //
-      // Iovec layout at `iovs_ptr + i*8`:
-      //   [0..4]  = buf (i32 pointer into user memory; writable
-      //                  destination for this iovec's slice)
-      //   [4..8]  = buf_len (u32, capacity)
-      //
-      // Strategy: sum every iovec's `buf_len` into a single total
-      // capacity, dispatch ONE `FD_READ` syscall with that
-      // capacity, and then distribute the returned bytes across
-      // the iovecs in order (filling each up to its own capacity
-      // before moving to the next). This mirrors the `fd_write`
-      // path that gather-concatenates user buffers into one
-      // payload — the PMos opcode API carries a single contiguous
-      // heap window per request, so scatter-gather lives entirely
-      // on this side.
-      //
-      // Zero-length reads (iovs_len == 0 or every buf_len == 0)
-      // short-circuit to `nread = 0` without calling the kernel,
-      // matching the WASI contract that a zero-capacity read is
-      // a trivial success.
-      fd_read: (fd, iovsPtr, iovsLen, nreadPtr) => {
-        if (this.memory === void 0) {
-          return ERRNO.EINVAL;
-        }
-        let view = new DataView(this.memory.buffer);
-        const iovecs = [];
-        let totalCapacity = 0;
-        for (let i = 0; i < iovsLen; i += 1) {
-          const iovBase = iovsPtr + i * 8;
-          const bufPtr = view.getUint32(iovBase, true);
-          const bufLen = view.getUint32(iovBase + 4, true);
-          iovecs.push({ ptr: bufPtr, len: bufLen });
-          totalCapacity += bufLen;
-        }
-        if (totalCapacity === 0) {
-          view.setUint32(nreadPtr, 0, true);
-          return 0;
-        }
-        const { response, heapOut } = this.backend.dispatch({
-          opcode: OP_WASI.FD_READ,
-          requestId: 0,
-          arg0: fd,
-          heapPtr: 0,
-          heapLen: totalCapacity
-        });
-        if (response.status !== 0) {
-          return -response.status;
-        }
-        const nread = Number(response.value);
-        let offset = 0;
-        const writeBuf = new Uint8Array(this.memory.buffer);
-        for (const iov of iovecs) {
-          if (offset >= nread) break;
-          const chunk = Math.min(iov.len, nread - offset);
-          if (chunk === 0) continue;
-          writeBuf.set(
-            heapOut.subarray(offset, offset + chunk),
-            iov.ptr
-          );
-          offset += chunk;
-        }
-        view = new DataView(this.memory.buffer);
-        view.setUint32(nreadPtr, nread, true);
-        return 0;
-      },
-      // WASI `path_open`.
-      //
-      // Signature (lowered):
-      //   path_open(
-      //     dirfd:     i32,  // directory fd (ignored — we don't
-      //                      //   do preopens; every path is
-      //                      //   absolute)
-      //     dirflags:  i32,  // symlink-follow flags (ignored
-      //                      //   in v1)
-      //     path_ptr:  i32,
-      //     path_len:  i32,
-      //     oflags:    i32,  // CREAT / TRUNC / DIRECTORY / EXCL
-      //                      //   — not wired on the PMos kernel
-      //                      //   side (`Kernel::path_open` takes
-      //                      //   only `FdFlags`), ignored for now
-      //     rights_base:       i64, // ignored (v1 rights model)
-      //     rights_inheriting: i64, // ignored
-      //     fdflags:   i32,  // APPEND / NONBLOCK / ... WASI bits
-      //                      //   don't line up with PMos FdFlags
-      //                      //   bits (different positions);
-      //                      //   v1 userland passes 0 and the
-      //                      //   shim passes 0 through
-      //     fd_out_ptr: i32, // i32 out-pointer for the new fd
-      //   ) -> errno: i32
-      //
-      // The PMos `PATH_OPEN` opcode carries only `flags` (u32)
-      // and a UTF-8 `path` on the heap, so the shim ignores
-      // every argument WASI has that the kernel doesn't yet
-      // care about. When a future slice wires the other bits
-      // (preopens for `/home/user`, oflags for O_CREAT, the
-      // rights model for sandboxed apps), each becomes a new
-      // decode step here — no wire-format break because the
-      // kernel's `FD_READ` / `FD_WRITE` semantics are
-      // unchanged.
-      path_open: (_dirfd, _dirflags, pathPtr, pathLen, _oflags, _rightsBase, _rightsInheriting, _fdflags, fdOutPtr) => {
-        if (this.memory === void 0) {
-          return ERRNO.EINVAL;
-        }
-        const pathBytes = new Uint8Array(
-          this.memory.buffer,
-          pathPtr,
-          pathLen
-        );
-        const pathCopy = new Uint8Array(pathBytes);
-        const { response } = this.backend.dispatch(
-          {
-            opcode: OP_WASI.PATH_OPEN,
-            requestId: 0,
-            arg0: 0,
-            // FdFlags::EMPTY — WASI fdflags not yet wired
-            heapPtr: 0,
-            heapLen: pathLen
-          },
-          pathCopy
-        );
-        if (response.status !== 0) {
-          return -response.status;
-        }
-        const view = new DataView(this.memory.buffer);
-        view.setUint32(fdOutPtr, Number(response.value), true);
-        return 0;
-      },
-      // WASI `proc_exit`.
-      //
-      // Signature: (rval: i32) -> never.
-      //
-      // Throws a `UserProcessExited` sentinel that the runtime's
-      // `run()` method catches. The wasm instance's _start frame
-      // is torn down as the throw unwinds through it — exactly
-      // the semantics WASI specifies.
-      proc_exit: (rval) => {
-        throw new UserProcessExited(rval);
-      },
-      // WASI `args_sizes_get` / `environ_sizes_get`.
-      //
-      // Signature: (argc_or_envc_ptr: i32, buf_size_ptr: i32) -> errno.
-      //
-      // Dispatches the PMos opcode with an 8-byte heap-out window,
-      // reads the two u32s the kernel wrote, and stores them at the
-      // user-memory out-pointers. v1 always reports `(0, 0)`; a
-      // future slice that attaches real argv/envp to `SpawnArgs`
-      // changes only the kernel handler — this shim stays intact.
-      args_sizes_get: (argcPtr, bufSizePtr) => {
-        return this.sizes_get(OP_WASI.ARGS_SIZES_GET, argcPtr, bufSizePtr);
-      },
-      environ_sizes_get: (envcPtr, bufSizePtr) => {
-        return this.sizes_get(OP_WASI.ENVIRON_SIZES_GET, envcPtr, bufSizePtr);
-      },
-      // WASI `args_get` / `environ_get`.
-      //
-      // Signature: (argv_ptr: i32, argv_buf_ptr: i32) -> errno.
-      //
-      // v1 returns an empty list, so there's nothing for the shim
-      // to write into user memory — the kernel handler is a no-op
-      // success. The out-pointers are accepted and ignored; when
-      // argc transitions to non-zero, the handler + this shim gain
-      // a pointer-table build step in lockstep.
-      args_get: (_argvPtr, _argvBufPtr) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.ARGS_GET,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        return response.status !== 0 ? -response.status : 0;
-      },
-      environ_get: (_envPtr, _envBufPtr) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.ENVIRON_GET,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        return response.status !== 0 ? -response.status : 0;
-      },
-      // WASI `fd_fdstat_get`.
-      //
-      // Signature: (fd: i32, buf_ptr: i32) -> errno.
-      //
-      // Dispatches FD_FDSTAT_GET with a 24-byte heap-out window,
-      // then copies the 24 bytes of fdstat_t from the heap scratch
-      // into user memory at `buf_ptr`. The bytes come out
-      // already-laid-out by the kernel handler: filetype (byte 0),
-      // _pad (1), fs_flags (2..4), _pad (4..8), fs_rights_base
-      // (8..16), fs_rights_inheriting (16..24).
-      fd_fdstat_get: (fd, bufPtr) => {
-        if (this.memory === void 0) return ERRNO.EINVAL;
-        const { response, heapOut } = this.backend.dispatch({
-          opcode: OP_WASI.FD_FDSTAT_GET,
-          requestId: 0,
-          arg0: fd,
-          heapPtr: 0,
-          heapLen: 24
-        });
-        if (response.status !== 0) return -response.status;
-        const writeBuf = new Uint8Array(this.memory.buffer);
-        writeBuf.set(heapOut.subarray(0, 24), bufPtr);
-        return 0;
-      },
-      // WASI `fd_prestat_get`.
-      //
-      // Signature: (fd: i32, buf_ptr: i32) -> errno.
-      //
-      // The kernel always returns -EBADF (no preopens in v1). The
-      // shim doesn't touch user memory — `buf_ptr` would only be
-      // written on success. WASI's preopen-discovery loop sees
-      // EBADF at the first probe and terminates.
-      fd_prestat_get: (fd, _bufPtr) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.FD_PRESTAT_GET,
-          requestId: 0,
-          arg0: fd,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        return -response.status;
-      }
-    };
-    const pmosExtShim = {
-      // `proc_spawn(path_ptr, path_len, caps: u64) -> i32`
-      //
-      // Reads the binary path from user memory, packs a
-      // `PROC_SPAWN` manifest (path + caps), dispatches the
-      // opcode through the backend. Returns:
-      //
-      //   * Positive pid on success (new child process).
-      //   * Negative errno on failure — already negated on the
-      //     Rust side (`Response.status` carries `-errno`), so
-      //     we just pass it through.
-      //
-      // The child doesn't actually *run* here: the kernel's
-      // PROC_SPAWN handler queues a pending spawn via the
-      // host's default `onSpawnProcess` callback, and the
-      // runtime's caller (usually `KernelWasmHost.
-      // drainPendingSpawns`) picks it up after `_start`
-      // returns. This is the reentrancy story: a parent that
-      // calls `proc_spawn` mid-run doesn't block waiting for
-      // the child; it gets a pid back and keeps running, and
-      // the child executes once the parent exits and the drain
-      // loop moves on.
-      proc_spawn: (pathPtr, pathLen, caps) => {
-        if (this.memory === void 0) {
-          return -ERRNO.EINVAL;
-        }
-        const pathBytes = new Uint8Array(
-          this.memory.buffer,
-          pathPtr,
-          pathLen
-        );
-        const path = new TextDecoder().decode(pathBytes);
-        const manifest = encodeSpawnManifest({ path, caps });
-        const { response } = this.backend.dispatch(
-          {
-            opcode: OP_EXT.PROC_SPAWN,
-            requestId: 0,
-            args: manifest.args,
-            heapPtr: 0,
-            heapLen: manifest.heap.length
-          },
-          manifest.heap
-        );
-        if (response.status !== 0) {
-          return response.status;
-        }
-        return Number(response.value);
-      },
-      // `ipc_socket(ty: i32) -> i32`
-      //
-      // Create an unbound socket. Returns the new fd (positive)
-      // or negative errno. `ty` is 0 = Stream, 1 = Dgram; any
-      // other value returns -EINVAL.
-      ipc_socket: (ty) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_EXT.IPC_SOCKET,
-          requestId: 0,
-          arg0: ty,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        if (response.status !== 0) return response.status;
-        return Number(response.value);
-      },
-      // `ipc_bind(fd: i32, path_ptr: i32, path_len: i32) -> i32`
-      //
-      // Bind an unbound socket fd to the kernel-visible path
-      // the caller has written into user memory at (path_ptr,
-      // path_len). Returns 0 on success, negative errno on
-      // failure (EADDRINUSE, EBADF, EINVAL for bad fd/path/state).
-      ipc_bind: (fd, pathPtr, pathLen) => {
-        if (this.memory === void 0) return -ERRNO.EINVAL;
-        const pathBytes = new Uint8Array(
-          this.memory.buffer,
-          pathPtr,
-          pathLen
-        );
-        const pathCopy = new Uint8Array(pathBytes);
-        const { response } = this.backend.dispatch(
-          {
-            opcode: OP_EXT.IPC_BIND,
-            requestId: 0,
-            arg0: fd,
-            heapPtr: 0,
-            heapLen: pathLen
-          },
-          pathCopy
-        );
-        return response.status;
-      },
-      // `ipc_listen(fd: i32, backlog: i32) -> i32`
-      //
-      // Transition a bound socket to listening. Returns 0 on
-      // success, negative errno on failure (EINVAL for bad
-      // state, EBADF for bad fd).
-      ipc_listen: (fd, backlog) => {
-        const args = new Uint8Array(16);
-        const view = new DataView(args.buffer);
-        view.setUint32(0, fd, true);
-        view.setUint32(4, backlog, true);
-        const { response } = this.backend.dispatch({
-          opcode: OP_EXT.IPC_LISTEN,
-          requestId: 0,
-          args,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        return response.status;
-      },
-      // `ipc_connect(fd: i32, path_ptr: i32, path_len: i32) -> i32`
-      //
-      // Connect an unbound socket to the listener at `path`.
-      // Returns 0 on success, negative errno on failure
-      // (ECONNREFUSED for unbound path, EBADF for bad fd,
-      // EINVAL for bad state).
-      ipc_connect: (fd, pathPtr, pathLen) => {
-        if (this.memory === void 0) return -ERRNO.EINVAL;
-        const pathBytes = new Uint8Array(
-          this.memory.buffer,
-          pathPtr,
-          pathLen
-        );
-        const pathCopy = new Uint8Array(pathBytes);
-        const { response } = this.backend.dispatch(
-          {
-            opcode: OP_EXT.IPC_CONNECT,
-            requestId: 0,
-            arg0: fd,
-            heapPtr: 0,
-            heapLen: pathLen
-          },
-          pathCopy
-        );
-        return response.status;
-      },
-      // `ipc_accept(listener_fd: i32) -> i32`
-      //
-      // Accept one pending connection from the listener.
-      // Returns the new server-side fd (positive) or negative
-      // errno (EAGAIN if no client pending, EBADF for bad fd,
-      // EINVAL if the fd isn't a listening socket).
-      ipc_accept: (listenerFd) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_EXT.IPC_ACCEPT,
-          requestId: 0,
-          arg0: listenerFd,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        if (response.status !== 0) return response.status;
-        return Number(response.value);
-      },
-      // `display_bind() -> i32`
-      //
-      // Bind the kernel-wide `/run/display` listening socket
-      // with the kernel's `Cap::DisplayServer` check. Returns
-      // the listener fd (positive) or negative errno —
-      // typically `-ENOTCAPABLE` if the caller doesn't hold
-      // `DisplayServer`, or `-EADDRINUSE` if another server
-      // is already bound.
-      display_bind: () => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_EXT.DISPLAY_BIND,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        if (response.status !== 0) return response.status;
-        return Number(response.value);
-      },
-      // `display_connect() -> i32`
-      //
-      // Connect to the `/run/display` listener with the
-      // kernel's `Cap::DisplayClient` check. Returns the
-      // connected client-side fd (positive) or negative errno
-      // — typically `-ENOTCAPABLE` if the caller lacks
-      // `DisplayClient`, or `-ECONNREFUSED` if no display
-      // server is bound.
-      display_connect: () => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_EXT.DISPLAY_CONNECT,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        if (response.status !== 0) return response.status;
-        return Number(response.value);
-      }
-    };
-    return {
-      wasi_snapshot_preview1: shim,
-      pmos_ext: pmosExtShim
-    };
-  }
-};
-
 // src/kernel-wasm-host.ts
 var KernelWasmHost = class _KernelWasmHost {
   // Note: the class deliberately does NOT retain the caller's
   // `KernelWasmHostOptions` past construction. Every field of that
   // options bag is captured by the host-import closures built in
   // `create()`. The only state the class itself owns is the WASM
-  // exports record, the pending-spawn queue (legacy; populated by the
-  // binaryRegistry-only default `onSpawnProcess`), and the shared
-  // 32-byte wake slot every user Worker + the main thread bumps to
-  // wake the kernel's dispatch loop.
-  constructor(exports, pendingSpawns, wakeBuffer) {
+  // exports record and the shared 32-byte wake slot every user
+  // Worker + the main thread bumps to wake the kernel's dispatch
+  // loop.
+  constructor(exports, wakeBuffer) {
     this.exports = exports;
-    this.pendingSpawns = pendingSpawns;
     this.wakeBuffer = wakeBuffer;
     this.wakeView = new Int32Array(wakeBuffer, 0, 8);
   }
-  /** Spawn history, appended to by `drainPendingSpawns`. */
-  spawnHistory = [];
   /** `Int32Array` view over [`wakeBuffer`]; index 0 is the wake slot. */
   wakeView;
   /**
@@ -1011,7 +409,6 @@ var KernelWasmHost = class _KernelWasmHost {
    */
   static async create(wasmBytes, options = {}) {
     let memory;
-    const pendingSpawns = [];
     const binaryRegistry = options.binaryRegistry;
     const kernelWorkerChannel = options.kernelWorkerChannel;
     const resolvedOnSpawnProcess = options.onSpawnProcess ?? (binaryRegistry !== void 0 && kernelWorkerChannel !== void 0 ? (pid, path) => {
@@ -1029,13 +426,6 @@ var KernelWasmHost = class _KernelWasmHost {
         path,
         wasmBytes: wasmBytes2
       });
-      return { ok: true };
-    } : binaryRegistry !== void 0 ? (pid, path) => {
-      const bytes = binaryRegistry.get(path);
-      if (bytes === void 0) {
-        return { ok: false, errno: ERRNO.ENOENT };
-      }
-      pendingSpawns.push({ pid, path, bytes });
       return { ok: true };
     } : void 0);
     const randomBytes = options.randomBytes ?? ((out) => {
@@ -1122,7 +512,7 @@ var KernelWasmHost = class _KernelWasmHost {
     } catch {
       wakeBuffer = new ArrayBuffer(32);
     }
-    return new _KernelWasmHost(exports, pendingSpawns, wakeBuffer);
+    return new _KernelWasmHost(exports, wakeBuffer);
   }
   // ---- process lifecycle --------------------------------------------
   /**
@@ -1309,63 +699,6 @@ var KernelWasmHost = class _KernelWasmHost {
     return 0;
   }
   // ---- Kernel interface --------------------------------------------
-  // ---- pending-spawn drain -----------------------------------------
-  /**
-   * Run every queued spawn to completion. Pops one pending spawn
-   * at a time, builds a [`UserWasmRuntime`] around its bytes +
-   * a [`KernelWasmHostBackend`] bound to the spawn's pid, calls
-   * `run()`, waits for it to return, then loops. If a running
-   * child queues more spawns (by issuing its own `PROC_SPAWN`
-   * syscalls), those are picked up on subsequent loop iterations.
-   *
-   * Sequential by design for the in-process slice: one runtime
-   * runs at a time, the kernel's scratch region is never
-   * contended, and `drainPendingSpawns` returns only when every
-   * transitive child has exited. A future cross-thread slice
-   * will replace this with a real multi-Worker scheduler that
-   * runs children concurrently in their own dedicated Web
-   * Workers; this method's return semantics become "all
-   * currently-known children have reached a checkpoint", not
-   * "all children have exited".
-   *
-   * Only meaningful when the host was constructed with a
-   * `binaryRegistry` (or a caller-supplied `onSpawnProcess` that
-   * also pushes into the queue — unusual but supported if the
-   * caller wants a custom lookup path that still uses
-   * `drainPendingSpawns` as the execution engine).
-   *
-   * Exit codes are ignored today. A follow-up slice will wire
-   * `proc_wait` into the kernel so the parent can reap children
-   * and observe their exit status; at that point this method
-   * will need to drive the reap path.
-   */
-  async drainPendingSpawns() {
-    while (this.pendingSpawns.length > 0) {
-      const spawn = this.pendingSpawns.shift();
-      const backend = new KernelWasmHostBackend(this, spawn.pid);
-      const runtime = new UserWasmRuntime(spawn.bytes, backend);
-      const exitCode = await runtime.run();
-      this.spawnHistory.push({ pid: spawn.pid, path: spawn.path, exitCode });
-    }
-  }
-  /**
-   * History of every spawn that `drainPendingSpawns` has run,
-   * in drain order. Each entry records the spawn's pid, binary
-   * path, and exit code. Lets tests assert on per-child success
-   * without having to reach into the runtime directly — the
-   * `drainPendingSpawns` method itself doesn't return per-child
-   * codes because in the eventual cross-thread design, children
-   * run concurrently and don't have a well-ordered "return"
-   * point. This history is a test-only affordance that works
-   * for the sequential in-process model.
-   */
-  get spawnHistoryEntries() {
-    return this.spawnHistory;
-  }
-  /** True iff at least one spawn is queued and not yet run. */
-  get hasPendingSpawns() {
-    return this.pendingSpawns.length > 0;
-  }
   /**
    * Push bytes into a kernel device's input ring. Implements the
    * tight `Kernel` interface the existing driver scaffold uses.
@@ -2372,7 +1705,6 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
       throw e;
     }
   }
-  const useMultiProcess = config.enableMultiProcessSpawn === true || options.enableMultiProcessSpawn === true;
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -2385,13 +1717,11 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
       messaging.postMessage({ kind: "panic", message });
     },
     ...registry !== void 0 ? { binaryRegistry: registry } : {},
-    ...useMultiProcess ? {
-      kernelWorkerChannel: {
-        postMessage: (msg) => {
-          messaging.postMessage(msg);
-        }
+    kernelWorkerChannel: {
+      postMessage: (msg) => {
+        messaging.postMessage(msg);
       }
-    } : {}
+    }
   });
   const scaffold = bootKernelWorker({
     kernel: host,
@@ -2400,14 +1730,12 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle) {
       messaging.postMessage(out);
     }
   });
-  if (useMultiProcess) {
-    messaging.postMessage({
-      kind: "kernel:wake-slot",
-      sab: host.wakeSlot.buffer
-    });
-  }
+  messaging.postMessage({
+    kind: "kernel:wake-slot",
+    sab: host.wakeSlot.buffer
+  });
   if (config.bootBinary !== void 0) {
-    await runBootBinary(host, config.bootBinary, pidMap, lifecycle, useMultiProcess);
+    await runBootBinary(host, config.bootBinary, pidMap, lifecycle);
   }
   return { scaffold, host };
 }
@@ -2434,7 +1762,7 @@ async function fetchBinaryRegistry(fetcher) {
   );
   return new Map(entries);
 }
-async function runBootBinary(host, bootBinary, pidMap, lifecycle, useMultiProcess) {
+async function runBootBinary(host, bootBinary, pidMap, lifecycle) {
   const bootstrapPid = host.registerProcess(CAPSET_ALL);
   host.installConsoleFd(bootstrapPid, 0);
   host.installConsoleFd(bootstrapPid, 1);
@@ -2459,10 +1787,6 @@ async function runBootBinary(host, bootBinary, pidMap, lifecycle, useMultiProces
     throw new Error(
       `kernel-worker: PROC_SPAWN(${bootBinary}) failed with status ${response.status}`
     );
-  }
-  if (!useMultiProcess) {
-    await host.drainPendingSpawns();
-    return;
   }
   await host.startDispatchLoop({
     pidSource: () => pidMap,

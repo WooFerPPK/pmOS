@@ -79,10 +79,6 @@ import {
   type SyscallResponse,
   DEV,
 } from "./shared/syscall";
-import {
-  KernelWasmHostBackend,
-  UserWasmRuntime,
-} from "./user-wasm-runtime";
 
 // ---- Export surface --------------------------------------------------
 
@@ -185,19 +181,21 @@ export interface KernelWasmHostOptions {
    * `PROC_SPAWN`, and returns a [`SpawnOutcome`] describing whether
    * the host accepted the spawn request.
    *
-   * When [`binaryRegistry`](#binaryregistry) is set and this
-   * callback is NOT, a default implementation is installed that
-   * looks the path up in the registry, queues the spawn for
-   * [`KernelWasmHost.drainPendingSpawns`] to execute later, and
-   * returns `{ ok: true }` on hit or `{ ok: false, errno: ENOENT }`
-   * on miss. Callers that want fully custom spawn semantics
-   * override this.
+   * When [`binaryRegistry`](#binaryregistry) AND
+   * [`kernelWorkerChannel`](#kernelworkerchannel) are BOTH set and
+   * this callback is NOT, a default implementation is installed
+   * that looks the path up in the registry, posts
+   * `{kind:"proc:spawn", pid, path, wasmBytes}` on the channel for
+   * the main-thread spawn router to handle, and returns
+   * `{ ok: true }` on hit or `{ ok: false, errno: ENOENT }` on
+   * miss. Callers that want fully custom spawn semantics override
+   * this.
    *
-   * When neither this callback nor a binary registry is set, the
-   * host accepts every spawn with `{ ok: true }` but never
-   * actually runs anything — the pid exists, it just has no
-   * backing process. Useful for the earlier slices that tested
-   * the seam but not the execution.
+   * When neither this callback nor the `binaryRegistry +
+   * kernelWorkerChannel` pair is set, the host accepts every spawn
+   * with `{ ok: true }` but never actually runs anything — the pid
+   * exists, it just has no backing process. Useful for tests that
+   * exercise only the seam.
    *
    * Returning `{ ok: false, errno }` triggers the kernel's
    * roll-back path: the new pid is reaped before the `PROC_SPAWN`
@@ -207,26 +205,23 @@ export interface KernelWasmHostOptions {
   /**
    * Map from binary path (e.g. `/usr/bin/hello`) to the wasm bytes
    * for that binary. Used by the default [`onSpawnProcess`]
-   * implementation to look up a binary when the kernel asks for a
-   * spawn. Caller can pass `BufferSource` of any kind (usually
-   * `ArrayBuffer` or `Uint8Array`); the host just forwards the
-   * bytes to `UserWasmRuntime` which in turn passes them to
-   * `WebAssembly.instantiate`.
+   * implementation (which requires [`kernelWorkerChannel`] to also
+   * be set) to look up a binary when the kernel asks for a spawn.
+   * Caller can pass `BufferSource` of any kind (usually
+   * `ArrayBuffer` or `Uint8Array`); the host forwards the bytes
+   * verbatim through the `proc:spawn` message to the main-thread
+   * spawn router.
    *
-   * When set, implies the default queuing `onSpawnProcess` unless
-   * `onSpawnProcess` is explicitly provided (in which case that
-   * callback wins and the registry is ignored — the caller is
-   * responsible for their own lookup).
+   * When [`onSpawnProcess`] is explicitly provided, the registry is
+   * ignored — the caller is responsible for their own lookup.
    */
   readonly binaryRegistry?: ReadonlyMap<string, BufferSource>;
   /**
-   * Optional channel back to the main thread. When present AND
-   * [`binaryRegistry`] is also set AND no explicit [`onSpawnProcess`]
-   * is given, the default spawn handler switches from queuing into
-   * the in-process [`drainPendingSpawns`] to posting a
-   * `{kind:"proc:spawn", pid, path, wasmBytes}` message on this
-   * channel and returning `{ ok: true }` synchronously to the
-   * kernel.
+   * Channel back to the main thread. When present alongside
+   * [`binaryRegistry`] and no explicit [`onSpawnProcess`], the
+   * default spawn handler posts `{kind:"proc:spawn", pid, path,
+   * wasmBytes}` on this channel and returns `{ ok: true }`
+   * synchronously to the kernel.
    *
    * The receiver (the main-thread spawn router from
    * [`bootstrap.ts`]) allocates a fresh SAB, instantiates a user
@@ -236,9 +231,7 @@ export interface KernelWasmHostOptions {
    *
    * Production's `/assets/kernel-worker.js` sets this to a thin
    * wrapper over `self.postMessage`; tests pass a fake that
-   * captures every post. When unset, the legacy in-process drain
-   * path stays live so existing callers don't regress. T235 deletes
-   * the legacy path along with [`drainPendingSpawns`].
+   * captures every post.
    */
   readonly kernelWorkerChannel?: { postMessage(msg: KernelToMain): void };
   /**
@@ -275,20 +268,6 @@ export interface KernelWasmHostOptions {
   readonly onFramebufferMessage?: (msg: unknown) => void;
 }
 
-/** One entry in the [`KernelWasmHost.drainPendingSpawns`] queue. */
-interface PendingSpawn {
-  readonly pid: number;
-  readonly path: string;
-  readonly bytes: BufferSource;
-}
-
-/** A finished spawn — records what ran and how it exited. */
-export interface SpawnHistoryEntry {
-  readonly pid: number;
-  readonly path: string;
-  readonly exitCode: number;
-}
-
 // ---- Dispatch result -------------------------------------------------
 
 /** Decoded response + heap output from one `dispatch` call. */
@@ -309,20 +288,16 @@ export class KernelWasmHost implements Kernel {
   // `KernelWasmHostOptions` past construction. Every field of that
   // options bag is captured by the host-import closures built in
   // `create()`. The only state the class itself owns is the WASM
-  // exports record, the pending-spawn queue (legacy; populated by the
-  // binaryRegistry-only default `onSpawnProcess`), and the shared
-  // 32-byte wake slot every user Worker + the main thread bumps to
-  // wake the kernel's dispatch loop.
+  // exports record and the shared 32-byte wake slot every user
+  // Worker + the main thread bumps to wake the kernel's dispatch
+  // loop.
   private constructor(
     private readonly exports: KernelExports,
-    private readonly pendingSpawns: PendingSpawn[],
     private readonly wakeBuffer: ArrayBufferLike,
   ) {
     this.wakeView = new Int32Array(wakeBuffer, 0, 8);
   }
 
-  /** Spawn history, appended to by `drainPendingSpawns`. */
-  private readonly spawnHistory: SpawnHistoryEntry[] = [];
   /** `Int32Array` view over [`wakeBuffer`]; index 0 is the wake slot. */
   private readonly wakeView: Int32Array;
 
@@ -343,29 +318,16 @@ export class KernelWasmHost implements Kernel {
     // because `memory.grow` detaches the previous buffer.
     let memory: WebAssembly.Memory | undefined;
 
-    // Pending-spawn queue: allocated up front so both the default
-    // `onSpawnProcess` closure and the class-side `drainPendingSpawns`
-    // method share the same array instance. A future cross-thread
-    // slice will replace this in-memory queue with a real Worker-
-    // registry; the shape (pid + path + bytes) is deliberately
-    // small so that migration is mechanical.
-    const pendingSpawns: PendingSpawn[] = [];
-
     // Resolve the `onSpawnProcess` callback. Priority:
     //   1. Explicit `options.onSpawnProcess` wins if provided.
-    //   2. Otherwise, if `options.binaryRegistry` is set AND
-    //      `options.kernelWorkerChannel` is also set, install the
+    //   2. Otherwise, if `options.binaryRegistry` AND
+    //      `options.kernelWorkerChannel` are BOTH set, install the
     //      proc:spawn-posting callback: look up the bytes, post
     //      `{kind:"proc:spawn", pid, path, wasmBytes}` to main, and
     //      return `{ ok: true }` synchronously. The caller
     //      (kernel-worker-entry) then picks up a `proc:sab` response
     //      from main and adds the pid to its dispatch loop.
-    //   3. Otherwise, if `options.binaryRegistry` is set alone, install
-    //      the legacy queuing callback that looks the path up in the
-    //      registry and pushes into `pendingSpawns` for
-    //      `drainPendingSpawns` to execute. Kept for tests + in-process
-    //      composition paths that predate the multi-Worker model.
-    //   4. Otherwise, leave unset (the host import closure treats "no
+    //   3. Otherwise, leave unset (the host import closure treats "no
     //      callback" as accept-and-do-nothing).
     const binaryRegistry = options.binaryRegistry;
     const kernelWorkerChannel = options.kernelWorkerChannel;
@@ -399,16 +361,7 @@ export class KernelWasmHost implements Kernel {
             });
             return { ok: true };
           }
-        : binaryRegistry !== undefined
-          ? (pid: number, path: string): SpawnOutcome => {
-              const bytes = binaryRegistry.get(path);
-              if (bytes === undefined) {
-                return { ok: false, errno: ERRNO.ENOENT };
-              }
-              pendingSpawns.push({ pid, path, bytes });
-              return { ok: true };
-            }
-          : undefined);
+        : undefined);
 
     const randomBytes = options.randomBytes ?? ((out: Uint8Array): void => {
       crypto.getRandomValues(out);
@@ -551,7 +504,7 @@ export class KernelWasmHost implements Kernel {
       wakeBuffer = new ArrayBuffer(32);
     }
 
-    return new KernelWasmHost(exports, pendingSpawns, wakeBuffer);
+    return new KernelWasmHost(exports, wakeBuffer);
   }
 
   // ---- process lifecycle --------------------------------------------
@@ -783,67 +736,6 @@ export class KernelWasmHost implements Kernel {
   }
 
   // ---- Kernel interface --------------------------------------------
-
-  // ---- pending-spawn drain -----------------------------------------
-
-  /**
-   * Run every queued spawn to completion. Pops one pending spawn
-   * at a time, builds a [`UserWasmRuntime`] around its bytes +
-   * a [`KernelWasmHostBackend`] bound to the spawn's pid, calls
-   * `run()`, waits for it to return, then loops. If a running
-   * child queues more spawns (by issuing its own `PROC_SPAWN`
-   * syscalls), those are picked up on subsequent loop iterations.
-   *
-   * Sequential by design for the in-process slice: one runtime
-   * runs at a time, the kernel's scratch region is never
-   * contended, and `drainPendingSpawns` returns only when every
-   * transitive child has exited. A future cross-thread slice
-   * will replace this with a real multi-Worker scheduler that
-   * runs children concurrently in their own dedicated Web
-   * Workers; this method's return semantics become "all
-   * currently-known children have reached a checkpoint", not
-   * "all children have exited".
-   *
-   * Only meaningful when the host was constructed with a
-   * `binaryRegistry` (or a caller-supplied `onSpawnProcess` that
-   * also pushes into the queue — unusual but supported if the
-   * caller wants a custom lookup path that still uses
-   * `drainPendingSpawns` as the execution engine).
-   *
-   * Exit codes are ignored today. A follow-up slice will wire
-   * `proc_wait` into the kernel so the parent can reap children
-   * and observe their exit status; at that point this method
-   * will need to drive the reap path.
-   */
-  async drainPendingSpawns(): Promise<void> {
-    while (this.pendingSpawns.length > 0) {
-      const spawn = this.pendingSpawns.shift()!;
-      const backend = new KernelWasmHostBackend(this, spawn.pid);
-      const runtime = new UserWasmRuntime(spawn.bytes, backend);
-      const exitCode = await runtime.run();
-      this.spawnHistory.push({ pid: spawn.pid, path: spawn.path, exitCode });
-    }
-  }
-
-  /**
-   * History of every spawn that `drainPendingSpawns` has run,
-   * in drain order. Each entry records the spawn's pid, binary
-   * path, and exit code. Lets tests assert on per-child success
-   * without having to reach into the runtime directly — the
-   * `drainPendingSpawns` method itself doesn't return per-child
-   * codes because in the eventual cross-thread design, children
-   * run concurrently and don't have a well-ordered "return"
-   * point. This history is a test-only affordance that works
-   * for the sequential in-process model.
-   */
-  get spawnHistoryEntries(): readonly SpawnHistoryEntry[] {
-    return this.spawnHistory;
-  }
-
-  /** True iff at least one spawn is queued and not yet run. */
-  get hasPendingSpawns(): boolean {
-    return this.pendingSpawns.length > 0;
-  }
 
   /**
    * Push bytes into a kernel device's input ring. Implements the

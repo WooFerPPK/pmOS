@@ -885,6 +885,73 @@ both happen in one JS function with no cross-language hop.
 `Atomics.wait` round-trip is still the dominant cost; JS-side
 ring orchestration is constant-time.
 
+### T235 (M1.6) — SpawnHistoryEntry deleted; composition tests use `runAllSpawns` helper
+
+§11 M1.6 "Files touched" said: "`drainPendingSpawns` and
+`pendingSpawns` queue deleted. `SpawnHistoryEntry` stays (it's
+useful; just not auto-populated by a drain loop anymore)."
+
+That "stays" turned out to be wrong. With the drain deleted, the
+only remaining consumer of `SpawnHistoryEntry` was the
+`KernelWasmHost.spawnHistoryEntries` getter + `spawnHistory`
+private array, and the only code that wrote to the array was
+`drainPendingSpawns` itself. No production caller read the
+history; only the composition tests did, and they read it to
+diagnose a child's exit code. With `runAllSpawns` (the test-local
+replacement) returning a per-child `{pid, path, exitCode}[]`
+directly, the tests no longer need host-side tracking. Keeping
+`SpawnHistoryEntry` + the getter + the array would have been a
+feature that had no caller — so T235 deleted the whole trio
+along with `drainPendingSpawns`.
+
+Also: §11 M1.6 said composition tests live in "`user-wasm-
+runtime.test.ts` and `kernel-wasm-host.test.ts`". Only
+`user-wasm-runtime.test.ts` actually used `drainPendingSpawns`;
+`kernel-wasm-host.test.ts`'s PROC_SPAWN coverage is at the opcode
+level and never touched the drain. The other file needing
+migration was `kernel-worker-entry.test.ts`, which had three
+pre-T233 tests that relied on the legacy
+`!useMultiProcess → drainPendingSpawns` fallback inside
+`runBootBinary`. Those got migrated to the T233 message-driven
+pattern (seed SAB with expected FD_WRITE, post `proc:sab` +
+`proc:exited`, await `whenReady`) rather than the direct
+`KernelWasmHostBackend.dispatch` approach the plan named, because
+the tests exercise the ENTIRE entry flow (fetcher fallback,
+manifest fetching, auto-spawn choreography) and bypassing the
+entry would have stripped the exercise from the test.
+
+**Landed instead**: a test-local `runAllSpawns(kernel, captures)`
+helper + `captureSpawn(registry, captures)` factory at the top of
+`user-wasm-runtime.test.ts`. Composition tests set up a captures
+array + install `onSpawnProcess: captureSpawn(...)` + dispatch
+PROC_SPAWN as before + call `await runAllSpawns(kernel, captures)`
+instead of `await kernel.drainPendingSpawns()`. The helper
+preserves sequential-reentrant semantics (parent runs to
+completion before child; children spawned mid-run append to the
+same captures array the loop is popping from). Tests that asserted
+on `kernel.spawnHistoryEntries` read the helper's return value
+instead.
+
+**Impact on §11 M1.6's "move composition tests" bullet**: mostly
+right but mechanically split three ways: (a) `user-wasm-
+runtime.test.ts` tests — use `runAllSpawns`; (b) `kernel-worker-
+entry.test.ts` pre-T233 tests — use the T233 message-driven
+pattern; (c) `dispatch-loop.test.ts` — already correct (T233
+tests use `startDispatchLoop` with fake pid sources, needing no
+migration beyond a one-line comment refresh).
+
+**Impact on Principle IX budget**: unchanged. Production doesn't
+run composition tests. The helper's UserWasmRuntime instantiation
+cost is only paid in vitest.
+
+**`kernel-worker.js` bundle size**: the removal of
+`drainPendingSpawns` + the legacy path let `kernel-wasm-host.ts`
+drop its `UserWasmRuntime` + `KernelWasmHostBackend` imports
+entirely (the whole user-space WASI shim code path is no longer
+reachable from the kernel Worker bundle). `dist/assets/kernel-
+worker.js` shrinks 80.9 → 56.0 KiB (-25 KiB), a larger
+reduction than anticipated by the plan.
+
 ## Planning Complete
 
 The seam is fully specified. Future sessions execute T230 → T231 →

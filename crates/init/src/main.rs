@@ -3,12 +3,14 @@
 //! In v1 the responsibility is deliberately tiny: announce that
 //! init is alive, spawn `/bin/hello-std` as a demo child via the
 //! PMos extension `proc_spawn` syscall, and exit cleanly so the
-//! drain loop can pick the child up. A real OS init would loop,
-//! reap children, and supervise long-lived services; PMos's
-//! sequential in-process `drainPendingSpawns` can't support a
-//! looping parent yet, so this slice's init is a single-shot
-//! launcher. The looping/supervision behaviour lands when the
-//! Worker-per-pid seam is cut.
+//! dispatch loop can pick the child up. A real OS init would
+//! loop, reap children, and supervise long-lived services; PMos
+//! now has the substrate for that (Worker-per-pid + per-pid SAB
+//! rings landed in T230–T235), but the kernel-side `proc_wait` /
+//! signal-delivery semantics (T075) are still partial, so this
+//! slice's init stays a single-shot launcher. The looping /
+//! supervision behaviour lands when `proc_wait` + the
+//! user-visible `SignalChannel` fd are wired through.
 //!
 //! The crate is a `std` binary: we lean on `println!` for output
 //! and on Rust's normal libc/WASI startup path for argv/environ
