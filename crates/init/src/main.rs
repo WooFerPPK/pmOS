@@ -1,16 +1,18 @@
 //! PID 1 — the first userland program the kernel spawns on boot.
 //!
 //! In v1 the responsibility is deliberately tiny: announce that
-//! init is alive, spawn `/bin/hello-std` as a demo child via the
-//! PMos extension `proc_spawn` syscall, and exit cleanly so the
-//! dispatch loop can pick the child up. A real OS init would
-//! loop, reap children, and supervise long-lived services; PMos
-//! now has the substrate for that (Worker-per-pid + per-pid SAB
-//! rings landed in T230–T235), but the kernel-side `proc_wait` /
-//! signal-delivery semantics (T075) are still partial, so this
-//! slice's init stays a single-shot launcher. The looping /
-//! supervision behaviour lands when `proc_wait` + the
-//! user-visible `SignalChannel` fd are wired through.
+//! init is alive, spawn two fire-and-forget demo children via
+//! the PMos extension `proc_spawn` syscall — first
+//! `/bin/hello-std`, then `/bin/display-server` — and exit
+//! cleanly so the dispatch loop can pick both children up. A
+//! real OS init would loop, reap children, and supervise
+//! long-lived services; PMos now has the substrate for that
+//! (Worker-per-pid + per-pid SAB rings landed in T230–T235), but
+//! the kernel-side `proc_wait` / signal-delivery semantics
+//! (T075) are still partial, so this slice's init stays a
+//! single-shot launcher. The looping / supervision behaviour
+//! lands when `proc_wait` + the user-visible `SignalChannel` fd
+//! are wired through.
 //!
 //! The crate is a `std` binary: we lean on `println!` for output
 //! and on Rust's normal libc/WASI startup path for argv/environ
@@ -47,6 +49,16 @@ fn main() {
         println!("init: proc_spawn /bin/hello-std failed errno={}", -rc);
     } else {
         println!("init spawned hello-std pid={}", rc);
+    }
+
+    const DISPLAY_SERVER: &[u8] = b"/bin/display-server";
+    let rc = unsafe {
+        proc_spawn(DISPLAY_SERVER.as_ptr(), DISPLAY_SERVER.len() as u32, u64::MAX)
+    };
+    if rc < 0 {
+        println!("init: proc_spawn /bin/display-server failed errno={}", -rc);
+    } else {
+        println!("init spawned display-server pid={}", rc);
     }
 
     println!("init exiting");

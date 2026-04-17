@@ -5,15 +5,22 @@
 // `/manifest.json`, registers a synthetic boot-loader pid,
 // dispatches `PROC_SPAWN(/bin/init)`, and `init` runs to
 // completion through the real Rust kernel. Init itself then
-// calls `pmos_ext.proc_spawn("/bin/hello-std")`, which queues
-// hello-std on the drain loop; once init exits, hello-std runs
-// and prints its own payload.
+// fires TWO fire-and-forget `pmos_ext.proc_spawn` calls — first
+// `/bin/hello-std`, then `/bin/display-server` — and exits.
+// The substrate's spawn router creates a dedicated user Worker
+// per child, so init + hello-std + display-server overlap:
+// three concurrent pids, three distinct linear memories, three
+// per-pid SAB rings serviced round-robin by the kernel Worker's
+// dispatch loop.
 //
 // The observable signal is the page console — `bootstrap.ts`
 // in real-kernel mode prefixes every flushed `/dev/console`
 // line with `[real-kernel]`. The test scrapes those lines via
-// `page.on('console', ...)` and asserts the expected ordered
-// sequence from init + hello-std reaches the browser.
+// `page.on('console', ...)` and asserts the expected sequence
+// from init + hello-std + display-server reaches the browser.
+// Ordering is pinned only within each pid (and within init →
+// child, since children start only after `proc_spawn` returns);
+// between the two children, interleaving is expected.
 //
 // The bare URL `/index.html` (no hash) is what a fresh visitor
 // hits, so the test deliberately uses that: if real-kernel is
@@ -33,7 +40,7 @@
 
 import { expect, test } from "@playwright/test";
 
-test("real kernel is the default boot path and runs init -> hello-std", async ({ page }) => {
+test("real kernel is the default boot path and runs init -> hello-std + display-server", async ({ page }) => {
   const consoleLines: string[] = [];
   page.on("console", (msg) => {
     consoleLines.push(msg.text());
@@ -44,24 +51,32 @@ test("real kernel is the default boot path and runs init -> hello-std", async ({
 
   await page.goto("/index.html");
 
-  // Poll until hello-std's line reaches the page. On a local
-  // dev-server the full boot (init → proc_spawn → drain →
-  // hello-std → fd_write → postMessage) completes in ~200 ms;
-  // the 15 s timeout is for cold-start CI.
-  const helloStdLine = () =>
-    consoleLines.find((l) => l.includes("[real-kernel] hello from std")) ??
-    null;
-  await expect.poll(helloStdLine, { timeout: 15_000 }).not.toBeNull();
+  // Poll until display-server's trailing "fb blit ok" line arrives
+  // — that's the last observable signal of a successful boot (it
+  // only prints after every step 1..7 of the display-server flow
+  // succeeds, so its presence implies hello-std's line and every
+  // init line have already landed). On a local dev-server the full
+  // three-pid boot completes in ~300 ms cold; the 15 s timeout is
+  // for cold-start CI.
+  const blitOkLine = () =>
+    consoleLines.find((l) =>
+      l.includes("[real-kernel] display-server fb blit ok"),
+    ) ?? null;
+  await expect.poll(blitOkLine, { timeout: 15_000 }).not.toBeNull();
 
-  // With hello-std observed, init's lines MUST already be present
-  // (the drain loop is sequential: init ran to completion before
-  // hello-std started). Pull them out and assert the ordering +
-  // shape explicitly.
+  // With the trailing display-server line observed, every other
+  // line MUST already be present. Pull the indices and assert the
+  // ordering that IS stable (within a single pid + init → child).
+  // Ordering BETWEEN hello-std and display-server is NOT asserted —
+  // they run concurrently in separate Workers.
   const initStartIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] init starting"),
   );
-  const initSpawnIdx = consoleLines.findIndex((l) =>
+  const initSpawnHelloStdIdx = consoleLines.findIndex((l) =>
     /\[real-kernel\] init spawned hello-std pid=\d+/.test(l),
+  );
+  const initSpawnDisplayServerIdx = consoleLines.findIndex((l) =>
+    /\[real-kernel\] init spawned display-server pid=\d+/.test(l),
   );
   const initExitIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] init exiting"),
@@ -69,11 +84,25 @@ test("real kernel is the default boot path and runs init -> hello-std", async ({
   const helloStdIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] hello from std"),
   );
+  const displayServerStartIdx = consoleLines.findIndex((l) =>
+    l.includes("[real-kernel] display-server starting"),
+  );
+  const displayServerBlitIdx = consoleLines.findIndex((l) =>
+    l.includes("[real-kernel] display-server fb blit ok"),
+  );
 
   expect(initStartIdx).toBeGreaterThanOrEqual(0);
-  expect(initSpawnIdx).toBeGreaterThan(initStartIdx);
-  expect(initExitIdx).toBeGreaterThan(initSpawnIdx);
+  expect(initSpawnHelloStdIdx).toBeGreaterThan(initStartIdx);
+  expect(initSpawnDisplayServerIdx).toBeGreaterThan(initSpawnHelloStdIdx);
+  expect(initExitIdx).toBeGreaterThan(initSpawnDisplayServerIdx);
+  // Children start only after init's proc_spawn returns — init's
+  // "exiting" line is just three more fd_writes + proc_exit, which
+  // finishes long before either child's std startup completes.
   expect(helloStdIdx).toBeGreaterThan(initExitIdx);
+  expect(displayServerStartIdx).toBeGreaterThan(initExitIdx);
+  // Within display-server's own output, "starting" must precede
+  // "fb blit ok" (single pid, sequential prints).
+  expect(displayServerBlitIdx).toBeGreaterThan(displayServerStartIdx);
 
   expect(consoleLines.some((l) => l.includes("real kernel ready"))).toBe(true);
   expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
@@ -81,30 +110,36 @@ test("real kernel is the default boot path and runs init -> hello-std", async ({
   // DOM surface: real-kernel mode renders each captured line into a
   // `<pre id="pmos-real-console">` so the page itself shows the
   // boot output (not just dev tools). The element's text must
-  // include every line hello-std + init produced, in the same
-  // order as the page-console capture above.
+  // include every line all three pids produced.
   const domText = await page.locator("#pmos-real-console").innerText();
   expect(domText).toContain("init starting");
   expect(domText).toMatch(/init spawned hello-std pid=\d+/);
+  expect(domText).toMatch(/init spawned display-server pid=\d+/);
   expect(domText).toContain("init exiting");
   expect(domText).toContain("hello from std");
+  expect(domText).toContain("display-server starting");
+  expect(domText).toContain("display-server fb blit ok");
   expect(domText.indexOf("init starting")).toBeLessThan(
     domText.indexOf("hello from std"),
   );
+  expect(domText.indexOf("display-server starting")).toBeLessThan(
+    domText.indexOf("display-server fb blit ok"),
+  );
 
-  // T234: init and hello-std MUST run in different user Workers, not
-  // sequentially in the kernel Worker's in-process drain loop. The
-  // bootstrap exposes the spawn router's peak `liveWorkers.size` via
-  // `<body data-pmos-peak-live-workers="N">`; init plus hello-std
-  // overlap (init is still printing "init exiting" while hello-std's
-  // Worker is already alive and parked on its first FD_WRITE), so
-  // peak is at least 2. The kernel Worker is NOT counted — only user
-  // Workers under `createSpawnRouter`'s management are.
+  // Three concurrent pids (init + hello-std + display-server) MUST
+  // each live in their own user Worker under `createSpawnRouter`'s
+  // management. `peakLiveWorkers` is the high-water mark of
+  // `router.liveWorkers.size` across every message the bootstrap's
+  // listener observes. The peak reaches 3 during the window where
+  // init has spawned both children and neither has exited yet; this
+  // is the load-bearing evidence that the substrate round-robins
+  // across THREE per-pid SAB rings, not just two. The kernel Worker
+  // is NOT counted — only user Workers under the router's management.
   const peakAttr = await page
     .locator("body")
     .getAttribute("data-pmos-peak-live-workers");
   expect(peakAttr).not.toBeNull();
-  expect(Number(peakAttr)).toBeGreaterThanOrEqual(2);
+  expect(Number(peakAttr)).toBeGreaterThanOrEqual(3);
 
   // T234: the kernel-wake-slot transport landed before any user Worker
   // spawned. Without this, every spawn would race the SAB-allocation

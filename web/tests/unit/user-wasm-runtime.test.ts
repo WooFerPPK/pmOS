@@ -125,6 +125,7 @@ let helloFbBlitWasmBytes: ArrayBuffer;
 let helloInputEchoWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
+let displayServerWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
   const repoRoot = path.resolve(__dirname, "../../..");
@@ -175,6 +176,11 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/init.wasm",
   );
+  // `display-server` is the std bin-target; dashes preserved.
+  const displayServerPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/display-server.wasm",
+  );
 
   for (const p of [
     kernelPath,
@@ -188,6 +194,7 @@ beforeAll(() => {
     helloInputEchoPath,
     helloStdPath,
     initPath,
+    displayServerPath,
   ]) {
     if (!fs.existsSync(p)) {
       throw new Error(
@@ -217,6 +224,7 @@ beforeAll(() => {
   helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   initWasmBytes = loadWasm(initPath);
+  displayServerWasmBytes = loadWasm(displayServerPath);
 });
 
 describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
@@ -1012,34 +1020,36 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(combined).toBe("hello from std\n");
   });
 
-  it("init (std) spawns hello-std via pmos_ext.proc_spawn, child runs after init exits", async () => {
-    // The first proof that a real Rust `std` binary can issue a
-    // PMos extension syscall (not just WASI) and reach a second
-    // std binary through the drain loop. The two-level
-    // composition was already proven with no_std cdylibs in the
-    // earlier `hello-wasi-spawner` test; this is the "both sides
-    // are std" progression: init uses `println!` for every line,
-    // calls `pmos_ext.proc_spawn` through an `extern "C"` block,
-    // and the spawned child is itself a std binary (hello-std)
-    // linking its own libc + WASI startup machinery.
+  it("init (std) spawns hello-std AND display-server via pmos_ext.proc_spawn, both children run after init exits", async () => {
+    // The three-pid substrate slice: init fires two fire-and-forget
+    // `pmos_ext.proc_spawn` calls (first `/bin/hello-std`, then
+    // `/bin/display-server`) and exits. Under `runAllSpawns` (the
+    // vitest composition helper) children run sequentially — init
+    // completes, then hello-std, then display-server — so the
+    // console-line ordering IS stable here. Production (post-T234
+    // / M1) runs children concurrently in separate user Workers;
+    // the Playwright spec in `real-kernel.spec.ts` is the observer
+    // that pins that concurrent shape.
     //
-    // Ordering is load-bearing: `runAllSpawns` is sequential (one
-    // runtime at a time), so hello-std can only start running after
-    // init's `main()` returns. The assertion on the console-line
-    // order is what certifies that guarantee; a concurrent drain
-    // would surface as interleaved output. (Production, post-T234,
-    // uses real user Workers that DO run concurrently — the
-    // composition-test semantics live only in this in-process
-    // `runAllSpawns` helper.)
+    // display-server's fb write is captured through
+    // `onFramebufferWrite` so the IPC round-trip's payload (4 RGBA
+    // pixels: red, green, blue, white) is load-bearing evidence that
+    // every step of the display-server flow (bind + connect +
+    // accept + fd_write + fd_read + path_open + fd_write) succeeded.
     const consoleWrites: Uint8Array[] = [];
+    const fbWrites: Uint8Array[] = [];
     const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/init", initWasmBytes],
       ["/bin/hello-std", helloStdWasmBytes],
+      ["/bin/display-server", displayServerWasmBytes],
     ]);
     const kernel = await KernelWasmHost.create(kernelWasmBytes, {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
+      },
+      onFramebufferWrite: (bytes) => {
+        fbWrites.push(bytes);
       },
       onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
@@ -1074,11 +1084,13 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     const history = await runAllSpawns(kernel, captures);
 
     expect(captures).toHaveLength(0);
-    expect(history).toHaveLength(2);
+    expect(history).toHaveLength(3);
     expect(history[0]!.path).toBe("/bin/init");
     expect(history[0]!.exitCode).toBe(0);
     expect(history[1]!.path).toBe("/bin/hello-std");
     expect(history[1]!.exitCode).toBe(0);
+    expect(history[2]!.path).toBe("/bin/display-server");
+    expect(history[2]!.exitCode).toBe(0);
 
     const combined = new TextDecoder().decode(
       new Uint8Array(
@@ -1088,14 +1100,30 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
         ),
       ),
     );
-    // init writes three lines; hello-std writes one. The pid the
-    // kernel allocates is dynamic, so line 2 matches on prefix.
+    // `runAllSpawns` runs children sequentially, so the line order
+    // is stable: init's 4 lines, then hello-std's 1, then
+    // display-server's 2. The pids the kernel allocates are dynamic
+    // so each "spawned" line matches on prefix.
     const lines = combined.split("\n").filter((l) => l.length > 0);
     expect(lines[0]).toBe("init starting");
     expect(lines[1]).toMatch(/^init spawned hello-std pid=\d+$/);
-    expect(lines[2]).toBe("init exiting");
-    expect(lines[3]).toBe("hello from std");
-    expect(lines).toHaveLength(4);
+    expect(lines[2]).toMatch(/^init spawned display-server pid=\d+$/);
+    expect(lines[3]).toBe("init exiting");
+    expect(lines[4]).toBe("hello from std");
+    expect(lines[5]).toBe("display-server starting");
+    expect(lines[6]).toBe("display-server fb blit ok");
+    expect(lines).toHaveLength(7);
+
+    // display-server's final step writes the IPC-received pixels to
+    // /dev/fb0. One write, 16 bytes, in RGBA order — same payload
+    // the display-server-lite composition test pins.
+    expect(fbWrites).toHaveLength(1);
+    expect(Array.from(fbWrites[0]!)).toEqual([
+      0xff, 0x00, 0x00, 0xff, // red
+      0x00, 0xff, 0x00, 0xff, // green
+      0x00, 0x00, 0xff, 0xff, // blue
+      0xff, 0xff, 0xff, 0xff, // white
+    ]);
   });
 
   it("returns the correct exit code when _start calls proc_exit with a nonzero value", async () => {
