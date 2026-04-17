@@ -367,6 +367,10 @@ function paintBoot(c, rows, animationFrame) {
 }
 function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
+  if (window.location.hash.includes("real-kernel")) {
+    runRealKernelMode();
+    return;
+  }
   const rows = [
     { label: "Cross-origin isolation (COOP/COEP)", status: "pending", detail: "" },
     { label: "SharedArrayBuffer", status: "pending", detail: "" },
@@ -785,6 +789,31 @@ function paintBlitToCanvasFullscreen(c, frame_) {
   ctx.fillRect(0, 0, W, H);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tmp, dx, dy, dw, dh);
+}
+function runRealKernelMode() {
+  console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
+  const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  const consoleHost = new ConsoleHost({
+    worker,
+    bootConfig: {
+      enableConsole: true,
+      enableInput: false,
+      enableFramebuffer: false,
+      useRealKernel: true,
+      bootBinary: "/bin/hello-std"
+    }
+  });
+  consoleHost.onOutput((bytes) => {
+    const text = new TextDecoder().decode(bytes).replace(/\n$/, "");
+    console.log(`[real-kernel] ${text}`);
+  });
+  consoleHost.onLifecycle((event) => {
+    if (event.kind === "ready") {
+      console.log("[pmos-bootstrap] real kernel ready");
+    } else if (event.kind === "panic") {
+      console.error(`[pmos-bootstrap] real kernel panic: ${event.message}`);
+    }
+  });
 }
 function showFallbackMessage(error) {
   document.body.innerHTML = `

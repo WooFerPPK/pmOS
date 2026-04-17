@@ -18,6 +18,7 @@
 // only if the UI wants to surface more status.
 
 import { ConsoleHost } from "./console-host";
+import type { ConsoleLifecycleEvent } from "./console-host";
 import { runEchoCheck } from "./console-check";
 import { FbHost } from "./fb-host";
 import type { FbFrame } from "./fb-host";
@@ -242,6 +243,15 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
 
 function main(): void {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
+
+  // Real-kernel mode is opt-in via URL hash (e.g. `index.html#real-kernel`)
+  // for the duration of the slice that wires `KernelWasmHost` into the
+  // production Worker. The mock-shell + live-terminal flow stays the
+  // default for every other URL.
+  if (window.location.hash.includes("real-kernel")) {
+    runRealKernelMode();
+    return;
+  }
 
   const rows: CheckRow[] = [
     { label: "Cross-origin isolation (COOP/COEP)", status: "pending", detail: "" },
@@ -843,6 +853,42 @@ function paintBlitToCanvasFullscreen(c: Canvas2D, frame_: FbFrame): void {
   ctx.fillRect(0, 0, W, H);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tmp, dx, dy, dw, dh);
+}
+
+/**
+ * Real-kernel boot path: spawns the kernel Worker with
+ * `useRealKernel: true` + `bootBinary: "/bin/hello-std"`, then
+ * forwards every byte the kernel flushes from `/dev/console` to
+ * the page console with a `[real-kernel]` prefix. Playwright
+ * scrapes the page console to assert on the boot binary's
+ * output; once a real terminal-mode wiring lands the prefix
+ * goes away and the bytes flow into the visible terminal
+ * surface instead.
+ */
+function runRealKernelMode(): void {
+  console.log("[pmos-bootstrap] real-kernel mode enabled via URL");
+  const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  const consoleHost = new ConsoleHost({
+    worker,
+    bootConfig: {
+      enableConsole: true,
+      enableInput: false,
+      enableFramebuffer: false,
+      useRealKernel: true,
+      bootBinary: "/bin/hello-std",
+    },
+  });
+  consoleHost.onOutput((bytes: Uint8Array) => {
+    const text = new TextDecoder().decode(bytes).replace(/\n$/, "");
+    console.log(`[real-kernel] ${text}`);
+  });
+  consoleHost.onLifecycle((event: ConsoleLifecycleEvent) => {
+    if (event.kind === "ready") {
+      console.log("[pmos-bootstrap] real kernel ready");
+    } else if (event.kind === "panic") {
+      console.error(`[pmos-bootstrap] real kernel panic: ${event.message}`);
+    }
+  });
 }
 
 function showFallbackMessage(error: string): void {

@@ -2083,11 +2083,24 @@ function bootMockKernel(messaging, config) {
   return scaffold;
 }
 async function bootRealKernel(messaging, config, options) {
-  const bytes = options.kernelWasmBytes;
-  if (bytes === void 0) {
-    const message = "kernel-worker: useRealKernel=true but no kernelWasmBytes injected and Worker-scope fetch is not yet wired";
+  const fetcher = options.fetcher ?? defaultFetcher;
+  let bytes;
+  try {
+    bytes = options.kernelWasmBytes ?? await fetcher("/assets/kernel.wasm");
+  } catch (e) {
+    const message = `kernel-worker: failed to load /assets/kernel.wasm: ${String(e)}`;
     messaging.postMessage({ kind: "panic", message });
-    throw new Error(message);
+    throw e;
+  }
+  let registry = options.binaryRegistry;
+  if (registry === void 0 && config.bootBinary !== void 0) {
+    try {
+      registry = await fetchBinaryRegistry(fetcher);
+    } catch (e) {
+      const message = `kernel-worker: failed to populate binary registry: ${String(e)}`;
+      messaging.postMessage({ kind: "panic", message });
+      throw e;
+    }
   }
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
@@ -2100,7 +2113,7 @@ async function bootRealKernel(messaging, config, options) {
     onPanic: (message) => {
       messaging.postMessage({ kind: "panic", message });
     },
-    ...options.binaryRegistry !== void 0 ? { binaryRegistry: options.binaryRegistry } : {}
+    ...registry !== void 0 ? { binaryRegistry: registry } : {}
   });
   const scaffold = bootKernelWorker({
     kernel: host,
@@ -2113,6 +2126,29 @@ async function bootRealKernel(messaging, config, options) {
     await runBootBinary(host, config.bootBinary);
   }
   return { scaffold, host };
+}
+async function defaultFetcher(url) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} fetching ${url}`);
+  }
+  return res.arrayBuffer();
+}
+async function fetchBinaryRegistry(fetcher) {
+  const manifestBuf = await fetcher("/manifest.json");
+  const manifestJson = new TextDecoder().decode(new Uint8Array(manifestBuf));
+  const manifest = JSON.parse(manifestJson);
+  const binAssets = manifest.assets.filter(
+    (a) => a.startsWith("assets/bin/") && a.endsWith(".wasm")
+  );
+  const entries = await Promise.all(
+    binAssets.map(async (asset) => {
+      const stem = asset.slice("assets/bin/".length, -".wasm".length);
+      const bytes = await fetcher(`/${asset}`);
+      return [`/bin/${stem}`, bytes];
+    })
+  );
+  return new Map(entries);
 }
 async function runBootBinary(host, bootBinary) {
   const initPid = host.registerProcess(CAPSET_ALL);
