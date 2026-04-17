@@ -185,6 +185,9 @@ var FbHost = class {
   }
 };
 
+// src/shared/sab-layout.ts
+var SAB_SIZE = 65536;
+
 // src/shared/input-proto.ts
 var MOUSE_EVENT_SIZE = 20;
 var MouseEventKind = {
@@ -877,8 +880,61 @@ function showPanic(message) {
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", main);
-} else {
-  main();
+function createSpawnRouter(deps) {
+  const live = /* @__PURE__ */ new Map();
+  function reap(pid, code, trap) {
+    const entry = live.get(pid);
+    if (!entry) {
+      return;
+    }
+    live.delete(pid);
+    entry.worker.terminate();
+    deps.kernelWorker.postMessage(
+      trap !== void 0 ? { kind: "proc:exited", pid, code, trap } : { kind: "proc:exited", pid, code }
+    );
+  }
+  return {
+    liveWorkers: live,
+    handleKernelMessage(msg) {
+      if (msg.kind !== "proc:spawn") {
+        return;
+      }
+      const sab = deps.allocSab();
+      const worker = deps.workerFactory();
+      live.set(msg.pid, { worker, sab });
+      worker.addEventListener("message", (ev) => {
+        const m = ev.data;
+        if (m.kind === "exited" && m.pid === msg.pid) {
+          reap(msg.pid, m.code, m.trap);
+        }
+      });
+      worker.addEventListener("error", (ev) => {
+        reap(msg.pid, -1, ev.message ?? "user worker error");
+      });
+      worker.postMessage({
+        kind: "boot",
+        pid: msg.pid,
+        sab,
+        wasmBytes: msg.wasmBytes
+      });
+      deps.kernelWorker.postMessage({ kind: "proc:sab", pid: msg.pid, sab });
+    },
+    terminateAll() {
+      for (const [pid, entry] of live) {
+        entry.worker.terminate();
+        live.delete(pid);
+      }
+    }
+  };
 }
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", main);
+  } else {
+    main();
+  }
+}
+export {
+  SAB_SIZE,
+  createSpawnRouter
+};

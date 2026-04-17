@@ -66,7 +66,25 @@ export type MainToKernel =
   | { readonly kind: "shutdown" }
   | ConsoleInputMessage
   | InputKbdMessage
-  | InputMouseMessage;
+  | InputMouseMessage
+  | {
+      // Main has spawned a user Worker for `pid` and is handing the
+      // kernel its SAB ring view. The kernel's dispatch loop adds the
+      // pid to its pidMap and starts polling the ring.
+      readonly kind: "proc:sab";
+      readonly pid: number;
+      readonly sab: ArrayBufferLike;
+    }
+  | {
+      // Main observed the user Worker for `pid` exit (clean
+      // proc_exit, trap, or script error). The kernel reaps the pid
+      // and removes it from its pidMap. `trap` is set for the abnormal
+      // paths so the kernel can include it in any Diagnostic surface.
+      readonly kind: "proc:exited";
+      readonly pid: number;
+      readonly code: number;
+      readonly trap?: string;
+    };
 
 /** Kernel-worker → main-thread. */
 export type KernelToMain =
@@ -74,4 +92,41 @@ export type KernelToMain =
   | { readonly kind: "panic"; readonly message: string }
   | ConsoleWriteMessage
   | FbSetModeMessage
-  | FbBlitMessage;
+  | FbBlitMessage
+  | {
+      // Kernel has allocated `pid` and needs main to instantiate the
+      // user Worker. Main allocates the SAB, posts `boot` to the new
+      // Worker, posts `proc:sab` back. The kernel pre-fetched
+      // `wasmBytes` from its `binaryRegistry` so main doesn't need
+      // its own copy of the binary table.
+      readonly kind: "proc:spawn";
+      readonly pid: number;
+      readonly path: string;
+      readonly wasmBytes: ArrayBufferLike;
+    };
+
+/**
+ * Main-thread → dedicated user Worker. Each user Worker receives
+ * exactly one `boot` message in its lifetime; the Worker exits after
+ * the wasm `_start` returns or traps and the message channel is then
+ * dead.
+ */
+export type MainToUser = {
+  readonly kind: "boot";
+  readonly pid: number;
+  readonly sab: ArrayBufferLike;
+  readonly wasmBytes: ArrayBufferLike;
+};
+
+/**
+ * Dedicated user Worker → main-thread. The Worker posts exactly one
+ * `exited` message before closing. `trap` is present when the user
+ * wasm trapped or the WASI shim threw a non-`UserProcessExited` error;
+ * for clean `proc_exit(code)` paths only `code` is set.
+ */
+export type UserToMain = {
+  readonly kind: "exited";
+  readonly pid: number;
+  readonly code: number;
+  readonly trap?: string;
+};

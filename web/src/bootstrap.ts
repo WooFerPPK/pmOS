@@ -22,13 +22,19 @@ import type { ConsoleLifecycleEvent } from "./console-host";
 import { runEchoCheck } from "./console-check";
 import { FbHost } from "./fb-host";
 import type { FbFrame } from "./fb-host";
+import { SAB_SIZE } from "./shared/sab-layout";
 import {
   MouseButton,
   MouseButtonState,
   packMouseButton,
   packMouseMotion,
 } from "./shared/input-proto";
-import type { MainToKernel } from "./shared/worker-proto";
+import type {
+  KernelToMain,
+  MainToKernel,
+  MainToUser,
+  UserToMain,
+} from "./shared/worker-proto";
 
 const BOOT_VERSION = "0.1.0-demo";
 
@@ -975,9 +981,166 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-// Go.
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", main);
-} else {
-  main();
+// ---- Main-thread spawn router (T232 / M1.3) ---------------------
+//
+// When the kernel Worker posts `proc:spawn`, main allocates a
+// per-pid SAB, spawns a dedicated user Worker from
+// `/assets/user-worker.js`, posts a `boot {pid, sab, wasmBytes}` to
+// the new Worker, and posts `proc:sab` back to the kernel so the
+// kernel's dispatch loop adds the pid to its pidMap. When the user
+// Worker posts `exited` (or fires an `error` event), main posts
+// `proc:exited` to the kernel and terminates the Worker.
+//
+// T232 lands the router as test-callable plumbing only. The
+// production `runRealKernelMode()` path above is untouched and still
+// uses the kernel's in-process drain. T234 swaps the bootstrap
+// production wiring onto this router and drops the in-process drain
+// for spawned children. The split keeps `real-kernel.spec.ts` green
+// across the M1 sub-slices instead of waiting on the full Worker
+// path to land before any tests can run.
+
+/**
+ * Minimal user-Worker interface — the subset of the dedicated
+ * `Worker` API the spawn router uses. A real `Worker` satisfies this
+ * structurally; tests pass a fake that captures `postMessage` and
+ * exposes injection hooks for `message` / `error` events.
+ */
+export interface UserWorkerLike {
+  postMessage(msg: MainToUser): void;
+  addEventListener(
+    type: "message",
+    listener: (ev: { data: UserToMain }) => void,
+  ): void;
+  addEventListener(
+    type: "error",
+    listener: (ev: { message?: string }) => void,
+  ): void;
+  removeEventListener(
+    type: "message",
+    listener: (ev: { data: UserToMain }) => void,
+  ): void;
+  removeEventListener(
+    type: "error",
+    listener: (ev: { message?: string }) => void,
+  ): void;
+  terminate(): void;
+}
+
+/** Dependencies the spawn router takes at construction. */
+export interface SpawnRouterDeps {
+  /**
+   * Channel back to the kernel Worker. The router posts `proc:sab`
+   * and `proc:exited` here. In production this is the same `Worker`
+   * the bootstrap created for `/assets/kernel-worker.js`.
+   */
+  readonly kernelWorker: { postMessage(msg: MainToKernel): void };
+  /**
+   * Construct a fresh user Worker. In production:
+   * `() => new Worker("/assets/user-worker.js", {type:"module"})`.
+   * Tests inject a fake.
+   */
+  readonly workerFactory: () => UserWorkerLike;
+  /**
+   * Allocate a fresh per-pid SAB. In production:
+   * `() => new SharedArrayBuffer(SAB_SIZE)`. Tests inject a plain
+   * `ArrayBuffer` because vitest under node has no SAB; the layout
+   * math the router cares about is byte-identical against either.
+   */
+  readonly allocSab: () => ArrayBufferLike;
+}
+
+/** A live entry in the router's pid → user-Worker map. */
+export interface SpawnedEntry {
+  readonly worker: UserWorkerLike;
+  readonly sab: ArrayBufferLike;
+}
+
+/** The handle [`createSpawnRouter`] returns. */
+export interface SpawnRouter {
+  /** Forward one `KernelToMain` message into the router. Non-spawn
+   * kinds are silently ignored so the caller can pipe every message
+   * without a discriminator switch. */
+  handleKernelMessage(msg: KernelToMain): void;
+  /** Live pid → user-Worker map. Test-readable; production code
+   * shouldn't mutate it. */
+  readonly liveWorkers: ReadonlyMap<number, SpawnedEntry>;
+  /**
+   * Terminate every live user Worker without posting `proc:exited`.
+   * For the kernel-panic path: the existing panic overlay's reload
+   * timer terminates user Workers so we don't ship a half-alive
+   * system back to the user.
+   */
+  terminateAll(): void;
+}
+
+export function createSpawnRouter(deps: SpawnRouterDeps): SpawnRouter {
+  const live = new Map<number, SpawnedEntry>();
+
+  function reap(pid: number, code: number, trap: string | undefined): void {
+    const entry = live.get(pid);
+    if (!entry) {
+      // Either an `exited` for a pid we never spawned (shouldn't
+      // happen) or a duplicate exit (the user Worker posts exited
+      // AND fires error on the same trap; main side reaps once).
+      return;
+    }
+    live.delete(pid);
+    entry.worker.terminate();
+    deps.kernelWorker.postMessage(
+      trap !== undefined
+        ? { kind: "proc:exited", pid, code, trap }
+        : { kind: "proc:exited", pid, code },
+    );
+  }
+
+  return {
+    liveWorkers: live,
+    handleKernelMessage(msg: KernelToMain): void {
+      if (msg.kind !== "proc:spawn") {
+        return;
+      }
+      const sab = deps.allocSab();
+      const worker = deps.workerFactory();
+      live.set(msg.pid, { worker, sab });
+      worker.addEventListener("message", (ev) => {
+        const m = ev.data;
+        if (m.kind === "exited" && m.pid === msg.pid) {
+          reap(msg.pid, m.code, m.trap);
+        }
+      });
+      worker.addEventListener("error", (ev) => {
+        reap(msg.pid, -1, ev.message ?? "user worker error");
+      });
+      worker.postMessage({
+        kind: "boot",
+        pid: msg.pid,
+        sab,
+        wasmBytes: msg.wasmBytes,
+      });
+      deps.kernelWorker.postMessage({ kind: "proc:sab", pid: msg.pid, sab });
+    },
+    terminateAll(): void {
+      for (const [pid, entry] of live) {
+        entry.worker.terminate();
+        live.delete(pid);
+      }
+    },
+  };
+}
+
+// `SAB_SIZE` is re-exported so the production wiring in T234 can
+// pass `() => new SharedArrayBuffer(SAB_SIZE)` without an extra
+// import alongside `createSpawnRouter`.
+export { SAB_SIZE };
+
+// Go. Gated on `document` so this module is safely importable from
+// vitest tests (which run under node and don't have a DOM). The
+// production esbuild bundle runs in a real browser where `document`
+// is always defined.
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", main);
+  } else {
+    main();
+  }
 }

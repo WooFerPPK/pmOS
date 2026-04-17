@@ -24,6 +24,7 @@ build:
         -p hello-std
     cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
     cd web && npx esbuild src/kernel-worker-entry.ts --bundle --outfile=../build/assets/kernel-worker.js --format=esm
+    cd web && npx esbuild src/user-worker-entry.ts --bundle --outfile=../build/assets/user-worker.js --format=esm
     cd web && npx esbuild src/sw.ts --bundle --outfile=../build/sw.js --format=esm
     cargo run -p xtask -- assemble-dist
 

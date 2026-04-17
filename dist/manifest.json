@@ -25,6 +25,7 @@
     "assets/hello.wasm",
     "assets/kernel-worker.js",
     "assets/kernel.wasm",
+    "assets/user-worker.js",
     "index.html",
     "sw.js"
   ]

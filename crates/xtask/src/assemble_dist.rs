@@ -50,6 +50,11 @@ fn run_inner() -> Result<()> {
         &mut manifest_paths,
     );
     copy_optional(
+        &repo_root.join("build/assets/user-worker.js"),
+        &dist_assets.join("user-worker.js"),
+        &mut manifest_paths,
+    );
+    copy_optional(
         &repo_root.join("build/sw.js"),
         &dist.join("sw.js"),
         &mut manifest_paths,
