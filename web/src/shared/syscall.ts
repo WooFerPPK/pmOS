@@ -111,6 +111,60 @@ export function decodeResponse(bytes: Uint8Array): SyscallResponse {
   };
 }
 
+/**
+ * Encode a [`SyscallResponse`] into the 32-byte little-endian layout
+ * the kernel produces. Padding bytes are zeroed. Inverse of
+ * [`decodeResponse`] and of `Response::to_le_bytes` on the Rust side.
+ *
+ * Used by the SAB-ring servicing path, which reads a decoded response
+ * out of `KernelWasmHost.dispatch` and needs to write it back to the
+ * per-pid SAB response ring in the exact byte layout the user-side
+ * `Sab::try_pop_response` expects.
+ */
+export function encodeResponse(res: SyscallResponse): Uint8Array {
+  const buf = new Uint8Array(SLOT_SIZE);
+  const view = new DataView(buf.buffer);
+  view.setUint32(0, res.requestId, true);
+  view.setInt32(4, res.status, true);
+  view.setBigInt64(8, res.value, true);
+  view.setUint32(16, res.extraLen, true);
+  return buf;
+}
+
+/** Decoded fields of a [`Request`] slot; mirror of [`SyscallRequest`]
+ * but with fully-populated `args` (16 bytes, owned) and explicit
+ * `flags`/`heapPtr`/`heapLen`. Used by the SAB-ring servicing path. */
+export interface DecodedRequest {
+  readonly opcode: number;
+  readonly flags: number;
+  readonly requestId: number;
+  /** The full 16-byte inline args window, copied out of the slot. */
+  readonly args: Uint8Array;
+  readonly heapPtr: number;
+  readonly heapLen: number;
+}
+
+/**
+ * Decode a 32-byte request slot as the inverse of [`encodeRequest`]
+ * and of `Request::from_le_bytes` on the Rust side. The returned
+ * `args` field is a fresh owned `Uint8Array` — it does not alias the
+ * input bytes.
+ */
+export function decodeRequest(bytes: Uint8Array): DecodedRequest {
+  if (bytes.length !== SLOT_SIZE) {
+    throw new Error(`syscall.decodeRequest: expected ${SLOT_SIZE} bytes, got ${bytes.length}`);
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, SLOT_SIZE);
+  return {
+    opcode: view.getUint16(0, true),
+    flags: view.getUint16(2, true),
+    requestId: view.getUint32(4, true),
+    args: bytes.slice(8, 24),
+    heapPtr: view.getUint32(24, true),
+    heapLen: view.getUint32(28, true),
+  };
+}
+
 // ---- Opcode constants -----------------------------------------------
 //
 // Mirror of `abi::wasi` + `abi::ext`. Only the opcodes the dispatcher

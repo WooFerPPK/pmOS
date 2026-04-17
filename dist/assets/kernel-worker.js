@@ -255,6 +255,19 @@ function bootKernelWorker(options) {
   };
 }
 
+// src/shared/sab-layout.ts
+var SAB_SIZE = 65536;
+var OFF_REQ_HEAD = 0;
+var OFF_REQ_TAIL = 4;
+var OFF_RES_HEAD = 8;
+var OFF_RES_TAIL = 12;
+var OFF_REQ_RING = 64;
+var OFF_RES_RING = 16384;
+var OFF_HEAP_SCRATCH = 32768;
+var HEAP_SCRATCH_BYTES = 32768;
+var REQ_SLOT_COUNT = 510;
+var RES_SLOT_COUNT = 510;
+
 // src/shared/syscall.ts
 var SLOT_SIZE = 32;
 function encodeRequest(req) {
@@ -288,6 +301,29 @@ function decodeResponse(bytes) {
     status: view.getInt32(4, true),
     value: view.getBigInt64(8, true),
     extraLen: view.getUint32(16, true)
+  };
+}
+function encodeResponse(res) {
+  const buf = new Uint8Array(SLOT_SIZE);
+  const view = new DataView(buf.buffer);
+  view.setUint32(0, res.requestId, true);
+  view.setInt32(4, res.status, true);
+  view.setBigInt64(8, res.value, true);
+  view.setUint32(16, res.extraLen, true);
+  return buf;
+}
+function decodeRequest(bytes) {
+  if (bytes.length !== SLOT_SIZE) {
+    throw new Error(`syscall.decodeRequest: expected ${SLOT_SIZE} bytes, got ${bytes.length}`);
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, SLOT_SIZE);
+  return {
+    opcode: view.getUint16(0, true),
+    flags: view.getUint16(2, true),
+    requestId: view.getUint32(4, true),
+    args: bytes.slice(8, 24),
+    heapPtr: view.getUint32(24, true),
+    heapLen: view.getUint32(28, true)
   };
 }
 var OP_WASI = {
@@ -1143,6 +1179,106 @@ var KernelWasmHost = class _KernelWasmHost {
       heapOut = new Uint8Array(src);
     }
     return { response, heapOut };
+  }
+  /**
+   * Service one pending request on the per-pid SAB ring.
+   *
+   * Pops one request out of the SAB's request ring, calls
+   * [`dispatch`] on behalf of `pid`, pushes the response into the
+   * SAB's response ring, and copies any heap output back into the
+   * SAB's heap scratch region at the request's declared `heap_ptr`
+   * offset.
+   *
+   * Return values:
+   *
+   *   * `0` — one request was serviced.
+   *   * `1` — the request ring was empty; no work done.
+   *
+   * `sab` is a `Uint8Array` view over the full `SAB_SIZE` bytes of
+   * the per-pid `SharedArrayBuffer`. Header atomics go through an
+   * `Int32Array` view constructed over the same backing; slot bytes
+   * are read and written directly.
+   *
+   * Wake-slot semaphores (`OFF_USER_WAIT_SLOT`,
+   * `OFF_KERNEL_WAIT_SLOT`) are intentionally NOT touched by this
+   * method — those are the kernel-Worker loop's concern. The caller
+   * is responsible for notifying the user after the response lands.
+   *
+   * Design note — why this orchestration lives in TS rather than in
+   * a kernel-side `kernel_service_sab` export (as
+   * `multi-process-plan.md §2 Changing` speculated): the kernel's
+   * WASM linear memory is a distinct address space from the SAB; a
+   * `*mut u8` pointing into the SAB is not a valid pointer in the
+   * kernel's memory, so the kernel cannot construct a
+   * `ring::Sab::from_raw` over SAB bytes without a memcpy-each-way
+   * through its own scratch region — and once the memcpy is on the
+   * JS side, there is no remaining work for the kernel to do that
+   * it does not already do inside the existing `kernel_dispatch`
+   * export. The plan's §4 block is correct in substance; only the
+   * language split moves.
+   */
+  serviceSab(pid, sab) {
+    if (sab.byteLength < SAB_SIZE) {
+      throw new Error(
+        `KernelWasmHost.serviceSab: sab is ${sab.byteLength} bytes, need ${SAB_SIZE}`
+      );
+    }
+    const buffer = sab.buffer;
+    const baseOffset = sab.byteOffset;
+    const header = new Int32Array(buffer, baseOffset, OFF_HEAP_SCRATCH / 4);
+    const reqHead = Atomics.load(header, OFF_REQ_HEAD / 4);
+    const reqTail = Atomics.load(header, OFF_REQ_TAIL / 4);
+    if (reqHead === reqTail) {
+      return 1;
+    }
+    const reqSlotIx = (reqTail >>> 0) % REQ_SLOT_COUNT;
+    const reqSlotOffset = baseOffset + OFF_REQ_RING + reqSlotIx * SLOT_SIZE;
+    const requestBytes = new Uint8Array(buffer, reqSlotOffset, SLOT_SIZE);
+    const decoded = decodeRequest(requestBytes);
+    let heapIn;
+    if (decoded.heapLen > 0) {
+      if (decoded.heapPtr + decoded.heapLen > HEAP_SCRATCH_BYTES || decoded.heapPtr > HEAP_SCRATCH_BYTES) {
+        throw new Error(
+          `KernelWasmHost.serviceSab: request heap ${decoded.heapPtr}+${decoded.heapLen} out of bounds (${HEAP_SCRATCH_BYTES})`
+        );
+      }
+      const heapOffset = baseOffset + OFF_HEAP_SCRATCH + decoded.heapPtr;
+      heapIn = new Uint8Array(
+        new Uint8Array(buffer, heapOffset, decoded.heapLen)
+      );
+    }
+    const { response, heapOut } = this.dispatch(
+      pid,
+      {
+        opcode: decoded.opcode,
+        flags: decoded.flags,
+        requestId: decoded.requestId,
+        args: decoded.args,
+        heapPtr: 0,
+        heapLen: decoded.heapLen
+      },
+      heapIn
+    );
+    const nextTail = (reqTail + 1 >>> 0) % REQ_SLOT_COUNT;
+    Atomics.store(header, OFF_REQ_TAIL / 4, nextTail);
+    const resHead = Atomics.load(header, OFF_RES_HEAD / 4);
+    const resTail = Atomics.load(header, OFF_RES_TAIL / 4);
+    const nextResHead = (resHead + 1 >>> 0) % RES_SLOT_COUNT;
+    if (nextResHead === resTail) {
+      throw new Error(
+        `KernelWasmHost.serviceSab: response ring full for pid ${pid}`
+      );
+    }
+    const resSlotIx = (resHead >>> 0) % RES_SLOT_COUNT;
+    const resSlotOffset = baseOffset + OFF_RES_RING + resSlotIx * SLOT_SIZE;
+    const resBytes = encodeResponse(response);
+    new Uint8Array(buffer, resSlotOffset, SLOT_SIZE).set(resBytes);
+    if (response.extraLen > 0 && heapOut.length > 0) {
+      const heapOffset = baseOffset + OFF_HEAP_SCRATCH + decoded.heapPtr;
+      new Uint8Array(buffer, heapOffset, response.extraLen).set(heapOut);
+    }
+    Atomics.store(header, OFF_RES_HEAD / 4, nextResHead);
+    return 0;
   }
   // ---- Kernel interface --------------------------------------------
   // ---- pending-spawn drain -----------------------------------------

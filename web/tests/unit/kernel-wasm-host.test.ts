@@ -23,11 +23,24 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { KernelWasmHost, type SpawnOutcome } from "../../src/kernel-wasm-host";
 import {
+  OFF_HEAP_SCRATCH,
+  OFF_REQ_HEAD,
+  OFF_REQ_RING,
+  OFF_REQ_TAIL,
+  OFF_RES_HEAD,
+  OFF_RES_RING,
+  OFF_RES_TAIL,
+  SAB_SIZE,
+  SLOT_SIZE as SAB_SLOT_SIZE,
+} from "../../src/shared/sab-layout";
+import {
   CAP,
   CAPSET_ALL,
   CAPSET_ORDINARY_APP,
   CAPSET_DESKTOP_SHELL,
   DEV,
+  decodeResponse,
+  encodeRequest,
   encodeSpawnManifest,
   ERRNO,
   OP_EXT,
@@ -564,5 +577,161 @@ describe("dispatch: heap overflow", () => {
         huge,
       ),
     ).toThrow(/capacity/);
+  });
+});
+
+// ---- serviceSab: per-pid SAB ring servicing (T230) -----------------
+//
+// The servicing primitive the multi-process dispatch loop will call
+// once per pid per round-robin tick. Today the tests drive it
+// synchronously: seed a request into a plain-ArrayBuffer stand-in for
+// the real SharedArrayBuffer (Vitest runs under node with no
+// cross-origin-isolated context, so SABs aren't available), call
+// `serviceSab`, assert on the response ring + any driver-side effect
+// (e.g. `onConsoleWrite`).
+//
+// Wake slots are intentionally not exercised here — `serviceSab` does
+// not touch them; that is the kernel-Worker loop's job (T233).
+
+/**
+ * Helper: build an empty 64 KiB SAB backing as a plain ArrayBuffer.
+ * Vitest (node) doesn't provide `SharedArrayBuffer` outside a COOP/
+ * COEP context, but the layout math in `sab-layout.ts` and the
+ * atomics operations in `Int32Array` both work against a plain
+ * `ArrayBuffer` — `Atomics.load` / `Atomics.store` accept any
+ * TypedArray over any `ArrayBufferLike`. All the SAB-seeding
+ * below uses `new Uint8Array(buf, offset, len)` + `.set(...)` and
+ * `Atomics.store(header, index, value)` the same way production
+ * will, so the code paths exercised here are byte-identical to the
+ * ones a real SharedArrayBuffer would drive.
+ */
+function freshSabBacking(): { buffer: ArrayBuffer; view: Uint8Array } {
+  const buffer = new ArrayBuffer(SAB_SIZE);
+  const view = new Uint8Array(buffer);
+  return { buffer, view };
+}
+
+/**
+ * Seed a single request into an otherwise-empty SAB at slot 0 of the
+ * request ring, with any heap payload placed at `heapPtr` inside the
+ * SAB's heap scratch region. Advances the request ring's HEAD to 1 so
+ * `serviceSab` sees one pending request.
+ */
+function seedRequest(
+  sab: { buffer: ArrayBuffer; view: Uint8Array },
+  request: Parameters<typeof encodeRequest>[0],
+  heap?: Uint8Array,
+): void {
+  const reqBytes = encodeRequest(request);
+  new Uint8Array(sab.buffer, OFF_REQ_RING, SAB_SLOT_SIZE).set(reqBytes);
+  if (heap !== undefined && heap.length > 0) {
+    const offset = request.heapPtr ?? 0;
+    new Uint8Array(sab.buffer, OFF_HEAP_SCRATCH + offset, heap.length).set(heap);
+  }
+  const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
+  Atomics.store(header, OFF_REQ_HEAD / 4, 1);
+}
+
+/** Read the response currently at slot 0 of the SAB's response ring. */
+function readResponseSlot(sab: { buffer: ArrayBuffer; view: Uint8Array }) {
+  const resBytes = new Uint8Array(
+    new Uint8Array(sab.buffer, OFF_RES_RING, SAB_SLOT_SIZE),
+  );
+  return decodeResponse(resBytes);
+}
+
+describe("serviceSab: FD_WRITE → onConsoleWrite round trip", () => {
+  it("pops a seeded FD_WRITE, dispatches through dispatch, pushes the response, and fires onConsoleWrite", async () => {
+    const { host, consoleWrites } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const sab = freshSabBacking();
+    const message = new TextEncoder().encode("hi\n");
+    seedRequest(
+      sab,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 100,
+        arg0: 1,
+        heapPtr: 0,
+        heapLen: message.length,
+      },
+      message,
+    );
+
+    const rc = host.serviceSab(pid, sab.view);
+    expect(rc).toBe(0);
+
+    // Request ring drained: head was 1, tail advanced to 1.
+    const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
+    expect(Atomics.load(header, OFF_REQ_HEAD / 4)).toBe(1);
+    expect(Atomics.load(header, OFF_REQ_TAIL / 4)).toBe(1);
+
+    // Response landed in slot 0; response ring's head is now 1.
+    expect(Atomics.load(header, OFF_RES_HEAD / 4)).toBe(1);
+    expect(Atomics.load(header, OFF_RES_TAIL / 4)).toBe(0);
+    const response = readResponseSlot(sab);
+    expect(response.requestId).toBe(100);
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(BigInt(message.length));
+    expect(response.extraLen).toBe(0);
+
+    // Driver-side effect: the console driver saw the exact line.
+    expect(consoleWrites).toHaveLength(1);
+    expect(Array.from(consoleWrites[0]!)).toEqual(Array.from(message));
+  });
+});
+
+describe("serviceSab: empty ring", () => {
+  it("returns 1 and does not touch the response ring", async () => {
+    const { host, consoleWrites } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const sab = freshSabBacking();
+    const rc = host.serviceSab(pid, sab.view);
+    expect(rc).toBe(1);
+
+    const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
+    expect(Atomics.load(header, OFF_REQ_HEAD / 4)).toBe(0);
+    expect(Atomics.load(header, OFF_REQ_TAIL / 4)).toBe(0);
+    expect(Atomics.load(header, OFF_RES_HEAD / 4)).toBe(0);
+    expect(Atomics.load(header, OFF_RES_TAIL / 4)).toBe(0);
+    expect(consoleWrites).toHaveLength(0);
+  });
+});
+
+describe("serviceSab: PROC_EXIT", () => {
+  it("services a PROC_EXIT(code=0) request and pushes an OK response", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const sab = freshSabBacking();
+    seedRequest(sab, {
+      opcode: OP_WASI.PROC_EXIT,
+      requestId: 200,
+      arg0: 0,
+    });
+
+    const rc = host.serviceSab(pid, sab.view);
+    expect(rc).toBe(0);
+
+    const response = readResponseSlot(sab);
+    expect(response.requestId).toBe(200);
+    expect(response.status).toBe(0);
+    // PROC_EXIT carries no return value; the dispatcher reports
+    // success-with-value-zero and the user-side unwinds via the
+    // `UserProcessExited` sentinel before ever reading this
+    // response. The assertion here is that the response bytes
+    // reach the SAB correctly.
+    expect(response.value).toBe(0n);
+    expect(response.extraLen).toBe(0);
+
+    const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
+    expect(Atomics.load(header, OFF_REQ_TAIL / 4)).toBe(1);
+    expect(Atomics.load(header, OFF_RES_HEAD / 4)).toBe(1);
   });
 });

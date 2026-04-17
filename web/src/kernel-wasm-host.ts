@@ -53,8 +53,23 @@
 import type { Driver, DriverHost } from "./drivers/types";
 import type { Kernel } from "./kernel-worker";
 import {
+  HEAP_SCRATCH_BYTES,
+  OFF_HEAP_SCRATCH,
+  OFF_REQ_HEAD,
+  OFF_REQ_RING,
+  OFF_REQ_TAIL,
+  OFF_RES_HEAD,
+  OFF_RES_RING,
+  OFF_RES_TAIL,
+  REQ_SLOT_COUNT,
+  RES_SLOT_COUNT,
+  SAB_SIZE,
+} from "./shared/sab-layout";
+import {
+  decodeRequest,
   decodeResponse,
   encodeRequest,
+  encodeResponse,
   ERRNO,
   SLOT_SIZE,
   type SyscallRequest,
@@ -558,6 +573,135 @@ export class KernelWasmHost implements Kernel {
     }
 
     return { response, heapOut };
+  }
+
+  /**
+   * Service one pending request on the per-pid SAB ring.
+   *
+   * Pops one request out of the SAB's request ring, calls
+   * [`dispatch`] on behalf of `pid`, pushes the response into the
+   * SAB's response ring, and copies any heap output back into the
+   * SAB's heap scratch region at the request's declared `heap_ptr`
+   * offset.
+   *
+   * Return values:
+   *
+   *   * `0` — one request was serviced.
+   *   * `1` — the request ring was empty; no work done.
+   *
+   * `sab` is a `Uint8Array` view over the full `SAB_SIZE` bytes of
+   * the per-pid `SharedArrayBuffer`. Header atomics go through an
+   * `Int32Array` view constructed over the same backing; slot bytes
+   * are read and written directly.
+   *
+   * Wake-slot semaphores (`OFF_USER_WAIT_SLOT`,
+   * `OFF_KERNEL_WAIT_SLOT`) are intentionally NOT touched by this
+   * method — those are the kernel-Worker loop's concern. The caller
+   * is responsible for notifying the user after the response lands.
+   *
+   * Design note — why this orchestration lives in TS rather than in
+   * a kernel-side `kernel_service_sab` export (as
+   * `multi-process-plan.md §2 Changing` speculated): the kernel's
+   * WASM linear memory is a distinct address space from the SAB; a
+   * `*mut u8` pointing into the SAB is not a valid pointer in the
+   * kernel's memory, so the kernel cannot construct a
+   * `ring::Sab::from_raw` over SAB bytes without a memcpy-each-way
+   * through its own scratch region — and once the memcpy is on the
+   * JS side, there is no remaining work for the kernel to do that
+   * it does not already do inside the existing `kernel_dispatch`
+   * export. The plan's §4 block is correct in substance; only the
+   * language split moves.
+   */
+  serviceSab(pid: number, sab: Uint8Array): 0 | 1 {
+    if (sab.byteLength < SAB_SIZE) {
+      throw new Error(
+        `KernelWasmHost.serviceSab: sab is ${sab.byteLength} bytes, need ${SAB_SIZE}`,
+      );
+    }
+    const buffer = sab.buffer;
+    const baseOffset = sab.byteOffset;
+    const header = new Int32Array(buffer, baseOffset, OFF_HEAP_SCRATCH / 4);
+
+    // Pop from the request ring. Producer (user) writes HEAD; consumer
+    // (kernel) reads TAIL. Empty when head == tail. Slot at tail % N.
+    const reqHead = Atomics.load(header, OFF_REQ_HEAD / 4);
+    const reqTail = Atomics.load(header, OFF_REQ_TAIL / 4);
+    if (reqHead === reqTail) {
+      return 1;
+    }
+    const reqSlotIx = (reqTail >>> 0) % REQ_SLOT_COUNT;
+    const reqSlotOffset = baseOffset + OFF_REQ_RING + reqSlotIx * SLOT_SIZE;
+    const requestBytes = new Uint8Array(buffer, reqSlotOffset, SLOT_SIZE);
+    const decoded = decodeRequest(requestBytes);
+
+    // Read the request's heap payload (if any) out of the SAB's heap
+    // scratch at the user-chosen offset. Copy to a fresh owned buffer
+    // so subsequent Atomics operations or dispatch-side memcpys don't
+    // see tearing from a concurrent writer (shouldn't happen in v1,
+    // but an owned buffer matches the existing dispatch() input-side
+    // pattern and is clearer under review).
+    let heapIn: Uint8Array | undefined;
+    if (decoded.heapLen > 0) {
+      if (
+        decoded.heapPtr + decoded.heapLen > HEAP_SCRATCH_BYTES ||
+        decoded.heapPtr > HEAP_SCRATCH_BYTES
+      ) {
+        throw new Error(
+          `KernelWasmHost.serviceSab: request heap ${decoded.heapPtr}+${decoded.heapLen} out of bounds (${HEAP_SCRATCH_BYTES})`,
+        );
+      }
+      const heapOffset = baseOffset + OFF_HEAP_SCRATCH + decoded.heapPtr;
+      heapIn = new Uint8Array(
+        new Uint8Array(buffer, heapOffset, decoded.heapLen),
+      );
+    }
+
+    // Dispatch. Remap `heapPtr` to 0 because the kernel's scratch
+    // region is not the SAB's — the user's SAB-side offset is not
+    // meaningful to the kernel, which always writes at offset 0 in
+    // its own scratch.
+    const { response, heapOut } = this.dispatch(
+      pid,
+      {
+        opcode: decoded.opcode,
+        flags: decoded.flags,
+        requestId: decoded.requestId,
+        args: decoded.args,
+        heapPtr: 0,
+        heapLen: decoded.heapLen,
+      },
+      heapIn,
+    );
+
+    // Advance the request ring's tail now that we have the work.
+    const nextTail = ((reqTail + 1) >>> 0) % REQ_SLOT_COUNT;
+    Atomics.store(header, OFF_REQ_TAIL / 4, nextTail);
+
+    // Push the response. Producer (kernel) writes HEAD; consumer (user)
+    // reads TAIL. Full when (head + 1) % N == tail.
+    const resHead = Atomics.load(header, OFF_RES_HEAD / 4);
+    const resTail = Atomics.load(header, OFF_RES_TAIL / 4);
+    const nextResHead = ((resHead + 1) >>> 0) % RES_SLOT_COUNT;
+    if (nextResHead === resTail) {
+      throw new Error(
+        `KernelWasmHost.serviceSab: response ring full for pid ${pid}`,
+      );
+    }
+    const resSlotIx = (resHead >>> 0) % RES_SLOT_COUNT;
+    const resSlotOffset = baseOffset + OFF_RES_RING + resSlotIx * SLOT_SIZE;
+    const resBytes = encodeResponse(response);
+    new Uint8Array(buffer, resSlotOffset, SLOT_SIZE).set(resBytes);
+
+    // Copy heap output (if any) back to the SAB's heap scratch at
+    // the user-chosen offset so the user reads it from the same
+    // place it wrote its input.
+    if (response.extraLen > 0 && heapOut.length > 0) {
+      const heapOffset = baseOffset + OFF_HEAP_SCRATCH + decoded.heapPtr;
+      new Uint8Array(buffer, heapOffset, response.extraLen).set(heapOut);
+    }
+
+    Atomics.store(header, OFF_RES_HEAD / 4, nextResHead);
+    return 0;
   }
 
   // ---- Kernel interface --------------------------------------------

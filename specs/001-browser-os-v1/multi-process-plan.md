@@ -846,6 +846,45 @@ T074 cross-reference (amend in place):
   architecture. If a sub-slice uncovers a design need that contradicts
   this plan, update the plan first, then land the sub-slice.
 
+## 13. Plan corrections (appended during execution)
+
+Corrections to the plan text above as sub-slices land and design
+claims are validated against reality. The plan body is left intact
+for historical continuity; corrections are appended here.
+
+### T230 (M1.1) — no kernel-side export
+
+§2 "Changing" and §4 "Kernel-side dispatch loop" described a new
+kernel export `kernel_service_sab(pid, sab_ptr, ...) -> i32` that
+wraps `Dispatcher::service_one` against a `ring::Sab::from_raw`
+view of the SAB. That design does not work: a WASM module's linear
+memory is a distinct address space from a `SharedArrayBuffer`, so a
+`*mut u8` pointing into the SAB is not a valid pointer in the
+kernel's memory. The kernel cannot construct a `Sab` over SAB bytes
+without a memcpy-each-way through its own scratch region, and once
+the memcpy is on the JS side, there is no remaining work for the
+kernel to do that it is not already doing inside `kernel_dispatch`.
+
+**Landed instead**: a pure-TS `KernelWasmHost.serviceSab(pid, sab:
+Uint8Array): 0 | 1` method that pops a request from the SAB, calls
+the existing synchronous `dispatch`, and pushes the response back.
+The `decodeRequest` + `encodeResponse` helpers were added to
+`shared/syscall.ts` to round out the encode/decode pairs. Wake
+slots are deliberately untouched — those are T233's concern.
+
+**Impact on downstream sub-slices**: §4 "Kernel-side dispatch
+loop" needs its pseudocode updated — the kernel Worker will call
+`host.serviceSab(pid, sabView)` in its round-robin loop rather than
+`kernel_service_sab(pid, sabPtr, ...)`. Semantics are identical.
+Performance cost is a few JS-level `Atomics.load/store` calls plus
+the existing `dispatch` path — lower than the original plan's
+memcpy-each-way estimate because the two ring-ops and the decode
+both happen in one JS function with no cross-language hop.
+
+**Impact on Principle IX budget**: unchanged. The per-syscall
+`Atomics.wait` round-trip is still the dominant cost; JS-side
+ring orchestration is constant-time.
+
 ## Planning Complete
 
 The seam is fully specified. Future sessions execute T230 → T231 →
