@@ -4811,6 +4811,84 @@ describe("dispatch: PROC_KILL", () => {
   });
 });
 
+// ---- dispatch: PROC_RAISE -------------------------------------------
+//
+// PROC_RAISE (0x0061, WASI range). Wire: args[0..2] = signum u16; no
+// target_pid (always the caller). v1 knows SIGINT=2, SIGKILL=9,
+// SIGTERM=15; any other signum → -EINVAL. No ENOTCAPABLE path exists
+// for raise(2) — the self-signal cap rule permits every sender.
+// SIGKILL zombifies the caller (response still posts back first).
+// SIGTERM / SIGINT queue on the caller's own SignalInbox.
+
+function encodeProcRaiseArgs(signum: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint16(0, signum & 0xffff, true);
+  return args;
+}
+
+describe("dispatch: PROC_RAISE", () => {
+  it("returns -EINVAL for an unknown signum", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PROC_RAISE,
+        requestId: 1320,
+        args: encodeProcRaiseArgs(77),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns 0 for self-SIGINT and queues a pending signal", async () => {
+    // Catchable signal to self — POSIX raise(SIGINT). The caller's
+    // SignalInbox accumulates one pending signal.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PROC_RAISE,
+        requestId: 1321,
+        args: encodeProcRaiseArgs(2),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
+
+  it("returns 0 for self-SIGKILL (the response posts back before the caller is torn down)", async () => {
+    // Terminal signal to self — POSIX raise(SIGKILL). The handler
+    // returns success; the dispatcher has already written the
+    // response before the caller's Worker is torn down on the next
+    // dispatch pass.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PROC_RAISE,
+        requestId: 1322,
+        args: encodeProcRaiseArgs(9),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {

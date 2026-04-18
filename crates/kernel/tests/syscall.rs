@@ -9482,6 +9482,138 @@ fn proc_kill_dead_target_returns_esrch() {
     assert_eq!(resp.status, -errno::ESRCH);
 }
 
+// ---- proc_raise ------------------------------------------------------
+//
+// PROC_RAISE (0x0061). POSIX raise(3): deliver a signal to the
+// calling process. v1 knows three signal numbers (same set
+// PROC_KILL knows):
+//
+//   * SIGKILL=9  → terminal, caller zombifies with Signaled(9).
+//   * SIGTERM=15 → catchable, queued on caller's SignalInbox.
+//   * SIGINT=2   → catchable, queued on caller's SignalInbox.
+//
+// Any other signum returns -EINVAL. Because the target is always
+// the caller, the self-signal cap rule (sender == target) is the
+// only one exercised — raise(3) never reports ENOTCAPABLE even
+// from a pid that holds no signalling caps at all.
+//
+// Wire layout:
+//   args[0..2] = signum (u16).
+// Response: value = 0 on success.
+
+fn proc_raise_args(signum: u16) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..2].copy_from_slice(&signum.to_le_bytes());
+    args
+}
+
+#[test]
+fn proc_raise_sigterm_queues_on_own_inbox() {
+    // Catchable signal to self: POSIX raise(SIGTERM). The caller's
+    // own SignalInbox accumulates the signal; state stays Running
+    // through the call since Term is catchable.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self-raiser", 0);
+
+    let req = Request {
+        opcode: op_wasi::PROC_RAISE,
+        flags: 0,
+        request_id: 1300,
+        args: proc_raise_args(15),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(pid).unwrap(), 1);
+    assert_eq!(
+        k.procs.get(pid).unwrap().state,
+        kernel::proc::ProcState::Running
+    );
+}
+
+#[test]
+fn proc_raise_sigint_queues_on_own_inbox() {
+    // Same path as SIGTERM — the catchable-signal branch also
+    // carries SIGINT. Included so a future slice that diverges the
+    // two (e.g. SIGINT wakes a parked syscall, SIGTERM does not)
+    // would fail fast here instead of inside the signal-delivery
+    // code.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self-raiser-int", 0);
+
+    let req = Request {
+        opcode: op_wasi::PROC_RAISE,
+        flags: 0,
+        request_id: 1301,
+        args: proc_raise_args(2),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(pid).unwrap(), 1);
+}
+
+#[test]
+fn proc_raise_sigkill_zombifies_caller() {
+    // Terminal signal to self: POSIX raise(SIGKILL). Caller
+    // transitions straight to Zombie with Signaled(9) exit status.
+    // The response still posts back (0) — the dispatcher writes it
+    // before the caller's Worker is torn down.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self-killer", 0);
+
+    let req = Request {
+        opcode: op_wasi::PROC_RAISE,
+        flags: 0,
+        request_id: 1302,
+        args: proc_raise_args(9),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(
+        k.procs.get(pid).unwrap().state,
+        kernel::proc::ProcState::Zombie
+    );
+    assert_eq!(
+        k.procs.get(pid).unwrap().exit_status,
+        Some(ExitStatus::Signaled(9))
+    );
+}
+
+#[test]
+fn proc_raise_unknown_signum_returns_einval() {
+    // Signum outside {2, 9, 15} → EINVAL before the kernel is
+    // touched. Mirrors PROC_KILL's unknown-signum probe so the
+    // two handlers stay symmetric on input validation.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self-bad-sig", 0);
+
+    let req = Request {
+        opcode: op_wasi::PROC_RAISE,
+        flags: 0,
+        request_id: 1303,
+        args: proc_raise_args(77),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    // No signal was queued and state is unchanged.
+    assert_eq!(k.pending_signals(pid).unwrap(), 0);
+    assert_eq!(
+        k.procs.get(pid).unwrap().state,
+        kernel::proc::ProcState::Running
+    );
+}
+
 // ---- proc_caps_get ---------------------------------------------------
 //
 // PROC_CAPS_GET (0x1105). Query a process's cap set. Sender may

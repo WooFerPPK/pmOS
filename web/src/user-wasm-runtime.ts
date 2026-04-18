@@ -689,6 +689,35 @@ export class UserWasmRuntime {
         throw new UserProcessExited(rval);
       },
 
+      // WASI `proc_raise(signum: i32) -> errno`.
+      //
+      // POSIX `raise(sig)`: deliver a signal to the calling process.
+      // v1 knows three (SIGINT=2, SIGTERM=15 queued on the caller's
+      // SignalInbox; SIGKILL=9 zombifies). The kernel handler packs
+      // signum into `args[0..2]` as a u16 and returns 0 on success
+      // or negative errno on failure (EINVAL for unknown signum).
+      //
+      // Unlike `proc_exit`, this shim DOES return: raise() is not
+      // a fatal unwind on its own. Under SIGKILL the caller's Worker
+      // is torn down by the dispatch loop on the next pass — the
+      // shim's return is technically observable but every subsequent
+      // syscall fails with NoSuchPid. Rust's libc unwinds via a
+      // different mechanism (abort() uses a trap, not raise).
+      proc_raise: (signum: number): number => {
+        const args = new Uint8Array(16);
+        const v = new DataView(args.buffer);
+        v.setUint16(0, signum & 0xffff, true);
+
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.PROC_RAISE,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `args_sizes_get` / `environ_sizes_get`.
       //
       // Signature: (argc_or_envc_ptr: i32, buf_size_ptr: i32) -> errno.

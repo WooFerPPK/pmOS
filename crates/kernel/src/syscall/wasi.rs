@@ -29,7 +29,7 @@ use abi::wasi::filestat as fs_off;
 
 use crate::fd::{FdFlags, FdObject};
 use crate::platform;
-use crate::proc::ExitStatus;
+use crate::proc::{ExitStatus, Signal};
 use crate::sys::{Kernel, KernelError};
 use crate::vfs::NodeType;
 
@@ -61,6 +61,7 @@ pub fn dispatch_wasi(
         op::FD_CLOSE => handle_fd_close(kernel, pid, req),
         op::PATH_OPEN => handle_path_open(kernel, pid, req, heap),
         op::PROC_EXIT => handle_proc_exit(kernel, pid, req),
+        op::PROC_RAISE => handle_proc_raise(kernel, pid, req),
         op::CLOCK_TIME_GET => handle_clock_time_get(req),
         op::CLOCK_RES_GET => handle_clock_res_get(req),
         op::RANDOM_GET => handle_random_get(req, heap),
@@ -521,6 +522,48 @@ fn handle_proc_exit(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let exit_code = args_u32(req, 0) as i32;
     let status = ExitStatus::Exited(exit_code);
     match kernel.proc_exit(pid, status) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- proc_raise --------------------------------------------------------
+//
+// Layout:
+//   args[0..2] = signum (u16). v1 knows three: SIGINT=2, SIGKILL=9,
+//                SIGTERM=15. Any other number → EINVAL before the
+//                kernel is touched (matches `handle_proc_kill`'s
+//                decode — a future SIGCHLD / SIGHUP wiring extends
+//                both handlers in lockstep without a wire-format
+//                break).
+// Response: value = 0 on success; negative errno on failure.
+//
+// POSIX `raise(sig)` delivers to the calling process — there is no
+// target pid to pick. This handler forwards to
+// `Kernel::proc_kill(pid, pid, signal)` so the self-signal cap path
+// (sender == target, always permitted) is the only one ever
+// exercised here: a catchable signal lands on the caller's own
+// SignalInbox, and SIGKILL zombifies the caller immediately. A
+// future slice that grows real signal-catchable user handlers on
+// the caller side keeps this handler unchanged — only the kernel's
+// post-delivery semantics change.
+//
+// Unlike `handle_proc_kill`, there is no target_pid in args, so the
+// wire layout is two bytes smaller. We deliberately do NOT reuse
+// `handle_proc_kill`'s 16-byte layout with target_pid zeroed:
+// userland compilers that call `__wasi_proc_raise(signum)` pack
+// only the signum, so aligning the wire to the signum-only shape
+// keeps the shim trivial.
+
+fn handle_proc_raise(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let signum = u16::from_le_bytes([req.args[0], req.args[1]]);
+    let signal = match signum {
+        2 => Signal::Interrupt,
+        9 => Signal::Kill,
+        15 => Signal::Term,
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    match kernel.proc_kill(pid, pid, signal) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }

@@ -247,6 +247,14 @@ export const OP_WASI = {
   PATH_REMOVE_DIRECTORY: 0x0046,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
+  /** Wire-format identity for WASI `proc_raise`. Deliver a POSIX
+   * signal to the caller (no target_pid — always self). Wire:
+   * signum u16 LE at args[0..2]; no heap. v1 recognises SIGINT=2,
+   * SIGKILL=9, SIGTERM=15; any other signum returns -EINVAL before
+   * the kernel touches process state. SIGKILL zombifies the caller
+   * immediately (response still posts back first); SIGTERM / SIGINT
+   * queue on the caller's own SignalInbox and leave state Running. */
+  PROC_RAISE: 0x0061,
   CLOCK_RES_GET: 0x0010,
   CLOCK_TIME_GET: 0x0011,
   RANDOM_GET: 0x0051,
