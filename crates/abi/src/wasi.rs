@@ -134,6 +134,107 @@ pub mod filestat {
     pub const OFF_CTIM:     usize = 56;
 }
 
+/// Wire layouts + flag tables for `POLL_ONEOFF` (opcode 0x0050).
+///
+/// Mirrors WASI preview 1's `subscription_t` + `event_t` C ABI:
+///
+/// `subscription_t` is 48 bytes (each caller-supplied subscription):
+///
+///   offset  0: userdata     u64  (opaque — echoed verbatim into the
+///                                 matching `event.userdata` so the
+///                                 caller can correlate subscriptions
+///                                 and events without tracking index
+///                                 positions)
+///   offset  8: tag          u8   (`eventtype::*`: CLOCK / FD_READ / FD_WRITE)
+///   offset  9: padding (7 bytes; must be zero)
+///   offset 16: payload — variant by tag (see below)
+///
+/// When `tag == eventtype::CLOCK`, the payload is a
+/// `subscription_clock_t` at offset 16..48:
+///
+///   offset 16: clock_id     u32  (`CLOCKID_MONOTONIC` / `CLOCKID_REALTIME`;
+///                                 cputime ids emit a per-subscription
+///                                 ENOTSUP event, invalid ids emit EINVAL)
+///   offset 20: padding (4 bytes)
+///   offset 24: timeout      u64  (absolute ns since an epoch if
+///                                 `subclockflags::ABSTIME` is set,
+///                                 relative ns otherwise)
+///   offset 32: precision    u64  (advisory; v1 ignores — the Platform
+///                                 clock is nanosecond-granular)
+///   offset 40: flags        u16  (`subclockflags::*`)
+///   offset 42: padding (6 bytes)
+///
+/// When `tag == eventtype::FD_READ` or `tag == eventtype::FD_WRITE`,
+/// the payload is a `subscription_fd_readwrite_t` at offset 16..48:
+///
+///   offset 16: fd           u32
+///   offset 20: padding (28 bytes — the fd-readwrite payload only
+///              decodes four bytes; the rest keeps the outer struct
+///              at 48 bytes for a fixed stride)
+///
+/// `event_t` is 32 bytes (each kernel-emitted event):
+///
+///   offset  0: userdata     u64  (echoed from the triggering subscription)
+///   offset  8: error        u16  (per-subscription errno — 0 on success,
+///                                 EBADF / EINVAL / ENOTSUP for error
+///                                 cases that are meaningful per-entry
+///                                 rather than aborting the whole syscall)
+///   offset 10: type         u8   (`eventtype::*` — echo of the subscription
+///                                 tag so the caller can quickly filter by
+///                                 kind without re-decoding the userdata
+///                                 → subscription pairing)
+///   offset 11: padding (5 bytes)
+///   offset 16: fd_readwrite.nbytes u64  (meaningful for FD_READ /
+///                                        FD_WRITE — estimated bytes
+///                                        ready to read / space to write;
+///                                        zero for CLOCK events)
+///   offset 24: fd_readwrite.flags  u16  (`eventrwflags::*` — only
+///                                        FD_READWRITE_HANGUP fires in v1)
+///   offset 26: padding (6 bytes)
+pub mod poll {
+    pub const SUBSCRIPTION_SIZE: usize = 48;
+    pub const EVENT_SIZE: usize = 32;
+
+    pub const SUB_OFF_USERDATA:   usize = 0;
+    pub const SUB_OFF_TAG:        usize = 8;
+    pub const SUB_OFF_PAYLOAD:    usize = 16;
+
+    pub const SUB_CLOCK_OFF_ID:        usize = 16;
+    pub const SUB_CLOCK_OFF_TIMEOUT:   usize = 24;
+    pub const SUB_CLOCK_OFF_PRECISION: usize = 32;
+    pub const SUB_CLOCK_OFF_FLAGS:     usize = 40;
+
+    pub const SUB_FDRW_OFF_FD: usize = 16;
+
+    pub const EVENT_OFF_USERDATA:     usize = 0;
+    pub const EVENT_OFF_ERROR:        usize = 8;
+    pub const EVENT_OFF_TYPE:         usize = 10;
+    pub const EVENT_OFF_RW_NBYTES:    usize = 16;
+    pub const EVENT_OFF_RW_FLAGS:     usize = 24;
+}
+
+/// WASI `eventtype_t` — identifies a subscription / event variant.
+pub mod eventtype {
+    pub const CLOCK:    u8 = 0;
+    pub const FD_READ:  u8 = 1;
+    pub const FD_WRITE: u8 = 2;
+}
+
+/// WASI `subclockflags_t` — applies to CLOCK subscriptions.
+pub mod subclockflags {
+    /// When set, `timeout` is an absolute time; when clear it is
+    /// relative to the instant the subscription is posted.
+    pub const ABSTIME: u16 = 0x1;
+}
+
+/// WASI `eventrwflags_t` — applies to FD_READ / FD_WRITE events.
+pub mod eventrwflags {
+    /// The peer end of the fd has hung up (reader for a write fd,
+    /// writer for a read fd). Semantically "readable at EOF" for
+    /// FD_READ, "writing will produce SIGPIPE" for FD_WRITE.
+    pub const FD_READWRITE_HANGUP: u16 = 0x1;
+}
+
 /// WASI preview 1 filetype byte (first byte of `filestat_t` /
 /// `fdstat_t`). Mirrors `__wasi_filetype_t` from the C header.
 pub mod filetype {

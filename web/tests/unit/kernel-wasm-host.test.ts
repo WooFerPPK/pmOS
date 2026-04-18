@@ -45,10 +45,17 @@ import {
   encodeRequest,
   encodeSpawnManifest,
   ERRNO,
+  EVENTRWFLAGS,
+  EVENTTYPE,
   FILETYPE,
   FSTFLAGS,
   OP_EXT,
   OP_WASI,
+  POLL_EVENT_OFF,
+  POLL_EVENT_SIZE,
+  POLL_SUB_OFF,
+  POLL_SUBSCRIPTION_SIZE,
+  SUBCLOCKFLAGS,
   WHENCE,
 } from "../../src/shared/syscall";
 
@@ -990,6 +997,388 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       heap,
     );
     expect(response.status).toBe(0);
+  });
+});
+
+// ---- dispatch: POLL_ONEOFF -----------------------------------------
+//
+// Multi-subscription readiness check. Wire: (n_subs, n_events_cap) as
+// two u32s in the inline args window; heap laid out as subs at
+// [0..n_subs*48] and events at [n_subs*48..n_subs*48 + n_events*32].
+// Response carries the actual emitted-event count in `value` and
+// mirrors it in `extraLen`.
+//
+// These TS tests pin the wire layout end-to-end through kernel.wasm
+// for the dispatcher-level branches: n_subs=0 rejection, the CLOCK
+// ready/not-ready splits, per-subscription EBADF/EINVAL/ENOTSUP, and
+// the events-cap clamp. The FD_READ/FD_WRITE Vnode/Socket fine-grained
+// paths are covered by the Rust kernel tests (which exercise the same
+// dispatcher through the same native-platform harness).
+
+function packPollArgs(nSubs: number, nEventsCap: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, nSubs, true);
+  v.setUint32(4, nEventsCap, true);
+  return args;
+}
+
+function packSubClock(
+  userdata: bigint,
+  clockId: number,
+  timeout: bigint,
+  flags: number,
+): Uint8Array {
+  const s = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+  const v = new DataView(s.buffer);
+  v.setBigUint64(POLL_SUB_OFF.USERDATA, userdata, true);
+  s[POLL_SUB_OFF.TAG] = EVENTTYPE.CLOCK;
+  v.setUint32(POLL_SUB_OFF.CLOCK_ID, clockId, true);
+  v.setBigUint64(POLL_SUB_OFF.CLOCK_TIMEOUT, timeout, true);
+  v.setUint16(POLL_SUB_OFF.CLOCK_FLAGS, flags, true);
+  return s;
+}
+
+function packSubFdRw(userdata: bigint, tag: number, fd: number): Uint8Array {
+  const s = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+  const v = new DataView(s.buffer);
+  v.setBigUint64(POLL_SUB_OFF.USERDATA, userdata, true);
+  s[POLL_SUB_OFF.TAG] = tag;
+  v.setUint32(POLL_SUB_OFF.FDRW_FD, fd, true);
+  return s;
+}
+
+interface DecodedEvent {
+  readonly userdata: bigint;
+  readonly error: number;
+  readonly type: number;
+  readonly nbytes: bigint;
+  readonly rwflags: number;
+}
+
+function decodeEvent(heap: Uint8Array, offset: number): DecodedEvent {
+  const v = new DataView(heap.buffer, heap.byteOffset + offset, POLL_EVENT_SIZE);
+  return {
+    userdata: v.getBigUint64(POLL_EVENT_OFF.USERDATA, true),
+    error: v.getUint16(POLL_EVENT_OFF.ERROR, true),
+    type: v.getUint8(POLL_EVENT_OFF.TYPE),
+    nbytes: v.getBigUint64(POLL_EVENT_OFF.RW_NBYTES, true),
+    rwflags: v.getUint16(POLL_EVENT_OFF.RW_FLAGS, true),
+  };
+}
+
+describe("dispatch: POLL_ONEOFF", () => {
+  it("returns -EINVAL for n_subs == 0", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(128);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 830,
+        args: packPollArgs(0, 4),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when heap is too short to hold the max of subs and events windows", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // 2 subs needs 96 bytes; heap of 60 is short → EINVAL.
+    const heap = new Uint8Array(60);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 831,
+        args: packPollArgs(2, 2),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("CLOCK monotonic with ABSTIME in the past fires one ready event", async () => {
+    const { host } = await freshHost({ nowNs: () => 1_000_000_000n });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    const sub = packSubClock(
+      42n,
+      CLOCKID.MONOTONIC,
+      1n, // abs 1 ns; far in the past of any non-zero now.
+      SUBCLOCKFLAGS.ABSTIME,
+    );
+    heap.set(sub, 0);
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 832,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+    expect(response.extraLen).toBe(POLL_EVENT_SIZE);
+    const ev = decodeEvent(heapOut, 0);
+    expect(ev.userdata).toBe(42n);
+    expect(ev.error).toBe(0);
+    expect(ev.type).toBe(EVENTTYPE.CLOCK);
+  });
+
+  it("CLOCK monotonic with ABSTIME far in the future emits zero events", async () => {
+    const { host } = await freshHost({ nowNs: () => 1_000n });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    const sub = packSubClock(
+      7n,
+      CLOCKID.MONOTONIC,
+      0xFFFF_FFFF_FFFF_FFFFn,
+      SUBCLOCKFLAGS.ABSTIME,
+    );
+    heap.set(sub, 0);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 833,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(0n);
+    expect(response.extraLen).toBe(0);
+  });
+
+  it("CLOCK with relative timeout 0 is ready (non-blocking semantics)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    heap.set(packSubClock(1n, CLOCKID.MONOTONIC, 0n, 0), 0);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 834,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+  });
+
+  it("CLOCK invalid id emits one event with per-sub EINVAL", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    heap.set(packSubClock(9n, 99, 0n, 0), 0);
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 835,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+    const ev = decodeEvent(heapOut, 0);
+    expect(ev.error).toBe(ERRNO.EINVAL);
+    expect(ev.type).toBe(EVENTTYPE.CLOCK);
+  });
+
+  it("CLOCK cputime id emits one event with per-sub ENOTSUP", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    heap.set(packSubClock(3n, CLOCKID.PROCESS_CPUTIME_ID, 0n, 0), 0);
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 836,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+    const ev = decodeEvent(heapOut, 0);
+    expect(ev.error).toBe(ERRNO.ENOTSUP);
+    expect(ev.type).toBe(EVENTTYPE.CLOCK);
+  });
+
+  it("FD_READ on an unopened fd emits one event with per-sub EBADF", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    heap.set(packSubFdRw(17n, EVENTTYPE.FD_READ, 99), 0);
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 837,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+    const ev = decodeEvent(heapOut, 0);
+    expect(ev.userdata).toBe(17n);
+    expect(ev.error).toBe(ERRNO.EBADF);
+    expect(ev.type).toBe(EVENTTYPE.FD_READ);
+  });
+
+  it("FD_WRITE on a /dev/console fd is always ready", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    heap.set(packSubFdRw(5n, EVENTTYPE.FD_WRITE, 1), 0);
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 838,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(1n);
+    const ev = decodeEvent(heapOut, 0);
+    expect(ev.error).toBe(0);
+    expect(ev.type).toBe(EVENTTYPE.FD_WRITE);
+    expect(ev.rwflags).toBe(0);
+  });
+
+  it("FD_READ on an empty /dev/console is not yet ready (zero events)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 0);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    heap.set(packSubFdRw(6n, EVENTTYPE.FD_READ, 0), 0);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 839,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(0n);
+  });
+
+  it("events_cap clamps the output when more subs are ready than the cap allows", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Three ready clock subs; cap = 2 → only two events emitted.
+    // Heap sized for 3 * 48-byte subs (which also covers 2 * 32-byte
+    // events — events overwrite subs in place).
+    const heap = new Uint8Array(3 * POLL_SUBSCRIPTION_SIZE);
+    heap.set(packSubClock(1n, CLOCKID.MONOTONIC, 0n, 0), 0);
+    heap.set(packSubClock(2n, CLOCKID.MONOTONIC, 0n, 0), POLL_SUBSCRIPTION_SIZE);
+    heap.set(
+      packSubClock(3n, CLOCKID.REALTIME, 0n, 0),
+      2 * POLL_SUBSCRIPTION_SIZE,
+    );
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 840,
+        args: packPollArgs(3, 2),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(2n);
+    expect(response.extraLen).toBe(2 * POLL_EVENT_SIZE);
+  });
+
+  it("echoes userdata verbatim in the emitted event", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
+    const ud = 0xDEAD_BEEF_CAFE_BABEn;
+    heap.set(packSubClock(ud, CLOCKID.MONOTONIC, 0n, 0), 0);
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.POLL_ONEOFF,
+        requestId: 841,
+        args: packPollArgs(1, 1),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+    const ev = decodeEvent(heapOut, 0);
+    expect(ev.userdata).toBe(ud);
+  });
+
+  it("suppress: EVENTRWFLAGS.FD_READWRITE_HANGUP const matches the Rust-side bit value", () => {
+    // Quick sanity check so a drift between the TS mirror and the
+    // abi crate is caught mechanically rather than waiting for a
+    // semantic mismatch in a downstream test.
+    expect(EVENTRWFLAGS.FD_READWRITE_HANGUP).toBe(0x1);
   });
 });
 

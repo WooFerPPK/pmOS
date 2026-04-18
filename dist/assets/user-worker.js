@@ -97,7 +97,17 @@ var OP_WASI = {
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Swap to whichever WASI opcode is
    * still unhandled as the implementation catches up. */
-  FD_READDIR: 47
+  FD_READDIR: 47,
+  /** Wire-format identity for `poll_oneoff`. The shim packs
+   * `(n_subs, n_events_cap)` into the inline args window (u32 each
+   * at offsets 0 / 4) and puts the subscription list followed by
+   * an events output window in the heap — subs at [0..n_subs*48],
+   * events at [n_subs*48..n_subs*48 + n_events_cap*32]. The kernel
+   * returns the actual event count in `response.value` and echoes
+   * it in `response.extraLen`. v1 is non-blocking: CLOCK fires only
+   * if the target time is already past; FD_READ / FD_WRITE fire
+   * only if the op would make progress right now. */
+  POLL_ONEOFF: 80
 };
 var OP_EXT = {
   IPC_SOCKET: 4096,
@@ -123,6 +133,8 @@ var ERRNO = {
   ENOTSUP: 58,
   EROFS: 69
 };
+var POLL_SUBSCRIPTION_SIZE = 48;
+var POLL_EVENT_SIZE = 32;
 var CAP = {
   DISPLAY_CLIENT: 1,
   DISPLAY_SERVER: 2,
@@ -920,6 +932,62 @@ var UserWasmRuntime = class {
           heap
         );
         return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `poll_oneoff`.
+      //
+      // Signature (lowered):
+      //   (in: i32, out: i32, nsubscriptions: i32, nevents: i32) -> errno: i32
+      //
+      // Multi-subscription readiness check. `in` points at an array
+      // of `nsubscriptions` subscription_t records (48 bytes each)
+      // and `out` points at an array of up to `nsubscriptions`
+      // event_t records (32 bytes each); the kernel fills in
+      // events for every subscription that is ready right now and
+      // writes the actual event count through `nevents`.
+      //
+      // v1 kernel is non-blocking: CLOCK fires only if the target
+      // time is already past; FD_READ / FD_WRITE fire only if the
+      // op would make progress without waiting. A caller that
+      // expects to block walks a spin loop at the WASI-call layer.
+      //
+      // Wire layout: args pack (n_subs, n_events_cap) as two u32s
+      // at offsets 0 and 4. The heap is a single buffer with subs
+      // at [0..n_subs*48] and events at [n_subs*48..n_subs*48 +
+      // n_events_cap*32]; n_events_cap is always == n_subs here
+      // because WASI's signature sizes the output buffer that way.
+      // The shim reads subs out of user memory into the heap buffer
+      // before dispatch, then copies emitted events back into user
+      // memory after dispatch.
+      poll_oneoff: (inPtr, outPtr, nsubscriptions, neventsPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        if (nsubscriptions === 0) return ERRNO.EINVAL;
+        const subsBytes = nsubscriptions * POLL_SUBSCRIPTION_SIZE;
+        const heap = new Uint8Array(subsBytes);
+        heap.set(
+          new Uint8Array(this.memory.buffer, inPtr, subsBytes),
+          0
+        );
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, nsubscriptions, true);
+        argsView.setUint32(4, nsubscriptions, true);
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.POLL_ONEOFF,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        if (response.status !== 0) return -response.status;
+        const nEvents = Number(response.value);
+        const memBytes = new Uint8Array(this.memory.buffer);
+        memBytes.set(heapOut.subarray(0, nEvents * POLL_EVENT_SIZE), outPtr);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(neventsPtr, nEvents, true);
+        return 0;
       },
       // WASI `clock_time_get`.
       //

@@ -222,6 +222,16 @@ export const OP_WASI = {
    * kernel doesn't yet handle. Swap to whichever WASI opcode is
    * still unhandled as the implementation catches up. */
   FD_READDIR: 0x002f,
+  /** Wire-format identity for `poll_oneoff`. The shim packs
+   * `(n_subs, n_events_cap)` into the inline args window (u32 each
+   * at offsets 0 / 4) and puts the subscription list followed by
+   * an events output window in the heap — subs at [0..n_subs*48],
+   * events at [n_subs*48..n_subs*48 + n_events_cap*32]. The kernel
+   * returns the actual event count in `response.value` and echoes
+   * it in `response.extraLen`. v1 is non-blocking: CLOCK fires only
+   * if the target time is already past; FD_READ / FD_WRITE fire
+   * only if the op would make progress right now. */
+  POLL_ONEOFF: 0x0050,
 } as const;
 
 /** PMos extension opcodes (0x1000..0x1501). */
@@ -313,6 +323,64 @@ export const FILETYPE = {
   SOCKET_DGRAM: 5,
   SOCKET_STREAM: 6,
   SYMBOLIC_LINK: 7,
+} as const;
+
+// ---- WASI poll_oneoff wire layout + flag tables --------------------
+//
+// Mirror of `abi::wasi::poll`, `abi::wasi::eventtype`,
+// `abi::wasi::subclockflags`, and `abi::wasi::eventrwflags`. The
+// subscription wire format is 48 bytes; the event wire format is 32
+// bytes. Both are laid out in ascending offset order inside the heap
+// region `poll_oneoff` hands the kernel — subs at the start, events
+// at heap[n_subs*48..].
+
+/** Size of one subscription slot in the `poll_oneoff` input heap. */
+export const POLL_SUBSCRIPTION_SIZE = 48;
+/** Size of one event slot in the `poll_oneoff` output heap. */
+export const POLL_EVENT_SIZE = 32;
+
+/** Subscription wire-offset table (48-byte record). */
+export const POLL_SUB_OFF = {
+  USERDATA: 0,
+  TAG: 8,
+  /** CLOCK payload offsets (only meaningful when TAG == EVENTTYPE.CLOCK). */
+  CLOCK_ID: 16,
+  CLOCK_TIMEOUT: 24,
+  CLOCK_PRECISION: 32,
+  CLOCK_FLAGS: 40,
+  /** FD_READ / FD_WRITE payload offset. */
+  FDRW_FD: 16,
+} as const;
+
+/** Event wire-offset table (32-byte record). */
+export const POLL_EVENT_OFF = {
+  USERDATA: 0,
+  ERROR: 8,
+  TYPE: 10,
+  RW_NBYTES: 16,
+  RW_FLAGS: 24,
+} as const;
+
+/** WASI `eventtype_t` — identifies a subscription / event variant. */
+export const EVENTTYPE = {
+  CLOCK: 0,
+  FD_READ: 1,
+  FD_WRITE: 2,
+} as const;
+
+/** WASI `subclockflags_t` (applies to CLOCK subscriptions). */
+export const SUBCLOCKFLAGS = {
+  /** When set, `timeout` is an absolute time; when clear it is relative
+   * to the instant the subscription is posted. */
+  ABSTIME: 0x1,
+} as const;
+
+/** WASI `eventrwflags_t` (applies to FD_READ / FD_WRITE events). */
+export const EVENTRWFLAGS = {
+  /** Peer end of the fd has hung up (reader closed for a write fd,
+   * writer closed for a read fd). Semantically "readable at EOF" for
+   * FD_READ, "writing will produce SIGPIPE" for FD_WRITE. */
+  FD_READWRITE_HANGUP: 0x1,
 } as const;
 
 // ---- Device identifiers ---------------------------------------------

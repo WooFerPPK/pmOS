@@ -48,6 +48,8 @@ import {
   ERRNO,
   OP_EXT,
   OP_WASI,
+  POLL_EVENT_SIZE,
+  POLL_SUBSCRIPTION_SIZE,
   type SyscallRequest,
 } from "./shared/syscall";
 
@@ -893,6 +895,81 @@ export class UserWasmRuntime {
           heap,
         );
         return response.status !== 0 ? -response.status : 0;
+      },
+
+      // WASI `poll_oneoff`.
+      //
+      // Signature (lowered):
+      //   (in: i32, out: i32, nsubscriptions: i32, nevents: i32) -> errno: i32
+      //
+      // Multi-subscription readiness check. `in` points at an array
+      // of `nsubscriptions` subscription_t records (48 bytes each)
+      // and `out` points at an array of up to `nsubscriptions`
+      // event_t records (32 bytes each); the kernel fills in
+      // events for every subscription that is ready right now and
+      // writes the actual event count through `nevents`.
+      //
+      // v1 kernel is non-blocking: CLOCK fires only if the target
+      // time is already past; FD_READ / FD_WRITE fire only if the
+      // op would make progress without waiting. A caller that
+      // expects to block walks a spin loop at the WASI-call layer.
+      //
+      // Wire layout: args pack (n_subs, n_events_cap) as two u32s
+      // at offsets 0 and 4. The heap is a single buffer with subs
+      // at [0..n_subs*48] and events at [n_subs*48..n_subs*48 +
+      // n_events_cap*32]; n_events_cap is always == n_subs here
+      // because WASI's signature sizes the output buffer that way.
+      // The shim reads subs out of user memory into the heap buffer
+      // before dispatch, then copies emitted events back into user
+      // memory after dispatch.
+      poll_oneoff: (
+        inPtr: number,
+        outPtr: number,
+        nsubscriptions: number,
+        neventsPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        if (nsubscriptions === 0) return ERRNO.EINVAL;
+        const subsBytes = nsubscriptions * POLL_SUBSCRIPTION_SIZE;
+        // Size the heap for the bigger of (subs, events). The kernel
+        // reads subs out of the heap, then overwrites the same region
+        // with event records in place — see `handle_poll_oneoff` in
+        // `crates/kernel/src/syscall/wasi.rs`. Subs is always bigger
+        // here (48 > 32 and n_events_cap == n_subs), so sizing to
+        // subsBytes is sufficient.
+        const heap = new Uint8Array(subsBytes);
+        // Copy subscriptions out of the wasm linear memory into the
+        // heap buffer the backend will ferry to the kernel.
+        heap.set(
+          new Uint8Array(this.memory.buffer, inPtr, subsBytes),
+          0,
+        );
+
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, nsubscriptions, true);
+        argsView.setUint32(4, nsubscriptions, true);
+
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.POLL_ONEOFF,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        if (response.status !== 0) return -response.status;
+        const nEvents = Number(response.value);
+        // Copy the emitted events out of `heapOut` (which the backend
+        // produces by reading `extra_len` bytes from the kernel's
+        // scratch region) into user memory at `outPtr`.
+        const memBytes = new Uint8Array(this.memory.buffer);
+        memBytes.set(heapOut.subarray(0, nEvents * POLL_EVENT_SIZE), outPtr);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(neventsPtr, nEvents, true);
+        return 0;
       },
 
       // WASI `clock_time_get`.

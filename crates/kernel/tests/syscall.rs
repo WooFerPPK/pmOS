@@ -1778,6 +1778,840 @@ fn path_filestat_set_times_with_short_heap_returns_einval() {
     assert_eq!(resp.status, -errno::EINVAL);
 }
 
+// ---- poll_oneoff ------------------------------------------------------
+//
+// WASI's multi-subscription poll: the caller hands the kernel N
+// `subscription_t` records (48 bytes each) and receives back up to M
+// `event_t` records (32 bytes each) describing which subscriptions
+// are ready right now. Wire layout used below:
+//
+//   args[0..4]  = n_subs (u32)
+//   args[4..8]  = n_events_cap (u32 — caller-provided max)
+//   heap[0..n_subs*48]                        = input subscriptions
+//   heap[n_subs*48..n_subs*48 + n_events*32]  = output events
+//   heap_len    = n_subs*48 + n_events_cap*32 (caller sizes this)
+// Response:
+//   value     = n_events actually emitted (u32 widened to i64)
+//   extra_len = same, echoed so the shim can read it without
+//               re-decoding `value` as BigInt
+//
+// v1 kernel is single-threaded; the semantic is "non-blocking check".
+// A CLOCK subscription is ready iff its target time has been reached
+// (absolute) or its relative timeout is zero. An FD_READ subscription
+// is ready iff a read() on the fd would not block — for a Vnode that
+// is always true (offset < size means data, offset >= size means EOF
+// which is also "readable"); for a CharDevice it depends on the
+// input ring; for a Socket it means rx_buf non-empty or peer closed.
+// An FD_WRITE subscription is ready iff a write() would make progress
+// — Vnode + /dev/console always, Socket iff peer has rx capacity.
+// Invalid fd / unsupported clock id / bogus tag emit one event per
+// bad subscription with `event.error` set (EBADF / EINVAL / ENOTSUP);
+// the whole syscall still returns success. Syscall-level EINVAL fires
+// only for shape errors: n_subs == 0, heap too short to hold the
+// declared subs, heap too short to also hold n_events_cap events.
+
+use abi::wasi::poll as pl;
+
+/// Pack `(n_subs, n_events_cap)` into the 16-byte inline args window.
+fn poll_oneoff_args(n_subs: u32, n_events_cap: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&n_subs.to_le_bytes());
+    args[4..8].copy_from_slice(&n_events_cap.to_le_bytes());
+    args
+}
+
+/// Pack a CLOCK subscription into a fresh 48-byte buffer.
+fn sub_clock(userdata: u64, clock_id: u32, timeout_ns: u64, flags: u16) -> [u8; 48] {
+    let mut s = [0u8; 48];
+    s[pl::SUB_OFF_USERDATA..pl::SUB_OFF_USERDATA + 8].copy_from_slice(&userdata.to_le_bytes());
+    s[pl::SUB_OFF_TAG] = abi::wasi::eventtype::CLOCK;
+    s[pl::SUB_CLOCK_OFF_ID..pl::SUB_CLOCK_OFF_ID + 4].copy_from_slice(&clock_id.to_le_bytes());
+    s[pl::SUB_CLOCK_OFF_TIMEOUT..pl::SUB_CLOCK_OFF_TIMEOUT + 8]
+        .copy_from_slice(&timeout_ns.to_le_bytes());
+    s[pl::SUB_CLOCK_OFF_FLAGS..pl::SUB_CLOCK_OFF_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
+    s
+}
+
+/// Pack an FD_READ or FD_WRITE subscription into a fresh 48-byte buffer.
+fn sub_fd_rw(userdata: u64, tag: u8, fd: u32) -> [u8; 48] {
+    let mut s = [0u8; 48];
+    s[pl::SUB_OFF_USERDATA..pl::SUB_OFF_USERDATA + 8].copy_from_slice(&userdata.to_le_bytes());
+    s[pl::SUB_OFF_TAG] = tag;
+    s[pl::SUB_FDRW_OFF_FD..pl::SUB_FDRW_OFF_FD + 4].copy_from_slice(&fd.to_le_bytes());
+    s
+}
+
+/// Decode a single 32-byte event from `heap` at `offset`.
+fn decode_event(heap: &[u8], offset: usize) -> (u64, u16, u8, u64, u16) {
+    let mut u = [0u8; 8];
+    u.copy_from_slice(&heap[offset..offset + 8]);
+    let userdata = u64::from_le_bytes(u);
+    let mut e = [0u8; 2];
+    e.copy_from_slice(&heap[offset + pl::EVENT_OFF_ERROR..offset + pl::EVENT_OFF_ERROR + 2]);
+    let error = u16::from_le_bytes(e);
+    let ty = heap[offset + pl::EVENT_OFF_TYPE];
+    let mut n = [0u8; 8];
+    n.copy_from_slice(&heap[offset + pl::EVENT_OFF_RW_NBYTES..offset + pl::EVENT_OFF_RW_NBYTES + 8]);
+    let nbytes = u64::from_le_bytes(n);
+    let mut f = [0u8; 2];
+    f.copy_from_slice(&heap[offset + pl::EVENT_OFF_RW_FLAGS..offset + pl::EVENT_OFF_RW_FLAGS + 2]);
+    let flags = u16::from_le_bytes(f);
+    (userdata, error, ty, nbytes, flags)
+}
+
+#[test]
+fn poll_oneoff_zero_subscriptions_returns_einval() {
+    // WASI requires at least one subscription — a zero-sub call is
+    // nonsensical. Reject at the dispatcher layer before allocating
+    // anything on the heap.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "empty", 0);
+    let mut heap = vec![0u8; 256];
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 820,
+        args: poll_oneoff_args(0, 4),
+        heap_ptr: 0,
+        heap_len: 256,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn poll_oneoff_heap_too_short_for_subs_returns_einval() {
+    // Declared 2 subs requires 96 bytes at minimum; a 48-byte heap
+    // can't hold them.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "truncsubs", 0);
+    let mut heap = vec![0u8; 48];
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 821,
+        args: poll_oneoff_args(2, 0),
+        heap_ptr: 0,
+        heap_len: 48,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn poll_oneoff_heap_too_short_for_events_returns_einval() {
+    // Exercise the max(subs_bytes, events_bytes) check: 1 sub at 48
+    // bytes is covered by the 80-byte heap, but 3 events cap needs
+    // 96 bytes — the caller has to size the heap for the bigger of
+    // the two windows. (The usual WASI shim passes n_events_cap ==
+    // n_subs, so subs is always the bigger half; this case exists
+    // to guard the `max` branch specifically.)
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "truncevs", 0);
+    let mut heap = vec![0u8; 100];
+    let s = sub_clock(1, abi::wasi::CLOCKID_MONOTONIC, 0, 0);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 822,
+        args: poll_oneoff_args(1, 3),
+        heap_ptr: 0,
+        heap_len: 80, // < 3*32 = 96 events_bytes; kernel rejects
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn poll_oneoff_unknown_subscription_type_emits_einval_event() {
+    // Tag 99 is not a valid eventtype. The handler emits one event
+    // with error=EINVAL rather than aborting the syscall, because
+    // bad-tag is a per-subscription problem (a caller with a mix of
+    // good + bad subs still wants their good events).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "badtag", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(0xDEAD_BEEFu64, 99, 0); // tag 99 → unknown
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 823,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    assert_eq!(resp.extra_len, pl::EVENT_SIZE as u32);
+    let (ud, err, ty, nb, fl) = decode_event(&heap, 0);
+    assert_eq!(ud, 0xDEAD_BEEFu64);
+    assert_eq!(err, errno::EINVAL as u16);
+    assert_eq!(ty, 99);
+    assert_eq!(nb, 0);
+    assert_eq!(fl, 0);
+}
+
+#[test]
+fn poll_oneoff_clock_monotonic_abstime_past_is_ready() {
+    // ABSTIME with a timeout of 1 ns is trivially in the past of the
+    // Platform monotonic clock (which is far beyond nanoseconds into
+    // the test run). Ready → one event, no error.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pastclk", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(
+        42,
+        abi::wasi::CLOCKID_MONOTONIC,
+        1,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 824,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (ud, err, ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(ud, 42);
+    assert_eq!(err, 0);
+    assert_eq!(ty, abi::wasi::eventtype::CLOCK);
+}
+
+#[test]
+fn poll_oneoff_clock_monotonic_abstime_future_is_not_ready() {
+    // ABSTIME with a timeout in the far future (u64::MAX) never
+    // fires in v1's non-blocking model. Zero events.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "futclk", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(
+        7,
+        abi::wasi::CLOCKID_MONOTONIC,
+        u64::MAX,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 825,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 0);
+}
+
+#[test]
+fn poll_oneoff_clock_realtime_abstime_past_is_ready() {
+    // Same shape as the monotonic case but hitting the realtime
+    // clock — 1 ns since the Unix epoch is also firmly in the past.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "realclk", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(
+        99,
+        abi::wasi::CLOCKID_REALTIME,
+        1,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 826,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(ty, abi::wasi::eventtype::CLOCK);
+}
+
+#[test]
+fn poll_oneoff_clock_relative_zero_timeout_is_ready() {
+    // Relative (no ABSTIME flag) with timeout=0 means "fire
+    // immediately". Non-blocking kernel honours that as "ready now".
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "relzero", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(1, abi::wasi::CLOCKID_MONOTONIC, 0, 0);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 827,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+}
+
+#[test]
+fn poll_oneoff_clock_relative_nonzero_is_not_ready() {
+    // Relative non-zero means "wait N ns from now". v1 is non-
+    // blocking — userland spins instead of us blocking — so any
+    // non-zero relative timeout is reported as "not ready yet".
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "relnonzero", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(1, abi::wasi::CLOCKID_MONOTONIC, 10_000_000_000, 0);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 828,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn poll_oneoff_clock_invalid_id_emits_einval_event() {
+    // Unknown clock id (42): emit a per-subscription event with
+    // errno=EINVAL instead of aborting the whole syscall.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "badclkid", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(5, 42, 0, 0);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 829,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (ud, err, ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(ud, 5);
+    assert_eq!(err, errno::EINVAL as u16);
+    assert_eq!(ty, abi::wasi::eventtype::CLOCK);
+}
+
+#[test]
+fn poll_oneoff_clock_cputime_id_emits_enotsup_event() {
+    // Cputime clock ids are recognised-but-unsupported — the
+    // `clock_time_get` handler returns ENOTSUP for them, and
+    // poll_oneoff mirrors that by emitting a per-subscription event
+    // with errno=ENOTSUP.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cpuclk", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(9, abi::wasi::CLOCKID_PROCESS_CPUTIME_ID, 0, 0);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 830,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(err, errno::ENOTSUP as u16);
+    assert_eq!(ty, abi::wasi::eventtype::CLOCK);
+}
+
+#[test]
+fn poll_oneoff_fd_read_bad_fd_emits_ebadf_event() {
+    // Unopened fd → per-subscription EBADF. Syscall-level success.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "badfd", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(0xABCD, abi::wasi::eventtype::FD_READ, 99);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 831,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (ud, err, ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(ud, 0xABCD);
+    assert_eq!(err, errno::EBADF as u16);
+    assert_eq!(ty, abi::wasi::eventtype::FD_READ);
+}
+
+#[test]
+fn poll_oneoff_fd_read_vnode_reports_ready_with_bytes_available() {
+    // A Vnode fd against a non-empty tmpfs file with offset 0 is
+    // always "ready to read" and the handler reports nbytes =
+    // remaining-bytes-in-file.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "vnoderd", "/v.txt", b"hello, poll");
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(1, abi::wasi::eventtype::FD_READ, fd);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 832,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (ud, err, ty, nb, fl) = decode_event(&heap, 0);
+    assert_eq!(ud, 1);
+    assert_eq!(err, 0);
+    assert_eq!(ty, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nb, "hello, poll".len() as u64);
+    assert_eq!(fl, 0);
+}
+
+#[test]
+fn poll_oneoff_fd_write_vnode_always_ready() {
+    // Vnode FD_WRITE: always ready in v1 (tmpfs + opfs + procfs
+    // accept writes without blocking; devfs + procfs reject at the
+    // write layer, not at the pollable layer — poll_oneoff's
+    // "is it writable" answer for a Vnode is unconditionally yes).
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "vnwr", "/vw.txt", b"");
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(2, abi::wasi::eventtype::FD_WRITE, fd);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 834,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, ty, _nb, fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(ty, abi::wasi::eventtype::FD_WRITE);
+    assert_eq!(fl, 0);
+}
+
+#[test]
+fn poll_oneoff_fd_read_console_empty_is_not_ready() {
+    // /dev/console with an empty input ring is not yet readable.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "con0", 0);
+    k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(3, abi::wasi::eventtype::FD_READ, 0);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 835,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn poll_oneoff_fd_read_console_with_input_is_ready() {
+    // Inject input bytes into the console ring, then poll FD_READ
+    // on the console fd — ready, nbytes = ring length.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "con1", 0);
+    k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    k.devs.inject_console_input(b"hi");
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(4, abi::wasi::eventtype::FD_READ, 0);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 836,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, _ty, nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(nb, 2);
+}
+
+#[test]
+fn poll_oneoff_fd_write_console_always_ready() {
+    // /dev/console's write sink is line-buffered and never blocks.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "conwr", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(5, abi::wasi::eventtype::FD_WRITE, 1);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 837,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(ty, abi::wasi::eventtype::FD_WRITE);
+}
+
+#[test]
+fn poll_oneoff_fd_read_socket_empty_connected_not_ready() {
+    // A connected socket with an empty rx buffer and a still-open
+    // peer is not yet readable. Build the pair directly via the
+    // IpcTable so the test doesn't depend on the full bind/listen/
+    // connect/accept handshake.
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sockrd", 0);
+
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(6, abi::wasi::eventtype::FD_READ, 10);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 839,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn poll_oneoff_fd_read_socket_with_data_ready() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sockrd2", 0);
+
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+        sa.rx_buf.extend(b"data");
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(7, abi::wasi::eventtype::FD_READ, 10);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 840,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, _ty, nb, fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(nb, 4);
+    assert_eq!(fl, 0);
+}
+
+#[test]
+fn poll_oneoff_fd_read_socket_peer_closed_hangup_ready() {
+    // Peer closed + empty rx_buf is ready-with-hangup, signalling
+    // EOF to the caller. nbytes = 0.
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sockrdclosed", 0);
+
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+        sb.closed = true;
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(8, abi::wasi::eventtype::FD_READ, 10);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 841,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, _ty, nb, fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(nb, 0);
+    assert_eq!(fl, abi::wasi::eventrwflags::FD_READWRITE_HANGUP);
+}
+
+#[test]
+fn poll_oneoff_fd_write_socket_with_peer_capacity_ready() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sockwr", 0);
+
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(11, abi::wasi::eventtype::FD_WRITE, 10);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 842,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(ty, abi::wasi::eventtype::FD_WRITE);
+}
+
+#[test]
+fn poll_oneoff_fd_read_on_signal_channel_emits_einval_event() {
+    // FD_READ on a SignalChannel fd is meaningless in v1 — the
+    // read path returns NotSupportedOnFd. Per-subscription EINVAL.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sigrd", 0);
+    k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(13, abi::wasi::eventtype::FD_READ, 5);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 843,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, _ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(err, errno::EINVAL as u16);
+}
+
+#[test]
+fn poll_oneoff_userdata_is_echoed_verbatim() {
+    // Userdata is 64 bits of opaque caller state; kernel must echo
+    // it without modification so the caller can correlate events
+    // back to subscriptions without tracking index positions.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "udatareal", 0);
+    let mut heap = vec![0u8; 128];
+    let s = sub_clock(
+        0xFEDC_BA98_7654_3210,
+        abi::wasi::CLOCKID_MONOTONIC,
+        0,
+        0,
+    );
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 844,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (ud, _err, _ty, _nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(ud, 0xFEDC_BA98_7654_3210);
+}
+
+#[test]
+fn poll_oneoff_mixed_subscriptions_emit_only_ready_ones() {
+    // Three subscriptions: ready-clock, not-ready-future-clock,
+    // ready-clock. Expect 2 events with userdatas 1 and 3 (2 is the
+    // never-firing one).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "mixed", 0);
+    let mut heap = vec![0u8; 3 * 48 + 3 * 32 + 32];
+    let s1 = sub_clock(1, abi::wasi::CLOCKID_MONOTONIC, 0, 0);
+    let s2 = sub_clock(
+        2,
+        abi::wasi::CLOCKID_MONOTONIC,
+        u64::MAX,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    let s3 = sub_clock(3, abi::wasi::CLOCKID_REALTIME, 0, 0);
+    heap[0..48].copy_from_slice(&s1);
+    heap[48..96].copy_from_slice(&s2);
+    heap[96..144].copy_from_slice(&s3);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 845,
+        args: poll_oneoff_args(3, 3),
+        heap_ptr: 0,
+        heap_len: 3 * 48 + 3 * 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 2);
+    // Events are written sequentially starting at heap_ptr + 0,
+    // overwriting the subscription window.
+    let (ud1, _, _, _, _) = decode_event(&heap, 0);
+    let (ud2, _, _, _, _) = decode_event(&heap, 32);
+    assert_eq!(ud1, 1);
+    assert_eq!(ud2, 3);
+}
+
+#[test]
+fn poll_oneoff_events_cap_caps_output_count() {
+    // Three ready subs but the caller's event cap is 2 — kernel
+    // emits 2 events and silently drops the third. No error.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cap2", 0);
+    let mut heap = vec![0u8; 3 * 48 + 2 * 32 + 32];
+    let s1 = sub_clock(1, abi::wasi::CLOCKID_MONOTONIC, 0, 0);
+    let s2 = sub_clock(2, abi::wasi::CLOCKID_MONOTONIC, 0, 0);
+    let s3 = sub_clock(3, abi::wasi::CLOCKID_REALTIME, 0, 0);
+    heap[0..48].copy_from_slice(&s1);
+    heap[48..96].copy_from_slice(&s2);
+    heap[96..144].copy_from_slice(&s3);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 846,
+        args: poll_oneoff_args(3, 2),
+        heap_ptr: 0,
+        heap_len: 3 * 48 + 2 * 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 2);
+    // extra_len is in bytes (n_events * event_size), mirroring the
+    // random_get / fd_read convention: "bytes written to the heap
+    // scratch region".
+    assert_eq!(resp.extra_len, 2 * pl::EVENT_SIZE as u32);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

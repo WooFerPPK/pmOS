@@ -67,6 +67,7 @@ pub fn dispatch_wasi(
         op::FD_FILESTAT_GET => handle_fd_filestat_get(kernel, pid, req, heap),
         op::PATH_FILESTAT_GET => handle_path_filestat_get(kernel, pid, req, heap),
         op::PATH_FILESTAT_SET_TIMES => handle_path_filestat_set_times(kernel, pid, req, heap),
+        op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
     }
@@ -1046,4 +1047,363 @@ fn handle_path_filestat_set_times(
 
 fn handle_fd_prestat_get(req: &Request) -> Response {
     Response::err(req.request_id, EBADF)
+}
+
+// ---- poll_oneoff -----------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = n_subs (u32; MUST be >= 1)
+//   args[4..8]  = n_events_cap (u32; caller-provided max number of
+//                 events the kernel may write back)
+//   heap[0..n_subs*48]                        = input subscriptions
+//                                                (48 bytes each; see
+//                                                `abi::wasi::poll` for
+//                                                the field offsets)
+//   heap[n_subs*48..n_subs*48 + n_events*32]  = output events (32 bytes
+//                                                each; kernel writes
+//                                                up to n_events_cap)
+//   heap_len    = n_subs*48 + n_events_cap*32 (caller sizes this)
+// Response:
+//   value     = n_events actually emitted (u32 widened to i64)
+//   extra_len = same (mirrored so the shim can read it without
+//               reinterpreting `value` as BigInt)
+//
+// ## v1 semantics: non-blocking only
+//
+// The real POSIX `poll()` sleeps the calling thread until at least one
+// subscription fires or a timeout elapses. PMos's kernel is strictly
+// single-threaded — the dispatcher runs each request to completion
+// before picking up the next one — so a handler that blocks would
+// stall every process sharing the kernel Worker. Instead, this
+// handler does a one-shot readiness check and returns immediately:
+//
+//   * CLOCK subscriptions fire only if the target time has already
+//     been reached. `ABSTIME` with a timeout in the past is ready;
+//     a relative timeout of 0 is ready; any relative non-zero
+//     timeout is reported as "not ready yet".
+//   * FD_READ / FD_WRITE subscriptions fire only if the corresponding
+//     operation would make progress right now — rx_buf non-empty for
+//     a readable socket, peer_closed for EOF, available bytes < size
+//     for a Vnode, etc.
+//
+// Userland is expected to spin: repeatedly call poll_oneoff until at
+// least one event fires. This is the documented weaker-than-POSIX
+// contract; a future slice that introduces real blocking (parking
+// the process on the subscription's target condition and waking via
+// the scheduler) keeps the same opcode shape and wire layout.
+//
+// ## Per-subscription errors vs syscall-level errors
+//
+// A bad subscription (unopened fd, unsupported clock id, bogus tag,
+// unsupported fd-object-type combination) emits ONE event with
+// `event.error` set to the appropriate errno. The whole syscall
+// still returns success — a caller with a mix of good and bad subs
+// still gets their good events alongside the bad ones. This matches
+// WASI's documented semantics.
+//
+// Syscall-level EINVAL fires only for shape errors that prevent the
+// handler from decoding the subscription list at all: n_subs == 0,
+// or a heap that's too short to hold the declared subs + the caller-
+// requested event window.
+
+use crate::fd::FdEntry;
+use crate::fs::devfs::{
+    DEV_CONSOLE, DEV_FB0, DEV_INPUT_KBD, DEV_INPUT_MOUSE, DEV_NULL, DEV_RANDOM, DEV_ZERO,
+};
+use crate::ipc::{SocketId, SocketState};
+use abi::errno::ENOENT;
+use abi::wasi::eventrwflags::FD_READWRITE_HANGUP;
+use abi::wasi::eventtype as et;
+use abi::wasi::poll as pl;
+use abi::wasi::subclockflags::ABSTIME;
+use alloc::vec::Vec;
+
+/// Build one 32-byte event slot from its logical fields.
+fn build_event(userdata: u64, error: u16, ty: u8, nbytes: u64, flags: u16) -> [u8; pl::EVENT_SIZE] {
+    let mut e = [0u8; pl::EVENT_SIZE];
+    e[pl::EVENT_OFF_USERDATA..pl::EVENT_OFF_USERDATA + 8]
+        .copy_from_slice(&userdata.to_le_bytes());
+    e[pl::EVENT_OFF_ERROR..pl::EVENT_OFF_ERROR + 2]
+        .copy_from_slice(&error.to_le_bytes());
+    e[pl::EVENT_OFF_TYPE] = ty;
+    e[pl::EVENT_OFF_RW_NBYTES..pl::EVENT_OFF_RW_NBYTES + 8]
+        .copy_from_slice(&nbytes.to_le_bytes());
+    e[pl::EVENT_OFF_RW_FLAGS..pl::EVENT_OFF_RW_FLAGS + 2]
+        .copy_from_slice(&flags.to_le_bytes());
+    e
+}
+
+/// Per-subscription readability / writability check. Returns
+/// `(is_ready, nbytes, rwflags, per_sub_error)`. If `per_sub_error`
+/// is `Some`, the caller emits an event with that errno regardless of
+/// the boolean; it's a "meaningless subscription" signal (e.g. FD_READ
+/// on a SignalChannel). If `is_ready` is true, the caller emits a
+/// success event with the returned nbytes + flags.
+fn fd_readiness(
+    kernel: &mut Kernel,
+    entry: &FdEntry,
+    is_read: bool,
+) -> (bool, u64, u16, Option<i32>) {
+    match entry.object {
+        FdObject::Vnode { mount_id, ino } => {
+            let st = match kernel.vfs.stat_ino(mount_id, ino) {
+                Ok(s) => s,
+                Err(_) => return (false, 0, 0, Some(ENOENT)),
+            };
+            if is_read {
+                if entry.offset < st.size {
+                    (true, st.size - entry.offset, 0, None)
+                } else {
+                    // Past EOF is still "ready to read" per WASI —
+                    // the caller's read() returns 0. Signal EOF via
+                    // the HANGUP flag so the caller doesn't spin.
+                    (true, 0, FD_READWRITE_HANGUP, None)
+                }
+            } else {
+                (true, 0, 0, None)
+            }
+        }
+        FdObject::CharDevice(devnum) => char_device_readiness(kernel, devnum, is_read),
+        FdObject::Socket(id) => socket_readiness(kernel, SocketId(id), is_read),
+        FdObject::PipeRead(_)
+        | FdObject::PipeWrite(_)
+        | FdObject::DisplayConn(_)
+        | FdObject::SignalChannel => {
+            // v1 doesn't wire these through fd_read / fd_write; poll
+            // on them is meaningless → per-subscription EINVAL.
+            (false, 0, 0, Some(EINVAL))
+        }
+    }
+}
+
+fn char_device_readiness(
+    kernel: &mut Kernel,
+    devnum: u32,
+    is_read: bool,
+) -> (bool, u64, u16, Option<i32>) {
+    if is_read {
+        match devnum {
+            // null always returns 0 (EOF) — ready-with-hangup would be
+            // a legal shape but most callers that poll /dev/null want
+            // to know it's readable; keep it simple and flag hangup.
+            DEV_NULL => (true, 0, FD_READWRITE_HANGUP, None),
+            // zero / random are infinite readable sources.
+            DEV_ZERO | DEV_RANDOM => (true, 0, 0, None),
+            DEV_CONSOLE => {
+                let len = kernel.devs.console_input_len();
+                if len > 0 {
+                    (true, len as u64, 0, None)
+                } else {
+                    (false, 0, 0, None)
+                }
+            }
+            // No public length accessor for the input rings; report
+            // not-ready. A future slice can expose a length on
+            // DeviceDispatcher and wire them here.
+            DEV_INPUT_KBD | DEV_INPUT_MOUSE => (false, 0, 0, None),
+            // fb0 is write-only.
+            DEV_FB0 => (false, 0, 0, Some(EINVAL)),
+            _ => (false, 0, 0, Some(EINVAL)),
+        }
+    } else {
+        match devnum {
+            // null / zero / console / fb0 all accept writes without blocking.
+            DEV_NULL | DEV_ZERO | DEV_CONSOLE | DEV_FB0 => (true, 0, 0, None),
+            DEV_RANDOM | DEV_INPUT_KBD | DEV_INPUT_MOUSE => {
+                (false, 0, 0, Some(EINVAL))
+            }
+            _ => (false, 0, 0, Some(EINVAL)),
+        }
+    }
+}
+
+fn socket_readiness(
+    kernel: &mut Kernel,
+    id: SocketId,
+    is_read: bool,
+) -> (bool, u64, u16, Option<i32>) {
+    // Snapshot the fields we need under a scoped mut borrow so we
+    // can release the borrow before looking at the peer.
+    let (state, peer_opt, rx_len) = {
+        let sock = match kernel.ipc.socket_mut(id) {
+            Ok(s) => s,
+            Err(_) => return (false, 0, 0, Some(EBADF)),
+        };
+        (sock.state, sock.peer, sock.rx_buf.len())
+    };
+    if state != SocketState::Connected {
+        return (false, 0, 0, Some(EINVAL));
+    }
+    let (peer_closed, peer_free) = match peer_opt {
+        Some(peer_id) => match kernel.ipc.socket_mut(peer_id) {
+            Ok(p) => (p.closed, p.rx_cap.saturating_sub(p.rx_buf.len())),
+            Err(_) => (true, 0),
+        },
+        None => (true, 0),
+    };
+    if is_read {
+        if rx_len > 0 {
+            (true, rx_len as u64, 0, None)
+        } else if peer_closed {
+            (true, 0, FD_READWRITE_HANGUP, None)
+        } else {
+            (false, 0, 0, None)
+        }
+    } else if peer_closed {
+        (true, 0, FD_READWRITE_HANGUP, None)
+    } else if peer_free > 0 {
+        (true, peer_free as u64, 0, None)
+    } else {
+        (false, 0, 0, None)
+    }
+}
+
+fn handle_poll_oneoff(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let n_subs = args_u32(req, 0);
+    let n_events_cap = args_u32(req, 4);
+    if n_subs == 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let subs_bytes = match (n_subs as usize).checked_mul(pl::SUBSCRIPTION_SIZE) {
+        Some(n) => n,
+        None => return Response::err(req.request_id, EINVAL),
+    };
+    let events_bytes = match (n_events_cap as usize).checked_mul(pl::EVENT_SIZE) {
+        Some(n) => n,
+        None => return Response::err(req.request_id, EINVAL),
+    };
+    let total_bytes = match subs_bytes.checked_add(events_bytes) {
+        Some(n) => n,
+        None => return Response::err(req.request_id, EINVAL),
+    };
+    let heap_len = req.heap_len as usize;
+    let heap_ptr = req.heap_ptr as usize;
+    // Events are written starting at `heap_ptr + 0`, overwriting the
+    // subscriptions (which the handler copies out into `subs` before
+    // touching the output region). The heap therefore only needs to
+    // fit the larger of the two windows — in practice that's always
+    // `subs_bytes`, since WASI's signature sizes the output buffer as
+    // `nsubscriptions` events and a 48-byte sub is bigger than a
+    // 32-byte event — but the check is written against `max` so a
+    // caller that passes `n_events_cap > n_subs` is still rejected
+    // cleanly when the events window doesn't fit.
+    let needed = core::cmp::max(subs_bytes, events_bytes);
+    if heap_len < needed {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let _ = total_bytes; // silence unused — kept for future growth.
+    let heap_end = match heap_ptr.checked_add(needed) {
+        Some(n) => n,
+        None => return Response::err(req.request_id, EINVAL),
+    };
+    if heap_end > heap.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+
+    // Copy the subscription bytes out before we touch the output
+    // region, so writing events doesn't alias the input reads.
+    let mut subs: Vec<[u8; pl::SUBSCRIPTION_SIZE]> = Vec::with_capacity(n_subs as usize);
+    for i in 0..(n_subs as usize) {
+        let base = heap_ptr + i * pl::SUBSCRIPTION_SIZE;
+        let mut arr = [0u8; pl::SUBSCRIPTION_SIZE];
+        arr.copy_from_slice(&heap[base..base + pl::SUBSCRIPTION_SIZE]);
+        subs.push(arr);
+    }
+
+    let mut events: Vec<[u8; pl::EVENT_SIZE]> = Vec::with_capacity(n_subs as usize);
+    for sub in &subs {
+        if events.len() >= n_events_cap as usize {
+            break;
+        }
+        let mut ud_bytes = [0u8; 8];
+        ud_bytes.copy_from_slice(&sub[pl::SUB_OFF_USERDATA..pl::SUB_OFF_USERDATA + 8]);
+        let userdata = u64::from_le_bytes(ud_bytes);
+        let tag = sub[pl::SUB_OFF_TAG];
+        match tag {
+            et::CLOCK => {
+                let mut cid_bytes = [0u8; 4];
+                cid_bytes.copy_from_slice(&sub[pl::SUB_CLOCK_OFF_ID..pl::SUB_CLOCK_OFF_ID + 4]);
+                let clock_id = u32::from_le_bytes(cid_bytes);
+                let mut to_bytes = [0u8; 8];
+                to_bytes.copy_from_slice(
+                    &sub[pl::SUB_CLOCK_OFF_TIMEOUT..pl::SUB_CLOCK_OFF_TIMEOUT + 8],
+                );
+                let timeout = u64::from_le_bytes(to_bytes);
+                let mut fl_bytes = [0u8; 2];
+                fl_bytes.copy_from_slice(
+                    &sub[pl::SUB_CLOCK_OFF_FLAGS..pl::SUB_CLOCK_OFF_FLAGS + 2],
+                );
+                let flags = u16::from_le_bytes(fl_bytes);
+                let now_opt = match clock_id {
+                    abi::wasi::CLOCKID_MONOTONIC => Some(platform::current().now_ns()),
+                    abi::wasi::CLOCKID_REALTIME => Some(platform::current().now_realtime_ns()),
+                    abi::wasi::CLOCKID_PROCESS_CPUTIME_ID
+                    | abi::wasi::CLOCKID_THREAD_CPUTIME_ID => {
+                        events.push(build_event(userdata, ENOTSUP as u16, et::CLOCK, 0, 0));
+                        continue;
+                    }
+                    _ => {
+                        events.push(build_event(userdata, EINVAL as u16, et::CLOCK, 0, 0));
+                        continue;
+                    }
+                };
+                let now = now_opt.unwrap();
+                let is_ready = if flags & ABSTIME != 0 {
+                    now >= timeout
+                } else {
+                    timeout == 0
+                };
+                if is_ready {
+                    events.push(build_event(userdata, 0, et::CLOCK, 0, 0));
+                }
+            }
+            et::FD_READ | et::FD_WRITE => {
+                let mut fd_bytes = [0u8; 4];
+                fd_bytes.copy_from_slice(&sub[pl::SUB_FDRW_OFF_FD..pl::SUB_FDRW_OFF_FD + 4]);
+                let fd = u32::from_le_bytes(fd_bytes);
+                let entry_opt = match kernel.fds(pid) {
+                    Ok(t) => t.get(fd).copied(),
+                    Err(_) => None,
+                };
+                let Some(entry) = entry_opt else {
+                    events.push(build_event(userdata, EBADF as u16, tag, 0, 0));
+                    continue;
+                };
+                let (ready, nbytes, rwflags, err_opt) =
+                    fd_readiness(kernel, &entry, tag == et::FD_READ);
+                if let Some(errno_code) = err_opt {
+                    events.push(build_event(userdata, errno_code as u16, tag, 0, 0));
+                } else if ready {
+                    events.push(build_event(userdata, 0, tag, nbytes, rwflags));
+                }
+            }
+            _ => {
+                events.push(build_event(userdata, EINVAL as u16, tag, 0, 0));
+            }
+        }
+    }
+
+    // Write events sequentially starting at `heap_ptr + 0`,
+    // overwriting the subscription window (which is no longer live
+    // because `subs` holds the copy). The caller's shim reads the
+    // events straight out of the same heap region.
+    let n_events = events.len();
+    for (i, e) in events.iter().enumerate() {
+        let start = heap_ptr + i * pl::EVENT_SIZE;
+        let end = start + pl::EVENT_SIZE;
+        heap[start..end].copy_from_slice(e);
+    }
+
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: n_events as i64,
+        extra_len: (n_events * pl::EVENT_SIZE) as u32,
+        _pad: [0u8; 12],
+    }
 }
