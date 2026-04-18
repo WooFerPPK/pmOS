@@ -407,12 +407,18 @@ const OFLAG_DIRECTORY = 0x0002;
 const OFLAG_EXCL = 0x0004;
 const OFLAG_TRUNC = 0x0008;
 
-function encodePathOpenArgs(fdflags: number, oflags: number, mode: number): Uint8Array {
+function encodePathOpenArgs(
+  fdflags: number,
+  oflags: number,
+  mode: number,
+  lookupFlags: number = 0,
+): Uint8Array {
   const args = new Uint8Array(16);
   const v = new DataView(args.buffer);
   v.setUint32(0, fdflags >>> 0, true);
   v.setUint16(4, oflags & 0xffff, true);
   v.setUint16(6, mode & 0xffff, true);
+  v.setUint32(8, lookupFlags >>> 0, true);
   return args;
 }
 
@@ -605,6 +611,144 @@ describe("dispatch: PATH_OPEN oflags", () => {
     expect(st.status).toBe(0);
     const size = new DataView(heapOut.buffer, heapOut.byteOffset).getBigUint64(32, true);
     expect(size).toBe(0n);
+  });
+});
+
+// ---- dispatch: PATH_OPEN lookup_flags (AT_SYMLINK_NOFOLLOW) ---------
+//
+// End-to-end through kernel.wasm: exercise the new args[8..12] u32
+// lookup_flags decode on PATH_OPEN. Bit 0 = SYMLINK_FOLLOW. Pre-
+// slice path_open always followed the final symlink (slice 1's
+// Vfs::resolve). Post-slice the flag governs: set → follow (fd
+// lands on the target's filetype); clear → do not follow (fd lands
+// on the symlink's own filetype). Intermediate components always
+// follow regardless of the bit.
+
+const LOOKUP_SYMLINK_FOLLOW = 0x0001;
+
+describe("dispatch: PATH_OPEN lookup_flags", () => {
+  it("with SYMLINK_FOLLOW set, opens the symlink's target", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /target as a directory so the follow-vs-nofollow
+    // distinction is visible via FD_FILESTAT_GET filetype.
+    const targetPath = new TextEncoder().encode("/target");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1400,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: targetPath.length,
+      },
+      targetPath,
+    );
+
+    const linkHeap = encodePathSymlinkHeap("/target", "/link");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1401,
+        args: encodePathSymlinkArgs("/target".length),
+        heapPtr: 0,
+        heapLen: linkHeap.length,
+      },
+      linkHeap,
+    );
+
+    const linkPath = new TextEncoder().encode("/link");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1402,
+        args: encodePathOpenArgs(0, 0, 0, LOOKUP_SYMLINK_FOLLOW),
+        heapPtr: 0,
+        heapLen: linkPath.length,
+      },
+      linkPath,
+    );
+    expect(response.status).toBe(0);
+    const fd = Number(response.value);
+
+    const { response: stat, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_GET,
+        requestId: 1403,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(stat.status).toBe(0);
+    expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
+  });
+
+  it("with SYMLINK_FOLLOW clear, opens the symlink's own vnode", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const targetPath = new TextEncoder().encode("/target");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1404,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: targetPath.length,
+      },
+      targetPath,
+    );
+
+    const linkHeap = encodePathSymlinkHeap("/target", "/link");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1405,
+        args: encodePathSymlinkArgs("/target".length),
+        heapPtr: 0,
+        heapLen: linkHeap.length,
+      },
+      linkHeap,
+    );
+
+    const linkPath = new TextEncoder().encode("/link");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1406,
+        args: encodePathOpenArgs(0, 0, 0, 0),
+        heapPtr: 0,
+        heapLen: linkPath.length,
+      },
+      linkPath,
+    );
+    expect(response.status).toBe(0);
+    const fd = Number(response.value);
+
+    // Stat the opened fd: filetype should be SYMBOLIC_LINK (7),
+    // not DIRECTORY (3).
+    const { response: stat, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_GET,
+        requestId: 1407,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(stat.status).toBe(0);
+    expect(heapOut[16]).toBe(FILETYPE.SYMBOLIC_LINK);
   });
 });
 

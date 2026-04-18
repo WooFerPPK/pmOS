@@ -97,6 +97,19 @@ pub mod fdflags {
     pub const SYNC:     u16 = 0x0010;
 }
 
+/// Lookup flags used with `path_open` (dirflags arg) and
+/// `path_filestat_get` (lookup_flags arg). WASI defines a single
+/// bit — SYMLINK_FOLLOW — governing whether the final component
+/// of a path is dereferenced when it is itself a symlink.
+/// Intermediate components always follow symlinks regardless of
+/// this bit.
+pub mod lookupflags {
+    /// Follow the final symlink (stat-like). When clear, the
+    /// final symlink is NOT dereferenced (lstat-like; open on a
+    /// symlink yields the symlink's own vnode).
+    pub const SYMLINK_FOLLOW: u32 = 0x0001;
+}
+
 /// Sdflags used with `sock_shutdown`. WASI models shutdown as a
 /// pair of independent bits (read-side and write-side) so userland
 /// can half-close one direction while leaving the other open.

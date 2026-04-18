@@ -158,7 +158,7 @@ fn path_open_on_regular_file_installs_vnode_fd() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/greeting", 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/greeting", 0, 0, 0, FdFlags::EMPTY).unwrap();
     let table = k.fds(pid).unwrap();
     let entry = table.get(fd).unwrap();
     assert!(matches!(entry.object, FdObject::Vnode { .. }));
@@ -176,7 +176,7 @@ fn path_open_nonexistent_file_is_not_found() {
         })
         .unwrap();
     let err = k
-        .path_open(pid, "/missing", 0, 0, FdFlags::EMPTY)
+        .path_open(pid, "/missing", 0, 0, 0, FdFlags::EMPTY)
         .unwrap_err();
     assert_eq!(err, KernelError::Fs(FsError::NotFound));
 }
@@ -199,12 +199,12 @@ fn fd_write_then_read_round_trips_through_tmpfs() {
     // Open once for writing, close, reopen for reading: this
     // matches the shape a real shell uses when redirecting
     // `>/notes.txt` then `cat /notes.txt`.
-    let wfd = k.path_open(pid, "/notes.txt", 0, 0, FdFlags::EMPTY).unwrap();
+    let wfd = k.path_open(pid, "/notes.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
     let n = k.fd_write(pid, wfd, b"hello\n").unwrap();
     assert_eq!(n, 6);
     k.fd_close(pid, wfd).unwrap();
 
-    let rfd = k.path_open(pid, "/notes.txt", 0, 0, FdFlags::EMPTY).unwrap();
+    let rfd = k.path_open(pid, "/notes.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
     let mut buf = [0u8; 16];
     let n = k.fd_read(pid, rfd, &mut buf).unwrap();
     assert_eq!(n, 6);
@@ -224,11 +224,11 @@ fn fd_read_advances_offset_across_multiple_calls() {
             cwd: "/",
         })
         .unwrap();
-    let wfd = k.path_open(pid, "/split.txt", 0, 0, FdFlags::EMPTY).unwrap();
+    let wfd = k.path_open(pid, "/split.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
     k.fd_write(pid, wfd, b"abcdefghij").unwrap();
     k.fd_close(pid, wfd).unwrap();
 
-    let rfd = k.path_open(pid, "/split.txt", 0, 0, FdFlags::EMPTY).unwrap();
+    let rfd = k.path_open(pid, "/split.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
     let mut buf = [0u8; 4];
     // Three consecutive partial reads consume the file in 4 /
     // 4 / 2 byte chunks, demonstrating that the fd's offset is
@@ -256,7 +256,7 @@ fn path_open_console_installs_chardevice_fd() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
     let entry = k.fds(pid).unwrap().get(fd).unwrap();
     assert_eq!(entry.object, FdObject::CharDevice(DEV_CONSOLE));
 }
@@ -274,7 +274,7 @@ fn path_open_fb0_refused_without_display_server_cap() {
         })
         .unwrap();
     let err = k
-        .path_open(pid, "/dev/fb0", 0, 0, FdFlags::EMPTY)
+        .path_open(pid, "/dev/fb0", 0, 0, 0, FdFlags::EMPTY)
         .unwrap_err();
     assert_eq!(err, KernelError::NotCapable);
 }
@@ -290,7 +290,7 @@ fn path_open_fb0_allowed_with_display_server_cap() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/fb0", 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/fb0", 0, 0, 0, FdFlags::EMPTY).unwrap();
     // It IS a chardev fd once opened; writes go through
     // DeviceDispatcher → Platform::driver_call which in the
     // native-platform test build is a no-op-Ok.
@@ -311,7 +311,7 @@ fn fd_read_chardevice_console_drains_injected_input() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
 
     k.devs.inject_console_input(b"ls\n");
     let mut buf = [0u8; 8];
@@ -331,7 +331,7 @@ fn fd_read_chardevice_console_empty_is_would_block() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
     let mut buf = [0u8; 4];
     let err = k.fd_read(pid, fd, &mut buf).unwrap_err();
     assert_eq!(err, KernelError::Dev(DevError::WouldBlock));
@@ -348,7 +348,7 @@ fn fd_write_chardevice_console_flushes_complete_lines() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
     k.fd_write(pid, fd, b"hello\n").unwrap();
     // Whole-line writes flush to the platform driver; the
     // in-kernel pending-line sink is empty.
@@ -372,7 +372,7 @@ fn fd_close_frees_the_slot() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/tmp.txt", 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/tmp.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
     assert!(k.fds(pid).unwrap().is_open(fd));
     k.fd_close(pid, fd).unwrap();
     assert!(!k.fds(pid).unwrap().is_open(fd));
@@ -1078,7 +1078,7 @@ fn principle_viii_shell_can_source_a_script_file() {
             cwd: "/",
         })
         .unwrap();
-    let wfd = k.path_open(init, "/script.sh", 0, 0, FdFlags::EMPTY).unwrap();
+    let wfd = k.path_open(init, "/script.sh", 0, 0, 0, FdFlags::EMPTY).unwrap();
     k.fd_write(init, wfd, b"echo first\necho second\nexit\n")
         .unwrap();
     k.fd_close(init, wfd).unwrap();
@@ -1093,7 +1093,7 @@ fn principle_viii_shell_can_source_a_script_file() {
             cwd: "/",
         })
         .unwrap();
-    let script_fd = k.path_open(sh, "/script.sh", 0, 0, FdFlags::EMPTY).unwrap();
+    let script_fd = k.path_open(sh, "/script.sh", 0, 0, 0, FdFlags::EMPTY).unwrap();
     k.install_fd(sh, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
         .unwrap();
     k.install_fd(sh, 2, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
@@ -1576,7 +1576,7 @@ fn path_open_creat_creates_new_file_and_returns_fd() {
     let pid = path_open_proc(&mut k, "creater");
 
     let fd = k
-        .path_open(pid, "/new.txt", abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
+        .path_open(pid, "/new.txt", 0, abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
         .unwrap();
     let table = k.fds(pid).unwrap();
     assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
@@ -1596,7 +1596,7 @@ fn path_open_creat_on_existing_file_opens_without_truncating() {
     let pid = path_open_proc(&mut k, "creater2");
 
     let fd = k
-        .path_open(pid, "/exists.txt", abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
+        .path_open(pid, "/exists.txt", 0, abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
         .unwrap();
     let mut buf = [0u8; 8];
     let n = k.fd_read(pid, fd, &mut buf).unwrap();
@@ -1615,6 +1615,7 @@ fn path_open_creat_excl_on_existing_returns_already_exists() {
         .path_open(
             pid,
             "/already.txt",
+            0,
             abi::wasi::oflags::CREAT | abi::wasi::oflags::EXCL,
             0,
             FdFlags::EMPTY,
@@ -1632,7 +1633,7 @@ fn path_open_excl_without_creat_is_ignored_on_existing() {
     let pid = path_open_proc(&mut k, "openerX");
 
     let fd = k
-        .path_open(pid, "/plain.txt", abi::wasi::oflags::EXCL, 0, FdFlags::EMPTY)
+        .path_open(pid, "/plain.txt", 0, abi::wasi::oflags::EXCL, 0, FdFlags::EMPTY)
         .unwrap();
     let table = k.fds(pid).unwrap();
     assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
@@ -1650,7 +1651,7 @@ fn path_open_trunc_shrinks_existing_regular_file_to_zero() {
     let pid = path_open_proc(&mut k, "truncater");
 
     let fd = k
-        .path_open(pid, "/data.bin", abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
+        .path_open(pid, "/data.bin", 0, abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
         .unwrap();
     // Stat now reports 0.
     assert_eq!(k.vfs.stat("/data.bin").unwrap().size, 0);
@@ -1667,7 +1668,7 @@ fn path_open_trunc_on_directory_returns_is_a_directory() {
     let pid = path_open_proc(&mut k, "truncDir");
 
     let err = k
-        .path_open(pid, "/dir", abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
+        .path_open(pid, "/dir", 0, abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
         .unwrap_err();
     assert_eq!(err, KernelError::Fs(FsError::IsADirectory));
 }
@@ -1684,6 +1685,7 @@ fn path_open_directory_flag_on_regular_file_returns_not_a_directory() {
         .path_open(
             pid,
             "/file.txt",
+            0,
             abi::wasi::oflags::DIRECTORY,
             0,
             FdFlags::EMPTY,
@@ -1703,6 +1705,7 @@ fn path_open_directory_flag_on_directory_opens_normally() {
         .path_open(
             pid,
             "/mydir",
+            0,
             abi::wasi::oflags::DIRECTORY,
             0,
             FdFlags::EMPTY,
@@ -1724,6 +1727,7 @@ fn path_open_creat_directory_returns_invalid_argument() {
         .path_open(
             pid,
             "/anything",
+            0,
             abi::wasi::oflags::CREAT | abi::wasi::oflags::DIRECTORY,
             0,
             FdFlags::EMPTY,
@@ -1747,6 +1751,7 @@ fn path_open_creat_trunc_on_existing_file_truncates() {
         .path_open(
             pid,
             "/ct.txt",
+            0,
             abi::wasi::oflags::CREAT | abi::wasi::oflags::TRUNC,
             0,
             FdFlags::EMPTY,
@@ -1768,10 +1773,161 @@ fn path_open_creat_in_readonly_fs_returns_read_only() {
         .path_open(
             pid,
             "/dev/newfile",
+            0,
             abi::wasi::oflags::CREAT,
             0,
             FdFlags::EMPTY,
         )
         .unwrap_err();
     assert_eq!(err, KernelError::Fs(FsError::ReadOnly));
+}
+
+// ---- path_open lookup_flags (AT_SYMLINK_NOFOLLOW-equivalent) ---------
+//
+// Pre-slice Kernel::path_open always followed the final symlink
+// (Vfs::open uses Vfs::resolve which dereferences). Post-slice the
+// new `lookup_flags` u32 argument governs the final-component
+// behaviour per WASI semantics: bit 0 (LOOKUP_SYMLINK_FOLLOW) set
+// → follow (stat-like); clear → do not follow (lstat-like /
+// O_NOFOLLOW).
+
+#[test]
+fn path_open_with_symlink_follow_reaches_target() {
+    // /target (regular file) ← /link (symlink). With
+    // LOOKUP_SYMLINK_FOLLOW set, the returned fd's vnode points
+    // at /target's ino. Identity check: writing via the fd lands
+    // on /target's bytes.
+    let mut k = make_kernel();
+    k.vfs.create("/target", 0o644).unwrap();
+    k.vfs.symlink("/target", "/link").unwrap();
+    let pid = path_open_proc(&mut k, "follower");
+
+    let fd = k
+        .path_open(
+            pid,
+            "/link",
+            abi::wasi::lookupflags::SYMLINK_FOLLOW,
+            0,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap();
+    k.fd_write(pid, fd, b"hi").unwrap();
+    let mut buf = [0u8; 4];
+    let n = k.vfs.read("/target", 0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"hi");
+}
+
+#[test]
+fn path_open_without_symlink_follow_opens_symlink_itself() {
+    // With LOOKUP_SYMLINK_FOLLOW clear, the returned fd's vnode
+    // is the *symlink's* own ino rather than the target's.
+    // Reading from a symlink vnode errors with
+    // FsError::InvalidArgument at the tmpfs layer (symlinks
+    // aren't byte-stream readable); the fd installs fine but
+    // fd_read returns -EINVAL. The stat on the vnode reports
+    // NodeType::SymLink.
+    let mut k = make_kernel();
+    k.vfs.create("/target", 0o644).unwrap();
+    k.vfs.symlink("/target", "/link").unwrap();
+    let link_ino = k.vfs.resolve_nofollow("/link").unwrap().1;
+    let pid = path_open_proc(&mut k, "nofollow");
+
+    let fd = k
+        .path_open(pid, "/link", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
+    let entry = k.fds(pid).unwrap().get(fd).unwrap();
+    match entry.object {
+        FdObject::Vnode { ino, .. } => assert_eq!(ino, link_ino),
+        other => panic!("expected Vnode fd, got {:?}", other),
+    }
+}
+
+#[test]
+fn path_open_with_follow_walks_chain_to_target() {
+    // /target ← /c ← /b ← /a. With follow set, opening /a
+    // dereferences the whole chain and the returned fd is on
+    // /target's ino.
+    let mut k = make_kernel();
+    k.vfs.create("/target", 0o644).unwrap();
+    k.vfs.symlink("/target", "/c").unwrap();
+    k.vfs.symlink("/c", "/b").unwrap();
+    k.vfs.symlink("/b", "/a").unwrap();
+    let target_ino = k.vfs.resolve("/target").unwrap().1;
+    let pid = path_open_proc(&mut k, "chain");
+
+    let fd = k
+        .path_open(
+            pid,
+            "/a",
+            abi::wasi::lookupflags::SYMLINK_FOLLOW,
+            0,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap();
+    let entry = k.fds(pid).unwrap().get(fd).unwrap();
+    match entry.object {
+        FdObject::Vnode { ino, .. } => assert_eq!(ino, target_ino),
+        other => panic!("expected Vnode fd, got {:?}", other),
+    }
+}
+
+#[test]
+fn path_open_with_follow_on_symlink_loop_returns_eloop() {
+    // /a → /a. With follow set, resolve walks SYMLOOP_MAX hops
+    // and surfaces FsError::SymLoop.
+    let mut k = make_kernel();
+    k.vfs.symlink("/a", "/a").unwrap();
+    let pid = path_open_proc(&mut k, "looper");
+
+    let err = k
+        .path_open(
+            pid,
+            "/a",
+            abi::wasi::lookupflags::SYMLINK_FOLLOW,
+            0,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap_err();
+    assert_eq!(err, KernelError::Fs(FsError::SymLoop));
+}
+
+#[test]
+fn path_open_with_follow_traverses_intermediate_symlink() {
+    // /realdir → /linkdir (symlink). /realdir/file exists. With
+    // LOOKUP_SYMLINK_FOLLOW set, Vfs::resolve's intermediate-
+    // follow behaviour (slice 1) kicks in — /linkdir is
+    // dereferenced before the final "file" lookup, so
+    // /linkdir/file resolves to /realdir/file's ino.
+    //
+    // v1's resolve_nofollow path (used when the flag is clear)
+    // is simpler: it preserves the pre-slice "don't follow
+    // anything" behaviour, so /linkdir/file with follow=0 errors
+    // with NotADirectory. Callers that want POSIX-correct lstat
+    // (intermediate follows, final doesn't) must pass follow=1
+    // for this v1 release.
+    let mut k = make_kernel();
+    k.vfs.mkdir("/realdir", 0o755).unwrap();
+    k.vfs.create("/realdir/file", 0o644).unwrap();
+    k.vfs.symlink("/realdir", "/linkdir").unwrap();
+    let real_file_ino = k.vfs.resolve("/realdir/file").unwrap().1;
+    let pid = path_open_proc(&mut k, "intermediate");
+
+    let fd = k
+        .path_open(
+            pid,
+            "/linkdir/file",
+            abi::wasi::lookupflags::SYMLINK_FOLLOW,
+            0,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap();
+    let entry = k.fds(pid).unwrap().get(fd).unwrap();
+    match entry.object {
+        FdObject::Vnode { ino, .. } => assert_eq!(ino, real_file_ino),
+        other => panic!("expected Vnode fd, got {:?}", other),
+    }
 }

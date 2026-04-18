@@ -449,6 +449,14 @@ fn handle_fd_close(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 //                 for a CREAT-created regular file; zero → default
 //                 0o644 applied kernel-side; ignored when CREAT
 //                 does not fire)
+//   args[8..12] = lookup flags (u32; bit 0 = SYMLINK_FOLLOW).
+//                 When set, a path whose final component is a
+//                 symlink is dereferenced to the target before
+//                 open. When clear, the symlink's own vnode is
+//                 returned (WASI `O_NOFOLLOW`-equivalent). Only
+//                 the final component is flag-governed —
+//                 intermediate symlinks always follow via
+//                 [`Vfs::resolve`].
 //   heap_ptr    = start of UTF-8 path
 //   heap_len    = path length in bytes
 // Response:
@@ -481,13 +489,14 @@ fn handle_path_open(
         let bytes = &req.args[6..8];
         u16::from_le_bytes([bytes[0], bytes[1]])
     };
+    let lookup_flags = args_u32(req, 8);
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.path_open(pid, path, oflags, mode, flags) {
+    match kernel.path_open(pid, path, lookup_flags, oflags, mode, flags) {
         Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }

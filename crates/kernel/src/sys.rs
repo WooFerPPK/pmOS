@@ -40,7 +40,7 @@ use crate::proc::{
     ExitStatus, ProcState, Process, ProcessTable, Scheduler, SignalInbox,
 };
 pub use crate::proc::Signal;
-use crate::vfs::{FsError, NodeType, Vfs};
+use crate::vfs::{FsError, Ino, MountId, NodeType, Vfs};
 
 /// Error returned by the high-level kernel API.
 ///
@@ -303,7 +303,7 @@ impl Kernel {
 
     // --- path_open / fd_read / fd_write / fd_close ----------------
 
-    /// `path_open(pid, path, oflags, mode, flags) -> fd`.
+    /// `path_open(pid, path, lookup_flags, oflags, mode, flags) -> fd`.
     ///
     /// Resolves `path` through the VFS honouring WASI `oflags`:
     ///
@@ -324,22 +324,34 @@ impl Kernel {
     /// * `CREAT | DIRECTORY` — [`KernelError::InvalidArgument`] (→
     ///   EINVAL). `path_create_directory` is the correct call.
     ///
-    /// Caps + [`FdObject`] selection are unchanged from the pre-
-    /// oflags form. Returns the fresh fd number on success.
+    /// `lookup_flags` governs final-component symlink handling:
+    /// bit 0 (`LOOKUP_SYMLINK_FOLLOW`) set → follow via
+    /// [`Vfs::open`]; clear → do not follow via
+    /// [`Vfs::open_nofollow`] so a path whose final component is
+    /// itself a symlink returns the symlink's own vnode rather
+    /// than the target's. Intermediate components always follow
+    /// symlinks — only the final component is flag-governed, per
+    /// WASI semantics.
+    ///
+    /// Caps + [`FdObject`] selection are unchanged. Returns the
+    /// fresh fd number on success.
     pub fn path_open(
         &mut self,
         pid: Pid,
         path: &str,
+        lookup_flags: u32,
         oflags: u16,
         mode: u16,
         flags: FdFlags,
     ) -> Result<u32, KernelError> {
+        use abi::wasi::lookupflags as wasi_lookup;
         use abi::wasi::oflags as wasi_oflags;
 
         let creat = (oflags & wasi_oflags::CREAT) != 0;
         let excl = (oflags & wasi_oflags::EXCL) != 0;
         let trunc = (oflags & wasi_oflags::TRUNC) != 0;
         let directory = (oflags & wasi_oflags::DIRECTORY) != 0;
+        let follow_symlink = (lookup_flags & wasi_lookup::SYMLINK_FOLLOW) != 0;
 
         if creat && directory {
             return Err(KernelError::InvalidArgument);
@@ -347,10 +359,18 @@ impl Kernel {
 
         let caps = self.caps.list(pid)?;
 
+        let open_path = |vfs: &mut Vfs, p: &str| -> Result<(MountId, Ino, NodeType), FsError> {
+            if follow_symlink {
+                vfs.open(p)
+            } else {
+                vfs.open_nofollow(p)
+            }
+        };
+
         // Resolution phase: CREAT runs through a try-open-then-
         // create flow; non-CREAT routes through the standard open.
         let (mount_id, ino, ty) = if creat {
-            match self.vfs.open(path) {
+            match open_path(&mut self.vfs, path) {
                 Ok((m, i, t)) => {
                     if excl {
                         return Err(KernelError::Fs(crate::vfs::FsError::AlreadyExists));
@@ -360,12 +380,14 @@ impl Kernel {
                 Err(crate::vfs::FsError::NotFound) => {
                     let effective_mode: u32 = if mode == 0 { 0o644 } else { mode as u32 };
                     self.vfs.create(path, effective_mode)?;
+                    // Freshly-created regular file; follow_symlink
+                    // is moot because the target isn't a symlink.
                     self.vfs.open(path)?
                 }
                 Err(e) => return Err(KernelError::Fs(e)),
             }
         } else {
-            self.vfs.open(path)?
+            open_path(&mut self.vfs, path)?
         };
 
         if directory && ty != NodeType::Directory {

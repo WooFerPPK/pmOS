@@ -494,9 +494,23 @@ impl Vfs {
     /// `NodeType::CharDevice(devnum)`; the caller should install
     /// a `FdObject::CharDevice(devnum)` in the fd table so
     /// subsequent read/write routes through `DeviceDispatcher`
-    /// rather than the filesystem.
+    /// rather than the filesystem. Intermediate + final symlinks
+    /// are dereferenced via [`Vfs::resolve`].
     pub fn open(&mut self, abs_path: &str) -> Result<(MountId, Ino, NodeType), FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        let st = fs.stat(ino)?;
+        Ok((mount_id, ino, st.ty))
+    }
+
+    /// Open an absolute path without dereferencing the final
+    /// symlink component (POSIX `O_NOFOLLOW` / WASI
+    /// `LOOKUP_SYMLINK_FOLLOW=0` semantics). Mirrors
+    /// [`Vfs::open`] but routes through [`Vfs::resolve_nofollow`]
+    /// so a path whose final component is itself a symlink yields
+    /// the symlink's own vnode rather than the target's.
+    pub fn open_nofollow(&mut self, abs_path: &str) -> Result<(MountId, Ino, NodeType), FsError> {
+        let (mount_id, ino) = self.resolve_nofollow(abs_path)?;
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         let st = fs.stat(ino)?;
         Ok((mount_id, ino, st.ty))

@@ -885,8 +885,10 @@ var UserWasmRuntime = class {
       //     dirfd:     i32,  // directory fd (ignored — we don't
       //                      //   do preopens; every path is
       //                      //   absolute)
-      //     dirflags:  i32,  // symlink-follow flags (ignored
-      //                      //   in v1)
+      //     dirflags:  i32,  // lookup flags (u32). Bit 0 =
+      //                      //   SYMLINK_FOLLOW. Threaded through
+      //                      //   to Kernel::path_open's
+      //                      //   lookup_flags arg at args[8..12].
       //     path_ptr:  i32,
       //     path_len:  i32,
       //     oflags:    i32,  // CREAT=0x01 / DIRECTORY=0x02 /
@@ -904,12 +906,11 @@ var UserWasmRuntime = class {
       //   ) -> errno: i32
       //
       // The PMos `PATH_OPEN` opcode packs (fdflags u32, oflags u16,
-      // mode u16) into the 16-byte inline args window. The shim
-      // passes oflags in args[4..6]; `mode` is 0 because WASI's
-      // signature does not carry a mode field — the kernel
-      // substitutes the default `0o644` when CREAT fires with
-      // mode=0.
-      path_open: (_dirfd, _dirflags, pathPtr, pathLen, oflags, _rightsBase, _rightsInheriting, _fdflags, fdOutPtr) => {
+      // mode u16, lookup_flags u32) into the 16-byte inline args
+      // window. `mode` is 0 because WASI's signature does not carry
+      // a mode field — the kernel substitutes the default `0o644`
+      // when CREAT fires with mode=0.
+      path_open: (_dirfd, dirflags, pathPtr, pathLen, oflags, _rightsBase, _rightsInheriting, _fdflags, fdOutPtr) => {
         if (this.memory === void 0) {
           return ERRNO.EINVAL;
         }
@@ -924,6 +925,7 @@ var UserWasmRuntime = class {
         argsView.setUint32(0, 0, true);
         argsView.setUint16(4, oflags & 65535, true);
         argsView.setUint16(6, 0, true);
+        argsView.setUint32(8, dirflags >>> 0, true);
         const { response } = this.backend.dispatch(
           {
             opcode: OP_WASI.PATH_OPEN,
