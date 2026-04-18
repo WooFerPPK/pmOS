@@ -277,10 +277,23 @@ impl IpcTable {
             if sender.state != SocketState::Connected {
                 return Err(IpcError::InvalidState);
             }
+            // Write-side half-close: the sender has promised not to
+            // write anymore. Treat subsequent send as a broken
+            // stream — callers should have stopped on the first
+            // shutdown.
+            if sender.shutdown_write {
+                return Err(IpcError::PipeBroken);
+            }
             sender.peer.ok_or(IpcError::InvalidState)?
         };
         let peer = self.sockets.get_mut(&peer_id).ok_or(IpcError::NoSuchSocket)?;
         if peer.closed {
+            return Err(IpcError::PipeBroken);
+        }
+        // Read-side half-close on the peer: the peer has refused
+        // further reads, so sending is pointless — EPIPE is the
+        // POSIX-correct signal.
+        if peer.shutdown_read {
             return Err(IpcError::PipeBroken);
         }
         let free = peer.rx_cap.saturating_sub(peer.rx_buf.len());
@@ -315,18 +328,32 @@ impl IpcTable {
         buf: &mut [u8],
         max_fds: usize,
     ) -> Result<(usize, Vec<u32>), IpcError> {
-        let peer_closed = {
+        // Read-side half-close: the caller has promised not to read
+        // anymore on this side; future recvs unconditionally EOF
+        // (matches POSIX shutdown(SHUT_RD) — peek state is
+        // discarded). This short-circuit fires independent of peer
+        // state; even a fully-populated rx_buf yields EOF.
+        {
             let sock = self.sockets.get(&sock_id).ok_or(IpcError::NoSuchSocket)?;
             if sock.state != SocketState::Connected {
                 return Err(IpcError::InvalidState);
             }
+            if sock.shutdown_read {
+                return Ok((0, Vec::new()));
+            }
+        }
+        let peer_closed = {
+            let sock = self.sockets.get(&sock_id).ok_or(IpcError::NoSuchSocket)?;
             // A None peer (e.g. the peer was torn down) counts
-            // as closed.
+            // as closed. A peer with `shutdown_write = true` has
+            // promised no more bytes will arrive, so it counts as
+            // closed for recv's EOF check even though its fd is
+            // still open.
             sock.peer
                 .map(|pid| {
                     self.sockets
                         .get(&pid)
-                        .map(|p| p.closed)
+                        .map(|p| p.closed || p.shutdown_write)
                         .unwrap_or(true)
                 })
                 .unwrap_or(true)
@@ -374,6 +401,39 @@ impl IpcTable {
     /// pre-drain `InvalidState` / EINVAL that conflated the dead-
     /// listener case with the accept-race retry window the display
     /// client walks during a healthy handshake.
+    /// Half-close one or both directions of a connected socket. The
+    /// fd stays open (the caller can still call [`close_socket`] to
+    /// fully tear down); only the per-direction shutdown flags
+    /// change.
+    ///
+    /// * `read = true` sets `shutdown_read`, so subsequent
+    ///   `recv_on_socket` short-circuits to `(0, Vec::new())` EOF
+    ///   regardless of rx buffer state, and the peer's
+    ///   `send_on_socket` returns `PipeBroken` since there's no
+    ///   reader left.
+    /// * `write = true` sets `shutdown_write`, so subsequent
+    ///   `send_on_socket` returns `PipeBroken`, and the peer's
+    ///   `recv_on_socket` observes EOF once its rx buffer drains.
+    ///
+    /// Unconditionally succeeds on a valid socket (idempotent — the
+    /// flags set is a monotonic OR, so repeated calls keep the same
+    /// endpoints shut). Returns `NoSuchSocket` on an unknown id.
+    pub fn shutdown_socket(
+        &mut self,
+        id: SocketId,
+        read: bool,
+        write: bool,
+    ) -> Result<(), IpcError> {
+        let sock = self.sockets.get_mut(&id).ok_or(IpcError::NoSuchSocket)?;
+        if read {
+            sock.shutdown_read = true;
+        }
+        if write {
+            sock.shutdown_write = true;
+        }
+        Ok(())
+    }
+
     pub fn close_socket(&mut self, id: SocketId) -> Result<(), IpcError> {
         let (_peer, bound, drained) = {
             let sock = self.sockets.get_mut(&id).ok_or(IpcError::NoSuchSocket)?;

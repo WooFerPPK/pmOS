@@ -2039,24 +2039,29 @@ fn handle_sock_send(
 //   args[0..4] = fd (u32)
 //   args[4..8] = how (u32, low 8 bits = WASI sdflags: RD=0x1, WR=0x2)
 // Response:
-//   value = 0 on success (`how == RD | WR`); ENOTSUP on half-close
-//   requests (only RD or only WR set); EINVAL on zero `how` or on
-//   any bits beyond RD | WR.
+//   value = 0 on success; EINVAL on zero `how` or on any bits
+//           beyond RD | WR; EINVAL on a non-Socket fd; EBADF on an
+//           unopened fd.
 //
-// v1's IpcTable has no half-close primitive — close_socket tears
-// down both directions at once. A userland caller asking for
-// sock_shutdown(fd, RD | WR) gets full close via close_socket,
-// which observably EOFs the peer on its next recv_on_socket. A
-// caller asking for a half-close gets ENOTSUP rather than a
-// silent full-close so the userland can fall back (or fail
-// cleanly) — lying about the semantics would turn later writes
-// on the write-side-"only-shutdown" socket into surprise
-// PipeBroken errors. Non-Socket FdObject → EINVAL; unopened fd
-// → EBADF. After sock_shutdown(RD | WR), the fd itself remains
-// open pointing at the now-closed socket; subsequent fd_close
-// (and any implicit close via release_object on process exit)
-// runs close_socket again harmlessly — close_socket is idempotent
-// on an already-closed socket.
+// Half-close is now a first-class IpcTable primitive: v1 tracks
+// `shutdown_read` and `shutdown_write` per Socket, and updates
+// `send_on_socket` / `recv_on_socket` to honour them. Dispatch
+// decodes the two sdflags bits and calls
+// `IpcTable::shutdown_socket(id, read, write)`. After a successful
+// call the fd stays open — subsequent fd_close still tears down
+// via close_socket, which is distinct from a shutdown and is the
+// path that actually reaps the kernel-side Socket entry.
+//
+// Post-shutdown semantics (per POSIX shutdown(2)):
+//   * RD sets shutdown_read → `recv_on_socket` unconditionally
+//     returns `(0, Vec::new())` EOF on this fd; peer's
+//     `send_on_socket` returns `PipeBroken` since there's no reader.
+//   * WR sets shutdown_write → `send_on_socket` returns
+//     `PipeBroken` on this fd; peer's `recv_on_socket` observes
+//     EOF once its rx buffer drains.
+//   * RD | WR sets both of the above.
+//
+// Non-Socket FdObject → EINVAL; unopened fd → EBADF.
 
 fn handle_sock_shutdown(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let fd = args_u32(req, 0);
@@ -2080,16 +2085,12 @@ fn handle_sock_shutdown(kernel: &mut Kernel, pid: Pid, req: &Request) -> Respons
     if how == 0 || (how & !(rd | wr)) != 0 {
         return Response::err(req.request_id, EINVAL);
     }
-    // Half-close (only RD or only WR) is unsupported in v1.
-    if how != (rd | wr) {
-        return Response::err(req.request_id, ENOTSUP);
-    }
-    // Full close: mirror close_socket. IpcError maps via
-    // From<IpcError> for KernelError — NoSuchSocket → BadFd →
-    // EBADF (the fd-table lookup above already guarded against
-    // that, but the mapping is honest if a concurrent path ever
-    // drops the socket entry).
-    match kernel.ipc.close_socket(crate::ipc::SocketId(socket_id)) {
+    let read = (how & rd) != 0;
+    let write = (how & wr) != 0;
+    match kernel
+        .ipc
+        .shutdown_socket(crate::ipc::SocketId(socket_id), read, write)
+    {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(
             req.request_id,

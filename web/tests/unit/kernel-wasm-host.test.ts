@@ -2615,7 +2615,11 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
     expect(response.status).toBe(-ERRNO.EINVAL);
   });
 
-  it("returns -ENOTSUP for a half-close (RD alone) on a Socket fd", async () => {
+  it("succeeds for a half-close (RD alone) on a Socket fd", async () => {
+    // Post-slice, half-close is first-class: RD alone sets the
+    // shutdown_read flag on the socket and returns 0. The fd stays
+    // open; a follow-up fd_close is still required to fully tear
+    // down.
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
@@ -2633,7 +2637,47 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
       requestId: 992,
       args: encodeSockShutdownArgs(sockFd, SDFLAGS.RD),
     });
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response.status).toBe(0);
+  });
+
+  it("succeeds for a half-close (WR alone) on a Socket fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const sockResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 1060,
+      arg0: 0,
+    });
+    const sockFd = Number(sockResp.response.value);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SHUTDOWN,
+      requestId: 1061,
+      args: encodeSockShutdownArgs(sockFd, SDFLAGS.WR),
+    });
+    expect(response.status).toBe(0);
+  });
+
+  it("succeeds for a full close (RD | WR) on a Socket fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const sockResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 1062,
+      arg0: 0,
+    });
+    const sockFd = Number(sockResp.response.value);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SHUTDOWN,
+      requestId: 1063,
+      args: encodeSockShutdownArgs(sockFd, SDFLAGS.RD | SDFLAGS.WR),
+    });
+    expect(response.status).toBe(0);
   });
 
   it("returns -EINVAL for a zero-how request on a Socket fd", async () => {

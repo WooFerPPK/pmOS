@@ -5175,7 +5175,10 @@ fn sock_shutdown_rdwr_closes_socket_observable_via_peer_eof() {
 }
 
 #[test]
-fn sock_shutdown_rd_alone_returns_enotsup() {
+fn sock_shutdown_rd_alone_marks_read_side_shutdown() {
+    // Half-close is now first-class: RD sets shutdown_read = true
+    // (shutdown_write left false), and the fd's .closed flag stays
+    // false — the fd remains open for a future fd_close.
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
@@ -5193,11 +5196,15 @@ fn sock_shutdown_rd_alone_returns_enotsup() {
         heap_len: 0,
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.status, 0);
+    let sock = k.ipc.socket_mut(a).unwrap();
+    assert!(sock.shutdown_read);
+    assert!(!sock.shutdown_write);
+    assert!(!sock.closed, "shutdown_socket does NOT set .closed");
 }
 
 #[test]
-fn sock_shutdown_wr_alone_returns_enotsup() {
+fn sock_shutdown_wr_alone_marks_write_side_shutdown() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
@@ -5215,7 +5222,171 @@ fn sock_shutdown_wr_alone_returns_enotsup() {
         heap_len: 0,
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.status, 0);
+    let sock = k.ipc.socket_mut(a).unwrap();
+    assert!(!sock.shutdown_read);
+    assert!(sock.shutdown_write);
+    assert!(!sock.closed);
+}
+
+#[test]
+fn sock_shutdown_rdwr_sets_both_flags_without_closing() {
+    // RD | WR now flips both shutdown flags but leaves the socket's
+    // `closed` flag false — that's what distinguishes
+    // `shutdown_socket` from `close_socket`. A subsequent fd_close
+    // is still required to reap the kernel-side Socket entry.
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let how = (abi::wasi::sdflags::RD | abi::wasi::sdflags::WR) as u32;
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 1050,
+        args: sock_shutdown_args(3, how),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let sock = k.ipc.socket_mut(a).unwrap();
+    assert!(sock.shutdown_read);
+    assert!(sock.shutdown_write);
+    assert!(!sock.closed);
+}
+
+#[test]
+fn sock_shutdown_read_makes_recv_return_eof() {
+    // Even with bytes in rx_buf, a read-shut socket's recv returns
+    // (0, []) — matches POSIX shutdown(SHUT_RD), which discards any
+    // pending incoming data.
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    // Push some bytes into a's rx buffer, then shutdown RD on a.
+    k.ipc.send_on_socket(b, b"payload", Vec::new()).unwrap();
+    assert_eq!(k.ipc.socket_mut(a).unwrap().rx_len(), 7);
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 1051,
+        args: sock_shutdown_args(3, abi::wasi::sdflags::RD as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, 0);
+
+    // Now recv on a should return (0, []) EOF — rx_buf bytes are
+    // discarded by the shutdown.
+    let mut rx = [0u8; 16];
+    let (n, _fds) = k.ipc.recv_on_socket(a, &mut rx, 0).unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn sock_shutdown_read_makes_peer_send_return_pipe_broken() {
+    // After A.shutdown(RD), B's subsequent send to A returns
+    // PipeBroken (→ EINVAL via NotSupportedOnFd → EINVAL in the
+    // current mapping) because A has refused further reads.
+    use kernel::ipc::{IpcError, SocketState, SocketType};
+    let mut k = make_kernel();
+    let _pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.ipc.shutdown_socket(a, true, false).unwrap();
+
+    let send_err = k.ipc.send_on_socket(b, b"data", Vec::new()).unwrap_err();
+    assert_eq!(send_err, IpcError::PipeBroken);
+}
+
+#[test]
+fn sock_shutdown_write_makes_send_return_pipe_broken() {
+    // After A.shutdown(WR), A's own send returns PipeBroken.
+    use kernel::ipc::{IpcError, SocketState, SocketType};
+    let mut k = make_kernel();
+    let _pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.ipc.shutdown_socket(a, false, true).unwrap();
+
+    let send_err = k.ipc.send_on_socket(a, b"data", Vec::new()).unwrap_err();
+    assert_eq!(send_err, IpcError::PipeBroken);
+}
+
+#[test]
+fn sock_shutdown_write_makes_peer_recv_observe_eof_when_rx_drains() {
+    // After A.shutdown(WR), B's recv sees EOF (0, []) once its
+    // rx_buf drains. Before the drain, still-buffered bytes are
+    // readable normally — only new reads past the buffer return EOF.
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let _pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    // Send some bytes to B's rx_buf first.
+    k.ipc.send_on_socket(a, b"xy", Vec::new()).unwrap();
+    k.ipc.shutdown_socket(a, false, true).unwrap();
+
+    // B drains its rx_buf.
+    let mut rx = [0u8; 4];
+    let (n, _) = k.ipc.recv_on_socket(b, &mut rx, 0).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(&rx[..2], b"xy");
+
+    // Next recv sees EOF (A's shutdown_write counts as closed for
+    // recv's EOF check).
+    let (n2, _) = k.ipc.recv_on_socket(b, &mut rx, 0).unwrap();
+    assert_eq!(n2, 0);
 }
 
 #[test]

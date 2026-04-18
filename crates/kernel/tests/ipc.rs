@@ -483,6 +483,111 @@ fn socket_close_listener_with_empty_backlog_is_unchanged() {
     ipc.bind_socket(other, "/run/svc").unwrap();
 }
 
+// ---- shutdown_socket (half-close) ---------------------------------
+//
+// Post-slice, IpcTable tracks per-direction shutdown flags in
+// addition to the existing .closed flag. shutdown_socket(id, read,
+// write) sets them monotonically (an OR — repeated calls never
+// un-shut a direction). Subsequent send / recv honour the flags via
+// the additional short-circuits introduced alongside the
+// SOCK_SHUTDOWN handler rewrite.
+
+#[test]
+fn ipc_shutdown_socket_sets_read_and_write_flags() {
+    let mut ipc = IpcTable::new();
+    let (a, _b) = paired(&mut ipc);
+
+    ipc.shutdown_socket(a, true, false).unwrap();
+    {
+        let sa = ipc.socket_mut(a).unwrap();
+        assert!(sa.shutdown_read);
+        assert!(!sa.shutdown_write);
+        assert!(!sa.closed, "shutdown is not close");
+    }
+
+    ipc.shutdown_socket(a, false, true).unwrap();
+    {
+        let sa = ipc.socket_mut(a).unwrap();
+        assert!(sa.shutdown_read, "read side stays shut (monotonic OR)");
+        assert!(sa.shutdown_write);
+    }
+}
+
+#[test]
+fn ipc_shutdown_socket_on_unknown_id_returns_no_such_socket() {
+    let mut ipc = IpcTable::new();
+    let err = ipc
+        .shutdown_socket(kernel::ipc::SocketId(42), true, true)
+        .unwrap_err();
+    assert_eq!(err, IpcError::NoSuchSocket);
+}
+
+#[test]
+fn ipc_shutdown_socket_read_short_circuits_recv_to_eof() {
+    // With bytes in rx_buf, a read-shut socket still gets EOF —
+    // discards pending data, matching POSIX shutdown(SHUT_RD).
+    let mut ipc = IpcTable::new();
+    let (a, b) = paired(&mut ipc);
+
+    // Populate a's rx_buf via b sending.
+    ipc.send_on_socket(b, b"stale", Vec::new()).unwrap();
+    assert_eq!(ipc.socket_mut(a).unwrap().rx_len(), 5);
+
+    ipc.shutdown_socket(a, true, false).unwrap();
+    let mut buf = [0u8; 16];
+    let (n, _) = ipc.recv_on_socket(a, &mut buf, 0).unwrap();
+    assert_eq!(n, 0, "read-shut recv returns EOF regardless of rx contents");
+}
+
+#[test]
+fn ipc_shutdown_socket_read_makes_peer_send_return_pipe_broken() {
+    let mut ipc = IpcTable::new();
+    let (a, b) = paired(&mut ipc);
+    ipc.shutdown_socket(a, true, false).unwrap();
+    let err = ipc.send_on_socket(b, b"data", Vec::new()).unwrap_err();
+    assert_eq!(err, IpcError::PipeBroken);
+}
+
+#[test]
+fn ipc_shutdown_socket_write_makes_own_send_return_pipe_broken() {
+    let mut ipc = IpcTable::new();
+    let (a, _b) = paired(&mut ipc);
+    ipc.shutdown_socket(a, false, true).unwrap();
+    let err = ipc.send_on_socket(a, b"data", Vec::new()).unwrap_err();
+    assert_eq!(err, IpcError::PipeBroken);
+}
+
+#[test]
+fn ipc_shutdown_socket_write_makes_peer_recv_eof_after_drain() {
+    let mut ipc = IpcTable::new();
+    let (a, b) = paired(&mut ipc);
+    ipc.send_on_socket(a, b"ab", Vec::new()).unwrap();
+    ipc.shutdown_socket(a, false, true).unwrap();
+
+    let mut buf = [0u8; 4];
+    let (n1, _) = ipc.recv_on_socket(b, &mut buf, 0).unwrap();
+    assert_eq!(n1, 2, "existing rx buffer bytes still readable");
+    assert_eq!(&buf[..2], b"ab");
+
+    let (n2, _) = ipc.recv_on_socket(b, &mut buf, 0).unwrap();
+    assert_eq!(n2, 0, "EOF after drain");
+}
+
+#[test]
+fn ipc_shutdown_socket_rdwr_does_not_set_closed_flag() {
+    // Full-direction shutdown is still semantically distinct from
+    // close — the fd stays open, the socket entry stays live in
+    // the IpcTable map, and close_socket is the only path that
+    // unbinds a listener or transitions pending Connecting clients.
+    let mut ipc = IpcTable::new();
+    let (a, _b) = paired(&mut ipc);
+    ipc.shutdown_socket(a, true, true).unwrap();
+    let sa = ipc.socket_mut(a).unwrap();
+    assert!(sa.shutdown_read);
+    assert!(sa.shutdown_write);
+    assert!(!sa.closed);
+}
+
 // ---- Helpers -------------------------------------------------------
 
 /// Build a pair of Connected sockets for use in the

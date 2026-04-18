@@ -79,6 +79,19 @@ pub struct Socket {
     /// has been called on this socket. A closed socket's peer
     /// observes EOF on the next `recv`.
     pub closed: bool,
+    /// True once [`IpcTable::shutdown_socket`](super::IpcTable::shutdown_socket)
+    /// has been called with `read = true`. A read-shut socket's own
+    /// `recv` short-circuits to `(0, Vec::new())` EOF (independent
+    /// of peer state), and the peer's `send` short-circuits to
+    /// `PipeBroken` since there's no reader left to accept the bytes.
+    pub shutdown_read: bool,
+    /// True once [`IpcTable::shutdown_socket`](super::IpcTable::shutdown_socket)
+    /// has been called with `write = true`. A write-shut socket's
+    /// own `send` short-circuits to `PipeBroken`, and the peer's
+    /// `recv` observes EOF once its rx buffer drains — the same
+    /// semantic as the peer having been fully closed, but without
+    /// tearing down the fd (the caller can still call `fd_close`).
+    pub shutdown_write: bool,
 }
 
 impl Socket {
@@ -95,6 +108,8 @@ impl Socket {
             rx_cap: SOCKET_BUF_CAP,
             rx_fds: VecDeque::new(),
             closed: false,
+            shutdown_read: false,
+            shutdown_write: false,
         }
     }
 
