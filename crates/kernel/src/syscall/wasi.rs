@@ -75,6 +75,8 @@ pub fn dispatch_wasi(
         op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
         op::FD_FDSTAT_SET_FLAGS => handle_fd_fdstat_set_flags(kernel, pid, req),
         op::FD_FILESTAT_SET_SIZE => handle_fd_filestat_set_size(kernel, pid, req),
+        op::FD_PREAD => handle_fd_pread(kernel, pid, req, heap),
+        op::FD_PWRITE => handle_fd_pwrite(kernel, pid, req, heap),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
@@ -1604,6 +1606,107 @@ fn handle_fd_filestat_set_size(
     };
     match kernel.vfs.truncate_ino(mount_id, ino, new_size) {
         Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+// ---- fd_pread / fd_pwrite ------------------------------------------
+//
+// Wire layout (both shapes identical except for the heap direction):
+//
+//   args[0..4]  = fd (u32)
+//   args[4..12] = offset (u64 LE)
+//   heap_ptr    = source (pwrite) or destination (pread)
+//   heap_len    = byte count
+//
+// Response (pread):
+//   value     = bytes actually read (0 on EOF)
+//   extra_len = bytes actually read (mirrors fd_read's convention)
+// Response (pwrite):
+//   value = bytes actually written
+//
+// POSIX + WASI semantics: positional I/O takes an explicit offset
+// and must NOT update the seekable-fd's position. A pread+pwrite
+// pair is observable through FdEntry.offset staying unchanged
+// after the call. The implementation reaches Vfs::read_ino /
+// Vfs::write_ino directly with the explicit offset rather than
+// routing through Kernel::fd_read / Kernel::fd_write (which also
+// advance the offset on Vnode branches).
+//
+// Vnode-only: char device / socket / pipe / signal-channel /
+// display-connection fds reject with EINVAL (same non-Vnode guard
+// shape as fd_seek / fd_tell / fd_filestat_set_size). Positional
+// I/O has no meaning on those object types — a socket's byte
+// stream isn't seekable, a char device's bytes are produced on
+// demand, etc.
+
+fn handle_fd_pread(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let offset = args_u64(req, 4);
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let (mount_id, ino) = match entry.object {
+        FdObject::Vnode { mount_id, ino } => (mount_id, ino),
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    let max_len = req.heap_len as usize;
+    let Some(buf) = heap_out_mut(req, heap, max_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.read_ino(mount_id, ino, offset, buf) {
+        Ok(n) => Response {
+            request_id: req.request_id,
+            status: 0,
+            value: n as i64,
+            extra_len: n as u32,
+            _pad: [0u8; 12],
+        },
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+fn handle_fd_pwrite(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let offset = args_u64(req, 4);
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let (mount_id, ino) = match entry.object {
+        FdObject::Vnode { mount_id, ino } => (mount_id, ino),
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    let Some(bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.write_ino(mount_id, ino, offset, bytes) {
+        Ok(n) => Response::ok(req.request_id, n as i64),
         Err(e) => Response::err(
             req.request_id,
             kerr_to_errno(KernelError::Fs(e)),

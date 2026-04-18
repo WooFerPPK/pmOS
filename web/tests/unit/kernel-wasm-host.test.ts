@@ -413,12 +413,12 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `FD_PREAD` is in the WASI range (0x002A) but still has no
-    // handler; was `FD_READDIR` before that handler landed. Swap
-    // this probe to whatever's still unhandled as the implementation
-    // catches up.
+    // `SOCK_SHUTDOWN` is in the WASI range (0x0073) but still has
+    // no handler; was `FD_PREAD` before that handler landed, then
+    // `FD_READDIR` before that. Swap this probe to whatever's still
+    // unhandled as the implementation catches up.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.FD_PREAD,
+      opcode: OP_WASI.SOCK_SHUTDOWN,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -1679,6 +1679,187 @@ describe("dispatch: FD_FILESTAT_SET_SIZE", () => {
       args: encodeFdFilestatSetSizeArgs(fd, 0n),
     });
     expect(response.status).toBe(-ERRNO.EROFS);
+  });
+});
+
+// ---- dispatch: FD_PREAD + FD_PWRITE --------------------------------
+//
+// Positional-I/O variants of FD_READ / FD_WRITE. Wire: (fd, offset)
+// as u32 + u64 LE in the inline args window; heap = destination
+// buffer (pread) / source bytes (pwrite). Vnode-only — non-Vnode
+// fds reject with EINVAL, same guard shape as fd_seek. The TS tests
+// pin the wire layout end-to-end through kernel.wasm: happy-path
+// pread on /proc/version (via PATH_OPEN) showing real bytes flow
+// back through the response, EINVAL branch on a /dev/console
+// CharDevice fd, EBADF on an unopened fd, and the EROFS branch for
+// pwrite against a procfs vnode. The Rust tests pin the
+// "entry.offset stays unchanged" invariant that requires direct
+// FdTable inspection.
+
+function encodeFdPreadArgs(fd: number, offset: bigint): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setBigUint64(4, offset, true);
+  return args;
+}
+
+function encodeFdPwriteArgs(fd: number, offset: bigint): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setBigUint64(4, offset, true);
+  return args;
+}
+
+describe("dispatch: FD_PREAD", () => {
+  it("reads bytes from a procfs vnode at an explicit offset", async () => {
+    // Open /proc/version as a Vnode fd, then pread from offset 0.
+    // procfs.read synthesises content on demand — the first few
+    // bytes are deterministic so we can assert them.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/proc/version");
+    const { response: open } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 960,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(open.status).toBe(0);
+    const fd = Number(open.value);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_PREAD,
+      requestId: 961,
+      args: encodeFdPreadArgs(fd, 0n),
+      heapPtr: 0,
+      heapLen: 32,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value > 0n).toBe(true);
+    expect(response.extraLen).toBeGreaterThan(0);
+    // First byte must be a printable ASCII char (procfs emits a
+    // text-like version string, not zero bytes).
+    expect(heapOut[0]).not.toBe(0);
+  });
+
+  it("returns -EINVAL on a char-device fd (non-Vnode)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_PREAD,
+      requestId: 962,
+      args: encodeFdPreadArgs(1, 0n),
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_PREAD,
+      requestId: 963,
+      args: encodeFdPreadArgs(99, 0n),
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
+describe("dispatch: FD_PWRITE", () => {
+  it("returns -EROFS when writing to a procfs vnode", async () => {
+    // Open /proc/version as a Vnode fd, then pwrite onto it.
+    // procfs.write returns ReadOnly → EROFS.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/proc/version");
+    const { response: open } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 964,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(open.status).toBe(0);
+    const fd = Number(open.value);
+
+    const heap = new TextEncoder().encode("hi");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_PWRITE,
+        requestId: 965,
+        args: encodeFdPwriteArgs(fd, 0n),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+
+  it("returns -EINVAL on a char-device fd (non-Vnode)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("hi");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_PWRITE,
+        requestId: 966,
+        args: encodeFdPwriteArgs(1, 0n),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("hi");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_PWRITE,
+        requestId: 967,
+        args: encodeFdPwriteArgs(99, 0n),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EBADF);
   });
 });
 

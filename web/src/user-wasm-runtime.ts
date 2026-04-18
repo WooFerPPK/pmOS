@@ -1126,6 +1126,106 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `fd_pread`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, iovs_ptr: i32, iovs_len: i32, offset: i64,
+      //    nread_ptr: i32) -> errno: i32
+      //
+      // Positional read: read from an explicit offset without
+      // advancing FdEntry.offset. v1 lowers a single-iovec shape
+      // (the iovec struct is `(buf_ptr: u32, buf_len: u32)` at
+      // iovs_ptr; iovs_len is usually 1 for println!-style libc
+      // callers). Copies the read bytes back into user memory at
+      // iovec.buf_ptr and writes the byte count as a u32 at
+      // nread_ptr. Vnode-only — non-Vnode fds return -EINVAL;
+      // unopened fds return -EBADF.
+      fd_pread: (
+        fd: number,
+        iovsPtr: number,
+        iovsLen: number,
+        offset: bigint,
+        nreadPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        if (iovsLen !== 1) return ERRNO.EINVAL;
+        const iovView = new DataView(this.memory.buffer, iovsPtr, 8);
+        const bufPtr = iovView.getUint32(0, true);
+        const bufLen = iovView.getUint32(4, true);
+
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setBigUint64(4, offset, true);
+
+        const heapOut = new Uint8Array(bufLen);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.FD_PREAD,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: bufLen,
+          },
+          heapOut,
+        );
+        if (response.status !== 0) return -response.status;
+        const read = Number(response.value);
+        const memBytes = new Uint8Array(this.memory.buffer);
+        memBytes.set(heapOut.subarray(0, read), bufPtr);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(nreadPtr, read, true);
+        return 0;
+      },
+
+      // WASI `fd_pwrite`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, iovs_ptr: i32, iovs_len: i32, offset: i64,
+      //    nwritten_ptr: i32) -> errno: i32
+      //
+      // Positional write: write at an explicit offset without
+      // advancing FdEntry.offset. Mirrors fd_pread's iovec lowering
+      // — single-iovec only in v1; multi-iovec callers that libc
+      // might emit lower to multiple single-iovec pwrites.
+      fd_pwrite: (
+        fd: number,
+        iovsPtr: number,
+        iovsLen: number,
+        offset: bigint,
+        nwrittenPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        if (iovsLen !== 1) return ERRNO.EINVAL;
+        const iovView = new DataView(this.memory.buffer, iovsPtr, 8);
+        const bufPtr = iovView.getUint32(0, true);
+        const bufLen = iovView.getUint32(4, true);
+        const bytes = new Uint8Array(this.memory.buffer, bufPtr, bufLen);
+        const heap = new Uint8Array(bufLen);
+        heap.set(bytes, 0);
+
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setBigUint64(4, offset, true);
+
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.FD_PWRITE,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: bufLen,
+          },
+          heap,
+        );
+        if (response.status !== 0) return -response.status;
+        const written = Number(response.value);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(nwrittenPtr, written, true);
+        return 0;
+      },
+
       // WASI `fd_filestat_set_size`.
       //
       // Signature (lowered):

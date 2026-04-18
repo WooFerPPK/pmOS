@@ -108,22 +108,23 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `FD_PREAD` is in the WASI range (0x002A) but still has no
-    // handler. Same shape as the ext-side test below: decoded as
-    // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>`
-    // arm, ENOSYS echoed back with the request_id intact.
+    // `SOCK_SHUTDOWN` is in the WASI range (0x0073) but still has
+    // no handler. Same shape as the ext-side test below: decoded as
+    // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>` arm,
+    // ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `FD_READDIR` before that handler landed, then
-    // `FD_SEEK`, then `CLOCK_TIME_GET` before those. When
-    // `FD_PREAD` grows a real handler, swap this probe to whatever's
-    // still unhandled at that point, or delete the test once every
-    // WASI opcode has real coverage.)
+    // (This probe was `FD_PREAD` before that handler landed, then
+    // `FD_READDIR` before it, then `FD_SEEK` / `CLOCK_TIME_GET`
+    // before those. When `SOCK_SHUTDOWN` grows a real handler,
+    // swap this probe to whatever's still unhandled at that
+    // point, or delete the test once every WASI opcode has real
+    // coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::FD_PREAD,
+        opcode: op_wasi::SOCK_SHUTDOWN,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -4263,6 +4264,266 @@ fn fd_filestat_set_size_on_unopened_fd_returns_ebadf() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, -errno::EBADF);
+}
+
+// ---- fd_pread / fd_pwrite --------------------------------------------
+//
+// Opcodes 0x002A + 0x002D. Positional-I/O variants of fd_read /
+// fd_write: take an explicit offset from inline args and do NOT
+// mutate FdEntry.offset. Wire layout (both shapes identical except
+// for the heap direction):
+//
+//   args[0..4]  = fd (u32)
+//   args[4..12] = offset (u64 LE)
+//   heap_ptr    = source (for pwrite) or destination (for pread)
+//   heap_len    = byte count
+// Response:
+//   pwrite.value = bytes written
+//   pread.value  = bytes read (0 on EOF); extra_len mirrors value
+//
+// Vnode-only. Non-Vnode FdObject variants reject with EINVAL —
+// positional I/O has no meaning on a char device / socket / pipe /
+// signal channel / display connection. The handler reaches
+// Vfs::read_ino / Vfs::write_ino directly with the explicit offset;
+// FdEntry.offset stays untouched, so a pread+pwrite pair does not
+// disturb a subsequent fd_read / fd_seek that uses the seekable-fd
+// position.
+
+fn fd_pread_args(fd: u32, offset: u64) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..12].copy_from_slice(&offset.to_le_bytes());
+    args
+}
+
+fn fd_pwrite_args(fd: u32, offset: u64) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..12].copy_from_slice(&offset.to_le_bytes());
+    args
+}
+
+#[test]
+fn fd_pread_reads_from_explicit_offset_without_advancing_entry_offset() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "preader", "/r.txt", b"0123456789");
+    // Set a non-zero entry.offset so we can verify it's preserved.
+    k.fds_mut(pid).unwrap().get_mut(fd).unwrap().offset = 3;
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::FD_PREAD,
+        flags: 0,
+        request_id: 940,
+        args: fd_pread_args(fd, 5),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 4);
+    assert_eq!(resp.extra_len, 4);
+    assert_eq!(&heap[..4], b"5678");
+    // entry.offset was 3 before the call, must still be 3 after.
+    assert_eq!(k.fds(pid).unwrap().get(fd).unwrap().offset, 3);
+}
+
+#[test]
+fn fd_pread_at_offset_zero_reads_from_start() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "preader", "/r.txt", b"0123456789");
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::FD_PREAD,
+        flags: 0,
+        request_id: 941,
+        args: fd_pread_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 3,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 3);
+    assert_eq!(&heap[..3], b"012");
+}
+
+#[test]
+fn fd_pread_past_eof_returns_zero_bytes() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "preader", "/r.txt", b"0123456789");
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::FD_PREAD,
+        flags: 0,
+        request_id: 942,
+        args: fd_pread_args(fd, 100),
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn fd_pread_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdevpreader", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::FD_PREAD,
+        flags: 0,
+        request_id: 943,
+        args: fd_pread_args(1, 0),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_pread_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghostpreader", 0);
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::FD_PREAD,
+        flags: 0,
+        request_id: 944,
+        args: fd_pread_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_pwrite_writes_at_explicit_offset_without_advancing_entry_offset() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "pwriter", "/w.txt", b"0000000000");
+    // Non-zero entry.offset survives the pwrite call.
+    k.fds_mut(pid).unwrap().get_mut(fd).unwrap().offset = 2;
+    let mut heap = vec![0u8; 32];
+    heap[..3].copy_from_slice(b"abc");
+
+    let req = Request {
+        opcode: op_wasi::FD_PWRITE,
+        flags: 0,
+        request_id: 945,
+        args: fd_pwrite_args(fd, 4),
+        heap_ptr: 0,
+        heap_len: 3,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 3);
+    // Observable effect: reading the file shows "0000abc000".
+    let mut buf = [0u8; 10];
+    k.vfs.read("/w.txt", 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"0000abc000");
+    // entry.offset was 2 before the call, must still be 2 after.
+    assert_eq!(k.fds(pid).unwrap().get(fd).unwrap().offset, 2);
+}
+
+#[test]
+fn fd_pwrite_past_eof_extends_file() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "pwriter", "/w.txt", b"abc");
+    let mut heap = vec![0u8; 32];
+    heap[..2].copy_from_slice(b"hi");
+
+    // Write "hi" at offset 10 — extends the file with zero-fill up
+    // through offset 10 (tmpfs.write zero-fills the gap) then the
+    // payload.
+    let req = Request {
+        opcode: op_wasi::FD_PWRITE,
+        flags: 0,
+        request_id: 946,
+        args: fd_pwrite_args(fd, 10),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 2);
+    let stat = k.vfs.stat("/w.txt").unwrap();
+    assert_eq!(stat.size, 12);
+}
+
+#[test]
+fn fd_pwrite_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdevpwriter", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 32];
+    heap[..2].copy_from_slice(b"hi");
+
+    let req = Request {
+        opcode: op_wasi::FD_PWRITE,
+        flags: 0,
+        request_id: 947,
+        args: fd_pwrite_args(1, 0),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_pwrite_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghostpwriter", 0);
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::FD_PWRITE,
+        flags: 0,
+        request_id: 948,
+        args: fd_pwrite_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_pwrite_to_procfs_vnode_returns_erofs() {
+    // procfs.write returns ReadOnly → EROFS. /proc/version is a
+    // regular-file vnode that the handler passes to vfs.write_ino.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "procpwriter", 0);
+    let (mount_id, ino) = k.vfs.resolve("/proc/version").expect("resolve");
+    k.install_fd(
+        pid,
+        10,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    let mut heap = vec![0u8; 32];
+    heap[..2].copy_from_slice(b"hi");
+
+    let req = Request {
+        opcode: op_wasi::FD_PWRITE,
+        flags: 0,
+        request_id: 949,
+        args: fd_pwrite_args(10, 0),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
 }
 
 #[test]

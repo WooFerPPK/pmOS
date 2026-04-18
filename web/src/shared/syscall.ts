@@ -294,6 +294,26 @@ export const OP_WASI = {
    * read-only filesystems (procfs) return EROFS. Shrinking
    * discards tail bytes, extending past EOF zero-fills. */
   FD_FILESTAT_SET_SIZE: 0x0028,
+  /** Wire-format identity for `fd_pread` / `fd_pwrite`. Positional
+   * I/O variants of fd_read / fd_write: take an explicit offset
+   * from inline args and do NOT mutate FdEntry.offset. Wire
+   * (both shapes identical except for heap direction): fd at
+   * args[0..4], offset u64 LE at args[4..12]; heap = destination
+   * buffer (pread) or source bytes (pwrite). Vnode-only — non-
+   * Vnode FdObject variants reject with EINVAL (same guard shape
+   * as fd_seek / fd_tell). Threads directly through Vfs::read_ino
+   * / Vfs::write_ino at the explicit offset so entry.offset
+   * stays untouched — a pread/pwrite pair does not disturb a
+   * subsequent fd_read / fd_seek that uses the seekable-fd
+   * position. */
+  FD_PREAD: 0x002a,
+  FD_PWRITE: 0x002d,
+  /** Unused by the WASI shim today; the tests probe it to verify
+   * the dispatcher's `ENOSYS` path still fires for opcodes the
+   * kernel doesn't yet handle. Was `FD_PREAD` before that handler
+   * landed; swap to whichever WASI opcode is still unhandled as
+   * the implementation catches up. */
+  SOCK_SHUTDOWN: 0x0073,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer
@@ -304,12 +324,6 @@ export const OP_WASI = {
    * entry signals "more may exist" by returning value == heap_len
    * and the caller re-issues with the last d_next as the cookie. */
   FD_READDIR: 0x002f,
-  /** Unused by the WASI shim today; the tests probe it to verify
-   * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Was `FD_READDIR` before that
-   * handler landed; swap to whichever WASI opcode is still
-   * unhandled as the implementation catches up. */
-  FD_PREAD: 0x002a,
   /** Wire-format identity for `poll_oneoff`. The shim packs
    * `(n_subs, n_events_cap)` into the inline args window (u32 each
    * at offsets 0 / 4) and puts the subscription list followed by
