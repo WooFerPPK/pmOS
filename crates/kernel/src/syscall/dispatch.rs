@@ -185,6 +185,7 @@ pub fn kerr_to_errno(err: KernelError) -> i32 {
         KernelError::WouldBlock => EAGAIN,
         KernelError::ConnectionRefused => ECONNREFUSED,
         KernelError::AddressInUse => errno::EADDRINUSE,
+        KernelError::PipeBroken => errno::EPIPE,
         KernelError::Fs(fs_err) => fs_err_to_errno(fs_err),
         KernelError::Dev(dev_err) => dev_err_to_errno(dev_err),
     }

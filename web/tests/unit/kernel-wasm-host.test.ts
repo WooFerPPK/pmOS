@@ -2473,6 +2473,98 @@ describe("dispatch: SOCK_SEND", () => {
     });
     expect(response.status).toBe(-ERRNO.EBADF);
   });
+
+  it("returns -EPIPE after own write side is shut down", async () => {
+    // Build a connected socket pair via the IPC ext opcodes:
+    // server: IPC_SOCKET → IPC_BIND → IPC_LISTEN; client: IPC_SOCKET
+    // → IPC_CONNECT; server: IPC_ACCEPT → accepted_fd paired with
+    // client. Then SOCK_SHUTDOWN(WR) on client → SOCK_SEND on
+    // client returns -EPIPE via PipeBroken → EPIPE.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Server-side socket + bind + listen.
+    const srvResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 1070,
+      arg0: 0,
+    });
+    const srvFd = Number(srvResp.response.value);
+
+    const bindPath = new TextEncoder().encode("/tmp/pair");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.IPC_BIND,
+        requestId: 1071,
+        arg0: srvFd,
+        heapPtr: 0,
+        heapLen: bindPath.length,
+      },
+      bindPath,
+    );
+    const listenArgs = new Uint8Array(16);
+    const lv = new DataView(listenArgs.buffer);
+    lv.setUint32(0, srvFd, true);
+    lv.setUint32(4, 4, true); // backlog
+    host.dispatch(pid, {
+      opcode: OP_EXT.IPC_LISTEN,
+      requestId: 1072,
+      args: listenArgs,
+    });
+
+    // Client socket + connect.
+    const clientResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 1073,
+      arg0: 0,
+    });
+    const clientFd = Number(clientResp.response.value);
+
+    const connectArgs = new Uint8Array(16);
+    new DataView(connectArgs.buffer).setUint32(0, clientFd, true);
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.IPC_CONNECT,
+        requestId: 1074,
+        args: connectArgs,
+        heapPtr: 0,
+        heapLen: bindPath.length,
+      },
+      bindPath,
+    );
+
+    // Server accepts.
+    host.dispatch(pid, {
+      opcode: OP_EXT.IPC_ACCEPT,
+      requestId: 1075,
+      arg0: srvFd,
+    });
+
+    // Now shutdown the client's write side.
+    host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SHUTDOWN,
+      requestId: 1076,
+      args: encodeSockShutdownArgs(clientFd, SDFLAGS.WR),
+    });
+
+    // sock_send should now return -EPIPE.
+    const payload = new TextEncoder().encode("hi");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.SOCK_SEND,
+        requestId: 1077,
+        args: encodeSockSendArgs(clientFd, 0),
+        heapPtr: 0,
+        heapLen: payload.length,
+      },
+      payload,
+    );
+    expect(response.status).toBe(-ERRNO.EPIPE);
+  });
 });
 
 describe("dispatch: SOCK_RECV", () => {

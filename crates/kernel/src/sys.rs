@@ -73,6 +73,13 @@ pub enum KernelError {
     /// Path already bound — e.g. a second `display_bind`
     /// call against the same socket path.
     AddressInUse,
+    /// Write attempted on a pipe / stream whose write path is broken
+    /// — peer fully closed, local `shutdown(WR)` applied, or peer
+    /// `shutdown(RD)` applied. Surfaces to userland as EPIPE (POSIX's
+    /// "broken pipe" signal). Distinct from [`KernelError::NotSupportedOnFd`]
+    /// (generic "this fd doesn't support this op") so the errno
+    /// surface matches `send(2)` / `write(2)`'s documented contract.
+    PipeBroken,
     /// Forwarded filesystem error (wraps `FsError`).
     Fs(FsError),
     /// Forwarded device-dispatch error (wraps `DevError`).
@@ -121,7 +128,7 @@ impl From<IpcError> for KernelError {
             IpcError::ConnectionRefused => KernelError::ConnectionRefused,
             IpcError::InvalidState => KernelError::InvalidArgument,
             IpcError::WouldBlock => KernelError::WouldBlock,
-            IpcError::PipeBroken => KernelError::NotSupportedOnFd,
+            IpcError::PipeBroken => KernelError::PipeBroken,
             IpcError::MsgTooLarge => KernelError::InvalidArgument,
         }
     }

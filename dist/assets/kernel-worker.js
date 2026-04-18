@@ -355,6 +355,11 @@ var ERRNO = {
   ENOTDIR: 54,
   ENOTEMPTY: 55,
   ENOTSUP: 58,
+  /** Broken pipe / socket. Returned by send / write when the
+   * peer has fully closed, the local write side has been shut
+   * down via SOCK_SHUTDOWN, or the peer has shut down its read
+   * side. Maps to `abi::errno::EPIPE`. */
+  EPIPE: 64,
   EROFS: 69
 };
 var DEV = {

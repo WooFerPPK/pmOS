@@ -6025,6 +6025,127 @@ fn path_symlink_with_old_len_past_heap_returns_einval() {
     assert_eq!(resp.status, -errno::EINVAL);
 }
 
+// ---- PipeBroken → EPIPE surface mapping ----------------------------
+//
+// Pre-slice, IpcError::PipeBroken mapped to KernelError::NotSupportedOnFd
+// → EINVAL, which is POSIX-imprecise (POSIX specifies EPIPE for
+// writes into a broken pipe / socket, distinct from the generic
+// EINVAL). Post-slice, KernelError has its own PipeBroken variant
+// mapped to EPIPE. Three canonical scenarios exercise the path
+// through the syscall dispatcher: fd_write on a Socket whose peer
+// has fully closed; fd_write on a Socket whose own write side has
+// been shut down; sock_send on a Socket whose peer has shut down
+// its read side.
+
+#[test]
+fn fd_write_on_socket_after_peer_close_returns_epipe() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sender", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    // Peer b closes, leaving a.peer pointing at a closed socket.
+    k.ipc.close_socket(b).unwrap();
+
+    let mut heap = vec![0u8; 16];
+    heap[..2].copy_from_slice(b"hi");
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1070,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EPIPE);
+}
+
+#[test]
+fn fd_write_on_write_shutdown_socket_returns_epipe() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sender", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    // Half-close the write side.
+    k.ipc.shutdown_socket(a, false, true).unwrap();
+
+    let mut heap = vec![0u8; 16];
+    heap[..2].copy_from_slice(b"hi");
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1071,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EPIPE);
+}
+
+#[test]
+fn sock_send_on_socket_with_peer_read_shutdown_returns_epipe() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sender", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    // Peer b shuts down its read side; a's send must EPIPE.
+    k.ipc.shutdown_socket(b, true, false).unwrap();
+
+    let mut heap = vec![0u8; 16];
+    heap[..2].copy_from_slice(b"hi");
+    let req = Request {
+        opcode: op_wasi::SOCK_SEND,
+        flags: 0,
+        request_id: 1072,
+        args: {
+            let mut a = [0u8; 16];
+            a[0..4].copy_from_slice(&3u32.to_le_bytes());
+            a
+        },
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EPIPE);
+}
+
 // ---- fd_prestat_dir_name --------------------------------------------
 //
 // Opcode 0x002C. WASI preopen-name lookup; companion to
