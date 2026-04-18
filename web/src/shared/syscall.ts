@@ -441,6 +441,7 @@ export const OP_EXT = {
   PROC_SELF: 0x1103,
   PROC_PARENT: 0x1104,
   PROC_WAIT: 0x1101,
+  PROC_KILL: 0x1102,
   DISPLAY_CONNECT: 0x1200,
   DISPLAY_BIND: 0x1201,
   CAP_CHECK: 0x1300,
@@ -479,6 +480,17 @@ export const ERRNO = {
    * side. Maps to `abi::errno::EPIPE`. */
   EPIPE: 64,
   EROFS: 69,
+  /** No such process. Returned by process-management opcodes
+   * (`proc_kill`, `proc_caps_get`) when the target pid doesn't
+   * exist or has already been reaped. Mirrors
+   * `abi::errno::ESRCH`. */
+  ESRCH: 71,
+  /** Caller's capability set does not permit this operation.
+   * PMos-specific errno (not in the POSIX baseline); used by
+   * `proc_kill` when the sender is not the target's parent, not
+   * the target itself, and doesn't hold `Cap::ProcKillAny`.
+   * Mirrors `abi::errno::ENOTCAPABLE`. */
+  ENOTCAPABLE: 76,
 } as const;
 
 // ---- WASI clock identifiers -----------------------------------------

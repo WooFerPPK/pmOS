@@ -4468,6 +4468,79 @@ describe("dispatch: PROC_WAIT", () => {
   });
 });
 
+// ---- dispatch: PROC_KILL --------------------------------------------
+//
+// PROC_KILL (0x1102). Wire: args[0..4] = target_pid i32; args[4..6]
+// = signum u16. v1 knows SIGINT=2, SIGKILL=9, SIGTERM=15; any other
+// signum → -EINVAL. -ESRCH on unknown pid, -ENOTCAPABLE when sender
+// is not parent / not self / doesn't hold Cap::ProcKillAny.
+
+function encodeProcKillArgs(targetPid: number, signum: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setInt32(0, targetPid, true);
+  v.setUint16(4, signum & 0xffff, true);
+  return args;
+}
+
+describe("dispatch: PROC_KILL", () => {
+  it("returns -EINVAL for an unknown signum", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1310,
+        args: encodeProcKillArgs(pid, 77),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -ESRCH when the target pid does not exist", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1311,
+        args: encodeProcKillArgs(9999, 15),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.ESRCH);
+  });
+
+  it("returns 0 for self-SIGINT (POSIX kill(getpid(), SIGINT))", async () => {
+    // Self-kill with a catchable signal works even without
+    // Cap::ProcKillAny — POSIX lets a process signal itself freely.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1312,
+        args: encodeProcKillArgs(pid, 2),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {

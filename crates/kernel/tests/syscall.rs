@@ -139,22 +139,22 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `PROC_KILL` is in the extension range (0x1102) but still has
-    // no handler. Same shape as the WASI case above: decoded as a
-    // known extension opcode, routed to `dispatch_ext`'s `_ =>`
+    // `PROC_CAPS_GET` is in the extension range (0x1105) but still
+    // has no handler. Same shape as the WASI case above: decoded as
+    // a known extension opcode, routed to `dispatch_ext`'s `_ =>`
     // arm, ENOSYS echoed back with the request_id intact.
     //
     // (This probe was `PROC_SPAWN` before that handler landed, then
-    // `PROC_WAIT`. When the next extension opcode gets implemented,
-    // swap this probe to whatever's still unhandled at that point,
-    // or delete the test once every extension opcode has real
-    // coverage.)
+    // `PROC_WAIT`, then `PROC_KILL`. When the next extension opcode
+    // gets implemented, swap this probe to whatever's still unhandled
+    // at that point, or delete the test once every extension opcode
+    // has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::PROC_KILL,
+        opcode: op_ext::PROC_CAPS_GET,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -9259,4 +9259,226 @@ fn proc_wait_on_signaled_child_returns_packed_signaled_status() {
     let flags = ((packed >> 40) & 0xff) as u8;
     assert_eq!(signum, 9);
     assert_eq!(flags, 0x02);
+}
+
+// ---- proc_kill -------------------------------------------------------
+//
+// PROC_KILL (0x1102). Send a POSIX-style signal to a pid. v1 knows
+// three signal numbers:
+//
+//   * SIGKILL=9  → terminal, target zombifies with Signaled(9).
+//   * SIGTERM=15 → catchable, queued on target's SignalInbox.
+//   * SIGINT=2   → catchable, queued on target's SignalInbox.
+//
+// Any other signum returns -EINVAL. Cap rules: sender must be the
+// target's parent OR the sender itself OR hold
+// `Cap::ProcKillAny`; otherwise -ENOTCAPABLE. Non-existent target
+// returns -ESRCH.
+//
+// Wire layout:
+//   args[0..4] = target_pid (i32).
+//   args[4..6] = signum (u16; low 16 bits of the POSIX signal
+//                number).
+// Response: value = 0 on success.
+
+fn proc_kill_args(target_pid: i32, signum: u16) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&target_pid.to_le_bytes());
+    args[4..6].copy_from_slice(&signum.to_le_bytes());
+    args
+}
+
+#[test]
+fn proc_kill_sigkill_zombifies_child() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "doomed");
+    k.procs
+        .transition(child, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1210,
+        args: proc_kill_args(child, 9),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(
+        k.procs.get(child).unwrap().state,
+        kernel::proc::ProcState::Zombie
+    );
+    assert_eq!(
+        k.procs.get(child).unwrap().exit_status,
+        Some(ExitStatus::Signaled(9))
+    );
+}
+
+#[test]
+fn proc_kill_sigterm_queues_on_inbox_and_leaves_target_running() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "target");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1211,
+        args: proc_kill_args(child, 15),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+    // Still Ready (Term is catchable and doesn't zombify).
+    assert_eq!(
+        k.procs.get(child).unwrap().state,
+        kernel::proc::ProcState::Ready
+    );
+}
+
+#[test]
+fn proc_kill_sigint_queues_on_inbox() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "int");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1212,
+        args: proc_kill_args(child, 2),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+}
+
+#[test]
+fn proc_kill_unknown_signum_returns_einval() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "child");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1213,
+        args: proc_kill_args(child, 77),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn proc_kill_nonexistent_target_returns_esrch() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1214,
+        args: proc_kill_args(9999, 15),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ESRCH);
+}
+
+#[test]
+fn proc_kill_non_child_without_proc_kill_any_returns_enotcapable() {
+    // a and b are both children of init → peers of each other, not
+    // in a parent-child relationship. Neither holds ProcKillAny, so
+    // a killing b returns ENOTCAPABLE.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let a = register_child(&mut k, init, "a");
+    let b = register_child(&mut k, init, "b");
+    k.procs
+        .transition(a, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.procs
+        .transition(b, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1215,
+        args: proc_kill_args(b, 15),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, a, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+    // b unchanged.
+    assert_eq!(
+        k.procs.get(b).unwrap().state,
+        kernel::proc::ProcState::Running
+    );
+}
+
+#[test]
+fn proc_kill_self_sigint_is_allowed_and_queues() {
+    // Self-kill with a catchable signal: POSIX kill(getpid(), SIG)
+    // works even without ProcKillAny. Post-slice the kernel's cap
+    // check allows sender == target.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self-signaller", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1216,
+        args: proc_kill_args(pid, 2),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(pid).unwrap(), 1);
+}
+
+#[test]
+fn proc_kill_dead_target_returns_esrch() {
+    // Reaped (Dead) target: ESRCH. proc_kill's NoSuchPid arm fires
+    // for both unknown pids and pids in the terminal Dead state.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "short");
+    k.procs
+        .transition(child, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child, ExitStatus::Exited(0)).unwrap();
+    // Reap the zombie so the process is fully Dead.
+    k.reap(child).unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1217,
+        args: proc_kill_args(child, 15),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ESRCH);
 }

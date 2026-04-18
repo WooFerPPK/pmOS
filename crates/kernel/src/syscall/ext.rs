@@ -31,7 +31,7 @@ use abi::ring::{Request, Response};
 
 use crate::ipc::SocketType;
 use crate::platform;
-use crate::proc::ExitStatus;
+use crate::proc::{ExitStatus, Signal};
 use crate::sys::{Kernel, SpawnArgs, WaitOutcome, WaitTarget};
 
 use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno};
@@ -57,6 +57,7 @@ pub fn dispatch_ext(
         op::CAP_LIST => handle_cap_list(kernel, pid, req),
         op::PROC_SPAWN => handle_proc_spawn(kernel, pid, req, heap),
         op::PROC_WAIT => handle_proc_wait(kernel, pid, req, heap),
+        op::PROC_KILL => handle_proc_kill(kernel, pid, req),
         op::DISPLAY_CONNECT => handle_display_connect(kernel, pid, req),
         op::DISPLAY_BIND => handle_display_bind(kernel, pid, req),
         _ => Response::err(req.request_id, ENOSYS),
@@ -536,6 +537,37 @@ fn handle_proc_wait(
         }
         Ok(WaitOutcome::WouldBlock) => Response::err(req.request_id, EAGAIN),
         Ok(WaitOutcome::NoChildren) => Response::err(req.request_id, ECHILD),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- proc_kill --------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = target_pid (i32).
+//   args[4..6] = signum (u16). v1 knows three: SIGINT=2, SIGKILL=9,
+//                SIGTERM=15. Any other number → EINVAL before the
+//                kernel is touched (a future SIGCHLD / SIGHUP wiring
+//                extends this match without a wire-format break).
+//
+// Response: value = 0 on success; negative errno on failure.
+//
+// Cap rules are enforced by Kernel::proc_kill: sender must be
+// target's parent OR sender == target (self-signal) OR hold
+// Cap::ProcKillAny. Other cases → -ENOTCAPABLE. Non-existent or
+// already-reaped target → -ESRCH.
+
+fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let target_pid = i32::from_le_bytes([req.args[0], req.args[1], req.args[2], req.args[3]]);
+    let signum = u16::from_le_bytes([req.args[4], req.args[5]]);
+    let signal = match signum {
+        2 => Signal::Interrupt,
+        9 => Signal::Kill,
+        15 => Signal::Term,
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    match kernel.proc_kill(pid, target_pid, signal) {
+        Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }

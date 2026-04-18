@@ -315,6 +315,7 @@ var OP_EXT = {
   PROC_SELF: 4355,
   PROC_PARENT: 4356,
   PROC_WAIT: 4353,
+  PROC_KILL: 4354,
   DISPLAY_CONNECT: 4608,
   DISPLAY_BIND: 4609,
   CAP_CHECK: 4864,
@@ -346,7 +347,18 @@ var ERRNO = {
    * down via SOCK_SHUTDOWN, or the peer has shut down its read
    * side. Maps to `abi::errno::EPIPE`. */
   EPIPE: 64,
-  EROFS: 69
+  EROFS: 69,
+  /** No such process. Returned by process-management opcodes
+   * (`proc_kill`, `proc_caps_get`) when the target pid doesn't
+   * exist or has already been reaped. Mirrors
+   * `abi::errno::ESRCH`. */
+  ESRCH: 71,
+  /** Caller's capability set does not permit this operation.
+   * PMos-specific errno (not in the POSIX baseline); used by
+   * `proc_kill` when the sender is not the target's parent, not
+   * the target itself, and doesn't hold `Cap::ProcKillAny`.
+   * Mirrors `abi::errno::ENOTCAPABLE`. */
+  ENOTCAPABLE: 76
 };
 var POLL_SUBSCRIPTION_SIZE = 48;
 var POLL_EVENT_SIZE = 32;
@@ -2034,6 +2046,33 @@ var UserWasmRuntime = class {
         }
         const pidView = new DataView(heapOut.buffer, heapOut.byteOffset);
         return pidView.getUint32(0, true);
+      },
+      // `proc_kill(target_pid: i32, signum: i32) -> i32`
+      //
+      // Deliver a POSIX-style signal to `target_pid`. v1 knows
+      // three: SIGINT=2 (catchable, queued), SIGTERM=15 (catchable,
+      // queued), SIGKILL=9 (terminal, zombifies target). Any other
+      // signum returns -EINVAL.
+      //
+      // Returns 0 on success; negative errno on failure:
+      //
+      //   * ESRCH — target pid does not exist or has been reaped.
+      //   * ENOTCAPABLE — sender is not the target's parent, not
+      //     the target itself, and doesn't hold Cap::ProcKillAny.
+      //   * EINVAL — unknown signum.
+      proc_kill: (targetPid, signum) => {
+        const args = new Uint8Array(16);
+        const v = new DataView(args.buffer);
+        v.setInt32(0, targetPid, true);
+        v.setUint16(4, signum & 65535, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.PROC_KILL,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status;
       },
       // `ipc_socket(ty: i32) -> i32`
       //

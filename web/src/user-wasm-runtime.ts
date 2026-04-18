@@ -1981,6 +1981,35 @@ export class UserWasmRuntime {
         return pidView.getUint32(0, true);
       },
 
+      // `proc_kill(target_pid: i32, signum: i32) -> i32`
+      //
+      // Deliver a POSIX-style signal to `target_pid`. v1 knows
+      // three: SIGINT=2 (catchable, queued), SIGTERM=15 (catchable,
+      // queued), SIGKILL=9 (terminal, zombifies target). Any other
+      // signum returns -EINVAL.
+      //
+      // Returns 0 on success; negative errno on failure:
+      //
+      //   * ESRCH — target pid does not exist or has been reaped.
+      //   * ENOTCAPABLE — sender is not the target's parent, not
+      //     the target itself, and doesn't hold Cap::ProcKillAny.
+      //   * EINVAL — unknown signum.
+      proc_kill: (targetPid: number, signum: number): number => {
+        const args = new Uint8Array(16);
+        const v = new DataView(args.buffer);
+        v.setInt32(0, targetPid, true);
+        v.setUint16(4, signum & 0xffff, true);
+
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.PROC_KILL,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status;
+      },
+
       // `ipc_socket(ty: i32) -> i32`
       //
       // Create an unbound socket. Returns the new fd (positive)

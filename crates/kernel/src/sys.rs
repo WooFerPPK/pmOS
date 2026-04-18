@@ -987,12 +987,15 @@ impl Kernel {
             .get(target_pid)
             .ok_or(KernelError::NoSuchPid)?;
         let is_parent = target.ppid == sender_pid;
+        let is_self = sender_pid == target_pid;
         if target.state == ProcState::Dead {
             return Err(KernelError::NoSuchPid);
         }
 
-        // Cap check.
-        if !is_parent && !sender_caps.contains(Cap::ProcKillAny) {
+        // Cap check. Parents can signal their own children; any pid
+        // can signal itself (POSIX `kill(getpid(), SIG)`); otherwise
+        // the caller must hold `Cap::ProcKillAny`.
+        if !is_parent && !is_self && !sender_caps.contains(Cap::ProcKillAny) {
             return Err(KernelError::NotCapable);
         }
 

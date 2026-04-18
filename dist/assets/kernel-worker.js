@@ -351,6 +351,7 @@ var OP_EXT = {
   PROC_SELF: 4355,
   PROC_PARENT: 4356,
   PROC_WAIT: 4353,
+  PROC_KILL: 4354,
   DISPLAY_CONNECT: 4608,
   DISPLAY_BIND: 4609,
   CAP_CHECK: 4864,
@@ -382,7 +383,18 @@ var ERRNO = {
    * down via SOCK_SHUTDOWN, or the peer has shut down its read
    * side. Maps to `abi::errno::EPIPE`. */
   EPIPE: 64,
-  EROFS: 69
+  EROFS: 69,
+  /** No such process. Returned by process-management opcodes
+   * (`proc_kill`, `proc_caps_get`) when the target pid doesn't
+   * exist or has already been reaped. Mirrors
+   * `abi::errno::ESRCH`. */
+  ESRCH: 71,
+  /** Caller's capability set does not permit this operation.
+   * PMos-specific errno (not in the POSIX baseline); used by
+   * `proc_kill` when the sender is not the target's parent, not
+   * the target itself, and doesn't hold `Cap::ProcKillAny`.
+   * Mirrors `abi::errno::ENOTCAPABLE`. */
+  ENOTCAPABLE: 76
 };
 var DEV = {
   FRAMEBUFFER: 0,
