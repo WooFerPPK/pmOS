@@ -1339,9 +1339,16 @@ fn path_filestat_get_on_tmpfs_regular_file_returns_filetype_and_size() {
     assert_eq!(&heap[17..24], &[0u8; 7], "filetype padding");
     assert_eq!(filestat_u64(&heap, 0, 24), 1, "nlink");
     assert_eq!(filestat_u64(&heap, 0, 32), bytes.len() as u64, "size");
-    assert_eq!(filestat_u64(&heap, 0, 40), 0, "atim");
-    assert_eq!(filestat_u64(&heap, 0, 48), 0, "mtim");
-    assert_eq!(filestat_u64(&heap, 0, 56), 0, "ctim");
+    // Real vnode timestamps: tmpfs threads Platform::now_realtime_ns
+    // through create + write. All three times are non-zero on a freshly-
+    // written tmpfs file (create stamps all three, write advances mtime
+    // + ctime); exact values come from the wall clock so only the
+    // "is nonzero" invariant is asserted here. The native platform's
+    // realtime clock reads SystemTime::now(), which is always > 0 in
+    // any reasonable test environment.
+    assert!(filestat_u64(&heap, 0, 40) > 0, "atim nonzero");
+    assert!(filestat_u64(&heap, 0, 48) > 0, "mtim nonzero");
+    assert!(filestat_u64(&heap, 0, 56) > 0, "ctim nonzero");
 }
 
 #[test]

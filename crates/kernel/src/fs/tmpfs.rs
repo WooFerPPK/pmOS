@@ -20,7 +20,8 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NodeType};
+use crate::platform;
+use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NanosSinceEpoch, NodeType};
 
 /// A single tmpfs node.
 enum TmpNode {
@@ -48,10 +49,25 @@ impl TmpNode {
     }
 }
 
-/// Metadata wrapper: the type-specific content plus the mode.
+/// Metadata wrapper: the type-specific content plus the mode and
+/// per-vnode POSIX-style timestamps.
+///
+/// Timestamps are nanoseconds since the Unix epoch, sourced from
+/// `Platform::now_realtime_ns()` at mutation time. Touch semantics:
+///
+/// * `create` / `mkdir`: all three set to `now()`.
+/// * `write` / `truncate`: `mtime_ns` + `ctime_ns` updated;
+///   `atime_ns` stays at creation time (noatime — v1 trades strict
+///   POSIX atime tracking for zero read-side write amplification;
+///   the Platform clock is still the single source of truth, so a
+///   future slice that opts into relatime just reads from the same
+///   side-channel on every read).
 struct TmpEntry {
     node: TmpNode,
     mode: Mode,
+    atime_ns: NanosSinceEpoch,
+    mtime_ns: NanosSinceEpoch,
+    ctime_ns: NanosSinceEpoch,
 }
 
 /// tmpfs filesystem.
@@ -63,12 +79,16 @@ pub struct TmpFs {
 impl TmpFs {
     /// Create a fresh tmpfs with an empty root directory.
     pub fn new() -> Self {
+        let now = now_ns();
         let mut nodes = BTreeMap::new();
         nodes.insert(
             1,
             TmpEntry {
                 node: TmpNode::Directory(BTreeMap::new()),
                 mode: 0o755,
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
             },
         );
         TmpFs {
@@ -139,6 +159,7 @@ impl Filesystem for TmpFs {
     }
 
     fn write(&mut self, ino: Ino, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+        let now = now_ns();
         let entry = self.entry_mut(ino)?;
         let bytes = match &mut entry.node {
             TmpNode::File(b) => b,
@@ -150,6 +171,8 @@ impl Filesystem for TmpFs {
             bytes.resize(needed, 0);
         }
         bytes[start..needed].copy_from_slice(buf);
+        entry.mtime_ns = now;
+        entry.ctime_ns = now;
         Ok(buf.len())
     }
 
@@ -181,11 +204,15 @@ impl Filesystem for TmpFs {
             }
         }
         let ino = self.alloc_ino();
+        let now = now_ns();
         self.nodes.insert(
             ino,
             TmpEntry {
                 node: TmpNode::File(Vec::new()),
                 mode,
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
             },
         );
         self.dir_children_mut(dir)?.insert(name.to_string(), ino);
@@ -201,11 +228,15 @@ impl Filesystem for TmpFs {
             }
         }
         let ino = self.alloc_ino();
+        let now = now_ns();
         self.nodes.insert(
             ino,
             TmpEntry {
                 node: TmpNode::Directory(BTreeMap::new()),
                 mode,
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
             },
         );
         self.dir_children_mut(dir)?.insert(name.to_string(), ino);
@@ -285,25 +316,35 @@ impl Filesystem for TmpFs {
             mode: entry.mode,
             nlink: 1,
             size: entry.node.size(),
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
+            atime_ns: entry.atime_ns,
+            mtime_ns: entry.mtime_ns,
+            ctime_ns: entry.ctime_ns,
         })
     }
 
     fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), FsError> {
+        let now = now_ns();
         let entry = self.entry_mut(ino)?;
         let bytes = match &mut entry.node {
             TmpNode::File(b) => b,
             TmpNode::Directory(_) => return Err(FsError::IsADirectory),
         };
         bytes.resize(new_size as usize, 0);
+        entry.mtime_ns = now;
+        entry.ctime_ns = now;
         Ok(())
     }
 
     fn kind_name(&self) -> &'static str {
         "tmpfs"
     }
+}
+
+/// Wall-clock ns via the active Platform impl. Pulled through a
+/// tiny helper so the handful of callers above don't have to spell
+/// out the full `platform::current().now_realtime_ns()` chain.
+fn now_ns() -> NanosSinceEpoch {
+    platform::current().now_realtime_ns()
 }
 
 /// Reject empty names and names containing `/` or a NUL byte.

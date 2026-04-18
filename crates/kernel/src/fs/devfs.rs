@@ -18,7 +18,8 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NodeType};
+use crate::platform;
+use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NanosSinceEpoch, NodeType};
 
 /// A single /dev entry, resolved at lookup time.
 struct DevEntry {
@@ -31,6 +32,12 @@ struct DevEntry {
 pub struct DevFs {
     entries: Vec<DevEntry>,
     name_to_ino: BTreeMap<String, Ino>,
+    /// Wall-clock snapshot taken at `DevFs::new()`. Every entry
+    /// reports this value for atime / mtime / ctime: devfs is
+    /// immutable at runtime (no create / write / unlink), so "when
+    /// was this node last touched" is exactly "when did this devfs
+    /// get mounted". Sourced from `Platform::now_realtime_ns()`.
+    created_at_ns: NanosSinceEpoch,
 }
 
 impl DevFs {
@@ -98,6 +105,7 @@ impl DevFs {
         DevFs {
             entries,
             name_to_ino,
+            created_at_ns: platform::current().now_realtime_ns(),
         }
     }
 
@@ -187,8 +195,18 @@ impl Filesystem for DevFs {
     }
 
     fn stat(&mut self, ino: Ino) -> Result<FileStat, FsError> {
+        let t = self.created_at_ns;
         if ino == 1 {
-            return Ok(FileStat::zeroed(1, NodeType::Directory, 0o755));
+            return Ok(FileStat {
+                ino: 1,
+                ty: NodeType::Directory,
+                mode: 0o755,
+                nlink: 1,
+                size: 0,
+                atime_ns: t,
+                mtime_ns: t,
+                ctime_ns: t,
+            });
         }
         let e = self.entry_by_ino(ino).ok_or(FsError::NotFound)?;
         Ok(FileStat {
@@ -197,9 +215,9 @@ impl Filesystem for DevFs {
             mode: e.mode,
             nlink: 1,
             size: 0,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
+            atime_ns: t,
+            mtime_ns: t,
+            ctime_ns: t,
         })
     }
 

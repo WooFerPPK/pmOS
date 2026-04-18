@@ -483,3 +483,87 @@ fn corrupt_superblock_checksum_fails_mount() {
         Err(e) => assert_eq!(e, FsError::Io),
     }
 }
+
+// ---- Real vnode timestamps ----------------------------------------
+//
+// OPFS's on-disk inode already carries `atime_ns` / `mtime_ns` /
+// `ctime_ns` — the disk format has always had slots for them.
+// Pre-slice, create/mkdir hard-coded all three to 0 and write/
+// truncate left them untouched, so stat always reported 0. With
+// the touch-on-write slice wiring `Platform::now_realtime_ns()`
+// into create/mkdir/write/truncate, the fields carry meaningful
+// values and persist across the journal commit + replay path.
+
+#[test]
+fn opfs_create_sets_nonzero_timestamps() {
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "f", 0o644).unwrap();
+    let st = fs.stat(ino).unwrap();
+    assert!(st.atime_ns > 0, "atime");
+    assert!(st.mtime_ns > 0, "mtime");
+    assert!(st.ctime_ns > 0, "ctime");
+    // Fresh file gets one now() applied to all three.
+    assert_eq!(st.atime_ns, st.mtime_ns);
+    assert_eq!(st.mtime_ns, st.ctime_ns);
+}
+
+#[test]
+fn opfs_mkdir_sets_nonzero_timestamps() {
+    let mut fs = fresh_fs();
+    let ino = fs.mkdir(ROOT_INO, "d", 0o755).unwrap();
+    let st = fs.stat(ino).unwrap();
+    assert!(st.atime_ns > 0);
+    assert!(st.mtime_ns > 0);
+    assert!(st.ctime_ns > 0);
+}
+
+#[test]
+fn opfs_write_advances_mtime_and_ctime_and_leaves_atime() {
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "f", 0o644).unwrap();
+    let before = fs.stat(ino).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    fs.write(ino, 0, b"hello").unwrap();
+
+    let after = fs.stat(ino).unwrap();
+    assert!(after.mtime_ns > before.mtime_ns, "mtime advanced");
+    assert!(after.ctime_ns > before.ctime_ns, "ctime advanced");
+    // noatime in v1.
+    assert_eq!(after.atime_ns, before.atime_ns);
+}
+
+#[test]
+fn opfs_truncate_advances_mtime_and_ctime() {
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "f", 0o644).unwrap();
+    fs.write(ino, 0, b"abcdef").unwrap();
+    let before = fs.stat(ino).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    fs.truncate(ino, 3).unwrap();
+
+    let after = fs.stat(ino).unwrap();
+    assert!(after.mtime_ns > before.mtime_ns);
+    assert!(after.ctime_ns > before.ctime_ns);
+}
+
+#[test]
+fn opfs_timestamps_survive_remount() {
+    // The journal + inode-on-disk persistence contract: mtime set
+    // before unmount is readable byte-for-byte after remount. This
+    // is the pin that catches a slice that forgets to route the
+    // timestamp update through `stage_inode_write`.
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "f", 0o644).unwrap();
+    fs.write(ino, 0, b"persisted").unwrap();
+    let before = fs.stat(ino).unwrap();
+    fs.sync().unwrap();
+
+    let device = fs.into_device();
+    let mut fs2 = OpfsFs::mount(device).expect("remount");
+    let after = fs2.stat(ino).unwrap();
+    assert_eq!(after.mtime_ns, before.mtime_ns);
+    assert_eq!(after.ctime_ns, before.ctime_ns);
+    assert_eq!(after.atime_ns, before.atime_ns);
+}

@@ -357,6 +357,122 @@ fn procfs_is_read_only() {
     assert_eq!(vfs.unlink("/proc/version").unwrap_err(), FsError::ReadOnly);
 }
 
+// ---- Real vnode timestamps -----------------------------------------
+//
+// Every filesystem in v1 now threads `Platform::now_realtime_ns()`
+// into its vnode metadata. Semantics are "touch-on-write with
+// noatime":
+//
+//   create / mkdir      set atime = mtime = ctime = now()
+//   write / truncate    update mtime + ctime, leave atime untouched
+//   read                does NOT touch atime in v1 (relaxed POSIX;
+//                       avoids the write-amplification that strict
+//                       atime would introduce on every read)
+//
+// Filesystems with no per-vnode mutation surface (devfs, procfs)
+// still report meaningful timestamps: devfs snapshots the time at
+// mount and reports it for every entry; procfs returns `now()` per
+// stat call since its content is synthesised fresh each time.
+//
+// The tests below assert `> 0` rather than specific values because
+// the underlying `Platform::now_realtime_ns` reflects the host
+// wall clock, which is opaque in tests. A real kernel integration
+// test that needed exact timestamps would inject a deterministic
+// Platform impl; these tests only pin the "zeros are gone"
+// contract the filestat-get shims depended on.
+
+#[test]
+fn tmpfs_stat_returns_nonzero_timestamps_for_created_file() {
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/f", 0o644).unwrap();
+    let st = vfs.stat("/f").unwrap();
+    assert!(st.atime_ns > 0, "atime");
+    assert!(st.mtime_ns > 0, "mtime");
+    assert!(st.ctime_ns > 0, "ctime");
+    // On a freshly-created file, all three are set to the same
+    // now(), so they agree byte-for-byte (one Platform call, one
+    // tuple assignment).
+    assert_eq!(st.atime_ns, st.mtime_ns);
+    assert_eq!(st.mtime_ns, st.ctime_ns);
+}
+
+#[test]
+fn tmpfs_stat_returns_nonzero_timestamps_for_created_directory() {
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.mkdir("/d", 0o755).unwrap();
+    let st = vfs.stat("/d").unwrap();
+    assert!(st.atime_ns > 0);
+    assert!(st.mtime_ns > 0);
+    assert!(st.ctime_ns > 0);
+}
+
+#[test]
+fn tmpfs_write_advances_mtime_and_ctime_and_leaves_atime() {
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/f", 0o644).unwrap();
+    let before = vfs.stat("/f").unwrap();
+
+    // Sleep a nanosecond's worth so the realtime clock advances
+    // past the create-time timestamp.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    vfs.write("/f", 0, b"hi").unwrap();
+
+    let after = vfs.stat("/f").unwrap();
+    assert!(after.mtime_ns > before.mtime_ns, "mtime advanced");
+    assert!(after.ctime_ns > before.ctime_ns, "ctime advanced");
+    // noatime in v1: atime stays at create-time.
+    assert_eq!(after.atime_ns, before.atime_ns);
+}
+
+#[test]
+fn tmpfs_truncate_advances_mtime_and_ctime() {
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/f", 0o644).unwrap();
+    vfs.write("/f", 0, b"abcdef").unwrap();
+    let before = vfs.stat("/f").unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    vfs.truncate("/f", 3).unwrap();
+
+    let after = vfs.stat("/f").unwrap();
+    assert!(after.mtime_ns > before.mtime_ns);
+    assert!(after.ctime_ns > before.ctime_ns);
+    assert_eq!(after.atime_ns, before.atime_ns);
+}
+
+#[test]
+fn devfs_stat_returns_nonzero_timestamps() {
+    let mut vfs = fresh_vfs_full();
+    let st = vfs.stat("/dev/console").unwrap();
+    assert!(st.atime_ns > 0);
+    assert!(st.mtime_ns > 0);
+    assert!(st.ctime_ns > 0);
+    // Every devfs entry shares the mount-time snapshot, so the
+    // three fields agree (single Platform call at mount).
+    assert_eq!(st.atime_ns, st.mtime_ns);
+    assert_eq!(st.mtime_ns, st.ctime_ns);
+}
+
+#[test]
+fn devfs_stat_is_stable_across_calls() {
+    // devfs timestamps are frozen at mount time — a second stat()
+    // of the same node returns the same triple.
+    let mut vfs = fresh_vfs_full();
+    let first = vfs.stat("/dev/null").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    let second = vfs.stat("/dev/null").unwrap();
+    assert_eq!(first.mtime_ns, second.mtime_ns);
+}
+
+#[test]
+fn procfs_stat_returns_nonzero_timestamps() {
+    let mut vfs = fresh_vfs_full();
+    let st = vfs.stat("/proc/version").unwrap();
+    assert!(st.atime_ns > 0);
+    assert!(st.mtime_ns > 0);
+    assert!(st.ctime_ns > 0);
+}
+
 // ---- Mount table bookkeeping ---------------------------------------
 
 #[test]

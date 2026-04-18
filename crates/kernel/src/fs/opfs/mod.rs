@@ -40,7 +40,8 @@
 
 use alloc::vec::Vec;
 
-use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode};
+use crate::platform;
+use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NanosSinceEpoch};
 
 pub mod block;
 pub mod journal;
@@ -583,9 +584,12 @@ impl Filesystem for OpfsFs {
     }
 
     fn write(&mut self, ino: Ino, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+        let now = now_ns();
         let mut file_ino = self.read_inode(ino)?;
         let mut txn = Transaction::new();
         let n = self.stage_file_write(&mut file_ino, offset, buf, &mut txn)?;
+        file_ino.mtime_ns = now;
+        file_ino.ctime_ns = now;
         self.stage_inode_write(&file_ino, &mut txn)?;
         self.commit_and_apply(&txn)?;
         Ok(n)
@@ -621,15 +625,16 @@ impl Filesystem for OpfsFs {
             return Err(FsError::AlreadyExists);
         }
         let new_ino = self.alloc_inode()?;
+        let now = now_ns();
         let new_inode = InodeOnDisk {
             ino: new_ino,
             kind: InodeKind::RegularFile,
             mode,
             nlink: 1,
             size: 0,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
+            atime_ns: now,
+            mtime_ns: now,
+            ctime_ns: now,
             direct: [0; INODE_DIRECT_BLOCKS],
             indirect: 0,
         };
@@ -658,15 +663,16 @@ impl Filesystem for OpfsFs {
             return Err(FsError::AlreadyExists);
         }
         let new_ino = self.alloc_inode()?;
+        let now = now_ns();
         let new_inode = InodeOnDisk {
             ino: new_ino,
             kind: InodeKind::Directory,
             mode,
             nlink: 2, // self link + "." — we don't store "." / ".." explicitly in v1
             size: 0,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
+            atime_ns: now,
+            mtime_ns: now,
+            ctime_ns: now,
             direct: [0; INODE_DIRECT_BLOCKS],
             indirect: 0,
         };
@@ -863,9 +869,12 @@ impl Filesystem for OpfsFs {
     }
 
     fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), FsError> {
+        let now = now_ns();
         let mut file = self.read_inode(ino)?;
         let mut txn = Transaction::new();
         self.stage_file_truncate(&mut file, new_size, &mut txn)?;
+        file.mtime_ns = now;
+        file.ctime_ns = now;
         self.stage_inode_write(&file, &mut txn)?;
         self.commit_and_apply(&txn)?;
         Ok(())
@@ -881,4 +890,12 @@ impl Filesystem for OpfsFs {
     fn kind_name(&self) -> &'static str {
         "opfs"
     }
+}
+
+/// Wall-clock ns via the active Platform impl, pulled into a local
+/// helper so the per-method call sites stay compact. Writes go
+/// through the journal + `stage_inode_write`, so the new timestamp
+/// lands atomically alongside the payload it stamps.
+fn now_ns() -> NanosSinceEpoch {
+    platform::current().now_realtime_ns()
 }

@@ -114,15 +114,16 @@ pub fn mkfs(mut device: DynBlockDevice) -> Result<OpfsFs, FsError> {
     // through the normal journal-backed path.
     let alloc_ino = fs.alloc_inode()?;
     debug_assert_eq!(alloc_ino, ROOT_INO);
+    let now = crate::platform::current().now_realtime_ns();
     let root = InodeOnDisk {
         ino: ROOT_INO,
         kind: InodeKind::Directory,
         mode: 0o755,
         nlink: 2,
         size: 0,
-        atime_ns: 0,
-        mtime_ns: 0,
-        ctime_ns: 0,
+        atime_ns: now,
+        mtime_ns: now,
+        ctime_ns: now,
         direct: [0; INODE_DIRECT_BLOCKS],
         indirect: 0,
     };

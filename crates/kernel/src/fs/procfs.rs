@@ -22,6 +22,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::platform;
 use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NodeType};
 
 /// Per-file snapshot as a plain string that procfs serves on `read`.
@@ -206,8 +207,25 @@ impl Filesystem for ProcFs {
     }
 
     fn stat(&mut self, ino: Ino) -> Result<FileStat, FsError> {
+        // Procfs content is synthesised per-call — the "file" is
+        // generated fresh from the ProcFsSource each read — so the
+        // semantic truth for every timestamp is "now". Per-call
+        // evaluation means successive stats on the same ino may
+        // report different values; that's consistent with how the
+        // content itself can change across calls (uptime, loadavg,
+        // meminfo all update every tick).
+        let now = platform::current().now_realtime_ns();
         if ino == INO_ROOT {
-            return Ok(FileStat::zeroed(INO_ROOT, NodeType::Directory, 0o555));
+            return Ok(FileStat {
+                ino: INO_ROOT,
+                ty: NodeType::Directory,
+                mode: 0o555,
+                nlink: 1,
+                size: 0,
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
+            });
         }
         if !self.entries.contains_key(&ino) {
             return Err(FsError::NotFound);
@@ -219,9 +237,9 @@ impl Filesystem for ProcFs {
             mode: 0o444,
             nlink: 1,
             size: content.len() as u64,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
+            atime_ns: now,
+            mtime_ns: now,
+            ctime_ns: now,
         })
     }
 
