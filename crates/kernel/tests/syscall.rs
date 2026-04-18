@@ -1485,6 +1485,299 @@ fn path_filestat_get_ignores_dir_fd_and_lookup_flags() {
     assert_eq!(heap[16], 2, "filetype = character_device");
 }
 
+// ---- path_filestat_set_times -----------------------------------------
+//
+// Write-side sibling of `path_filestat_get`: lets userland set a
+// vnode's atim / mtim via the `utimensat` family of WASI libc calls.
+// Unblocked by the real-vnode-timestamps slice (before which every
+// fs reported 0 for all three times, so setting them would have
+// just ratcheted a zero-initialised field).
+//
+// Wire layout:
+//   args[0..4]    = dir_fd (u32, ignored — v1 has no preopens)
+//   args[4..8]    = lookup_flags (u32, ignored — v1 doesn't follow
+//                   symlinks either way)
+//   args[8..12]   = fstflags (u32; only the low 4 bits meaningful —
+//                   SET_ATIM=0x1, SET_ATIM_NOW=0x2, SET_MTIM=0x4,
+//                   SET_MTIM_NOW=0x8; the four-bit combinations that
+//                   set both explicit + _NOW for the same field are
+//                   EINVAL)
+//   args[12..16]  = reserved (0)
+//   heap[0..8]    = atim (u64 LE ns-since-epoch; ignored unless
+//                   SET_ATIM is set)
+//   heap[8..16]   = mtim (u64 LE ns-since-epoch; ignored unless
+//                   SET_MTIM is set)
+//   heap[16..]    = UTF-8 path bytes
+//   heap_len      = 16 + path.len()
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Semantics: a successful call also bumps ctime to now() (the
+// metadata changed even if the caller didn't ask). Zero fstflags
+// is a legal no-op success — WASI permits it so callers can use
+// the syscall as a permission probe.
+
+/// Pack the 16-byte inline args window for a set_times dispatch.
+fn path_filestat_set_times_args(dir_fd: u32, lookup_flags: u32, fstflags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&dir_fd.to_le_bytes());
+    args[4..8].copy_from_slice(&lookup_flags.to_le_bytes());
+    args[8..12].copy_from_slice(&fstflags.to_le_bytes());
+    args
+}
+
+/// Pack the heap prefix + path into a fresh Vec<u8>. Returns the
+/// combined buffer; tests copy it into their heap.
+fn path_filestat_set_times_heap(atim: u64, mtim: u64, path: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + path.len());
+    buf.extend_from_slice(&atim.to_le_bytes());
+    buf.extend_from_slice(&mtim.to_le_bytes());
+    buf.extend_from_slice(path);
+    buf
+}
+
+#[test]
+fn path_filestat_set_times_sets_atim_and_mtim_on_tmpfs() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "timer", 0);
+    k.vfs.create("/t.txt", 0o644).expect("create");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/t.txt";
+    let buf = path_filestat_set_times_heap(777_000_000, 888_000_000, path);
+    heap[..buf.len()].copy_from_slice(&buf);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 800,
+        args: path_filestat_set_times_args(
+            0,
+            0,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_MTIM) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: buf.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+
+    // Verify the values landed by stat-ing the file.
+    let st = k.vfs.stat("/t.txt").unwrap();
+    assert_eq!(st.atime_ns, 777_000_000);
+    assert_eq!(st.mtime_ns, 888_000_000);
+    // ctime bumps to now() because the metadata changed; it must
+    // be non-zero and distinct from the explicit a/mtim (the wall
+    // clock is the 2020s in ns, not a three-digit-million value).
+    assert!(st.ctime_ns > 888_000_000);
+}
+
+#[test]
+fn path_filestat_set_times_set_atim_now_stamps_current_wall_clock() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "nower", 0);
+    k.vfs.create("/n.txt", 0o644).expect("create");
+    let before = k.vfs.stat("/n.txt").unwrap().atime_ns;
+
+    // Pass 0 for atim — the kernel substitutes now() because of
+    // SET_ATIM_NOW, ignoring the explicit value.
+    let mut heap = vec![0u8; 128];
+    let path = b"/n.txt";
+    let buf = path_filestat_set_times_heap(0, 0, path);
+    heap[..buf.len()].copy_from_slice(&buf);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 801,
+        args: path_filestat_set_times_args(
+            0,
+            0,
+            abi::wasi::fstflags::SET_ATIM_NOW as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: buf.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+
+    let after = k.vfs.stat("/n.txt").unwrap();
+    assert!(after.atime_ns > before, "atim advanced past create-time");
+    // mtim must stay at create-time since SET_MTIM wasn't requested.
+    // (Create stamped all three to the same now().)
+    // Can't assert equality rigidly because SET_ATIM_NOW's "now"
+    // and create's "now" read the same clock a millisecond apart;
+    // the invariant is mtim did NOT jump with atim.
+    assert!(after.mtime_ns < after.atime_ns);
+}
+
+#[test]
+fn path_filestat_set_times_with_zero_flags_is_noop_success() {
+    // WASI permits an empty fstflags — the call validates the path
+    // (+ the caller's rights) but doesn't touch the timestamps.
+    // Useful as a permission probe from userland.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "prober", 0);
+    k.vfs.create("/p.txt", 0o644).expect("create");
+    let before = k.vfs.stat("/p.txt").unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/p.txt";
+    let buf = path_filestat_set_times_heap(111, 222, path);
+    heap[..buf.len()].copy_from_slice(&buf);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 802,
+        args: path_filestat_set_times_args(0, 0, 0),
+        heap_ptr: 0,
+        heap_len: buf.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+
+    let after = k.vfs.stat("/p.txt").unwrap();
+    assert_eq!(after.atime_ns, before.atime_ns, "atim untouched");
+    assert_eq!(after.mtime_ns, before.mtime_ns, "mtim untouched");
+    assert_eq!(after.ctime_ns, before.ctime_ns, "ctime untouched (zero-flags is not a metadata change)");
+}
+
+#[test]
+fn path_filestat_set_times_with_both_atim_explicit_and_now_returns_einval() {
+    // Per WASI: SET_ATIM and SET_ATIM_NOW are mutually exclusive.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "conflicter", 0);
+    k.vfs.create("/c.txt", 0o644).expect("create");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/c.txt";
+    let buf = path_filestat_set_times_heap(0, 0, path);
+    heap[..buf.len()].copy_from_slice(&buf);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 803,
+        args: path_filestat_set_times_args(
+            0,
+            0,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_ATIM_NOW) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: buf.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_filestat_set_times_with_both_mtim_explicit_and_now_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "conflicter", 0);
+    k.vfs.create("/c.txt", 0o644).expect("create");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/c.txt";
+    let buf = path_filestat_set_times_heap(0, 0, path);
+    heap[..buf.len()].copy_from_slice(&buf);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 804,
+        args: path_filestat_set_times_args(
+            0,
+            0,
+            (abi::wasi::fstflags::SET_MTIM | abi::wasi::fstflags::SET_MTIM_NOW) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: buf.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_filestat_set_times_on_missing_path_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghost", 0);
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/nope/nope";
+    let buf = path_filestat_set_times_heap(1, 2, path);
+    heap[..buf.len()].copy_from_slice(&buf);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 805,
+        args: path_filestat_set_times_args(
+            0,
+            0,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_MTIM) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: buf.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_filestat_set_times_on_dev_console_returns_erofs() {
+    // devfs is read-only — set_times on a device node rejects with
+    // EROFS just like create/unlink/mkdir do.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "devsetter", 0);
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/dev/console";
+    let buf = path_filestat_set_times_heap(111, 222, path);
+    heap[..buf.len()].copy_from_slice(&buf);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 806,
+        args: path_filestat_set_times_args(
+            0,
+            0,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_MTIM) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: buf.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
+#[test]
+fn path_filestat_set_times_with_short_heap_returns_einval() {
+    // The heap must carry at least 16 bytes (the atim + mtim prefix)
+    // plus the path. A shorter heap means the shim produced a
+    // malformed buffer.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "truncated", 0);
+
+    let mut heap = vec![0u8; 128];
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 807,
+        args: path_filestat_set_times_args(
+            0,
+            0,
+            abi::wasi::fstflags::SET_ATIM as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 8, // only one u64 fits, no room for both times + path
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

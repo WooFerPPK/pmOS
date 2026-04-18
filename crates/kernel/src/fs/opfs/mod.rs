@@ -880,6 +880,31 @@ impl Filesystem for OpfsFs {
         Ok(())
     }
 
+    fn set_times(
+        &mut self,
+        ino: Ino,
+        atime_ns: Option<NanosSinceEpoch>,
+        mtime_ns: Option<NanosSinceEpoch>,
+    ) -> Result<(), FsError> {
+        let now = now_ns();
+        let mut inode = self.read_inode(ino)?;
+        if let Some(a) = atime_ns {
+            inode.atime_ns = a;
+        }
+        if let Some(m) = mtime_ns {
+            inode.mtime_ns = m;
+        }
+        // Metadata change bumps ctime — identical to how write/
+        // truncate stamp it — so a stat after set_times sees a
+        // non-zero ctime even if the caller only asked for
+        // SET_ATIM.
+        inode.ctime_ns = now;
+        let mut txn = Transaction::new();
+        self.stage_inode_write(&inode, &mut txn)?;
+        self.commit_and_apply(&txn)?;
+        Ok(())
+    }
+
     fn sync(&mut self) -> Result<(), FsError> {
         self.journal.apply_committed(self.device.as_mut())?;
         self.write_superblock()?;

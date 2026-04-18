@@ -335,6 +335,25 @@ impl Filesystem for TmpFs {
         Ok(())
     }
 
+    fn set_times(
+        &mut self,
+        ino: Ino,
+        atime_ns: Option<NanosSinceEpoch>,
+        mtime_ns: Option<NanosSinceEpoch>,
+    ) -> Result<(), FsError> {
+        let now = now_ns();
+        let entry = self.entry_mut(ino)?;
+        if let Some(a) = atime_ns {
+            entry.atime_ns = a;
+        }
+        if let Some(m) = mtime_ns {
+            entry.mtime_ns = m;
+        }
+        // Any actual touch is a metadata change; bump ctime.
+        entry.ctime_ns = now;
+        Ok(())
+    }
+
     fn kind_name(&self) -> &'static str {
         "tmpfs"
     }

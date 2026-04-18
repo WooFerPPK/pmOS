@@ -46,6 +46,7 @@ import {
   encodeSpawnManifest,
   ERRNO,
   FILETYPE,
+  FSTFLAGS,
   OP_EXT,
   OP_WASI,
   WHENCE,
@@ -811,6 +812,184 @@ describe("dispatch: PATH_FILESTAT_GET", () => {
     expect(st.filetype).toBe(FILETYPE.DIRECTORY);
     // Root directory's nlink is 1 in tmpfs; size is 0 (directory).
     expect(st.size).toBe(0n);
+  });
+});
+
+// ---- dispatch: PATH_FILESTAT_SET_TIMES -----------------------------
+//
+// Wire layout (kernel side): dir_fd + lookup_flags at args[0..4]
+// + [4..8] (ignored in v1); fstflags at args[8..12] (low 4 bits
+// meaningful); atim at heap[0..8] (u64 LE ns); mtim at heap[8..16]
+// (u64 LE ns); path at heap[16..]. heap_len = 16 + path.len().
+// Response carries status only (value = 0 on success).
+//
+// The TS tests pin the wire layout end-to-end through kernel.wasm:
+// the EINVAL paths (invalid flag pairs, short heap) cover the
+// dispatcher's decoding rejections; the EROFS path pins devfs's
+// read-only contract; the happy path on /proc/version is not
+// useful because procfs returns its own EROFS. The end-to-end
+// "times actually applied" check lives in the Rust kernel-level
+// tests since the TS dispatcher alone can't easily stat a tmpfs
+// file through the opcode surface (no FD_FILESTAT_GET via PATH
+// ... → actually it can, through a PATH_OPEN + FD_FILESTAT_GET
+// fold, but the Rust tests already pin this exhaustively).
+
+function encodeSetTimesHeap(atim: bigint, mtim: bigint, path: string): Uint8Array {
+  const pathBytes = new TextEncoder().encode(path);
+  const buf = new Uint8Array(16 + pathBytes.length);
+  const view = new DataView(buf.buffer);
+  view.setBigUint64(0, atim, true);
+  view.setBigUint64(8, mtim, true);
+  buf.set(pathBytes, 16);
+  return buf;
+}
+
+function encodeSetTimesArgs(
+  dirFd: number,
+  lookupFlags: number,
+  fstflags: number,
+): Uint8Array {
+  const args = new Uint8Array(16);
+  const view = new DataView(args.buffer);
+  view.setUint32(0, dirFd, true);
+  view.setUint32(4, lookupFlags, true);
+  view.setUint32(8, fstflags, true);
+  return args;
+}
+
+describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
+  it("returns -ENOENT for a path that does not resolve", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodeSetTimesHeap(111n, 222n, "/nowhere");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+        requestId: 810,
+        args: encodeSetTimesArgs(0, 0, FSTFLAGS.SET_ATIM | FSTFLAGS.SET_MTIM),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.ENOENT);
+  });
+
+  it("returns -EROFS for a /dev path (devfs is read-only)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodeSetTimesHeap(0n, 0n, "/dev/console");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+        requestId: 811,
+        args: encodeSetTimesArgs(0, 0, FSTFLAGS.SET_ATIM | FSTFLAGS.SET_MTIM),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+
+  it("returns -EINVAL when SET_ATIM and SET_ATIM_NOW are both set", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Path doesn't need to resolve — the flag-pair check fires
+    // before path resolution. Asserting the EINVAL errno without
+    // creating a real file also keeps the test isolated.
+    const heap = encodeSetTimesHeap(0n, 0n, "/whatever");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+        requestId: 812,
+        args: encodeSetTimesArgs(
+          0,
+          0,
+          FSTFLAGS.SET_ATIM | FSTFLAGS.SET_ATIM_NOW,
+        ),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when SET_MTIM and SET_MTIM_NOW are both set", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodeSetTimesHeap(0n, 0n, "/whatever");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+        requestId: 813,
+        args: encodeSetTimesArgs(
+          0,
+          0,
+          FSTFLAGS.SET_MTIM | FSTFLAGS.SET_MTIM_NOW,
+        ),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when heap is shorter than the 16-byte atim/mtim prefix", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const shortHeap = new Uint8Array(8); // only room for atim, no mtim + no path
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+        requestId: 814,
+        args: encodeSetTimesArgs(0, 0, FSTFLAGS.SET_ATIM),
+        heapPtr: 0,
+        heapLen: shortHeap.length,
+      },
+      shortHeap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns 0 (no-op success) when fstflags is 0 on an existing path", async () => {
+    // Zero-flags is a legal permission probe — resolve the path,
+    // validate the caller, do nothing else. Use /proc/version since
+    // it exists and is reachable via the dispatch surface alone.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodeSetTimesHeap(0n, 0n, "/proc/version");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+        requestId: 815,
+        args: encodeSetTimesArgs(0, 0, 0),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
   });
 });
 

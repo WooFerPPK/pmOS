@@ -223,6 +223,25 @@ pub trait Filesystem: Send {
     /// Truncate a regular file to `new_size` bytes.
     fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), FsError>;
 
+    /// Set the `atime_ns` and / or `mtime_ns` on `ino`. Either
+    /// argument being `None` means "leave this field unchanged".
+    /// A successful call also bumps `ctime_ns` to now() — setting
+    /// the times is itself a metadata change.
+    ///
+    /// Default: returns `FsError::ReadOnly`. Filesystems that can
+    /// honour the set override this. Splitting the WASI
+    /// `fstflags` decode in the dispatcher means this trait method
+    /// takes already-materialised Option values — the filesystem
+    /// never sees the SET_ATIM_NOW / SET_MTIM_NOW bits.
+    fn set_times(
+        &mut self,
+        _ino: Ino,
+        _atime_ns: Option<NanosSinceEpoch>,
+        _mtime_ns: Option<NanosSinceEpoch>,
+    ) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
     /// Flush any buffered writes. Default no-op.
     fn sync(&mut self) -> Result<(), FsError> {
         Ok(())
@@ -433,6 +452,27 @@ impl Vfs {
         let (mount_id, ino) = self.resolve(abs_path)?;
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         fs.truncate(ino, new_size)
+    }
+
+    /// Set atim and/or mtim on the vnode at `abs_path`. `None`
+    /// means "leave this field unchanged". Pure passthrough to
+    /// [`Filesystem::set_times`]; a zero-effect call (both
+    /// `None`) still round-trips through the resolve step so a
+    /// userland caller using the syscall as a permission probe
+    /// gets an `ENOENT` for a missing path + a success for an
+    /// existing one, rather than a spurious `ReadOnly` short-cut.
+    pub fn set_times(
+        &mut self,
+        abs_path: &str,
+        atime_ns: Option<NanosSinceEpoch>,
+        mtime_ns: Option<NanosSinceEpoch>,
+    ) -> Result<(), FsError> {
+        let (mount_id, ino) = self.resolve(abs_path)?;
+        if atime_ns.is_none() && mtime_ns.is_none() {
+            return Ok(());
+        }
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.set_times(ino, atime_ns, mtime_ns)
     }
 }
 

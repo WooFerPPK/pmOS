@@ -60,6 +60,14 @@ var OP_WASI = {
   FD_READ: 46,
   FD_WRITE: 52,
   PATH_FILESTAT_GET: 65,
+  /** Wire-format identity for `path_filestat_set_times`. The shim
+   * packs `dir_fd`, `lookup_flags`, and `fstflags` into the inline
+   * args window (dir_fd + lookup_flags ignored in v1; fstflags is
+   * the SET_ATIM / SET_ATIM_NOW / SET_MTIM / SET_MTIM_NOW bitfield)
+   * and puts `atim | mtim | path` in the heap (two u64 LE
+   * timestamps followed by the UTF-8 path bytes). The kernel
+   * returns 0 on success or -errno on error; no heap round-trip. */
+  PATH_FILESTAT_SET_TIMES: 66,
   PATH_OPEN: 68,
   PROC_EXIT: 96,
   CLOCK_RES_GET: 16,
@@ -112,7 +120,8 @@ var ERRNO = {
   EINVAL: 28,
   ENOENT: 44,
   ENOSYS: 52,
-  ENOTSUP: 58
+  ENOTSUP: 58,
+  EROFS: 69
 };
 var CAP = {
   DISPLAY_CLIENT: 1,
@@ -863,6 +872,54 @@ var UserWasmRuntime = class {
         const writeBuf = new Uint8Array(this.memory.buffer);
         writeBuf.set(heapOut.subarray(0, 64), bufPtr);
         return 0;
+      },
+      // WASI `path_filestat_set_times`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, flags: i32, path_ptr: i32, path_len: i32,
+      //    atim: i64, mtim: i64, fstflags: i32) -> errno: i32
+      //
+      // Write-side sibling of `path_filestat_get`: sets a vnode's
+      // atim / mtim per the `fstflags` bitfield (SET_ATIM=0x1,
+      // SET_ATIM_NOW=0x2, SET_MTIM=0x4, SET_MTIM_NOW=0x8). Zero
+      // fstflags is a legal no-op success — callers use it as a
+      // permission / existence probe. Invalid pairs (SET_ATIM +
+      // SET_ATIM_NOW, SET_MTIM + SET_MTIM_NOW) return EINVAL.
+      //
+      // Wire layout: dir_fd + lookup_flags + fstflags go in the
+      // inline args window (u32 each at offsets 0 / 4 / 8); atim +
+      // mtim + path share the heap (two u64 LE at [0..16] then the
+      // UTF-8 path bytes at [16..]). heap_len = 16 + path_len. The
+      // shim packs a single Uint8Array combining those three into
+      // the heap buffer — cheaper than a second dispatch round-trip.
+      path_filestat_set_times: (_dirfd, _flags, pathPtr, pathLen, atim, mtim, fstflags) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(
+          this.memory.buffer,
+          pathPtr,
+          pathLen
+        );
+        const heap = new Uint8Array(16 + pathLen);
+        const heapView = new DataView(heap.buffer);
+        heapView.setBigUint64(0, atim, true);
+        heapView.setBigUint64(8, mtim, true);
+        heap.set(pathBytes, 16);
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, 0, true);
+        argsView.setUint32(4, 0, true);
+        argsView.setUint32(8, fstflags, true);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        return response.status !== 0 ? -response.status : 0;
       },
       // WASI `clock_time_get`.
       //

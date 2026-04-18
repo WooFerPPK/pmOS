@@ -184,6 +184,14 @@ export const OP_WASI = {
   FD_READ: 0x002e,
   FD_WRITE: 0x0034,
   PATH_FILESTAT_GET: 0x0041,
+  /** Wire-format identity for `path_filestat_set_times`. The shim
+   * packs `dir_fd`, `lookup_flags`, and `fstflags` into the inline
+   * args window (dir_fd + lookup_flags ignored in v1; fstflags is
+   * the SET_ATIM / SET_ATIM_NOW / SET_MTIM / SET_MTIM_NOW bitfield)
+   * and puts `atim | mtim | path` in the heap (two u64 LE
+   * timestamps followed by the UTF-8 path bytes). The kernel
+   * returns 0 on success or -errno on error; no heap round-trip. */
+  PATH_FILESTAT_SET_TIMES: 0x0042,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
   CLOCK_RES_GET: 0x0010,
@@ -245,6 +253,7 @@ export const ERRNO = {
   ENOENT: 44,
   ENOSYS: 52,
   ENOTSUP: 58,
+  EROFS: 69,
 } as const;
 
 // ---- WASI clock identifiers -----------------------------------------
@@ -273,6 +282,20 @@ export const WHENCE = {
   SET: 0,
   CUR: 1,
   END: 2,
+} as const;
+
+// ---- WASI fstflags bitfield -----------------------------------------
+//
+// Mirror of `abi::wasi::fstflags`. Bit-mask OR'd into the fstflags
+// argument of `path_filestat_set_times` / `fd_filestat_set_times`.
+// Within each pair (ATIM / ATIM_NOW, MTIM / MTIM_NOW) only one bit
+// may be set at a time — setting both is EINVAL.
+
+export const FSTFLAGS = {
+  SET_ATIM: 0x1,
+  SET_ATIM_NOW: 0x2,
+  SET_MTIM: 0x4,
+  SET_MTIM_NOW: 0x8,
 } as const;
 
 // ---- WASI filetype bytes --------------------------------------------

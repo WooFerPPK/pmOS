@@ -106,6 +106,18 @@ pub enum Whence {
     End = 2,
 }
 
+/// `fstflags` bitfield shared by `fd_filestat_set_times` and
+/// `path_filestat_set_times`. Each pair of `_NOW`/explicit bits is
+/// mutually exclusive — setting both for the same field (`SET_ATIM |
+/// SET_ATIM_NOW`, `SET_MTIM | SET_MTIM_NOW`) is `EINVAL`. With zero
+/// bits set the call is a no-op success.
+pub mod fstflags {
+    pub const SET_ATIM:     u16 = 0x1;
+    pub const SET_ATIM_NOW: u16 = 0x2;
+    pub const SET_MTIM:     u16 = 0x4;
+    pub const SET_MTIM_NOW: u16 = 0x8;
+}
+
 /// `filestat_t` wire layout shared by `FD_FILESTAT_GET` and
 /// `PATH_FILESTAT_GET`. Matches WASI preview 1's C ABI: 64 bytes,
 /// little-endian, with the 1-byte `filetype` padded out to 8 bytes

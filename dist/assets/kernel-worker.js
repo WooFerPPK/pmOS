@@ -349,7 +349,8 @@ var ERRNO = {
   EINVAL: 28,
   ENOENT: 44,
   ENOSYS: 52,
-  ENOTSUP: 58
+  ENOTSUP: 58,
+  EROFS: 69
 };
 var DEV = {
   FRAMEBUFFER: 0,

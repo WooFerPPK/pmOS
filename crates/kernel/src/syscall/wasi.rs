@@ -66,6 +66,7 @@ pub fn dispatch_wasi(
         op::FD_FDSTAT_GET => handle_fd_fdstat_get(kernel, pid, req, heap),
         op::FD_FILESTAT_GET => handle_fd_filestat_get(kernel, pid, req, heap),
         op::PATH_FILESTAT_GET => handle_path_filestat_get(kernel, pid, req, heap),
+        op::PATH_FILESTAT_SET_TIMES => handle_path_filestat_set_times(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
     }
@@ -922,6 +923,109 @@ fn handle_path_filestat_get(
         value: 0,
         extra_len: fs_off::SIZE as u32,
         _pad: [0u8; 12],
+    }
+}
+
+// ---- path_filestat_set_times -----------------------------------------
+//
+// Layout:
+//   args[0..4]    = dir_fd (u32, ignored — v1 has no preopens)
+//   args[4..8]    = lookup_flags (u32, ignored — v1 doesn't follow
+//                   symlinks either way)
+//   args[8..12]   = fstflags (u32; low 4 bits: SET_ATIM=0x1,
+//                   SET_ATIM_NOW=0x2, SET_MTIM=0x4, SET_MTIM_NOW=0x8;
+//                   upper bits unused)
+//   args[12..16]  = reserved (must be 0; ignored in v1)
+//   heap[0..8]    = atim (u64 LE ns-since-epoch; ignored unless
+//                   SET_ATIM is set)
+//   heap[8..16]   = mtim (u64 LE ns-since-epoch; ignored unless
+//                   SET_MTIM is set)
+//   heap[16..]    = UTF-8 path bytes
+//   heap_len      = 16 + path.len()
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Unblocked by the real-vnode-timestamps slice (before which every
+// filesystem reported 0 for all three times, so setting them via
+// this opcode would have just ratcheted a zero-initialised field).
+// The dispatcher decodes fstflags into a pair of Option values and
+// hands them to `Vfs::set_times`; the filesystem never sees the
+// raw fstflags bits, only "this is the new atim" / "don't touch
+// mtim". SET_ATIM_NOW + SET_MTIM_NOW substitute
+// `Platform::now_realtime_ns()` at this layer, not at the
+// filesystem. ctime is always bumped by the filesystem's
+// `set_times` impl when the call has any effect — metadata change.
+//
+// The heap layout puts the two u64 timestamps in the first 16
+// bytes then the path. Picking this over "atim/mtim inline in
+// args + path in heap" keeps the 16-byte inline args window
+// identical to path_filestat_get's (dir_fd + lookup_flags at the
+// same offsets) and leaves args[8..] free for fstflags + future
+// growth.
+
+fn handle_path_filestat_set_times(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let _dir_fd = args_u32(req, 0);
+    let _lookup_flags = args_u32(req, 4);
+    let fstflags = args_u32(req, 8);
+
+    // Validate the exclusive pairs: SET_ATIM + SET_ATIM_NOW is
+    // EINVAL per WASI, same for the mtim pair. These fire BEFORE
+    // the heap-length check so a caller with invalid flags gets a
+    // consistent errno regardless of whether they also sent a
+    // well-formed heap.
+    let a_now = fstflags & abi::wasi::fstflags::SET_ATIM_NOW as u32 != 0;
+    let a_set = fstflags & abi::wasi::fstflags::SET_ATIM as u32 != 0;
+    let m_now = fstflags & abi::wasi::fstflags::SET_MTIM_NOW as u32 != 0;
+    let m_set = fstflags & abi::wasi::fstflags::SET_MTIM as u32 != 0;
+    if a_now && a_set {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if m_now && m_set {
+        return Response::err(req.request_id, EINVAL);
+    }
+
+    let Some(heap_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if heap_bytes.len() < 16 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let mut atim_buf = [0u8; 8];
+    atim_buf.copy_from_slice(&heap_bytes[0..8]);
+    let atim = u64::from_le_bytes(atim_buf);
+    let mut mtim_buf = [0u8; 8];
+    mtim_buf.copy_from_slice(&heap_bytes[8..16]);
+    let mtim = u64::from_le_bytes(mtim_buf);
+    let Ok(path) = core::str::from_utf8(&heap_bytes[16..]) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+
+    let atim_opt = if a_now {
+        Some(platform::current().now_realtime_ns())
+    } else if a_set {
+        Some(atim)
+    } else {
+        None
+    };
+    let mtim_opt = if m_now {
+        Some(platform::current().now_realtime_ns())
+    } else if m_set {
+        Some(mtim)
+    } else {
+        None
+    };
+
+    match kernel.vfs.set_times(path, atim_opt, mtim_opt) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
     }
 }
 
