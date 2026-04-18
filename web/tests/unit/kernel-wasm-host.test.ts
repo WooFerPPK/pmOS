@@ -414,13 +414,15 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `FD_PRESTAT_DIR_NAME` is in the WASI range (0x002C) but still
-    // has no handler; was `PATH_READLINK` before that handler landed,
-    // then `PATH_SYMLINK`, `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`,
-    // `FD_READDIR`. Swap this probe to whatever's still unhandled as
-    // the implementation catches up.
+    // `FD_FDSTAT_SET_RIGHTS` is in the WASI range (0x0026) but still
+    // has no handler and isn't planned for v1 (WASI's rights system
+    // is un-v1-relevant). Was `FD_PRESTAT_DIR_NAME` before that
+    // handler landed, then `PATH_READLINK`, `PATH_SYMLINK`,
+    // `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. Swap
+    // this probe to whatever's still unhandled as the implementation
+    // catches up.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
+      opcode: OP_WASI.FD_FDSTAT_SET_RIGHTS,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -1803,6 +1805,48 @@ describe("dispatch: PATH_READLINK", () => {
       rlHeap,
     );
     expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
+// ---- dispatch: FD_PRESTAT_DIR_NAME ---------------------------------
+//
+// Companion to fd_prestat_get. v1 has no preopens so the kernel
+// always returns -EBADF, matching fd_prestat_get's semantic. Pinning
+// the consistency invariant here keeps the libc preopen-discovery
+// loop working — the loop iterates fd 3/4/5 calling both opcodes
+// until both return EBADF. Pre-slice, dir_name returned ENOSYS which
+// broke the loop; post-slice both agree on EBADF.
+
+describe("dispatch: FD_PRESTAT_DIR_NAME", () => {
+  it("returns -EBADF for any fd (no preopens in v1)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
+      requestId: 1040,
+      arg0: 3,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+
+  it("returns -EBADF even for an installed fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 3);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
+      requestId: 1041,
+      arg0: 3,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
   });
 });
 

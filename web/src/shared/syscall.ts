@@ -379,12 +379,22 @@ export const OP_WASI = {
    * the target bytes; non-symlink targets → EINVAL; devfs / procfs /
    * opfs inherit the trait default (NotSupported → ENOTSUP). */
   PATH_READLINK: 0x0045,
+  /** Wire-format identity for `fd_prestat_dir_name`. Preopen-name
+   * companion to fd_prestat_get. Wire: args[0..4] = fd (ignored).
+   * v1 has no preopens so the honest answer for every fd is EBADF;
+   * post-slice both fd_prestat_get and fd_prestat_dir_name agree on
+   * EBADF so userland's libc-style preopen-discovery loops terminate
+   * cleanly (pre-slice dir_name returned ENOSYS, which broke the
+   * loop). */
+  FD_PRESTAT_DIR_NAME: 0x002c,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Was `PATH_READLINK` before that
-   * handler landed; swap to whichever WASI opcode is still
-   * unhandled as the implementation catches up. */
-  FD_PRESTAT_DIR_NAME: 0x002c,
+   * kernel doesn't yet handle. Was `FD_PRESTAT_DIR_NAME` before
+   * that handler landed; swap to whichever WASI opcode is still
+   * unhandled as the implementation catches up. WASI's rights
+   * system is un-v1-relevant so FD_FDSTAT_SET_RIGHTS is a reasonable
+   * long-term probe target. */
+  FD_FDSTAT_SET_RIGHTS: 0x0026,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer

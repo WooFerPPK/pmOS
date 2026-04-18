@@ -1838,6 +1838,30 @@ export class UserWasmRuntime {
         });
         return -response.status;
       },
+
+      // WASI `fd_prestat_dir_name`.
+      //
+      // Signature: (fd: i32, path_ptr: i32, path_len: i32) -> errno.
+      //
+      // Companion to fd_prestat_get. The kernel always returns EBADF
+      // (no preopens in v1). The shim doesn't touch user memory —
+      // path_ptr / path_len would only be consulted on success.
+      // Matching EBADF-from-both-syscalls is what terminates the
+      // libc preopen-discovery loop cleanly.
+      fd_prestat_dir_name: (
+        fd: number,
+        _pathPtr: number,
+        _pathLen: number,
+      ): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return -response.status;
+      },
     } as const;
 
     // PMos extension namespace — syscalls WASI doesn't cover.

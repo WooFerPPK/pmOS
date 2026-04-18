@@ -87,6 +87,7 @@ pub fn dispatch_wasi(
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
+        op::FD_PRESTAT_DIR_NAME => handle_fd_prestat_dir_name(req),
         _ => Response::err(req.request_id, ENOSYS),
     }
 }
@@ -1219,6 +1220,27 @@ fn handle_path_filestat_set_times(
 // cleanly.
 
 fn handle_fd_prestat_get(req: &Request) -> Response {
+    Response::err(req.request_id, EBADF)
+}
+
+// ---- fd_prestat_dir_name ---------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32; ignored — same EBADF for every fd)
+//   heap       = caller's output buffer (ignored — nothing is written
+//                on the EBADF path)
+// Response:
+//   status    = -EBADF (always)
+//
+// Companion to fd_prestat_get. Userland's preopen-discovery loops
+// iterate fd 3/4/5 calling both fd_prestat_get and fd_prestat_dir_name
+// until both return EBADF. Pre-slice, v1 returned EBADF from get but
+// ENOSYS from dir_name, which broke the loop — callers saw "no
+// preopens" for get and "this syscall doesn't exist" for dir_name,
+// which is inconsistent. Post-slice, both agree on EBADF and the
+// loop terminates cleanly.
+
+fn handle_fd_prestat_dir_name(req: &Request) -> Response {
     Response::err(req.request_id, EBADF)
 }
 

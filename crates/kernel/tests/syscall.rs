@@ -108,22 +108,24 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `FD_PRESTAT_DIR_NAME` is in the WASI range (0x002C) but still
-    // has no handler. Same shape as the ext-side test below: decoded
-    // as a known WASI opcode, routed to `dispatch_wasi`'s `_ =>` arm,
-    // ENOSYS echoed back with the request_id intact.
+    // `FD_FDSTAT_SET_RIGHTS` is in the WASI range (0x0026) but still
+    // has no handler — and isn't planned for v1 (WASI's rights system
+    // is un-v1-relevant). Same shape as the ext-side test below:
+    // decoded as a known WASI opcode, routed to `dispatch_wasi`'s
+    // `_ =>` arm, ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `PATH_READLINK` before that handler landed,
-    // then `PATH_SYMLINK`, `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`,
-    // `FD_READDIR`. When `FD_PRESTAT_DIR_NAME` grows a real handler,
-    // swap this probe to whatever's still unhandled at that point,
-    // or delete the test once every WASI opcode has real coverage.)
+    // (This probe was `FD_PRESTAT_DIR_NAME` before that handler
+    // landed, then `PATH_READLINK`, `PATH_SYMLINK`, `PATH_LINK`,
+    // `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. When
+    // `FD_FDSTAT_SET_RIGHTS` grows a real handler — if ever — swap
+    // this probe to whatever's still unhandled at that point, or
+    // delete the test once every WASI opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::FD_PRESTAT_DIR_NAME,
+        opcode: op_wasi::FD_FDSTAT_SET_RIGHTS,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -5850,6 +5852,90 @@ fn path_symlink_with_old_len_past_heap_returns_einval() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, -errno::EINVAL);
+}
+
+// ---- fd_prestat_dir_name --------------------------------------------
+//
+// Opcode 0x002C. WASI preopen-name lookup; companion to
+// fd_prestat_get. v1 has no preopens, so the honest answer for every
+// fd is EBADF (matching fd_prestat_get's semantic). Userland's
+// libc-style preopen-discovery loops iterate fd 3/4/5 calling both
+// fd_prestat_get and fd_prestat_dir_name until both return EBADF;
+// pre-slice, v1 returned EBADF from get and ENOSYS from dir_name,
+// which broke the loop. Post-slice, both agree on EBADF and the
+// loop terminates cleanly.
+
+#[test]
+fn fd_prestat_dir_name_returns_ebadf_for_any_fd() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "libc_probe", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_PRESTAT_DIR_NAME,
+        flags: 0,
+        request_id: 1030,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_prestat_dir_name_returns_ebadf_for_unopened_fd() {
+    // Same EBADF whether the fd is unallocated or allocated — v1 has
+    // no preopens at all.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "libc_probe", 0);
+    k.install_fd(pid, 3, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_PRESTAT_DIR_NAME,
+        flags: 0,
+        request_id: 1031,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_prestat_dir_name_and_fd_prestat_get_agree_on_ebadf() {
+    // Pin the consistency invariant: whatever fd_prestat_get returns
+    // for a given fd, fd_prestat_dir_name returns the same (both
+    // EBADF in v1, matching the libc preopen-discovery contract).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "libc_probe", 0);
+    let mut heap = vec![0u8; 64];
+
+    let get_req = Request {
+        opcode: op_wasi::FD_PRESTAT_GET,
+        flags: 0,
+        request_id: 1032,
+        args: u32_args(4),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let get_resp = dispatch(&mut k, pid, &get_req, &mut heap);
+
+    let name_req = Request {
+        opcode: op_wasi::FD_PRESTAT_DIR_NAME,
+        flags: 0,
+        request_id: 1033,
+        args: u32_args(4),
+        heap_ptr: 0,
+        heap_len: 64,
+    };
+    let name_resp = dispatch(&mut k, pid, &name_req, &mut heap);
+
+    assert_eq!(get_resp.status, name_resp.status);
+    assert_eq!(get_resp.status, -errno::EBADF);
 }
 
 // ---- path_readlink -------------------------------------------------
