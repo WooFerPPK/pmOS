@@ -369,6 +369,17 @@ impl Filesystem for TmpFs {
         Ok(())
     }
 
+    fn readlink(&mut self, ino: Ino, out: &mut [u8]) -> Result<usize, FsError> {
+        let entry = self.entry(ino)?;
+        let target = match &entry.node {
+            TmpNode::SymLink(t) => t.as_bytes(),
+            _ => return Err(FsError::InvalidArgument),
+        };
+        let n = core::cmp::min(out.len(), target.len());
+        out[..n].copy_from_slice(&target[..n]);
+        Ok(n)
+    }
+
     fn symlink(
         &mut self,
         dir: Ino,

@@ -366,12 +366,25 @@ export const OP_WASI = {
    * TmpNode::SymLink(target) variant; devfs / procfs / opfs inherit
    * the trait default (NotSupported → ENOTSUP). */
   PATH_SYMLINK: 0x0048,
+  /** Wire-format identity for `path_readlink`. Symlink-dereference
+   * opcode: copy a symlink's target bytes into a caller-supplied
+   * output buffer. Wire: args[0..4] = dir_fd (ignored), args[4..8] =
+   * path_len (u32; how many bytes at heap[0..] are the UTF-8 input
+   * path; the remainder is the output buffer). Response.value =
+   * bytes written. Truncates silently if the target exceeds buf_cap
+   * (POSIX readlink(2) semantics — the caller distinguishes exact-
+   * fit from truncated by re-issuing with a larger buffer when
+   * value == buf_cap). Threads through Vfs::readlink →
+   * Filesystem::readlink; tmpfs's TmpNode::SymLink variant yields
+   * the target bytes; non-symlink targets → EINVAL; devfs / procfs /
+   * opfs inherit the trait default (NotSupported → ENOTSUP). */
+  PATH_READLINK: 0x0045,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Was `PATH_SYMLINK` before that
+   * kernel doesn't yet handle. Was `PATH_READLINK` before that
    * handler landed; swap to whichever WASI opcode is still
    * unhandled as the implementation catches up. */
-  PATH_READLINK: 0x0045,
+  FD_PRESTAT_DIR_NAME: 0x002c,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer

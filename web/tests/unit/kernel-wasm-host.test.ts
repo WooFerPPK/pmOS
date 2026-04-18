@@ -414,13 +414,13 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `PATH_READLINK` is in the WASI range (0x0045) but still has no
-    // handler; was `PATH_SYMLINK` before that handler landed, then
-    // `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. Swap
-    // this probe to whatever's still unhandled as the implementation
-    // catches up.
+    // `FD_PRESTAT_DIR_NAME` is in the WASI range (0x002C) but still
+    // has no handler; was `PATH_READLINK` before that handler landed,
+    // then `PATH_SYMLINK`, `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`,
+    // `FD_READDIR`. Swap this probe to whatever's still unhandled as
+    // the implementation catches up.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.PATH_READLINK,
+      opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -1631,6 +1631,176 @@ describe("dispatch: PATH_SYMLINK", () => {
         heapLen: heap.length,
       },
       heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
+// ---- dispatch: PATH_READLINK ---------------------------------------
+//
+// Symlink-dereference opcode at 0x0045. Wire packs dir_fd at args[0..4]
+// (ignored) + path_len at args[4..8]. Heap[0..path_len] is the UTF-8
+// input path; the remainder is the output buffer. Response.value =
+// bytes written (up to buf_cap). These TS tests pin the wire layout
+// end-to-end through kernel.wasm: happy-path target readback after a
+// prior PATH_SYMLINK, -EINVAL on a regular file, -ENOENT on a missing
+// path, -ENOTSUP within /dev (devfs inherits the default), -EINVAL
+// on zero path_len.
+
+function encodePathReadlinkArgs(dirFd: number, pathLen: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, dirFd, true);
+  v.setUint32(4, pathLen, true);
+  return args;
+}
+
+describe("dispatch: PATH_READLINK", () => {
+  it("reads a symlink target created via PATH_SYMLINK", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /mylink → /real/target via PATH_SYMLINK.
+    const target = "/real/target";
+    const linkPath = "/mylink";
+    const mkHeap = encodePathSymlinkHeap(target, linkPath);
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1020,
+        args: encodePathSymlinkArgs(target.length),
+        heapPtr: 0,
+        heapLen: mkHeap.length,
+      },
+      mkHeap,
+    );
+
+    // Now readlink /mylink into a 64-byte heap.
+    const pathBytes = new TextEncoder().encode(linkPath);
+    const rlHeap = new Uint8Array(64);
+    rlHeap.set(pathBytes, 0);
+
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_READLINK,
+        requestId: 1021,
+        args: encodePathReadlinkArgs(0, pathBytes.length),
+        heapPtr: 0,
+        heapLen: rlHeap.length,
+      },
+      rlHeap,
+    );
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(target.length);
+    // Kernel writes target bytes at heap[0..n] (overwriting path).
+    const decoded = new TextDecoder().decode(
+      heapOut.subarray(0, target.length),
+    );
+    expect(decoded).toBe(target);
+  });
+
+  it("returns -EINVAL on a directory (non-symlink target in tmpfs)", async () => {
+    // The root directory of tmpfs is a regular Directory node;
+    // tmpfs.readlink returns InvalidArgument for any non-SymLink
+    // variant.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create a fresh /somedir via PATH_CREATE_DIRECTORY; readlink
+    // on it must yield EINVAL.
+    const dirPath = new TextEncoder().encode("/somedir");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1022,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: dirPath.length,
+      },
+      dirPath,
+    );
+
+    const rlHeap = new Uint8Array(32);
+    rlHeap.set(dirPath, 0);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_READLINK,
+        requestId: 1023,
+        args: encodePathReadlinkArgs(0, dirPath.length),
+        heapPtr: 0,
+        heapLen: rlHeap.length,
+      },
+      rlHeap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -ENOENT on a missing path", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/not/here");
+    const rlHeap = new Uint8Array(pathBytes.length + 32);
+    rlHeap.set(pathBytes, 0);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_READLINK,
+        requestId: 1024,
+        args: encodePathReadlinkArgs(0, pathBytes.length),
+        heapPtr: 0,
+        heapLen: rlHeap.length,
+      },
+      rlHeap,
+    );
+    expect(response.status).toBe(-ERRNO.ENOENT);
+  });
+
+  it("returns -ENOTSUP on /dev (devfs inherits NotSupported default)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/dev/console");
+    const rlHeap = new Uint8Array(pathBytes.length + 32);
+    rlHeap.set(pathBytes, 0);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_READLINK,
+        requestId: 1025,
+        args: encodePathReadlinkArgs(0, pathBytes.length),
+        heapPtr: 0,
+        heapLen: rlHeap.length,
+      },
+      rlHeap,
+    );
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+  });
+
+  it("returns -EINVAL for zero path_len", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const rlHeap = new Uint8Array(32);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_READLINK,
+        requestId: 1026,
+        args: encodePathReadlinkArgs(0, 0),
+        heapPtr: 0,
+        heapLen: rlHeap.length,
+      },
+      rlHeap,
     );
     expect(response.status).toBe(-ERRNO.EINVAL);
   });

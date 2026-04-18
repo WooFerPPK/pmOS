@@ -108,22 +108,22 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `PATH_READLINK` is in the WASI range (0x0045) but still has no
-    // handler. Same shape as the ext-side test below: decoded as
-    // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>` arm,
+    // `FD_PRESTAT_DIR_NAME` is in the WASI range (0x002C) but still
+    // has no handler. Same shape as the ext-side test below: decoded
+    // as a known WASI opcode, routed to `dispatch_wasi`'s `_ =>` arm,
     // ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `PATH_SYMLINK` before that handler landed, then
-    // `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. When
-    // `PATH_READLINK` grows a real handler, swap this probe to
-    // whatever's still unhandled at that point, or delete the test
-    // once every WASI opcode has real coverage.)
+    // (This probe was `PATH_READLINK` before that handler landed,
+    // then `PATH_SYMLINK`, `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`,
+    // `FD_READDIR`. When `FD_PRESTAT_DIR_NAME` grows a real handler,
+    // swap this probe to whatever's still unhandled at that point,
+    // or delete the test once every WASI opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::PATH_READLINK,
+        opcode: op_wasi::FD_PRESTAT_DIR_NAME,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -5847,6 +5847,233 @@ fn path_symlink_with_old_len_past_heap_returns_einval() {
         args: path_symlink_args(999),
         heap_ptr: 0,
         heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+// ---- path_readlink -------------------------------------------------
+//
+// Opcode 0x0045. Read a symlink's target bytes into a caller-supplied
+// output buffer. Wire:
+//
+//   args[0..4] = dir_fd (u32; ignored in v1 — no preopens)
+//   args[4..8] = path_len (u32; how many bytes at heap[0..] are the
+//                UTF-8 input path; the rest of the heap is the
+//                output buffer)
+//   heap[0..path_len]        = UTF-8 input path (the symlink to read)
+//   heap[path_len..heap_len] = output buffer capacity for the kernel
+//                              to write the target bytes into
+// Response:
+//   value     = bytes actually written (0..=buf_cap)
+//   extra_len = mirrors value (bytes-written convention)
+//
+// Truncates if the target exceeds the output buffer's capacity —
+// matches POSIX readlink(2)'s documented behaviour. The kernel does
+// NOT null-terminate; the caller uses the returned byte count.
+//
+// Semantics: looks up the ino at `path`, confirms it's a SymLink,
+// copies the target bytes into the output buffer. Non-symlink targets
+// (regular file, directory, char device) → EINVAL. Filesystems that
+// don't know what a symlink is (devfs, procfs, opfs) inherit the
+// trait default NotSupported → ENOTSUP.
+
+fn path_readlink_args(dir_fd: u32, path_len: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&dir_fd.to_le_bytes());
+    args[4..8].copy_from_slice(&path_len.to_le_bytes());
+    args
+}
+
+/// Build a heap buffer of exactly `heap_size` bytes with the path
+/// copied into the leading `path.len()` bytes. The rest is zero-
+/// filled; the kernel writes target bytes back at heap[0..n] which
+/// may overlap the path region (the kernel snapshots the path first).
+fn path_readlink_heap(path: &[u8], heap_size: usize) -> Vec<u8> {
+    let mut heap = vec![0u8; heap_size];
+    let copy_len = core::cmp::min(path.len(), heap_size);
+    heap[..copy_len].copy_from_slice(&path[..copy_len]);
+    heap
+}
+
+#[test]
+fn path_readlink_returns_target_bytes_for_a_symlink() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    // Create a symlink via the VFS directly (the path_symlink handler
+    // is exercised by its own tests).
+    k.vfs.symlink("/actual/target", "/lnk").expect("symlink");
+
+    let path = b"/lnk";
+    let mut heap = path_readlink_heap(path, 64);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1020,
+        args: path_readlink_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let expected = b"/actual/target";
+    assert_eq!(resp.value as usize, expected.len());
+    assert_eq!(resp.extra_len as usize, expected.len());
+    // Kernel writes target bytes at heap[0..n] (overwriting the path
+    // region; path was snapshotted before the write).
+    let n = resp.value as usize;
+    assert_eq!(&heap[..n], expected);
+}
+
+#[test]
+fn path_readlink_truncates_when_buffer_is_smaller_than_target() {
+    // POSIX readlink(2) silently truncates when the buffer is too
+    // small; the caller sees only value = heap_len and has no way to
+    // distinguish from an exact-fit target. heap_len doubles as the
+    // output buffer capacity.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    k.vfs.symlink("/a/long/target/string", "/lnk").expect("symlink");
+
+    let path = b"/lnk";
+    // heap_size = path length means the kernel has exactly path.len()
+    // bytes of output space after snapshotting the path.
+    let mut heap = path_readlink_heap(path, path.len());
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1021,
+        args: path_readlink_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value as usize, path.len());
+    assert_eq!(&heap[..path.len()], b"/a/l");
+}
+
+#[test]
+fn path_readlink_on_regular_file_returns_einval() {
+    // tmpfs.readlink returns InvalidArgument for non-SymLink nodes.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    k.vfs.create("/regular", 0o644).expect("create");
+
+    let path = b"/regular";
+    let mut heap = path_readlink_heap(path, 32);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1022,
+        args: path_readlink_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_readlink_on_missing_path_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let path = b"/nope";
+    let mut heap = path_readlink_heap(path, 32);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1023,
+        args: path_readlink_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_readlink_on_devfs_returns_enotsup() {
+    // devfs inherits the NotSupported default — it doesn't know what
+    // a symlink is.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+
+    let path = b"/dev/console";
+    let mut heap = path_readlink_heap(path, 32);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1024,
+        args: path_readlink_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+}
+
+#[test]
+fn path_readlink_with_zero_path_len_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1025,
+        args: path_readlink_args(0, 0),
+        heap_ptr: 0,
+        heap_len: 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_readlink_with_path_len_past_heap_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1026,
+        args: path_readlink_args(0, 999),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_readlink_with_invalid_utf8_path_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let mut heap = vec![0u8; 32];
+    heap[0] = 0xff;
+    heap[1] = 0xfe;
+
+    let req = Request {
+        opcode: op_wasi::PATH_READLINK,
+        flags: 0,
+        request_id: 1027,
+        args: path_readlink_args(0, 2),
+        heap_ptr: 0,
+        heap_len: 32,
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, -errno::EINVAL);

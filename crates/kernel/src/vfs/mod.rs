@@ -286,6 +286,20 @@ pub trait Filesystem: Send {
         Err(FsError::NotSupported)
     }
 
+    /// Copy the symlink target at `ino` into `out`, returning the
+    /// number of bytes actually written. If `out` is shorter than the
+    /// target, the output is silently truncated (POSIX readlink(2)
+    /// semantics — the caller uses the returned byte count).
+    ///
+    /// Default: returns `FsError::NotSupported` (→ `ENOTSUP`).
+    /// Filesystems that support symlinks (tmpfs) override with a
+    /// per-variant match: a SymLink node yields its target bytes; a
+    /// non-SymLink node returns `FsError::InvalidArgument` (→
+    /// `EINVAL`).
+    fn readlink(&mut self, _ino: Ino, _out: &mut [u8]) -> Result<usize, FsError> {
+        Err(FsError::NotSupported)
+    }
+
     /// Flush any buffered writes. Default no-op.
     fn sync(&mut self) -> Result<(), FsError> {
         Ok(())
@@ -513,6 +527,19 @@ impl Vfs {
         let (mount_id, parent_ino, name) = self.resolve_parent(link_path)?;
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         fs.symlink(parent_ino, &name, target)
+    }
+
+    /// Copy the symlink target at `abs_path` into `out`. Resolves the
+    /// path (which does NOT dereference symlinks in v1 — the final
+    /// component stays a symlink rather than being followed), then
+    /// dispatches to [`Filesystem::readlink`] on the owning mount.
+    /// tmpfs returns the target string; devfs / procfs / opfs inherit
+    /// the default (`NotSupported` → ENOTSUP). A non-symlink target
+    /// returns `InvalidArgument` → EINVAL.
+    pub fn readlink(&mut self, abs_path: &str, out: &mut [u8]) -> Result<usize, FsError> {
+        let (mount_id, ino) = self.resolve(abs_path)?;
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.readlink(ino, out)
     }
 
     /// Stat an absolute path.

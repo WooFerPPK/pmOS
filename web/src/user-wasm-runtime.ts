@@ -1149,6 +1149,67 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `path_readlink`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, path_ptr: i32, path_len: i32,
+      //    buf_ptr: i32, buf_len: i32, bufused_ptr: i32) -> errno: i32
+      //
+      // Reads a symlink's target into a caller-supplied buffer.
+      // Wire: args[0..4] = dir_fd (ignored), args[4..8] = path_len;
+      // heap[0..path_len] carries the input path on request and the
+      // kernel overwrites heap[0..n] with target bytes on response
+      // (the kernel snapshots the path first). The shim allocates a
+      // heap of `max(path_len, buf_len)` bytes so the kernel has at
+      // least `buf_len` bytes of output capacity; kernel truncates
+      // silently to heap_len if target is longer (POSIX readlink(2)
+      // semantics). Returns bytes written in response.value +
+      // response.extraLen; the shim copies heapOut[0..n] back to
+      // user memory at buf_ptr and writes the count at bufused_ptr.
+      path_readlink: (
+        _dirfd: number,
+        pathPtr: number,
+        pathLen: number,
+        bufPtr: number,
+        bufLen: number,
+        bufusedPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(
+          this.memory.buffer,
+          pathPtr,
+          pathLen,
+        );
+        const heapSize = Math.max(pathLen, bufLen);
+        const heap = new Uint8Array(heapSize);
+        heap.set(pathBytes, 0);
+
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, 0, true); // dir_fd — ignored
+        argsView.setUint32(4, pathLen, true);
+
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_READLINK,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        if (response.status !== 0) return -response.status;
+        const n = Math.min(Number(response.value), bufLen);
+        // Kernel writes target bytes at heap[0..n]; copy out to the
+        // caller's buf_ptr region.
+        const userBuf = new Uint8Array(this.memory.buffer, bufPtr, bufLen);
+        userBuf.set(heapOut.subarray(0, n));
+        const usedView = new DataView(this.memory.buffer, bufusedPtr, 4);
+        usedView.setUint32(0, n, true);
+        return 0;
+      },
+
       // WASI `path_create_directory`.
       //
       // Signature (lowered):

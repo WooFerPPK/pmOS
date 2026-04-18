@@ -73,6 +73,7 @@ pub fn dispatch_wasi(
         op::PATH_RENAME => handle_path_rename(kernel, pid, req, heap),
         op::PATH_LINK => handle_path_link(kernel, pid, req, heap),
         op::PATH_SYMLINK => handle_path_symlink(kernel, pid, req, heap),
+        op::PATH_READLINK => handle_path_readlink(kernel, pid, req, heap),
         op::PATH_CREATE_DIRECTORY => handle_path_create_directory(kernel, pid, req, heap),
         op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
         op::FD_FDSTAT_SET_FLAGS => handle_fd_fdstat_set_flags(kernel, pid, req),
@@ -1579,6 +1580,71 @@ fn handle_path_symlink(
     };
     match kernel.vfs.symlink(target, new_path) {
         Ok(_ino) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+// ---- path_readlink --------------------------------------------------
+//
+// Layout:
+//   args[0..4] = dir_fd (u32; ignored in v1 — no preopens)
+//   args[4..8] = path_len (u32; the first path_len bytes of heap are
+//                the UTF-8 input path; the full heap_len doubles as
+//                the output buffer capacity)
+//   heap[0..path_len] on request = UTF-8 input path
+//   heap[0..n] on response       = target bytes written by the kernel
+// Response:
+//   value     = bytes actually written (n; 0..=heap_len)
+//   extra_len = mirrors value (bytes-written convention, so the host
+//               test harness's `heapOut = heap[0..extra_len]` surface
+//               yields the target bytes directly)
+//
+// The kernel snapshots the path out of heap[0..path_len] first so it
+// can reuse the entire heap as the output buffer. Truncates silently
+// if the target exceeds heap_len — matches POSIX readlink(2)'s
+// documented behaviour; the caller distinguishes "exact fit" from
+// "truncated" by reissuing with a larger heap when value == heap_len.
+//
+// Threads through `Vfs::readlink` → `Filesystem::readlink` on the
+// owning mount. tmpfs's override pattern-matches on `TmpNode::SymLink`
+// and copies the target bytes; non-symlink targets return
+// `InvalidArgument` → EINVAL. Filesystems that don't know what a
+// symlink is (devfs, procfs, opfs) inherit the trait default
+// `NotSupported` → ENOTSUP.
+
+fn handle_path_readlink(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let _dir_fd = args_u32(req, 0);
+    let path_len = args_u32(req, 4) as usize;
+
+    let heap_len = req.heap_len as usize;
+    let Some(full) = heap_out_mut(req, heap, heap_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if path_len == 0 || path_len > full.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+    // Snapshot the path out of the input region so the full heap can
+    // be reused as the target output buffer.
+    let path_owned: alloc::string::String = match core::str::from_utf8(&full[..path_len]) {
+        Ok(s) => s.into(),
+        Err(_) => return Response::err(req.request_id, EINVAL),
+    };
+    match kernel.vfs.readlink(&path_owned, full) {
+        Ok(n) => Response {
+            request_id: req.request_id,
+            status: 0,
+            value: n as i64,
+            extra_len: n as u32,
+            _pad: [0u8; 12],
+        },
         Err(e) => Response::err(
             req.request_id,
             kerr_to_errno(KernelError::Fs(e)),
