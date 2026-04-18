@@ -200,6 +200,15 @@ export const OP_WASI = {
    * without mutating it. Functionally a `fd_seek(fd, 0, Cur, *)` at
    * the WASI surface level. */
   FD_TELL: 0x0033,
+  /** Wire-format identity for the four fd-state opcodes. All four
+   * take an fd as a u32 at `arg0` and collapse to trivial semantics
+   * in v1's tmpfs-backed VFS: advise/sync/datasync = no-op success
+   * on a Vnode; allocate = ENOTSUP on a Vnode; EBADF on an unopened
+   * fd and EINVAL on every non-Vnode FdObject. */
+  FD_ADVISE: 0x0020,
+  FD_ALLOCATE: 0x0021,
+  FD_SYNC: 0x0032,
+  FD_DATASYNC: 0x0023,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Swap to whichever WASI opcode is

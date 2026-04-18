@@ -76,6 +76,15 @@ var OP_WASI = {
    * without mutating it. Functionally a `fd_seek(fd, 0, Cur, *)` at
    * the WASI surface level. */
   FD_TELL: 51,
+  /** Wire-format identity for the four fd-state opcodes. All four
+   * take an fd as a u32 at `arg0` and collapse to trivial semantics
+   * in v1's tmpfs-backed VFS: advise/sync/datasync = no-op success
+   * on a Vnode; allocate = ENOTSUP on a Vnode; EBADF on an unopened
+   * fd and EINVAL on every non-Vnode FdObject. */
+  FD_ADVISE: 32,
+  FD_ALLOCATE: 33,
+  FD_SYNC: 50,
+  FD_DATASYNC: 35,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Swap to whichever WASI opcode is
@@ -533,6 +542,92 @@ var UserWasmRuntime = class {
         const view = new DataView(this.memory.buffer);
         view.setBigInt64(offsetPtr, response.value, true);
         return 0;
+      },
+      // WASI fd-state opcodes (`fd_advise` / `fd_allocate` / `fd_sync`
+      // / `fd_datasync`). All four take only an fd (at arg0), all four
+      // share the same EBADF + non-Vnode-EINVAL guards, and all four
+      // collapse to trivial semantics in v1's tmpfs-backed VFS:
+      //
+      //   fd_advise / fd_sync / fd_datasync  →  no-op success on Vnode
+      //   fd_allocate                        →  ENOTSUP on Vnode
+      //
+      // The shim ignores every WASI argument the kernel doesn't
+      // decode: fd_advise's (offset, len, advice) and fd_allocate's
+      // (offset, len) all go unused in v1. The kernel's no-op /
+      // ENOTSUP response is independent of those values; passing
+      // them on the wire would cost bytes without changing behaviour.
+      // WASI `fd_advise`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, offset: i64, len: i64, advice: i32) -> errno: i32
+      //
+      // The advice byte (NORMAL / SEQUENTIAL / RANDOM / WILLNEED /
+      // DONTNEED / NOREUSE) is a hint WASI permits the implementation
+      // to ignore. v1 has no page cache to advise, so the kernel
+      // returns success without looking at any of the arguments.
+      fd_advise: (_fd, _offset, _len, _advice) => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_ADVISE,
+          requestId: 0,
+          arg0: _fd,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `fd_allocate`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, offset: i64, len: i64) -> errno: i32
+      //
+      // Requests that the filesystem reserve space on disk. v1 tmpfs
+      // has no preallocation primitive, so the kernel returns
+      // ENOTSUP; a success response would lie about reserved space.
+      fd_allocate: (_fd, _offset, _len) => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_ALLOCATE,
+          requestId: 0,
+          arg0: _fd,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `fd_sync`.
+      //
+      // Signature (lowered): (fd: i32) -> errno: i32
+      //
+      // Flushes all modified data + metadata to durable storage.
+      // v1 writes are synchronous into the vfs state (tmpfs +
+      // devfs + procfs are in-memory; opfs is backed by the OPFS
+      // block driver which flushes on every write), so there's
+      // nothing to flush — no-op success.
+      fd_sync: (fd) => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_SYNC,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `fd_datasync`.
+      //
+      // Signature (lowered): (fd: i32) -> errno: i32
+      //
+      // Same as fd_sync but only requires the data to reach
+      // storage, not the metadata. Same no-op-success semantics
+      // in v1 for the same reason.
+      fd_datasync: (fd) => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_DATASYNC,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status !== 0 ? -response.status : 0;
       },
       // WASI `path_open`.
       //

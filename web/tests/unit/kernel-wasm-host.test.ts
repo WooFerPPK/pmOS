@@ -1024,6 +1024,173 @@ describe("dispatch: FD_TELL", () => {
   });
 });
 
+// ---- dispatch: fd-state opcodes (FD_ADVISE / FD_ALLOCATE / FD_SYNC /
+// ---- FD_DATASYNC) ----------------------------------------------------
+//
+// Four related "fd-state" opcodes bundled into one describe block.
+// All four take an fd as a u32 at `arg0` and collapse to trivial
+// semantics in v1's tmpfs-backed VFS:
+//
+//   FD_ADVISE / FD_SYNC / FD_DATASYNC = no-op success on a Vnode.
+//   FD_ALLOCATE                       = ENOTSUP on a Vnode.
+//   All four                          = EBADF on an unopened fd,
+//                                       EINVAL on every non-Vnode
+//                                       FdObject (the state these
+//                                       opcodes touch only has meaning
+//                                       for seekable regular files).
+//
+// Reuses the `openProcVersion` helper from the FD_SEEK block to stage
+// a Vnode fd through the dispatch surface alone.
+
+describe("dispatch: FD_ADVISE", () => {
+  it("returns 0 on a /proc/version Vnode fd (no-op success)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_ADVISE,
+      requestId: 790,
+      arg0: fd,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -EINVAL for a /dev/console fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_ADVISE,
+      requestId: 791,
+      arg0: 1,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF for an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_ADVISE,
+      requestId: 792,
+      arg0: 99,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
+describe("dispatch: FD_ALLOCATE", () => {
+  it("returns -ENOTSUP on a /proc/version Vnode fd (v1 tmpfs has no preallocation)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_ALLOCATE,
+      requestId: 793,
+      arg0: fd,
+    });
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+  });
+
+  it("returns -EINVAL for a /dev/console fd (non-Vnode rejection fires before ENOTSUP)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_ALLOCATE,
+      requestId: 794,
+      arg0: 1,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF for an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_ALLOCATE,
+      requestId: 795,
+      arg0: 99,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
+describe("dispatch: FD_SYNC", () => {
+  it("returns 0 on a /proc/version Vnode fd (no-op success)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SYNC,
+      requestId: 796,
+      arg0: fd,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -EINVAL for a /dev/console fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SYNC,
+      requestId: 797,
+      arg0: 1,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
+describe("dispatch: FD_DATASYNC", () => {
+  it("returns 0 on a /proc/version Vnode fd (no-op success)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_DATASYNC,
+      requestId: 798,
+      arg0: fd,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -EINVAL for a /dev/console fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_DATASYNC,
+      requestId: 799,
+      arg0: 1,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {

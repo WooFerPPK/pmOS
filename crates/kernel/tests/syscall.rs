@@ -1875,6 +1875,276 @@ fn fd_tell_on_invalid_fd_returns_ebadf() {
     assert_eq!(resp.status, -errno::EBADF);
 }
 
+// ---- fd-state opcodes (fd_advise / fd_allocate / fd_sync / fd_datasync) ----
+//
+// Four related "fd-state" opcodes bundled in one block. In v1's
+// tmpfs-backed VFS there is no advisor, no write-buffer to flush, and
+// no preallocation primitive — the semantics collapse to:
+//
+//   fd_advise   = no-op success on a Vnode (the advice is taken, then
+//                 discarded — POSIX and WASI both permit this; the
+//                 opcode is purely a hint).
+//   fd_sync     = no-op success on a Vnode (nothing to flush; v1
+//                 writes are synchronous into the vfs state).
+//   fd_datasync = no-op success on a Vnode (same reason).
+//   fd_allocate = ENOTSUP on every fd (v1 tmpfs doesn't honour
+//                 preallocation; returning success would lie about
+//                 reserved space, so the honest answer is ENOTSUP).
+//
+// All four share the same guards: EBADF on an unopened fd; EINVAL on
+// every non-Vnode FdObject (the state these opcodes touch only has
+// meaning for seekable regular files). Handlers model exactly on
+// `handle_fd_tell`'s shape — one `args_u32` read for the fd, one
+// lookup, one match on the FdObject variant, done.
+
+// Pack the 40-byte fd_advise args window. The opcode's WASI signature
+// is `(fd, offset: u64, len: u64, advice: u8) -> errno`; the PMos
+// wire layout is u32-aligned-friendly: fd at 0..4, offset at 4..12,
+// len at 12..20, advice at 20..24 (low byte). The test helper packs
+// into 16 bytes for the inline args window; offset and len carry
+// zero in the v1 no-op semantics so the trailing bytes stay zero.
+fn fd_advise_args(fd: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[..4].copy_from_slice(&fd.to_le_bytes());
+    args
+}
+
+#[test]
+fn fd_advise_on_vnode_fd_returns_success() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "adviser", "/a.txt", b"abcdefghij");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_ADVISE,
+        flags: 0,
+        request_id: 760,
+        args: fd_advise_args(fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.request_id, 760);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    // The advise is a hint — the fd's offset must be untouched.
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 0);
+}
+
+#[test]
+fn fd_advise_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "adviser", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_ADVISE,
+        flags: 0,
+        request_id: 761,
+        args: fd_advise_args(1),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_advise_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "adviser", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_ADVISE,
+        flags: 0,
+        request_id: 762,
+        args: fd_advise_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_allocate_on_vnode_fd_returns_enotsup() {
+    // v1 tmpfs has no preallocation primitive. A success response
+    // would lie about reserved space; ENOTSUP is the honest answer.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "allocator", "/a.txt", b"abc");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_ALLOCATE,
+        flags: 0,
+        request_id: 763,
+        args: fd_advise_args(fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    // The fd's offset must be untouched (the refusal is a no-op).
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 0);
+}
+
+#[test]
+fn fd_allocate_on_char_device_fd_returns_einval() {
+    // Non-Vnode rejection fires *before* the ENOTSUP semantic;
+    // char-device has no preallocation meaning at all.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "allocator", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_ALLOCATE,
+        flags: 0,
+        request_id: 764,
+        args: fd_advise_args(1),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_allocate_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "allocator", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_ALLOCATE,
+        flags: 0,
+        request_id: 765,
+        args: fd_advise_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_sync_on_vnode_fd_returns_success() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "syncer", "/s.txt", b"abcdefghij");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SYNC,
+        flags: 0,
+        request_id: 766,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn fd_sync_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "syncer", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SYNC,
+        flags: 0,
+        request_id: 767,
+        args: u32_args(1),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_sync_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "syncer", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SYNC,
+        flags: 0,
+        request_id: 768,
+        args: u32_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_datasync_on_vnode_fd_returns_success() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "datasyncer", "/d.txt", b"abc");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_DATASYNC,
+        flags: 0,
+        request_id: 769,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn fd_datasync_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "datasyncer", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_DATASYNC,
+        flags: 0,
+        request_id: 770,
+        args: u32_args(1),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_datasync_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "datasyncer", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_DATASYNC,
+        flags: 0,
+        request_id: 771,
+        args: u32_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
 // ---- fd_prestat_get ---------------------------------------------------
 
 #[test]

@@ -48,6 +48,10 @@ pub fn dispatch_wasi(
         op::FD_READ => handle_fd_read(kernel, pid, req, heap),
         op::FD_SEEK => handle_fd_seek(kernel, pid, req),
         op::FD_TELL => handle_fd_tell(kernel, pid, req),
+        op::FD_ADVISE => handle_fd_advise(kernel, pid, req),
+        op::FD_ALLOCATE => handle_fd_allocate(kernel, pid, req),
+        op::FD_SYNC => handle_fd_sync(kernel, pid, req),
+        op::FD_DATASYNC => handle_fd_datasync(kernel, pid, req),
         op::FD_CLOSE => handle_fd_close(kernel, pid, req),
         op::PATH_OPEN => handle_path_open(kernel, pid, req, heap),
         op::PROC_EXIT => handle_proc_exit(kernel, pid, req),
@@ -264,6 +268,88 @@ fn handle_fd_tell(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     };
     match entry.object {
         FdObject::Vnode { .. } => Response::ok(req.request_id, entry.offset as i64),
+        _ => Response::err(req.request_id, EINVAL),
+    }
+}
+
+// ---- fd-state opcodes (fd_advise / fd_allocate / fd_sync / fd_datasync) ----
+//
+// Four "fd-state" opcodes that collapse to trivial semantics in v1's
+// tmpfs-backed VFS. All four share the same guards — EBADF on an
+// unopened fd; EINVAL on every non-Vnode FdObject (the state these
+// opcodes touch only has meaning for seekable regular files).
+//
+//   fd_advise   = no-op success (the advice is taken, then discarded;
+//                 POSIX and WASI both permit this, the opcode is a
+//                 hint with no reserved behaviour).
+//   fd_sync     = no-op success (nothing to flush; v1 writes are
+//                 synchronous into the vfs state).
+//   fd_datasync = no-op success (same reason).
+//   fd_allocate = ENOTSUP (v1 tmpfs has no preallocation primitive;
+//                 a success response would lie about reserved space,
+//                 ENOTSUP is the honest answer).
+//
+// Handlers mirror `handle_fd_tell`'s shape verbatim — one fd read,
+// one table lookup, one match on the FdObject variant. Offset bytes,
+// length bytes, and the advice byte in the WASI signature are all
+// ignored in v1: the semantics collapse regardless of their values.
+
+fn handle_fd_advise(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    match entry.object {
+        FdObject::Vnode { .. } => Response::ok(req.request_id, 0),
+        _ => Response::err(req.request_id, EINVAL),
+    }
+}
+
+fn handle_fd_allocate(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    match entry.object {
+        FdObject::Vnode { .. } => Response::err(req.request_id, ENOTSUP),
+        _ => Response::err(req.request_id, EINVAL),
+    }
+}
+
+fn handle_fd_sync(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    match entry.object {
+        FdObject::Vnode { .. } => Response::ok(req.request_id, 0),
+        _ => Response::err(req.request_id, EINVAL),
+    }
+}
+
+fn handle_fd_datasync(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    match entry.object {
+        FdObject::Vnode { .. } => Response::ok(req.request_id, 0),
         _ => Response::err(req.request_id, EINVAL),
     }
 }

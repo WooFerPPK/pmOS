@@ -465,6 +465,106 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // WASI fd-state opcodes (`fd_advise` / `fd_allocate` / `fd_sync`
+      // / `fd_datasync`). All four take only an fd (at arg0), all four
+      // share the same EBADF + non-Vnode-EINVAL guards, and all four
+      // collapse to trivial semantics in v1's tmpfs-backed VFS:
+      //
+      //   fd_advise / fd_sync / fd_datasync  →  no-op success on Vnode
+      //   fd_allocate                        →  ENOTSUP on Vnode
+      //
+      // The shim ignores every WASI argument the kernel doesn't
+      // decode: fd_advise's (offset, len, advice) and fd_allocate's
+      // (offset, len) all go unused in v1. The kernel's no-op /
+      // ENOTSUP response is independent of those values; passing
+      // them on the wire would cost bytes without changing behaviour.
+
+      // WASI `fd_advise`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, offset: i64, len: i64, advice: i32) -> errno: i32
+      //
+      // The advice byte (NORMAL / SEQUENTIAL / RANDOM / WILLNEED /
+      // DONTNEED / NOREUSE) is a hint WASI permits the implementation
+      // to ignore. v1 has no page cache to advise, so the kernel
+      // returns success without looking at any of the arguments.
+      fd_advise: (
+        _fd: number,
+        _offset: bigint,
+        _len: bigint,
+        _advice: number,
+      ): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_ADVISE,
+          requestId: 0,
+          arg0: _fd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
+      // WASI `fd_allocate`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, offset: i64, len: i64) -> errno: i32
+      //
+      // Requests that the filesystem reserve space on disk. v1 tmpfs
+      // has no preallocation primitive, so the kernel returns
+      // ENOTSUP; a success response would lie about reserved space.
+      fd_allocate: (
+        _fd: number,
+        _offset: bigint,
+        _len: bigint,
+      ): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_ALLOCATE,
+          requestId: 0,
+          arg0: _fd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
+      // WASI `fd_sync`.
+      //
+      // Signature (lowered): (fd: i32) -> errno: i32
+      //
+      // Flushes all modified data + metadata to durable storage.
+      // v1 writes are synchronous into the vfs state (tmpfs +
+      // devfs + procfs are in-memory; opfs is backed by the OPFS
+      // block driver which flushes on every write), so there's
+      // nothing to flush — no-op success.
+      fd_sync: (fd: number): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_SYNC,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
+      // WASI `fd_datasync`.
+      //
+      // Signature (lowered): (fd: i32) -> errno: i32
+      //
+      // Same as fd_sync but only requires the data to reach
+      // storage, not the metadata. Same no-op-success semantics
+      // in v1 for the same reason.
+      fd_datasync: (fd: number): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_DATASYNC,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `path_open`.
       //
       // Signature (lowered):
