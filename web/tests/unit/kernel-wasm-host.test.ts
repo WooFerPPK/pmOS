@@ -1599,6 +1599,89 @@ describe("dispatch: FD_FDSTAT_SET_FLAGS", () => {
   });
 });
 
+// ---- dispatch: FD_FILESTAT_SET_SIZE --------------------------------
+//
+// WASI's ftruncate opcode. Wire: (fd, new_size) — fd as u32 at
+// args[0..4], new_size as u64 LE at args[4..12]; no heap. The TS
+// tests pin the dispatcher's per-branch behaviour end-to-end through
+// kernel.wasm: the EINVAL branch for a non-Vnode fd (char device),
+// the EROFS branch for a procfs vnode (/proc/version), and the EBADF
+// branch for an unopened fd. Happy-path truncate needs a tmpfs
+// vnode fd which the TS harness cannot easily stand up (path_open
+// with CREAT is not wired yet), so that branch is covered by the
+// Rust tests only.
+
+function encodeFdFilestatSetSizeArgs(
+  fd: number,
+  newSize: bigint,
+): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setBigUint64(4, newSize, true);
+  return args;
+}
+
+describe("dispatch: FD_FILESTAT_SET_SIZE", () => {
+  it("returns -EINVAL on a char-device fd (non-Vnode)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_SET_SIZE,
+      requestId: 950,
+      args: encodeFdFilestatSetSizeArgs(1, 0n),
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_SET_SIZE,
+      requestId: 951,
+      args: encodeFdFilestatSetSizeArgs(99, 100n),
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+
+  it("returns -EROFS when truncating a procfs vnode (/proc/version)", async () => {
+    // Open /proc/version through PATH_OPEN (procfs regular file →
+    // Vnode fd), then call FD_FILESTAT_SET_SIZE on the resulting fd.
+    // procfs.truncate returns ReadOnly → EROFS.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/proc/version");
+    const { response: open } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 952,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(open.status).toBe(0);
+    const fd = Number(open.value);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_SET_SIZE,
+      requestId: 953,
+      args: encodeFdFilestatSetSizeArgs(fd, 0n),
+    });
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+});
+
 // ---- dispatch: FD_RENUMBER -----------------------------------------
 //
 // WASI's dup2-spelling. Wire: (from, to) as two u32s at args[0..4]

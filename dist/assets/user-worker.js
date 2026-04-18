@@ -159,6 +159,17 @@ var OP_WASI = {
    * FdObject-variant rejection (WASI permits the call on any fd
    * type). */
   FD_FDSTAT_SET_FLAGS: 37,
+  /** Wire-format identity for `fd_filestat_set_size`. WASI's
+   * equivalent of POSIX ftruncate: truncate or zero-extend a
+   * seekable fd to an exact byte count. Wire: fd at args[0..4],
+   * new_size u64 LE at args[4..12]. Vnode-only — char device /
+   * socket / pipe / signal-channel / display-connection fds are
+   * rejected with EINVAL (same non-Vnode guard as fd_seek /
+   * fd_tell / fd_filestat_set_times). Directory target passes
+   * through to tmpfs.truncate → IsADirectory → EISDIR;
+   * read-only filesystems (procfs) return EROFS. Shrinking
+   * discards tail bytes, extending past EOF zero-fills. */
+  FD_FILESTAT_SET_SIZE: 40,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer
@@ -1200,6 +1211,31 @@ var UserWasmRuntime = class {
         argsView.setUint32(4, to, true);
         const { response } = this.backend.dispatch({
           opcode: OP_WASI.FD_RENUMBER,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `fd_filestat_set_size`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, new_size: i64) -> errno: i32
+      //
+      // WASI's equivalent of POSIX ftruncate: truncate / zero-extend
+      // a seekable fd to an exact byte count. Vnode-only — non-Vnode
+      // fds reject with EINVAL. Directory targets reject with EISDIR
+      // (tmpfs.truncate returns IsADirectory). Read-only filesystems
+      // return EROFS. Wire: fd + new_size in the inline args window
+      // (u32 + u64 LE); no heap round-trip.
+      fd_filestat_set_size: (fd, new_size) => {
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setBigUint64(4, new_size, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_FILESTAT_SET_SIZE,
           requestId: 0,
           args,
           heapPtr: 0,

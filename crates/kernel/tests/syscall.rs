@@ -4134,6 +4134,167 @@ fn fd_fdstat_set_flags_with_unopened_fd_returns_ebadf() {
     assert_eq!(resp.status, -errno::EBADF);
 }
 
+// ---- fd_filestat_set_size ------------------------------------------
+//
+// Opcode 0x0028. Truncate / extend a seekable fd to a specific size.
+// Wire:
+//   args[0..4]  = fd (u32)
+//   args[4..12] = new_size (u64 LE)
+// Response: value = 0 on success; status = -errno on error.
+//
+// Vnode fds only — the operation has no meaning on a char device,
+// socket, pipe, signal channel, or display connection. The handler
+// rejects those with EINVAL (same branch shape as fd_seek / fd_tell).
+// Directory targets passthrough to tmpfs.truncate which returns
+// IsADirectory → EISDIR. Read-only filesystems (procfs) return
+// ReadOnly → EROFS; unsupported filesystems (devfs) return
+// NotSupported → ENOTSUP (but devfs has no regular-file vnodes to
+// reach in v1, so that branch isn't exercised from the WASI surface).
+
+fn fd_filestat_set_size_args(fd: u32, new_size: u64) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..12].copy_from_slice(&new_size.to_le_bytes());
+    args
+}
+
+#[test]
+fn fd_filestat_set_size_truncates_tmpfs_file() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "truncer", "/big.txt", b"0123456789");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_SIZE,
+        flags: 0,
+        request_id: 930,
+        args: fd_filestat_set_size_args(fd, 4),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    let stat = k.vfs.stat("/big.txt").expect("stat");
+    assert_eq!(stat.size, 4);
+}
+
+#[test]
+fn fd_filestat_set_size_extends_tmpfs_file_with_zeros() {
+    // Extending past EOF should zero-fill; POSIX + WASI both permit this.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "extender", "/small.txt", b"abc");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_SIZE,
+        flags: 0,
+        request_id: 931,
+        args: fd_filestat_set_size_args(fd, 16),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let stat = k.vfs.stat("/small.txt").expect("stat");
+    assert_eq!(stat.size, 16);
+
+    // First three bytes preserved; rest zero.
+    let mut buf = [0u8; 16];
+    let n = k.vfs.read("/small.txt", 0, &mut buf).expect("read");
+    assert_eq!(n, 16);
+    assert_eq!(&buf[..3], b"abc");
+    assert!(buf[3..].iter().all(|&b| b == 0), "zero fill past old EOF");
+}
+
+#[test]
+fn fd_filestat_set_size_on_directory_vnode_returns_eisdir() {
+    // Open a directory vnode (via make_dir_fd) and try to truncate it.
+    // tmpfs.truncate returns IsADirectory → EISDIR.
+    let mut k = make_kernel();
+    let (pid, fd) = make_dir_fd(&mut k, "dirtruncer", "/d_trunc");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_SIZE,
+        flags: 0,
+        request_id: 932,
+        args: fd_filestat_set_size_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EISDIR);
+}
+
+#[test]
+fn fd_filestat_set_size_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdevtruncer", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_SIZE,
+        flags: 0,
+        request_id: 933,
+        args: fd_filestat_set_size_args(1, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_filestat_set_size_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghosttruncer", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_SIZE,
+        flags: 0,
+        request_id: 934,
+        args: fd_filestat_set_size_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_filestat_set_size_on_procfs_returns_erofs() {
+    // procfs.truncate returns ReadOnly → EROFS. /proc/version is a
+    // regular-file vnode, so it opens as FdObject::Vnode and the
+    // handler reaches the filesystem's truncate method rather than
+    // stopping at the non-Vnode EINVAL guard.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "proctruncer", 0);
+    let (mount_id, ino) = k.vfs.resolve("/proc/version").expect("resolve proc version");
+    k.install_fd(
+        pid,
+        10,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_SIZE,
+        flags: 0,
+        request_id: 935,
+        args: fd_filestat_set_size_args(10, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

@@ -74,6 +74,7 @@ pub fn dispatch_wasi(
         op::PATH_CREATE_DIRECTORY => handle_path_create_directory(kernel, pid, req, heap),
         op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
         op::FD_FDSTAT_SET_FLAGS => handle_fd_fdstat_set_flags(kernel, pid, req),
+        op::FD_FILESTAT_SET_SIZE => handle_fd_filestat_set_size(kernel, pid, req),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
@@ -1552,6 +1553,62 @@ fn handle_fd_fdstat_set_flags(kernel: &mut Kernel, pid: Pid, req: &Request) -> R
         entry.flags.insert(FdFlags::NONBLOCK);
     }
     Response::ok(req.request_id, 0)
+}
+
+// ---- fd_filestat_set_size ------------------------------------------
+//
+// Layout:
+//   args[0..4]  = fd (u32)
+//   args[4..12] = new_size (u64 LE)
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Truncate — or extend with zero-fill — a seekable fd to an exact
+// byte count. POSIX ftruncate / WASI fd_filestat_set_size share the
+// same "bytes" semantics: shrinking discards tail bytes, extending
+// past EOF zero-fills the gap. The vnode's mtime + ctime both
+// advance per POSIX (the filesystem impl handles that — tmpfs
+// updates both on every resize).
+//
+// Vnode-only. The operation has no meaning on a char device
+// (bytes are produced on demand, not stored), a socket (no
+// seekable storage), a pipe (same), a signal channel, or a
+// display connection. Non-Vnode FdObject variants reject with
+// EINVAL — same guard shape as fd_seek / fd_tell.
+//
+// Threads through the new Vfs::truncate_ino helper, mirroring
+// how fd_filestat_set_times reached tmpfs.set_times via
+// Vfs::set_times_ino. tmpfs returns IsADirectory → EISDIR for a
+// directory vnode; procfs returns ReadOnly → EROFS; devfs returns
+// NotSupported → ENOTSUP (but devfs has no regular-file vnodes in
+// v1, so that branch is unreachable from the WASI surface).
+
+fn handle_fd_filestat_set_size(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+) -> Response {
+    let fd = args_u32(req, 0);
+    let new_size = args_u64(req, 4);
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let (mount_id, ino) = match entry.object {
+        FdObject::Vnode { mount_id, ino } => (mount_id, ino),
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    match kernel.vfs.truncate_ino(mount_id, ino, new_size) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
 }
 
 // ---- poll_oneoff -----------------------------------------------------

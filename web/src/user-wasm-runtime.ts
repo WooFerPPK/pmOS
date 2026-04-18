@@ -1126,6 +1126,32 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `fd_filestat_set_size`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, new_size: i64) -> errno: i32
+      //
+      // WASI's equivalent of POSIX ftruncate: truncate / zero-extend
+      // a seekable fd to an exact byte count. Vnode-only — non-Vnode
+      // fds reject with EINVAL. Directory targets reject with EISDIR
+      // (tmpfs.truncate returns IsADirectory). Read-only filesystems
+      // return EROFS. Wire: fd + new_size in the inline args window
+      // (u32 + u64 LE); no heap round-trip.
+      fd_filestat_set_size: (fd: number, new_size: bigint): number => {
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setBigUint64(4, new_size, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_FILESTAT_SET_SIZE,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `fd_fdstat_set_flags`.
       //
       // Signature (lowered):

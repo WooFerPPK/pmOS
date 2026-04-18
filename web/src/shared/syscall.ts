@@ -283,6 +283,17 @@ export const OP_WASI = {
    * FdObject-variant rejection (WASI permits the call on any fd
    * type). */
   FD_FDSTAT_SET_FLAGS: 0x0025,
+  /** Wire-format identity for `fd_filestat_set_size`. WASI's
+   * equivalent of POSIX ftruncate: truncate or zero-extend a
+   * seekable fd to an exact byte count. Wire: fd at args[0..4],
+   * new_size u64 LE at args[4..12]. Vnode-only — char device /
+   * socket / pipe / signal-channel / display-connection fds are
+   * rejected with EINVAL (same non-Vnode guard as fd_seek /
+   * fd_tell / fd_filestat_set_times). Directory target passes
+   * through to tmpfs.truncate → IsADirectory → EISDIR;
+   * read-only filesystems (procfs) return EROFS. Shrinking
+   * discards tail bytes, extending past EOF zero-fills. */
+  FD_FILESTAT_SET_SIZE: 0x0028,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer

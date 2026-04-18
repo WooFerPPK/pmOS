@@ -469,6 +469,20 @@ impl Vfs {
         fs.truncate(ino, new_size)
     }
 
+    /// Truncate `(mount_id, ino)` directly. Mirrors [`Vfs::stat_ino`] /
+    /// [`Vfs::set_times_ino`]: the syscall layer already carries the
+    /// pair on a `Vnode` fd, so `fd_filestat_set_size` skips path
+    /// resolution by calling this instead of [`Vfs::truncate`].
+    pub fn truncate_ino(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+        new_size: u64,
+    ) -> Result<(), FsError> {
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.truncate(ino, new_size)
+    }
+
     /// Set atim and/or mtim on the vnode at `abs_path`. `None`
     /// means "leave this field unchanged". Pure passthrough to
     /// [`Filesystem::set_times`]; a zero-effect call (both
