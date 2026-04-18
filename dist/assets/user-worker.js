@@ -103,6 +103,24 @@ var OP_WASI = {
    * heap holds the UTF-8 path bytes. Threads through Vfs::unlink
    * (→ Filesystem::unlink on the owning mount). */
   PATH_UNLINK_FILE: 73,
+  /** Wire-format identity for `path_create_directory`. mkdir
+   * opcode; wire layout matches path_unlink_file. dir_fd at
+   * args[0..4] is ignored in v1; heap holds the UTF-8 path bytes.
+   * The kernel hard-codes mode 0o755 on the Vfs::mkdir call —
+   * WASI's mkdir signature has no mode argument. Branches:
+   * AlreadyExists → EEXIST, missing parent → ENOENT, devfs/procfs
+   * → EROFS, invalid UTF-8 → EINVAL. */
+  PATH_CREATE_DIRECTORY: 64,
+  /** Wire-format identity for `path_remove_directory`. rmdir
+   * opcode; wire layout matches path_unlink_file. dir_fd at
+   * args[0..4] is ignored in v1; heap holds the UTF-8 path bytes.
+   * Threads through Vfs::rmdir (→ Filesystem::rmdir on the owning
+   * mount). Branches: non-empty directory → ENOTEMPTY, regular
+   * file target → ENOTDIR (tmpfs.rmdir returns NotADirectory for a
+   * non-dir target — callers must use path_unlink_file for regular
+   * files), missing → ENOENT, devfs/procfs → EROFS, invalid UTF-8
+   * → EINVAL. */
+  PATH_REMOVE_DIRECTORY: 70,
   PATH_OPEN: 68,
   PROC_EXIT: 96,
   CLOCK_RES_GET: 16,
@@ -173,9 +191,13 @@ var OP_EXT = {
 var ERRNO = {
   EBADF: 8,
   ECONNREFUSED: 14,
+  EEXIST: 20,
   EINVAL: 28,
+  EISDIR: 31,
   ENOENT: 44,
   ENOSYS: 52,
+  ENOTDIR: 54,
+  ENOTEMPTY: 55,
   ENOTSUP: 58,
   EROFS: 69
 };
@@ -1081,6 +1103,61 @@ var UserWasmRuntime = class {
             opcode: OP_WASI.PATH_RENAME,
             requestId: 0,
             args,
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `path_create_directory`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, path_ptr: i32, path_len: i32) -> errno: i32
+      //
+      // mkdir opcode. Wire layout matches path_unlink_file. The
+      // kernel hard-codes mode 0o755 — WASI's mkdir signature has
+      // no mode argument. Threads through Vfs::mkdir on the owning
+      // mount; devfs + procfs return EROFS.
+      path_create_directory: (_dirfd, pathPtr, pathLen) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+        const heap = new Uint8Array(pathLen);
+        heap.set(pathBytes, 0);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+            requestId: 0,
+            arg0: 0,
+            // dir_fd ignored in v1
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `path_remove_directory`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, path_ptr: i32, path_len: i32) -> errno: i32
+      //
+      // rmdir opcode. Wire layout matches path_unlink_file. Strictly
+      // for directories — rmdir on a regular file returns ENOTDIR
+      // (tmpfs.rmdir returns NotADirectory for non-dir targets), and
+      // rmdir on a non-empty directory returns ENOTEMPTY. Callers
+      // must unlink file children first, then rmdir the container.
+      path_remove_directory: (_dirfd, pathPtr, pathLen) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+        const heap = new Uint8Array(pathLen);
+        heap.set(pathBytes, 0);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_REMOVE_DIRECTORY,
+            requestId: 0,
+            arg0: 0,
+            // dir_fd ignored in v1
             heapPtr: 0,
             heapLen: heap.length
           },

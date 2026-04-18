@@ -1305,6 +1305,233 @@ describe("dispatch: PATH_RENAME", () => {
   });
 });
 
+// ---- dispatch: PATH_CREATE_DIRECTORY + PATH_REMOVE_DIRECTORY -------
+//
+// mkdir + rmdir opcodes at 0x0040 + 0x0046. Wire layout matches
+// PATH_UNLINK_FILE (dir_fd at args[0..4], heap = UTF-8 path bytes).
+// The kernel threads through the existing Vfs::mkdir + Vfs::rmdir
+// methods; mkdir hard-codes mode 0o755. The TS tests pin the
+// wire-layout branches end-to-end through kernel.wasm: a happy-
+// path round-trip (mkdir then rmdir, confirming via PATH_FILESTAT_GET
+// that the directory was created and later removed), the ENOENT /
+// EROFS / EEXIST / ENOTEMPTY error branches.
+
+function encodePathDirArgs(dirFd: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, dirFd, true);
+  return args;
+}
+
+describe("dispatch: PATH_CREATE_DIRECTORY", () => {
+  it("creates a tmpfs directory visible to PATH_FILESTAT_GET", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/mkdir_td");
+    const { response: mk } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 920,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(mk.status).toBe(0);
+
+    // Verify the new directory exists via PATH_FILESTAT_GET.
+    const { response: st, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 921,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(st.status).toBe(0);
+    expect(st.extraLen).toBe(64);
+    const filestat = decodeFilestat(heapOut);
+    expect(filestat.filetype).toBe(FILETYPE.DIRECTORY);
+  });
+
+  it("returns -EEXIST when the target already exists", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/dup_dir");
+    // First call creates.
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 922,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    // Second call collides.
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 923,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(-ERRNO.EEXIST);
+  });
+
+  it("returns -EROFS on /dev (read-only filesystem)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/dev/newdir");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 924,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+});
+
+describe("dispatch: PATH_REMOVE_DIRECTORY", () => {
+  it("removes an empty directory created via PATH_CREATE_DIRECTORY", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/rmdir_td");
+    // Create.
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 930,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    // Remove.
+    const { response: rm } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_REMOVE_DIRECTORY,
+        requestId: 931,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(rm.status).toBe(0);
+
+    // Subsequent PATH_FILESTAT_GET should report ENOENT.
+    const { response: st } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 932,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(st.status).toBe(-ERRNO.ENOENT);
+  });
+
+  it("returns -ENOTEMPTY when the directory is not empty", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Populate /full with a subdirectory via two mkdir calls, then
+    // attempt rmdir on /full → ENOTEMPTY. v1's path_open doesn't
+    // have CREAT wired, so nested mkdir is the only way to seed a
+    // non-empty directory through the syscall dispatch surface.
+    const outer = new TextEncoder().encode("/full");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 933,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: outer.length,
+      },
+      outer,
+    );
+    const inner = new TextEncoder().encode("/full/inner");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 934,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: inner.length,
+      },
+      inner,
+    );
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_REMOVE_DIRECTORY,
+        requestId: 935,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: outer.length,
+      },
+      outer,
+    );
+    expect(response.status).toBe(-ERRNO.ENOTEMPTY);
+  });
+
+  it("returns -ENOENT for a path that does not exist", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/ghost_dir");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_REMOVE_DIRECTORY,
+        requestId: 936,
+        args: encodePathDirArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(-ERRNO.ENOENT);
+  });
+});
+
 // ---- dispatch: FD_RENUMBER -----------------------------------------
 //
 // WASI's dup2-spelling. Wire: (from, to) as two u32s at args[0..4]

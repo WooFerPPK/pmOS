@@ -3714,6 +3714,251 @@ fn path_rename_with_zero_new_path_returns_einval() {
     assert_eq!(resp.status, -errno::EINVAL);
 }
 
+// ---- path_create_directory / path_remove_directory -----------------
+//
+// mkdir + rmdir opcodes at 0x0040 + 0x0046. Both thread through the
+// existing Vfs API (`Vfs::mkdir` + `Vfs::rmdir`) — no new Vfs methods
+// and no Filesystem trait additions; each in-tree fs (tmpfs, devfs,
+// procfs, opfs) already implements the trait-level `mkdir` + `rmdir`
+// methods. The slice is purely syscall wiring, mirroring the shape
+// of path_unlink_file.
+//
+// Wire layouts match path_unlink_file: args[0..4] = dir_fd (ignored
+// in v1, no preopens); heap = UTF-8 path bytes; heap_len = path
+// length. PATH_CREATE_DIRECTORY hard-codes mode 0o755 — WASI's
+// mkdir signature has no mode argument, so the kernel picks a
+// sensible default for the new directory's permission bits.
+// Response: value = 0 on success; status = -errno on error.
+
+fn path_mkdir_args(dir_fd: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&dir_fd.to_le_bytes());
+    args
+}
+
+fn path_rmdir_args(dir_fd: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&dir_fd.to_le_bytes());
+    args
+}
+
+#[test]
+fn path_create_directory_creates_directory_on_tmpfs() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "mkdirer", 0);
+    let path = b"/newdir";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_CREATE_DIRECTORY,
+        flags: 0,
+        request_id: 910,
+        args: path_mkdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    let stat = k.vfs.stat("/newdir").expect("stat /newdir after mkdir");
+    assert_eq!(stat.ty, kernel::vfs::NodeType::Directory);
+}
+
+#[test]
+fn path_create_directory_on_existing_name_returns_eexist() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "mkdirer", 0);
+    k.vfs.create("/already", 0o644).expect("seed file");
+    let path = b"/already";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_CREATE_DIRECTORY,
+        flags: 0,
+        request_id: 911,
+        args: path_mkdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EEXIST);
+}
+
+#[test]
+fn path_create_directory_with_missing_parent_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "mkdirer", 0);
+    let path = b"/no/such/parent/child";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_CREATE_DIRECTORY,
+        flags: 0,
+        request_id: 912,
+        args: path_mkdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_create_directory_on_devfs_returns_erofs() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "mkdirer", 0);
+    let path = b"/dev/newdir";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_CREATE_DIRECTORY,
+        flags: 0,
+        request_id: 913,
+        args: path_mkdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
+#[test]
+fn path_create_directory_with_invalid_utf8_path_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "mkdirer", 0);
+    let mut heap = vec![0u8; 64];
+    heap[0] = 0xff;
+    heap[1] = 0xfe;
+
+    let req = Request {
+        opcode: op_wasi::PATH_CREATE_DIRECTORY,
+        flags: 0,
+        request_id: 914,
+        args: path_mkdir_args(0),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_remove_directory_removes_empty_directory() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rmdirer", 0);
+    k.vfs.mkdir("/emptydir", 0o755).expect("seed dir");
+    assert!(k.vfs.stat("/emptydir").is_ok(), "dir exists pre-call");
+    let path = b"/emptydir";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_REMOVE_DIRECTORY,
+        flags: 0,
+        request_id: 915,
+        args: path_rmdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(
+        k.vfs.stat("/emptydir").unwrap_err(),
+        kernel::vfs::FsError::NotFound,
+    );
+}
+
+#[test]
+fn path_remove_directory_on_non_empty_returns_enotempty() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rmdirer", 0);
+    k.vfs.mkdir("/fulldir", 0o755).expect("seed dir");
+    k.vfs.create("/fulldir/child", 0o644).expect("seed child");
+    let path = b"/fulldir";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_REMOVE_DIRECTORY,
+        flags: 0,
+        request_id: 916,
+        args: path_rmdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTEMPTY);
+}
+
+#[test]
+fn path_remove_directory_on_regular_file_returns_enotdir() {
+    // Calling rmdir on a regular file — tmpfs.rmdir returns
+    // NotADirectory which maps to ENOTDIR. WASI callers must use
+    // path_unlink_file for regular files instead.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rmdirer", 0);
+    k.vfs.create("/notadir.txt", 0o644).expect("seed file");
+    let path = b"/notadir.txt";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_REMOVE_DIRECTORY,
+        flags: 0,
+        request_id: 917,
+        args: path_rmdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTDIR);
+}
+
+#[test]
+fn path_remove_directory_on_missing_path_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rmdirer", 0);
+    let path = b"/nope";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_REMOVE_DIRECTORY,
+        flags: 0,
+        request_id: 918,
+        args: path_rmdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_remove_directory_on_devfs_returns_erofs() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rmdirer", 0);
+    let path = b"/dev/somedir";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_REMOVE_DIRECTORY,
+        flags: 0,
+        request_id: 919,
+        args: path_rmdir_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

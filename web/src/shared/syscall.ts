@@ -227,6 +227,24 @@ export const OP_WASI = {
    * heap holds the UTF-8 path bytes. Threads through Vfs::unlink
    * (→ Filesystem::unlink on the owning mount). */
   PATH_UNLINK_FILE: 0x0049,
+  /** Wire-format identity for `path_create_directory`. mkdir
+   * opcode; wire layout matches path_unlink_file. dir_fd at
+   * args[0..4] is ignored in v1; heap holds the UTF-8 path bytes.
+   * The kernel hard-codes mode 0o755 on the Vfs::mkdir call —
+   * WASI's mkdir signature has no mode argument. Branches:
+   * AlreadyExists → EEXIST, missing parent → ENOENT, devfs/procfs
+   * → EROFS, invalid UTF-8 → EINVAL. */
+  PATH_CREATE_DIRECTORY: 0x0040,
+  /** Wire-format identity for `path_remove_directory`. rmdir
+   * opcode; wire layout matches path_unlink_file. dir_fd at
+   * args[0..4] is ignored in v1; heap holds the UTF-8 path bytes.
+   * Threads through Vfs::rmdir (→ Filesystem::rmdir on the owning
+   * mount). Branches: non-empty directory → ENOTEMPTY, regular
+   * file target → ENOTDIR (tmpfs.rmdir returns NotADirectory for a
+   * non-dir target — callers must use path_unlink_file for regular
+   * files), missing → ENOENT, devfs/procfs → EROFS, invalid UTF-8
+   * → EINVAL. */
+  PATH_REMOVE_DIRECTORY: 0x0046,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
   CLOCK_RES_GET: 0x0010,
@@ -305,11 +323,13 @@ export const OP_EXT = {
 export const ERRNO = {
   EBADF: 8,
   ECONNREFUSED: 14,
+  EEXIST: 20,
   EINVAL: 28,
   EISDIR: 31,
   ENOENT: 44,
   ENOSYS: 52,
   ENOTDIR: 54,
+  ENOTEMPTY: 55,
   ENOTSUP: 58,
   EROFS: 69,
 } as const;

@@ -71,6 +71,8 @@ pub fn dispatch_wasi(
         op::FD_RENUMBER => handle_fd_renumber(kernel, pid, req),
         op::PATH_UNLINK_FILE => handle_path_unlink_file(kernel, pid, req, heap),
         op::PATH_RENAME => handle_path_rename(kernel, pid, req, heap),
+        op::PATH_CREATE_DIRECTORY => handle_path_create_directory(kernel, pid, req, heap),
+        op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
@@ -1421,6 +1423,71 @@ fn handle_path_rename(
         return Response::err(req.request_id, EINVAL);
     };
     match kernel.vfs.rename(old_path, new_path) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+// ---- path_create_directory / path_remove_directory ----------------
+//
+// mkdir + rmdir wire layout (both identical to path_unlink_file's):
+//   args[0..4]  = dir_fd (u32, ignored — v1 has no preopens)
+//   heap_ptr    = offset of UTF-8 path bytes
+//   heap_len    = length of the path
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// WASI's path_create_directory signature has no mode argument, so
+// v1 hard-codes mode 0o755 on the Vfs::mkdir call — standard
+// "owner rwx, everyone rx" for new directories. Userland that
+// wants a different mode uses path_filestat_set_times (WASI has
+// no chmod syscall in preview 1).
+//
+// Semantics thread through Vfs::mkdir / Vfs::rmdir: tmpfs mutates
+// its in-memory dir-tree (AlreadyExists → EEXIST, NotFound on
+// parent → ENOENT, NotEmpty → ENOTEMPTY, NotADirectory → ENOTDIR
+// for rmdir on a regular file); devfs + procfs return ReadOnly →
+// EROFS.
+
+fn handle_path_create_directory(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let _dir_fd = args_u32(req, 0);
+    let Some(path_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.mkdir(path, 0o755) {
+        Ok(_) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+fn handle_path_remove_directory(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let _dir_fd = args_u32(req, 0);
+    let Some(path_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.rmdir(path) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(
             req.request_id,

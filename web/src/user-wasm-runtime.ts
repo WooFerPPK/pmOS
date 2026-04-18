@@ -1033,6 +1033,69 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `path_create_directory`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, path_ptr: i32, path_len: i32) -> errno: i32
+      //
+      // mkdir opcode. Wire layout matches path_unlink_file. The
+      // kernel hard-codes mode 0o755 — WASI's mkdir signature has
+      // no mode argument. Threads through Vfs::mkdir on the owning
+      // mount; devfs + procfs return EROFS.
+      path_create_directory: (
+        _dirfd: number,
+        pathPtr: number,
+        pathLen: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+        const heap = new Uint8Array(pathLen);
+        heap.set(pathBytes, 0);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+            requestId: 0,
+            arg0: 0, // dir_fd ignored in v1
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+
+      // WASI `path_remove_directory`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, path_ptr: i32, path_len: i32) -> errno: i32
+      //
+      // rmdir opcode. Wire layout matches path_unlink_file. Strictly
+      // for directories — rmdir on a regular file returns ENOTDIR
+      // (tmpfs.rmdir returns NotADirectory for non-dir targets), and
+      // rmdir on a non-empty directory returns ENOTEMPTY. Callers
+      // must unlink file children first, then rmdir the container.
+      path_remove_directory: (
+        _dirfd: number,
+        pathPtr: number,
+        pathLen: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+        const heap = new Uint8Array(pathLen);
+        heap.set(pathBytes, 0);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_REMOVE_DIRECTORY,
+            requestId: 0,
+            arg0: 0, // dir_fd ignored in v1
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `fd_renumber`.
       //
       // Signature (lowered):
