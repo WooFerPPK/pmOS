@@ -871,30 +871,27 @@ var UserWasmRuntime = class {
       //                      //   in v1)
       //     path_ptr:  i32,
       //     path_len:  i32,
-      //     oflags:    i32,  // CREAT / TRUNC / DIRECTORY / EXCL
-      //                      //   — not wired on the PMos kernel
-      //                      //   side (`Kernel::path_open` takes
-      //                      //   only `FdFlags`), ignored for now
+      //     oflags:    i32,  // CREAT=0x01 / DIRECTORY=0x02 /
+      //                      //   EXCL=0x04 / TRUNC=0x08 — wired
+      //                      //   through to Kernel::path_open at
+      //                      //   args[4..6] as a u16.
       //     rights_base:       i64, // ignored (v1 rights model)
       //     rights_inheriting: i64, // ignored
       //     fdflags:   i32,  // APPEND / NONBLOCK / ... WASI bits
       //                      //   don't line up with PMos FdFlags
       //                      //   bits (different positions);
       //                      //   v1 userland passes 0 and the
-      //                      //   shim passes 0 through
+      //                      //   shim passes 0 through.
       //     fd_out_ptr: i32, // i32 out-pointer for the new fd
       //   ) -> errno: i32
       //
-      // The PMos `PATH_OPEN` opcode carries only `flags` (u32)
-      // and a UTF-8 `path` on the heap, so the shim ignores
-      // every argument WASI has that the kernel doesn't yet
-      // care about. When a future slice wires the other bits
-      // (preopens for `/home/user`, oflags for O_CREAT, the
-      // rights model for sandboxed apps), each becomes a new
-      // decode step here — no wire-format break because the
-      // kernel's `FD_READ` / `FD_WRITE` semantics are
-      // unchanged.
-      path_open: (_dirfd, _dirflags, pathPtr, pathLen, _oflags, _rightsBase, _rightsInheriting, _fdflags, fdOutPtr) => {
+      // The PMos `PATH_OPEN` opcode packs (fdflags u32, oflags u16,
+      // mode u16) into the 16-byte inline args window. The shim
+      // passes oflags in args[4..6]; `mode` is 0 because WASI's
+      // signature does not carry a mode field — the kernel
+      // substitutes the default `0o644` when CREAT fires with
+      // mode=0.
+      path_open: (_dirfd, _dirflags, pathPtr, pathLen, oflags, _rightsBase, _rightsInheriting, _fdflags, fdOutPtr) => {
         if (this.memory === void 0) {
           return ERRNO.EINVAL;
         }
@@ -904,12 +901,16 @@ var UserWasmRuntime = class {
           pathLen
         );
         const pathCopy = new Uint8Array(pathBytes);
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, 0, true);
+        argsView.setUint16(4, oflags & 65535, true);
+        argsView.setUint16(6, 0, true);
         const { response } = this.backend.dispatch(
           {
             opcode: OP_WASI.PATH_OPEN,
             requestId: 0,
-            arg0: 0,
-            // FdFlags::EMPTY — WASI fdflags not yet wired
+            args,
             heapPtr: 0,
             heapLen: pathLen
           },

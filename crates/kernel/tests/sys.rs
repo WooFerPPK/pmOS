@@ -158,7 +158,7 @@ fn path_open_on_regular_file_installs_vnode_fd() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/greeting", FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/greeting", 0, 0, FdFlags::EMPTY).unwrap();
     let table = k.fds(pid).unwrap();
     let entry = table.get(fd).unwrap();
     assert!(matches!(entry.object, FdObject::Vnode { .. }));
@@ -176,7 +176,7 @@ fn path_open_nonexistent_file_is_not_found() {
         })
         .unwrap();
     let err = k
-        .path_open(pid, "/missing", FdFlags::EMPTY)
+        .path_open(pid, "/missing", 0, 0, FdFlags::EMPTY)
         .unwrap_err();
     assert_eq!(err, KernelError::Fs(FsError::NotFound));
 }
@@ -199,12 +199,12 @@ fn fd_write_then_read_round_trips_through_tmpfs() {
     // Open once for writing, close, reopen for reading: this
     // matches the shape a real shell uses when redirecting
     // `>/notes.txt` then `cat /notes.txt`.
-    let wfd = k.path_open(pid, "/notes.txt", FdFlags::EMPTY).unwrap();
+    let wfd = k.path_open(pid, "/notes.txt", 0, 0, FdFlags::EMPTY).unwrap();
     let n = k.fd_write(pid, wfd, b"hello\n").unwrap();
     assert_eq!(n, 6);
     k.fd_close(pid, wfd).unwrap();
 
-    let rfd = k.path_open(pid, "/notes.txt", FdFlags::EMPTY).unwrap();
+    let rfd = k.path_open(pid, "/notes.txt", 0, 0, FdFlags::EMPTY).unwrap();
     let mut buf = [0u8; 16];
     let n = k.fd_read(pid, rfd, &mut buf).unwrap();
     assert_eq!(n, 6);
@@ -224,11 +224,11 @@ fn fd_read_advances_offset_across_multiple_calls() {
             cwd: "/",
         })
         .unwrap();
-    let wfd = k.path_open(pid, "/split.txt", FdFlags::EMPTY).unwrap();
+    let wfd = k.path_open(pid, "/split.txt", 0, 0, FdFlags::EMPTY).unwrap();
     k.fd_write(pid, wfd, b"abcdefghij").unwrap();
     k.fd_close(pid, wfd).unwrap();
 
-    let rfd = k.path_open(pid, "/split.txt", FdFlags::EMPTY).unwrap();
+    let rfd = k.path_open(pid, "/split.txt", 0, 0, FdFlags::EMPTY).unwrap();
     let mut buf = [0u8; 4];
     // Three consecutive partial reads consume the file in 4 /
     // 4 / 2 byte chunks, demonstrating that the fd's offset is
@@ -256,7 +256,7 @@ fn path_open_console_installs_chardevice_fd() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
     let entry = k.fds(pid).unwrap().get(fd).unwrap();
     assert_eq!(entry.object, FdObject::CharDevice(DEV_CONSOLE));
 }
@@ -274,7 +274,7 @@ fn path_open_fb0_refused_without_display_server_cap() {
         })
         .unwrap();
     let err = k
-        .path_open(pid, "/dev/fb0", FdFlags::EMPTY)
+        .path_open(pid, "/dev/fb0", 0, 0, FdFlags::EMPTY)
         .unwrap_err();
     assert_eq!(err, KernelError::NotCapable);
 }
@@ -290,7 +290,7 @@ fn path_open_fb0_allowed_with_display_server_cap() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/fb0", FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/fb0", 0, 0, FdFlags::EMPTY).unwrap();
     // It IS a chardev fd once opened; writes go through
     // DeviceDispatcher → Platform::driver_call which in the
     // native-platform test build is a no-op-Ok.
@@ -311,7 +311,7 @@ fn fd_read_chardevice_console_drains_injected_input() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
 
     k.devs.inject_console_input(b"ls\n");
     let mut buf = [0u8; 8];
@@ -331,7 +331,7 @@ fn fd_read_chardevice_console_empty_is_would_block() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
     let mut buf = [0u8; 4];
     let err = k.fd_read(pid, fd, &mut buf).unwrap_err();
     assert_eq!(err, KernelError::Dev(DevError::WouldBlock));
@@ -348,7 +348,7 @@ fn fd_write_chardevice_console_flushes_complete_lines() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, FdFlags::EMPTY).unwrap();
     k.fd_write(pid, fd, b"hello\n").unwrap();
     // Whole-line writes flush to the platform driver; the
     // in-kernel pending-line sink is empty.
@@ -372,7 +372,7 @@ fn fd_close_frees_the_slot() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/tmp.txt", FdFlags::EMPTY).unwrap();
+    let fd = k.path_open(pid, "/tmp.txt", 0, 0, FdFlags::EMPTY).unwrap();
     assert!(k.fds(pid).unwrap().is_open(fd));
     k.fd_close(pid, fd).unwrap();
     assert!(!k.fds(pid).unwrap().is_open(fd));
@@ -1078,7 +1078,7 @@ fn principle_viii_shell_can_source_a_script_file() {
             cwd: "/",
         })
         .unwrap();
-    let wfd = k.path_open(init, "/script.sh", FdFlags::EMPTY).unwrap();
+    let wfd = k.path_open(init, "/script.sh", 0, 0, FdFlags::EMPTY).unwrap();
     k.fd_write(init, wfd, b"echo first\necho second\nexit\n")
         .unwrap();
     k.fd_close(init, wfd).unwrap();
@@ -1093,7 +1093,7 @@ fn principle_viii_shell_can_source_a_script_file() {
             cwd: "/",
         })
         .unwrap();
-    let script_fd = k.path_open(sh, "/script.sh", FdFlags::EMPTY).unwrap();
+    let script_fd = k.path_open(sh, "/script.sh", 0, 0, FdFlags::EMPTY).unwrap();
     k.install_fd(sh, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
         .unwrap();
     k.install_fd(sh, 2, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
@@ -1548,4 +1548,230 @@ fn proc_exit_of_pending_client_leaves_listener_intact() {
         .transition(app_b, kernel::proc::ProcState::Running)
         .unwrap();
     let _fd_b = k.display_connect(app_b).unwrap();
+}
+
+// ---- path_open oflags (CREAT / DIRECTORY / EXCL / TRUNC) -------------
+//
+// Pre-slice, `Kernel::path_open` took only `FdFlags` and ignored WASI
+// `oflags` entirely: a CREAT-on-missing-path errored with ENOENT, a
+// TRUNC-on-existing-file left the bytes untouched, a DIRECTORY check
+// never fired. Post-slice, the signature grows `oflags: u16` + `mode:
+// u16` and honours the four POSIX-flavoured bits per the WASI spec.
+
+fn path_open_proc(k: &mut Kernel, name: &str) -> abi::ext::Pid {
+    k.register_process(RegisterArgs {
+        name,
+        ppid: 1,
+        caps: initial::ORDINARY_APP,
+        cwd: "/",
+    })
+    .unwrap()
+}
+
+#[test]
+fn path_open_creat_creates_new_file_and_returns_fd() {
+    // CREAT on a missing path should create a new regular file
+    // (mode 0o644 when mode=0) and install a Vnode fd.
+    let mut k = make_kernel();
+    let pid = path_open_proc(&mut k, "creater");
+
+    let fd = k
+        .path_open(pid, "/new.txt", abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
+        .unwrap();
+    let table = k.fds(pid).unwrap();
+    assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
+    // And the file shows up on stat.
+    let st = k.vfs.stat("/new.txt").unwrap();
+    assert!(st.ty.is_regular());
+    assert_eq!(st.size, 0);
+}
+
+#[test]
+fn path_open_creat_on_existing_file_opens_without_truncating() {
+    // CREAT on an existing path should NOT clobber — just open
+    // normally. A prior write of "hi" must still be readable.
+    let mut k = make_kernel();
+    k.vfs.create("/exists.txt", 0o644).unwrap();
+    k.vfs.write("/exists.txt", 0, b"hi").unwrap();
+    let pid = path_open_proc(&mut k, "creater2");
+
+    let fd = k
+        .path_open(pid, "/exists.txt", abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
+        .unwrap();
+    let mut buf = [0u8; 8];
+    let n = k.fd_read(pid, fd, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"hi");
+}
+
+#[test]
+fn path_open_creat_excl_on_existing_returns_already_exists() {
+    // CREAT | EXCL on an existing path must reject with
+    // AlreadyExists (→ EEXIST at the dispatcher layer).
+    let mut k = make_kernel();
+    k.vfs.create("/already.txt", 0o644).unwrap();
+    let pid = path_open_proc(&mut k, "creater3");
+
+    let err = k
+        .path_open(
+            pid,
+            "/already.txt",
+            abi::wasi::oflags::CREAT | abi::wasi::oflags::EXCL,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap_err();
+    assert_eq!(err, KernelError::Fs(FsError::AlreadyExists));
+}
+
+#[test]
+fn path_open_excl_without_creat_is_ignored_on_existing() {
+    // EXCL without CREAT has no effect per POSIX — the path is
+    // opened as if EXCL wasn't set.
+    let mut k = make_kernel();
+    k.vfs.create("/plain.txt", 0o644).unwrap();
+    let pid = path_open_proc(&mut k, "openerX");
+
+    let fd = k
+        .path_open(pid, "/plain.txt", abi::wasi::oflags::EXCL, 0, FdFlags::EMPTY)
+        .unwrap();
+    let table = k.fds(pid).unwrap();
+    assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
+}
+
+#[test]
+fn path_open_trunc_shrinks_existing_regular_file_to_zero() {
+    // TRUNC on an existing regular file zeroes the file before
+    // returning the fd. After open, a read from position 0
+    // should yield 0 bytes.
+    let mut k = make_kernel();
+    k.vfs.create("/data.bin", 0o644).unwrap();
+    k.vfs.write("/data.bin", 0, b"abcdef").unwrap();
+    assert_eq!(k.vfs.stat("/data.bin").unwrap().size, 6);
+    let pid = path_open_proc(&mut k, "truncater");
+
+    let fd = k
+        .path_open(pid, "/data.bin", abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
+        .unwrap();
+    // Stat now reports 0.
+    assert_eq!(k.vfs.stat("/data.bin").unwrap().size, 0);
+    let mut buf = [0u8; 8];
+    let n = k.fd_read(pid, fd, &mut buf).unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn path_open_trunc_on_directory_returns_is_a_directory() {
+    // TRUNC on a directory is meaningless per POSIX — EISDIR.
+    let mut k = make_kernel();
+    k.vfs.mkdir("/dir", 0o755).unwrap();
+    let pid = path_open_proc(&mut k, "truncDir");
+
+    let err = k
+        .path_open(pid, "/dir", abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
+        .unwrap_err();
+    assert_eq!(err, KernelError::Fs(FsError::IsADirectory));
+}
+
+#[test]
+fn path_open_directory_flag_on_regular_file_returns_not_a_directory() {
+    // DIRECTORY requires the final target to be a directory. A
+    // regular file with this flag set → ENOTDIR.
+    let mut k = make_kernel();
+    k.vfs.create("/file.txt", 0o644).unwrap();
+    let pid = path_open_proc(&mut k, "dirChecker");
+
+    let err = k
+        .path_open(
+            pid,
+            "/file.txt",
+            abi::wasi::oflags::DIRECTORY,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap_err();
+    assert_eq!(err, KernelError::Fs(FsError::NotADirectory));
+}
+
+#[test]
+fn path_open_directory_flag_on_directory_opens_normally() {
+    // DIRECTORY on an actual directory opens normally.
+    let mut k = make_kernel();
+    k.vfs.mkdir("/mydir", 0o755).unwrap();
+    let pid = path_open_proc(&mut k, "dirOpener");
+
+    let fd = k
+        .path_open(
+            pid,
+            "/mydir",
+            abi::wasi::oflags::DIRECTORY,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap();
+    let table = k.fds(pid).unwrap();
+    assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
+}
+
+#[test]
+fn path_open_creat_directory_returns_invalid_argument() {
+    // CREAT | DIRECTORY is a category error — use
+    // path_create_directory to create a directory. Reject before
+    // touching the fs.
+    let mut k = make_kernel();
+    let pid = path_open_proc(&mut k, "bad");
+
+    let err = k
+        .path_open(
+            pid,
+            "/anything",
+            abi::wasi::oflags::CREAT | abi::wasi::oflags::DIRECTORY,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap_err();
+    assert_eq!(err, KernelError::InvalidArgument);
+}
+
+#[test]
+fn path_open_creat_trunc_on_existing_file_truncates() {
+    // CREAT | TRUNC on an existing file opens it + truncates to 0.
+    // The combination is legal and common (`open(path, O_WRONLY |
+    // O_CREAT | O_TRUNC, 0o644)` — the libc shorthand for "make
+    // sure this exists and is empty").
+    let mut k = make_kernel();
+    k.vfs.create("/ct.txt", 0o644).unwrap();
+    k.vfs.write("/ct.txt", 0, b"old data").unwrap();
+    let pid = path_open_proc(&mut k, "ct");
+
+    let fd = k
+        .path_open(
+            pid,
+            "/ct.txt",
+            abi::wasi::oflags::CREAT | abi::wasi::oflags::TRUNC,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap();
+    assert_eq!(k.vfs.stat("/ct.txt").unwrap().size, 0);
+    let mut buf = [0u8; 8];
+    assert_eq!(k.fd_read(pid, fd, &mut buf).unwrap(), 0);
+}
+
+#[test]
+fn path_open_creat_in_readonly_fs_returns_read_only() {
+    // CREAT inside /dev (devfs) hits the Filesystem::create default
+    // which returns ReadOnly → EROFS.
+    let mut k = make_kernel();
+    let pid = path_open_proc(&mut k, "roCreat");
+
+    let err = k
+        .path_open(
+            pid,
+            "/dev/newfile",
+            abi::wasi::oflags::CREAT,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap_err();
+    assert_eq!(err, KernelError::Fs(FsError::ReadOnly));
 }

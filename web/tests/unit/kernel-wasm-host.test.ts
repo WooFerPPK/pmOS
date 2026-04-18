@@ -393,6 +393,221 @@ describe("dispatch: PATH_OPEN", () => {
   });
 });
 
+// ---- dispatch: PATH_OPEN oflags (CREAT / DIRECTORY / EXCL / TRUNC) -
+//
+// End-to-end through kernel.wasm: exercise the new args[4..6] u16
+// oflags decode. Pre-slice path_open ignored oflags entirely; post-
+// slice the kernel honours CREAT (create missing file), EXCL
+// (combined with CREAT, reject existing), TRUNC (zero existing
+// regular file), DIRECTORY (require dir target), and
+// CREAT|DIRECTORY (→ EINVAL).
+
+const OFLAG_CREAT = 0x0001;
+const OFLAG_DIRECTORY = 0x0002;
+const OFLAG_EXCL = 0x0004;
+const OFLAG_TRUNC = 0x0008;
+
+function encodePathOpenArgs(fdflags: number, oflags: number, mode: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fdflags >>> 0, true);
+  v.setUint16(4, oflags & 0xffff, true);
+  v.setUint16(6, mode & 0xffff, true);
+  return args;
+}
+
+describe("dispatch: PATH_OPEN oflags", () => {
+  it("creates a new regular file when CREAT is set on a missing path", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/new-via-creat.txt");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1140,
+        args: encodePathOpenArgs(0, OFLAG_CREAT, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(response.status).toBe(0);
+
+    // The file is now visible via PATH_FILESTAT_GET with filetype =
+    // REGULAR_FILE.
+    const { response: st, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1141,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(st.status).toBe(0);
+    expect(heapOut[16]).toBe(FILETYPE.REGULAR_FILE);
+  });
+
+  it("returns -EEXIST when CREAT|EXCL targets an existing path", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Seed /exists via CREAT.
+    const pathBytes = new TextEncoder().encode("/exists.txt");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1142,
+        args: encodePathOpenArgs(0, OFLAG_CREAT, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+
+    // CREAT|EXCL on the same path rejects.
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1143,
+        args: encodePathOpenArgs(0, OFLAG_CREAT | OFLAG_EXCL, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(response.status).toBe(-ERRNO.EEXIST);
+  });
+
+  it("returns -ENOTDIR when DIRECTORY targets a regular file", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /a-file via CREAT so it's a regular file.
+    const pathBytes = new TextEncoder().encode("/a-file");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1144,
+        args: encodePathOpenArgs(0, OFLAG_CREAT, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+
+    // DIRECTORY on the regular file → ENOTDIR.
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1145,
+        args: encodePathOpenArgs(0, OFLAG_DIRECTORY, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(response.status).toBe(-ERRNO.ENOTDIR);
+  });
+
+  it("returns -EINVAL for CREAT|DIRECTORY", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/would-be-dir");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1146,
+        args: encodePathOpenArgs(0, OFLAG_CREAT | OFLAG_DIRECTORY, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("TRUNC zeroes an existing regular file", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // CREAT then FD_WRITE some bytes.
+    const pathBytes = new TextEncoder().encode("/to-trunc");
+    const { response: openResp } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1147,
+        args: encodePathOpenArgs(0, OFLAG_CREAT, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(openResp.status).toBe(0);
+    const fd = Number(openResp.value);
+
+    const writeBuf = new TextEncoder().encode("hello");
+    const { response: wrResp } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 1148,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: writeBuf.length,
+      },
+      writeBuf,
+    );
+    expect(wrResp.status).toBe(0);
+
+    // Now re-open with TRUNC. The file should be 0 bytes post-open.
+    const { response: truncResp } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1149,
+        args: encodePathOpenArgs(0, OFLAG_TRUNC, 0),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(truncResp.status).toBe(0);
+
+    // Stat confirms size = 0.
+    const { response: st, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1150,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(st.status).toBe(0);
+    const size = new DataView(heapOut.buffer, heapOut.byteOffset).getBigUint64(32, true);
+    expect(size).toBe(0n);
+  });
+});
+
 // ---- dispatch: ENOSYS ----------------------------------------------
 
 describe("dispatch: ENOSYS", () => {

@@ -443,6 +443,12 @@ fn handle_fd_close(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 //   args[0..4]  = fd flags (u32, in WASI `fdflags` encoding —
 //                 APPEND=0x01, DSYNC=0x02, NONBLOCK=0x04,
 //                 RSYNC=0x08, SYNC=0x10)
+//   args[4..6]  = oflags (u16, WASI `oflags` encoding — CREAT=0x01,
+//                 DIRECTORY=0x02, EXCL=0x04, TRUNC=0x08)
+//   args[6..8]  = mode hint (u16, low 9 bits advisory permission
+//                 for a CREAT-created regular file; zero → default
+//                 0o644 applied kernel-side; ignored when CREAT
+//                 does not fire)
 //   heap_ptr    = start of UTF-8 path
 //   heap_len    = path length in bytes
 // Response:
@@ -450,18 +456,14 @@ fn handle_fd_close(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 //
 // The fdflags u32 is translated through `FdFlags::from_wasi_bits`
 // into PMos's internal encoding (which differs — PMos CLOEXEC=0x01,
-// NONBLOCK=0x02, APPEND=0x04). Prior to that helper landing, this
-// handler passed the WASI bits directly to `FdFlags::from_bits`,
-// which silently mis-mapped APPEND → CLOEXEC (dropping the fd on
-// proc_spawn), NONBLOCK → APPEND (mis-routing writes to EOF), etc.
-// DSYNC / RSYNC / SYNC are accepted and discarded since tmpfs is
-// synchronous; the helper ignores them.
+// NONBLOCK=0x02, APPEND=0x04). DSYNC / RSYNC / SYNC are accepted
+// and discarded since tmpfs is synchronous; the helper ignores them.
 //
-// oflags (CREAT/TRUNC/DIRECTORY/EXCL) are not yet wired on the
-// Kernel side (`Kernel::path_open` takes only `FdFlags`), so the
-// dispatcher doesn't decode them either. When the path-resolution
-// layer grows oflag support, this handler gains one more u32 at
-// args[4..8] without a wire-format break.
+// oflags govern creation / truncation / directory-require semantics
+// and are honoured by [`Kernel::path_open`] directly. CREAT |
+// DIRECTORY → EINVAL (use PATH_CREATE_DIRECTORY to create a
+// directory). EXCL without CREAT is ignored per POSIX. TRUNC on a
+// directory → EISDIR; TRUNC on a read-only fs → EROFS.
 
 fn handle_path_open(
     kernel: &mut Kernel,
@@ -471,13 +473,21 @@ fn handle_path_open(
 ) -> Response {
     let wasi_bits = args_u32(req, 0);
     let flags = FdFlags::from_wasi_bits(wasi_bits);
+    let oflags = {
+        let bytes = &req.args[4..6];
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    };
+    let mode = {
+        let bytes = &req.args[6..8];
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    };
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.path_open(pid, path, flags) {
+    match kernel.path_open(pid, path, oflags, mode, flags) {
         Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }

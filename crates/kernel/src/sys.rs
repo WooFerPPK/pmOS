@@ -303,20 +303,94 @@ impl Kernel {
 
     // --- path_open / fd_read / fd_write / fd_close ----------------
 
-    /// `path_open(pid, path, flags) -> fd`.
+    /// `path_open(pid, path, oflags, mode, flags) -> fd`.
     ///
-    /// Resolves `path` through the VFS, checks per-device
-    /// capabilities if the target is a character device, installs
-    /// a matching [`FdObject`] in the calling process's fd table,
-    /// and returns the fresh fd number.
+    /// Resolves `path` through the VFS honouring WASI `oflags`:
+    ///
+    /// * `CREAT=0x01` — if the path doesn't exist, create a regular
+    ///   file with the given `mode` before opening. When `mode` is 0
+    ///   the default `0o644` is applied. If the path exists, CREAT
+    ///   is a no-op (the file is opened normally).
+    /// * `EXCL=0x04` — combined with CREAT, rejects with
+    ///   [`FsError::AlreadyExists`] (→ EEXIST) if the path already
+    ///   exists. Standalone (without CREAT) it's ignored per POSIX.
+    /// * `TRUNC=0x08` — after open, truncate a regular file to
+    ///   length 0. Fails with [`FsError::IsADirectory`] (→ EISDIR)
+    ///   when applied to a directory and with
+    ///   [`FsError::ReadOnly`] (→ EROFS) on a read-only filesystem.
+    /// * `DIRECTORY=0x02` — require the final target to be a
+    ///   directory; otherwise [`FsError::NotADirectory`] (→
+    ///   ENOTDIR).
+    /// * `CREAT | DIRECTORY` — [`KernelError::InvalidArgument`] (→
+    ///   EINVAL). `path_create_directory` is the correct call.
+    ///
+    /// Caps + [`FdObject`] selection are unchanged from the pre-
+    /// oflags form. Returns the fresh fd number on success.
     pub fn path_open(
         &mut self,
         pid: Pid,
         path: &str,
+        oflags: u16,
+        mode: u16,
         flags: FdFlags,
     ) -> Result<u32, KernelError> {
+        use abi::wasi::oflags as wasi_oflags;
+
+        let creat = (oflags & wasi_oflags::CREAT) != 0;
+        let excl = (oflags & wasi_oflags::EXCL) != 0;
+        let trunc = (oflags & wasi_oflags::TRUNC) != 0;
+        let directory = (oflags & wasi_oflags::DIRECTORY) != 0;
+
+        if creat && directory {
+            return Err(KernelError::InvalidArgument);
+        }
+
         let caps = self.caps.list(pid)?;
-        let (mount_id, ino, ty) = self.vfs.open(path)?;
+
+        // Resolution phase: CREAT runs through a try-open-then-
+        // create flow; non-CREAT routes through the standard open.
+        let (mount_id, ino, ty) = if creat {
+            match self.vfs.open(path) {
+                Ok((m, i, t)) => {
+                    if excl {
+                        return Err(KernelError::Fs(crate::vfs::FsError::AlreadyExists));
+                    }
+                    (m, i, t)
+                }
+                Err(crate::vfs::FsError::NotFound) => {
+                    let effective_mode: u32 = if mode == 0 { 0o644 } else { mode as u32 };
+                    self.vfs.create(path, effective_mode)?;
+                    self.vfs.open(path)?
+                }
+                Err(e) => return Err(KernelError::Fs(e)),
+            }
+        } else {
+            self.vfs.open(path)?
+        };
+
+        if directory && ty != NodeType::Directory {
+            return Err(KernelError::Fs(crate::vfs::FsError::NotADirectory));
+        }
+
+        if trunc {
+            match ty {
+                NodeType::Directory => {
+                    return Err(KernelError::Fs(crate::vfs::FsError::IsADirectory));
+                }
+                NodeType::RegularFile => {
+                    self.vfs.truncate_ino(mount_id, ino, 0)?;
+                }
+                _ => {
+                    // Non-regular, non-directory targets (char devices,
+                    // symlinks, sockets, fifos) silently ignore TRUNC —
+                    // WASI doesn't specify behaviour there and POSIX
+                    // truncate on those is either a no-op or EINVAL
+                    // depending on the system. v1 picks "no-op" since
+                    // it matches Linux's open(O_TRUNC) on a char device.
+                }
+            }
+        }
+
         let object = match ty {
             NodeType::CharDevice(devnum) => {
                 DeviceDispatcher::check_open(devnum, caps)?;
