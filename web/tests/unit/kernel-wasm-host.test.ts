@@ -587,34 +587,39 @@ describe("dispatch: CLOCK_RES_GET", () => {
 // tmpfs file through the dispatch surface; the Rust tests already
 // pin those branches end-to-end.
 
-describe("dispatch: FD_FILESTAT_GET", () => {
-  function decodeFilestat(heapOut: Uint8Array): {
-    dev: bigint;
-    ino: bigint;
-    filetype: number;
-    nlink: bigint;
-    size: bigint;
-    atim: bigint;
-    mtim: bigint;
-    ctim: bigint;
-  } {
-    const view = new DataView(
-      heapOut.buffer,
-      heapOut.byteOffset,
-      heapOut.byteLength,
-    );
-    return {
-      dev: view.getBigUint64(0, true),
-      ino: view.getBigUint64(8, true),
-      filetype: view.getUint8(16),
-      nlink: view.getBigUint64(24, true),
-      size: view.getBigUint64(32, true),
-      atim: view.getBigUint64(40, true),
-      mtim: view.getBigUint64(48, true),
-      ctim: view.getBigUint64(56, true),
-    };
-  }
+/**
+ * Decode the 64-byte `filestat_t` wire layout into its u64/u8 fields.
+ * Shared by the FD_FILESTAT_GET and PATH_FILESTAT_GET describe blocks
+ * — both produce the same wire format.
+ */
+function decodeFilestat(heapOut: Uint8Array): {
+  dev: bigint;
+  ino: bigint;
+  filetype: number;
+  nlink: bigint;
+  size: bigint;
+  atim: bigint;
+  mtim: bigint;
+  ctim: bigint;
+} {
+  const view = new DataView(
+    heapOut.buffer,
+    heapOut.byteOffset,
+    heapOut.byteLength,
+  );
+  return {
+    dev: view.getBigUint64(0, true),
+    ino: view.getBigUint64(8, true),
+    filetype: view.getUint8(16),
+    nlink: view.getBigUint64(24, true),
+    size: view.getBigUint64(32, true),
+    atim: view.getBigUint64(40, true),
+    mtim: view.getBigUint64(48, true),
+    ctim: view.getBigUint64(56, true),
+  };
+}
 
+describe("dispatch: FD_FILESTAT_GET", () => {
   it("returns filetype=CHARACTER_DEVICE for a /dev/console fd", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
@@ -716,6 +721,95 @@ describe("dispatch: FD_FILESTAT_GET", () => {
     expect(st.mtim).toBe(0n);
     expect(st.ctim).toBe(0n);
     expect(st.filetype).toBe(FILETYPE.CHARACTER_DEVICE);
+  });
+});
+
+// ---- dispatch: PATH_FILESTAT_GET ------------------------------------
+//
+// The path-based sibling of FD_FILESTAT_GET. Dispatches stage the
+// path bytes into the kernel's heap-scratch region as `heapIn`; the
+// kernel reads the path, resolves it, and writes the 64-byte
+// `filestat_t` back into the same region. The TS tests cover the
+// three kernel branches the dispatch surface can reach without
+// standing up a tmpfs file through the syscall path: `/dev/console`
+// (char device), `/nonexistent` (ENOENT), and `/` (root directory).
+// The Rust tests pin the tmpfs-regular-file + tmpfs-directory paths
+// that need `Vfs::create` / `Vfs::mkdir` setup.
+
+describe("dispatch: PATH_FILESTAT_GET", () => {
+  function encodePath(s: string): Uint8Array {
+    return new TextEncoder().encode(s);
+  }
+
+  it("returns filetype=CHARACTER_DEVICE for /dev/console", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = encodePath("/dev/console");
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 740,
+        arg0: 0, // dir_fd — ignored
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(0);
+    expect(response.extraLen).toBe(64);
+    const st = decodeFilestat(heapOut);
+    expect(st.filetype).toBe(FILETYPE.CHARACTER_DEVICE);
+    expect(st.nlink).toBe(1n);
+    expect(st.size).toBe(0n);
+  });
+
+  it("returns -ENOENT for a path that does not resolve", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = encodePath("/nonexistent/path");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 741,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response.extraLen).toBe(0);
+  });
+
+  it("returns filetype=DIRECTORY for the root path /", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = encodePath("/");
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 742,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(0);
+    expect(response.extraLen).toBe(64);
+    const st = decodeFilestat(heapOut);
+    expect(st.filetype).toBe(FILETYPE.DIRECTORY);
+    // Root directory's nlink is 1 in tmpfs; size is 0 (directory).
+    expect(st.size).toBe(0n);
   });
 });
 

@@ -59,6 +59,7 @@ pub fn dispatch_wasi(
         op::ENVIRON_GET => handle_environ_get(req),
         op::FD_FDSTAT_GET => handle_fd_fdstat_get(kernel, pid, req, heap),
         op::FD_FILESTAT_GET => handle_fd_filestat_get(kernel, pid, req, heap),
+        op::PATH_FILESTAT_GET => handle_path_filestat_get(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
     }
@@ -592,6 +593,101 @@ fn handle_fd_filestat_get(
     buf[fs_off::OFF_ATIM..fs_off::OFF_ATIM + 8].copy_from_slice(&atim.to_le_bytes());
     buf[fs_off::OFF_MTIM..fs_off::OFF_MTIM + 8].copy_from_slice(&mtim.to_le_bytes());
     buf[fs_off::OFF_CTIM..fs_off::OFF_CTIM + 8].copy_from_slice(&ctim.to_le_bytes());
+
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: fs_off::SIZE as u32,
+        _pad: [0u8; 12],
+    }
+}
+
+// ---- path_filestat_get ------------------------------------------------
+//
+// Layout:
+//   args[0..4] = dir_fd (u32, ignored — v1 has no preopens, every
+//                path is treated as absolute)
+//   args[4..8] = lookup flags (u32, ignored — only
+//                LOOKUP_SYMLINK_FOLLOW=0x1 is defined, and v1's VFS
+//                doesn't follow symlinks either way, so the flag
+//                is a no-op regardless of its value)
+//   heap_ptr   = offset of the path bytes (input) AND of the 64-byte
+//                filestat_t (output). The handler reads the path
+//                first, then overwrites the same region with the
+//                filestat_t — the two windows share the heap ptr
+//                because [`Request`] only carries one heap region.
+//   heap_len   = length of the path bytes on input. The output is
+//                always `fs_off::SIZE` (64) bytes regardless of
+//                heap_len; the caller sizes heap_cap for >= 64.
+// Response:
+//   value     = 0
+//   extra_len = 64
+//
+// The path-based sibling of [`handle_fd_filestat_get`]. Reuses the
+// same `filestat_t` wire layout + [`filetype_from_nodetype`] helper
+// + [`Vfs::stat_ino`] accessor; the only genuinely new surface is
+// the path-string input decoding (same as [`handle_path_open`]) and
+// the different error path for a missing path (FsError::NotFound →
+// ENOENT via [`kerr_to_errno`]).
+//
+// Userland std code compiled for wasm32-wasip1 lowers
+// `std::fs::metadata(path)` through this opcode; PMos has no
+// preopens, so the path that arrives at the kernel is already the
+// absolute form the caller wrote in its source.
+fn handle_path_filestat_get(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    // dir_fd + lookup flags are part of the documented wire layout
+    // but unused in v1 (no preopens, no symlink following); the
+    // reads pin the layout so a future slice can use them without
+    // a wire-format break.
+    let _dir_fd = args_u32(req, 0);
+    let _lookup_flags = args_u32(req, 4);
+    let Some(path_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let (mount_id, ino) = match kernel.vfs.resolve(path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::err(
+                req.request_id,
+                kerr_to_errno(KernelError::Fs(e)),
+            )
+        }
+    };
+    let st = match kernel.vfs.stat_ino(mount_id, ino) {
+        Ok(s) => s,
+        Err(e) => {
+            return Response::err(
+                req.request_id,
+                kerr_to_errno(KernelError::Fs(e)),
+            )
+        }
+    };
+
+    let Some(buf) = heap_out_mut(req, heap, fs_off::SIZE) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    buf[..fs_off::SIZE].copy_from_slice(&[0u8; fs_off::SIZE]);
+    buf[fs_off::OFF_DEV..fs_off::OFF_DEV + 8]
+        .copy_from_slice(&(mount_id.0 as u64).to_le_bytes());
+    buf[fs_off::OFF_INO..fs_off::OFF_INO + 8].copy_from_slice(&st.ino.to_le_bytes());
+    buf[fs_off::OFF_FILETYPE] = filetype_from_nodetype(st.ty);
+    // bytes fs_off::OFF_FILETYPE+1 .. fs_off::OFF_NLINK stay zero
+    // (struct-alignment padding before the next u64 field).
+    buf[fs_off::OFF_NLINK..fs_off::OFF_NLINK + 8]
+        .copy_from_slice(&(st.nlink as u64).to_le_bytes());
+    buf[fs_off::OFF_SIZE..fs_off::OFF_SIZE + 8].copy_from_slice(&st.size.to_le_bytes());
+    buf[fs_off::OFF_ATIM..fs_off::OFF_ATIM + 8].copy_from_slice(&st.atime_ns.to_le_bytes());
+    buf[fs_off::OFF_MTIM..fs_off::OFF_MTIM + 8].copy_from_slice(&st.mtime_ns.to_le_bytes());
+    buf[fs_off::OFF_CTIM..fs_off::OFF_CTIM + 8].copy_from_slice(&st.ctime_ns.to_le_bytes());
 
     Response {
         request_id: req.request_id,

@@ -59,6 +59,7 @@ var OP_WASI = {
   FD_PRESTAT_GET: 43,
   FD_READ: 46,
   FD_WRITE: 52,
+  PATH_FILESTAT_GET: 65,
   PATH_OPEN: 68,
   PROC_EXIT: 96,
   CLOCK_RES_GET: 16,
@@ -631,6 +632,58 @@ var UserWasmRuntime = class {
           heapPtr: 0,
           heapLen: 64
         });
+        if (response.status !== 0) return -response.status;
+        const writeBuf = new Uint8Array(this.memory.buffer);
+        writeBuf.set(heapOut.subarray(0, 64), bufPtr);
+        return 0;
+      },
+      // WASI `path_filestat_get`.
+      //
+      // Signature (lowered):
+      //   path_filestat_get(
+      //     dirfd:     i32, // directory fd — ignored (v1 has no
+      //                     //   preopens; every path is absolute)
+      //     flags:     i32, // lookup flags — v1 accepts any value
+      //                     //   (LOOKUP_SYMLINK_FOLLOW=0x1 is a
+      //                     //   no-op since the VFS doesn't follow
+      //                     //   symlinks either way)
+      //     path_ptr:  i32,
+      //     path_len:  i32,
+      //     buf_ptr:   i32, // out-pointer for the 64-byte filestat_t
+      //   ) -> errno: i32
+      //
+      // Reads the path bytes from user memory and stages them into
+      // the kernel's heap-scratch region (input). The kernel reads
+      // the path, resolves it, and writes a 64-byte filestat_t back
+      // into the same heap region (input + output share the heap
+      // ptr since `Request` only carries one heap window). The shim
+      // then copies `heapOut` to user memory at `buf_ptr`. Mirrors
+      // the path-input shape of `path_open` + the output-copy shape
+      // of `fd_filestat_get`.
+      //
+      // Unblocks `std::fs::metadata(path)` for std binaries; the
+      // fd-based sibling (`fd_filestat_get`) already covers
+      // `File::metadata()`, but a lot of std code goes through the
+      // path variant directly.
+      path_filestat_get: (_dirfd, _flags, pathPtr, pathLen, bufPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(
+          this.memory.buffer,
+          pathPtr,
+          pathLen
+        );
+        const pathCopy = new Uint8Array(pathBytes);
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_FILESTAT_GET,
+            requestId: 0,
+            arg0: 0,
+            // dir_fd — ignored
+            heapPtr: 0,
+            heapLen: pathLen
+          },
+          pathCopy
+        );
         if (response.status !== 0) return -response.status;
         const writeBuf = new Uint8Array(this.memory.buffer);
         writeBuf.set(heapOut.subarray(0, 64), bufPtr);

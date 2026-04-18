@@ -1284,6 +1284,200 @@ fn fd_filestat_get_on_invalid_fd_returns_ebadf() {
     assert!(heap.iter().all(|&b| b == 0));
 }
 
+// ---- path_filestat_get ------------------------------------------------
+//
+// Path-based sibling of `fd_filestat_get`. Writes the same 64-byte
+// `filestat_t` wire layout; the only genuinely new surface is the
+// path-string input decoding and the ENOENT error path for a
+// missing path. `dir_fd` + `lookup_flags` are part of the documented
+// wire layout but are ignored in v1 (PMos has no preopens and the
+// v1 VFS doesn't follow symlinks either way). Reuses the `filestat_u64`
+// helper defined above the fd_filestat_get block.
+//
+// Five tests cover the reachable branches: tmpfs regular file with
+// a known size, tmpfs directory, char-device path (/dev/console),
+// missing path, and the root directory "/". A sixth test pins the
+// "dir_fd + flags are ignored" contract so a future slice that
+// wires them can't silently break the layout.
+
+fn path_filestat_args(dir_fd: u32, flags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&dir_fd.to_le_bytes());
+    args[4..8].copy_from_slice(&flags.to_le_bytes());
+    args
+}
+
+#[test]
+fn path_filestat_get_on_tmpfs_regular_file_returns_filetype_and_size() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pathstater", 0);
+    let bytes: &[u8] = b"hello, path_filestat_get";
+    k.vfs.create("/probe.txt", 0o644).expect("create");
+    let wrote = k.vfs.write("/probe.txt", 0, bytes).expect("write");
+    assert_eq!(wrote, bytes.len());
+    let (mount_id, ino) = k.vfs.resolve("/probe.txt").expect("resolve");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/probe.txt";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 720,
+        args: path_filestat_args(0, 0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 64);
+    assert_eq!(filestat_u64(&heap, 0, 0), mount_id.0 as u64, "dev");
+    assert_eq!(filestat_u64(&heap, 0, 8), ino, "ino");
+    assert_eq!(heap[16], 4, "filetype = regular_file");
+    assert_eq!(&heap[17..24], &[0u8; 7], "filetype padding");
+    assert_eq!(filestat_u64(&heap, 0, 24), 1, "nlink");
+    assert_eq!(filestat_u64(&heap, 0, 32), bytes.len() as u64, "size");
+    assert_eq!(filestat_u64(&heap, 0, 40), 0, "atim");
+    assert_eq!(filestat_u64(&heap, 0, 48), 0, "mtim");
+    assert_eq!(filestat_u64(&heap, 0, 56), 0, "ctim");
+}
+
+#[test]
+fn path_filestat_get_on_tmpfs_directory_returns_filetype_directory() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "dirpather", 0);
+    k.vfs.mkdir("/adir", 0o755).expect("mkdir");
+    let (mount_id, ino) = k.vfs.resolve("/adir").expect("resolve");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/adir";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 721,
+        args: path_filestat_args(0, 0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.extra_len, 64);
+    assert_eq!(filestat_u64(&heap, 0, 0), mount_id.0 as u64, "dev");
+    assert_eq!(filestat_u64(&heap, 0, 8), ino, "ino");
+    assert_eq!(heap[16], 3, "filetype = directory");
+    assert_eq!(filestat_u64(&heap, 0, 32), 0, "size (directory)");
+}
+
+#[test]
+fn path_filestat_get_on_dev_console_returns_filetype_char_device() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "devpather", 0);
+    let (mount_id, _ino) = k.vfs.resolve("/dev/console").expect("resolve");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/dev/console";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 722,
+        args: path_filestat_args(0, 0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.extra_len, 64);
+    assert_eq!(filestat_u64(&heap, 0, 0), mount_id.0 as u64, "dev");
+    assert_eq!(heap[16], 2, "filetype = character_device");
+    assert_eq!(filestat_u64(&heap, 0, 24), 1, "nlink");
+    assert_eq!(filestat_u64(&heap, 0, 32), 0, "size (char device)");
+}
+
+#[test]
+fn path_filestat_get_on_missing_path_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghost", 0);
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/nonexistent/path";
+    heap[..path.len()].copy_from_slice(path);
+    // Record the path prefix before dispatch so we can assert the
+    // handler did NOT overwrite it with filestat bytes on the error
+    // path (error responses must leave the heap-out region untouched
+    // so callers that reuse the buffer don't observe stale data).
+    let before: Vec<u8> = heap[..path.len()].to_vec();
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 723,
+        args: path_filestat_args(0, 0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+    assert_eq!(resp.extra_len, 0);
+    assert_eq!(&heap[..path.len()], &before[..], "heap untouched on error");
+}
+
+#[test]
+fn path_filestat_get_on_root_returns_filetype_directory_and_root_mount_id() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "rooter", 0);
+    let (mount_id, ino) = k.vfs.resolve("/").expect("resolve");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 724,
+        args: path_filestat_args(0, 0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(filestat_u64(&heap, 0, 0), mount_id.0 as u64, "dev = root mount id");
+    assert_eq!(filestat_u64(&heap, 0, 8), ino, "ino = root ino");
+    assert_eq!(heap[16], 3, "filetype = directory");
+}
+
+#[test]
+fn path_filestat_get_ignores_dir_fd_and_lookup_flags() {
+    // v1 has no preopens + no symlink following, so dir_fd and the
+    // LOOKUP_SYMLINK_FOLLOW flag (the only defined flag bit) are
+    // accepted with any value. Pass garbage for both and still get
+    // a successful stat against an absolute path.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ignorer", 0);
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/dev/console";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 725,
+        args: path_filestat_args(0xFFFF_FFFF, 0xDEAD_BEEF),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(heap[16], 2, "filetype = character_device");
+}
+
 // ---- fd_prestat_get ---------------------------------------------------
 
 #[test]
