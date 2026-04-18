@@ -539,3 +539,226 @@ fn readdir_reports_correct_types() {
     assert!(saw_dir);
     assert!(saw_file);
 }
+
+// ---- Symlink-aware path resolution --------------------------------
+//
+// Pre-slice `Vfs::resolve` stopped at whatever inode the filesystem
+// yielded for each path component, so a SymLink component short-
+// circuited the walk. Post-slice `resolve` follows symlinks (both
+// intermediate and final components) with a SYMLOOP_MAX-bounded
+// chain and delegates loop detection to `FsError::SymLoop → ELOOP`.
+// `resolve_nofollow` preserves the pre-slice behaviour so
+// `stat` / `readlink` keep their lstat-like semantics on a path
+// whose final component is itself a symlink.
+
+#[test]
+fn resolve_follows_single_absolute_symlink_to_regular_file() {
+    // /target is a regular file; /link is a symlink pointing at it.
+    // Post-slice, resolve("/link") returns /target's ino, not /link's.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/target", 0o644).unwrap();
+    vfs.write("/target", 0, b"hello").unwrap();
+    vfs.symlink("/target", "/link").unwrap();
+
+    let target_ino = vfs.resolve("/target").unwrap().1;
+    let link_ino = vfs.resolve("/link").unwrap().1;
+    assert_eq!(link_ino, target_ino, "resolve follows symlink to target");
+}
+
+#[test]
+fn resolve_nofollow_returns_symlink_ino() {
+    // resolve_nofollow preserves the pre-slice short-circuit: the
+    // symlink's own ino is returned, not the target's.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/target", 0o644).unwrap();
+    vfs.symlink("/target", "/link").unwrap();
+
+    let target_ino = vfs.resolve("/target").unwrap().1;
+    let link_ino = vfs.resolve_nofollow("/link").unwrap().1;
+    assert_ne!(link_ino, target_ino, "resolve_nofollow returns symlink's own ino");
+    // And its node type is SymLink.
+    let (mid, ino) = vfs.resolve_nofollow("/link").unwrap();
+    let st = vfs.stat_ino(mid, ino).unwrap();
+    assert!(st.ty.is_symlink());
+}
+
+#[test]
+fn resolve_follows_three_link_chain() {
+    // /a -> /b -> /c -> /target. resolve("/a") reaches /target in
+    // three hops without tripping SYMLOOP_MAX.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/target", 0o644).unwrap();
+    vfs.symlink("/target", "/c").unwrap();
+    vfs.symlink("/c", "/b").unwrap();
+    vfs.symlink("/b", "/a").unwrap();
+
+    let target_ino = vfs.resolve("/target").unwrap().1;
+    let a_ino = vfs.resolve("/a").unwrap().1;
+    assert_eq!(a_ino, target_ino);
+}
+
+#[test]
+fn resolve_follows_symlink_in_intermediate_component() {
+    // /realdir is a directory with a file; /linkdir is a symlink to
+    // /realdir. resolve("/linkdir/file") walks /linkdir as an
+    // intermediate component, follows to /realdir, then looks up
+    // "file" → /realdir/file.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.mkdir("/realdir", 0o755).unwrap();
+    vfs.create("/realdir/file", 0o644).unwrap();
+    vfs.symlink("/realdir", "/linkdir").unwrap();
+
+    let real_ino = vfs.resolve("/realdir/file").unwrap().1;
+    let via_link = vfs.resolve("/linkdir/file").unwrap().1;
+    assert_eq!(via_link, real_ino);
+}
+
+#[test]
+fn resolve_follows_relative_symlink_target() {
+    // /d/s is a symlink whose target is the relative string "t".
+    // POSIX says this resolves to /d/t (relative to the symlink's
+    // parent directory, not to cwd or /).
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.mkdir("/d", 0o755).unwrap();
+    vfs.create("/d/t", 0o644).unwrap();
+    vfs.symlink("t", "/d/s").unwrap();
+
+    let target = vfs.resolve("/d/t").unwrap().1;
+    let via_link = vfs.resolve("/d/s").unwrap().1;
+    assert_eq!(via_link, target);
+}
+
+#[test]
+fn resolve_follows_relative_symlink_with_dotdot() {
+    // /d1/s is a symlink whose target is "../d2/t". Post-slice this
+    // normalises to /d2/t relative to /d1's parent (which is /).
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.mkdir("/d1", 0o755).unwrap();
+    vfs.mkdir("/d2", 0o755).unwrap();
+    vfs.create("/d2/t", 0o644).unwrap();
+    vfs.symlink("../d2/t", "/d1/s").unwrap();
+
+    let target = vfs.resolve("/d2/t").unwrap().1;
+    let via_link = vfs.resolve("/d1/s").unwrap().1;
+    assert_eq!(via_link, target);
+}
+
+#[test]
+fn resolve_symlink_self_loop_returns_eloop() {
+    // /a -> /a. Following hits SYMLOOP_MAX immediately.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.symlink("/a", "/a").unwrap();
+
+    let err = vfs.resolve("/a").unwrap_err();
+    assert_eq!(err, FsError::SymLoop);
+}
+
+#[test]
+fn resolve_symlink_chain_loop_returns_eloop() {
+    // /a -> /b, /b -> /a. Hopping back and forth burns the budget.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.symlink("/b", "/a").unwrap();
+    vfs.symlink("/a", "/b").unwrap();
+
+    let err = vfs.resolve("/a").unwrap_err();
+    assert_eq!(err, FsError::SymLoop);
+}
+
+#[test]
+fn resolve_symlink_to_nonexistent_returns_not_found() {
+    // A dangling symlink: /link -> /nope. Following reaches lookup
+    // of "nope" in / which returns NotFound.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.symlink("/nope", "/link").unwrap();
+
+    let err = vfs.resolve("/link").unwrap_err();
+    assert_eq!(err, FsError::NotFound);
+}
+
+#[test]
+fn resolve_follows_symlink_across_mounts() {
+    // /tmp is a separate mount. /link on the root fs targets
+    // /tmp/target. Resolving /link must restart resolution from
+    // the VFS root so the mount table routes to /tmp's fs.
+    let mut vfs = fresh_vfs_full();
+    vfs.create("/tmp/target", 0o644).unwrap();
+    vfs.symlink("/tmp/target", "/link").unwrap();
+
+    let (tmp_mount, target_ino) = vfs.resolve("/tmp/target").unwrap();
+    let (via_link_mount, via_link_ino) = vfs.resolve("/link").unwrap();
+    assert_eq!(via_link_mount, tmp_mount);
+    assert_eq!(via_link_ino, target_ino);
+}
+
+#[test]
+fn stat_still_uses_lstat_semantics_for_final_symlink() {
+    // stat() on a path whose final component is a symlink reports
+    // the symlink's own stat (ty = SymLink), mirroring lstat().
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/target", 0o644).unwrap();
+    vfs.symlink("/target", "/link").unwrap();
+
+    let st = vfs.stat("/link").unwrap();
+    assert!(st.ty.is_symlink(), "stat reports SymLink on final symlink");
+}
+
+#[test]
+fn readlink_still_uses_nofollow() {
+    // readlink() on a symlink path returns the target bytes rather
+    // than following the link. The resolve_nofollow route is what
+    // lets readlink see the symlink's own ino.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.symlink("/some/target", "/mylink").unwrap();
+
+    let mut buf = [0u8; 32];
+    let n = vfs.readlink("/mylink", &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"/some/target");
+}
+
+#[test]
+fn unlink_of_symlink_removes_link_not_target() {
+    // unlink on a symlink path removes the symlink; the target file
+    // is untouched. resolve_parent's intermediate follow doesn't
+    // affect this because the final component of the link path is
+    // a symlink and resolve_parent treats it as a basename rather
+    // than resolving it.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/target", 0o644).unwrap();
+    vfs.write("/target", 0, b"data").unwrap();
+    vfs.symlink("/target", "/link").unwrap();
+
+    vfs.unlink("/link").unwrap();
+
+    // Target still exists.
+    assert!(vfs.stat("/target").is_ok());
+    // Link is gone.
+    let err = vfs.resolve_nofollow("/link").unwrap_err();
+    assert_eq!(err, FsError::NotFound);
+}
+
+#[test]
+fn read_via_symlink_returns_target_bytes() {
+    // Reading through a symlink path uses resolve (follow), so the
+    // read lands on the target file's bytes rather than failing
+    // with InvalidArgument on the symlink itself.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/target", 0o644).unwrap();
+    vfs.write("/target", 0, b"bytes").unwrap();
+    vfs.symlink("/target", "/link").unwrap();
+
+    let mut buf = [0u8; 8];
+    let n = vfs.read("/link", 0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"bytes");
+}
+
+#[test]
+fn open_follows_symlink_reports_target_filetype() {
+    // Vfs::open returns (mount, ino, NodeType). For /link → /target
+    // (regular file), open reports the target's type, not SymLink.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.create("/target", 0o644).unwrap();
+    vfs.symlink("/target", "/link").unwrap();
+
+    let (_m, _i, ty) = vfs.open("/link").unwrap();
+    assert_eq!(ty, NodeType::RegularFile);
+}

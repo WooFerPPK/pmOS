@@ -119,6 +119,12 @@ impl MountTable {
         None
     }
 
+    /// Return the normalised mountpoint path for a mount id, or
+    /// `None` if no such mount is installed.
+    pub fn mountpoint_of(&self, id: MountId) -> Option<&str> {
+        self.mounts.iter().find(|m| m.id == id).map(|m| m.mountpoint.as_str())
+    }
+
     /// Iterate mount metadata (id + mountpoint string) in the
     /// current sort order (longest first).
     pub fn iter(&self) -> impl Iterator<Item = (MountId, &str)> + '_ {

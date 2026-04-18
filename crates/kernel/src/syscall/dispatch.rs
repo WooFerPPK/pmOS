@@ -204,6 +204,7 @@ fn fs_err_to_errno(err: FsError) -> i32 {
         FsError::InvalidArgument => EINVAL,
         FsError::PermissionDenied => EACCES,
         FsError::ReadOnly => EROFS,
+        FsError::SymLoop => errno::ELOOP,
     }
 }
 

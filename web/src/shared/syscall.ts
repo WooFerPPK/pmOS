@@ -459,6 +459,10 @@ export const ERRNO = {
   EEXIST: 20,
   EINVAL: 28,
   EISDIR: 31,
+  /** Too many levels of symbolic links. Returned from path
+   * resolution when a symlink chain exceeds SYMLOOP_MAX (40).
+   * Mirrors `abi::errno::ELOOP`. */
+  ELOOP: 32,
   ENOENT: 44,
   ENOSYS: 52,
   ENOTDIR: 54,

@@ -35,6 +35,12 @@ use crate::vfs::NodeType;
 
 use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno};
 
+/// WASI lookupflags bit that requests symlink dereferencing on the
+/// final path component. Intermediate components always follow
+/// symlinks in [`Vfs::resolve`]; this flag only governs the last
+/// component. Unset → lstat-like (don't follow final symlink).
+const LOOKUP_SYMLINK_FOLLOW: u32 = 0x1;
+
 /// Dispatch a request whose opcode is in the WASI preview 1 range.
 /// The caller has already guarded with [`abi::wasi::is_wasi`].
 pub fn dispatch_wasi(
@@ -908,10 +914,13 @@ fn handle_fd_filestat_get(
 // Layout:
 //   args[0..4] = dir_fd (u32, ignored — v1 has no preopens, every
 //                path is treated as absolute)
-//   args[4..8] = lookup flags (u32, ignored — only
-//                LOOKUP_SYMLINK_FOLLOW=0x1 is defined, and v1's VFS
-//                doesn't follow symlinks either way, so the flag
-//                is a no-op regardless of its value)
+//   args[4..8] = lookup flags (u32; the only defined bit is
+//                LOOKUP_SYMLINK_FOLLOW=0x1. When set, the final
+//                path component is dereferenced if it's a symlink
+//                — POSIX stat semantics. When unset, the final
+//                component is NOT dereferenced — POSIX lstat
+//                semantics. Intermediate components always follow
+//                symlinks; only the final one is flag-governed.)
 //   heap_ptr   = offset of the path bytes (input) AND of the 64-byte
 //                filestat_t (output). The handler reads the path
 //                first, then overwrites the same region with the
@@ -941,19 +950,26 @@ fn handle_path_filestat_get(
     req: &Request,
     heap: &mut [u8],
 ) -> Response {
-    // dir_fd + lookup flags are part of the documented wire layout
-    // but unused in v1 (no preopens, no symlink following); the
-    // reads pin the layout so a future slice can use them without
-    // a wire-format break.
+    // dir_fd still unused in v1 (no preopens). lookup_flags drives
+    // symlink-follow behaviour per WASI: bit 0 set → follow final
+    // symlink (stat), unset → don't (lstat). Intermediate
+    // symlinks always follow regardless — that's implicit in
+    // Vfs::resolve vs. resolve_nofollow.
     let _dir_fd = args_u32(req, 0);
-    let _lookup_flags = args_u32(req, 4);
+    let lookup_flags = args_u32(req, 4);
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    let (mount_id, ino) = match kernel.vfs.resolve(path) {
+    let follow = (lookup_flags & LOOKUP_SYMLINK_FOLLOW) != 0;
+    let resolved = if follow {
+        kernel.vfs.resolve(path)
+    } else {
+        kernel.vfs.resolve_nofollow(path)
+    };
+    let (mount_id, ino) = match resolved {
         Ok(p) => p,
         Err(e) => {
             return Response::err(

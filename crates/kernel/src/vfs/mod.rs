@@ -160,6 +160,9 @@ pub enum FsError {
     PermissionDenied,
     /// Read-only filesystem.
     ReadOnly,
+    /// Path resolution encountered a symlink loop or chain longer
+    /// than [`Vfs::SYMLOOP_MAX`]. Maps to ELOOP at the syscall layer.
+    SymLoop,
 }
 
 /// The interface every concrete filesystem implements.
@@ -348,10 +351,29 @@ impl Vfs {
         self.mounts.len()
     }
 
-    /// Resolve an absolute path to `(mount_id, ino)`. Follows
-    /// component lookups through the owning filesystem. Does
-    /// not follow symlinks in v1.
+    /// Maximum number of symlink dereferences on a single resolve
+    /// before `FsError::SymLoop` is returned. POSIX requires at
+    /// least SYMLOOP_MAX=8; v1 uses 40 to match Linux's
+    /// MAXSYMLINKS default so an unusual but legitimate deep chain
+    /// doesn't fail.
+    pub const SYMLOOP_MAX: u32 = 40;
+
+    /// Resolve an absolute path to `(mount_id, ino)`, following
+    /// symlinks for both intermediate and final components.
+    /// Bounded by [`Vfs::SYMLOOP_MAX`]; exceeds the budget →
+    /// `FsError::SymLoop` (→ `ELOOP` at the syscall layer).
     pub fn resolve(&mut self, abs_path: &str) -> Result<(MountId, Ino), FsError> {
+        self.resolve_inner(abs_path, true, Self::SYMLOOP_MAX)
+    }
+
+    /// Resolve an absolute path to `(mount_id, ino)` without
+    /// following any symlinks. Preserves the pre-slice short-
+    /// circuit: if any component resolves to a SymLink vnode, the
+    /// walk continues as if the filesystem had returned that ino
+    /// verbatim. Used by lstat-like callers — `stat` and
+    /// `readlink` — so the final symlink stays addressable
+    /// through its own ino.
+    pub fn resolve_nofollow(&mut self, abs_path: &str) -> Result<(MountId, Ino), FsError> {
         let canon = path::normalize(abs_path);
         let (mount_id, rel) = self
             .mounts
@@ -361,6 +383,88 @@ impl Vfs {
         let mut ino = fs.root();
         for component in path::components(&rel) {
             ino = fs.lookup(ino, component)?;
+        }
+        Ok((mount_id, ino))
+    }
+
+    fn resolve_inner(
+        &mut self,
+        abs_path: &str,
+        follow_last: bool,
+        follows_left: u32,
+    ) -> Result<(MountId, Ino), FsError> {
+        let canon = path::normalize(abs_path);
+        let (mount_id, rel) = self
+            .mounts
+            .longest_prefix(&canon)
+            .ok_or(FsError::NotFound)?;
+        let components: Vec<&str> = path::components(&rel).collect();
+        let n = components.len();
+
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        let mut ino = fs.root();
+        if n == 0 {
+            return Ok((mount_id, ino));
+        }
+
+        for (i, comp) in components.iter().enumerate() {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            ino = fs.lookup(ino, comp)?;
+            let is_last = i + 1 == n;
+            let should_follow = !is_last || follow_last;
+            if !should_follow {
+                continue;
+            }
+            let st = fs.stat(ino)?;
+            if st.ty != NodeType::SymLink {
+                continue;
+            }
+            if follows_left == 0 {
+                return Err(FsError::SymLoop);
+            }
+            // Fetch the target bytes. POSIX PATH_MAX is 4096;
+            // any target longer than that is `ENAMETOOLONG` in
+            // principle, but v1's filesystems already cap the
+            // target string on symlink() and readlink truncates
+            // silently, so a simple fixed buffer is fine.
+            let mut buf = [0u8; 4096];
+            let target_len = fs.readlink(ino, &mut buf)?;
+            let target = core::str::from_utf8(&buf[..target_len])
+                .map_err(|_| FsError::InvalidArgument)?;
+
+            // Rebuild the path to re-resolve. For an absolute
+            // target, `new_path = target + remainder`. For a
+            // relative target, the symlink's *parent directory*
+            // (in the VFS path namespace, i.e. mount prefix +
+            // components up to but not including the symlink)
+            // is the base.
+            let mut new_path = String::new();
+            if target.starts_with('/') {
+                new_path.push_str(target);
+            } else {
+                let mount_prefix = self
+                    .mounts
+                    .mountpoint_of(mount_id)
+                    .ok_or(FsError::NotFound)?;
+                new_path.push_str(mount_prefix);
+                for prefix_comp in &components[..i] {
+                    if !new_path.ends_with('/') {
+                        new_path.push('/');
+                    }
+                    new_path.push_str(prefix_comp);
+                }
+                if !new_path.ends_with('/') {
+                    new_path.push('/');
+                }
+                new_path.push_str(target);
+            }
+            for tail in &components[i + 1..] {
+                if !new_path.ends_with('/') {
+                    new_path.push('/');
+                }
+                new_path.push_str(tail);
+            }
+            return self.resolve_inner(&new_path, follow_last, follows_left - 1);
         }
         Ok((mount_id, ino))
     }
@@ -529,22 +633,28 @@ impl Vfs {
         fs.symlink(parent_ino, &name, target)
     }
 
-    /// Copy the symlink target at `abs_path` into `out`. Resolves the
-    /// path (which does NOT dereference symlinks in v1 — the final
-    /// component stays a symlink rather than being followed), then
-    /// dispatches to [`Filesystem::readlink`] on the owning mount.
-    /// tmpfs returns the target string; devfs / procfs / opfs inherit
-    /// the default (`NotSupported` → ENOTSUP). A non-symlink target
-    /// returns `InvalidArgument` → EINVAL.
+    /// Copy the symlink target at `abs_path` into `out`. Uses
+    /// [`Vfs::resolve_nofollow`] so the final component — expected
+    /// to be a symlink — is not dereferenced before the readlink
+    /// call. Dispatches to [`Filesystem::readlink`] on the owning
+    /// mount; tmpfs returns the target string; devfs / procfs /
+    /// opfs inherit the default (`NotSupported` → ENOTSUP). A
+    /// non-symlink target returns `InvalidArgument` → EINVAL.
     pub fn readlink(&mut self, abs_path: &str, out: &mut [u8]) -> Result<usize, FsError> {
-        let (mount_id, ino) = self.resolve(abs_path)?;
+        let (mount_id, ino) = self.resolve_nofollow(abs_path)?;
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         fs.readlink(ino, out)
     }
 
-    /// Stat an absolute path.
+    /// Stat an absolute path. Uses [`Vfs::resolve_nofollow`] so a
+    /// path whose final component is itself a symlink reports the
+    /// symlink's own metadata (ty = SymLink), matching POSIX lstat
+    /// semantics. Callers that want POSIX stat semantics — follow
+    /// the final symlink — should resolve the path themselves via
+    /// [`Vfs::resolve`] and call [`Vfs::stat_ino`] on the
+    /// resulting `(mount, ino)` pair.
     pub fn stat(&mut self, abs_path: &str) -> Result<FileStat, FsError> {
-        let (mount_id, ino) = self.resolve(abs_path)?;
+        let (mount_id, ino) = self.resolve_nofollow(abs_path)?;
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         fs.stat(ino)
     }

@@ -1638,6 +1638,228 @@ describe("dispatch: PATH_SYMLINK", () => {
   });
 });
 
+// ---- dispatch: PATH_FILESTAT_GET symlink-follow lookup flags --------
+//
+// End-to-end through kernel.wasm: exercise the new
+// LOOKUP_SYMLINK_FOLLOW=0x1 bit on PATH_FILESTAT_GET's lookup_flags
+// arg. Prior to the symlink-aware-resolve slice, Vfs::resolve never
+// followed symlinks and the flag was a no-op; post-slice, bit-0 set
+// routes through Vfs::resolve (follow), bit-0 clear routes through
+// Vfs::resolve_nofollow (lstat). Creates a /target + /link pair via
+// PATH_CREATE_DIRECTORY + PATH_SYMLINK, then asserts the two branches
+// return the right filetype. Also pins ELOOP end-to-end on a self-
+// referential symlink (`/a → /a`) with follow requested.
+
+function encodePathFilestatArgs(dirFd: number, lookupFlags: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, dirFd, true);
+  v.setUint32(4, lookupFlags, true);
+  return args;
+}
+
+describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
+  it("returns target filetype when LOOKUP_SYMLINK_FOLLOW is set", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /target as a directory so the target-vs-symlink filetype
+    // is unambiguous (directory = 3, symbolic_link = 7).
+    const dirPath = new TextEncoder().encode("/target");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1130,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: dirPath.length,
+      },
+      dirPath,
+    );
+
+    // Create /link → /target.
+    const mkHeap = encodePathSymlinkHeap("/target", "/link");
+    const mk = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1131,
+        args: encodePathSymlinkArgs("/target".length),
+        heapPtr: 0,
+        heapLen: mkHeap.length,
+      },
+      mkHeap,
+    );
+    expect(mk.response.status).toBe(0);
+
+    // Stat /link with lookup_flags=0x1 — follow the final symlink.
+    const linkPath = new TextEncoder().encode("/link");
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1132,
+        args: encodePathFilestatArgs(0, 0x1),
+        heapPtr: 0,
+        heapLen: linkPath.length,
+      },
+      linkPath,
+    );
+    expect(response.status).toBe(0);
+    expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
+  });
+
+  it("returns symlink filetype when LOOKUP_SYMLINK_FOLLOW is clear", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const dirPath = new TextEncoder().encode("/target");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1133,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: dirPath.length,
+      },
+      dirPath,
+    );
+
+    const mkHeap = encodePathSymlinkHeap("/target", "/link");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1134,
+        args: encodePathSymlinkArgs("/target".length),
+        heapPtr: 0,
+        heapLen: mkHeap.length,
+      },
+      mkHeap,
+    );
+
+    // Stat /link with lookup_flags=0 — lstat-like, final symlink
+    // is not dereferenced.
+    const linkPath = new TextEncoder().encode("/link");
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1135,
+        args: encodePathFilestatArgs(0, 0x0),
+        heapPtr: 0,
+        heapLen: linkPath.length,
+      },
+      linkPath,
+    );
+    expect(response.status).toBe(0);
+    expect(heapOut[16]).toBe(FILETYPE.SYMBOLIC_LINK);
+  });
+
+  it("returns -ELOOP when following a self-referential symlink", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /a → /a: a direct self-loop. SYMLOOP_MAX (40) hops
+    // exhaust the budget and the resolver returns SymLoop → ELOOP.
+    const mkHeap = encodePathSymlinkHeap("/a", "/a");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1136,
+        args: encodePathSymlinkArgs("/a".length),
+        heapPtr: 0,
+        heapLen: mkHeap.length,
+      },
+      mkHeap,
+    );
+
+    const probe = new TextEncoder().encode("/a");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1137,
+        args: encodePathFilestatArgs(0, 0x1),
+        heapPtr: 0,
+        heapLen: probe.length,
+      },
+      probe,
+    );
+    expect(response.status).toBe(-ERRNO.ELOOP);
+  });
+
+  it("reaches target through a three-link chain when follow is set", async () => {
+    // /target (regular file) ← /c ← /b ← /a. Statting /a with follow
+    // should trace the whole chain and land on the regular-file
+    // filetype. This pins the transitive-follow behaviour — not just
+    // single-level follow — end-to-end.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /target as a regular file via PATH_OPEN with fdflags=0.
+    // path_open auto-creates when the fs's create() is the path used
+    // by the handler; here the cleanest way is to write a zero-byte
+    // file using FD_WRITE on a newly-installed fd. But v1's path_open
+    // is open-existing-only (oflags ignored) — so use
+    // PATH_CREATE_DIRECTORY won't work (we want a regular file). The
+    // tmpfs-side `Vfs::create` is not userland-facing.
+    //
+    // Workaround: use PATH_SYMLINK to create /c → /target where
+    // /target is a *directory* (simpler to create). Then /b → /c,
+    // /a → /b. The terminal filetype will be DIRECTORY.
+    const dirPath = new TextEncoder().encode("/target");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1138,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: dirPath.length,
+      },
+      dirPath,
+    );
+
+    for (const [target, link] of [["/target", "/c"], ["/c", "/b"], ["/b", "/a"]] as const) {
+      const heap = encodePathSymlinkHeap(target, link);
+      host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.PATH_SYMLINK,
+          requestId: 1140,
+          args: encodePathSymlinkArgs(target.length),
+          heapPtr: 0,
+          heapLen: heap.length,
+        },
+        heap,
+      );
+    }
+
+    const probe = new TextEncoder().encode("/a");
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1141,
+        args: encodePathFilestatArgs(0, 0x1),
+        heapPtr: 0,
+        heapLen: probe.length,
+      },
+      probe,
+    );
+    expect(response.status).toBe(0);
+    expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
+  });
+});
+
 // ---- dispatch: PATH_READLINK ---------------------------------------
 //
 // Symlink-dereference opcode at 0x0045. Wire packs dir_fd at args[0..4]

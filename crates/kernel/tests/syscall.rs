@@ -1588,11 +1588,13 @@ fn path_filestat_get_on_root_returns_filetype_directory_and_root_mount_id() {
 }
 
 #[test]
-fn path_filestat_get_ignores_dir_fd_and_lookup_flags() {
-    // v1 has no preopens + no symlink following, so dir_fd and the
-    // LOOKUP_SYMLINK_FOLLOW flag (the only defined flag bit) are
-    // accepted with any value. Pass garbage for both and still get
-    // a successful stat against an absolute path.
+fn path_filestat_get_ignores_dir_fd() {
+    // v1 has no preopens, so dir_fd is accepted with any value.
+    // Non-symlink targets are unaffected by the lookup_flags
+    // SYMLINK_FOLLOW bit (follow-vs-nofollow is a no-op on a
+    // regular char device). Pass garbage for dir_fd and a flag
+    // set whose bit-0 is 1 (follow); the handler still returns
+    // the right stat.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "ignorer", 0);
 
@@ -1611,6 +1613,91 @@ fn path_filestat_get_ignores_dir_fd_and_lookup_flags() {
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
     assert_eq!(heap[16], 2, "filetype = character_device");
+}
+
+#[test]
+fn path_filestat_get_with_symlink_follow_reaches_target_stat() {
+    // Build /target (regular file) + /link (symlink to /target),
+    // dispatch PATH_FILESTAT_GET with lookup_flags bit 0 set
+    // (LOOKUP_SYMLINK_FOLLOW) on "/link", assert the returned
+    // filestat's filetype field is regular-file (4), not symlink
+    // (7). Post-slice this is the stat-semantics route into
+    // Vfs::resolve.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symfollow", 0);
+    k.vfs.create("/target", 0o644).expect("create target");
+    k.vfs.symlink("/target", "/link").expect("symlink");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/link";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 1130,
+        args: path_filestat_args(0, 0x1),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(heap[16], 4, "filetype = regular_file (followed to target)");
+}
+
+#[test]
+fn path_filestat_get_without_symlink_follow_returns_symlink_filetype() {
+    // Same /target + /link setup; lookup_flags = 0 is the
+    // lstat route — the final symlink component is NOT
+    // dereferenced, so the returned filetype is symbolic_link
+    // (7). This pins the pre-slice default behaviour: a caller
+    // that doesn't opt in to follow keeps lstat semantics.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "lstatter", 0);
+    k.vfs.create("/target", 0o644).expect("create target");
+    k.vfs.symlink("/target", "/link").expect("symlink");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/link";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 1131,
+        args: path_filestat_args(0, 0x0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(heap[16], 7, "filetype = symbolic_link (no follow)");
+}
+
+#[test]
+fn path_filestat_get_with_follow_on_symlink_loop_returns_eloop() {
+    // /a -> /a self-loop. With LOOKUP_SYMLINK_FOLLOW set, the
+    // resolver walks SYMLOOP_MAX hops and returns ELOOP. The
+    // error propagates through fs_err_to_errno's new SymLoop
+    // arm to abi::errno::ELOOP (32).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "looper", 0);
+    k.vfs.symlink("/a", "/a").expect("self-loop symlink");
+
+    let mut heap = vec![0u8; 128];
+    let path = b"/a";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_FILESTAT_GET,
+        flags: 0,
+        request_id: 1132,
+        args: path_filestat_args(0, 0x1),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ELOOP);
 }
 
 // ---- path_filestat_set_times -----------------------------------------
