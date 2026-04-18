@@ -69,6 +69,8 @@ pub fn dispatch_wasi(
         op::PATH_FILESTAT_SET_TIMES => handle_path_filestat_set_times(kernel, pid, req, heap),
         op::FD_FILESTAT_SET_TIMES => handle_fd_filestat_set_times(kernel, pid, req, heap),
         op::FD_RENUMBER => handle_fd_renumber(kernel, pid, req),
+        op::PATH_UNLINK_FILE => handle_path_unlink_file(kernel, pid, req, heap),
+        op::PATH_RENAME => handle_path_rename(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
@@ -1193,6 +1195,112 @@ fn handle_path_filestat_set_times(
 
 fn handle_fd_prestat_get(req: &Request) -> Response {
     Response::err(req.request_id, EBADF)
+}
+
+// ---- path_unlink_file ------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = dir_fd (u32, ignored — v1 has no preopens, every
+//                 path is treated as absolute)
+//   heap_ptr    = offset of UTF-8 path bytes
+//   heap_len    = length of the path
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// WASI's path_unlink_file is strictly for regular files — unlinking
+// a directory returns EISDIR (the caller should use
+// path_remove_directory instead). This is the first write-side
+// filesystem-mutation WASI opcode in PMos's surface: the handler
+// threads the path through `Vfs::unlink`, which in turn calls
+// `Filesystem::unlink` on the mount owning the path. tmpfs overrides
+// with the real removal path; devfs / procfs inherit the default
+// (returns NotSupported → ENOTSUP). A future OPFS slice will
+// override with the journal-backed path.
+
+fn handle_path_unlink_file(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let _dir_fd = args_u32(req, 0);
+    let Some(path_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(path) = core::str::from_utf8(path_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.unlink(path) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+// ---- path_rename -----------------------------------------------------
+//
+// Layout:
+//   args[0..4]   = from_dir_fd (u32, ignored — v1 has no preopens)
+//   args[4..8]   = to_dir_fd   (u32, ignored)
+//   args[8..12]  = old_len (u32; split point in the heap window —
+//                  heap[0..old_len] is the old UTF-8 path,
+//                  heap[old_len..heap_len] is the new UTF-8 path)
+//   args[12..16] = reserved (must be 0; ignored in v1)
+//   heap[0..old_len]        = UTF-8 old path
+//   heap[old_len..heap_len] = UTF-8 new path
+//   heap_len                = old_len + new_len (enforced by the
+//                             dispatcher; a shorter heap_len rejects
+//                             with EINVAL)
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Unusual two-heap-strings wire format: [`Request`] carries only one
+// heap region, so the kernel packs both paths into a single window
+// and reads old_len from the inline args to know where to split.
+// Picking the u32-in-args layout over "null-separated concatenation"
+// keeps the dispatcher branch simple (no in-band scan for a
+// separator byte, no path-contains-null concern) and matches the way
+// `path_open` threads a path-length hint through args today.
+//
+// Semantics pass through `Vfs::rename` — which rejects cross-mount
+// renames with `FsError::NotSupported` (→ ENOTSUP) so userland uses
+// create+write+unlink for those cases instead. Within a single mount,
+// tmpfs replaces any existing destination per POSIX rename, and the
+// other in-tree filesystems inherit the trait default (ReadOnly /
+// NotSupported depending on the impl).
+
+fn handle_path_rename(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let _from_dir_fd = args_u32(req, 0);
+    let _to_dir_fd = args_u32(req, 4);
+    let old_len = args_u32(req, 8) as usize;
+
+    let Some(heap_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if old_len == 0 || old_len >= heap_bytes.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let (old_bytes, new_bytes) = heap_bytes.split_at(old_len);
+    let Ok(old_path) = core::str::from_utf8(old_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(new_path) = core::str::from_utf8(new_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.rename(old_path, new_path) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
 }
 
 // ---- poll_oneoff -----------------------------------------------------

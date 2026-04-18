@@ -87,6 +87,22 @@ var OP_WASI = {
    * prior `to`'s object is released via the kernel's
    * release_object path so pipe / socket refs are not leaked. */
   FD_RENUMBER: 48,
+  /** Wire-format identity for `path_rename`. Two heap strings (old
+   * + new path) packed into a single heap window with an in-band
+   * split point: the shim writes old_len at args[8..12] and lays
+   * the heap out as `(old_path, new_path)` concatenated; the kernel
+   * splits at that offset. from_dir_fd + to_dir_fd at args[0..4] +
+   * [4..8] are ignored in v1 (no preopens). Cross-mount rename is
+   * rejected with ENOTSUP (use create+write+unlink instead); within
+   * a mount, tmpfs replaces any existing destination per POSIX
+   * rename semantics. */
+  PATH_RENAME: 71,
+  /** Wire-format identity for `path_unlink_file`. Strictly for
+   * regular files — unlinking a directory returns EISDIR (use
+   * path_remove_directory). dir_fd at args[0..4] is ignored in v1;
+   * heap holds the UTF-8 path bytes. Threads through Vfs::unlink
+   * (→ Filesystem::unlink on the owning mount). */
+  PATH_UNLINK_FILE: 73,
   PATH_OPEN: 68,
   PROC_EXIT: 96,
   CLOCK_RES_GET: 16,
@@ -943,6 +959,75 @@ var UserWasmRuntime = class {
         const { response } = this.backend.dispatch(
           {
             opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `path_unlink_file`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, path_ptr: i32, path_len: i32) -> errno: i32
+      //
+      // Strictly for regular files — unlinking a directory returns
+      // EISDIR (WASI callers should use path_remove_directory).
+      // Threads through Vfs::unlink on the owning mount.
+      path_unlink_file: (_dirfd, pathPtr, pathLen) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+        const heap = new Uint8Array(pathLen);
+        heap.set(pathBytes, 0);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_UNLINK_FILE,
+            requestId: 0,
+            arg0: 0,
+            // dir_fd ignored in v1
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `path_rename`.
+      //
+      // Signature (lowered):
+      //   (old_fd: i32, old_path_ptr: i32, old_path_len: i32,
+      //    new_fd: i32, new_path_ptr: i32, new_path_len: i32) -> errno: i32
+      //
+      // The only WASI opcode that ferries two heap strings. Wire:
+      // old_len at args[8..12] marks the split point in a single
+      // heap buffer containing `(old_path, new_path)` concatenated.
+      // The kernel reads old_len from the inline args and splits
+      // the heap at that offset; no null-separator scan needed.
+      path_rename: (_oldFd, oldPathPtr, oldPathLen, _newFd, newPathPtr, newPathLen) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const oldBytes = new Uint8Array(
+          this.memory.buffer,
+          oldPathPtr,
+          oldPathLen
+        );
+        const newBytes = new Uint8Array(
+          this.memory.buffer,
+          newPathPtr,
+          newPathLen
+        );
+        const heap = new Uint8Array(oldPathLen + newPathLen);
+        heap.set(oldBytes, 0);
+        heap.set(newBytes, oldPathLen);
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, 0, true);
+        argsView.setUint32(4, 0, true);
+        argsView.setUint32(8, oldPathLen, true);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_RENAME,
             requestId: 0,
             args,
             heapPtr: 0,

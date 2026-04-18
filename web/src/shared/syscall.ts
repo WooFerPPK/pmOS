@@ -211,6 +211,22 @@ export const OP_WASI = {
    * prior `to`'s object is released via the kernel's
    * release_object path so pipe / socket refs are not leaked. */
   FD_RENUMBER: 0x0030,
+  /** Wire-format identity for `path_rename`. Two heap strings (old
+   * + new path) packed into a single heap window with an in-band
+   * split point: the shim writes old_len at args[8..12] and lays
+   * the heap out as `(old_path, new_path)` concatenated; the kernel
+   * splits at that offset. from_dir_fd + to_dir_fd at args[0..4] +
+   * [4..8] are ignored in v1 (no preopens). Cross-mount rename is
+   * rejected with ENOTSUP (use create+write+unlink instead); within
+   * a mount, tmpfs replaces any existing destination per POSIX
+   * rename semantics. */
+  PATH_RENAME: 0x0047,
+  /** Wire-format identity for `path_unlink_file`. Strictly for
+   * regular files — unlinking a directory returns EISDIR (use
+   * path_remove_directory). dir_fd at args[0..4] is ignored in v1;
+   * heap holds the UTF-8 path bytes. Threads through Vfs::unlink
+   * (→ Filesystem::unlink on the owning mount). */
+  PATH_UNLINK_FILE: 0x0049,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
   CLOCK_RES_GET: 0x0010,

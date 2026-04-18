@@ -897,6 +897,89 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `path_unlink_file`.
+      //
+      // Signature (lowered):
+      //   (dirfd: i32, path_ptr: i32, path_len: i32) -> errno: i32
+      //
+      // Strictly for regular files — unlinking a directory returns
+      // EISDIR (WASI callers should use path_remove_directory).
+      // Threads through Vfs::unlink on the owning mount.
+      path_unlink_file: (
+        _dirfd: number,
+        pathPtr: number,
+        pathLen: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+        const heap = new Uint8Array(pathLen);
+        heap.set(pathBytes, 0);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_UNLINK_FILE,
+            requestId: 0,
+            arg0: 0, // dir_fd ignored in v1
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+
+      // WASI `path_rename`.
+      //
+      // Signature (lowered):
+      //   (old_fd: i32, old_path_ptr: i32, old_path_len: i32,
+      //    new_fd: i32, new_path_ptr: i32, new_path_len: i32) -> errno: i32
+      //
+      // The only WASI opcode that ferries two heap strings. Wire:
+      // old_len at args[8..12] marks the split point in a single
+      // heap buffer containing `(old_path, new_path)` concatenated.
+      // The kernel reads old_len from the inline args and splits
+      // the heap at that offset; no null-separator scan needed.
+      path_rename: (
+        _oldFd: number,
+        oldPathPtr: number,
+        oldPathLen: number,
+        _newFd: number,
+        newPathPtr: number,
+        newPathLen: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const oldBytes = new Uint8Array(
+          this.memory.buffer,
+          oldPathPtr,
+          oldPathLen,
+        );
+        const newBytes = new Uint8Array(
+          this.memory.buffer,
+          newPathPtr,
+          newPathLen,
+        );
+        const heap = new Uint8Array(oldPathLen + newPathLen);
+        heap.set(oldBytes, 0);
+        heap.set(newBytes, oldPathLen);
+
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, 0, true); // from_dir_fd — ignored
+        argsView.setUint32(4, 0, true); // to_dir_fd — ignored
+        argsView.setUint32(8, oldPathLen, true);
+
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_RENAME,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `fd_renumber`.
       //
       // Signature (lowered):

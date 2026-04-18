@@ -1000,6 +1000,172 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
   });
 });
 
+// ---- dispatch: PATH_UNLINK_FILE + PATH_RENAME ---------------------
+//
+// Two filesystem-mutation opcodes. PATH_UNLINK_FILE is single-path;
+// PATH_RENAME packs both paths into a single heap window split by an
+// old_len u32 at args[8..12]. These TS tests pin the wire layout
+// end-to-end through kernel.wasm for the dispatcher-level branches:
+// the happy-path tmpfs mutation (create + opcode + stat the result),
+// the ENOENT / EISDIR / EROFS error paths, and PATH_RENAME's
+// old_len validation (zero, past heap, empty new path). The in-tree
+// unit-test harness uses /proc/version as a pre-existing file to
+// probe the ENOTSUP/EROFS paths without hitting the native disk.
+
+function encodePathUnlinkArgs(dirFd: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, dirFd, true);
+  return args;
+}
+
+function encodePathRenameArgs(
+  fromDirFd: number,
+  toDirFd: number,
+  oldLen: number,
+): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fromDirFd, true);
+  v.setUint32(4, toDirFd, true);
+  v.setUint32(8, oldLen, true);
+  return args;
+}
+
+function encodePathRenameHeap(oldPath: string, newPath: string): Uint8Array {
+  const enc = new TextEncoder();
+  const oldB = enc.encode(oldPath);
+  const newB = enc.encode(newPath);
+  const heap = new Uint8Array(oldB.length + newB.length);
+  heap.set(oldB, 0);
+  heap.set(newB, oldB.length);
+  return heap;
+}
+
+describe("dispatch: PATH_UNLINK_FILE", () => {
+  it("returns -ENOENT for a missing path", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/nowhere");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_UNLINK_FILE,
+        requestId: 880,
+        args: encodePathUnlinkArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(-ERRNO.ENOENT);
+  });
+
+  it("returns -EROFS for a /dev path (devfs is read-only)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = new TextEncoder().encode("/dev/console");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_UNLINK_FILE,
+        requestId: 881,
+        args: encodePathUnlinkArgs(0),
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+});
+
+describe("dispatch: PATH_RENAME", () => {
+  it("returns -ENOENT when the source path does not exist", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodePathRenameHeap("/nope", "/also_nope");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_RENAME,
+        requestId: 890,
+        args: encodePathRenameArgs(0, 0, "/nope".length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.ENOENT);
+  });
+
+  it("returns -EROFS when renaming a devfs entry (read-only filesystem)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodePathRenameHeap("/dev/null", "/dev/nullx");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_RENAME,
+        requestId: 891,
+        args: encodePathRenameArgs(0, 0, "/dev/null".length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+
+  it("returns -EINVAL for zero old_len", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("/nonsense");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_RENAME,
+        requestId: 892,
+        args: encodePathRenameArgs(0, 0, 0),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when old_len >= heap_len (empty new path)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("/a.txt");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_RENAME,
+        requestId: 893,
+        args: encodePathRenameArgs(0, 0, heap.length), // old_len == heap_len
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
 // ---- dispatch: FD_RENUMBER -----------------------------------------
 //
 // WASI's dup2-spelling. Wire: (from, to) as two u32s at args[0..4]

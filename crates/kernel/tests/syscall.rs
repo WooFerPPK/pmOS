@@ -3076,6 +3076,357 @@ fn fd_renumber_preserves_offset_and_flags() {
     assert!(e.flags.contains(FdFlags::NONBLOCK));
 }
 
+// ---- path_unlink_file / path_rename ---------------------------------
+//
+// Two filesystem-mutation opcodes that expand the syscall surface
+// beyond the "read-mostly" set already covered by the prior eleven
+// WASI slices. Both thread through the existing Vfs public API
+// (`Vfs::unlink` + `Vfs::rename`) — no new Vfs methods or Filesystem
+// trait additions; each in-tree fs (tmpfs, devfs, procfs, opfs)
+// already implements the trait-level `unlink` + `rename` methods.
+// The slice is purely about new syscall wire layouts + handlers.
+//
+// PATH_UNLINK_FILE wire layout:
+//   args[0..4]  = dir_fd (u32, ignored — v1 has no preopens)
+//   heap_ptr    = offset of UTF-8 path bytes
+//   heap_len    = length of the path
+// Response: value = 0 on success; status = -errno on error.
+//
+// PATH_RENAME wire layout: two paths in a single heap window need
+// in-band length encoding since [`Request`] carries only one heap
+// region. The kernel reads old_len from args[8..12] and splits the
+// heap into (heap[0..old_len], heap[old_len..heap_len]) as (old,
+// new). This keeps the inline args window consistent with other
+// path opcodes (dir_fd at offsets 0/4) and fits both path lengths
+// in a single heap round-trip.
+//
+//   args[0..4]   = from_dir_fd (u32, ignored — v1 has no preopens)
+//   args[4..8]   = to_dir_fd   (u32, ignored)
+//   args[8..12]  = old_len     (u32; index into heap for the split)
+//   args[12..16] = reserved    (must be 0; ignored in v1)
+//   heap[0..old_len]        = UTF-8 old path
+//   heap[old_len..heap_len] = UTF-8 new path
+//   heap_len                = old_len + new_len
+// Response: value = 0 on success; status = -errno on error.
+
+fn path_unlink_file_args(dir_fd: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&dir_fd.to_le_bytes());
+    args
+}
+
+fn path_rename_args(from_dir_fd: u32, to_dir_fd: u32, old_len: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&from_dir_fd.to_le_bytes());
+    args[4..8].copy_from_slice(&to_dir_fd.to_le_bytes());
+    args[8..12].copy_from_slice(&old_len.to_le_bytes());
+    args
+}
+
+#[test]
+fn path_unlink_file_removes_regular_file_from_tmpfs() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "unlinker", 0);
+    k.vfs.create("/u.txt", 0o644).expect("create");
+    assert!(k.vfs.stat("/u.txt").is_ok(), "file exists pre-call");
+
+    let path = b"/u.txt";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_UNLINK_FILE,
+        flags: 0,
+        request_id: 880,
+        args: path_unlink_file_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.vfs.stat("/u.txt").unwrap_err(), kernel::vfs::FsError::NotFound);
+}
+
+#[test]
+fn path_unlink_file_on_missing_path_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "unlinker", 0);
+    let path = b"/no_such_file";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_UNLINK_FILE,
+        flags: 0,
+        request_id: 881,
+        args: path_unlink_file_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_unlink_file_on_directory_returns_eisdir() {
+    // WASI's path_unlink_file is strictly for regular files —
+    // unlinking a directory must use path_remove_directory.
+    // tmpfs.unlink returns IsADirectory which maps to EISDIR.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "unlinker", 0);
+    k.vfs.mkdir("/d", 0o755).expect("mkdir");
+
+    let path = b"/d";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_UNLINK_FILE,
+        flags: 0,
+        request_id: 882,
+        args: path_unlink_file_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EISDIR);
+}
+
+#[test]
+fn path_unlink_file_on_devfs_returns_erofs() {
+    // devfs overrides unlink to return ReadOnly → EROFS. Matches
+    // the prior path_filestat_set_times devfs path in terms of
+    // wire-level errno; the only write-side mutation that ever
+    // reaches devfs is through one of these syscall handlers.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "unlinker", 0);
+    let path = b"/dev/console";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_UNLINK_FILE,
+        flags: 0,
+        request_id: 883,
+        args: path_unlink_file_args(0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
+#[test]
+fn path_unlink_file_with_invalid_utf8_path_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "unlinker", 0);
+    let mut heap = vec![0u8; 64];
+    heap[0] = 0xff;
+    heap[1] = 0xfe;
+
+    let req = Request {
+        opcode: op_wasi::PATH_UNLINK_FILE,
+        flags: 0,
+        request_id: 884,
+        args: path_unlink_file_args(0),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_rename_moves_file_within_same_directory() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    k.vfs.create("/a.txt", 0o644).expect("create");
+    k.vfs.write("/a.txt", 0, b"hello").expect("write");
+
+    let old_path = b"/a.txt";
+    let new_path = b"/b.txt";
+    let mut heap = vec![0u8; 128];
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()..old_path.len() + new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 890,
+        args: path_rename_args(0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: (old_path.len() + new_path.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(
+        k.vfs.stat("/a.txt").unwrap_err(),
+        kernel::vfs::FsError::NotFound,
+    );
+    let st = k.vfs.stat("/b.txt").unwrap();
+    assert_eq!(st.size, 5);
+}
+
+#[test]
+fn path_rename_moves_file_across_directories() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    k.vfs.mkdir("/src", 0o755).expect("mkdir src");
+    k.vfs.mkdir("/dst", 0o755).expect("mkdir dst");
+    k.vfs.create("/src/file", 0o644).expect("create");
+
+    let old_path = b"/src/file";
+    let new_path = b"/dst/file";
+    let mut heap = vec![0u8; 128];
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()..old_path.len() + new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 891,
+        args: path_rename_args(0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: (old_path.len() + new_path.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert!(k.vfs.stat("/src/file").is_err());
+    assert!(k.vfs.stat("/dst/file").is_ok());
+}
+
+#[test]
+fn path_rename_from_missing_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    let old_path = b"/nope";
+    let new_path = b"/also_nope";
+    let mut heap = vec![0u8; 128];
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()..old_path.len() + new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 892,
+        args: path_rename_args(0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: (old_path.len() + new_path.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_rename_on_devfs_returns_erofs() {
+    // devfs overrides rename to return ReadOnly → EROFS.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    let old_path = b"/dev/null";
+    let new_path = b"/dev/nullx";
+    let mut heap = vec![0u8; 128];
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()..old_path.len() + new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 893,
+        args: path_rename_args(0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: (old_path.len() + new_path.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
+#[test]
+fn path_rename_cross_mount_returns_enotsup() {
+    // Vfs::rename explicitly rejects cross-mount renames with
+    // NotSupported so userland uses create+write+unlink instead.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    k.vfs.create("/x.txt", 0o644).expect("create");
+    let old_path = b"/x.txt";
+    let new_path = b"/dev/x.txt";
+    let mut heap = vec![0u8; 128];
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()..old_path.len() + new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 894,
+        args: path_rename_args(0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: (old_path.len() + new_path.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+}
+
+#[test]
+fn path_rename_with_zero_old_len_returns_einval() {
+    // Empty old path is nonsensical.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    let new_path = b"/nope";
+    let mut heap = vec![0u8; 64];
+    heap[..new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 895,
+        args: path_rename_args(0, 0, 0),
+        heap_ptr: 0,
+        heap_len: new_path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_rename_with_old_len_past_heap_returns_einval() {
+    // old_len exceeding heap_len is a malformed shim.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    let mut heap = vec![0u8; 64];
+    heap[..4].copy_from_slice(b"/abc");
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 896,
+        args: path_rename_args(0, 0, 999),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_rename_with_zero_new_path_returns_einval() {
+    // new_len = 0 (heap_len == old_len) = empty new path.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renamer", 0);
+    let old_path = b"/a.txt";
+    let mut heap = vec![0u8; 64];
+    heap[..old_path.len()].copy_from_slice(old_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 897,
+        args: path_rename_args(0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: old_path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a
