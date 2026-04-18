@@ -252,11 +252,22 @@ export const OP_WASI = {
   FD_ALLOCATE: 0x0021,
   FD_SYNC: 0x0032,
   FD_DATASYNC: 0x0023,
+  /** Wire-format identity for `fd_readdir`. Directory-listing
+   * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
+   * LE; 0 = start from beginning); heap = caller's output buffer
+   * with capacity heap_len bytes. Kernel writes 24-byte dirent_t
+   * records + inline name bytes into the buffer until it fills
+   * or entries exhaust. value / extraLen = bytes written. Entries
+   * pack back-to-back with no padding; a buffer that fills mid-
+   * entry signals "more may exist" by returning value == heap_len
+   * and the caller re-issues with the last d_next as the cookie. */
+  FD_READDIR: 0x002f,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Swap to whichever WASI opcode is
-   * still unhandled as the implementation catches up. */
-  FD_READDIR: 0x002f,
+   * kernel doesn't yet handle. Was `FD_READDIR` before that
+   * handler landed; swap to whichever WASI opcode is still
+   * unhandled as the implementation catches up. */
+  FD_PREAD: 0x002a,
   /** Wire-format identity for `poll_oneoff`. The shim packs
    * `(n_subs, n_events_cap)` into the inline args window (u32 each
    * at offsets 0 / 4) and puts the subscription list followed by
@@ -295,8 +306,10 @@ export const ERRNO = {
   EBADF: 8,
   ECONNREFUSED: 14,
   EINVAL: 28,
+  EISDIR: 31,
   ENOENT: 44,
   ENOSYS: 52,
+  ENOTDIR: 54,
   ENOTSUP: 58,
   EROFS: 69,
 } as const;
@@ -358,6 +371,23 @@ export const FILETYPE = {
   SOCKET_DGRAM: 5,
   SOCKET_STREAM: 6,
   SYMBOLIC_LINK: 7,
+} as const;
+
+// ---- WASI fd_readdir dirent wire layout ----------------------------
+//
+// Mirror of `abi::wasi::dirent`. Each entry in an fd_readdir output
+// buffer is a 24-byte dirent_t header followed immediately by
+// d_namlen bytes of UTF-8 name — no inter-entry padding.
+
+/** Size of one dirent_t header (name bytes follow immediately). */
+export const POLL_DIRENT_HEADER_SIZE = 24;
+
+/** Dirent_t header field offsets. */
+export const DIRENT_OFF = {
+  D_NEXT:   0,  // u64 — resumption cookie after this entry
+  D_INO:    8,  // u64
+  D_NAMLEN: 16, // u32
+  D_TYPE:   20, // u8 (filetype)
 } as const;
 
 // ---- WASI poll_oneoff wire layout + flag tables --------------------

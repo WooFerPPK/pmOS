@@ -108,21 +108,22 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `FD_READDIR` is in the WASI range (0x002F) but still has no
+    // `FD_PREAD` is in the WASI range (0x002A) but still has no
     // handler. Same shape as the ext-side test below: decoded as
     // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>`
     // arm, ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `FD_SEEK` before that handler landed; before
-    // that, `CLOCK_TIME_GET`. When `FD_READDIR` grows a real handler,
-    // swap this probe to whatever's still unhandled at that point,
-    // or delete the test once every WASI opcode has real coverage.)
+    // (This probe was `FD_READDIR` before that handler landed, then
+    // `FD_SEEK`, then `CLOCK_TIME_GET` before those. When
+    // `FD_PREAD` grows a real handler, swap this probe to whatever's
+    // still unhandled at that point, or delete the test once every
+    // WASI opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::FD_READDIR,
+        opcode: op_wasi::FD_PREAD,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -3074,6 +3075,292 @@ fn fd_renumber_preserves_offset_and_flags() {
     let e = k.fds(pid).unwrap().get(42).expect("landed at 42");
     assert_eq!(e.offset, 7);
     assert!(e.flags.contains(FdFlags::NONBLOCK));
+}
+
+// ---- fd_readdir ------------------------------------------------------
+//
+// WASI's directory-listing opcode. Wire layout:
+//
+//   args[0..4]  = fd (u32)
+//   args[4..12] = cookie (u64 LE; 0 = start from the beginning,
+//                 otherwise resume after the entry whose d_next
+//                 the caller last observed)
+//   heap_ptr    = start of the caller's output buffer
+//   heap_len    = buffer capacity in bytes
+// Response:
+//   value     = bytes actually written (0 ≤ value ≤ heap_len)
+//   extra_len = mirrored bytes-written, same convention as random_get
+//
+// Each entry in the output buffer is a 24-byte dirent_t header
+// (d_next / d_ino / d_namlen / d_type — see `abi::wasi::dirent`)
+// followed immediately by d_namlen bytes of UTF-8 name, with NO
+// inter-entry padding. A buffer that fills mid-entry receives a
+// truncated final entry; the caller signals "more entries may
+// exist" by observing value == heap_len and re-issuing the call
+// with the last d_next cookie they successfully decoded.
+//
+// v1 does NOT inject `.` / `..` entries — WASI doesn't require
+// them, and v1 filesystems don't track parent inodes so there's no
+// honest way to synthesise `..`. Callers that need them can scan
+// the directory and add them userland-side.
+//
+// Per-branch guards:
+//   * Unopened fd → EBADF.
+//   * Non-Vnode FdObject (CharDevice / Socket / Pipe / etc.) →
+//     EINVAL. Only directories can be readdir'd.
+//   * Vnode pointing at a non-directory → ENOTDIR (from
+//     Filesystem::readdir via kerr_to_errno).
+//   * heap_len == 0 → value=0, extra_len=0 (success with nothing
+//     written; caller's probe for buffer sizing).
+
+fn fd_readdir_args(fd: u32, cookie: u64) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..12].copy_from_slice(&cookie.to_le_bytes());
+    args
+}
+
+/// Decode a single dirent header out of `heap` at byte `offset`.
+/// Returns (d_next, d_ino, d_namlen, d_type) — name bytes follow
+/// at `heap[offset + 24 .. offset + 24 + d_namlen]`.
+fn decode_dirent_header(heap: &[u8], offset: usize) -> (u64, u64, u32, u8) {
+    use abi::wasi::dirent as de;
+    let mut d_next_bytes = [0u8; 8];
+    d_next_bytes.copy_from_slice(&heap[offset + de::OFF_D_NEXT..offset + de::OFF_D_NEXT + 8]);
+    let d_next = u64::from_le_bytes(d_next_bytes);
+    let mut d_ino_bytes = [0u8; 8];
+    d_ino_bytes.copy_from_slice(&heap[offset + de::OFF_D_INO..offset + de::OFF_D_INO + 8]);
+    let d_ino = u64::from_le_bytes(d_ino_bytes);
+    let mut d_namlen_bytes = [0u8; 4];
+    d_namlen_bytes
+        .copy_from_slice(&heap[offset + de::OFF_D_NAMLEN..offset + de::OFF_D_NAMLEN + 4]);
+    let d_namlen = u32::from_le_bytes(d_namlen_bytes);
+    let d_type = heap[offset + de::OFF_D_TYPE];
+    (d_next, d_ino, d_namlen, d_type)
+}
+
+fn make_dir_fd(
+    k: &mut Kernel,
+    name: &str,
+    dir_path: &str,
+) -> (abi::ext::Pid, u32) {
+    let pid = make_running_proc(k, name, 0);
+    k.vfs.mkdir(dir_path, 0o755).expect("mkdir");
+    let (mount_id, ino) = k.vfs.resolve(dir_path).expect("resolve");
+    k.install_fd(
+        pid,
+        10,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    (pid, 10)
+}
+
+#[test]
+fn fd_readdir_on_empty_directory_writes_no_bytes() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_dir_fd(&mut k, "ereader", "/emptydir");
+    let mut heap = vec![0u8; 256];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 900,
+        args: fd_readdir_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 256,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 0);
+}
+
+#[test]
+fn fd_readdir_lists_all_entries_in_a_populated_directory() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_dir_fd(&mut k, "reader", "/d");
+    k.vfs.create("/d/one.txt", 0o644).expect("create one");
+    k.vfs.create("/d/two.txt", 0o644).expect("create two");
+    k.vfs.mkdir("/d/sub", 0o755).expect("mkdir sub");
+    let mut heap = vec![0u8; 512];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 901,
+        args: fd_readdir_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 512,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+
+    // Walk the dirent stream: three headers, each 24 bytes + name.
+    let total = resp.value as usize;
+    assert!(total > 0);
+    let mut off = 0usize;
+    let mut names = Vec::new();
+    while off < total {
+        let (d_next, _d_ino, d_namlen, d_type) = decode_dirent_header(&heap, off);
+        let name_start = off + 24;
+        let name_end = name_start + d_namlen as usize;
+        let name = core::str::from_utf8(&heap[name_start..name_end]).unwrap().to_string();
+        names.push((name, d_type, d_next));
+        off = name_end;
+    }
+    assert_eq!(names.len(), 3);
+    // Cookies strictly increasing (each d_next is the index of the
+    // entry AFTER the current one, starting from 1).
+    assert_eq!(names[0].2, 1);
+    assert_eq!(names[1].2, 2);
+    assert_eq!(names[2].2, 3);
+    // One of them is the subdirectory, and its type is DIRECTORY.
+    let sub = names.iter().find(|(n, _, _)| n == "sub").expect("sub listed");
+    assert_eq!(sub.1, 3, "sub is filetype DIRECTORY (3)");
+}
+
+#[test]
+fn fd_readdir_with_cookie_resumes_from_that_position() {
+    // Cookie = 1 should skip the first entry and return the rest.
+    let mut k = make_kernel();
+    let (pid, fd) = make_dir_fd(&mut k, "resumer", "/r");
+    k.vfs.create("/r/alpha", 0o644).expect("create");
+    k.vfs.create("/r/beta", 0o644).expect("create");
+    k.vfs.create("/r/gamma", 0o644).expect("create");
+    let mut heap = vec![0u8; 512];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 902,
+        args: fd_readdir_args(fd, 1),
+        heap_ptr: 0,
+        heap_len: 512,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let total = resp.value as usize;
+    let mut off = 0usize;
+    let mut names = Vec::new();
+    while off < total {
+        let (_d_next, _d_ino, d_namlen, _d_type) = decode_dirent_header(&heap, off);
+        let name_start = off + 24;
+        let name_end = name_start + d_namlen as usize;
+        let name = core::str::from_utf8(&heap[name_start..name_end]).unwrap().to_string();
+        names.push(name);
+        off = name_end;
+    }
+    // 2 entries remaining after skipping 1.
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn fd_readdir_truncates_when_buffer_fills_mid_entry() {
+    // Size the buffer so one full entry lands and a partial second
+    // entry forces truncation. Caller detects truncation via
+    // value == heap_len on re-call.
+    let mut k = make_kernel();
+    let (pid, fd) = make_dir_fd(&mut k, "trunc", "/t");
+    k.vfs.create("/t/aaaaaaaaaaaaaaa.txt", 0o644).expect("create"); // 19 bytes name
+    k.vfs.create("/t/bbbbbbbbbbbbbbb.txt", 0o644).expect("create"); // 19 bytes name
+    // One entry = 24 bytes header + 19 bytes name = 43 bytes.
+    // Buffer of 50 bytes fits one full entry (43) + 7 bytes of
+    // the next entry's header (partial).
+    let mut heap = vec![0u8; 50];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 903,
+        args: fd_readdir_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 50,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    // At least one full entry written + some of the second.
+    assert!(resp.value as usize >= 43);
+    assert!(resp.value as usize <= 50);
+}
+
+#[test]
+fn fd_readdir_on_non_directory_vnode_returns_enotdir() {
+    // Open a regular file as a Vnode fd; readdir should return
+    // ENOTDIR from tmpfs.readdir.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "nondir", "/notadir.txt", b"");
+    let mut heap = vec![0u8; 256];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 904,
+        args: fd_readdir_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 256,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTDIR);
+}
+
+#[test]
+fn fd_readdir_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdev_reader", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 256];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 905,
+        args: fd_readdir_args(1, 0),
+        heap_ptr: 0,
+        heap_len: 256,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_readdir_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghost_reader", 0);
+    let mut heap = vec![0u8; 256];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 906,
+        args: fd_readdir_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 256,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_readdir_with_zero_sized_buffer_returns_zero_bytes() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_dir_fd(&mut k, "probe_reader", "/p");
+    k.vfs.create("/p/one", 0o644).expect("create");
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_READDIR,
+        flags: 0,
+        request_id: 907,
+        args: fd_readdir_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
 }
 
 // ---- path_unlink_file / path_rename ---------------------------------

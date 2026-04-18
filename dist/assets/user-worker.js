@@ -128,11 +128,22 @@ var OP_WASI = {
   FD_ALLOCATE: 33,
   FD_SYNC: 50,
   FD_DATASYNC: 35,
+  /** Wire-format identity for `fd_readdir`. Directory-listing
+   * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
+   * LE; 0 = start from beginning); heap = caller's output buffer
+   * with capacity heap_len bytes. Kernel writes 24-byte dirent_t
+   * records + inline name bytes into the buffer until it fills
+   * or entries exhaust. value / extraLen = bytes written. Entries
+   * pack back-to-back with no padding; a buffer that fills mid-
+   * entry signals "more may exist" by returning value == heap_len
+   * and the caller re-issues with the last d_next as the cookie. */
+  FD_READDIR: 47,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Swap to whichever WASI opcode is
-   * still unhandled as the implementation catches up. */
-  FD_READDIR: 47,
+   * kernel doesn't yet handle. Was `FD_READDIR` before that
+   * handler landed; swap to whichever WASI opcode is still
+   * unhandled as the implementation catches up. */
+  FD_PREAD: 42,
   /** Wire-format identity for `poll_oneoff`. The shim packs
    * `(n_subs, n_events_cap)` into the inline args window (u32 each
    * at offsets 0 / 4) and puts the subscription list followed by
@@ -967,6 +978,46 @@ var UserWasmRuntime = class {
           heap
         );
         return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `fd_readdir`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, buf_ptr: i32, buf_len: i32, cookie: i64,
+      //    bufused_ptr: i32) -> errno: i32
+      //
+      // Directory listing. Wire layout at the kernel: fd at
+      // args[0..4], cookie (u64 LE) at args[4..12], heap is the
+      // output buffer. Kernel writes 24-byte dirent_t headers +
+      // inline name bytes. Shim copies the kernel's heapOut back
+      // into user memory at buf_ptr and writes the byte-count to
+      // bufused_ptr as u32. A buffer that fills mid-entry receives
+      // a truncated entry; the caller spots it via
+      // bytes_written == buf_len and re-issues with the last d_next
+      // cookie they decoded successfully.
+      fd_readdir: (fd, bufPtr, bufLen, cookie, bufusedPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setBigUint64(4, cookie, true);
+        const heap = new Uint8Array(bufLen);
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.FD_READDIR,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        if (response.status !== 0) return -response.status;
+        const written = Number(response.value);
+        const memBytes = new Uint8Array(this.memory.buffer);
+        memBytes.set(heapOut.subarray(0, written), bufPtr);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(bufusedPtr, written, true);
+        return 0;
       },
       // WASI `path_unlink_file`.
       //

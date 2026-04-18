@@ -213,6 +213,33 @@ pub mod poll {
     pub const EVENT_OFF_RW_FLAGS:     usize = 24;
 }
 
+/// Wire layout of a single `dirent_t` record produced by
+/// `FD_READDIR` (opcode 0x002F). Mirrors WASI preview 1's C ABI:
+///
+///   offset  0: d_next   u64  (resumption cookie — caller passes
+///                              this value as the next call's
+///                              cookie to continue the listing
+///                              AFTER this entry)
+///   offset  8: d_ino    u64
+///   offset 16: d_namlen u32
+///   offset 20: d_type   u8   (`filetype::*`)
+///   offset 21: padding  3B   (pads to 24-byte alignment; the name
+///                              bytes follow immediately, with no
+///                              trailing null)
+///
+/// After the 24-byte header, `d_namlen` bytes of UTF-8 name follow
+/// in-line. The next entry's header starts immediately after the
+/// name — no inter-entry padding. A caller-provided buffer that
+/// fills mid-entry receives a truncated final entry; the kernel
+/// signals "more entries may exist" by returning value == buf_len.
+pub mod dirent {
+    pub const HEADER_SIZE:    usize = 24;
+    pub const OFF_D_NEXT:     usize = 0;
+    pub const OFF_D_INO:      usize = 8;
+    pub const OFF_D_NAMLEN:   usize = 16;
+    pub const OFF_D_TYPE:     usize = 20;
+}
+
 /// WASI `eventtype_t` — identifies a subscription / event variant.
 pub mod eventtype {
     pub const CLOCK:    u8 = 0;

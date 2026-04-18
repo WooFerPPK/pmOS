@@ -897,6 +897,59 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `fd_readdir`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, buf_ptr: i32, buf_len: i32, cookie: i64,
+      //    bufused_ptr: i32) -> errno: i32
+      //
+      // Directory listing. Wire layout at the kernel: fd at
+      // args[0..4], cookie (u64 LE) at args[4..12], heap is the
+      // output buffer. Kernel writes 24-byte dirent_t headers +
+      // inline name bytes. Shim copies the kernel's heapOut back
+      // into user memory at buf_ptr and writes the byte-count to
+      // bufused_ptr as u32. A buffer that fills mid-entry receives
+      // a truncated entry; the caller spots it via
+      // bytes_written == buf_len and re-issues with the last d_next
+      // cookie they decoded successfully.
+      fd_readdir: (
+        fd: number,
+        bufPtr: number,
+        bufLen: number,
+        cookie: bigint,
+        bufusedPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setBigUint64(4, cookie, true);
+        // Kernel writes directly into its own heap scratch; the shim
+        // sizes the heap buffer at bufLen (or 0 if bufLen is 0) so
+        // the dispatch layer's "heap_len = caller capacity" contract
+        // matches.
+        const heap = new Uint8Array(bufLen);
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.FD_READDIR,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        if (response.status !== 0) return -response.status;
+        const written = Number(response.value);
+        // Copy written bytes out to user memory at bufPtr. Re-fetch
+        // the memory view in case the dispatch path grew it.
+        const memBytes = new Uint8Array(this.memory.buffer);
+        memBytes.set(heapOut.subarray(0, written), bufPtr);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(bufusedPtr, written, true);
+        return 0;
+      },
+
       // WASI `path_unlink_file`.
       //
       // Signature (lowered):

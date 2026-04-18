@@ -381,6 +381,21 @@ impl Vfs {
     /// List the entries of the directory at an absolute path.
     pub fn readdir(&mut self, abs_path: &str) -> Result<Vec<DirEntry>, FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
+        self.readdir_ino(mount_id, ino)
+    }
+
+    /// List the entries of the directory at `(mount_id, ino)`.
+    /// Mirrors [`Vfs::stat_ino`] / [`Vfs::read_ino`]: the syscall
+    /// layer already carries the pair on a `Vnode` fd, so
+    /// `fd_readdir` skips path resolution by calling this instead
+    /// of [`Vfs::readdir`]. Returns the directory's entries
+    /// verbatim (no `.` / `..` injection — WASI doesn't require
+    /// them and v1 filesystems don't track parent inodes).
+    pub fn readdir_ino(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+    ) -> Result<Vec<DirEntry>, FsError> {
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         let mut out = Vec::new();
         fs.readdir(ino, &mut out)?;

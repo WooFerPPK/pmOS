@@ -71,6 +71,7 @@ pub fn dispatch_wasi(
         op::FD_RENUMBER => handle_fd_renumber(kernel, pid, req),
         op::PATH_UNLINK_FILE => handle_path_unlink_file(kernel, pid, req, heap),
         op::PATH_RENAME => handle_path_rename(kernel, pid, req, heap),
+        op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
@@ -1195,6 +1196,131 @@ fn handle_path_filestat_set_times(
 
 fn handle_fd_prestat_get(req: &Request) -> Response {
     Response::err(req.request_id, EBADF)
+}
+
+// ---- fd_readdir ------------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = fd (u32)
+//   args[4..12] = cookie (u64 LE; 0 = start from beginning)
+//   heap_ptr    = start of caller's output buffer
+//   heap_len    = buffer capacity in bytes
+// Response:
+//   value     = bytes actually written (0..=heap_len)
+//   extra_len = mirrors value (bytes-written convention)
+//
+// WASI's directory listing. Each entry in the output buffer is a
+// 24-byte dirent header (d_next / d_ino / d_namlen / d_type; see
+// `abi::wasi::dirent`) followed immediately by d_namlen bytes of
+// UTF-8 name. Entries pack back-to-back with no inter-entry
+// padding — a buffer that fills mid-entry receives a truncated
+// final entry. The caller signals "more entries may exist" by
+// observing value == heap_len and re-issuing with the last d_next
+// cookie they successfully decoded.
+//
+// Cookie semantics: 0 = start from the beginning, N = resume AFTER
+// the entry whose d_next was last observed as N-1. The kernel
+// assigns d_next = (index_in_listing + 1), so cookie = 3 means
+// "skip entries 0, 1, 2 and start from entry 3".
+//
+// Guards in order:
+//   1. Unopened fd → EBADF.
+//   2. Non-Vnode FdObject → EINVAL. Only directories can be
+//      readdir'd; char devices / sockets / pipes / signal channels
+//      have no directory listing.
+//   3. Vnode pointing at a non-directory → ENOTDIR (passed through
+//      from Filesystem::readdir via kerr_to_errno).
+//   4. heap_len == 0 → value = 0, extra_len = 0 (success with
+//      nothing written; a caller probing for sizing).
+//
+// v1 does NOT inject `.` / `..` entries. WASI doesn't require them,
+// and the v1 VFS doesn't track parent inodes — a synthesised `..`
+// would need a separate parent-tracking pass on every dir op.
+
+use abi::wasi::dirent as de;
+
+fn handle_fd_readdir(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let cookie = args_u64(req, 4);
+    let buf_len = req.heap_len as usize;
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let (mount_id, ino) = match entry.object {
+        FdObject::Vnode { mount_id, ino } => (mount_id, ino),
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+
+    let entries = match kernel.vfs.readdir_ino(mount_id, ino) {
+        Ok(v) => v,
+        Err(e) => {
+            return Response::err(
+                req.request_id,
+                kerr_to_errno(KernelError::Fs(e)),
+            )
+        }
+    };
+
+    let Some(buf) = heap_out_mut(req, heap, buf_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+
+    let mut written = 0usize;
+    let start = cookie as usize;
+    for (i, ent) in entries.iter().enumerate().skip(start) {
+        if written >= buf_len {
+            break;
+        }
+        let name_bytes = ent.name.as_bytes();
+        let d_type = filetype_from_nodetype(ent.ty);
+        let d_next = (i as u64) + 1;
+
+        // Write the header byte-by-byte into what remains. If the
+        // header itself doesn't fit, write what does and stop —
+        // truncation is allowed at any point.
+        let remaining = buf_len - written;
+        let header_end = core::cmp::min(de::HEADER_SIZE, remaining);
+        let mut header = [0u8; de::HEADER_SIZE];
+        header[de::OFF_D_NEXT..de::OFF_D_NEXT + 8]
+            .copy_from_slice(&d_next.to_le_bytes());
+        header[de::OFF_D_INO..de::OFF_D_INO + 8]
+            .copy_from_slice(&ent.ino.to_le_bytes());
+        header[de::OFF_D_NAMLEN..de::OFF_D_NAMLEN + 4]
+            .copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        header[de::OFF_D_TYPE] = d_type;
+        buf[written..written + header_end].copy_from_slice(&header[..header_end]);
+        written += header_end;
+        if header_end < de::HEADER_SIZE {
+            break;
+        }
+
+        // Write as much of the name as fits.
+        let remaining = buf_len - written;
+        let name_fit = core::cmp::min(name_bytes.len(), remaining);
+        buf[written..written + name_fit].copy_from_slice(&name_bytes[..name_fit]);
+        written += name_fit;
+        if name_fit < name_bytes.len() {
+            break;
+        }
+    }
+
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: written as i64,
+        extra_len: written as u32,
+        _pad: [0u8; 12],
+    }
 }
 
 // ---- path_unlink_file ------------------------------------------------

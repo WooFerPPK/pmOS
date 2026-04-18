@@ -41,6 +41,7 @@ import {
   CAPSET_DESKTOP_SHELL,
   CLOCKID,
   DEV,
+  DIRENT_OFF,
   decodeResponse,
   encodeRequest,
   encodeSpawnManifest,
@@ -51,6 +52,7 @@ import {
   FSTFLAGS,
   OP_EXT,
   OP_WASI,
+  POLL_DIRENT_HEADER_SIZE,
   POLL_EVENT_OFF,
   POLL_EVENT_SIZE,
   POLL_SUB_OFF,
@@ -410,10 +412,12 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `FD_READDIR` is in the WASI range (0x002F) but still has no
-    // handler; swap this probe when FD_READDIR grows one.
+    // `FD_PREAD` is in the WASI range (0x002A) but still has no
+    // handler; was `FD_READDIR` before that handler landed. Swap
+    // this probe to whatever's still unhandled as the implementation
+    // catches up.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.FD_READDIR,
+      opcode: OP_WASI.FD_PREAD,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -997,6 +1001,141 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       heap,
     );
     expect(response.status).toBe(0);
+  });
+});
+
+// ---- dispatch: FD_READDIR ------------------------------------------
+//
+// Directory-listing opcode. Wire: fd at args[0..4], cookie (u64 LE)
+// at args[4..12]; heap is the output buffer. Kernel writes 24-byte
+// dirent_t headers + inline name bytes into the buffer. These TS
+// tests pin the dispatcher's wire layout end-to-end through
+// kernel.wasm — the zero-heap-len probe, the EBADF / EINVAL error
+// branches, and a happy-path listing from /proc (procfs is always
+// populated and reachable through the dispatch surface alone via
+// PATH_OPEN on /proc as a directory).
+
+function encodeFdReaddirArgs(fd: number, cookie: bigint): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setBigUint64(4, cookie, true);
+  return args;
+}
+
+function openProcDirFd(host: KernelWasmHost, pid: number): number {
+  // /proc is mounted as a directory in the kernel's init layout.
+  const pathBytes = new TextEncoder().encode("/proc");
+  const { response } = host.dispatch(
+    pid,
+    {
+      opcode: OP_WASI.PATH_OPEN,
+      requestId: 988,
+      arg0: 0,
+      heapPtr: 0,
+      heapLen: pathBytes.length,
+    },
+    pathBytes,
+  );
+  expect(response.status).toBe(0);
+  return Number(response.value);
+}
+
+describe("dispatch: FD_READDIR", () => {
+  it("returns -EBADF for an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READDIR,
+      requestId: 900,
+      args: encodeFdReaddirArgs(99, 0n),
+      heapPtr: 0,
+      heapLen: 256,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+
+  it("returns -EINVAL for a non-Vnode fd (/dev/console)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READDIR,
+      requestId: 901,
+      args: encodeFdReaddirArgs(1, 0n),
+      heapPtr: 0,
+      heapLen: 256,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -ENOTDIR when the Vnode points at a regular file", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READDIR,
+      requestId: 902,
+      args: encodeFdReaddirArgs(fd, 0n),
+      heapPtr: 0,
+      heapLen: 256,
+    });
+    expect(response.status).toBe(-ERRNO.ENOTDIR);
+  });
+
+  it("returns 0 bytes written for a zero-capacity buffer (probe)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcDirFd(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READDIR,
+      requestId: 903,
+      args: encodeFdReaddirArgs(fd, 0n),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(0n);
+    expect(response.extraLen).toBe(0);
+  });
+
+  it("lists /proc directory entries with valid dirent headers", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcDirFd(host, pid);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READDIR,
+      requestId: 904,
+      args: encodeFdReaddirArgs(fd, 0n),
+      heapPtr: 0,
+      heapLen: 1024,
+    });
+    expect(response.status).toBe(0);
+    const total = Number(response.value);
+    expect(total).toBeGreaterThan(0);
+    expect(response.extraLen).toBe(total);
+
+    // Decode one entry — the first one — and verify the header
+    // fields + name round-trip cleanly.
+    const v = new DataView(heapOut.buffer, heapOut.byteOffset, POLL_DIRENT_HEADER_SIZE);
+    const dNext = v.getBigUint64(DIRENT_OFF.D_NEXT, true);
+    const dNamlen = v.getUint32(DIRENT_OFF.D_NAMLEN, true);
+    expect(dNext).toBe(1n);
+    expect(dNamlen).toBeGreaterThan(0);
+    const name = new TextDecoder().decode(
+      heapOut.subarray(POLL_DIRENT_HEADER_SIZE, POLL_DIRENT_HEADER_SIZE + dNamlen),
+    );
+    expect(name.length).toBe(dNamlen);
   });
 });
 
