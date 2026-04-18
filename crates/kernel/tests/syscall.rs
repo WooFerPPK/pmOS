@@ -108,21 +108,21 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `FD_SEEK` is in the WASI range (0x0031) but still has no
+    // `FD_READDIR` is in the WASI range (0x002F) but still has no
     // handler. Same shape as the ext-side test below: decoded as
     // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>`
     // arm, ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `CLOCK_TIME_GET` before that handler
-    // landed. When `FD_SEEK` grows a real handler, swap this
-    // probe to whatever's still unhandled at that point, or
-    // delete the test once every WASI opcode has real coverage.)
+    // (This probe was `FD_SEEK` before that handler landed; before
+    // that, `CLOCK_TIME_GET`. When `FD_READDIR` grows a real handler,
+    // swap this probe to whatever's still unhandled at that point,
+    // or delete the test once every WASI opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::FD_SEEK,
+        opcode: op_wasi::FD_READDIR,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -1476,6 +1476,289 @@ fn path_filestat_get_ignores_dir_fd_and_lookup_flags() {
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
     assert_eq!(heap[16], 2, "filetype = character_device");
+}
+
+// ---- fd_seek ----------------------------------------------------------
+//
+// WASI's seek combines three distinct file-position operations into a
+// single opcode whose meaning depends on `whence` (Set=0, Cur=1, End=2).
+// Per-fd, not per-vnode: two fds pointing at the same vnode have
+// independent positions. v1 rejects fd_seek on every non-Vnode FdObject
+// with EINVAL — whence has no meaning on a char device, socket, pipe,
+// or signal channel. Seeking past EOF is allowed (POSIX/WASI both
+// permit it; v1's tmpfs read returns 0 bytes from such an offset).
+//
+// Wire layout used below:
+//   args[0..4]  = fd (u32)
+//   args[4..8]  = whence (u32; only the low byte is meaningful)
+//   args[8..16] = offset (i64; bit pattern of u64)
+// Response:
+//   value       = new absolute offset (u64 widened to i64; bit-exact)
+
+/// Pack `(fd, whence, offset)` into the 16-byte inline args window.
+fn fd_seek_args(fd: u32, whence: u32, offset: i64) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..8].copy_from_slice(&whence.to_le_bytes());
+    args[8..16].copy_from_slice(&offset.to_le_bytes());
+    args
+}
+
+/// Set up a Vnode fd against a fresh tmpfs file containing `bytes`,
+/// returning the (pid, fd) pair. The test bodies are short enough
+/// that this helper is the bulk of the setup boilerplate.
+fn make_proc_with_file_fd(
+    k: &mut Kernel,
+    name: &str,
+    path: &str,
+    bytes: &[u8],
+) -> (abi::ext::Pid, u32) {
+    let pid = make_running_proc(k, name, 0);
+    k.vfs.create(path, 0o644).expect("create");
+    let wrote = k.vfs.write(path, 0, bytes).expect("write");
+    assert_eq!(wrote, bytes.len());
+    let (mount_id, ino) = k.vfs.resolve(path).expect("resolve");
+    k.install_fd(
+        pid,
+        10,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    (pid, 10)
+}
+
+#[test]
+fn fd_seek_set_advances_to_absolute_offset() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "seeker", "/s.txt", b"abcdefghij");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 730,
+        args: fd_seek_args(fd, abi::wasi::Whence::Set as u32, 5),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.request_id, 730);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 5);
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 5);
+}
+
+#[test]
+fn fd_seek_set_with_negative_offset_returns_einval() {
+    // SeekSet asks for an absolute position; negative is meaningless.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "seeker", "/s.txt", b"abcdef");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 731,
+        args: fd_seek_args(fd, abi::wasi::Whence::Set as u32, -1),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    // Offset must be unchanged after a rejected seek.
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 0);
+}
+
+#[test]
+fn fd_seek_cur_with_zero_returns_current_position() {
+    // The `fd_tell` idiom: Cur 0 reports the current offset without
+    // changing it.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "teller", "/s.txt", b"abcdefghij");
+    // Pre-seed the offset so the test isn't checking 0 == 0.
+    k.fds_mut(pid).unwrap().set_offset(fd, 4).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 732,
+        args: fd_seek_args(fd, abi::wasi::Whence::Cur as u32, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 4);
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 4);
+}
+
+#[test]
+fn fd_seek_cur_with_negative_offset_back_past_zero_returns_einval() {
+    // SeekCur from offset 2 with delta -5 would underflow to -3;
+    // checked_add_signed catches it and the handler maps to EINVAL.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "rewinder", "/s.txt", b"abcdefghij");
+    k.fds_mut(pid).unwrap().set_offset(fd, 2).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 733,
+        args: fd_seek_args(fd, abi::wasi::Whence::Cur as u32, -5),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 2);
+}
+
+#[test]
+fn fd_seek_end_with_zero_returns_file_size() {
+    // SeekEnd 0 lands at the end-of-file position, which is the file
+    // size for a regular file.
+    let bytes: &[u8] = b"abcdefghij";
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "ender", "/s.txt", bytes);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 734,
+        args: fd_seek_args(fd, abi::wasi::Whence::End as u32, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, bytes.len() as i64);
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), bytes.len() as u64);
+}
+
+#[test]
+fn fd_seek_end_with_negative_offset_seeks_into_file() {
+    // SeekEnd -3 on a 10-byte file lands at offset 7 (size + offset).
+    let bytes: &[u8] = b"abcdefghij";
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "tail", "/s.txt", bytes);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 735,
+        args: fd_seek_args(fd, abi::wasi::Whence::End as u32, -3),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, (bytes.len() - 3) as i64);
+    assert_eq!(
+        k.fds(pid).unwrap().offset(fd).unwrap(),
+        (bytes.len() - 3) as u64,
+    );
+}
+
+#[test]
+fn fd_seek_with_invalid_whence_returns_einval() {
+    // Whence values outside {Set=0, Cur=1, End=2} are EINVAL — the
+    // handler is the single line of defence for the wire format.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "bogus", "/s.txt", b"abc");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 736,
+        args: fd_seek_args(fd, 99, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 0);
+}
+
+#[test]
+fn fd_seek_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "stranger", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 737,
+        args: fd_seek_args(99, abi::wasi::Whence::Set as u32, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_seek_on_char_device_fd_returns_einval() {
+    // CharDevice (and every other non-Vnode FdObject) has no seek
+    // semantics — whence on a console fd is meaningless, EINVAL.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "consoler", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 738,
+        args: fd_seek_args(1, abi::wasi::Whence::Set as u32, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_seek_then_fd_read_reads_from_new_position() {
+    // The integration test that pins the actual reason fd_seek
+    // exists: a subsequent fd_read on the same fd starts from the
+    // seek'd offset, not from zero.
+    let mut k = make_kernel();
+    let bytes: &[u8] = b"abcdefghij";
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "after_seek", "/s.txt", bytes);
+    let mut heap = vec![0u8; 64];
+
+    // Seek to offset 4.
+    let seek = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 739,
+        args: fd_seek_args(fd, abi::wasi::Whence::Set as u32, 4),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, pid, &seek, &mut heap).status, 0);
+
+    // Read 4 bytes — should get "efgh", not "abcd".
+    let read = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 740,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &read, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 4);
+    assert_eq!(&heap[..4], b"efgh");
 }
 
 // ---- fd_prestat_get ---------------------------------------------------

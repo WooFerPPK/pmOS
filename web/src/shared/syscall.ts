@@ -190,11 +190,15 @@ export const OP_WASI = {
   CLOCK_TIME_GET: 0x0011,
   RANDOM_GET: 0x0051,
   SCHED_YIELD: 0x0052,
+  /** Wire-format identity for `fd_seek`. The shim packs
+   * `(fd, whence, offset)` into the inline args window; the kernel
+   * returns the new absolute offset in `response.value`. */
+  FD_SEEK: 0x0031,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Swap to whichever WASI opcode is
    * still unhandled as the implementation catches up. */
-  FD_SEEK: 0x0031,
+  FD_READDIR: 0x002f,
 } as const;
 
 /** PMos extension opcodes (0x1000..0x1501). */
@@ -240,6 +244,20 @@ export const CLOCKID = {
   MONOTONIC: 1,
   PROCESS_CPUTIME_ID: 2,
   THREAD_CPUTIME_ID: 3,
+} as const;
+
+// ---- WASI seek whence -----------------------------------------------
+//
+// Mirror of `abi::wasi::Whence`. Selects the reference point for an
+// `FD_SEEK` opcode's `offset` argument: SET = absolute; CUR = relative
+// to the current position (CUR with offset 0 is the `fd_tell` idiom);
+// END = relative to file size (typically with a negative offset to
+// land inside the file).
+
+export const WHENCE = {
+  SET: 0,
+  CUR: 1,
+  END: 2,
 } as const;
 
 // ---- WASI filetype bytes --------------------------------------------

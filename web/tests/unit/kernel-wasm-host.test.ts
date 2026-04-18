@@ -48,6 +48,7 @@ import {
   FILETYPE,
   OP_EXT,
   OP_WASI,
+  WHENCE,
 } from "../../src/shared/syscall";
 
 // ---- shared fixture -------------------------------------------------
@@ -401,10 +402,10 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `FD_SEEK` is in the WASI range (0x0031) but still has no
-    // handler; swap this probe when FD_SEEK grows one.
+    // `FD_READDIR` is in the WASI range (0x002F) but still has no
+    // handler; swap this probe when FD_READDIR grows one.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.FD_SEEK,
+      opcode: OP_WASI.FD_READDIR,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -810,6 +811,153 @@ describe("dispatch: PATH_FILESTAT_GET", () => {
     expect(st.filetype).toBe(FILETYPE.DIRECTORY);
     // Root directory's nlink is 1 in tmpfs; size is 0 (directory).
     expect(st.size).toBe(0n);
+  });
+});
+
+// ---- dispatch: FD_SEEK ----------------------------------------------
+//
+// FD_SEEK packs `(fd, whence, offset)` into the inline args window
+// (fd at 0..4, whence at 4..8, offset i64 at 8..16) and gets back the
+// new absolute offset in `response.value` — same shape as
+// `clock_time_get` (one u64 result, no heap round-trip). The TS tests
+// pin the wire layout end-to-end through `kernel.wasm`'s dispatcher:
+// the EBADF + EINVAL paths cover the non-Vnode rejection branches
+// without a setup pipeline, and the SeekSet/Cur/End round trips against
+// a `/proc/version` Vnode fd (procfs is mounted at /proc by the kernel
+// init, so PATH_OPEN gives us a regular-file fd through the dispatch
+// surface alone). The Rust kernel-side tests pin every whence-decoding
+// branch and the underflow EINVAL paths exhaustively against tmpfs.
+
+/** Encode `(fd, whence, offset)` into the 16-byte inline args window
+ * the FD_SEEK opcode expects. */
+function encodeFdSeekArgs(
+  fd: number,
+  whence: number,
+  offset: bigint,
+): Uint8Array {
+  const args = new Uint8Array(16);
+  const view = new DataView(args.buffer);
+  view.setUint32(0, fd, true);
+  view.setUint32(4, whence, true);
+  view.setBigInt64(8, offset, true);
+  return args;
+}
+
+/** Open `/proc/version` via PATH_OPEN and return the resulting Vnode
+ * fd. ProcFs is mounted at /proc by the kernel init, so the file
+ * always resolves; the size is whatever StaticProcFsSource emits for
+ * the version string (non-zero, so SeekEnd assertions are meaningful). */
+function openProcVersion(host: KernelWasmHost, pid: number): number {
+  const pathBytes = new TextEncoder().encode("/proc/version");
+  const { response } = host.dispatch(
+    pid,
+    {
+      opcode: OP_WASI.PATH_OPEN,
+      requestId: 999,
+      arg0: 0,
+      heapPtr: 0,
+      heapLen: pathBytes.length,
+    },
+    pathBytes,
+  );
+  expect(response.status).toBe(0);
+  return Number(response.value);
+}
+
+describe("dispatch: FD_SEEK", () => {
+  it("returns -EBADF for an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SEEK,
+      requestId: 770,
+      args: encodeFdSeekArgs(99, WHENCE.SET, 0n),
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns -EINVAL for a /dev/console fd (whence has no meaning on a CharDevice)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SEEK,
+      requestId: 771,
+      args: encodeFdSeekArgs(1, WHENCE.SET, 0n),
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("SeekSet on a /proc/version Vnode fd returns the new absolute offset", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SEEK,
+      requestId: 772,
+      args: encodeFdSeekArgs(fd, WHENCE.SET, 7n),
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(7n);
+  });
+
+  it("SeekCur 0 reports the current offset (the fd_tell idiom)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    // First SeekSet to position 4, then SeekCur 0 to read it back.
+    const seek = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SEEK,
+      requestId: 773,
+      args: encodeFdSeekArgs(fd, WHENCE.SET, 4n),
+    });
+    expect(seek.response.status).toBe(0);
+
+    const tell = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SEEK,
+      requestId: 774,
+      args: encodeFdSeekArgs(fd, WHENCE.CUR, 0n),
+    });
+    expect(tell.response.status).toBe(0);
+    expect(tell.response.value).toBe(4n);
+  });
+
+  it("SeekEnd 0 returns the file size of /proc/version", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    // Cross-check the size via FD_FILESTAT_GET so the test doesn't
+    // hard-code the StaticProcFsSource string length — both paths
+    // should agree on whatever the procfs source happens to produce.
+    const stat = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_GET,
+      requestId: 775,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(stat.response.status).toBe(0);
+    const size = decodeFilestat(stat.heapOut).size;
+    expect(size).toBeGreaterThan(0n);
+
+    const seek = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SEEK,
+      requestId: 776,
+      args: encodeFdSeekArgs(fd, WHENCE.END, 0n),
+    });
+    expect(seek.response.status).toBe(0);
+    expect(seek.response.value).toBe(size);
   });
 });
 

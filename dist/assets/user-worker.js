@@ -66,11 +66,15 @@ var OP_WASI = {
   CLOCK_TIME_GET: 17,
   RANDOM_GET: 81,
   SCHED_YIELD: 82,
+  /** Wire-format identity for `fd_seek`. The shim packs
+   * `(fd, whence, offset)` into the inline args window; the kernel
+   * returns the new absolute offset in `response.value`. */
+  FD_SEEK: 49,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Swap to whichever WASI opcode is
    * still unhandled as the implementation catches up. */
-  FD_SEEK: 49
+  FD_READDIR: 47
 };
 var OP_EXT = {
   IPC_SOCKET: 4096,
@@ -452,6 +456,44 @@ var UserWasmRuntime = class {
         }
         view = new DataView(this.memory.buffer);
         view.setUint32(nreadPtr, nread, true);
+        return 0;
+      },
+      // WASI `fd_seek`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, offset: i64, whence: i32, new_offset_ptr: i32) -> errno: i32
+      //
+      // `whence` selects the reference point: SET=0 (absolute), CUR=1
+      // (relative to current — `fd_seek(fd, 0, CUR, *)` is the
+      // `fd_tell` idiom), END=2 (relative to file size). `offset` is
+      // signed: a SeekCur with a negative offset rewinds; SeekSet with
+      // a negative offset is rejected (-EINVAL); SeekEnd with a
+      // negative offset is the typical "seek N bytes from end" case.
+      //
+      // Dispatches FD_SEEK packing `(fd, whence, offset)` into the
+      // inline args window — fd at args[0..4] (u32), whence at
+      // args[4..8] (u32; only the low byte is meaningful), offset at
+      // args[8..16] (i64 bit pattern as u64). The kernel returns the
+      // new absolute offset in `response.value`; the shim writes it
+      // as a u64 LE at `new_offset_ptr`. Same shape as
+      // `clock_time_get`: one u64 result, no heap round-trip.
+      fd_seek: (fd, offset, whence, newOffsetPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, whence, true);
+        argsView.setBigInt64(8, offset, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_SEEK,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        if (response.status !== 0) return -response.status;
+        const view = new DataView(this.memory.buffer);
+        view.setBigInt64(newOffsetPtr, response.value, true);
         return 0;
       },
       // WASI `path_open`.

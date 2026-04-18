@@ -385,6 +385,53 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // WASI `fd_seek`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, offset: i64, whence: i32, new_offset_ptr: i32) -> errno: i32
+      //
+      // `whence` selects the reference point: SET=0 (absolute), CUR=1
+      // (relative to current — `fd_seek(fd, 0, CUR, *)` is the
+      // `fd_tell` idiom), END=2 (relative to file size). `offset` is
+      // signed: a SeekCur with a negative offset rewinds; SeekSet with
+      // a negative offset is rejected (-EINVAL); SeekEnd with a
+      // negative offset is the typical "seek N bytes from end" case.
+      //
+      // Dispatches FD_SEEK packing `(fd, whence, offset)` into the
+      // inline args window — fd at args[0..4] (u32), whence at
+      // args[4..8] (u32; only the low byte is meaningful), offset at
+      // args[8..16] (i64 bit pattern as u64). The kernel returns the
+      // new absolute offset in `response.value`; the shim writes it
+      // as a u64 LE at `new_offset_ptr`. Same shape as
+      // `clock_time_get`: one u64 result, no heap round-trip.
+      fd_seek: (
+        fd: number,
+        offset: bigint,
+        whence: number,
+        newOffsetPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, whence, true);
+        argsView.setBigInt64(8, offset, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_SEEK,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return -response.status;
+        // setBigInt64 with the kernel's i64 bit pattern writes 8 bytes
+        // identical to setBigUint64 with the u64 absolute offset — the
+        // wire is bit-exact through the i64↔u64 reinterpretation.
+        const view = new DataView(this.memory.buffer);
+        view.setBigInt64(newOffsetPtr, response.value, true);
+        return 0;
+      },
+
       // WASI `path_open`.
       //
       // Signature (lowered):

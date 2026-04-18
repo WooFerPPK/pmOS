@@ -33,7 +33,7 @@ use crate::proc::ExitStatus;
 use crate::sys::{Kernel, KernelError};
 use crate::vfs::NodeType;
 
-use super::dispatch::{args_u32, heap_in, heap_out_mut, kerr_to_errno};
+use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno};
 
 /// Dispatch a request whose opcode is in the WASI preview 1 range.
 /// The caller has already guarded with [`abi::wasi::is_wasi`].
@@ -46,6 +46,7 @@ pub fn dispatch_wasi(
     match req.opcode {
         op::FD_WRITE => handle_fd_write(kernel, pid, req, heap),
         op::FD_READ => handle_fd_read(kernel, pid, req, heap),
+        op::FD_SEEK => handle_fd_seek(kernel, pid, req),
         op::FD_CLOSE => handle_fd_close(kernel, pid, req),
         op::PATH_OPEN => handle_path_open(kernel, pid, req, heap),
         op::PROC_EXIT => handle_proc_exit(kernel, pid, req),
@@ -125,6 +126,108 @@ fn handle_fd_read(
         },
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
+}
+
+// ---- fd_seek -----------------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = fd (u32)
+//   args[4..8]  = whence (u32; only the low byte is meaningful, mapping
+//                 to abi::wasi::Whence: Set=0, Cur=1, End=2)
+//   args[8..16] = offset (i64; bit pattern read as u64 then cast)
+// Response:
+//   value       = new absolute offset (u64 widened to i64; bit-exact)
+//
+// WASI's seek combines three normally-distinct file-position operations
+// into a single opcode whose meaning depends on `whence`:
+//
+//   * Set → new position is exactly `offset` (offset must be >= 0;
+//           a negative SeekSet is meaningless and returns EINVAL).
+//   * Cur → new position is `current + offset`; both directions are
+//           legal as long as the result doesn't underflow past 0
+//           (a Cur seek that would land below 0 returns EINVAL). The
+//           idiomatic `fd_tell` fold lives here as `Cur 0` — no
+//           change to the offset, just read it back.
+//   * End → new position is `file_size + offset`; offset is typically
+//           negative (seek-into-file from the end). EINVAL on
+//           underflow same as Cur.
+//
+// Per-fd, not per-vnode: two fds pointing at the same vnode have
+// independent positions. This matches POSIX + WASI semantics. v1
+// rejects fd_seek on every non-Vnode FdObject with EINVAL — whence
+// has no meaning on a char device, socket, pipe, or signal channel.
+// Seeking past EOF on a regular file is allowed (POSIX/WASI both
+// permit it; v1's tmpfs read returns 0 bytes from such an offset and
+// a write would extend the file).
+//
+// The new offset travels back in `response.value` rather than via a
+// heap write, mirroring `clock_time_get`'s shape — both opcodes
+// compute one u64 and the shim writes it straight to a user pointer
+// via `setBigInt64`. No heap round-trip needed.
+
+fn handle_fd_seek(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let whence_byte = (args_u32(req, 4) & 0xff) as u8;
+    let offset = args_u64(req, 8) as i64;
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let (mount_id, ino) = match entry.object {
+        FdObject::Vnode { mount_id, ino } => (mount_id, ino),
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+
+    // Pattern-matching on the u8 against the enum's discriminants
+    // keeps the abi::wasi::Whence variants as the single source of
+    // truth without an unsafe transmute. A future variant added to
+    // the enum needs a matching arm here, which is what we want.
+    let new_offset = match whence_byte {
+        x if x == abi::wasi::Whence::Set as u8 => {
+            if offset < 0 {
+                return Response::err(req.request_id, EINVAL);
+            }
+            offset as u64
+        }
+        x if x == abi::wasi::Whence::Cur as u8 => {
+            match entry.offset.checked_add_signed(offset) {
+                Some(n) => n,
+                None => return Response::err(req.request_id, EINVAL),
+            }
+        }
+        x if x == abi::wasi::Whence::End as u8 => {
+            let st = match kernel.vfs.stat_ino(mount_id, ino) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Response::err(
+                        req.request_id,
+                        kerr_to_errno(KernelError::Fs(e)),
+                    )
+                }
+            };
+            match st.size.checked_add_signed(offset) {
+                Some(n) => n,
+                None => return Response::err(req.request_id, EINVAL),
+            }
+        }
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+
+    // The fd was present a moment ago; only EBADF can fire here, and
+    // only if a concurrent close raced — which the single-threaded
+    // dispatcher rules out. The mapping is honest regardless.
+    let table = match kernel.fds_mut(pid) {
+        Ok(t) => t,
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    if table.set_offset(fd, new_offset).is_err() {
+        return Response::err(req.request_id, EBADF);
+    }
+    Response::ok(req.request_id, new_offset as i64)
 }
 
 // ---- fd_close ----------------------------------------------------------

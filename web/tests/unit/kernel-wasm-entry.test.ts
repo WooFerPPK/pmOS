@@ -530,12 +530,12 @@ describe("kernel.wasm extern C entry points", () => {
     expect(resp.status).toBe(-ENOSYS);
   });
 
-  it("known WASI opcode with no handler returns -ENOSYS (FD_SEEK)", () => {
+  it("known WASI opcode with no handler returns -ENOSYS (FD_READDIR)", () => {
     const pid = kernel.kernel_register_process(CAPSET_ALL);
     expect(kernel.kernel_mark_running(pid)).toBe(0);
 
     writeRequest(kernel, {
-      opcode: 0x0031, // FD_SEEK — in WASI range but not implemented
+      opcode: 0x002f, // FD_READDIR — in WASI range but not implemented
       requestId: 601,
       arg0: 0,
       heapPtr: 0,
