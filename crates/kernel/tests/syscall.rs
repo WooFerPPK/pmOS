@@ -2612,6 +2612,282 @@ fn poll_oneoff_events_cap_caps_output_count() {
     assert_eq!(resp.extra_len, 2 * pl::EVENT_SIZE as u32);
 }
 
+// ---- fd_filestat_set_times -------------------------------------------
+//
+// Fd-based sibling of `path_filestat_set_times`. Same fstflags +
+// Option-value semantics as the path variant; difference is purely in
+// how the (mount_id, ino) pair is resolved — from the fd instead of a
+// VFS path. Reuses `Vfs::set_times_ino` (the direct-ino mirror of
+// `Vfs::set_times`) and the same fstflags decode as
+// `handle_path_filestat_set_times`.
+//
+// Wire layout:
+//   args[0..4]    = fd (u32)
+//   args[4..8]    = fstflags (u32; only the low 4 bits meaningful —
+//                   SET_ATIM / SET_ATIM_NOW / SET_MTIM / SET_MTIM_NOW;
+//                   invalid pairs → EINVAL; zero fstflags → no-op
+//                   success without touching the fs)
+//   heap[0..8]    = atim (u64 LE ns-since-epoch; ignored unless
+//                   SET_ATIM is set)
+//   heap[8..16]   = mtim (u64 LE ns-since-epoch; ignored unless
+//                   SET_MTIM is set)
+//   heap_len      = 16
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Guards in order:
+//   1. Exclusive flag pairs → EINVAL (fires before any fd lookup or
+//      heap read so an invalid-flags probe gets a stable errno
+//      regardless of whether the fd is open).
+//   2. Heap < 16 → EINVAL (malformed shim).
+//   3. Unopened fd → EBADF.
+//   4. Non-Vnode FdObject → EINVAL (fd_filestat_set_times is only
+//      meaningful for regular files + directories; char devices,
+//      sockets, pipes, and signal channels carry no time metadata to
+//      mutate).
+//   5. Filesystem rejection → passed through unchanged (EROFS for
+//      devfs/procfs, etc.).
+
+fn fd_filestat_set_times_args(fd: u32, fstflags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..8].copy_from_slice(&fstflags.to_le_bytes());
+    args
+}
+
+fn fd_filestat_set_times_heap(atim: u64, mtim: u64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&atim.to_le_bytes());
+    buf[8..16].copy_from_slice(&mtim.to_le_bytes());
+    buf
+}
+
+#[test]
+fn fd_filestat_set_times_sets_atim_and_mtim_on_tmpfs_fd() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "fd_timer", "/f.txt", b"");
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(777_000_000, 888_000_000));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 850,
+        args: fd_filestat_set_times_args(
+            fd,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_MTIM) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let st = k.vfs.stat("/f.txt").unwrap();
+    assert_eq!(st.atime_ns, 777_000_000);
+    assert_eq!(st.mtime_ns, 888_000_000);
+    assert!(st.ctime_ns > 888_000_000);
+}
+
+#[test]
+fn fd_filestat_set_times_set_atim_now_stamps_wall_clock_via_platform() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "fd_nower", "/fn.txt", b"");
+    let before = k.vfs.stat("/fn.txt").unwrap().atime_ns;
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(0, 0));
+    std::thread::sleep(std::time::Duration::from_millis(1));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 851,
+        args: fd_filestat_set_times_args(
+            fd,
+            abi::wasi::fstflags::SET_ATIM_NOW as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let after = k.vfs.stat("/fn.txt").unwrap();
+    assert!(after.atime_ns > before);
+    // mtim unchanged — SET_MTIM not set.
+    assert!(after.mtime_ns < after.atime_ns);
+}
+
+#[test]
+fn fd_filestat_set_times_with_zero_flags_is_noop_success() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "fd_prober", "/fp.txt", b"");
+    let before = k.vfs.stat("/fp.txt").unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(111, 222));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 852,
+        args: fd_filestat_set_times_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let after = k.vfs.stat("/fp.txt").unwrap();
+    assert_eq!(after.atime_ns, before.atime_ns, "atim untouched");
+    assert_eq!(after.mtime_ns, before.mtime_ns, "mtim untouched");
+    assert_eq!(after.ctime_ns, before.ctime_ns, "ctime untouched");
+}
+
+#[test]
+fn fd_filestat_set_times_with_both_atim_explicit_and_now_returns_einval() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "fd_confl", "/fc.txt", b"");
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(0, 0));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 853,
+        args: fd_filestat_set_times_args(
+            fd,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_ATIM_NOW) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_filestat_set_times_with_both_mtim_explicit_and_now_returns_einval() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "fd_confl", "/fm.txt", b"");
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(0, 0));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 854,
+        args: fd_filestat_set_times_args(
+            fd,
+            (abi::wasi::fstflags::SET_MTIM | abi::wasi::fstflags::SET_MTIM_NOW) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_filestat_set_times_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "fd_ghost", 0);
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(1, 2));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 855,
+        args: fd_filestat_set_times_args(
+            99,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_MTIM) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_filestat_set_times_on_char_device_fd_returns_einval() {
+    // Non-Vnode FdObject: char device, socket, pipe, signal channel.
+    // Guard rejects before any fs call — EINVAL, not EROFS.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "fd_cdev", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(111, 222));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 856,
+        args: fd_filestat_set_times_args(
+            1,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_MTIM) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_filestat_set_times_on_procfs_fd_returns_erofs() {
+    // procfs is read-only; its set_times returns ReadOnly which maps
+    // to EROFS. This exercises the filesystem-rejection passthrough
+    // path — guard 5 in the list above.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "fd_proc", 0);
+    let (mount_id, ino) = k.vfs.resolve("/proc/version").expect("resolve");
+    k.install_fd(
+        pid,
+        4,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..16].copy_from_slice(&fd_filestat_set_times_heap(111, 222));
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 857,
+        args: fd_filestat_set_times_args(
+            4,
+            (abi::wasi::fstflags::SET_ATIM | abi::wasi::fstflags::SET_MTIM) as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
+#[test]
+fn fd_filestat_set_times_with_short_heap_returns_einval() {
+    // Heap must carry both u64 LE timestamps (16 bytes); a shorter
+    // heap means the shim produced a malformed buffer.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "fd_trunc", "/ft.txt", b"");
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_TIMES,
+        flags: 0,
+        request_id: 858,
+        args: fd_filestat_set_times_args(
+            fd,
+            abi::wasi::fstflags::SET_ATIM as u32,
+        ),
+        heap_ptr: 0,
+        heap_len: 8, // only room for atim, no mtim
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

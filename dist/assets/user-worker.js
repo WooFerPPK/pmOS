@@ -68,6 +68,16 @@ var OP_WASI = {
    * timestamps followed by the UTF-8 path bytes). The kernel
    * returns 0 on success or -errno on error; no heap round-trip. */
   PATH_FILESTAT_SET_TIMES: 66,
+  /** Wire-format identity for `fd_filestat_set_times`. Fd-based
+   * sibling of `path_filestat_set_times`: the shim packs `fd` at
+   * args[0..4] and `fstflags` at args[4..8]; atim + mtim share the
+   * heap (two u64 LE at [0..16], heap_len = 16). Guards mirror the
+   * path variant for the flag-pair + heap-length checks, then add
+   * the fd guards: EBADF on an unopened fd, EINVAL on any non-Vnode
+   * FdObject (char devices / sockets / pipes / signal channels
+   * carry no time metadata). Filesystem rejections (EROFS from
+   * devfs / procfs) pass through unchanged. */
+  FD_FILESTAT_SET_TIMES: 41,
   PATH_OPEN: 68,
   PROC_EXIT: 96,
   CLOCK_RES_GET: 16,
@@ -924,6 +934,42 @@ var UserWasmRuntime = class {
         const { response } = this.backend.dispatch(
           {
             opcode: OP_WASI.PATH_FILESTAT_SET_TIMES,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `fd_filestat_set_times`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, atim: i64, mtim: i64, fstflags: i32) -> errno: i32
+      //
+      // Fd-based sibling of `path_filestat_set_times`: same fstflags
+      // + Options shape; the only difference is that the target vnode
+      // is reached via an fd instead of a path. Wire layout: fd at
+      // args[0..4], fstflags at args[4..8]; atim + mtim share the heap
+      // (two u64 LE at [0..16], heap_len = 16). Guards mirror the path
+      // variant (exclusive pair validation → EINVAL, short heap →
+      // EINVAL) plus the fd guards (EBADF on unopened fd; EINVAL on
+      // non-Vnode FdObject). Zero fstflags is a legal no-op success
+      // for a valid Vnode fd — the caller holds an open fd so the
+      // path-resolve + rights checks already ran at path_open time.
+      fd_filestat_set_times: (fd, atim, mtim, fstflags) => {
+        const heap = new Uint8Array(16);
+        const heapView = new DataView(heap.buffer);
+        heapView.setBigUint64(0, atim, true);
+        heapView.setBigUint64(8, mtim, true);
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, fstflags, true);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
             requestId: 0,
             args,
             heapPtr: 0,

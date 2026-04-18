@@ -474,6 +474,29 @@ impl Vfs {
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         fs.set_times(ino, atime_ns, mtime_ns)
     }
+
+    /// Set atim and/or mtim on `(mount_id, ino)` directly. Mirrors
+    /// [`Vfs::stat_ino`]: the syscall layer already carries the
+    /// pair on a `Vnode` fd, so `fd_filestat_set_times` skips path
+    /// resolution by calling this instead of [`Vfs::set_times`].
+    /// A zero-effect call (both `None`) returns `Ok(())` without
+    /// touching the filesystem — there's no permission-probe value
+    /// here because the caller already holds a valid fd, which
+    /// means path-resolve + rights were already checked at
+    /// path_open time.
+    pub fn set_times_ino(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+        atime_ns: Option<NanosSinceEpoch>,
+        mtime_ns: Option<NanosSinceEpoch>,
+    ) -> Result<(), FsError> {
+        if atime_ns.is_none() && mtime_ns.is_none() {
+            return Ok(());
+        }
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.set_times(ino, atime_ns, mtime_ns)
+    }
 }
 
 impl Default for Vfs {

@@ -192,6 +192,16 @@ export const OP_WASI = {
    * timestamps followed by the UTF-8 path bytes). The kernel
    * returns 0 on success or -errno on error; no heap round-trip. */
   PATH_FILESTAT_SET_TIMES: 0x0042,
+  /** Wire-format identity for `fd_filestat_set_times`. Fd-based
+   * sibling of `path_filestat_set_times`: the shim packs `fd` at
+   * args[0..4] and `fstflags` at args[4..8]; atim + mtim share the
+   * heap (two u64 LE at [0..16], heap_len = 16). Guards mirror the
+   * path variant for the flag-pair + heap-length checks, then add
+   * the fd guards: EBADF on an unopened fd, EINVAL on any non-Vnode
+   * FdObject (char devices / sockets / pipes / signal channels
+   * carry no time metadata). Filesystem rejections (EROFS from
+   * devfs / procfs) pass through unchanged. */
+  FD_FILESTAT_SET_TIMES: 0x0029,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
   CLOCK_RES_GET: 0x0010,

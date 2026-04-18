@@ -1000,6 +1000,168 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
   });
 });
 
+// ---- dispatch: FD_FILESTAT_SET_TIMES -------------------------------
+//
+// Fd-based sibling of PATH_FILESTAT_SET_TIMES. Wire: fd at args[0..4]
+// + fstflags at args[4..8]; atim + mtim share the heap (two u64 LE at
+// [0..16], heap_len = 16). These TS tests pin the dispatcher's
+// per-branch behaviour end-to-end through kernel.wasm: EBADF on an
+// unopened fd, EINVAL on a non-Vnode fd (/dev/console), EINVAL on
+// invalid flag pairs, zero-flags no-op success on a valid Vnode fd,
+// and the EROFS passthrough from procfs. The "set-times-actually-
+// applied" check lives in the Rust kernel tests since the TS
+// dispatcher alone can't stat by fd through the opcode surface.
+
+function encodeFdSetTimesArgs(fd: number, fstflags: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setUint32(4, fstflags, true);
+  return args;
+}
+
+function encodeFdSetTimesHeap(atim: bigint, mtim: bigint): Uint8Array {
+  const heap = new Uint8Array(16);
+  const v = new DataView(heap.buffer);
+  v.setBigUint64(0, atim, true);
+  v.setBigUint64(8, mtim, true);
+  return heap;
+}
+
+describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
+  it("returns -EBADF on an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodeFdSetTimesHeap(111n, 222n);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
+        requestId: 860,
+        args: encodeFdSetTimesArgs(99, FSTFLAGS.SET_ATIM | FSTFLAGS.SET_MTIM),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+
+  it("returns -EINVAL on a /dev/console fd (non-Vnode FdObject)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const heap = encodeFdSetTimesHeap(0n, 0n);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
+        requestId: 861,
+        args: encodeFdSetTimesArgs(1, FSTFLAGS.SET_ATIM | FSTFLAGS.SET_MTIM),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when SET_ATIM and SET_ATIM_NOW are both set", async () => {
+    // Pair-conflict check fires before fd lookup, so we can use
+    // fd=99 (unopened) and still see EINVAL — stable errno across
+    // fd states is part of the contract.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodeFdSetTimesHeap(0n, 0n);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
+        requestId: 862,
+        args: encodeFdSetTimesArgs(99, FSTFLAGS.SET_ATIM | FSTFLAGS.SET_ATIM_NOW),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when SET_MTIM and SET_MTIM_NOW are both set", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodeFdSetTimesHeap(0n, 0n);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
+        requestId: 863,
+        args: encodeFdSetTimesArgs(99, FSTFLAGS.SET_MTIM | FSTFLAGS.SET_MTIM_NOW),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns 0 (no-op success) for zero fstflags on a valid Vnode fd", async () => {
+    // /proc/version opens as a Vnode fd. Zero flags = no-op; the
+    // kernel never reaches set_times_ino, so procfs's EROFS never
+    // fires.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const heap = encodeFdSetTimesHeap(0n, 0n);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
+        requestId: 864,
+        args: encodeFdSetTimesArgs(fd, 0),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(0);
+  });
+
+  it("returns -EROFS on a procfs Vnode fd with non-zero fstflags", async () => {
+    // /proc/version is a Vnode fd (not a char device), so the
+    // non-Vnode EINVAL guard doesn't fire. Procfs's set_times returns
+    // ReadOnly → EROFS.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const heap = encodeFdSetTimesHeap(111n, 222n);
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
+        requestId: 865,
+        args: encodeFdSetTimesArgs(fd, FSTFLAGS.SET_ATIM | FSTFLAGS.SET_MTIM),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+});
+
 // ---- dispatch: POLL_ONEOFF -----------------------------------------
 //
 // Multi-subscription readiness check. Wire: (n_subs, n_events_cap) as

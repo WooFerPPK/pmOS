@@ -67,6 +67,7 @@ pub fn dispatch_wasi(
         op::FD_FILESTAT_GET => handle_fd_filestat_get(kernel, pid, req, heap),
         op::PATH_FILESTAT_GET => handle_path_filestat_get(kernel, pid, req, heap),
         op::PATH_FILESTAT_SET_TIMES => handle_path_filestat_set_times(kernel, pid, req, heap),
+        op::FD_FILESTAT_SET_TIMES => handle_fd_filestat_set_times(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
@@ -963,6 +964,109 @@ fn handle_path_filestat_get(
 // identical to path_filestat_get's (dir_fd + lookup_flags at the
 // same offsets) and leaves args[8..] free for fstflags + future
 // growth.
+
+// ---- fd_filestat_set_times -------------------------------------------
+//
+// Layout:
+//   args[0..4]    = fd (u32)
+//   args[4..8]    = fstflags (u32; SET_ATIM / SET_ATIM_NOW / SET_MTIM /
+//                   SET_MTIM_NOW — same bits as path_filestat_set_times)
+//   heap[0..8]    = atim (u64 LE ns-since-epoch; ignored unless
+//                   SET_ATIM is set)
+//   heap[8..16]   = mtim (u64 LE ns-since-epoch; ignored unless
+//                   SET_MTIM is set)
+//   heap_len      = 16
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Fd-based sibling of `path_filestat_set_times`: same fstflags + same
+// Option-materialisation for the _NOW variants + same zero-flags no-op
+// semantics. Differs only in how the `(mount_id, ino)` pair is resolved
+// — the fd table lookup replaces the path-resolve step. Reuses
+// `Vfs::set_times_ino` (the direct-ino mirror of `Vfs::set_times`) so
+// the underlying `Filesystem::set_times` call is byte-identical to the
+// path variant.
+//
+// Guards in order:
+//   1. Exclusive flag-pair validation fires BEFORE any fd lookup or
+//      heap read — an invalid-flags probe gets the same EINVAL errno
+//      regardless of fd state, mirroring the path variant.
+//   2. Heap shorter than 16 → EINVAL (malformed shim).
+//   3. Unopened fd → EBADF.
+//   4. Non-Vnode FdObject → EINVAL (char devices, sockets, pipes,
+//      signal channels carry no time metadata to mutate; guard mirrors
+//      `fd_seek` / `fd_tell` / the fd-state bundle).
+//   5. Filesystem rejection (EROFS for devfs / procfs etc.) is passed
+//      through via `kerr_to_errno(KernelError::Fs(_))`.
+
+fn handle_fd_filestat_set_times(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let fstflags = args_u32(req, 4);
+
+    let a_now = fstflags & abi::wasi::fstflags::SET_ATIM_NOW as u32 != 0;
+    let a_set = fstflags & abi::wasi::fstflags::SET_ATIM as u32 != 0;
+    let m_now = fstflags & abi::wasi::fstflags::SET_MTIM_NOW as u32 != 0;
+    let m_set = fstflags & abi::wasi::fstflags::SET_MTIM as u32 != 0;
+    if a_now && a_set {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if m_now && m_set {
+        return Response::err(req.request_id, EINVAL);
+    }
+
+    let Some(heap_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if heap_bytes.len() < 16 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let mut atim_buf = [0u8; 8];
+    atim_buf.copy_from_slice(&heap_bytes[0..8]);
+    let atim = u64::from_le_bytes(atim_buf);
+    let mut mtim_buf = [0u8; 8];
+    mtim_buf.copy_from_slice(&heap_bytes[8..16]);
+    let mtim = u64::from_le_bytes(mtim_buf);
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let (mount_id, ino) = match entry.object {
+        FdObject::Vnode { mount_id, ino } => (mount_id, ino),
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+
+    let atim_opt = if a_now {
+        Some(platform::current().now_realtime_ns())
+    } else if a_set {
+        Some(atim)
+    } else {
+        None
+    };
+    let mtim_opt = if m_now {
+        Some(platform::current().now_realtime_ns())
+    } else if m_set {
+        Some(mtim)
+    } else {
+        None
+    };
+
+    match kernel.vfs.set_times_ino(mount_id, ino, atim_opt, mtim_opt) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
 
 fn handle_path_filestat_set_times(
     kernel: &mut Kernel,
