@@ -428,11 +428,22 @@ fn handle_fd_close(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 // ---- path_open ---------------------------------------------------------
 //
 // Layout:
-//   args[0..4]  = fd flags (u32, as raw `FdFlags::from_bits` bits)
+//   args[0..4]  = fd flags (u32, in WASI `fdflags` encoding —
+//                 APPEND=0x01, DSYNC=0x02, NONBLOCK=0x04,
+//                 RSYNC=0x08, SYNC=0x10)
 //   heap_ptr    = start of UTF-8 path
 //   heap_len    = path length in bytes
 // Response:
 //   value       = freshly-allocated fd number (u32 widened to i64)
+//
+// The fdflags u32 is translated through `FdFlags::from_wasi_bits`
+// into PMos's internal encoding (which differs — PMos CLOEXEC=0x01,
+// NONBLOCK=0x02, APPEND=0x04). Prior to that helper landing, this
+// handler passed the WASI bits directly to `FdFlags::from_bits`,
+// which silently mis-mapped APPEND → CLOEXEC (dropping the fd on
+// proc_spawn), NONBLOCK → APPEND (mis-routing writes to EOF), etc.
+// DSYNC / RSYNC / SYNC are accepted and discarded since tmpfs is
+// synchronous; the helper ignores them.
 //
 // oflags (CREAT/TRUNC/DIRECTORY/EXCL) are not yet wired on the
 // Kernel side (`Kernel::path_open` takes only `FdFlags`), so the
@@ -446,8 +457,8 @@ fn handle_path_open(
     req: &Request,
     heap: &[u8],
 ) -> Response {
-    let flags_bits = args_u32(req, 0);
-    let flags = FdFlags::from_bits(flags_bits);
+    let wasi_bits = args_u32(req, 0);
+    let flags = FdFlags::from_wasi_bits(wasi_bits);
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
@@ -1543,19 +1554,16 @@ fn handle_fd_fdstat_set_flags(kernel: &mut Kernel, pid: Pid, req: &Request) -> R
         return Response::err(req.request_id, EBADF);
     };
 
-    // Start from the existing flags, clear NONBLOCK + APPEND, then
-    // OR in whatever the WASI argument requested. Preserves CLOEXEC
-    // (and any future non-F_SETFL flag) because those never appear
-    // in the WASI fdflags u32. DSYNC / RSYNC / SYNC are simply not
-    // translated to any PMos bit — they're accepted and discarded.
+    // Preserve CLOEXEC (and any future non-F_SETFL flag) because
+    // those never appear in the WASI fdflags u32. Clear the
+    // F_SETFL-owned bits (NONBLOCK + APPEND), then OR in whatever
+    // `FdFlags::from_wasi_bits` materialised from the caller's
+    // argument — the same translation path_open uses for its
+    // fdflags.
     entry.flags.remove(FdFlags::NONBLOCK);
     entry.flags.remove(FdFlags::APPEND);
-    if wasi_bits & (abi::wasi::fdflags::APPEND as u32) != 0 {
-        entry.flags.insert(FdFlags::APPEND);
-    }
-    if wasi_bits & (abi::wasi::fdflags::NONBLOCK as u32) != 0 {
-        entry.flags.insert(FdFlags::NONBLOCK);
-    }
+    let new_bits = FdFlags::from_wasi_bits(wasi_bits);
+    entry.flags.insert(new_bits);
     Response::ok(req.request_id, 0)
 }
 

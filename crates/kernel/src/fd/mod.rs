@@ -64,6 +64,31 @@ impl FdFlags {
     pub const fn from_bits(bits: u32) -> FdFlags {
         FdFlags(bits)
     }
+
+    /// Translate a WASI `fdflags` u32 (from `abi::wasi::fdflags`,
+    /// APPEND=0x01, DSYNC=0x02, NONBLOCK=0x04, RSYNC=0x08,
+    /// SYNC=0x10) into PMos internal FdFlags bits. Used by every
+    /// WASI opcode that accepts fdflags from userland — `path_open`
+    /// and `fd_fdstat_set_flags` today.
+    ///
+    /// v1 recognises only APPEND + NONBLOCK meaningfully;
+    /// DSYNC / RSYNC / SYNC are accepted and discarded because
+    /// tmpfs writes are already synchronous into in-memory state,
+    /// so there's nothing to flush. CLOEXEC is NOT represented in
+    /// the WASI fdflags encoding — the F_SETFD-level flag is only
+    /// set via proc_spawn inheritance policy, not via path_open or
+    /// fd_fdstat_set_flags — so this helper never sets it.
+    #[inline]
+    pub const fn from_wasi_bits(wasi_bits: u32) -> FdFlags {
+        let mut bits: u32 = 0;
+        if wasi_bits & (abi::wasi::fdflags::APPEND as u32) != 0 {
+            bits |= FdFlags::APPEND.0;
+        }
+        if wasi_bits & (abi::wasi::fdflags::NONBLOCK as u32) != 0 {
+            bits |= FdFlags::NONBLOCK.0;
+        }
+        FdFlags(bits)
+    }
 }
 
 /// Logical types of objects an fd can reference.

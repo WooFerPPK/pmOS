@@ -386,6 +386,131 @@ fn path_open_with_invalid_utf8_returns_einval() {
     assert_eq!(resp.status, -errno::EINVAL);
 }
 
+// ---- path_open + WASI fdflags translation ---------------------------
+//
+// WASI's fdflags encoding (APPEND=0x01, DSYNC=0x02, NONBLOCK=0x04,
+// RSYNC=0x08, SYNC=0x10) differs from PMos's internal FdFlags
+// (CLOEXEC=0x01, NONBLOCK=0x02, APPEND=0x04). Userland passes WASI
+// bits via path_open's args[0..4] window, so the handler must
+// translate before storing. These regression tests pin the correct
+// mapping: an fd opened with WASI APPEND must end up with PMos
+// APPEND (not CLOEXEC, which would mis-drop the fd on proc_spawn);
+// WASI NONBLOCK must map to PMos NONBLOCK (not PMos APPEND, which
+// would mis-route writes to EOF); WASI's sync bits DSYNC/RSYNC/SYNC
+// are accepted and discarded since v1's tmpfs is synchronous —
+// setting any of them must not set any PMos bit.
+
+#[test]
+fn path_open_with_wasi_append_sets_pmos_append() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "opener", 0);
+    k.vfs.create("/o.txt", 0o644).expect("create");
+    let path = b"/o.txt";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_OPEN,
+        flags: 0,
+        request_id: 960,
+        args: u32_args(abi::wasi::fdflags::APPEND as u32),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let fd = resp.value as u32;
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(e.flags.contains(FdFlags::APPEND), "WASI APPEND → PMos APPEND");
+    assert!(!e.flags.contains(FdFlags::CLOEXEC), "must not set CLOEXEC");
+    assert!(!e.flags.contains(FdFlags::NONBLOCK), "must not set NONBLOCK");
+}
+
+#[test]
+fn path_open_with_wasi_nonblock_sets_pmos_nonblock() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "opener", 0);
+    k.vfs.create("/o.txt", 0o644).expect("create");
+    let path = b"/o.txt";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_OPEN,
+        flags: 0,
+        request_id: 961,
+        args: u32_args(abi::wasi::fdflags::NONBLOCK as u32),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let fd = resp.value as u32;
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(e.flags.contains(FdFlags::NONBLOCK), "WASI NONBLOCK → PMos NONBLOCK");
+    assert!(!e.flags.contains(FdFlags::APPEND), "must not set APPEND");
+    assert!(!e.flags.contains(FdFlags::CLOEXEC), "must not set CLOEXEC");
+}
+
+#[test]
+fn path_open_with_wasi_sync_bits_sets_no_pmos_bits() {
+    // DSYNC + RSYNC + SYNC are meaningful on platforms with
+    // durable-write guarantees; v1's tmpfs writes are already
+    // synchronous into in-memory state, so the bits are accepted
+    // and discarded — none of them map to a PMos bit.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "opener", 0);
+    k.vfs.create("/o.txt", 0o644).expect("create");
+    let path = b"/o.txt";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let combined = (abi::wasi::fdflags::DSYNC
+        | abi::wasi::fdflags::RSYNC
+        | abi::wasi::fdflags::SYNC) as u32;
+    let req = Request {
+        opcode: op_wasi::PATH_OPEN,
+        flags: 0,
+        request_id: 962,
+        args: u32_args(combined),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let fd = resp.value as u32;
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert_eq!(e.flags, FdFlags::EMPTY, "sync-family bits discard to EMPTY");
+}
+
+#[test]
+fn path_open_with_wasi_append_and_nonblock_sets_both_pmos_bits() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "opener", 0);
+    k.vfs.create("/o.txt", 0o644).expect("create");
+    let path = b"/o.txt";
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let combined =
+        (abi::wasi::fdflags::APPEND | abi::wasi::fdflags::NONBLOCK) as u32;
+    let req = Request {
+        opcode: op_wasi::PATH_OPEN,
+        flags: 0,
+        request_id: 963,
+        args: u32_args(combined),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let fd = resp.value as u32;
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(e.flags.contains(FdFlags::APPEND));
+    assert!(e.flags.contains(FdFlags::NONBLOCK));
+    assert!(!e.flags.contains(FdFlags::CLOEXEC));
+}
+
 // ---- proc_exit --------------------------------------------------------
 
 #[test]
