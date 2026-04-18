@@ -1863,6 +1863,107 @@ describe("dispatch: FD_PWRITE", () => {
   });
 });
 
+// ---- dispatch: SOCK_SEND + SOCK_RECV -------------------------------
+//
+// WASI socket aliases of FD_WRITE / FD_READ on Socket fds. Wire:
+// (fd, si_flags / ri_flags) at args[0..8]; heap = source (send) or
+// destination (recv) buffer. Socket-only — non-Socket FdObject
+// variants reject with EINVAL. The TS tests pin the wire layout
+// end-to-end through kernel.wasm: EINVAL branch for a char-device
+// fd, EINVAL branch for a fresh IPC_SOCKET-created socket (which
+// is in Unbound state — send/recv before connect returns
+// InvalidState → EINVAL), and EBADF for an unopened fd. Happy-
+// path send/recv requires a connected socket pair which the TS
+// harness can't easily stand up through public syscalls alone;
+// the Rust tests pin that branch.
+
+function encodeSockSendArgs(fd: number, siFlags: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setUint32(4, siFlags & 0xffff, true);
+  return args;
+}
+
+function encodeSockRecvArgs(fd: number, riFlags: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setUint32(4, riFlags & 0xffff, true);
+  return args;
+}
+
+describe("dispatch: SOCK_SEND", () => {
+  it("returns -EINVAL on a char-device fd (non-Socket)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("hi");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.SOCK_SEND,
+        requestId: 970,
+        args: encodeSockSendArgs(1, 0),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SEND,
+      requestId: 971,
+      args: encodeSockSendArgs(99, 0),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
+describe("dispatch: SOCK_RECV", () => {
+  it("returns -EINVAL on a char-device fd (non-Socket)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_RECV,
+      requestId: 972,
+      args: encodeSockRecvArgs(1, 0),
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_RECV,
+      requestId: 973,
+      args: encodeSockRecvArgs(99, 0),
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
 // ---- dispatch: FD_RENUMBER -----------------------------------------
 //
 // WASI's dup2-spelling. Wire: (from, to) as two u32s at args[0..4]

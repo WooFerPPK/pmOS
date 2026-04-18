@@ -184,6 +184,18 @@ var OP_WASI = {
    * position. */
   FD_PREAD: 42,
   FD_PWRITE: 45,
+  /** Wire-format identity for `sock_send` / `sock_recv`. WASI
+   * socket aliases of FD_WRITE / FD_READ on Socket fds. Both wire
+   * layouts match fd_read / fd_write except for one extra u16 at
+   * args[4..6] (si_flags for send, ri_flags for recv — v1 ignores).
+   * Socket-only — non-Socket FdObject variants reject with EINVAL
+   * (PMos has no ENOTSOCK errno; EINVAL matches the non-Vnode
+   * guard shape used by every other fd-type-specific opcode).
+   * Unopened fd is EBADF; InvalidState IpcError (sending on an
+   * unconnected socket) also surfaces as EINVAL. Reuses
+   * kernel.ipc.send_on_socket / recv_on_socket directly. */
+  SOCK_SEND: 114,
+  SOCK_RECV: 113,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Was `FD_PREAD` before that handler
@@ -1231,6 +1243,85 @@ var UserWasmRuntime = class {
           heapLen: 0
         });
         return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `sock_send`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, si_data_ptr: i32, si_data_len: i32,
+      //    si_flags: i32, so_datalen_ptr: i32) -> errno: i32
+      //
+      // WASI socket-alias of fd_write on Socket fds. Copies the
+      // (si_data_ptr, si_data_len) buffer into the dispatch heap
+      // and dispatches SOCK_SEND with (fd, si_flags) packed into
+      // the inline args window. On success writes bytes_sent as a
+      // u32 at so_datalen_ptr. Non-Socket fds reject with -EINVAL.
+      // v1 ignores si_flags entirely — the kernel accepts whatever
+      // low 16 bits are supplied and discards them.
+      sock_send: (fd, siDataPtr, siDataLen, siFlags, soDatalenPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const bytes = new Uint8Array(this.memory.buffer, siDataPtr, siDataLen);
+        const heap = new Uint8Array(siDataLen);
+        heap.set(bytes, 0);
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, siFlags & 65535, true);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.SOCK_SEND,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: siDataLen
+          },
+          heap
+        );
+        if (response.status !== 0) return -response.status;
+        const sent = Number(response.value);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(soDatalenPtr, sent, true);
+        return 0;
+      },
+      // WASI `sock_recv`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, ri_data_ptr: i32, ri_data_len: i32,
+      //    ri_flags: i32, ro_datalen_ptr: i32,
+      //    ro_flags_ptr: i32) -> errno: i32
+      //
+      // WASI socket-alias of fd_read on Socket fds. Dispatches
+      // SOCK_RECV with (fd, ri_flags) packed into the inline args
+      // window; the response carries bytes_read in value + extraLen.
+      // Copies the read bytes back into user memory at
+      // ri_data_ptr, writes bytes_read as a u32 at ro_datalen_ptr,
+      // and writes 0 as a u16 at ro_flags_ptr (v1 has no
+      // out-of-band data, no PEEK, no message truncation — every
+      // recv yields ro_flags = 0).
+      sock_recv: (fd, riDataPtr, riDataLen, riFlags, roDatalenPtr, roFlagsPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, riFlags & 65535, true);
+        const heapOut = new Uint8Array(riDataLen);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.SOCK_RECV,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: riDataLen
+          },
+          heapOut
+        );
+        if (response.status !== 0) return -response.status;
+        const read = Number(response.value);
+        const memBytes = new Uint8Array(this.memory.buffer);
+        memBytes.set(heapOut.subarray(0, read), riDataPtr);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(roDatalenPtr, read, true);
+        memView.setUint16(roFlagsPtr, 0, true);
+        return 0;
       },
       // WASI `fd_pread`.
       //

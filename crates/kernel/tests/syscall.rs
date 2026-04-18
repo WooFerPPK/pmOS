@@ -4556,6 +4556,242 @@ fn fd_filestat_set_size_on_procfs_returns_erofs() {
     assert_eq!(resp.status, -errno::EROFS);
 }
 
+// ---- sock_send / sock_recv -----------------------------------------
+//
+// Opcodes 0x0072 + 0x0071. WASI socket aliases of FD_WRITE / FD_READ
+// on Socket fds. Wire:
+//
+//   SOCK_SEND: args[0..4] = fd (u32)
+//              args[4..8] = si_flags (u16 low; ignored in v1)
+//              heap_ptr   = source bytes
+//              heap_len   = byte count
+//   SOCK_RECV: args[0..4] = fd (u32)
+//              args[4..8] = ri_flags (u16 low; ignored in v1)
+//              heap_ptr   = destination buffer
+//              heap_len   = buffer capacity
+// Response (sock_send): value = bytes sent
+// Response (sock_recv): value + extra_len = bytes received
+//
+// Socket-only — non-Socket FdObject variants reject with EINVAL
+// (PMos's kerr_to_errno has no ENOTSOCK; EINVAL is the honest
+// answer, matching the non-Socket branch for every other fd-type-
+// specific opcode). An InvalidState IpcError (e.g. sending on an
+// unconnected socket) also surfaces as EINVAL via the standard
+// IpcError → KernelError mapping. Unopened fds return EBADF.
+//
+// v1 ignores the si_flags / ri_flags u16 entirely — WASI defines
+// them for out-of-band data, MSG_PEEK, MSG_DONTWAIT etc., none of
+// which v1's single-threaded kernel exposes. The dispatcher
+// accepts whatever low 16 bits are supplied and discards them.
+
+fn sock_send_args(fd: u32, si_flags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..8].copy_from_slice(&si_flags.to_le_bytes());
+    args
+}
+
+fn sock_recv_args(fd: u32, ri_flags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..8].copy_from_slice(&ri_flags.to_le_bytes());
+    args
+}
+
+#[test]
+fn sock_send_delivers_bytes_to_connected_peer() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sender", 0);
+
+    // Wire a connected socket pair a ↔ b.
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+
+    let msg = b"hello";
+    let mut heap = vec![0u8; 64];
+    heap[..msg.len()].copy_from_slice(msg);
+
+    let req = Request {
+        opcode: op_wasi::SOCK_SEND,
+        flags: 0,
+        request_id: 950,
+        args: sock_send_args(10, 0),
+        heap_ptr: 0,
+        heap_len: msg.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, msg.len() as i64);
+    let sb = k.ipc.socket_mut(b).unwrap();
+    let delivered: Vec<u8> = sb.rx_buf.iter().copied().collect();
+    assert_eq!(&delivered[..], msg);
+}
+
+#[test]
+fn sock_send_ignores_si_flags() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sender", 0);
+
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    heap[..2].copy_from_slice(b"hi");
+
+    // Non-zero si_flags (e.g. WASI's siflags bit 0) must not break the
+    // call — v1 discards those bits rather than validating them.
+    let req = Request {
+        opcode: op_wasi::SOCK_SEND,
+        flags: 0,
+        request_id: 951,
+        args: sock_send_args(10, 0x0001),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 2);
+}
+
+#[test]
+fn sock_send_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdevsender", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+    heap[..2].copy_from_slice(b"hi");
+
+    let req = Request {
+        opcode: op_wasi::SOCK_SEND,
+        flags: 0,
+        request_id: 952,
+        args: sock_send_args(1, 0),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn sock_send_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghostsender", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_SEND,
+        flags: 0,
+        request_id: 953,
+        args: sock_send_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn sock_recv_reads_bytes_from_peer_send() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "receiver", 0);
+
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+        sa.rx_buf.extend(b"payload");
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_RECV,
+        flags: 0,
+        request_id: 954,
+        args: sock_recv_args(10, 0),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 7);
+    assert_eq!(resp.extra_len, 7);
+    assert_eq!(&heap[..7], b"payload");
+}
+
+#[test]
+fn sock_recv_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdevreceiver", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_RECV,
+        flags: 0,
+        request_id: 955,
+        args: sock_recv_args(1, 0),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn sock_recv_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghostreceiver", 0);
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_RECV,
+        flags: 0,
+        request_id: 956,
+        args: sock_recv_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

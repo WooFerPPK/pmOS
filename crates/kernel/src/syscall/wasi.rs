@@ -77,6 +77,8 @@ pub fn dispatch_wasi(
         op::FD_FILESTAT_SET_SIZE => handle_fd_filestat_set_size(kernel, pid, req),
         op::FD_PREAD => handle_fd_pread(kernel, pid, req, heap),
         op::FD_PWRITE => handle_fd_pwrite(kernel, pid, req, heap),
+        op::SOCK_SEND => handle_sock_send(kernel, pid, req, heap),
+        op::SOCK_RECV => handle_sock_recv(kernel, pid, req, heap),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
@@ -1710,6 +1712,112 @@ fn handle_fd_pwrite(
         Err(e) => Response::err(
             req.request_id,
             kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+// ---- sock_send / sock_recv -----------------------------------------
+//
+// WASI socket aliases of FD_WRITE / FD_READ on Socket fds. Wire:
+//
+//   SOCK_SEND: args[0..4] = fd (u32)
+//              args[4..8] = si_flags (u16 in the low bits; v1 ignores)
+//              heap_in    = bytes to send
+//   SOCK_RECV: args[0..4] = fd (u32)
+//              args[4..8] = ri_flags (u16 in the low bits; v1 ignores)
+//              heap_out   = destination buffer, heap_len = capacity
+//
+// Both reject non-Socket FdObject with EINVAL — PMos has no
+// ENOTSOCK errno; EINVAL matches the non-Vnode guard shape used by
+// every other fd-type-specific opcode. Unopened fd is EBADF. The
+// handlers reuse kernel.ipc.send_on_socket / kernel.ipc.recv_on_socket
+// directly; IpcError converts to KernelError via the existing
+// From<IpcError> impl and then to errno via kerr_to_errno. An
+// InvalidState IpcError (e.g. sending on an unconnected socket)
+// surfaces as EINVAL, a ConnectionRefused surfaces as ECONNREFUSED,
+// etc. — the mapping is consistent with what FD_READ / FD_WRITE
+// report on the same fd.
+//
+// The si_flags / ri_flags WASI fields encode out-of-band data bits,
+// MSG_PEEK, MSG_DONTWAIT etc. None of those are meaningful on v1's
+// single-threaded kernel with memory-backed socket buffers, so the
+// handler accepts whatever low 16 bits the caller supplies and
+// discards them — a userland caller that asks for SO_OOB gets a
+// plain in-band send, no error.
+
+fn handle_sock_send(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let _si_flags = args_u32(req, 4) & 0xFFFF;
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let socket_id = match entry.object {
+        FdObject::Socket(id) => id,
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    let Some(bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel
+        .ipc
+        .send_on_socket(crate::ipc::SocketId(socket_id), bytes, alloc::vec::Vec::new())
+    {
+        Ok(n) => Response::ok(req.request_id, n as i64),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::from(e)),
+        ),
+    }
+}
+
+fn handle_sock_recv(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let _ri_flags = args_u32(req, 4) & 0xFFFF;
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let socket_id = match entry.object {
+        FdObject::Socket(id) => id,
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+    let max_len = req.heap_len as usize;
+    let Some(buf) = heap_out_mut(req, heap, max_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel
+        .ipc
+        .recv_on_socket(crate::ipc::SocketId(socket_id), buf, 0)
+    {
+        Ok((n, _fds)) => Response {
+            request_id: req.request_id,
+            status: 0,
+            value: n as i64,
+            extra_len: n as u32,
+            _pad: [0u8; 12],
+        },
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::from(e)),
         ),
     }
 }

@@ -308,6 +308,18 @@ export const OP_WASI = {
    * position. */
   FD_PREAD: 0x002a,
   FD_PWRITE: 0x002d,
+  /** Wire-format identity for `sock_send` / `sock_recv`. WASI
+   * socket aliases of FD_WRITE / FD_READ on Socket fds. Both wire
+   * layouts match fd_read / fd_write except for one extra u16 at
+   * args[4..6] (si_flags for send, ri_flags for recv — v1 ignores).
+   * Socket-only — non-Socket FdObject variants reject with EINVAL
+   * (PMos has no ENOTSOCK errno; EINVAL matches the non-Vnode
+   * guard shape used by every other fd-type-specific opcode).
+   * Unopened fd is EBADF; InvalidState IpcError (sending on an
+   * unconnected socket) also surfaces as EINVAL. Reuses
+   * kernel.ipc.send_on_socket / recv_on_socket directly. */
+  SOCK_SEND: 0x0072,
+  SOCK_RECV: 0x0071,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Was `FD_PREAD` before that handler
