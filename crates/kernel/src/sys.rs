@@ -390,7 +390,15 @@ impl Kernel {
                 let (n, _fds) = self.ipc.recv_on_socket(SocketId(id), buf, 0)?;
                 Ok(n)
             }
-            FdObject::PipeRead(_) => Err(KernelError::NotSupportedOnFd),
+            FdObject::PipeRead(id) => {
+                use crate::ipc::{PipeId, PipeReadResult};
+                let pipe = self.ipc.pipe_mut(PipeId(id))?;
+                match pipe.try_read(buf) {
+                    PipeReadResult::Read(n) => Ok(n),
+                    PipeReadResult::Eof => Ok(0),
+                    PipeReadResult::WouldBlock => Err(KernelError::WouldBlock),
+                }
+            }
             FdObject::PipeWrite(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel => Err(KernelError::NotSupportedOnFd),
@@ -426,7 +434,15 @@ impl Kernel {
                 let n = self.ipc.send_on_socket(SocketId(id), buf, Vec::new())?;
                 Ok(n)
             }
-            FdObject::PipeWrite(_) => Err(KernelError::NotSupportedOnFd),
+            FdObject::PipeWrite(id) => {
+                use crate::ipc::{PipeId, PipeWriteResult};
+                let pipe = self.ipc.pipe_mut(PipeId(id))?;
+                match pipe.try_write(buf) {
+                    PipeWriteResult::Wrote(n) => Ok(n),
+                    PipeWriteResult::Broken => Err(KernelError::PipeBroken),
+                    PipeWriteResult::WouldBlock => Err(KernelError::WouldBlock),
+                }
+            }
             FdObject::PipeRead(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel => Err(KernelError::NotSupportedOnFd),

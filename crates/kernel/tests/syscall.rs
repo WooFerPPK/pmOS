@@ -6025,6 +6025,265 @@ fn path_symlink_with_old_len_past_heap_returns_einval() {
     assert_eq!(resp.status, -errno::EINVAL);
 }
 
+// ---- fd_read / fd_write on pipe fds --------------------------------
+//
+// Pre-slice, Kernel::fd_read on a PipeRead fd and Kernel::fd_write on
+// a PipeWrite fd both returned NotSupportedOnFd → EINVAL
+// unconditionally, even though the ipc::pipe module had been
+// providing try_read / try_write primitives since slice 0. Post-
+// slice, those two variants thread through to `ipc::Pipe::try_read`
+// / `ipc::Pipe::try_write` directly; the reverse-direction cases
+// (read on PipeWrite, write on PipeRead) still return EINVAL.
+//
+// Conversion of PipeReadResult / PipeWriteResult to syscall returns:
+//
+//   PipeReadResult::Read(n)       → Ok(n)
+//   PipeReadResult::Eof           → Ok(0)                     (EOF convention)
+//   PipeReadResult::WouldBlock    → Err(KernelError::WouldBlock)  → EAGAIN
+//   PipeWriteResult::Wrote(n)     → Ok(n)
+//   PipeWriteResult::Broken       → Err(KernelError::PipeBroken)  → EPIPE
+//   PipeWriteResult::WouldBlock   → Err(KernelError::WouldBlock)  → EAGAIN
+
+#[test]
+fn fd_read_on_pipe_read_returns_bytes_written_by_other_side() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let pipe_id = k.ipc.create_pipe();
+    // Preload the pipe with content via the IpcTable helper.
+    k.ipc.pipe_mut(pipe_id).unwrap().try_write(b"hello");
+    k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1080,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 5);
+    assert_eq!(&heap[..5], b"hello");
+}
+
+#[test]
+fn fd_read_on_pipe_read_returns_zero_when_writer_closed_and_buffer_empty() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let pipe_id = k.ipc.create_pipe();
+    // Drop the writer side; the buffer is empty and writer_closed.
+    k.ipc.drop_pipe_writer(pipe_id).unwrap();
+    k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1081,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0, "POSIX EOF convention");
+}
+
+#[test]
+fn fd_read_on_empty_pipe_with_writer_open_returns_eagain() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let pipe_id = k.ipc.create_pipe();
+    k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1082,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EAGAIN);
+}
+
+#[test]
+fn fd_write_on_pipe_write_buffers_bytes_for_reader() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe();
+    k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..5].copy_from_slice(b"world");
+
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1083,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 5,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 5);
+
+    // The reader side now has those bytes in its buffer.
+    let mut buf = [0u8; 8];
+    let res = k.ipc.pipe_mut(pipe_id).unwrap().try_read(&mut buf);
+    assert_eq!(res, kernel::ipc::PipeReadResult::Read(5));
+    assert_eq!(&buf[..5], b"world");
+}
+
+#[test]
+fn fd_write_on_pipe_write_returns_epipe_when_reader_closed() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe();
+    // Drop the reader side first — subsequent writes are broken.
+    k.ipc.drop_pipe_reader(pipe_id).unwrap();
+    k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..2].copy_from_slice(b"hi");
+
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1084,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EPIPE);
+}
+
+#[test]
+fn fd_write_on_pipe_write_returns_eagain_when_buffer_full() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe();
+    // Fill the pipe's 64 KiB buffer via direct IpcTable calls.
+    let chunk = vec![0u8; 64 * 1024];
+    let res = k.ipc.pipe_mut(pipe_id).unwrap().try_write(&chunk);
+    assert_eq!(res, kernel::ipc::PipeWriteResult::Wrote(64 * 1024));
+    k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..1].copy_from_slice(b"x");
+
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1085,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 1,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EAGAIN);
+}
+
+#[test]
+fn fd_read_on_pipe_write_fd_returns_einval() {
+    // Reading from the write end is still a wrong-direction op;
+    // NotSupportedOnFd → EINVAL, distinct from the read-end paths.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "misreader", 0);
+    let pipe_id = k.ipc.create_pipe();
+    k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1086,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_write_on_pipe_read_fd_returns_einval() {
+    // Writing to the read end is still a wrong-direction op.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "miswriter", 0);
+    let pipe_id = k.ipc.create_pipe();
+    k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..2].copy_from_slice(b"no");
+
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1087,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn pipe_round_trip_via_fd_read_and_fd_write_syscalls() {
+    // End-to-end: one process holds both ends, writes via fd, reads
+    // back via the paired fd.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "round_tripper", 0);
+    let pipe_id = k.ipc.create_pipe();
+    k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(pid, 4, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+
+    // Write "pipe!" via fd 4.
+    heap[..5].copy_from_slice(b"pipe!");
+    let write_req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1088,
+        args: u32_args(4),
+        heap_ptr: 0,
+        heap_len: 5,
+    };
+    let w = dispatch(&mut k, pid, &write_req, &mut heap);
+    assert_eq!(w.status, 0);
+    assert_eq!(w.value, 5);
+
+    // Read via fd 3.
+    for b in heap[..5].iter_mut() {
+        *b = 0;
+    }
+    let read_req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1089,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let r = dispatch(&mut k, pid, &read_req, &mut heap);
+    assert_eq!(r.status, 0);
+    assert_eq!(r.value, 5);
+    assert_eq!(&heap[..5], b"pipe!");
+}
+
 // ---- PipeBroken → EPIPE surface mapping ----------------------------
 //
 // Pre-slice, IpcError::PipeBroken mapped to KernelError::NotSupportedOnFd
