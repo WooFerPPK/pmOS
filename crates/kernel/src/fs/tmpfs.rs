@@ -65,6 +65,10 @@ impl TmpNode {
 struct TmpEntry {
     node: TmpNode,
     mode: Mode,
+    /// Number of directory entries pointing at this inode. Starts at
+    /// 1 on create/mkdir; link() bumps it, unlink() decrements it.
+    /// The inode only leaves `self.nodes` when nlink reaches 0.
+    nlink: u32,
     atime_ns: NanosSinceEpoch,
     mtime_ns: NanosSinceEpoch,
     ctime_ns: NanosSinceEpoch,
@@ -86,6 +90,7 @@ impl TmpFs {
             TmpEntry {
                 node: TmpNode::Directory(BTreeMap::new()),
                 mode: 0o755,
+                nlink: 1,
                 atime_ns: now,
                 mtime_ns: now,
                 ctime_ns: now,
@@ -210,6 +215,7 @@ impl Filesystem for TmpFs {
             TmpEntry {
                 node: TmpNode::File(Vec::new()),
                 mode,
+                nlink: 1,
                 atime_ns: now,
                 mtime_ns: now,
                 ctime_ns: now,
@@ -234,6 +240,7 @@ impl Filesystem for TmpFs {
             TmpEntry {
                 node: TmpNode::Directory(BTreeMap::new()),
                 mode,
+                nlink: 1,
                 atime_ns: now,
                 mtime_ns: now,
                 ctime_ns: now,
@@ -252,9 +259,21 @@ impl Filesystem for TmpFs {
         if child.node.is_dir() {
             return Err(FsError::IsADirectory);
         }
-        // Safe to remove from parent and drop the node.
+        // Remove the parent's dir entry first.
         self.dir_children_mut(dir)?.remove(name);
-        self.nodes.remove(&child_ino);
+        // Decrement nlink; the inode outlives the name if another
+        // hardlink still references it. Only drop the node's bytes
+        // when the last reference is gone.
+        let remaining = {
+            let entry = self.entry_mut(child_ino)?;
+            entry.nlink = entry.nlink.saturating_sub(1);
+            let now = now_ns();
+            entry.ctime_ns = now;
+            entry.nlink
+        };
+        if remaining == 0 {
+            self.nodes.remove(&child_ino);
+        }
         Ok(())
     }
 
@@ -314,7 +333,7 @@ impl Filesystem for TmpFs {
             ino,
             ty: entry.node.node_type(),
             mode: entry.mode,
-            nlink: 1,
+            nlink: entry.nlink,
             size: entry.node.size(),
             atime_ns: entry.atime_ns,
             mtime_ns: entry.mtime_ns,
@@ -332,6 +351,44 @@ impl Filesystem for TmpFs {
         bytes.resize(new_size as usize, 0);
         entry.mtime_ns = now;
         entry.ctime_ns = now;
+        Ok(())
+    }
+
+    fn link(
+        &mut self,
+        from_dir: Ino,
+        from_name: &str,
+        to_dir: Ino,
+        to_name: &str,
+    ) -> Result<(), FsError> {
+        check_name(to_name)?;
+        let src_ino = {
+            let children = self.dir_children(from_dir)?;
+            *children.get(from_name).ok_or(FsError::NotFound)?
+        };
+        {
+            let dst_children = self.dir_children(to_dir)?;
+            if dst_children.contains_key(to_name) {
+                return Err(FsError::AlreadyExists);
+            }
+        }
+        // Bump nlink + ctime on the source inode; a hardlink adds a
+        // reference and is itself a metadata change.
+        let now = now_ns();
+        {
+            let entry = self.entry_mut(src_ino)?;
+            entry.nlink = entry.nlink.saturating_add(1);
+            entry.ctime_ns = now;
+        }
+        // Insert the new directory entry. Touch the destination
+        // directory's mtime+ctime — its contents just changed.
+        self.dir_children_mut(to_dir)?
+            .insert(to_name.to_string(), src_ino);
+        {
+            let entry = self.entry_mut(to_dir)?;
+            entry.mtime_ns = now;
+            entry.ctime_ns = now;
+        }
         Ok(())
     }
 

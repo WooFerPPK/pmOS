@@ -414,13 +414,12 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `PATH_LINK` is in the WASI range (0x0043) but still has no
-    // handler; was `SOCK_SHUTDOWN` before that handler landed,
-    // `FD_PREAD` before that, `FD_READDIR` before that. Swap this
-    // probe to whatever's still unhandled as the implementation
-    // catches up.
+    // `PATH_SYMLINK` is in the WASI range (0x0048) but still has no
+    // handler; was `PATH_LINK` before that handler landed, then
+    // `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. Swap this probe to
+    // whatever's still unhandled as the implementation catches up.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.PATH_LINK,
+      opcode: OP_WASI.PATH_SYMLINK,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -1299,6 +1298,168 @@ describe("dispatch: PATH_RENAME", () => {
         opcode: OP_WASI.PATH_RENAME,
         requestId: 893,
         args: encodePathRenameArgs(0, 0, heap.length), // old_len == heap_len
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
+// ---- dispatch: PATH_LINK -------------------------------------------
+//
+// Hardlink opcode at 0x0043. Wire packs (old_fd, old_flags, new_fd,
+// old_len) as four u32s in the inline args window; only old_len
+// (args[12..16]) is decoded in v1. Heap carries (old_path, new_path)
+// concatenated, split at old_len. These TS tests pin the wire layout
+// end-to-end through kernel.wasm for the error branches reachable
+// from this harness: -ENOENT for a missing source, -EEXIST when the
+// target already exists, -EROFS within /dev (devfs inherits the trait
+// default), -EINVAL for zero old_len, and -EINVAL when old_len >=
+// heap_len. The happy-path nlink verification lives in the Rust
+// kernel tests; here we focus on the dispatcher-level branches.
+
+function encodePathLinkArgs(
+  oldFd: number,
+  oldFlags: number,
+  newFd: number,
+  oldLen: number,
+): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, oldFd, true);
+  v.setUint32(4, oldFlags, true);
+  v.setUint32(8, newFd, true);
+  v.setUint32(12, oldLen, true);
+  return args;
+}
+
+function encodePathLinkHeap(oldPath: string, newPath: string): Uint8Array {
+  const enc = new TextEncoder();
+  const oldB = enc.encode(oldPath);
+  const newB = enc.encode(newPath);
+  const heap = new Uint8Array(oldB.length + newB.length);
+  heap.set(oldB, 0);
+  heap.set(newB, oldB.length);
+  return heap;
+}
+
+describe("dispatch: PATH_LINK", () => {
+  it("returns -ENOENT when the source path does not exist", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodePathLinkHeap("/nope", "/alias");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_LINK,
+        requestId: 1000,
+        args: encodePathLinkArgs(0, 0, 0, "/nope".length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.ENOENT);
+  });
+
+  it("returns -EROFS when linking within /dev (devfs inherits default)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodePathLinkHeap("/dev/null", "/dev/null2");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_LINK,
+        requestId: 1001,
+        args: encodePathLinkArgs(0, 0, 0, "/dev/null".length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EROFS);
+  });
+
+  it("returns -ENOTSUP for cross-mount links", async () => {
+    // Source in /proc, destination in /dev → different mounts.
+    // Vfs::link rejects this before touching either filesystem.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodePathLinkHeap("/proc/version", "/dev/xver");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_LINK,
+        requestId: 1002,
+        args: encodePathLinkArgs(0, 0, 0, "/proc/version".length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+  });
+
+  it("returns -EINVAL for zero old_len", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("/nowhere");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_LINK,
+        requestId: 1003,
+        args: encodePathLinkArgs(0, 0, 0, 0),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when old_len >= heap_len (empty new path)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("/a");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_LINK,
+        requestId: 1004,
+        args: encodePathLinkArgs(0, 0, 0, heap.length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when old_len > heap_len", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("/abc");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_LINK,
+        requestId: 1005,
+        args: encodePathLinkArgs(0, 0, 0, 999),
         heapPtr: 0,
         heapLen: heap.length,
       },

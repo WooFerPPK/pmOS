@@ -108,23 +108,23 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `PATH_LINK` is in the WASI range (0x0043) but still has no
+    // `PATH_SYMLINK` is in the WASI range (0x0048) but still has no
     // handler. Same shape as the ext-side test below: decoded as
     // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>` arm,
     // ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `SOCK_SHUTDOWN` before that handler landed,
-    // then `FD_PREAD`, then `FD_READDIR`, then `FD_SEEK` /
-    // `CLOCK_TIME_GET` before those. When `PATH_LINK` grows a real
-    // handler, swap this probe to whatever's still unhandled at
-    // that point, or delete the test once every WASI opcode has
-    // real coverage.)
+    // (This probe was `PATH_LINK` before that handler landed, then
+    // `SOCK_SHUTDOWN`, then `FD_PREAD`, then `FD_READDIR`, then
+    // `FD_SEEK` / `CLOCK_TIME_GET` before those. When `PATH_SYMLINK`
+    // grows a real handler, swap this probe to whatever's still
+    // unhandled at that point, or delete the test once every WASI
+    // opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::PATH_LINK,
+        opcode: op_wasi::PATH_SYMLINK,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -5304,6 +5304,348 @@ fn sock_shutdown_on_unopened_fd_returns_ebadf() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, -errno::EBADF);
+}
+
+// ---- path_link -----------------------------------------------------
+//
+// Opcode 0x0043. Create a new directory entry (hardlink) pointing at
+// an existing inode. Wire:
+//
+//   args[0..4]   = old_fd       (u32; ignored in v1 — no preopens)
+//   args[4..8]   = old_flags    (u32; lookup flags — ignored in v1,
+//                                 symlinks aren't followed by the path
+//                                 resolver regardless)
+//   args[8..12]  = new_fd       (u32; ignored in v1)
+//   args[12..16] = old_len      (u32; split point in heap window —
+//                                 heap[0..old_len] is the old / source
+//                                 UTF-8 path, heap[old_len..heap_len]
+//                                 is the new / hardlink-target path)
+//
+// Mirrors PATH_RENAME's two-heap-strings packing but with old_len at
+// [12..16] because path_link has three integer-shaped args in the
+// WASI signature before the path-length fields.
+//
+// Semantics: new name appears as an alias of the same inode — writes
+// through one name are visible through the other, and the source's
+// nlink increments. Vfs::link detects cross-mount and returns
+// NotSupported → ENOTSUP; within-mount calls dispatch to
+// Filesystem::link on the owning mount. tmpfs overrides with the real
+// impl; devfs/procfs inherit the trait default (ReadOnly → EROFS,
+// matching Filesystem::set_times' default).
+
+fn path_link_args(old_fd: u32, old_flags: u32, new_fd: u32, old_len: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&old_fd.to_le_bytes());
+    args[4..8].copy_from_slice(&old_flags.to_le_bytes());
+    args[8..12].copy_from_slice(&new_fd.to_le_bytes());
+    args[12..16].copy_from_slice(&old_len.to_le_bytes());
+    args
+}
+
+fn path_link_heap(old_path: &[u8], new_path: &[u8]) -> Vec<u8> {
+    let mut heap = vec![0u8; old_path.len() + new_path.len()];
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()..].copy_from_slice(new_path);
+    heap
+}
+
+#[test]
+fn path_link_creates_alias_pointing_at_same_ino() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    let src_ino = k.vfs.create("/src.txt", 0o644).expect("create");
+    k.vfs.write("/src.txt", 0, b"hello").expect("write");
+
+    let old_path = b"/src.txt";
+    let new_path = b"/hlnk.txt";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 990,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+
+    let src_stat = k.vfs.stat("/src.txt").unwrap();
+    let new_stat = k.vfs.stat("/hlnk.txt").unwrap();
+    assert_eq!(src_stat.ino, new_stat.ino);
+    assert_eq!(src_stat.ino, src_ino);
+    assert_eq!(src_stat.size, 5);
+    assert_eq!(new_stat.size, 5);
+}
+
+#[test]
+fn path_link_both_names_share_file_content() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    k.vfs.create("/original", 0o644).expect("create");
+    k.vfs.write("/original", 0, b"ABC").expect("write");
+
+    let old_path = b"/original";
+    let new_path = b"/alias";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 991,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, 0);
+
+    // Append via the new name; read via the old name — shared content.
+    k.vfs.write("/alias", 3, b"DEF").expect("write alias");
+    let mut buf = [0u8; 6];
+    let n = k.vfs.read("/original", 0, &mut buf).unwrap();
+    assert_eq!(n, 6);
+    assert_eq!(&buf, b"ABCDEF");
+}
+
+#[test]
+fn path_link_increments_nlink() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    k.vfs.create("/f", 0o644).expect("create");
+    assert_eq!(k.vfs.stat("/f").unwrap().nlink, 1);
+
+    let old_path = b"/f";
+    let new_path = b"/g";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 992,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, 0);
+    assert_eq!(k.vfs.stat("/f").unwrap().nlink, 2);
+    assert_eq!(k.vfs.stat("/g").unwrap().nlink, 2);
+}
+
+#[test]
+fn path_link_from_missing_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    let old_path = b"/nope";
+    let new_path = b"/also_nope";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 993,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_link_to_existing_target_returns_eexist() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    k.vfs.create("/a", 0o644).expect("create a");
+    k.vfs.create("/b", 0o644).expect("create b");
+
+    let old_path = b"/a";
+    let new_path = b"/b";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 994,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EEXIST);
+}
+
+#[test]
+fn path_link_cross_mount_returns_enotsup() {
+    // Vfs::link rejects cross-mount links with NotSupported → ENOTSUP,
+    // mirroring Vfs::rename's cross-mount guard. A hardlink can't span
+    // filesystems because inode numbers are per-mount.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    k.vfs.create("/x.txt", 0o644).expect("create");
+    let old_path = b"/x.txt";
+    let new_path = b"/dev/x.txt";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 995,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+}
+
+#[test]
+fn path_link_on_devfs_returns_erofs() {
+    // Within-devfs link: devfs inherits the trait default (ReadOnly →
+    // EROFS), same as Filesystem::set_times does for devfs.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    let old_path = b"/dev/null";
+    let new_path = b"/dev/nullx";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 996,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EROFS);
+}
+
+#[test]
+fn path_link_with_invalid_utf8_old_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    let mut heap = vec![0u8; 64];
+    // Invalid UTF-8 in the old-path region, valid (but unused) new path.
+    heap[0] = 0xff;
+    heap[1] = 0xfe;
+    heap[2..2 + b"/b".len()].copy_from_slice(b"/b");
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 997,
+        args: path_link_args(0, 0, 0, 2),
+        heap_ptr: 0,
+        heap_len: (2 + b"/b".len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_link_with_invalid_utf8_new_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    let mut heap = vec![0u8; 64];
+    let old_path = b"/a";
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()] = 0xff;
+    heap[old_path.len() + 1] = 0xfe;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 998,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: (old_path.len() + 2) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_link_with_zero_old_len_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    let new_path = b"/nowhere";
+    let mut heap = vec![0u8; 32];
+    heap[..new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 999,
+        args: path_link_args(0, 0, 0, 0),
+        heap_ptr: 0,
+        heap_len: new_path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_link_with_old_len_past_heap_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    let mut heap = vec![0u8; 32];
+    heap[..4].copy_from_slice(b"/abc");
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 1000,
+        args: path_link_args(0, 0, 0, 999),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_link_then_unlink_source_keeps_content_via_alias() {
+    // With nlink tracking, unlinking one name of a hardlinked pair
+    // must leave the content reachable via the surviving name — the
+    // entire point of nlink. Validates tmpfs's unlink no longer drops
+    // the inode while another reference exists.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "linker", 0);
+    k.vfs.create("/primary", 0o644).expect("create");
+    k.vfs.write("/primary", 0, b"zz").expect("write");
+
+    let old_path = b"/primary";
+    let new_path = b"/alias";
+    let mut heap = path_link_heap(old_path, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_LINK,
+        flags: 0,
+        request_id: 1001,
+        args: path_link_args(0, 0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, 0);
+
+    k.vfs.unlink("/primary").expect("unlink primary");
+    assert!(k.vfs.stat("/primary").is_err(), "primary name gone");
+
+    let st = k.vfs.stat("/alias").expect("alias still resolves");
+    assert_eq!(st.nlink, 1, "nlink decremented on unlink");
+    let mut buf = [0u8; 2];
+    let n = k.vfs.read("/alias", 0, &mut buf).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(&buf, b"zz");
 }
 
 // ---- fd_seek ----------------------------------------------------------

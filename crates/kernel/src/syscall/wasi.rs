@@ -71,6 +71,7 @@ pub fn dispatch_wasi(
         op::FD_RENUMBER => handle_fd_renumber(kernel, pid, req),
         op::PATH_UNLINK_FILE => handle_path_unlink_file(kernel, pid, req, heap),
         op::PATH_RENAME => handle_path_rename(kernel, pid, req, heap),
+        op::PATH_LINK => handle_path_link(kernel, pid, req, heap),
         op::PATH_CREATE_DIRECTORY => handle_path_create_directory(kernel, pid, req, heap),
         op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
         op::FD_FDSTAT_SET_FLAGS => handle_fd_fdstat_set_flags(kernel, pid, req),
@@ -1442,6 +1443,73 @@ fn handle_path_rename(
         return Response::err(req.request_id, EINVAL);
     };
     match kernel.vfs.rename(old_path, new_path) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+// ---- path_link -------------------------------------------------------
+//
+// Layout:
+//   args[0..4]   = old_fd      (u32; ignored in v1 — no preopens)
+//   args[4..8]   = old_flags   (u32; lookup flags — ignored in v1,
+//                               symlinks aren't followed by the path
+//                               resolver regardless)
+//   args[8..12]  = new_fd      (u32; ignored in v1)
+//   args[12..16] = old_len     (u32; split point in heap window —
+//                               heap[0..old_len] is the source path,
+//                               heap[old_len..heap_len] is the new
+//                               hardlink-target path)
+//   heap[0..old_len]        = UTF-8 source path (must already exist)
+//   heap[old_len..heap_len] = UTF-8 new path (must NOT already exist)
+//   heap_len                = old_len + new_len (a shorter heap_len
+//                             rejects with EINVAL)
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Creates a hardlink — a second directory entry pointing at the same
+// inode. After success, writes through either name are visible through
+// the other, and stat().nlink reports the updated count. Mirrors
+// PATH_RENAME's two-heap-strings packing but with old_len at
+// args[12..16] because path_link carries three integer-shaped args
+// before the path-length fields at the WASI level.
+//
+// Threads through `Vfs::link` → `Filesystem::link` on the owning mount.
+// tmpfs overrides with the real nlink++ + dir-entry-insert path;
+// devfs / procfs / opfs inherit the trait default (`ReadOnly` → EROFS)
+// exactly the way [`Filesystem::set_times`]'s default behaves. Cross-
+// mount links are rejected at the VFS layer with `NotSupported` →
+// ENOTSUP — a hardlink can't span filesystems because inode numbers
+// are per-mount.
+
+fn handle_path_link(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let _old_fd = args_u32(req, 0);
+    let _old_flags = args_u32(req, 4);
+    let _new_fd = args_u32(req, 8);
+    let old_len = args_u32(req, 12) as usize;
+
+    let Some(heap_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if old_len == 0 || old_len >= heap_bytes.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let (old_bytes, new_bytes) = heap_bytes.split_at(old_len);
+    let Ok(old_path) = core::str::from_utf8(old_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(new_path) = core::str::from_utf8(new_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.link(old_path, new_path) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(
             req.request_id,

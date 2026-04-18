@@ -339,12 +339,24 @@ export const OP_WASI = {
    * EINVAL; unopened fd → EBADF. After a successful shutdown the
    * peer observes EOF on its next recv. */
   SOCK_SHUTDOWN: 0x0073,
+  /** Wire-format identity for `path_link`. Hardlink opcode: create a
+   * new directory entry pointing at an existing inode. Wire packs
+   * (old_fd, old_flags, new_fd, old_len) into the inline args window
+   * as four u32s at offsets 0/4/8/12; old_fd/old_flags/new_fd are
+   * ignored in v1 (no preopens, no symlink-following in resolve).
+   * The heap carries both paths concatenated with the split at
+   * args[12..16]: heap[0..old_len] = source path, heap[old_len..] =
+   * new hardlink-target path. Threads through Vfs::link → the owning
+   * mount's Filesystem::link; tmpfs bumps nlink + adds a dir entry,
+   * devfs / procfs inherit the trait default (ReadOnly → EROFS).
+   * Cross-mount links return ENOTSUP. */
+  PATH_LINK: 0x0043,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Was `SOCK_SHUTDOWN` before that
+   * kernel doesn't yet handle. Was `PATH_LINK` before that
    * handler landed; swap to whichever WASI opcode is still
    * unhandled as the implementation catches up. */
-  PATH_LINK: 0x0043,
+  PATH_SYMLINK: 0x0048,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer

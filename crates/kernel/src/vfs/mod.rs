@@ -242,6 +242,26 @@ pub trait Filesystem: Send {
         Err(FsError::ReadOnly)
     }
 
+    /// Create a hardlink `to_name` in `to_dir` pointing at the same
+    /// inode that `from_name` in `from_dir` already points at.
+    /// Cross-mount linking is rejected at the VFS layer before this
+    /// method is called, so all four arguments reference the same
+    /// filesystem.
+    ///
+    /// Default: returns `FsError::ReadOnly`. tmpfs overrides with the
+    /// real `nlink++` + dir-entry-insert path; devfs / procfs / opfs
+    /// inherit the default (→ `EROFS`), matching
+    /// [`Filesystem::set_times`]'s default.
+    fn link(
+        &mut self,
+        _from_dir: Ino,
+        _from_name: &str,
+        _to_dir: Ino,
+        _to_name: &str,
+    ) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
     /// Flush any buffered writes. Default no-op.
     fn sync(&mut self) -> Result<(), FsError> {
         Ok(())
@@ -440,6 +460,23 @@ impl Vfs {
         }
         let fs = self.mounts.fs_mut(from_mount).ok_or(FsError::NotFound)?;
         fs.rename(from_parent, &from_name, to_parent, &to_name)
+    }
+
+    /// Create a hardlink at `to` pointing at the same inode already
+    /// named by `from`. Cross-mount links are rejected with
+    /// `NotSupported` (→ ENOTSUP) — a hardlink can't span filesystems
+    /// because inode numbers are per-mount. Within a single mount
+    /// this dispatches to [`Filesystem::link`] on the owning mount;
+    /// tmpfs overrides with the real `nlink++` path, devfs / procfs
+    /// inherit the default (`ReadOnly` → EROFS).
+    pub fn link(&mut self, from: &str, to: &str) -> Result<(), FsError> {
+        let (from_mount, from_parent, from_name) = self.resolve_parent(from)?;
+        let (to_mount, to_parent, to_name) = self.resolve_parent(to)?;
+        if from_mount != to_mount {
+            return Err(FsError::NotSupported);
+        }
+        let fs = self.mounts.fs_mut(from_mount).ok_or(FsError::NotFound)?;
+        fs.link(from_parent, &from_name, to_parent, &to_name)
     }
 
     /// Stat an absolute path.

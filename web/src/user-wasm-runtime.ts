@@ -1033,6 +1033,69 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `path_link`.
+      //
+      // Signature (lowered):
+      //   (old_fd: i32, old_flags: i32,
+      //    old_path_ptr: i32, old_path_len: i32,
+      //    new_fd: i32,
+      //    new_path_ptr: i32, new_path_len: i32) -> errno: i32
+      //
+      // Mirrors path_rename's two-heap-strings shape but with the
+      // split-point word at args[12..16] (path_link has three
+      // integer-shaped args in the WASI signature — old_fd,
+      // old_flags, new_fd — before the path lengths). The heap
+      // carries (old_path, new_path) concatenated; the kernel reads
+      // old_len from inline args to know where to split. old_fd /
+      // old_flags / new_fd are ignored in v1 (no preopens, no
+      // symlink-following in resolve). Cross-mount links return
+      // ENOTSUP; within tmpfs the new name aliases the source
+      // inode's bytes (writes via one name are visible via the
+      // other).
+      path_link: (
+        _oldFd: number,
+        _oldFlags: number,
+        oldPathPtr: number,
+        oldPathLen: number,
+        _newFd: number,
+        newPathPtr: number,
+        newPathLen: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const oldBytes = new Uint8Array(
+          this.memory.buffer,
+          oldPathPtr,
+          oldPathLen,
+        );
+        const newBytes = new Uint8Array(
+          this.memory.buffer,
+          newPathPtr,
+          newPathLen,
+        );
+        const heap = new Uint8Array(oldPathLen + newPathLen);
+        heap.set(oldBytes, 0);
+        heap.set(newBytes, oldPathLen);
+
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, 0, true); // old_fd — ignored
+        argsView.setUint32(4, 0, true); // old_flags — ignored
+        argsView.setUint32(8, 0, true); // new_fd — ignored
+        argsView.setUint32(12, oldPathLen, true);
+
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_LINK,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `path_create_directory`.
       //
       // Signature (lowered):
