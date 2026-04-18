@@ -762,3 +762,62 @@ fn open_follows_symlink_reports_target_filetype() {
     let (_m, _i, ty) = vfs.open("/link").unwrap();
     assert_eq!(ty, NodeType::RegularFile);
 }
+
+// ---- resolve_nofollow: POSIX-perfect intermediate follow -----------
+//
+// Pre-slice-7 resolve_nofollow was a literal "don't follow anything"
+// walker — even an intermediate symlink short-circuited with
+// NotADirectory. Post-slice-7 it follows intermediate symlinks
+// (because real POSIX lstat semantics say only the FINAL component
+// should stay at the symlink) while leaving the final component at
+// its own ino when it's a symlink. Matches SYMLOOP_MAX-bounded chain
+// walking with ELOOP detection.
+
+#[test]
+fn resolve_nofollow_follows_intermediate_symlink() {
+    // /linkdir → /realdir (intermediate symlink). /realdir/file
+    // exists. resolve_nofollow("/linkdir/file") should dereference
+    // /linkdir, then look up "file" in /realdir, landing on the
+    // regular file's ino.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.mkdir("/realdir", 0o755).unwrap();
+    vfs.create("/realdir/file", 0o644).unwrap();
+    vfs.symlink("/realdir", "/linkdir").unwrap();
+
+    let real_file_ino = vfs.resolve("/realdir/file").unwrap().1;
+    let via_link = vfs.resolve_nofollow("/linkdir/file").unwrap().1;
+    assert_eq!(via_link, real_file_ino);
+}
+
+#[test]
+fn resolve_nofollow_intermediate_symlink_loop_returns_eloop() {
+    // /a → /b/sibling (intermediate ref), /b → /a (creates a loop
+    // when resolving /a/anything since /a's target is /b/sibling
+    // which references /a). SYMLOOP_MAX budget is shared with
+    // resolve() via the inner helper so the bound applies here too.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.symlink("/b", "/a").unwrap();
+    vfs.symlink("/a", "/b").unwrap();
+
+    let err = vfs.resolve_nofollow("/a/leaf").unwrap_err();
+    assert_eq!(err, FsError::SymLoop);
+}
+
+#[test]
+fn stat_follows_intermediate_symlink_to_target() {
+    // /linkdir → /realdir; /realdir/file exists. Pre-slice-7 stat
+    // on /linkdir/file errored with NotADirectory because Vfs::stat
+    // routes through resolve_nofollow and that didn't follow
+    // intermediates. Post-slice-7 stat returns the target file's
+    // metadata (RegularFile), matching POSIX lstat semantics where
+    // intermediate symlinks are always dereferenced.
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    vfs.mkdir("/realdir", 0o755).unwrap();
+    vfs.create("/realdir/file", 0o644).unwrap();
+    vfs.write("/realdir/file", 0, b"hello").unwrap();
+    vfs.symlink("/realdir", "/linkdir").unwrap();
+
+    let st = vfs.stat("/linkdir/file").unwrap();
+    assert_eq!(st.ty, NodeType::RegularFile);
+    assert_eq!(st.size, 5);
+}

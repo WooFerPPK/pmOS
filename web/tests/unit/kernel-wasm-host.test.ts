@@ -2217,6 +2217,77 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
     expect(response.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
   });
+
+  it("follows intermediate symlinks under lstat semantics (follow=0)", async () => {
+    // /realdir (directory with a regular file) + /linkdir →
+    // /realdir. Pre-POSIX-perfect-resolve_nofollow,
+    // PATH_FILESTAT_GET on /linkdir/file with lookup_flags=0
+    // errored with -ENOTDIR because v1's resolve_nofollow didn't
+    // follow intermediate symlinks. Post-slice-7 it follows
+    // intermediates (only the final component is flag-governed)
+    // so /linkdir/file returns the target regular file's
+    // filetype even with the flag clear.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /realdir/ and a file inside it.
+    const realdirPath = new TextEncoder().encode("/realdir");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1170,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: realdirPath.length,
+      },
+      realdirPath,
+    );
+    const filePath = new TextEncoder().encode("/realdir/file");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1171,
+        args: encodePathOpenArgs(0, OFLAG_CREAT, 0),
+        heapPtr: 0,
+        heapLen: filePath.length,
+      },
+      filePath,
+    );
+    // /linkdir → /realdir.
+    const linkHeap = encodePathSymlinkHeap("/realdir", "/linkdir");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1172,
+        args: encodePathSymlinkArgs("/realdir".length),
+        heapPtr: 0,
+        heapLen: linkHeap.length,
+      },
+      linkHeap,
+    );
+
+    // PATH_FILESTAT_GET on /linkdir/file with lookup_flags=0.
+    // Expect the regular-file filetype (4) via intermediate
+    // symlink follow.
+    const probe = new TextEncoder().encode("/linkdir/file");
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1173,
+        args: encodePathFilestatArgs(0, 0),
+        heapPtr: 0,
+        heapLen: probe.length,
+      },
+      probe,
+    );
+    expect(response.status).toBe(0);
+    expect(heapOut[16]).toBe(FILETYPE.REGULAR_FILE);
+  });
 });
 
 // ---- dispatch: PATH_READLINK ---------------------------------------

@@ -367,24 +367,15 @@ impl Vfs {
     }
 
     /// Resolve an absolute path to `(mount_id, ino)` without
-    /// following any symlinks. Preserves the pre-slice short-
-    /// circuit: if any component resolves to a SymLink vnode, the
-    /// walk continues as if the filesystem had returned that ino
-    /// verbatim. Used by lstat-like callers — `stat` and
-    /// `readlink` — so the final symlink stays addressable
-    /// through its own ino.
+    /// following the FINAL symlink component (POSIX lstat /
+    /// `O_NOFOLLOW` semantics). Intermediate symlinks are still
+    /// dereferenced — only the last component is left at its own
+    /// ino when it happens to be a symlink. Used by `stat`,
+    /// `readlink`, and `path_open(SYMLINK_FOLLOW=0)` so the final
+    /// symlink stays addressable through its own ino without
+    /// requiring callers to hand-walk their paths.
     pub fn resolve_nofollow(&mut self, abs_path: &str) -> Result<(MountId, Ino), FsError> {
-        let canon = path::normalize(abs_path);
-        let (mount_id, rel) = self
-            .mounts
-            .longest_prefix(&canon)
-            .ok_or(FsError::NotFound)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        let mut ino = fs.root();
-        for component in path::components(&rel) {
-            ino = fs.lookup(ino, component)?;
-        }
-        Ok((mount_id, ino))
+        self.resolve_inner(abs_path, false, Self::SYMLOOP_MAX)
     }
 
     fn resolve_inner(

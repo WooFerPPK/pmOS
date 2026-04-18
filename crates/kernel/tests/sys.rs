@@ -1902,12 +1902,11 @@ fn path_open_with_follow_traverses_intermediate_symlink() {
     // dereferenced before the final "file" lookup, so
     // /linkdir/file resolves to /realdir/file's ino.
     //
-    // v1's resolve_nofollow path (used when the flag is clear)
-    // is simpler: it preserves the pre-slice "don't follow
-    // anything" behaviour, so /linkdir/file with follow=0 errors
-    // with NotADirectory. Callers that want POSIX-correct lstat
-    // (intermediate follows, final doesn't) must pass follow=1
-    // for this v1 release.
+    // After the POSIX-perfect resolve_nofollow slice the same
+    // result obtains under follow=0 too; this test specifically
+    // pins the follow=1 branch. See the companion
+    // path_open_nofollow_traverses_intermediate_symlink test for
+    // the follow=0 half.
     let mut k = make_kernel();
     k.vfs.mkdir("/realdir", 0o755).unwrap();
     k.vfs.create("/realdir/file", 0o644).unwrap();
@@ -1924,6 +1923,30 @@ fn path_open_with_follow_traverses_intermediate_symlink() {
             0,
             FdFlags::EMPTY,
         )
+        .unwrap();
+    let entry = k.fds(pid).unwrap().get(fd).unwrap();
+    match entry.object {
+        FdObject::Vnode { ino, .. } => assert_eq!(ino, real_file_ino),
+        other => panic!("expected Vnode fd, got {:?}", other),
+    }
+}
+
+#[test]
+fn path_open_nofollow_traverses_intermediate_symlink() {
+    // Companion to path_open_with_follow_traverses_intermediate_
+    // symlink. Post-slice-7 resolve_nofollow follows intermediate
+    // symlinks; only the FINAL component is left at its own ino
+    // when it's a symlink. So /linkdir/file with follow=0 also
+    // reaches /realdir/file.
+    let mut k = make_kernel();
+    k.vfs.mkdir("/realdir", 0o755).unwrap();
+    k.vfs.create("/realdir/file", 0o644).unwrap();
+    k.vfs.symlink("/realdir", "/linkdir").unwrap();
+    let real_file_ino = k.vfs.resolve("/realdir/file").unwrap().1;
+    let pid = path_open_proc(&mut k, "nofollow-intermediate");
+
+    let fd = k
+        .path_open(pid, "/linkdir/file", 0, 0, 0, FdFlags::EMPTY)
         .unwrap();
     let entry = k.fds(pid).unwrap().get(fd).unwrap();
     match entry.object {
