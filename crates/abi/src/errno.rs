@@ -19,6 +19,7 @@ pub const EAFNOSUPPORT:     i32 = 5;  // address family not supported
 pub const EAGAIN:           i32 = 6;  // resource unavailable, try again
 pub const EALREADY:         i32 = 7;  // connection already in progress
 pub const EBADF:            i32 = 8;  // bad file descriptor
+pub const ECHILD:           i32 = 9;  // no child processes
 pub const EBUSY:            i32 = 10; // device or resource busy
 pub const ECANCELED:        i32 = 11; // operation canceled
 pub const ECONNABORTED:     i32 = 13; // connection aborted

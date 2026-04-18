@@ -139,22 +139,22 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `PROC_WAIT` is in the extension range (0x1101) but still has
+    // `PROC_KILL` is in the extension range (0x1102) but still has
     // no handler. Same shape as the WASI case above: decoded as a
     // known extension opcode, routed to `dispatch_ext`'s `_ =>`
     // arm, ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `PROC_SPAWN` before that handler landed. When
-    // the next extension opcode — `PROC_WAIT`, `IPC_SOCKET`, etc.
-    // — gets implemented, swap this probe to whatever's still
-    // unhandled at that point, or delete the test once every
-    // extension opcode has real coverage.)
+    // (This probe was `PROC_SPAWN` before that handler landed, then
+    // `PROC_WAIT`. When the next extension opcode gets implemented,
+    // swap this probe to whatever's still unhandled at that point,
+    // or delete the test once every extension opcode has real
+    // coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::PROC_WAIT,
+        opcode: op_ext::PROC_KILL,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -9019,4 +9019,244 @@ fn service_one_returns_false_when_ring_empty() {
 
     let mut disp = Dispatcher::new(&mut k, pid);
     assert!(!disp.service_one(&sab, &mut heap));
+}
+
+// ---- proc_wait -------------------------------------------------------
+//
+// PROC_WAIT (0x1101). v1 userland surface over Kernel::proc_wait.
+// Wire layout:
+//   args[0..4] = target_pid (i32). 0 or -1 → any child; > 0 → specific
+//                 pid; < -1 → EINVAL (process-group wait unsupported).
+//                 == caller's own pid → ECHILD (can't wait on self).
+//   args[4..8] = options (u32). WNOHANG = 0x1. v1 is always non-
+//                blocking — dispatcher can't park processes yet — so
+//                the bit is decoded for forward-compat but all waits
+//                return -EAGAIN on WouldBlock regardless.
+//   heap_len   = 0 (no child pid read-back) or 4 (write child pid to
+//                heap[0..4] on a successful reap).
+// Response:
+//   status     = 0 on reap; -errno on error.
+//   value (i64) on success = packed status:
+//                 bits  0..32 = exit code (i32).
+//                 bits 32..40 = signum (u8, 0 if not Signaled).
+//                 bits 40..48 = flags: 0x01 Exited, 0x02 Signaled,
+//                                       0x04 Crashed.
+//   extra_len  = 4 if the caller requested the child pid (heap_len
+//                >= 4), 0 otherwise.
+// Errors (negated errno in .status):
+//   ECHILD     = no children matching the target, or target ==
+//                sender pid.
+//   EAGAIN     = live children exist but none are zombies (also
+//                returned when WNOHANG is set; v1 never blocks).
+//   EINVAL     = malformed target_pid (< -1) or the options u32 has
+//                unknown bits set beyond WNOHANG.
+
+fn proc_wait_args(target_pid: i32, options: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&target_pid.to_le_bytes());
+    args[4..8].copy_from_slice(&options.to_le_bytes());
+    args
+}
+
+/// Register a child under `parent` (using a plain register — NOT
+/// `proc_spawn`, because that needs a backing fs path + a Platform
+/// spawn_process call). Leaves the child in Ready state; tests
+/// transition it to Running + proc_exit as needed.
+fn register_child(k: &mut Kernel, parent: abi::ext::Pid, name: &str) -> abi::ext::Pid {
+    let child = k
+        .register_process(RegisterArgs {
+            name,
+            ppid: parent,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .expect("register child");
+    k.mark_ready(child).expect("mark_ready child");
+    child
+}
+
+#[test]
+fn proc_wait_any_reaps_zombie_child_returns_packed_status() {
+    // Set up init (pid 1-ish) + a child that runs then exits(42).
+    // proc_wait with target=-1 + options=0 reaps the zombie and
+    // returns the packed exit status.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "shortlived");
+    k.procs
+        .transition(child, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child, ExitStatus::Exited(42)).unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_WAIT,
+        flags: 0,
+        request_id: 1200,
+        args: proc_wait_args(-1, 0),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    // Packed: exit code 42 at low 32; flags Exited=0x01 at bits 40..48.
+    let packed = resp.value as u64;
+    let exit_code = (packed & 0xffff_ffff) as i32;
+    let signum = ((packed >> 32) & 0xff) as u8;
+    let flags = ((packed >> 40) & 0xff) as u8;
+    assert_eq!(exit_code, 42);
+    assert_eq!(signum, 0);
+    assert_eq!(flags, 0x01);
+    // Child pid written to heap[0..4] as u32 LE.
+    assert_eq!(resp.extra_len, 4);
+    let reaped_pid = u32::from_le_bytes([heap[0], heap[1], heap[2], heap[3]]);
+    assert_eq!(reaped_pid as i32, child);
+    // And the child is actually reaped.
+    assert!(!k.procs.is_alive(child));
+}
+
+#[test]
+fn proc_wait_specific_pid_reaps_only_named_child() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child_a = register_child(&mut k, init, "a");
+    let child_b = register_child(&mut k, init, "b");
+    k.procs
+        .transition(child_a, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.procs
+        .transition(child_b, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child_b, ExitStatus::Exited(7)).unwrap();
+    // child_a still running; child_b is a zombie.
+
+    let req = Request {
+        opcode: op_ext::PROC_WAIT,
+        flags: 0,
+        request_id: 1201,
+        args: proc_wait_args(child_b, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let exit_code = (resp.value as u64 & 0xffff_ffff) as i32;
+    assert_eq!(exit_code, 7);
+    // heap_len was 0, so no pid written back.
+    assert_eq!(resp.extra_len, 0);
+}
+
+#[test]
+fn proc_wait_wnohang_with_live_child_returns_eagain() {
+    // A live child that hasn't exited yet. With WNOHANG set, the
+    // handler returns -EAGAIN instead of blocking.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let _child = register_child(&mut k, init, "running");
+    // Child remains in Ready state (alive).
+
+    let req = Request {
+        opcode: op_ext::PROC_WAIT,
+        flags: 0,
+        request_id: 1202,
+        args: proc_wait_args(-1, abi::ext::wait_opts::WNOHANG),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EAGAIN);
+}
+
+#[test]
+fn proc_wait_on_unknown_pid_returns_echild() {
+    // Wait target is a pid that either doesn't exist or isn't a
+    // child of the caller. Must distinguish from EAGAIN: no live
+    // children at all matching the target → ECHILD.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "lonely", 0);
+    // No children registered. Wait for any → ECHILD.
+
+    let req = Request {
+        opcode: op_ext::PROC_WAIT,
+        flags: 0,
+        request_id: 1203,
+        args: proc_wait_args(-1, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ECHILD);
+}
+
+#[test]
+fn proc_wait_on_self_returns_echild() {
+    // Specific target == caller's own pid: can't wait on yourself.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "selfie", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_WAIT,
+        flags: 0,
+        request_id: 1204,
+        args: proc_wait_args(pid, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ECHILD);
+}
+
+#[test]
+fn proc_wait_invalid_target_below_minus_one_returns_einval() {
+    // target_pid < -1 is process-group wait (POSIX waitpid(-gid, ...)).
+    // v1 doesn't implement process groups, so reject with EINVAL
+    // rather than silently treating it as Any.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "grpwait", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_WAIT,
+        flags: 0,
+        request_id: 1205,
+        args: proc_wait_args(-5, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn proc_wait_on_signaled_child_returns_packed_signaled_status() {
+    // Child terminated by signal 9 (SIGKILL). Packed status has
+    // flags = 0x02 Signaled and signum = 9.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "killed");
+    k.procs
+        .transition(child, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.proc_exit(child, ExitStatus::Signaled(9)).unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_WAIT,
+        flags: 0,
+        request_id: 1206,
+        args: proc_wait_args(child, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let packed = resp.value as u64;
+    let signum = ((packed >> 32) & 0xff) as u8;
+    let flags = ((packed >> 40) & 0xff) as u8;
+    assert_eq!(signum, 9);
+    assert_eq!(flags, 0x02);
 }

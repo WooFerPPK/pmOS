@@ -4393,6 +4393,81 @@ describe("dispatch: FD_DATASYNC", () => {
   });
 });
 
+// ---- dispatch: PROC_WAIT --------------------------------------------
+//
+// PROC_WAIT (0x1101). Wire layout: args[0..4] = target_pid (i32),
+// args[4..8] = options u32 (WNOHANG=0x1). heap_len=4 writes the
+// reaped child's pid into heap[0..4]. On success, response.value
+// carries the packed status (low 32 exit code; 32..40 signum;
+// 40..48 flags: 0x01 Exited, 0x02 Signaled, 0x04 Crashed). Error
+// surface: EINVAL (target_pid < -1 or unknown options bits),
+// ECHILD (no matching child or self-wait), EAGAIN (live child, not
+// yet zombie).
+
+function encodeProcWaitArgs(targetPid: number, options: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setInt32(0, targetPid, true);
+  v.setUint32(4, options >>> 0, true);
+  return args;
+}
+
+describe("dispatch: PROC_WAIT", () => {
+  it("returns -ECHILD when the caller has no children", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_WAIT,
+        requestId: 1300,
+        args: encodeProcWaitArgs(-1, 0),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.ECHILD);
+  });
+
+  it("returns -ECHILD when the target pid is the caller itself", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_WAIT,
+        requestId: 1301,
+        args: encodeProcWaitArgs(pid, 0),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.ECHILD);
+  });
+
+  it("returns -EINVAL when target_pid is below -1", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_WAIT,
+        requestId: 1302,
+        args: encodeProcWaitArgs(-42, 0),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {

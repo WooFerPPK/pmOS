@@ -25,14 +25,14 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use abi::cap::{Cap, CapSet};
-use abi::errno::{EINVAL, ENOSYS, ESRCH};
+use abi::errno::{EAGAIN, ECHILD, EINVAL, ENOSYS, ESRCH};
 use abi::ext::{self as op, Pid};
 use abi::ring::{Request, Response};
 
 use crate::ipc::SocketType;
 use crate::platform;
 use crate::proc::ExitStatus;
-use crate::sys::{Kernel, SpawnArgs};
+use crate::sys::{Kernel, SpawnArgs, WaitOutcome, WaitTarget};
 
 use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno};
 
@@ -56,6 +56,7 @@ pub fn dispatch_ext(
         op::CAP_CHECK => handle_cap_check(kernel, pid, req),
         op::CAP_LIST => handle_cap_list(kernel, pid, req),
         op::PROC_SPAWN => handle_proc_spawn(kernel, pid, req, heap),
+        op::PROC_WAIT => handle_proc_wait(kernel, pid, req, heap),
         op::DISPLAY_CONNECT => handle_display_connect(kernel, pid, req),
         op::DISPLAY_BIND => handle_display_bind(kernel, pid, req),
         _ => Response::err(req.request_id, ENOSYS),
@@ -451,4 +452,90 @@ fn handle_proc_spawn(
     }
 
     Response::ok(req.request_id, new_pid as i64)
+}
+
+// ---- proc_wait --------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = target_pid (i32). 0 or -1 → any child; > 0 → specific
+//                pid; < -1 → EINVAL.
+//   args[4..8] = options (u32). Only WNOHANG is recognised; other bits
+//                → EINVAL.
+//   heap_ptr   = start of the optional 4-byte child-pid scratch.
+//   heap_len   = 0 (caller doesn't need the pid back) or 4 (writes the
+//                reaped child's pid as u32 LE).
+// Response:
+//   value      = packed status: low 32 bits = exit code (i32); bits
+//                32..40 = signum (u8, 0 if Exited); bits 40..48 =
+//                flags (0x01 Exited, 0x02 Signaled, 0x04 Crashed).
+//   extra_len  = 4 when the caller requested the pid readback, 0
+//                otherwise.
+// Errors:
+//   EAGAIN     = live children exist but none are zombies. v1 always
+//                returns non-blocking — the caller retries.
+//   ECHILD     = no child matching the target, or target == sender pid.
+//   EINVAL     = malformed target or unknown options bits.
+//
+// Self-wait is rejected with ECHILD rather than EDEADLK because POSIX
+// waitpid(pid == self) semantically means "a pid that can't be my
+// child" — ECHILD matches what Linux returns. Process-group wait
+// (target < -1) is out of scope for v1's flat process model; returning
+// EINVAL steers userland away from a feature we don't implement.
+
+fn pack_exit_status(status: ExitStatus) -> i64 {
+    match status {
+        ExitStatus::Exited(code) => {
+            let low = (code as u32) as u64;
+            ((0x01_u64) << 40) | low as u64
+        }
+        ExitStatus::Signaled(sig) => {
+            // Signum lives in bits 32..40; flags 0x02 in 40..48.
+            let sig = (sig as u64) & 0xff;
+            ((0x02_u64) << 40) | (sig << 32)
+        }
+        ExitStatus::Crashed => (0x04_u64) << 40,
+    }
+    .try_into()
+    .unwrap_or(i64::MAX)
+}
+
+fn handle_proc_wait(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let target_pid = i32::from_le_bytes([req.args[0], req.args[1], req.args[2], req.args[3]]);
+    let options = args_u32(req, 4);
+    if options & !abi::ext::wait_opts::WNOHANG != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if target_pid < -1 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let target = if target_pid == 0 || target_pid == -1 {
+        WaitTarget::Any
+    } else {
+        if target_pid == pid {
+            return Response::err(req.request_id, ECHILD);
+        }
+        WaitTarget::Specific(target_pid)
+    };
+
+    match kernel.proc_wait(pid, target) {
+        Ok(WaitOutcome::Reaped(child, status)) => {
+            let packed = pack_exit_status(status);
+            let mut resp = Response::ok(req.request_id, packed);
+            if (req.heap_len as usize) >= 4 {
+                if let Some(out) = heap_out_mut(req, heap, 4) {
+                    out[0..4].copy_from_slice(&(child as u32).to_le_bytes());
+                    resp.extra_len = 4;
+                }
+            }
+            resp
+        }
+        Ok(WaitOutcome::WouldBlock) => Response::err(req.request_id, EAGAIN),
+        Ok(WaitOutcome::NoChildren) => Response::err(req.request_id, ECHILD),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
 }

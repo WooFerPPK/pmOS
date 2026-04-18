@@ -323,6 +323,11 @@ var OP_EXT = {
 var ERRNO = {
   EAGAIN: 6,
   EBADF: 8,
+  /** No child processes. Returned by `proc_wait` when the caller
+   * has no children matching the wait target, or when the target
+   * is the caller's own pid (POSIX: can't wait on self). Mirrors
+   * `abi::errno::ECHILD`. */
+  ECHILD: 9,
   ECONNREFUSED: 14,
   EEXIST: 20,
   EINVAL: 28,
@@ -1987,6 +1992,48 @@ var UserWasmRuntime = class {
           return response.status;
         }
         return Number(response.value);
+      },
+      // `proc_wait(target_pid: i32, options: i32, status_out_ptr: i32) -> i32`
+      //
+      // Reap a zombie child. Returns:
+      //
+      //   * Positive pid of the reaped child on success, with the
+      //     packed status (low 32 = exit code, next 8 = signum,
+      //     next 8 = flags: 0x01 Exited / 0x02 Signaled / 0x04
+      //     Crashed) written as an i64 LE to `status_out_ptr` if
+      //     that pointer is non-zero.
+      //   * Negative errno on failure — ECHILD (no matching child
+      //     or target == self), EAGAIN (live child, not yet
+      //     zombie), EINVAL (malformed target_pid or options).
+      //
+      // v1 is always non-blocking: the dispatcher can't park
+      // processes yet, so a non-zombie target always surfaces as
+      // -EAGAIN regardless of the WNOHANG bit. Userland loops or
+      // polls other mechanisms if it wants to block.
+      proc_wait: (targetPid, options, statusOutPtr) => {
+        const args = new Uint8Array(16);
+        const v = new DataView(args.buffer);
+        v.setInt32(0, targetPid, true);
+        v.setUint32(4, options >>> 0, true);
+        const { response, heapOut } = this.backend.dispatch({
+          opcode: OP_EXT.PROC_WAIT,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 4
+        });
+        if (response.status !== 0) {
+          return response.status;
+        }
+        if (statusOutPtr !== 0 && this.memory !== void 0) {
+          const memView = new DataView(this.memory.buffer);
+          memView.setBigInt64(statusOutPtr, response.value, true);
+        }
+        if (heapOut.length < 4) {
+          return -ERRNO.EINVAL;
+        }
+        const pidView = new DataView(heapOut.buffer, heapOut.byteOffset);
+        return pidView.getUint32(0, true);
       },
       // `ipc_socket(ty: i32) -> i32`
       //

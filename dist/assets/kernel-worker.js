@@ -359,6 +359,11 @@ var OP_EXT = {
 var ERRNO = {
   EAGAIN: 6,
   EBADF: 8,
+  /** No child processes. Returned by `proc_wait` when the caller
+   * has no children matching the wait target, or when the target
+   * is the caller's own pid (POSIX: can't wait on self). Mirrors
+   * `abi::errno::ECHILD`. */
+  ECHILD: 9,
   ECONNREFUSED: 14,
   EEXIST: 20,
   EINVAL: 28,
