@@ -1126,6 +1126,44 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `sock_accept`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, flags: i32, ro_fd_ptr: i32) -> errno: i32
+      //
+      // Accept a pending connection on a listening socket. Wire:
+      // listener_fd at args[0..4], fdflags (WASI encoding) at
+      // args[4..8]; the kernel applies the fdflags to the new fd.
+      // On success the response.value carries the newly-allocated
+      // fd; the shim writes it as a u32 at ro_fd_ptr. Empty
+      // backlog returns -EAGAIN (non-blocking semantics match v1's
+      // single-threaded kernel); non-Socket fd returns -EINVAL;
+      // unopened fd returns -EBADF.
+      sock_accept: (
+        fd: number,
+        flags: number,
+        roFdPtr: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, flags, true);
+
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.SOCK_ACCEPT,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return -response.status;
+        const newFd = Number(response.value);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(roFdPtr, newFd, true);
+        return 0;
+      },
+
       // WASI `sock_send`.
       //
       // Signature (lowered):

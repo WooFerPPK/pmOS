@@ -79,6 +79,7 @@ pub fn dispatch_wasi(
         op::FD_PWRITE => handle_fd_pwrite(kernel, pid, req, heap),
         op::SOCK_SEND => handle_sock_send(kernel, pid, req, heap),
         op::SOCK_RECV => handle_sock_recv(kernel, pid, req, heap),
+        op::SOCK_ACCEPT => handle_sock_accept(kernel, pid, req),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
@@ -1786,6 +1787,48 @@ fn handle_sock_send(
             kerr_to_errno(KernelError::from(e)),
         ),
     }
+}
+
+// ---- sock_accept ---------------------------------------------------
+//
+// Layout:
+//   args[0..4] = listener_fd (u32)
+//   args[4..8] = fdflags (u32, WASI encoding — applied to the new
+//                fd via FdFlags::from_wasi_bits; typically NONBLOCK)
+// Response:
+//   value = freshly-allocated fd for the accepted connection.
+//
+// WASI alias of the existing IPC_ACCEPT (ext 0x1004). The handler
+// forwards to Kernel::accept_socket — the same semantic the
+// extension opcode reaches — and then applies the WASI fdflags to
+// the new fd's FdEntry. Kernel::accept_socket already handles:
+//   - non-Socket fd → NotSupportedOnFd → EINVAL
+//   - unopened fd → BadFd → EBADF
+//   - listener not in Listening state → InvalidState → EINVAL
+//   - empty backlog → WouldBlock → EAGAIN
+// so this handler is an extremely thin wrapper.
+
+fn handle_sock_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let listener_fd = args_u32(req, 0);
+    let wasi_fdflags = args_u32(req, 4);
+
+    let new_fd = match kernel.accept_socket(pid, listener_fd) {
+        Ok(fd) => fd,
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    // Apply the WASI fdflags (APPEND/NONBLOCK after translation;
+    // sync-family bits discarded; CLOEXEC never set). A zero
+    // fdflags argument is a no-op — the new fd starts with
+    // FdFlags::EMPTY from FdEntry::new inside accept_socket.
+    if wasi_fdflags != 0 {
+        let flags = FdFlags::from_wasi_bits(wasi_fdflags);
+        if let Ok(table) = kernel.fds_mut(pid) {
+            if let Some(entry) = table.get_mut(new_fd) {
+                entry.flags = flags;
+            }
+        }
+    }
+    Response::ok(req.request_id, new_fd as i64)
 }
 
 fn handle_sock_recv(

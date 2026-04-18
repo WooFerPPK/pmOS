@@ -320,6 +320,15 @@ export const OP_WASI = {
    * kernel.ipc.send_on_socket / recv_on_socket directly. */
   SOCK_SEND: 0x0072,
   SOCK_RECV: 0x0071,
+  /** Wire-format identity for `sock_accept`. WASI alias of the
+   * existing IPC_ACCEPT (ext 0x1004). Wire: listener_fd at
+   * args[0..4], fdflags (WASI encoding) at args[4..8]. The kernel
+   * forwards to the existing accept-socket path and applies the
+   * fdflags to the new fd via FdFlags::from_wasi_bits. Response.value
+   * = freshly-allocated fd for the accepted connection. Error
+   * surface: non-Socket fd → EINVAL, unopened → EBADF, listener
+   * not in Listening state → EINVAL, empty backlog → EAGAIN. */
+  SOCK_ACCEPT: 0x0070,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Was `FD_PREAD` before that handler
@@ -371,6 +380,7 @@ export const OP_EXT = {
 // form (`-errno`), so a test asserts `response.status === -ERRNO.EBADF`.
 
 export const ERRNO = {
+  EAGAIN: 6,
   EBADF: 8,
   ECONNREFUSED: 14,
   EEXIST: 20,

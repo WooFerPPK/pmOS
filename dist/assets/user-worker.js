@@ -196,6 +196,15 @@ var OP_WASI = {
    * kernel.ipc.send_on_socket / recv_on_socket directly. */
   SOCK_SEND: 114,
   SOCK_RECV: 113,
+  /** Wire-format identity for `sock_accept`. WASI alias of the
+   * existing IPC_ACCEPT (ext 0x1004). Wire: listener_fd at
+   * args[0..4], fdflags (WASI encoding) at args[4..8]. The kernel
+   * forwards to the existing accept-socket path and applies the
+   * fdflags to the new fd via FdFlags::from_wasi_bits. Response.value
+   * = freshly-allocated fd for the accepted connection. Error
+   * surface: non-Socket fd → EINVAL, unopened → EBADF, listener
+   * not in Listening state → EINVAL, empty backlog → EAGAIN. */
+  SOCK_ACCEPT: 112,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Was `FD_PREAD` before that handler
@@ -239,6 +248,7 @@ var OP_EXT = {
   CAP_LIST: 4865
 };
 var ERRNO = {
+  EAGAIN: 6,
   EBADF: 8,
   ECONNREFUSED: 14,
   EEXIST: 20,
@@ -1243,6 +1253,38 @@ var UserWasmRuntime = class {
           heapLen: 0
         });
         return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `sock_accept`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, flags: i32, ro_fd_ptr: i32) -> errno: i32
+      //
+      // Accept a pending connection on a listening socket. Wire:
+      // listener_fd at args[0..4], fdflags (WASI encoding) at
+      // args[4..8]; the kernel applies the fdflags to the new fd.
+      // On success the response.value carries the newly-allocated
+      // fd; the shim writes it as a u32 at ro_fd_ptr. Empty
+      // backlog returns -EAGAIN (non-blocking semantics match v1's
+      // single-threaded kernel); non-Socket fd returns -EINVAL;
+      // unopened fd returns -EBADF.
+      sock_accept: (fd, flags, roFdPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, flags, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.SOCK_ACCEPT,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        if (response.status !== 0) return -response.status;
+        const newFd = Number(response.value);
+        const memView = new DataView(this.memory.buffer);
+        memView.setUint32(roFdPtr, newFd, true);
+        return 0;
       },
       // WASI `sock_send`.
       //

@@ -4917,6 +4917,197 @@ fn sock_recv_on_unopened_fd_returns_ebadf() {
     assert_eq!(resp.status, -errno::EBADF);
 }
 
+// ---- sock_accept ---------------------------------------------------
+//
+// Opcode 0x0070. WASI alias of the existing IPC_ACCEPT at ext
+// 0x1004. Accepts a pending connection on a listening socket and
+// returns a new fd for the accepted connection. Wire:
+//
+//   args[0..4] = listener_fd (u32)
+//   args[4..8] = fdflags (u32, WASI encoding — applied to the
+//                newly-allocated fd via FdFlags::from_wasi_bits;
+//                typically NONBLOCK)
+// Response:
+//   value = freshly-allocated fd for the accepted connection.
+//
+// Reuses Kernel::accept_socket (same method IPC_ACCEPT calls). The
+// only addition is the fdflags translation applied to the new fd
+// after allocation — WASI's sock_accept signature is
+// `sock_accept(fd, flags) -> fd` with the flags semantically the
+// same as the F_SETFL bits path_open/fd_fdstat_set_flags understand.
+//
+// Error surface mirrors IPC_ACCEPT: non-Socket FdObject → EINVAL
+// (via NotSupportedOnFd); unopened fd → EBADF; listener not in
+// Listening state → EINVAL; empty backlog → EAGAIN.
+
+fn sock_accept_args(listener_fd: u32, fdflags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&listener_fd.to_le_bytes());
+    args[4..8].copy_from_slice(&fdflags.to_le_bytes());
+    args
+}
+
+#[test]
+fn sock_accept_returns_fresh_fd_for_pending_backlog_client() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "accepter", 0);
+
+    // Listener with a pending Connecting client on its backlog.
+    let listener = k.ipc.create_socket(SocketType::Stream);
+    let client = k.ipc.create_socket(SocketType::Stream);
+    {
+        let ls = k.ipc.socket_mut(listener).unwrap();
+        ls.state = SocketState::Listening;
+        ls.backlog.push_back(client);
+    }
+    {
+        let cs = k.ipc.socket_mut(client).unwrap();
+        cs.state = SocketState::Connecting;
+    }
+    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_ACCEPT,
+        flags: 0,
+        request_id: 970,
+        args: sock_accept_args(3, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let new_fd = resp.value as u32;
+    // The new fd must be a Socket variant (server side of the
+    // accepted connection).
+    let entry = k.fds(pid).unwrap().get(new_fd).unwrap();
+    assert!(matches!(entry.object, FdObject::Socket(_)));
+}
+
+#[test]
+fn sock_accept_applies_wasi_fdflags_to_the_new_fd() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "accepter", 0);
+
+    let listener = k.ipc.create_socket(SocketType::Stream);
+    let client = k.ipc.create_socket(SocketType::Stream);
+    {
+        let ls = k.ipc.socket_mut(listener).unwrap();
+        ls.state = SocketState::Listening;
+        ls.backlog.push_back(client);
+    }
+    {
+        let cs = k.ipc.socket_mut(client).unwrap();
+        cs.state = SocketState::Connecting;
+    }
+    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_ACCEPT,
+        flags: 0,
+        request_id: 971,
+        args: sock_accept_args(3, abi::wasi::fdflags::NONBLOCK as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let new_fd = resp.value as u32;
+    let entry = k.fds(pid).unwrap().get(new_fd).unwrap();
+    assert!(entry.flags.contains(FdFlags::NONBLOCK));
+}
+
+#[test]
+fn sock_accept_on_empty_backlog_returns_eagain() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "accepter", 0);
+
+    let listener = k.ipc.create_socket(SocketType::Stream);
+    {
+        let ls = k.ipc.socket_mut(listener).unwrap();
+        ls.state = SocketState::Listening;
+        // No backlog entries — empty.
+    }
+    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_ACCEPT,
+        flags: 0,
+        request_id: 972,
+        args: sock_accept_args(3, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EAGAIN);
+}
+
+#[test]
+fn sock_accept_on_non_listening_socket_returns_einval() {
+    use kernel::ipc::SocketType;
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "accepter", 0);
+
+    // Fresh socket — state defaults to Unbound, not Listening.
+    let s = k.ipc.create_socket(SocketType::Stream);
+    k.install_fd(pid, 3, FdObject::Socket(s.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_ACCEPT,
+        flags: 0,
+        request_id: 973,
+        args: sock_accept_args(3, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn sock_accept_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdev_accepter", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_ACCEPT,
+        flags: 0,
+        request_id: 974,
+        args: sock_accept_args(1, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn sock_accept_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghost_accepter", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_ACCEPT,
+        flags: 0,
+        request_id: 975,
+        args: sock_accept_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

@@ -1964,6 +1964,78 @@ describe("dispatch: SOCK_RECV", () => {
   });
 });
 
+// ---- dispatch: SOCK_ACCEPT -----------------------------------------
+//
+// WASI alias of IPC_ACCEPT. Wire: (listener_fd, fdflags) as two u32s
+// at args[0..4] + args[4..8]; no heap. These TS tests pin the
+// dispatcher's per-branch behaviour end-to-end through kernel.wasm
+// via opcodes userland can actually reach: EINVAL on a non-Socket
+// fd (char-device), EINVAL on a socket in Unbound state (not yet
+// listening), and EBADF on an unopened fd. The happy-path +
+// fdflags-applied-to-new-fd branches need a full IPC handshake
+// across two pids which is covered by the Rust tests.
+
+function encodeSockAcceptArgs(fd: number, fdflags: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setUint32(4, fdflags, true);
+  return args;
+}
+
+describe("dispatch: SOCK_ACCEPT", () => {
+  it("returns -EINVAL on a char-device fd (non-Socket)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_ACCEPT,
+      requestId: 980,
+      args: encodeSockAcceptArgs(1, 0),
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL on a freshly-created (Unbound) socket fd", async () => {
+    // Stand up a socket via IPC_SOCKET (state=Unbound), then try to
+    // accept on it. The kernel's accept_socket returns
+    // IpcError::InvalidState → EINVAL.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const sockResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 981,
+      arg0: 0,
+    });
+    expect(sockResp.response.status).toBe(0);
+    const sockFd = Number(sockResp.response.value);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_ACCEPT,
+      requestId: 982,
+      args: encodeSockAcceptArgs(sockFd, 0),
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_ACCEPT,
+      requestId: 983,
+      args: encodeSockAcceptArgs(99, 0),
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
 // ---- dispatch: FD_RENUMBER -----------------------------------------
 //
 // WASI's dup2-spelling. Wire: (from, to) as two u32s at args[0..4]
