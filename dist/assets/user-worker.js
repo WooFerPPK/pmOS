@@ -146,6 +146,19 @@ var OP_WASI = {
   FD_ALLOCATE: 33,
   FD_SYNC: 50,
   FD_DATASYNC: 35,
+  /** Wire-format identity for `fd_fdstat_set_flags`. WASI's
+   * equivalent of POSIX fcntl(F_SETFL): overwrites the fd's
+   * file-status flags (NONBLOCK / APPEND / DSYNC / RSYNC / SYNC).
+   * Wire: fd at args[0..4], new_fdflags (WASI encoding — see
+   * FDFLAGS below) at args[4..8]. v1 recognises only NONBLOCK +
+   * APPEND meaningfully; DSYNC/RSYNC/SYNC are accepted + ignored
+   * (tmpfs writes are already synchronous). CLOEXEC is preserved
+   * across the call (F_SETFD owns that bit, not F_SETFL), so a
+   * CLOEXEC-marked fd that receives fd_fdstat_set_flags(NONBLOCK)
+   * ends up CLOEXEC + NONBLOCK. EBADF on an unopened fd; no
+   * FdObject-variant rejection (WASI permits the call on any fd
+   * type). */
+  FD_FDSTAT_SET_FLAGS: 37,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer
@@ -1187,6 +1200,32 @@ var UserWasmRuntime = class {
         argsView.setUint32(4, to, true);
         const { response } = this.backend.dispatch({
           opcode: OP_WASI.FD_RENUMBER,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `fd_fdstat_set_flags`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, fdflags: i32) -> errno: i32
+      //
+      // WASI's equivalent of POSIX fcntl(F_SETFL): overwrites the fd's
+      // file-status flags (NONBLOCK / APPEND / DSYNC / RSYNC / SYNC).
+      // v1 recognises NONBLOCK + APPEND; sync-family bits are accepted
+      // + ignored. CLOEXEC is preserved on the fd across the call. No
+      // FdObject-variant rejection — WASI permits the call on any fd
+      // type. Dispatches FD_FDSTAT_SET_FLAGS packing (fd, fdflags) as
+      // two u32s in the inline args window. No heap round-trip.
+      fd_fdstat_set_flags: (fd, fdflags) => {
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, fdflags, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_FDSTAT_SET_FLAGS,
           requestId: 0,
           args,
           heapPtr: 0,

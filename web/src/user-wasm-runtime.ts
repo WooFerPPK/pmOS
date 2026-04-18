@@ -1126,6 +1126,33 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `fd_fdstat_set_flags`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, fdflags: i32) -> errno: i32
+      //
+      // WASI's equivalent of POSIX fcntl(F_SETFL): overwrites the fd's
+      // file-status flags (NONBLOCK / APPEND / DSYNC / RSYNC / SYNC).
+      // v1 recognises NONBLOCK + APPEND; sync-family bits are accepted
+      // + ignored. CLOEXEC is preserved on the fd across the call. No
+      // FdObject-variant rejection — WASI permits the call on any fd
+      // type. Dispatches FD_FDSTAT_SET_FLAGS packing (fd, fdflags) as
+      // two u32s in the inline args window. No heap round-trip.
+      fd_fdstat_set_flags: (fd: number, fdflags: number): number => {
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, fdflags, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_FDSTAT_SET_FLAGS,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `fd_filestat_set_times`.
       //
       // Signature (lowered):

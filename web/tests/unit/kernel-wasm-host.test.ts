@@ -48,6 +48,7 @@ import {
   ERRNO,
   EVENTRWFLAGS,
   EVENTTYPE,
+  FDFLAGS,
   FILETYPE,
   FSTFLAGS,
   OP_EXT,
@@ -1529,6 +1530,72 @@ describe("dispatch: PATH_REMOVE_DIRECTORY", () => {
       path,
     );
     expect(response.status).toBe(-ERRNO.ENOENT);
+  });
+});
+
+// ---- dispatch: FD_FDSTAT_SET_FLAGS ---------------------------------
+//
+// WASI's F_SETFL opcode: overwrites the fd's NONBLOCK / APPEND /
+// *SYNC bits. Wire: (fd, new_fdflags) as two u32s at args[0..4] +
+// args[4..8]; no heap. The TS tests pin the dispatcher's per-branch
+// behaviour end-to-end through kernel.wasm: the happy-path NONBLOCK
+// set, the sync-family accepted-as-noop path, and the EBADF branch
+// for an unopened fd. The Rust tests pin the CLOEXEC-preserve
+// invariant and the clear-on-zero semantics that require direct
+// FdTable inspection.
+
+function encodeFdFdstatSetFlagsArgs(
+  fd: number,
+  fdflags: number,
+): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setUint32(4, fdflags, true);
+  return args;
+}
+
+describe("dispatch: FD_FDSTAT_SET_FLAGS", () => {
+  it("returns 0 when setting NONBLOCK on an open fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FDSTAT_SET_FLAGS,
+      requestId: 940,
+      args: encodeFdFdstatSetFlagsArgs(1, FDFLAGS.NONBLOCK),
+    });
+    expect(response.status).toBe(0);
+  });
+
+  it("accepts DSYNC + RSYNC + SYNC bits as no-op success", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const combined = FDFLAGS.DSYNC | FDFLAGS.RSYNC | FDFLAGS.SYNC;
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FDSTAT_SET_FLAGS,
+      requestId: 941,
+      args: encodeFdFdstatSetFlagsArgs(1, combined),
+    });
+    expect(response.status).toBe(0);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FDSTAT_SET_FLAGS,
+      requestId: 942,
+      args: encodeFdFdstatSetFlagsArgs(99, FDFLAGS.NONBLOCK),
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
   });
 });
 

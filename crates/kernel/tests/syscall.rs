@@ -3959,6 +3959,181 @@ fn path_remove_directory_on_devfs_returns_erofs() {
     assert_eq!(resp.status, -errno::EROFS);
 }
 
+// ---- fd_fdstat_set_flags --------------------------------------------
+//
+// Opcode 0x0025. WASI's equivalent of POSIX fcntl(F_SETFL) —
+// overwrites the fd's NONBLOCK / APPEND / *SYNC bits. Wire:
+//
+//   args[0..4] = fd (u32)
+//   args[4..8] = new_fdflags (u32; WASI encoding from abi::wasi::fdflags
+//                — APPEND=0x01, DSYNC=0x02, NONBLOCK=0x04, RSYNC=0x08,
+//                SYNC=0x10)
+//
+// Translation: the WASI bit values differ from PMos's internal
+// FdFlags (CLOEXEC=0x01, NONBLOCK=0x02, APPEND=0x04), so the handler
+// decodes the WASI u32 and sets the corresponding PMos bits. Only
+// NONBLOCK + APPEND are meaningful in v1; DSYNC/RSYNC/SYNC are
+// accepted and discarded (tmpfs has no write buffer to sync). The
+// CLOEXEC bit is preserved — F_SETFL semantics: the "fd-level"
+// flag is only mutated at spawn time, not by set_flags.
+
+fn fd_fdstat_set_flags_args(fd: u32, wasi_fdflags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..8].copy_from_slice(&wasi_fdflags.to_le_bytes());
+    args
+}
+
+#[test]
+fn fd_fdstat_set_flags_sets_nonblock_on_open_fd() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "flagger", "/f.txt", b"hi");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_FLAGS,
+        flags: 0,
+        request_id: 920,
+        args: fd_fdstat_set_flags_args(fd, abi::wasi::fdflags::NONBLOCK as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(e.flags.contains(FdFlags::NONBLOCK));
+    assert!(!e.flags.contains(FdFlags::APPEND));
+}
+
+#[test]
+fn fd_fdstat_set_flags_sets_append_on_open_fd() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "flagger", "/f.txt", b"hi");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_FLAGS,
+        flags: 0,
+        request_id: 921,
+        args: fd_fdstat_set_flags_args(fd, abi::wasi::fdflags::APPEND as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(e.flags.contains(FdFlags::APPEND));
+    assert!(!e.flags.contains(FdFlags::NONBLOCK));
+}
+
+#[test]
+fn fd_fdstat_set_flags_with_zero_clears_previously_set_flags() {
+    // Set NONBLOCK + APPEND directly in the FdTable, then call
+    // fd_fdstat_set_flags(0) to clear them. F_SETFL-style replace
+    // semantics: whatever bits weren't in the argument are cleared.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "flagger", "/f.txt", b"hi");
+    {
+        let table = k.fds_mut(pid).unwrap();
+        let entry = table.get_mut(fd).unwrap();
+        entry.flags.insert(FdFlags::NONBLOCK);
+        entry.flags.insert(FdFlags::APPEND);
+    }
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_FLAGS,
+        flags: 0,
+        request_id: 922,
+        args: fd_fdstat_set_flags_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(!e.flags.contains(FdFlags::NONBLOCK));
+    assert!(!e.flags.contains(FdFlags::APPEND));
+}
+
+#[test]
+fn fd_fdstat_set_flags_preserves_cloexec() {
+    // CLOEXEC is a file-descriptor-level flag (POSIX F_SETFD) not a
+    // file-status flag (F_SETFL). fd_fdstat_set_flags is the WASI
+    // equivalent of F_SETFL, so CLOEXEC must not be disturbed by it.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "flagger", "/f.txt", b"hi");
+    {
+        let table = k.fds_mut(pid).unwrap();
+        let entry = table.get_mut(fd).unwrap();
+        entry.flags.insert(FdFlags::CLOEXEC);
+    }
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_FLAGS,
+        flags: 0,
+        request_id: 923,
+        args: fd_fdstat_set_flags_args(fd, abi::wasi::fdflags::NONBLOCK as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(e.flags.contains(FdFlags::CLOEXEC), "CLOEXEC preserved across set_flags");
+    assert!(e.flags.contains(FdFlags::NONBLOCK));
+}
+
+#[test]
+fn fd_fdstat_set_flags_accepts_sync_bits_as_noop() {
+    // WASI's DSYNC / RSYNC / SYNC bits are meaningful for platforms
+    // with durable-write guarantees. v1's tmpfs is already
+    // synchronous (writes land in memory immediately), so these bits
+    // are accepted without error and then discarded — they never set
+    // any internal flag. Passing them combined with NONBLOCK still
+    // sets NONBLOCK correctly.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "flagger", "/f.txt", b"hi");
+    let combined = (abi::wasi::fdflags::DSYNC
+        | abi::wasi::fdflags::RSYNC
+        | abi::wasi::fdflags::SYNC
+        | abi::wasi::fdflags::NONBLOCK) as u32;
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_FLAGS,
+        flags: 0,
+        request_id: 924,
+        args: fd_fdstat_set_flags_args(fd, combined),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let e = k.fds(pid).unwrap().get(fd).unwrap();
+    assert!(e.flags.contains(FdFlags::NONBLOCK));
+    assert!(!e.flags.contains(FdFlags::APPEND));
+}
+
+#[test]
+fn fd_fdstat_set_flags_with_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghost_flagger", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_FLAGS,
+        flags: 0,
+        request_id: 925,
+        args: fd_fdstat_set_flags_args(99, abi::wasi::fdflags::NONBLOCK as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a

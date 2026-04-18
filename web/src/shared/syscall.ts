@@ -270,6 +270,19 @@ export const OP_WASI = {
   FD_ALLOCATE: 0x0021,
   FD_SYNC: 0x0032,
   FD_DATASYNC: 0x0023,
+  /** Wire-format identity for `fd_fdstat_set_flags`. WASI's
+   * equivalent of POSIX fcntl(F_SETFL): overwrites the fd's
+   * file-status flags (NONBLOCK / APPEND / DSYNC / RSYNC / SYNC).
+   * Wire: fd at args[0..4], new_fdflags (WASI encoding — see
+   * FDFLAGS below) at args[4..8]. v1 recognises only NONBLOCK +
+   * APPEND meaningfully; DSYNC/RSYNC/SYNC are accepted + ignored
+   * (tmpfs writes are already synchronous). CLOEXEC is preserved
+   * across the call (F_SETFD owns that bit, not F_SETFL), so a
+   * CLOEXEC-marked fd that receives fd_fdstat_set_flags(NONBLOCK)
+   * ends up CLOEXEC + NONBLOCK. EBADF on an unopened fd; no
+   * FdObject-variant rejection (WASI permits the call on any fd
+   * type). */
+  FD_FDSTAT_SET_FLAGS: 0x0025,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer
@@ -374,6 +387,25 @@ export const FSTFLAGS = {
   SET_ATIM_NOW: 0x2,
   SET_MTIM: 0x4,
   SET_MTIM_NOW: 0x8,
+} as const;
+
+// ---- WASI fdflags bitfield ------------------------------------------
+//
+// Mirror of `abi::wasi::fdflags`. Bit-mask OR'd into the new_fdflags
+// argument of `fd_fdstat_set_flags`. These bit values DIFFER from
+// PMos's internal `kernel::fd::FdFlags` (APPEND=0x01 vs CLOEXEC=0x01;
+// NONBLOCK=0x04 vs APPEND=0x04 on the internal side) — the kernel
+// translates on decode, so TS callers always pass WASI bit values.
+// v1 recognises only NONBLOCK + APPEND meaningfully; DSYNC / RSYNC /
+// SYNC are accepted and discarded (tmpfs writes are already
+// synchronous into in-memory state).
+
+export const FDFLAGS = {
+  APPEND: 0x1,
+  DSYNC: 0x2,
+  NONBLOCK: 0x4,
+  RSYNC: 0x8,
+  SYNC: 0x10,
 } as const;
 
 // ---- WASI filetype bytes --------------------------------------------

@@ -73,6 +73,7 @@ pub fn dispatch_wasi(
         op::PATH_RENAME => handle_path_rename(kernel, pid, req, heap),
         op::PATH_CREATE_DIRECTORY => handle_path_create_directory(kernel, pid, req, heap),
         op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
+        op::FD_FDSTAT_SET_FLAGS => handle_fd_fdstat_set_flags(kernel, pid, req),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
@@ -1494,6 +1495,63 @@ fn handle_path_remove_directory(
             kerr_to_errno(KernelError::Fs(e)),
         ),
     }
+}
+
+// ---- fd_fdstat_set_flags -------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32)
+//   args[4..8] = new_fdflags (u32; WASI encoding from abi::wasi::fdflags:
+//                APPEND=0x01, DSYNC=0x02, NONBLOCK=0x04, RSYNC=0x08,
+//                SYNC=0x10)
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// WASI's equivalent of POSIX `fcntl(F_SETFL)`: overwrites the fd's
+// file-status flags. v1 recognises two WASI bits meaningfully —
+// NONBLOCK and APPEND — and accepts the three sync-family bits
+// (DSYNC/RSYNC/SYNC) as a no-op (tmpfs writes are already
+// synchronous into in-memory state, so there is nothing to flush).
+//
+// Bit translation: WASI's fdflags encoding differs from PMos's
+// internal FdFlags (APPEND=0x01 vs CLOEXEC=0x01 on the PMos side;
+// NONBLOCK=0x04 vs APPEND=0x04, etc.). The handler reads the WASI
+// u32 and sets the corresponding PMos bits. CLOEXEC is the
+// descriptor-level flag POSIX `F_SETFD` owns, not `F_SETFL`, so
+// this handler preserves any prior CLOEXEC bit on the fd verbatim
+// — a userland call that asks for NONBLOCK on a CLOEXEC-marked fd
+// keeps CLOEXEC set without any extra opcode dance.
+//
+// Rejects only EBADF (unopened fd). WASI permits `fd_fdstat_set_flags`
+// on any fd type — a socket can be made NONBLOCK, a char device can
+// be APPEND'd — so the handler does not check the FdObject variant.
+
+fn handle_fd_fdstat_set_flags(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let wasi_bits = args_u32(req, 4);
+
+    let table = match kernel.fds_mut(pid) {
+        Ok(t) => t,
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let Some(entry) = table.get_mut(fd) else {
+        return Response::err(req.request_id, EBADF);
+    };
+
+    // Start from the existing flags, clear NONBLOCK + APPEND, then
+    // OR in whatever the WASI argument requested. Preserves CLOEXEC
+    // (and any future non-F_SETFL flag) because those never appear
+    // in the WASI fdflags u32. DSYNC / RSYNC / SYNC are simply not
+    // translated to any PMos bit — they're accepted and discarded.
+    entry.flags.remove(FdFlags::NONBLOCK);
+    entry.flags.remove(FdFlags::APPEND);
+    if wasi_bits & (abi::wasi::fdflags::APPEND as u32) != 0 {
+        entry.flags.insert(FdFlags::APPEND);
+    }
+    if wasi_bits & (abi::wasi::fdflags::NONBLOCK as u32) != 0 {
+        entry.flags.insert(FdFlags::NONBLOCK);
+    }
+    Response::ok(req.request_id, 0)
 }
 
 // ---- poll_oneoff -----------------------------------------------------
