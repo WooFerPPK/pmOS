@@ -262,6 +262,30 @@ pub trait Filesystem: Send {
         Err(FsError::ReadOnly)
     }
 
+    /// Create a symlink in `dir` named `name` whose content is the
+    /// arbitrary UTF-8 `target` string. Returns the new ino.
+    ///
+    /// The target need not exist — dangling symlinks are first-class
+    /// in POSIX/WASI, and v1's `Vfs::resolve` doesn't follow
+    /// symlinks anyway so the distinction never matters on a
+    /// resolution path.
+    ///
+    /// Default: returns `FsError::NotSupported` (→ `ENOTSUP`).
+    /// Filesystems that support symlinks (tmpfs) override; devfs /
+    /// procfs / opfs inherit the default. The default differs from
+    /// `link`'s `ReadOnly` default because symlink semantics are a
+    /// capability (does this filesystem know what a symlink is?)
+    /// rather than a write permission, and devfs / procfs never gain
+    /// symlinks in any conceivable future.
+    fn symlink(
+        &mut self,
+        _dir: Ino,
+        _name: &str,
+        _target: &str,
+    ) -> Result<Ino, FsError> {
+        Err(FsError::NotSupported)
+    }
+
     /// Flush any buffered writes. Default no-op.
     fn sync(&mut self) -> Result<(), FsError> {
         Ok(())
@@ -477,6 +501,18 @@ impl Vfs {
         }
         let fs = self.mounts.fs_mut(from_mount).ok_or(FsError::NotFound)?;
         fs.link(from_parent, &from_name, to_parent, &to_name)
+    }
+
+    /// Create a symlink at `link_path` that holds the arbitrary UTF-8
+    /// `target` string. resolve_parent on `link_path` locates the
+    /// directory + final component, then dispatches to
+    /// [`Filesystem::symlink`] on the owning mount. tmpfs overrides
+    /// with the real `TmpNode::SymLink` allocation; devfs / procfs /
+    /// opfs inherit the default (`NotSupported` → ENOTSUP).
+    pub fn symlink(&mut self, target: &str, link_path: &str) -> Result<Ino, FsError> {
+        let (mount_id, parent_ino, name) = self.resolve_parent(link_path)?;
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.symlink(parent_ino, &name, target)
     }
 
     /// Stat an absolute path.

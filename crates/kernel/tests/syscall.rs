@@ -108,23 +108,22 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `PATH_SYMLINK` is in the WASI range (0x0048) but still has no
+    // `PATH_READLINK` is in the WASI range (0x0045) but still has no
     // handler. Same shape as the ext-side test below: decoded as
     // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>` arm,
     // ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `PATH_LINK` before that handler landed, then
-    // `SOCK_SHUTDOWN`, then `FD_PREAD`, then `FD_READDIR`, then
-    // `FD_SEEK` / `CLOCK_TIME_GET` before those. When `PATH_SYMLINK`
-    // grows a real handler, swap this probe to whatever's still
-    // unhandled at that point, or delete the test once every WASI
-    // opcode has real coverage.)
+    // (This probe was `PATH_SYMLINK` before that handler landed, then
+    // `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. When
+    // `PATH_READLINK` grows a real handler, swap this probe to
+    // whatever's still unhandled at that point, or delete the test
+    // once every WASI opcode has real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::PATH_SYMLINK,
+        opcode: op_wasi::PATH_READLINK,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -5604,6 +5603,248 @@ fn path_link_with_old_len_past_heap_returns_einval() {
         flags: 0,
         request_id: 1000,
         args: path_link_args(0, 0, 0, 999),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+// ---- path_symlink -------------------------------------------------
+//
+// Opcode 0x0048. Create a symlink at a new path, holding a target
+// string. Wire:
+//
+//   args[0..4] = old_len (u32; split point in heap — heap[0..old_len]
+//                is the target string that the symlink holds,
+//                heap[old_len..heap_len] is the new path to create)
+//   heap[0..old_len]        = UTF-8 target string (arbitrary; may
+//                             not exist — dangling symlinks are fine)
+//   heap[old_len..heap_len] = UTF-8 new path (the path of the symlink
+//                             the caller is creating)
+//
+// Simpler packing than PATH_LINK because WASI path_symlink has only
+// one integer-shaped arg (new_fd) in its signature before the path
+// lengths, and v1 ignores it anyway.
+//
+// Semantics: creates a NodeType::SymLink vnode whose "content" is the
+// target string rather than regular-file bytes. Vfs::resolve does NOT
+// follow symlinks in v1 — `stat()` on the symlink path returns the
+// symlink's own metadata (ty = SymLink, size = target byte length);
+// opening the symlink path via path_open still returns the symlink
+// itself; walking a path that crosses a symlink component yields
+// whatever the filesystem returns without dereferencing. A future
+// slice can teach Vfs::resolve to follow symlinks for callers that
+// want it.
+
+fn path_symlink_args(old_len: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&old_len.to_le_bytes());
+    args
+}
+
+fn path_symlink_heap(target: &[u8], new_path: &[u8]) -> Vec<u8> {
+    let mut heap = vec![0u8; target.len() + new_path.len()];
+    heap[..target.len()].copy_from_slice(target);
+    heap[target.len()..].copy_from_slice(new_path);
+    heap
+}
+
+#[test]
+fn path_symlink_creates_symlink_stats_as_filetype_symlink() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+
+    let target = b"/some/target";
+    let new_path = b"/mylink";
+    let mut heap = path_symlink_heap(target, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1010,
+        args: path_symlink_args(target.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+
+    let st = k.vfs.stat("/mylink").expect("symlink stats");
+    assert!(st.ty.is_symlink(), "stat reports NodeType::SymLink");
+    assert_eq!(st.size, target.len() as u64, "size = target byte length");
+}
+
+#[test]
+fn path_symlink_dangling_target_is_allowed() {
+    // A symlink's target need not exist — dangling links are first-
+    // class in POSIX/WASI.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+
+    let target = b"/no/such/path";
+    let new_path = b"/dangling";
+    let mut heap = path_symlink_heap(target, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1011,
+        args: path_symlink_args(target.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, 0);
+    assert!(k.vfs.stat("/dangling").unwrap().ty.is_symlink());
+}
+
+#[test]
+fn path_symlink_with_existing_link_path_returns_eexist() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+    k.vfs.create("/exists", 0o644).expect("create");
+
+    let target = b"/target";
+    let new_path = b"/exists";
+    let mut heap = path_symlink_heap(target, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1012,
+        args: path_symlink_args(target.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EEXIST);
+}
+
+#[test]
+fn path_symlink_with_missing_parent_returns_enoent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+
+    let target = b"/target";
+    let new_path = b"/no/such/dir/link";
+    let mut heap = path_symlink_heap(target, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1013,
+        args: path_symlink_args(target.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn path_symlink_on_devfs_returns_enotsup() {
+    // devfs inherits the trait default (NotSupported → ENOTSUP).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+
+    let target = b"/target";
+    let new_path = b"/dev/mylink";
+    let mut heap = path_symlink_heap(target, new_path);
+    let heap_len = heap.len() as u32;
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1014,
+        args: path_symlink_args(target.len() as u32),
+        heap_ptr: 0,
+        heap_len,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+}
+
+#[test]
+fn path_symlink_with_invalid_utf8_target_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+    let mut heap = vec![0u8; 64];
+    // Target bytes are invalid UTF-8; the new-path half is valid.
+    heap[0] = 0xff;
+    heap[1] = 0xfe;
+    let new_path = b"/link";
+    heap[2..2 + new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1015,
+        args: path_symlink_args(2),
+        heap_ptr: 0,
+        heap_len: (2 + new_path.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_symlink_with_invalid_utf8_newpath_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+    let target = b"/t";
+    let mut heap = vec![0u8; 64];
+    heap[..target.len()].copy_from_slice(target);
+    heap[target.len()] = 0xff;
+    heap[target.len() + 1] = 0xfe;
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1016,
+        args: path_symlink_args(target.len() as u32),
+        heap_ptr: 0,
+        heap_len: (target.len() + 2) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_symlink_with_zero_old_len_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+    let new_path = b"/anywhere";
+    let mut heap = vec![0u8; 32];
+    heap[..new_path.len()].copy_from_slice(new_path);
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1017,
+        args: path_symlink_args(0),
+        heap_ptr: 0,
+        heap_len: new_path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn path_symlink_with_old_len_past_heap_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "symlinker", 0);
+    let mut heap = vec![0u8; 32];
+    heap[..4].copy_from_slice(b"/xxx");
+
+    let req = Request {
+        opcode: op_wasi::PATH_SYMLINK,
+        flags: 0,
+        request_id: 1018,
+        args: path_symlink_args(999),
         heap_ptr: 0,
         heap_len: 4,
     };

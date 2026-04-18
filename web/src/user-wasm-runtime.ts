@@ -1096,6 +1096,59 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `path_symlink`.
+      //
+      // Signature (lowered):
+      //   (old_path_ptr: i32, old_path_len: i32,
+      //    new_fd: i32,
+      //    new_path_ptr: i32, new_path_len: i32) -> errno: i32
+      //
+      // "old_path" here is the TARGET string the symlink holds (a
+      // legacy POSIX naming choice — WASI preserves it). "new_path"
+      // is the path of the symlink to create. new_fd is the dirfd
+      // for the new path and v1 ignores it. Wire packs old_len (the
+      // target string length) into args[0..4]; heap carries
+      // (target, new_path) concatenated with the split at old_len.
+      // The target need not exist — dangling symlinks are fine.
+      path_symlink: (
+        targetPtr: number,
+        targetLen: number,
+        _newFd: number,
+        newPathPtr: number,
+        newPathLen: number,
+      ): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const targetBytes = new Uint8Array(
+          this.memory.buffer,
+          targetPtr,
+          targetLen,
+        );
+        const newBytes = new Uint8Array(
+          this.memory.buffer,
+          newPathPtr,
+          newPathLen,
+        );
+        const heap = new Uint8Array(targetLen + newPathLen);
+        heap.set(targetBytes, 0);
+        heap.set(newBytes, targetLen);
+
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, targetLen, true);
+
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_SYMLINK,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length,
+          },
+          heap,
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `path_create_directory`.
       //
       // Signature (lowered):

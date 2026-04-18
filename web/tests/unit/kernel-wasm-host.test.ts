@@ -414,12 +414,13 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `PATH_SYMLINK` is in the WASI range (0x0048) but still has no
-    // handler; was `PATH_LINK` before that handler landed, then
-    // `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. Swap this probe to
-    // whatever's still unhandled as the implementation catches up.
+    // `PATH_READLINK` is in the WASI range (0x0045) but still has no
+    // handler; was `PATH_SYMLINK` before that handler landed, then
+    // `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. Swap
+    // this probe to whatever's still unhandled as the implementation
+    // catches up.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.PATH_SYMLINK,
+      opcode: OP_WASI.PATH_READLINK,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -1460,6 +1461,172 @@ describe("dispatch: PATH_LINK", () => {
         opcode: OP_WASI.PATH_LINK,
         requestId: 1005,
         args: encodePathLinkArgs(0, 0, 0, 999),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
+// ---- dispatch: PATH_SYMLINK ----------------------------------------
+//
+// Symlink-creation opcode at 0x0048. Wire packs old_len (target byte
+// length) at args[0..4]; heap carries (target, new_path) concatenated,
+// split at old_len. These TS tests pin the wire layout end-to-end
+// through kernel.wasm for the dispatcher-level branches reachable
+// from this harness: happy-path creation visible via
+// PATH_FILESTAT_GET as a SymLink filetype, EEXIST when the link-path
+// already exists (via a prior PATH_CREATE_DIRECTORY), ENOTSUP on
+// /dev (devfs inherits the trait default), EINVAL on zero/past-heap
+// old_len.
+
+function encodePathSymlinkArgs(oldLen: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, oldLen, true);
+  return args;
+}
+
+function encodePathSymlinkHeap(target: string, newPath: string): Uint8Array {
+  const enc = new TextEncoder();
+  const t = enc.encode(target);
+  const n = enc.encode(newPath);
+  const heap = new Uint8Array(t.length + n.length);
+  heap.set(t, 0);
+  heap.set(n, t.length);
+  return heap;
+}
+
+describe("dispatch: PATH_SYMLINK", () => {
+  it("creates a symlink visible via PATH_FILESTAT_GET as a SymLink", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodePathSymlinkHeap("/some/target", "/mylink");
+    const { response: mk } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1010,
+        args: encodePathSymlinkArgs("/some/target".length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(mk.status).toBe(0);
+
+    // Stat the created link; v1's resolver doesn't follow symlinks,
+    // so stat returns the symlink's own metadata.
+    const pathHeap = new TextEncoder().encode("/mylink");
+    const { response: st, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 1011,
+        arg0: 0, // dir_fd — ignored
+        heapPtr: 0,
+        heapLen: pathHeap.length,
+      },
+      pathHeap,
+    );
+    expect(st.status).toBe(0);
+    expect(st.extraLen).toBe(64);
+    const filestat = decodeFilestat(heapOut);
+    expect(filestat.filetype).toBe(FILETYPE.SYMBOLIC_LINK);
+    // size = target byte length per POSIX.
+    expect(filestat.size).toBe(BigInt("/some/target".length));
+  });
+
+  it("returns -EEXIST when the link-path target already exists", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Create /existing as a directory first.
+    const dirPath = new TextEncoder().encode("/existing");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_CREATE_DIRECTORY,
+        requestId: 1012,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: dirPath.length,
+      },
+      dirPath,
+    );
+
+    const heap = encodePathSymlinkHeap("/t", "/existing");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1013,
+        args: encodePathSymlinkArgs(2),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EEXIST);
+  });
+
+  it("returns -ENOTSUP when creating a symlink in /dev", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = encodePathSymlinkHeap("/anywhere", "/dev/mylink");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1014,
+        args: encodePathSymlinkArgs("/anywhere".length),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+  });
+
+  it("returns -EINVAL for zero old_len", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("/whatever");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1015,
+        args: encodePathSymlinkArgs(0),
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EINVAL when old_len >= heap_len (empty new path)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const heap = new TextEncoder().encode("/t");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 1016,
+        args: encodePathSymlinkArgs(heap.length),
         heapPtr: 0,
         heapLen: heap.length,
       },

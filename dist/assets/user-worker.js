@@ -227,12 +227,27 @@ var OP_WASI = {
    * devfs / procfs inherit the trait default (ReadOnly → EROFS).
    * Cross-mount links return ENOTSUP. */
   PATH_LINK: 67,
+  /** Wire-format identity for `path_symlink`. Symlink-creation
+   * opcode: creates a vnode whose "content" is an arbitrary UTF-8
+   * target string. Wire: args[0..4] = old_len (u32; split point in
+   * heap — heap[0..old_len] is the target string the symlink holds,
+   * heap[old_len..heap_len] is the new path to create as a symlink).
+   * Cleaner packing than PATH_LINK because WASI path_symlink has
+   * only one integer-shaped arg (new_fd) and v1 ignores it. The
+   * target need not exist (dangling symlinks are fine) and v1's
+   * Vfs::resolve does NOT dereference symlinks — stat() on the
+   * symlink returns the symlink itself, path_open on the symlink
+   * path yields the symlink's fd. Threads through Vfs::symlink →
+   * Filesystem::symlink; tmpfs allocates a new ino with a
+   * TmpNode::SymLink(target) variant; devfs / procfs / opfs inherit
+   * the trait default (NotSupported → ENOTSUP). */
+  PATH_SYMLINK: 72,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Was `PATH_LINK` before that
+   * kernel doesn't yet handle. Was `PATH_SYMLINK` before that
    * handler landed; swap to whichever WASI opcode is still
    * unhandled as the implementation catches up. */
-  PATH_SYMLINK: 72,
+  PATH_READLINK: 69,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer
@@ -1235,6 +1250,50 @@ var UserWasmRuntime = class {
         const { response } = this.backend.dispatch(
           {
             opcode: OP_WASI.PATH_LINK,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: heap.length
+          },
+          heap
+        );
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `path_symlink`.
+      //
+      // Signature (lowered):
+      //   (old_path_ptr: i32, old_path_len: i32,
+      //    new_fd: i32,
+      //    new_path_ptr: i32, new_path_len: i32) -> errno: i32
+      //
+      // "old_path" here is the TARGET string the symlink holds (a
+      // legacy POSIX naming choice — WASI preserves it). "new_path"
+      // is the path of the symlink to create. new_fd is the dirfd
+      // for the new path and v1 ignores it. Wire packs old_len (the
+      // target string length) into args[0..4]; heap carries
+      // (target, new_path) concatenated with the split at old_len.
+      // The target need not exist — dangling symlinks are fine.
+      path_symlink: (targetPtr, targetLen, _newFd, newPathPtr, newPathLen) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const targetBytes = new Uint8Array(
+          this.memory.buffer,
+          targetPtr,
+          targetLen
+        );
+        const newBytes = new Uint8Array(
+          this.memory.buffer,
+          newPathPtr,
+          newPathLen
+        );
+        const heap = new Uint8Array(targetLen + newPathLen);
+        heap.set(targetBytes, 0);
+        heap.set(newBytes, targetLen);
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, targetLen, true);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.PATH_SYMLINK,
             requestId: 0,
             args,
             heapPtr: 0,

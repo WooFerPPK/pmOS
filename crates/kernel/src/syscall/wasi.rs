@@ -72,6 +72,7 @@ pub fn dispatch_wasi(
         op::PATH_UNLINK_FILE => handle_path_unlink_file(kernel, pid, req, heap),
         op::PATH_RENAME => handle_path_rename(kernel, pid, req, heap),
         op::PATH_LINK => handle_path_link(kernel, pid, req, heap),
+        op::PATH_SYMLINK => handle_path_symlink(kernel, pid, req, heap),
         op::PATH_CREATE_DIRECTORY => handle_path_create_directory(kernel, pid, req, heap),
         op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
         op::FD_FDSTAT_SET_FLAGS => handle_fd_fdstat_set_flags(kernel, pid, req),
@@ -1511,6 +1512,73 @@ fn handle_path_link(
     };
     match kernel.vfs.link(old_path, new_path) {
         Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::Fs(e)),
+        ),
+    }
+}
+
+// ---- path_symlink ----------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = old_len (u32; split point in heap window —
+//                 heap[0..old_len] is the target UTF-8 string that
+//                 the symlink holds, heap[old_len..heap_len] is the
+//                 new path to create as a symlink)
+//   heap[0..old_len]        = UTF-8 target string (arbitrary; need
+//                             not exist — dangling symlinks are fine)
+//   heap[old_len..heap_len] = UTF-8 new path (the path of the symlink
+//                             the caller is creating)
+//   heap_len                = old_len + new_len (a shorter heap_len
+//                             rejects with EINVAL)
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Cleaner than PATH_LINK's packing because WASI path_symlink has only
+// one integer-shaped arg (new_fd) in its signature and v1 ignores it
+// anyway — only old_len is decoded.
+//
+// Creates a vnode whose "content" is the target string rather than
+// regular-file bytes. The target is NOT resolved or validated at
+// creation — POSIX/WASI explicitly allow dangling symlinks, and v1's
+// `Vfs::resolve` doesn't follow symlinks regardless. A future
+// path_readlink slice will retrieve the target; a future
+// resolve-follows-symlinks slice (separate) can teach the path walker
+// to dereference.
+//
+// Threads through `Vfs::symlink` → `Filesystem::symlink` on the
+// owning mount. tmpfs overrides with the real TmpNode::SymLink
+// allocation; devfs / procfs / opfs inherit the trait default
+// (`NotSupported` → ENOTSUP). The default differs from link's
+// `ReadOnly` default because symlink semantics are a capability
+// (does this filesystem know what a symlink is?) rather than a write
+// permission — devfs / procfs never gain symlinks in any v1-era
+// future slice.
+
+fn handle_path_symlink(
+    kernel: &mut Kernel,
+    _pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let old_len = args_u32(req, 0) as usize;
+
+    let Some(heap_bytes) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if old_len == 0 || old_len >= heap_bytes.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let (target_bytes, new_bytes) = heap_bytes.split_at(old_len);
+    let Ok(target) = core::str::from_utf8(target_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(new_path) = core::str::from_utf8(new_bytes) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.vfs.symlink(target, new_path) {
+        Ok(_ino) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(
             req.request_id,
             kerr_to_errno(KernelError::Fs(e)),

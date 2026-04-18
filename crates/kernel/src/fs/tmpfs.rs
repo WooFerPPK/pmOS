@@ -27,6 +27,12 @@ use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NanosSinceE
 enum TmpNode {
     File(Vec<u8>),
     Directory(BTreeMap<String, Ino>),
+    /// A symlink whose "content" is the arbitrary UTF-8 target string.
+    /// v1's `Vfs::resolve` does not dereference symlinks — walking a
+    /// path that crosses a symlink component yields whatever the
+    /// filesystem returns without following. A `readlink` handler
+    /// can still retrieve the target bytes out of this variant.
+    SymLink(String),
 }
 
 impl TmpNode {
@@ -38,6 +44,7 @@ impl TmpNode {
         match self {
             TmpNode::File(_) => NodeType::RegularFile,
             TmpNode::Directory(_) => NodeType::Directory,
+            TmpNode::SymLink(_) => NodeType::SymLink,
         }
     }
 
@@ -45,6 +52,9 @@ impl TmpNode {
         match self {
             TmpNode::File(bytes) => bytes.len() as u64,
             TmpNode::Directory(children) => children.len() as u64,
+            // POSIX convention: st_size on a symlink is the target
+            // byte length.
+            TmpNode::SymLink(target) => target.len() as u64,
         }
     }
 }
@@ -152,6 +162,9 @@ impl Filesystem for TmpFs {
         let bytes = match &entry.node {
             TmpNode::File(b) => b,
             TmpNode::Directory(_) => return Err(FsError::IsADirectory),
+            // Symlinks aren't byte-stream readable — callers use the
+            // readlink path to fetch the target string.
+            TmpNode::SymLink(_) => return Err(FsError::InvalidArgument),
         };
         let start = offset as usize;
         if start >= bytes.len() {
@@ -169,6 +182,7 @@ impl Filesystem for TmpFs {
         let bytes = match &mut entry.node {
             TmpNode::File(b) => b,
             TmpNode::Directory(_) => return Err(FsError::IsADirectory),
+            TmpNode::SymLink(_) => return Err(FsError::InvalidArgument),
         };
         let start = offset as usize;
         let needed = start + buf.len();
@@ -347,11 +361,52 @@ impl Filesystem for TmpFs {
         let bytes = match &mut entry.node {
             TmpNode::File(b) => b,
             TmpNode::Directory(_) => return Err(FsError::IsADirectory),
+            TmpNode::SymLink(_) => return Err(FsError::InvalidArgument),
         };
         bytes.resize(new_size as usize, 0);
         entry.mtime_ns = now;
         entry.ctime_ns = now;
         Ok(())
+    }
+
+    fn symlink(
+        &mut self,
+        dir: Ino,
+        name: &str,
+        target: &str,
+    ) -> Result<Ino, FsError> {
+        check_name(name)?;
+        {
+            let children = self.dir_children(dir)?;
+            if children.contains_key(name) {
+                return Err(FsError::AlreadyExists);
+            }
+        }
+        let ino = self.alloc_ino();
+        let now = now_ns();
+        self.nodes.insert(
+            ino,
+            TmpEntry {
+                node: TmpNode::SymLink(target.into()),
+                // Symlink permissions: 0o777 matches Linux's default
+                // (the target's own permissions govern any open of a
+                // followed link; the symlink node's mode bits are
+                // advisory on every real POSIX system).
+                mode: 0o777,
+                nlink: 1,
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
+            },
+        );
+        self.dir_children_mut(dir)?.insert(name.into(), ino);
+        // Parent dir's mtime+ctime bump — a new entry appeared.
+        {
+            let entry = self.entry_mut(dir)?;
+            entry.mtime_ns = now;
+            entry.ctime_ns = now;
+        }
+        Ok(ino)
     }
 
     fn link(
