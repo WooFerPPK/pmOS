@@ -344,6 +344,7 @@ var OP_EXT = {
   CAP_LIST: 4865
 };
 var ERRNO = {
+  EAGAIN: 6,
   EBADF: 8,
   ECONNREFUSED: 14,
   EEXIST: 20,
