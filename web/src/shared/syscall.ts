@@ -194,6 +194,12 @@ export const OP_WASI = {
    * `(fd, whence, offset)` into the inline args window; the kernel
    * returns the new absolute offset in `response.value`. */
   FD_SEEK: 0x0031,
+  /** Wire-format identity for `fd_tell`. The read-only sibling of
+   * `fd_seek`: the shim packs `fd` as a single u32 at `arg0`; the
+   * kernel returns the current absolute offset in `response.value`
+   * without mutating it. Functionally a `fd_seek(fd, 0, Cur, *)` at
+   * the WASI surface level. */
+  FD_TELL: 0x0033,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
    * kernel doesn't yet handle. Swap to whichever WASI opcode is

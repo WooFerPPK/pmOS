@@ -47,6 +47,7 @@ pub fn dispatch_wasi(
         op::FD_WRITE => handle_fd_write(kernel, pid, req, heap),
         op::FD_READ => handle_fd_read(kernel, pid, req, heap),
         op::FD_SEEK => handle_fd_seek(kernel, pid, req),
+        op::FD_TELL => handle_fd_tell(kernel, pid, req),
         op::FD_CLOSE => handle_fd_close(kernel, pid, req),
         op::PATH_OPEN => handle_path_open(kernel, pid, req, heap),
         op::PROC_EXIT => handle_proc_exit(kernel, pid, req),
@@ -228,6 +229,43 @@ fn handle_fd_seek(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
         return Response::err(req.request_id, EBADF);
     }
     Response::ok(req.request_id, new_offset as i64)
+}
+
+// ---- fd_tell -----------------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32)
+// Response:
+//   value      = current absolute offset (u64 widened to i64; bit-exact)
+//
+// The read-only sibling of `fd_seek`: report a seekable fd's current
+// position without mutating it. Functionally equivalent to
+// `fd_seek(fd, 0, Cur, *)` at the WASI-surface level — the value the
+// kernel returns is identical in both paths because both read
+// `FdEntry.offset` — but fd_tell is its own opcode (0x0033) because
+// it's strictly cheaper: no whence byte to decode, no checked signed
+// arithmetic, no `Vfs::stat_ino` call for the End whence branch.
+// WASI libc lowers `ftell()` through this opcode.
+//
+// Shares `fd_seek`'s EBADF + non-Vnode-EINVAL guards: a char device
+// / socket / pipe has no meaningful position, so fd_tell on a
+// non-Vnode FdObject is EINVAL just like fd_seek. No heap round-trip
+// — the u64 offset travels back in `response.value`, mirroring
+// `clock_time_get` + `fd_seek`'s response shape.
+
+fn handle_fd_tell(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    match entry.object {
+        FdObject::Vnode { .. } => Response::ok(req.request_id, entry.offset as i64),
+        _ => Response::err(req.request_id, EINVAL),
+    }
 }
 
 // ---- fd_close ----------------------------------------------------------

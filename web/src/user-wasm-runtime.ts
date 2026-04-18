@@ -432,6 +432,39 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // WASI `fd_tell`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, offset_ptr: i32) -> errno: i32
+      //
+      // The read-only sibling of `fd_seek`: report the fd's current
+      // absolute position without mutating it. Functionally a
+      // `fd_seek(fd, 0, Cur, *)` at the WASI-surface level — which
+      // is exactly how libc's `ftell()` lowers when `fd_tell` is
+      // absent — but fd_tell is its own opcode (0x0033) because it's
+      // strictly cheaper on the kernel side (no whence to decode, no
+      // signed arithmetic, no file-size lookup).
+      //
+      // Dispatches FD_TELL packing `fd` as the u32 at args[0..4] via
+      // the `arg0` path. On success writes the i64 offset as u64 LE
+      // at `offset_ptr`; the wire is bit-exact through the i64↔u64
+      // reinterpretation, same trick `fd_seek` + `clock_time_get`
+      // use for their u64 results.
+      fd_tell: (fd: number, offsetPtr: number): number => {
+        if (this.memory === undefined) return ERRNO.EINVAL;
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_TELL,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) return -response.status;
+        const view = new DataView(this.memory.buffer);
+        view.setBigInt64(offsetPtr, response.value, true);
+        return 0;
+      },
+
       // WASI `path_open`.
       //
       // Signature (lowered):

@@ -961,6 +961,69 @@ describe("dispatch: FD_SEEK", () => {
   });
 });
 
+// ---- dispatch: FD_TELL ----------------------------------------------
+//
+// The read-only sibling of FD_SEEK: fd at a single u32 arg0 (no
+// whence + no offset — fd_tell takes nothing but an fd), response
+// carries the current absolute offset in `response.value`. Shares
+// FD_SEEK's EBADF + non-Vnode-EINVAL guards; reuses the
+// `openProcVersion` + `encodeFdSeekArgs` helpers from the FD_SEEK
+// block for the after-seek integration check.
+
+describe("dispatch: FD_TELL", () => {
+  it("returns 0 initially for a freshly-opened /proc/version Vnode fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_TELL,
+      requestId: 780,
+      arg0: fd,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(0n);
+  });
+
+  it("returns the seek'd offset after a SeekSet via FD_SEEK", async () => {
+    // Pin the integration: fd_tell sees whatever fd_seek just wrote.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const fd = openProcVersion(host, pid);
+
+    const seek = host.dispatch(pid, {
+      opcode: OP_WASI.FD_SEEK,
+      requestId: 781,
+      args: encodeFdSeekArgs(fd, WHENCE.SET, 6n),
+    });
+    expect(seek.response.status).toBe(0);
+
+    const tell = host.dispatch(pid, {
+      opcode: OP_WASI.FD_TELL,
+      requestId: 782,
+      arg0: fd,
+    });
+    expect(tell.response.status).toBe(0);
+    expect(tell.response.value).toBe(6n);
+  });
+
+  it("returns -EINVAL for a /dev/console fd (fd_tell has no meaning on a CharDevice)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_TELL,
+      requestId: 783,
+      arg0: 1,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {

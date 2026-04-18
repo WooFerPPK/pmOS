@@ -1761,6 +1761,120 @@ fn fd_seek_then_fd_read_reads_from_new_position() {
     assert_eq!(&heap[..4], b"efgh");
 }
 
+// ---- fd_tell ----------------------------------------------------------
+//
+// The read-only sibling of `fd_seek`: report the current absolute file
+// position of a seekable fd without changing it. Same per-fd semantics
+// as fd_seek (two fds at the same vnode have independent positions),
+// same non-Vnode rejection (EINVAL on every non-Vnode FdObject — a
+// char device / socket / pipe has no meaningful position), same EBADF
+// on an unopened fd. WASI libc lowers `ftell()` through this opcode;
+// Rust's `File::stream_position` lowers through the equivalent
+// `fd_seek(fd, 0, Cur, *)` fold. Either path reads the same
+// `FdEntry.offset` field this handler reports.
+//
+// Wire layout used below:
+//   args[0..4]  = fd (u32)
+// Response:
+//   value       = current absolute offset (u64 widened to i64; bit-exact)
+
+#[test]
+fn fd_tell_on_fresh_file_returns_initial_offset_zero() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "teller", "/t.txt", b"abcdefghij");
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_TELL,
+        flags: 0,
+        request_id: 750,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.request_id, 750);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    // The read-only contract: fd_tell must not mutate the offset.
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 0);
+}
+
+#[test]
+fn fd_tell_after_fd_seek_returns_the_sought_position() {
+    // The integration test that pins the actual reason fd_tell exists
+    // as a distinct opcode: fd_tell sees whatever fd_seek just wrote.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "after_seek", "/t.txt", b"abcdefghij");
+    let mut heap = vec![0u8; 16];
+
+    // Seek to offset 5 first.
+    let seek = Request {
+        opcode: op_wasi::FD_SEEK,
+        flags: 0,
+        request_id: 750,
+        args: fd_seek_args(fd, abi::wasi::Whence::Set as u32, 5),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, pid, &seek, &mut heap).status, 0);
+
+    // fd_tell must report the seek'd position.
+    let tell = Request {
+        opcode: op_wasi::FD_TELL,
+        flags: 0,
+        request_id: 751,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &tell, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 5);
+    assert_eq!(k.fds(pid).unwrap().offset(fd).unwrap(), 5);
+}
+
+#[test]
+fn fd_tell_on_char_device_fd_returns_einval() {
+    // CharDevice (and every other non-Vnode FdObject) has no position
+    // semantics — fd_tell on a console fd is meaningless, EINVAL.
+    // Shares this rejection branch with fd_seek.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "consoler", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_TELL,
+        flags: 0,
+        request_id: 752,
+        args: u32_args(1),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn fd_tell_on_invalid_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "stranger", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_TELL,
+        flags: 0,
+        request_id: 753,
+        args: u32_args(99),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
 // ---- fd_prestat_get ---------------------------------------------------
 
 #[test]
