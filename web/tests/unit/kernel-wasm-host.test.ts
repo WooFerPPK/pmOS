@@ -58,6 +58,7 @@ import {
   POLL_EVENT_SIZE,
   POLL_SUB_OFF,
   POLL_SUBSCRIPTION_SIZE,
+  SDFLAGS,
   SUBCLOCKFLAGS,
   WHENCE,
 } from "../../src/shared/syscall";
@@ -413,12 +414,13 @@ describe("dispatch: ENOSYS", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `SOCK_SHUTDOWN` is in the WASI range (0x0073) but still has
-    // no handler; was `FD_PREAD` before that handler landed, then
-    // `FD_READDIR` before that. Swap this probe to whatever's still
-    // unhandled as the implementation catches up.
+    // `PATH_LINK` is in the WASI range (0x0043) but still has no
+    // handler; was `SOCK_SHUTDOWN` before that handler landed,
+    // `FD_PREAD` before that, `FD_READDIR` before that. Swap this
+    // probe to whatever's still unhandled as the implementation
+    // catches up.
     const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.SOCK_SHUTDOWN,
+      opcode: OP_WASI.PATH_LINK,
       requestId: 41,
     });
     expect(response.status).toBe(-ERRNO.ENOSYS);
@@ -2031,6 +2033,96 @@ describe("dispatch: SOCK_ACCEPT", () => {
       opcode: OP_WASI.SOCK_ACCEPT,
       requestId: 983,
       args: encodeSockAcceptArgs(99, 0),
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
+// ---- dispatch: SOCK_SHUTDOWN ---------------------------------------
+//
+// v1 supports only full close (how = RD | WR); half-close returns
+// -ENOTSUP; zero how or reserved bits return -EINVAL. Wire: (fd,
+// how) as two u32s at args[0..4] + args[4..8]; no heap. These TS
+// tests pin the dispatcher's per-branch behaviour end-to-end
+// through kernel.wasm: -EINVAL on a char-device fd (non-Socket),
+// -ENOTSUP for a RD-only half-close on a fresh IPC_SOCKET-created
+// fd, -EINVAL for a zero-how request, -EBADF for an unopened fd.
+// The happy-path full-close path requires a connected pair which
+// the Rust tests pin; the TS tests focus on the error surface.
+
+function encodeSockShutdownArgs(fd: number, how: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd, true);
+  v.setUint32(4, how, true);
+  return args;
+}
+
+describe("dispatch: SOCK_SHUTDOWN", () => {
+  it("returns -EINVAL on a char-device fd (non-Socket)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SHUTDOWN,
+      requestId: 990,
+      args: encodeSockShutdownArgs(1, SDFLAGS.RD | SDFLAGS.WR),
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -ENOTSUP for a half-close (RD alone) on a Socket fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const sockResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 991,
+      arg0: 0,
+    });
+    expect(sockResp.response.status).toBe(0);
+    const sockFd = Number(sockResp.response.value);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SHUTDOWN,
+      requestId: 992,
+      args: encodeSockShutdownArgs(sockFd, SDFLAGS.RD),
+    });
+    expect(response.status).toBe(-ERRNO.ENOTSUP);
+  });
+
+  it("returns -EINVAL for a zero-how request on a Socket fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const sockResp = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_SOCKET,
+      requestId: 993,
+      arg0: 0,
+    });
+    const sockFd = Number(sockResp.response.value);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SHUTDOWN,
+      requestId: 994,
+      args: encodeSockShutdownArgs(sockFd, 0),
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("returns -EBADF when the fd is not open", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SOCK_SHUTDOWN,
+      requestId: 995,
+      args: encodeSockShutdownArgs(99, SDFLAGS.RD | SDFLAGS.WR),
     });
     expect(response.status).toBe(-ERRNO.EBADF);
   });

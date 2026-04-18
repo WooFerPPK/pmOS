@@ -80,6 +80,7 @@ pub fn dispatch_wasi(
         op::SOCK_SEND => handle_sock_send(kernel, pid, req, heap),
         op::SOCK_RECV => handle_sock_recv(kernel, pid, req, heap),
         op::SOCK_ACCEPT => handle_sock_accept(kernel, pid, req),
+        op::SOCK_SHUTDOWN => handle_sock_shutdown(kernel, pid, req),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
@@ -1807,6 +1808,71 @@ fn handle_sock_send(
 //   - listener not in Listening state → InvalidState → EINVAL
 //   - empty backlog → WouldBlock → EAGAIN
 // so this handler is an extremely thin wrapper.
+
+// ---- sock_shutdown -------------------------------------------------
+//
+// Layout:
+//   args[0..4] = fd (u32)
+//   args[4..8] = how (u32, low 8 bits = WASI sdflags: RD=0x1, WR=0x2)
+// Response:
+//   value = 0 on success (`how == RD | WR`); ENOTSUP on half-close
+//   requests (only RD or only WR set); EINVAL on zero `how` or on
+//   any bits beyond RD | WR.
+//
+// v1's IpcTable has no half-close primitive — close_socket tears
+// down both directions at once. A userland caller asking for
+// sock_shutdown(fd, RD | WR) gets full close via close_socket,
+// which observably EOFs the peer on its next recv_on_socket. A
+// caller asking for a half-close gets ENOTSUP rather than a
+// silent full-close so the userland can fall back (or fail
+// cleanly) — lying about the semantics would turn later writes
+// on the write-side-"only-shutdown" socket into surprise
+// PipeBroken errors. Non-Socket FdObject → EINVAL; unopened fd
+// → EBADF. After sock_shutdown(RD | WR), the fd itself remains
+// open pointing at the now-closed socket; subsequent fd_close
+// (and any implicit close via release_object on process exit)
+// runs close_socket again harmlessly — close_socket is idempotent
+// on an already-closed socket.
+
+fn handle_sock_shutdown(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    let how = args_u32(req, 4) & 0xFF;
+
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(e) => *e,
+            None => return Response::err(req.request_id, EBADF),
+        },
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let socket_id = match entry.object {
+        FdObject::Socket(id) => id,
+        _ => return Response::err(req.request_id, EINVAL),
+    };
+
+    let rd = abi::wasi::sdflags::RD as u32;
+    let wr = abi::wasi::sdflags::WR as u32;
+    // Zero how or bits beyond RD | WR = malformed request.
+    if how == 0 || (how & !(rd | wr)) != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    // Half-close (only RD or only WR) is unsupported in v1.
+    if how != (rd | wr) {
+        return Response::err(req.request_id, ENOTSUP);
+    }
+    // Full close: mirror close_socket. IpcError maps via
+    // From<IpcError> for KernelError — NoSuchSocket → BadFd →
+    // EBADF (the fd-table lookup above already guarded against
+    // that, but the mapping is honest if a concurrent path ever
+    // drops the socket entry).
+    match kernel.ipc.close_socket(crate::ipc::SocketId(socket_id)) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(
+            req.request_id,
+            kerr_to_errno(KernelError::from(e)),
+        ),
+    }
+}
 
 fn handle_sock_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let listener_fd = args_u32(req, 0);

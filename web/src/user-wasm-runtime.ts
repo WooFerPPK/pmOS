@@ -1126,6 +1126,30 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `sock_shutdown`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, how: i32) -> errno: i32
+      //
+      // Shutdown one or both directions of a socket. v1 only
+      // supports full close (how = RD | WR); half-close returns
+      // -ENOTSUP. Zero how or reserved bits return -EINVAL.
+      // Non-Socket fd returns -EINVAL; unopened fd returns -EBADF.
+      sock_shutdown: (fd: number, how: number): number => {
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, how, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.SOCK_SHUTDOWN,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `sock_accept`.
       //
       // Signature (lowered):

@@ -205,12 +205,22 @@ var OP_WASI = {
    * surface: non-Socket fd → EINVAL, unopened → EBADF, listener
    * not in Listening state → EINVAL, empty backlog → EAGAIN. */
   SOCK_ACCEPT: 112,
+  /** Wire-format identity for `sock_shutdown`. Shutdown one or
+   * both directions of a socket. Wire: fd at args[0..4], how
+   * (low 8 bits = WASI sdflags: RD=0x1, WR=0x2) at args[4..8].
+   * v1's IpcTable has no half-close primitive, so the handler
+   * accepts only how=RD|WR (full close via close_socket) and
+   * rejects the half-close combinations with ENOTSUP. Zero how
+   * or bits beyond RD|WR reject with EINVAL. Non-Socket fd →
+   * EINVAL; unopened fd → EBADF. After a successful shutdown the
+   * peer observes EOF on its next recv. */
+  SOCK_SHUTDOWN: 115,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
-   * kernel doesn't yet handle. Was `FD_PREAD` before that handler
-   * landed; swap to whichever WASI opcode is still unhandled as
-   * the implementation catches up. */
-  SOCK_SHUTDOWN: 115,
+   * kernel doesn't yet handle. Was `SOCK_SHUTDOWN` before that
+   * handler landed; swap to whichever WASI opcode is still
+   * unhandled as the implementation catches up. */
+  PATH_LINK: 67,
   /** Wire-format identity for `fd_readdir`. Directory-listing
    * opcode. args[0..4] = fd (u32); args[4..12] = cookie (u64
    * LE; 0 = start from beginning); heap = caller's output buffer
@@ -1247,6 +1257,29 @@ var UserWasmRuntime = class {
         argsView.setUint32(4, to, true);
         const { response } = this.backend.dispatch({
           opcode: OP_WASI.FD_RENUMBER,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+      // WASI `sock_shutdown`.
+      //
+      // Signature (lowered):
+      //   (fd: i32, how: i32) -> errno: i32
+      //
+      // Shutdown one or both directions of a socket. v1 only
+      // supports full close (how = RD | WR); half-close returns
+      // -ENOTSUP. Zero how or reserved bits return -EINVAL.
+      // Non-Socket fd returns -EINVAL; unopened fd returns -EBADF.
+      sock_shutdown: (fd, how) => {
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, fd, true);
+        argsView.setUint32(4, how, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.SOCK_SHUTDOWN,
           requestId: 0,
           args,
           heapPtr: 0,

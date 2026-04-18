@@ -108,23 +108,23 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `SOCK_SHUTDOWN` is in the WASI range (0x0073) but still has
-    // no handler. Same shape as the ext-side test below: decoded as
+    // `PATH_LINK` is in the WASI range (0x0043) but still has no
+    // handler. Same shape as the ext-side test below: decoded as
     // a known WASI opcode, routed to `dispatch_wasi`'s `_ =>` arm,
     // ENOSYS echoed back with the request_id intact.
     //
-    // (This probe was `FD_PREAD` before that handler landed, then
-    // `FD_READDIR` before it, then `FD_SEEK` / `CLOCK_TIME_GET`
-    // before those. When `SOCK_SHUTDOWN` grows a real handler,
-    // swap this probe to whatever's still unhandled at that
-    // point, or delete the test once every WASI opcode has real
-    // coverage.)
+    // (This probe was `SOCK_SHUTDOWN` before that handler landed,
+    // then `FD_PREAD`, then `FD_READDIR`, then `FD_SEEK` /
+    // `CLOCK_TIME_GET` before those. When `PATH_LINK` grows a real
+    // handler, swap this probe to whatever's still unhandled at
+    // that point, or delete the test once every WASI opcode has
+    // real coverage.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::SOCK_SHUTDOWN,
+        opcode: op_wasi::PATH_LINK,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -5101,6 +5101,204 @@ fn sock_accept_on_unopened_fd_returns_ebadf() {
         flags: 0,
         request_id: 975,
         args: sock_accept_args(99, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+// ---- sock_shutdown -------------------------------------------------
+//
+// Opcode 0x0073. Shutdown one or both directions of a socket.
+// Wire:
+//
+//   args[0..4] = fd (u32)
+//   args[4..8] = how (u32, low 8 bits = WASI sdflags: RD=0x1, WR=0x2)
+//
+// v1's IpcTable has no half-close primitive — close_socket tears
+// down both directions at once — so the handler accepts only
+// `RD | WR` (full close, mapped to close_socket) and rejects the
+// half-close combinations with ENOTSUP. Zero `how` rejects with
+// EINVAL since shutting down nothing is meaningless; bits beyond
+// RD | WR also reject with EINVAL.
+//
+// Standard guards: non-Socket FdObject → EINVAL; unopened fd →
+// EBADF.
+
+fn sock_shutdown_args(fd: u32, how: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..8].copy_from_slice(&how.to_le_bytes());
+    args
+}
+
+#[test]
+fn sock_shutdown_rdwr_closes_socket_observable_via_peer_eof() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shutter", 0);
+
+    // Connect a ↔ b.
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let how = (abi::wasi::sdflags::RD | abi::wasi::sdflags::WR) as u32;
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 980,
+        args: sock_shutdown_args(3, how),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+
+    // a is now closed; b's recv_on_socket should return (0, []) EOF.
+    let mut rx = [0u8; 8];
+    let (n, _fds) = k.ipc.recv_on_socket(b, &mut rx, 0).unwrap();
+    assert_eq!(n, 0, "peer observes EOF after sock_shutdown(RDWR)");
+}
+
+#[test]
+fn sock_shutdown_rd_alone_returns_enotsup() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 981,
+        args: sock_shutdown_args(3, abi::wasi::sdflags::RD as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+}
+
+#[test]
+fn sock_shutdown_wr_alone_returns_enotsup() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 982,
+        args: sock_shutdown_args(3, abi::wasi::sdflags::WR as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+}
+
+#[test]
+fn sock_shutdown_with_zero_how_returns_einval() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 983,
+        args: sock_shutdown_args(3, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn sock_shutdown_with_reserved_bits_returns_einval() {
+    // Any bits beyond RD | WR (0x3) are not defined by WASI and
+    // the handler rejects them rather than silently discarding —
+    // v1 is strict about input validation for unused bitfields.
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shutter", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    // Bit 0x80 is undefined; RD | WR = 0x3, so 0x83 has the
+    // full-close pair set but also an undefined bit.
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 984,
+        args: sock_shutdown_args(3, 0x83),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn sock_shutdown_on_char_device_fd_returns_einval() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "cdev_shutter", 0);
+    k.install_fd(pid, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let how = (abi::wasi::sdflags::RD | abi::wasi::sdflags::WR) as u32;
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 985,
+        args: sock_shutdown_args(1, how),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn sock_shutdown_on_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghost_shutter", 0);
+    let mut heap = vec![0u8; 16];
+
+    let how = (abi::wasi::sdflags::RD | abi::wasi::sdflags::WR) as u32;
+    let req = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 986,
+        args: sock_shutdown_args(99, how),
         heap_ptr: 0,
         heap_len: 0,
     };

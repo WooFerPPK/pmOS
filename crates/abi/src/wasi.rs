@@ -97,6 +97,23 @@ pub mod fdflags {
     pub const SYNC:     u16 = 0x0010;
 }
 
+/// Sdflags used with `sock_shutdown`. WASI models shutdown as a
+/// pair of independent bits (read-side and write-side) so userland
+/// can half-close one direction while leaving the other open.
+///
+/// v1's IpcTable has no half-close primitive — `close_socket`
+/// tears down both directions at once — so the dispatcher accepts
+/// only `RD | WR` (full close, mapped to `close_socket`) and
+/// rejects the half-close combinations with `ENOTSUP`. A zero
+/// `how` value (neither bit set) rejects with `EINVAL` since
+/// shutting down nothing is meaningless. Any bits beyond RD | WR
+/// also reject with `EINVAL` — WASI reserves those but v1 is
+/// strict about input validation.
+pub mod sdflags {
+    pub const RD: u8 = 0x1;
+    pub const WR: u8 = 0x2;
+}
+
 /// Seek whence for `fd_seek`.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
