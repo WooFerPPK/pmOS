@@ -139,22 +139,21 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `PROC_CAPS_GET` is in the extension range (0x1105) but still
-    // has no handler. Same shape as the WASI case above: decoded as
-    // a known extension opcode, routed to `dispatch_ext`'s `_ =>`
+    // `CAP_GRANT` is in the extension range (0x1302) but still has
+    // no handler. Same shape as the WASI case above: decoded as a
+    // known extension opcode, routed to `dispatch_ext`'s `_ =>`
     // arm, ENOSYS echoed back with the request_id intact.
     //
     // (This probe was `PROC_SPAWN` before that handler landed, then
-    // `PROC_WAIT`, then `PROC_KILL`. When the next extension opcode
-    // gets implemented, swap this probe to whatever's still unhandled
-    // at that point, or delete the test once every extension opcode
-    // has real coverage.)
+    // `PROC_WAIT`, then `PROC_KILL`, then `PROC_CAPS_GET`. CAP_GRANT
+    // is a v2-era concern — delegating cap edits to userland is out
+    // of scope for v1 — so it's a stable long-term probe target.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::PROC_CAPS_GET,
+        opcode: op_ext::CAP_GRANT,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -9481,4 +9480,112 @@ fn proc_kill_dead_target_returns_esrch() {
     let mut heap = vec![0u8; 16];
     let resp = dispatch(&mut k, init, &req, &mut heap);
     assert_eq!(resp.status, -errno::ESRCH);
+}
+
+// ---- proc_caps_get ---------------------------------------------------
+//
+// PROC_CAPS_GET (0x1105). Query a process's cap set. Sender may
+// query its own caps freely. Querying another pid requires the
+// sender to be the target's parent OR to hold Cap::ProcInspect —
+// otherwise ENOTCAPABLE. Non-existent / reaped target → ESRCH.
+//
+// Wire layout:
+//   args[0..4] = target_pid (i32).
+// Response: value = CapSet as i64 on success; negative errno on
+// failure.
+
+fn proc_caps_get_args(target_pid: i32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&target_pid.to_le_bytes());
+    args
+}
+
+#[test]
+fn proc_caps_get_self_returns_own_capset() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "selfy", 0);
+    let own = k.caps.list(pid).unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_CAPS_GET,
+        flags: 0,
+        request_id: 1220,
+        args: proc_caps_get_args(pid),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value as u64, own.0);
+}
+
+#[test]
+fn proc_caps_get_child_from_parent_returns_child_capset() {
+    // init (parent) queries a child's caps — allowed without
+    // ProcInspect because is_parent = true.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "kid");
+    let child_caps = k.caps.list(child).unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_CAPS_GET,
+        flags: 0,
+        request_id: 1221,
+        args: proc_caps_get_args(child),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value as u64, child_caps.0);
+}
+
+#[test]
+fn proc_caps_get_on_unknown_pid_returns_esrch() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pryer", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_CAPS_GET,
+        flags: 0,
+        request_id: 1222,
+        args: proc_caps_get_args(9999),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ESRCH);
+}
+
+#[test]
+fn proc_caps_get_on_non_child_without_proc_inspect_returns_enotcapable() {
+    // Two siblings a and b under init. Neither is the other's
+    // parent. `a` has ORDINARY_APP caps — no ProcInspect. `a`
+    // trying to read `b`'s caps → ENOTCAPABLE.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let a = register_child(&mut k, init, "a");
+    let b = register_child(&mut k, init, "b");
+    k.procs
+        .transition(a, kernel::proc::ProcState::Running)
+        .unwrap();
+    k.procs
+        .transition(b, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_CAPS_GET,
+        flags: 0,
+        request_id: 1223,
+        args: proc_caps_get_args(b),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, a, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
 }

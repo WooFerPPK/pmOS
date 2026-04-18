@@ -1981,6 +1981,48 @@ export class UserWasmRuntime {
         return pidView.getUint32(0, true);
       },
 
+      // `proc_caps_get(target_pid: i32, caps_out_ptr: i32) -> i32`
+      //
+      // Query the cap set held by `target_pid`. Writes the caps as a
+      // u64 LE to `caps_out_ptr` on success. Returns 0 on success;
+      // negative errno on failure:
+      //
+      //   * ESRCH — target pid does not exist or has been reaped.
+      //   * ENOTCAPABLE — sender is not the target's parent and
+      //     doesn't hold Cap::ProcInspect. Querying one's own caps
+      //     never trips this — the kernel short-circuits when
+      //     target == sender.
+      //   * EINVAL — if `caps_out_ptr` is 0 (the shim requires an
+      //     output buffer; a caller that doesn't want the value
+      //     should use CAP_CHECK instead).
+      proc_caps_get: (
+        targetPid: number,
+        capsOutPtr: number,
+      ): number => {
+        if (capsOutPtr === 0 || this.memory === undefined) {
+          return -ERRNO.EINVAL;
+        }
+        const args = new Uint8Array(16);
+        const v = new DataView(args.buffer);
+        v.setInt32(0, targetPid, true);
+
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.PROC_CAPS_GET,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) {
+          return response.status;
+        }
+        const memView = new DataView(this.memory.buffer);
+        // CapSet is u64 in the kernel; value field is i64. Bits are
+        // identical — write as u64 LE.
+        memView.setBigUint64(capsOutPtr, BigInt.asUintN(64, response.value), true);
+        return 0;
+      },
+
       // `proc_kill(target_pid: i32, signum: i32) -> i32`
       //
       // Deliver a POSIX-style signal to `target_pid`. v1 knows

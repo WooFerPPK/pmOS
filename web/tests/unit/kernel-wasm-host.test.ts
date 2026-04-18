@@ -4468,6 +4468,61 @@ describe("dispatch: PROC_WAIT", () => {
   });
 });
 
+// ---- dispatch: PROC_CAPS_GET ----------------------------------------
+//
+// PROC_CAPS_GET (0x1105). Wire: args[0..4] = target_pid i32.
+// Returns CapSet as i64 in response.value on success; -ESRCH when
+// the target doesn't exist; -ENOTCAPABLE when the sender is not
+// the target's parent, not self, and doesn't hold Cap::ProcInspect.
+
+function encodeProcCapsGetArgs(targetPid: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setInt32(0, targetPid, true);
+  return args;
+}
+
+describe("dispatch: PROC_CAPS_GET", () => {
+  it("returns the caller's own caps when target == sender", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_CAPS_GET,
+        requestId: 1320,
+        args: encodeProcCapsGetArgs(pid),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+    // CAPSET_ALL = u64::MAX. As an i64 that's -1; bit-pattern
+    // round-trips through the value field.
+    expect(BigInt.asUintN(64, response.value)).toBe(CAPSET_ALL);
+  });
+
+  it("returns -ESRCH for an unknown target pid", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_CAPS_GET,
+        requestId: 1321,
+        args: encodeProcCapsGetArgs(9999),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.ESRCH);
+  });
+});
+
 // ---- dispatch: PROC_KILL --------------------------------------------
 //
 // PROC_KILL (0x1102). Wire: args[0..4] = target_pid i32; args[4..6]

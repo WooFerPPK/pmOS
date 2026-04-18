@@ -41,6 +41,14 @@ pub enum Cap {
     /// layout. Held by the desktop shell (for delegation to the
     /// settings app at launcher spawn time).
     KeymapAdmin = 10,
+    /// May query another process's capability set via
+    /// `proc_caps_get`. Querying one's own caps never requires
+    /// this cap; it's only consulted when the target pid is a
+    /// non-child of the sender. Held by init by default (as part
+    /// of `CapSet::ALL`) and by `ProcEnumerate`-equipped tools
+    /// that need to inspect neighbours' permissions — e.g.
+    /// sysmon.
+    ProcInspect = 11,
 }
 
 impl Cap {
@@ -63,6 +71,7 @@ impl Cap {
             8  => Some(Cap::CapGrant),
             9  => Some(Cap::DevBlock),
             10 => Some(Cap::KeymapAdmin),
+            11 => Some(Cap::ProcInspect),
             _  => None,
         }
     }
@@ -81,6 +90,7 @@ impl Cap {
             Cap::CapGrant      => "CAP_GRANT",
             Cap::DevBlock      => "DEV_BLOCK",
             Cap::KeymapAdmin   => "KEYMAP_ADMIN",
+            Cap::ProcInspect   => "PROC_INSPECT",
         }
     }
 }
@@ -227,12 +237,12 @@ mod tests {
 
     #[test]
     fn from_u32_roundtrip() {
-        for v in 1..=10 {
+        for v in 1..=11 {
             let cap = Cap::from_u32(v).expect("known cap");
             assert_eq!(cap as u32, v);
         }
         assert!(Cap::from_u32(0).is_none());
-        assert!(Cap::from_u32(11).is_none());
+        assert!(Cap::from_u32(12).is_none());
     }
 
     #[test]
@@ -250,5 +260,6 @@ mod tests {
         assert_eq!(Cap::CapGrant.name(),      "CAP_GRANT");
         assert_eq!(Cap::DevBlock.name(),      "DEV_BLOCK");
         assert_eq!(Cap::KeymapAdmin.name(),   "KEYMAP_ADMIN");
+        assert_eq!(Cap::ProcInspect.name(),   "PROC_INSPECT");
     }
 }

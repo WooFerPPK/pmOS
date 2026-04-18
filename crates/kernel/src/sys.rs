@@ -1024,6 +1024,41 @@ impl Kernel {
         Ok(())
     }
 
+    /// Return the capability set held by `target_pid`.
+    ///
+    /// Cap rules: querying one's own caps never requires any
+    /// extra permission; querying another pid requires the sender
+    /// to be the target's parent OR to hold
+    /// [`Cap::ProcInspect`]. Otherwise
+    /// [`KernelError::NotCapable`].
+    ///
+    /// Returns [`KernelError::NoSuchPid`] when `target_pid` does
+    /// not exist (or has been reaped to `Dead`). The sender must
+    /// also exist — `CapError::NoSuchPid` on the sender_caps
+    /// fetch bubbles through `From<CapError>` to the same variant.
+    pub fn proc_caps_get(
+        &self,
+        sender_pid: Pid,
+        target_pid: Pid,
+    ) -> Result<CapSet, KernelError> {
+        let sender_caps = self.caps.list(sender_pid)?;
+        if sender_pid == target_pid {
+            return Ok(sender_caps);
+        }
+        let target = self
+            .procs
+            .get(target_pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        if target.state == ProcState::Dead {
+            return Err(KernelError::NoSuchPid);
+        }
+        let is_parent = target.ppid == sender_pid;
+        if !is_parent && !sender_caps.contains(Cap::ProcInspect) {
+            return Err(KernelError::NotCapable);
+        }
+        Ok(self.caps.list(target_pid)?)
+    }
+
     /// Drain the pending signals queued on `pid`'s inbox.
     /// Returns them in delivery order; the inbox is empty after
     /// this call. Used by tests and (once T071/T072 land) by

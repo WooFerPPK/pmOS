@@ -58,6 +58,7 @@ pub fn dispatch_ext(
         op::PROC_SPAWN => handle_proc_spawn(kernel, pid, req, heap),
         op::PROC_WAIT => handle_proc_wait(kernel, pid, req, heap),
         op::PROC_KILL => handle_proc_kill(kernel, pid, req),
+        op::PROC_CAPS_GET => handle_proc_caps_get(kernel, pid, req),
         op::DISPLAY_CONNECT => handle_display_connect(kernel, pid, req),
         op::DISPLAY_BIND => handle_display_bind(kernel, pid, req),
         _ => Response::err(req.request_id, ENOSYS),
@@ -568,6 +569,27 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     };
     match kernel.proc_kill(pid, target_pid, signal) {
         Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- proc_caps_get ----------------------------------------------------
+//
+// Layout:
+//   args[0..4] = target_pid (i32).
+// Response: value = CapSet as i64 on success; negative errno on
+// failure. The CapSet is always a u64 bitset on the Rust side; the
+// cast to i64 preserves every bit (bits 63..0 round-trip verbatim).
+//
+// Cap rules are enforced by Kernel::proc_caps_get: sender can
+// query own caps freely; querying another pid requires parent-
+// relationship OR Cap::ProcInspect. Non-existent / reaped target
+// → -ESRCH.
+
+fn handle_proc_caps_get(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
+    let target_pid = i32::from_le_bytes([req.args[0], req.args[1], req.args[2], req.args[3]]);
+    match kernel.proc_caps_get(pid, target_pid) {
+        Ok(caps) => Response::ok(req.request_id, caps.0 as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
