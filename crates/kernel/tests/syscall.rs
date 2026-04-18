@@ -2653,6 +2653,166 @@ fn ipc_round_trip_server_accepts_client_and_they_exchange_bytes() {
     assert_eq!(&heap[..2], b"hi");
 }
 
+#[test]
+fn fd_write_on_pending_client_after_listener_drop_returns_econnrefused() {
+    // End-to-end through the dispatcher: server binds + listens;
+    // client connects (pending on backlog); server closes the
+    // listener fd WITHOUT accepting; client's subsequent fd_write
+    // surfaces ECONNREFUSED instead of the pre-drain EINVAL.
+    //
+    // This is the kernel-correctness guarantee display-client-demo
+    // now relies on: a non-EINVAL errno means the retry loop should
+    // exit rather than spin to MAX_POLLS waiting for an accept that
+    // will never come.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "server", 0);
+    let client = make_running_proc(&mut k, "client", 0);
+    let mut heap = vec![0u8; 128];
+    let path = b"/tmp/drop";
+
+    // Server: socket + bind + listen.
+    let srv_listener = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 300,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+    heap[..path.len()].copy_from_slice(path);
+    assert_eq!(
+        dispatch(
+            &mut k,
+            server,
+            &Request {
+                opcode: op_ext::IPC_BIND,
+                flags: 0,
+                request_id: 301,
+                args: u32_args(srv_listener),
+                heap_ptr: 0,
+                heap_len: path.len() as u32,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+    assert_eq!(
+        dispatch(
+            &mut k,
+            server,
+            &Request {
+                opcode: op_ext::IPC_LISTEN,
+                flags: 0,
+                request_id: 302,
+                args: u32_u32_args(srv_listener, 4),
+                heap_ptr: 0,
+                heap_len: 0,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+
+    // Client: socket + connect (parks on backlog).
+    let cli_fd = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 303,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+    heap[..path.len()].copy_from_slice(path);
+    assert_eq!(
+        dispatch(
+            &mut k,
+            client,
+            &Request {
+                opcode: op_ext::IPC_CONNECT,
+                flags: 0,
+                request_id: 304,
+                args: u32_args(cli_fd),
+                heap_ptr: 0,
+                heap_len: path.len() as u32,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+
+    // Pre-drop sanity: fd_write on the pending client returns
+    // EINVAL (the accept-race signal display-client-demo retries
+    // on). If this assertion drifts, the retry loop semantic has
+    // broken even before the listener drops.
+    heap[..2].copy_from_slice(b"hi");
+    let pre_drop = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_wasi::FD_WRITE,
+            flags: 0,
+            request_id: 305,
+            args: u32_args(cli_fd),
+            heap_ptr: 0,
+            heap_len: 2,
+        },
+        &mut heap,
+    );
+    assert_eq!(pre_drop.status, -errno::EINVAL);
+
+    // Server closes the listener fd WITHOUT accepting. The close
+    // path drains the backlog so the still-pending client
+    // transitions to Closed.
+    assert_eq!(
+        dispatch(
+            &mut k,
+            server,
+            &Request {
+                opcode: op_wasi::FD_CLOSE,
+                flags: 0,
+                request_id: 306,
+                args: u32_args(srv_listener),
+                heap_ptr: 0,
+                heap_len: 0,
+            },
+            &mut heap,
+        )
+        .status,
+        0,
+    );
+
+    // Post-drop: fd_write now reports ECONNREFUSED.
+    let post_drop = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_wasi::FD_WRITE,
+            flags: 0,
+            request_id: 307,
+            args: u32_args(cli_fd),
+            heap_ptr: 0,
+            heap_len: 2,
+        },
+        &mut heap,
+    );
+    assert_eq!(post_drop.status, -errno::ECONNREFUSED);
+}
+
 // ---- display_connect --------------------------------------------------
 
 #[test]

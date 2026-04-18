@@ -361,6 +361,128 @@ fn socket_close_unbinds_the_path() {
     ipc.bind_socket(other, "/run/svc").unwrap();
 }
 
+// ---- Listener drop with pending Connecting clients ----------------
+//
+// When a listener socket is dropped while pending Connecting clients
+// are queued on its backlog, those clients stay paired with a peer
+// that will never accept them. Before the backlog-drain step these
+// clients observed `InvalidState` (→ EINVAL) on subsequent
+// `fd_write`, which is indistinguishable from the "server is alive
+// but hasn't accepted yet" EINVAL that display-client-demo's retry
+// loop papers over. After the drain, drained clients observe
+// `ConnectionRefused` (→ ECONNREFUSED) instead — the same errno they
+// would have seen if the listener had never been reachable at all,
+// and the cue display-client-demo would use to break out of the
+// retry loop.
+//
+// The drain transitions each pending client to `SocketState::Closed`
+// and leaves `peer = None`. `send_on_socket` gains one branch that
+// maps the Closed-state case to `ConnectionRefused`. The existing
+// Connecting-state case keeps returning `InvalidState`, so the
+// accept-race EINVAL retry window in display-client-demo is not
+// disturbed.
+
+#[test]
+fn socket_close_listener_drains_pending_connecting_client_to_closed_state() {
+    let mut ipc = IpcTable::new();
+    let listener = ipc.create_socket(SocketType::Stream);
+    ipc.bind_socket(listener, "/run/svc").unwrap();
+    ipc.listen_socket(listener, 4).unwrap();
+
+    let client = ipc.create_socket(SocketType::Stream);
+    ipc.connect_socket(client, "/run/svc").unwrap();
+    // Pre-drop, the client is Connecting (queued on the backlog).
+    assert_eq!(ipc.socket_mut(client).unwrap().state, SocketState::Connecting);
+
+    ipc.close_socket(listener).unwrap();
+
+    // Post-drop, the drained client transitions to Closed — the
+    // signal subsequent send/recv branches detect.
+    let c = ipc.socket_mut(client).unwrap();
+    assert_eq!(c.state, SocketState::Closed);
+    // The drained client never had a peer; the listener minted the
+    // server side only at accept time.
+    assert_eq!(c.peer, None);
+}
+
+#[test]
+fn socket_close_listener_drains_all_pending_connecting_clients() {
+    let mut ipc = IpcTable::new();
+    let listener = ipc.create_socket(SocketType::Stream);
+    ipc.bind_socket(listener, "/run/svc").unwrap();
+    ipc.listen_socket(listener, 8).unwrap();
+
+    let clients: alloc::vec::Vec<_> = (0..3)
+        .map(|_| {
+            let c = ipc.create_socket(SocketType::Stream);
+            ipc.connect_socket(c, "/run/svc").unwrap();
+            c
+        })
+        .collect();
+
+    ipc.close_socket(listener).unwrap();
+
+    for c in clients {
+        assert_eq!(ipc.socket_mut(c).unwrap().state, SocketState::Closed);
+    }
+}
+
+#[test]
+fn socket_send_on_drained_client_returns_connection_refused() {
+    let mut ipc = IpcTable::new();
+    let listener = ipc.create_socket(SocketType::Stream);
+    ipc.bind_socket(listener, "/run/svc").unwrap();
+    ipc.listen_socket(listener, 4).unwrap();
+
+    let client = ipc.create_socket(SocketType::Stream);
+    ipc.connect_socket(client, "/run/svc").unwrap();
+    ipc.close_socket(listener).unwrap();
+
+    // fd_write on the drained client observes a ConnectionRefused
+    // error that maps to ECONNREFUSED at the syscall layer — the
+    // semantic cue "the server you tried to reach is gone".
+    let err = ipc
+        .send_on_socket(client, b"hi", alloc::vec::Vec::new())
+        .unwrap_err();
+    assert_eq!(err, IpcError::ConnectionRefused);
+}
+
+#[test]
+fn socket_send_on_connecting_client_with_live_listener_still_invalid_state() {
+    // Invariant: the accept-race case (listener alive, client
+    // queued but not accepted yet) keeps returning InvalidState.
+    // display-client-demo's EINVAL retry loop depends on this
+    // split — only the listener-drop case should surface the new
+    // ConnectionRefused.
+    let mut ipc = IpcTable::new();
+    let listener = ipc.create_socket(SocketType::Stream);
+    ipc.bind_socket(listener, "/run/svc").unwrap();
+    ipc.listen_socket(listener, 4).unwrap();
+
+    let client = ipc.create_socket(SocketType::Stream);
+    ipc.connect_socket(client, "/run/svc").unwrap();
+    // No close — the listener is still live.
+
+    let err = ipc
+        .send_on_socket(client, b"hi", alloc::vec::Vec::new())
+        .unwrap_err();
+    assert_eq!(err, IpcError::InvalidState);
+}
+
+#[test]
+fn socket_close_listener_with_empty_backlog_is_unchanged() {
+    let mut ipc = IpcTable::new();
+    let listener = ipc.create_socket(SocketType::Stream);
+    ipc.bind_socket(listener, "/run/svc").unwrap();
+    ipc.listen_socket(listener, 4).unwrap();
+
+    // No pending clients; close should behave exactly as before:
+    // binding released, listener flagged closed.
+    ipc.close_socket(listener).unwrap();
+    let other = ipc.create_socket(SocketType::Stream);
+    ipc.bind_socket(other, "/run/svc").unwrap();
+}
+
 // ---- Helpers -------------------------------------------------------
 
 /// Build a pair of Connected sockets for use in the

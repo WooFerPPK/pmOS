@@ -263,6 +263,17 @@ impl IpcTable {
                 .sockets
                 .get(&sender_id)
                 .ok_or(IpcError::NoSuchSocket)?;
+            // `Closed` is the state a pending Connecting client
+            // transitions to when its listener drops before
+            // `accept` (see `close_socket`'s backlog-drain step).
+            // Surface `ConnectionRefused` so the caller's errno
+            // layer sees ECONNREFUSED — the semantic cue "the
+            // listener you tried to reach is gone", distinct
+            // from the accept-race `InvalidState` / EINVAL that
+            // fires while the listener is still live.
+            if sender.state == SocketState::Closed {
+                return Err(IpcError::ConnectionRefused);
+            }
             if sender.state != SocketState::Connected {
                 return Err(IpcError::InvalidState);
             }
@@ -353,14 +364,39 @@ impl IpcTable {
     /// v1 leaves the closed socket in the map so any still-
     /// open peer can observe it. A full implementation would
     /// reap it once the peer has also closed.
+    ///
+    /// If the closing socket is a Listening one with pending
+    /// Connecting clients on its backlog, each of those clients
+    /// transitions to [`SocketState::Closed`] (leaving `peer =
+    /// None`). A subsequent `send_on_socket` on a drained client
+    /// returns [`IpcError::ConnectionRefused`] — the semantic cue
+    /// "the listener you tried to reach is gone" — instead of the
+    /// pre-drain `InvalidState` / EINVAL that conflated the dead-
+    /// listener case with the accept-race retry window the display
+    /// client walks during a healthy handshake.
     pub fn close_socket(&mut self, id: SocketId) -> Result<(), IpcError> {
-        let (_peer, bound) = {
+        let (_peer, bound, drained) = {
             let sock = self.sockets.get_mut(&id).ok_or(IpcError::NoSuchSocket)?;
             sock.closed = true;
-            (sock.peer, sock.bound_path.clone())
+            // Snapshot the pending backlog *only* if this socket
+            // was in the Listening role. A non-listening close
+            // leaves the backlog alone (the vec is empty anyway
+            // for non-listening sockets, but the explicit guard
+            // makes the intent unambiguous).
+            let drained: Vec<SocketId> = if sock.state == SocketState::Listening {
+                sock.backlog.drain(..).collect()
+            } else {
+                Vec::new()
+            };
+            (sock.peer, sock.bound_path.clone(), drained)
         };
         if let Some(path) = bound {
             self.bindings.remove(&path);
+        }
+        for client_id in drained {
+            if let Some(client) = self.sockets.get_mut(&client_id) {
+                client.state = SocketState::Closed;
+            }
         }
         // DO NOT clear the peer's .peer pointer: the peer
         // needs to reach us via that pointer to observe our
