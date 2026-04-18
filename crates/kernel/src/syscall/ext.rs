@@ -34,7 +34,7 @@ use crate::platform;
 use crate::proc::ExitStatus;
 use crate::sys::{Kernel, SpawnArgs};
 
-use super::dispatch::{args_u32, args_u64, heap_in, kerr_to_errno};
+use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno};
 
 /// Dispatch a request whose opcode is in the PMos extension range.
 /// The caller has already guarded with [`abi::ext::is_ext`].
@@ -50,6 +50,7 @@ pub fn dispatch_ext(
         op::IPC_LISTEN => handle_ipc_listen(kernel, pid, req),
         op::IPC_CONNECT => handle_ipc_connect(kernel, pid, req, heap),
         op::IPC_ACCEPT => handle_ipc_accept(kernel, pid, req),
+        op::IPC_PIPE => handle_ipc_pipe(kernel, pid, req, heap),
         op::PROC_SELF => handle_proc_self(pid, req),
         op::PROC_PARENT => handle_proc_parent(kernel, pid, req),
         op::CAP_CHECK => handle_cap_check(kernel, pid, req),
@@ -248,6 +249,59 @@ fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     match kernel.accept_socket(pid, listener_fd) {
         Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- ipc_pipe ---------------------------------------------------------
+//
+// Layout: no args. heap[0..8] is an output-only scratch region.
+// Response:
+//   value     = 0 on success
+//   extra_len = 8 (the kernel wrote read_fd at heap[0..4] and
+//                write_fd at heap[4..8] as little-endian u32s)
+//
+// Mirrors POSIX `pipe(2)`: create a pipe, install both ends on the
+// caller. After success the caller owns two fds — the PipeRead at
+// [0..4] and the PipeWrite at [4..8]. Either end can be dup'd into
+// a child via PROC_SPAWN stdio inheritance; both ends honour the
+// full fd_read / fd_write / fd_close surface.
+//
+// heap_len < 8 is rejected BEFORE any fd allocation so a malformed
+// shim doesn't leak a half-installed pipe. If the second alloc
+// fails mid-call (fd-limit exhaustion), Kernel::create_pipe_fds
+// rolls back the first install and drops both pipe refs.
+
+fn handle_ipc_pipe(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    if (req.heap_len as usize) < 8 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let (read_fd, write_fd) = match kernel.create_pipe_fds(pid) {
+        Ok(pair) => pair,
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+    let Some(out) = heap_out_mut(req, heap, 8) else {
+        // Roll back if heap is out of range post-alloc. In practice
+        // the earlier heap_len check should've caught this, but
+        // heap_out_mut also guards heap_ptr + len <= heap.len().
+        if let Ok(table) = kernel.fds_mut(pid) {
+            let _ = table.close(read_fd);
+            let _ = table.close(write_fd);
+        }
+        return Response::err(req.request_id, EINVAL);
+    };
+    out[0..4].copy_from_slice(&read_fd.to_le_bytes());
+    out[4..8].copy_from_slice(&write_fd.to_le_bytes());
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: 8,
+        _pad: [0u8; 12],
     }
 }
 

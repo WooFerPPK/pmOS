@@ -2030,6 +2030,34 @@ export class UserWasmRuntime {
         return response.status;
       },
 
+      // `ipc_pipe(fds_ptr: i32) -> i32`
+      //
+      // Create a pipe pair; the kernel writes `[read_fd, write_fd]`
+      // as two u32s into user memory at `fds_ptr`. Returns 0 on
+      // success, negative errno on failure (EMFILE if the fd table
+      // is full). Mirrors POSIX `pipe(2)`. Uses a scratch-heap
+      // round-trip: the kernel writes the two fds into the 8-byte
+      // scratch, and the shim copies them out to `fds_ptr`.
+      ipc_pipe: (fdsPtr: number): number => {
+        if (this.memory === undefined) return -ERRNO.EINVAL;
+        const heap = new Uint8Array(8);
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.IPC_PIPE,
+            requestId: 0,
+            arg0: 0,
+            heapPtr: 0,
+            heapLen: 8,
+          },
+          heap,
+        );
+        if (response.status !== 0) return response.status;
+        // Copy the 8 bytes of (read_fd, write_fd) into user memory.
+        const userFds = new Uint8Array(this.memory.buffer, fdsPtr, 8);
+        userFds.set(heapOut.subarray(0, 8));
+        return 0;
+      },
+
       // `ipc_accept(listener_fd: i32) -> i32`
       //
       // Accept one pending connection from the listener.

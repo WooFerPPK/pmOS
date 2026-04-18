@@ -14,6 +14,11 @@ pub const IPC_CONNECT:  u16 = 0x1003;
 pub const IPC_ACCEPT:   u16 = 0x1004;
 pub const IPC_SEND:     u16 = 0x1005;
 pub const IPC_RECV:     u16 = 0x1006;
+/// Create a pipe pair (POSIX `pipe(2)` equivalent). Installs a
+/// `FdObject::PipeRead` fd and a `FdObject::PipeWrite` fd on the
+/// caller, writing both fds as two u32s LE into the caller's heap
+/// scratch at `heap[0..8]`. Requires `heap_len == 8`.
+pub const IPC_PIPE:     u16 = 0x1007;
 
 /// `ipc_socket` types.
 #[repr(u8)]

@@ -593,6 +593,45 @@ impl Kernel {
         Ok(fd)
     }
 
+    /// Create a pipe pair and install both ends on `pid`'s fd table.
+    /// Returns `(read_fd, write_fd)`. Mirrors POSIX `pipe(2)`: after
+    /// a successful call, bytes written to `write_fd` are readable
+    /// from `read_fd` via the existing fd_read / fd_write paths.
+    ///
+    /// If the second `alloc` fails (fd-limit exhaustion between the
+    /// two allocs), the first fd is released to keep the fd table
+    /// consistent — a failed IPC_PIPE leaves zero fds installed.
+    /// The underlying `Pipe` object is also dropped from the IPC
+    /// table's live map since neither end ever got a reference.
+    pub fn create_pipe_fds(&mut self, pid: Pid) -> Result<(u32, u32), KernelError> {
+        let pipe_id = self.ipc.create_pipe();
+        // First fd: read side.
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
+        let read_fd = match table.alloc(FdEntry::new(FdObject::PipeRead(pipe_id.0))) {
+            Ok(fd) => fd,
+            Err(e) => {
+                // Release the pipe's read ref so the pipe can be reaped.
+                let _ = self.ipc.drop_pipe_reader(pipe_id);
+                let _ = self.ipc.drop_pipe_writer(pipe_id);
+                return Err(e.into());
+            }
+        };
+        // Second fd: write side.
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
+        let write_fd = match table.alloc(FdEntry::new(FdObject::PipeWrite(pipe_id.0))) {
+            Ok(fd) => fd,
+            Err(e) => {
+                // Roll back the read fd install, then release both
+                // pipe refs so nothing leaks.
+                let _ = table.close(read_fd);
+                let _ = self.ipc.drop_pipe_reader(pipe_id);
+                let _ = self.ipc.drop_pipe_writer(pipe_id);
+                return Err(e.into());
+            }
+        };
+        Ok((read_fd, write_fd))
+    }
+
     /// Bind `fd` (which must refer to an unbound socket) to `path`.
     /// The path is a kernel-visible string, not a filesystem path —
     /// it lives in a separate bindings table on `IpcTable`, not in

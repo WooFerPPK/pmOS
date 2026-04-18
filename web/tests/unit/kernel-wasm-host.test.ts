@@ -2474,6 +2474,129 @@ describe("dispatch: SOCK_SEND", () => {
     expect(response.status).toBe(-ERRNO.EBADF);
   });
 
+  it("returns 0 on IPC_PIPE and the round-trip via fd_read/fd_write works", async () => {
+    // User-facing pipe-pair creation: IPC_PIPE (ext 0x1007) allocates
+    // a PipeRead fd and a PipeWrite fd, writing both as u32s at
+    // heap[0..8]. FD_WRITE on the write fd then makes bytes
+    // readable via FD_READ on the read fd.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_PIPE,
+      requestId: 1090,
+      arg0: 0,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(response.status).toBe(0);
+    expect(response.extraLen).toBe(8);
+    const readFd = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    ).getUint32(0, true);
+    const writeFd = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    ).getUint32(4, true);
+    expect(readFd).not.toBe(writeFd);
+
+    // Write "pipe" via the write fd.
+    const payload = new TextEncoder().encode("pipe");
+    const writeRes = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 1091,
+        arg0: writeFd,
+        heapPtr: 0,
+        heapLen: payload.length,
+      },
+      payload,
+    );
+    expect(writeRes.response.status).toBe(0);
+    expect(Number(writeRes.response.value)).toBe(4);
+
+    // Read via the read fd and confirm.
+    const readRes = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 1092,
+      arg0: readFd,
+      heapPtr: 0,
+      heapLen: 16,
+    });
+    expect(readRes.response.status).toBe(0);
+    expect(Number(readRes.response.value)).toBe(4);
+    const decoded = new TextDecoder().decode(readRes.heapOut.subarray(0, 4));
+    expect(decoded).toBe("pipe");
+  });
+
+  it("IPC_PIPE with heap_len < 8 returns -EINVAL", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_PIPE,
+      requestId: 1093,
+      arg0: 0,
+      heapPtr: 0,
+      heapLen: 4, // too short for (read_fd, write_fd) u32 pair
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+
+  it("IPC_PIPE then close read fd then fd_write returns -EPIPE", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const create = host.dispatch(pid, {
+      opcode: OP_EXT.IPC_PIPE,
+      requestId: 1094,
+      arg0: 0,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    const readFd = new DataView(
+      create.heapOut.buffer,
+      create.heapOut.byteOffset,
+      create.heapOut.byteLength,
+    ).getUint32(0, true);
+    const writeFd = new DataView(
+      create.heapOut.buffer,
+      create.heapOut.byteOffset,
+      create.heapOut.byteLength,
+    ).getUint32(4, true);
+
+    // Close the read end.
+    host.dispatch(pid, {
+      opcode: OP_WASI.FD_CLOSE,
+      requestId: 1095,
+      arg0: readFd,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+
+    // fd_write now sees EPIPE.
+    const payload = new TextEncoder().encode("x");
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 1096,
+        arg0: writeFd,
+        heapPtr: 0,
+        heapLen: 1,
+      },
+      payload,
+    );
+    expect(response.status).toBe(-ERRNO.EPIPE);
+  });
+
   it("returns -EPIPE after own write side is shut down", async () => {
     // Build a connected socket pair via the IPC ext opcodes:
     // server: IPC_SOCKET → IPC_BIND → IPC_LISTEN; client: IPC_SOCKET

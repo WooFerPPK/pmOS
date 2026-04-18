@@ -334,6 +334,19 @@ var OP_EXT = {
   IPC_LISTEN: 4098,
   IPC_CONNECT: 4099,
   IPC_ACCEPT: 4100,
+  /** Wire-format identity for `ipc_pipe`. Create a pipe pair: the
+   * kernel allocates two fds on the caller — a PipeRead at
+   * heap[0..4] and a PipeWrite at heap[4..8] — and returns success
+   * with extraLen = 8. No inline args; heap_len must be >= 8 or the
+   * dispatcher rejects with EINVAL before allocating any fds. On a
+   * failed second-fd alloc mid-call, the kernel rolls back the
+   * first install so the fd table never holds a half-installed
+   * pair. After a successful call: bytes written to the write fd
+   * are readable via the read fd through the existing fd_read /
+   * fd_write arms (landed in fbddb91); closing either end
+   * propagates to the other (reader closed → subsequent writes
+   * EPIPE; writer closed → subsequent reads see (0, []) EOF). */
+  IPC_PIPE: 4103,
   PROC_SPAWN: 4352,
   PROC_SELF: 4355,
   PROC_PARENT: 4356,

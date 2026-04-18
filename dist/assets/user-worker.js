@@ -298,6 +298,19 @@ var OP_EXT = {
   IPC_LISTEN: 4098,
   IPC_CONNECT: 4099,
   IPC_ACCEPT: 4100,
+  /** Wire-format identity for `ipc_pipe`. Create a pipe pair: the
+   * kernel allocates two fds on the caller — a PipeRead at
+   * heap[0..4] and a PipeWrite at heap[4..8] — and returns success
+   * with extraLen = 8. No inline args; heap_len must be >= 8 or the
+   * dispatcher rejects with EINVAL before allocating any fds. On a
+   * failed second-fd alloc mid-call, the kernel rolls back the
+   * first install so the fd table never holds a half-installed
+   * pair. After a successful call: bytes written to the write fd
+   * are readable via the read fd through the existing fd_read /
+   * fd_write arms (landed in fbddb91); closing either end
+   * propagates to the other (reader closed → subsequent writes
+   * EPIPE; writer closed → subsequent reads see (0, []) EOF). */
+  IPC_PIPE: 4103,
   PROC_SPAWN: 4352,
   PROC_SELF: 4355,
   PROC_PARENT: 4356,
@@ -2056,6 +2069,32 @@ var UserWasmRuntime = class {
           pathCopy
         );
         return response.status;
+      },
+      // `ipc_pipe(fds_ptr: i32) -> i32`
+      //
+      // Create a pipe pair; the kernel writes `[read_fd, write_fd]`
+      // as two u32s into user memory at `fds_ptr`. Returns 0 on
+      // success, negative errno on failure (EMFILE if the fd table
+      // is full). Mirrors POSIX `pipe(2)`. Uses a scratch-heap
+      // round-trip: the kernel writes the two fds into the 8-byte
+      // scratch, and the shim copies them out to `fds_ptr`.
+      ipc_pipe: (fdsPtr) => {
+        if (this.memory === void 0) return -ERRNO.EINVAL;
+        const heap = new Uint8Array(8);
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.IPC_PIPE,
+            requestId: 0,
+            arg0: 0,
+            heapPtr: 0,
+            heapLen: 8
+          },
+          heap
+        );
+        if (response.status !== 0) return response.status;
+        const userFds = new Uint8Array(this.memory.buffer, fdsPtr, 8);
+        userFds.set(heapOut.subarray(0, 8));
+        return 0;
       },
       // `ipc_accept(listener_fd: i32) -> i32`
       //

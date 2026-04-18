@@ -6025,6 +6025,246 @@ fn path_symlink_with_old_len_past_heap_returns_einval() {
     assert_eq!(resp.status, -errno::EINVAL);
 }
 
+// ---- IPC_PIPE extension opcode -------------------------------------
+//
+// 0x1007. Create a pipe pair and install both ends in the caller's
+// fd table. Wire:
+//
+//   args[0..16]            = all zero (no inline args)
+//   heap[0..8]             = output buffer for (read_fd, write_fd)
+//                             — kernel writes two u32s little-endian
+//   heap_len               = 8 (fixed; a shorter heap_len rejects
+//                             with EINVAL)
+// Response:
+//   value                  = 0
+//   extra_len              = 8 (bytes-written convention — mirrors
+//                             fd_read's surface)
+//
+// After a successful call:
+//   * read_fd is an FdObject::PipeRead handle.
+//   * write_fd is an FdObject::PipeWrite handle.
+//   * Bytes written to write_fd are readable via read_fd via the
+//     fd_read / fd_write pipe arms landed in fbddb91.
+//   * Closing read_fd and then writing to write_fd returns EPIPE
+//     (via the ca5bb8a PipeBroken → EPIPE mapping).
+//
+// Mirrors POSIX `pipe(2)` and WASI's `fd_pipe` style: the caller
+// owns both ends, can dup-inherit either into a child via
+// PROC_SPAWN, and closes them independently.
+
+#[test]
+fn ipc_pipe_allocates_two_fresh_fds_and_installs_read_and_write_pair() {
+    use kernel::fd::FdObject;
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "piper", 0);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_ext::IPC_PIPE,
+        flags: 0,
+        request_id: 1100,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 8);
+
+    let read_fd = u32::from_le_bytes(heap[0..4].try_into().unwrap());
+    let write_fd = u32::from_le_bytes(heap[4..8].try_into().unwrap());
+    assert_ne!(read_fd, write_fd, "two distinct fds");
+
+    // Verify the installed FdObject variants.
+    let table = k.fds(pid).unwrap();
+    let read_entry = table.get(read_fd).expect("read_fd installed");
+    let write_entry = table.get(write_fd).expect("write_fd installed");
+    assert!(matches!(read_entry.object, FdObject::PipeRead(_)));
+    assert!(matches!(write_entry.object, FdObject::PipeWrite(_)));
+
+    // Both fds reference the same underlying pipe id.
+    let read_pipe_id = match read_entry.object {
+        FdObject::PipeRead(id) => id,
+        _ => unreachable!(),
+    };
+    let write_pipe_id = match write_entry.object {
+        FdObject::PipeWrite(id) => id,
+        _ => unreachable!(),
+    };
+    assert_eq!(read_pipe_id, write_pipe_id, "both ends share the same pipe");
+}
+
+#[test]
+fn ipc_pipe_round_trip_write_then_read_via_fd_syscalls() {
+    // End-to-end: IPC_PIPE to create, FD_WRITE via the write fd,
+    // FD_READ via the read fd. Confirms the fbddb91 pipe fd arms
+    // and this slice compose cleanly.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "piper", 0);
+    let mut heap = vec![0u8; 64];
+
+    // Create the pipe pair.
+    let create = Request {
+        opcode: op_ext::IPC_PIPE,
+        flags: 0,
+        request_id: 1101,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &create, &mut heap);
+    assert_eq!(resp.status, 0);
+    let read_fd = u32::from_le_bytes(heap[0..4].try_into().unwrap());
+    let write_fd = u32::from_le_bytes(heap[4..8].try_into().unwrap());
+
+    // Write "ping" through write_fd.
+    heap[..4].copy_from_slice(b"ping");
+    let write = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1102,
+        args: u32_args(write_fd),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let w = dispatch(&mut k, pid, &write, &mut heap);
+    assert_eq!(w.status, 0);
+    assert_eq!(w.value, 4);
+
+    // Clear heap, then read through read_fd.
+    for b in heap[..16].iter_mut() {
+        *b = 0;
+    }
+    let read = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1103,
+        args: u32_args(read_fd),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let r = dispatch(&mut k, pid, &read, &mut heap);
+    assert_eq!(r.status, 0);
+    assert_eq!(r.value, 4);
+    assert_eq!(&heap[..4], b"ping");
+}
+
+#[test]
+fn ipc_pipe_read_fd_close_then_write_returns_epipe() {
+    // Drop the read end via fd_close; subsequent write surfaces
+    // EPIPE via the PipeBroken → EPIPE mapping.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "piper", 0);
+    let mut heap = vec![0u8; 64];
+
+    let create = Request {
+        opcode: op_ext::IPC_PIPE,
+        flags: 0,
+        request_id: 1104,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    assert_eq!(dispatch(&mut k, pid, &create, &mut heap).status, 0);
+    let read_fd = u32::from_le_bytes(heap[0..4].try_into().unwrap());
+    let write_fd = u32::from_le_bytes(heap[4..8].try_into().unwrap());
+
+    // Close the read end.
+    let close = Request {
+        opcode: op_wasi::FD_CLOSE,
+        flags: 0,
+        request_id: 1105,
+        args: u32_args(read_fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, pid, &close, &mut heap).status, 0);
+
+    // Write now yields EPIPE.
+    heap[..2].copy_from_slice(b"no");
+    let write = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 1106,
+        args: u32_args(write_fd),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let w = dispatch(&mut k, pid, &write, &mut heap);
+    assert_eq!(w.status, -errno::EPIPE);
+}
+
+#[test]
+fn ipc_pipe_write_fd_close_then_read_returns_zero_eof() {
+    // Drop the write end; the read end returns (0, []) EOF once
+    // the buffer drains.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "piper", 0);
+    let mut heap = vec![0u8; 64];
+
+    let create = Request {
+        opcode: op_ext::IPC_PIPE,
+        flags: 0,
+        request_id: 1107,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    assert_eq!(dispatch(&mut k, pid, &create, &mut heap).status, 0);
+    let read_fd = u32::from_le_bytes(heap[0..4].try_into().unwrap());
+    let write_fd = u32::from_le_bytes(heap[4..8].try_into().unwrap());
+
+    // Close the write end.
+    let close = Request {
+        opcode: op_wasi::FD_CLOSE,
+        flags: 0,
+        request_id: 1108,
+        args: u32_args(write_fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, pid, &close, &mut heap).status, 0);
+
+    // Read on an empty pipe with no writer → EOF (0, []).
+    let read = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1109,
+        args: u32_args(read_fd),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let r = dispatch(&mut k, pid, &read, &mut heap);
+    assert_eq!(r.status, 0);
+    assert_eq!(r.value, 0);
+}
+
+#[test]
+fn ipc_pipe_with_short_heap_returns_einval() {
+    // heap_len < 8 can't hold the (read_fd, write_fd) pair; reject
+    // with EINVAL before any fd allocation happens so a caller with
+    // a malformed shim doesn't leak half-installed pipes.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "piper", 0);
+    let mut heap = vec![0u8; 4]; // too short
+
+    let req = Request {
+        opcode: op_ext::IPC_PIPE,
+        flags: 0,
+        request_id: 1110,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+
+    // No fds were installed — fd table open count is still zero.
+    let table = k.fds(pid).unwrap();
+    assert_eq!(table.open_count(), 0);
+}
+
 // ---- fd_read / fd_write on pipe fds --------------------------------
 //
 // Pre-slice, Kernel::fd_read on a PipeRead fd and Kernel::fd_write on
