@@ -220,6 +220,38 @@ impl FdTable {
         slot.take().ok_or(FdError::BadFd)
     }
 
+    /// Atomically renumber `from` to `to` (WASI's dup2-spelling).
+    ///
+    /// * `from == to` and `from` is open: no-op, returns `Ok(None)`.
+    ///   The fd stays open with its entry unchanged.
+    /// * `from == to` and `from` is NOT open: returns
+    ///   `Err(FdError::BadFd)`. (POSIX's dup2(bad, bad) = EBADF.)
+    /// * `from != to` and `from` is open: `from` is closed, `to`
+    ///   is replaced with `from`'s entry. Returns the entry that
+    ///   was at `to` (if any) so the caller can release any object-
+    ///   side resources it held (pipe / socket refs, etc.).
+    /// * `from != to` and `from` is NOT open: returns
+    ///   `Err(FdError::BadFd)`. `to` is left unchanged.
+    ///
+    /// The move preserves `offset` and `flags` on the `from` entry
+    /// verbatim — no transformations, no CLOEXEC clearing. Userland
+    /// asked for this specific number; it gets exactly what `from`
+    /// had.
+    pub fn renumber(
+        &mut self,
+        from: u32,
+        to: u32,
+    ) -> Result<Option<FdEntry>, FdError> {
+        if from == to {
+            // Validate from is open; otherwise EBADF.
+            self.get(from).ok_or(FdError::BadFd)?;
+            return Ok(None);
+        }
+        let from_entry = self.close(from)?;
+        let prior = self.install_at(to, from_entry)?;
+        Ok(prior)
+    }
+
     /// Duplicate an existing fd into a new lowest-free slot.
     /// Clears `CLOEXEC` on the new entry (POSIX `dup` behaviour).
     pub fn dup(&mut self, fd: u32) -> Result<u32, FdError> {

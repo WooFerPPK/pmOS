@@ -202,6 +202,15 @@ export const OP_WASI = {
    * carry no time metadata). Filesystem rejections (EROFS from
    * devfs / procfs) pass through unchanged. */
   FD_FILESTAT_SET_TIMES: 0x0029,
+  /** Wire-format identity for `fd_renumber`. WASI's dup2-spelling:
+   * atomically move the FdEntry at `from` to `to`, closing whatever
+   * was at `to` first. Args pack (from, to) as two u32s at offsets
+   * 0 / 4; no heap. `from == to` on an open fd is a no-op success;
+   * `from == to` on a closed fd is EBADF (mirrors POSIX's
+   * dup2(bad, bad)); `from` not open is EBADF with `to` untouched;
+   * prior `to`'s object is released via the kernel's
+   * release_object path so pipe / socket refs are not leaked. */
+  FD_RENUMBER: 0x0030,
   PATH_OPEN: 0x0044,
   PROC_EXIT: 0x0060,
   CLOCK_RES_GET: 0x0010,

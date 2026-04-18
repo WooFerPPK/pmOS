@@ -897,6 +897,36 @@ export class UserWasmRuntime {
         return response.status !== 0 ? -response.status : 0;
       },
 
+      // WASI `fd_renumber`.
+      //
+      // Signature (lowered):
+      //   (from: i32, to: i32) -> errno: i32
+      //
+      // WASI's dup2-spelling: atomically move the FdEntry at `from`
+      // to `to`, closing whatever was at `to` first. If `from == to`
+      // on an open fd, it's a no-op success; if on a closed fd,
+      // EBADF. If `from` is not open, EBADF with `to` untouched.
+      // The kernel's `fd_renumber` releases any prior `to` object
+      // (pipe / socket ref) via `release_object` — same path
+      // `fd_close` uses.
+      //
+      // Dispatches FD_RENUMBER packing `(from, to)` as two u32s in
+      // the inline args window. No heap round-trip.
+      fd_renumber: (from: number, to: number): number => {
+        const args = new Uint8Array(16);
+        const argsView = new DataView(args.buffer);
+        argsView.setUint32(0, from, true);
+        argsView.setUint32(4, to, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_RENUMBER,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return response.status !== 0 ? -response.status : 0;
+      },
+
       // WASI `fd_filestat_set_times`.
       //
       // Signature (lowered):

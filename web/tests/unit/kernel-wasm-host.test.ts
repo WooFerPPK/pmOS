@@ -1000,6 +1000,112 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
   });
 });
 
+// ---- dispatch: FD_RENUMBER -----------------------------------------
+//
+// WASI's dup2-spelling. Wire: (from, to) as two u32s at args[0..4]
+// + args[4..8]; no heap. These TS tests pin the dispatcher's per-
+// branch behaviour end-to-end through kernel.wasm: the happy-path
+// move (source closed, destination holds the entry), the
+// noop-on-open contract, and both EBADF error branches.
+
+function encodeFdRenumberArgs(from: number, to: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, from, true);
+  v.setUint32(4, to, true);
+  return args;
+}
+
+describe("dispatch: FD_RENUMBER", () => {
+  it("moves an open fd to a fresh slot, closing the source", async () => {
+    // Stage fd 3 as /dev/console via installConsoleFd, then
+    // renumber 3 → 7. fd 3 becomes closed (next op on 3 is EBADF),
+    // fd 7 holds what 3 had (a FD_WRITE on fd 7 reaches
+    // /dev/console via onConsoleWrite).
+    const { host, consoleWrites } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 3);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_RENUMBER,
+      requestId: 870,
+      args: encodeFdRenumberArgs(3, 7),
+    });
+    expect(response.status).toBe(0);
+
+    // A write to fd 7 now reaches the console sink.
+    const line = new TextEncoder().encode("hi\n");
+    const writeRes = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 871,
+        arg0: 7,
+        heapPtr: 0,
+        heapLen: line.length,
+      },
+      line,
+    );
+    expect(writeRes.response.status).toBe(0);
+    expect(consoleWrites.length).toBe(1);
+
+    // A write to fd 3 fails with EBADF — it was closed by the move.
+    const brokenRes = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 872,
+        arg0: 3,
+        heapPtr: 0,
+        heapLen: line.length,
+      },
+      line,
+    );
+    expect(brokenRes.response.status).toBe(-ERRNO.EBADF);
+  });
+
+  it("returns 0 (no-op) when from == to on an open fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 5);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_RENUMBER,
+      requestId: 873,
+      args: encodeFdRenumberArgs(5, 5),
+    });
+    expect(response.status).toBe(0);
+  });
+
+  it("returns -EBADF when from is unopened", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_RENUMBER,
+      requestId: 874,
+      args: encodeFdRenumberArgs(99, 7),
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+
+  it("returns -EBADF when from == to on an unopened fd (POSIX dup2(bad, bad))", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_RENUMBER,
+      requestId: 875,
+      args: encodeFdRenumberArgs(42, 42),
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
 // ---- dispatch: FD_FILESTAT_SET_TIMES -------------------------------
 //
 // Fd-based sibling of PATH_FILESTAT_SET_TIMES. Wire: fd at args[0..4]

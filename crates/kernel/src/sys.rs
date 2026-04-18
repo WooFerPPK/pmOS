@@ -426,6 +426,26 @@ impl Kernel {
         }
     }
 
+    /// `fd_renumber(pid, from, to)`. WASI's dup2-spelling. Moves
+    /// the FdEntry at `from` to `to`, atomically closing any prior
+    /// entry at `to`. If `from == to`, validates that `from` is
+    /// open and returns success as a no-op. Releases object-side
+    /// resources for the prior `to` entry (pipe / socket ref
+    /// counts) before returning, same way `fd_close` does.
+    pub fn fd_renumber(
+        &mut self,
+        pid: Pid,
+        from: u32,
+        to: u32,
+    ) -> Result<(), KernelError> {
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
+        let prior = table.renumber(from, to)?;
+        if let Some(entry) = prior {
+            self.release_object(entry.object);
+        }
+        Ok(())
+    }
+
     /// `fd_close(pid, fd)`. Releases any object-side resources
     /// (pipe reference, socket, display connection) as part of
     /// the close, not just the fd-table slot.

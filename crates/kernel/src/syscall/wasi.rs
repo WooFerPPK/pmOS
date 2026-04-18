@@ -68,6 +68,7 @@ pub fn dispatch_wasi(
         op::PATH_FILESTAT_GET => handle_path_filestat_get(kernel, pid, req, heap),
         op::PATH_FILESTAT_SET_TIMES => handle_path_filestat_set_times(kernel, pid, req, heap),
         op::FD_FILESTAT_SET_TIMES => handle_fd_filestat_set_times(kernel, pid, req, heap),
+        op::FD_RENUMBER => handle_fd_renumber(kernel, pid, req),
         op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
         op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
         _ => Response::err(req.request_id, ENOSYS),
@@ -354,6 +355,47 @@ fn handle_fd_datasync(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response 
     match entry.object {
         FdObject::Vnode { .. } => Response::ok(req.request_id, 0),
         _ => Response::err(req.request_id, EINVAL),
+    }
+}
+
+// ---- fd_renumber -----------------------------------------------------
+//
+// Layout:
+//   args[0..4] = from (u32)
+//   args[4..8] = to   (u32)
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// WASI's dup2-spelling: atomically move `from` to `to`, closing
+// whatever was at `to` first. Semantics (matching wasmtime's
+// reading of WASI preview 1):
+//
+//   * from == to on an open fd: no-op success. The fd stays open,
+//     entry unchanged. Mirrors POSIX's dup2(fd, fd) = fd.
+//   * from == to on an unopened fd: EBADF. Mirrors POSIX's
+//     dup2(bad, bad) = EBADF.
+//   * from != to and from is open: `from` is closed, `to` is
+//     replaced with `from`'s entry (offset + flags preserved
+//     verbatim). If `to` was open pre-call, its entry's object
+//     is released via `release_object` — important for pipe /
+//     socket ref counts.
+//   * from != to and from is not open: EBADF, `to` untouched.
+//
+// The move is a single-process operation — no fs, no ipc, no
+// platform calls. The only reason the kernel wrapper exists (rather
+// than calling FdTable::renumber directly from the handler) is the
+// release_object path for the prior `to` entry.
+
+fn handle_fd_renumber(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+) -> Response {
+    let from = args_u32(req, 0);
+    let to = args_u32(req, 4);
+    match kernel.fd_renumber(pid, from, to) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 

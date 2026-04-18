@@ -2888,6 +2888,194 @@ fn fd_filestat_set_times_with_short_heap_returns_einval() {
     assert_eq!(resp.status, -errno::EINVAL);
 }
 
+// ---- fd_renumber -----------------------------------------------------
+//
+// WASI's dup2-spelling: atomically move an fd from `from` to `to`,
+// closing whatever was at `to` if it was already open. Wire layout:
+//
+//   args[0..4] = from (u32)
+//   args[4..8] = to   (u32)
+//   heap       = unused
+// Response:
+//   value = 0 on success; status = -errno on error.
+//
+// Semantics (follows wasmtime's reading of WASI preview 1 fd_renumber):
+//
+//   * from == to: no-op success, but still validates that `from`
+//     refers to an open fd — calling fd_renumber(99, 99) when 99 is
+//     not open returns EBADF, not success. This mirrors POSIX's
+//     dup2(invalid, invalid) = EBADF.
+//   * from is not open: EBADF; `to` is left unchanged.
+//   * from is open, to is closed: entry is moved — `from` becomes
+//     closed, `to` holds what `from` held.
+//   * from is open, to is also open: `to`'s entry is closed first
+//     (releasing any pipe/socket refs via the kernel's
+//     release_object path), then `from` is moved into `to`.
+//
+// The FdEntry is moved verbatim, preserving offset + flags. No
+// object-side resources are duplicated (the move doesn't dup a
+// pipe/socket reference — the underlying handle is the same).
+
+fn fd_renumber_args(from: u32, to: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&from.to_le_bytes());
+    args[4..8].copy_from_slice(&to.to_le_bytes());
+    args
+}
+
+#[test]
+fn fd_renumber_moves_entry_and_closes_source() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renumberer", 0);
+    k.install_fd(pid, 3, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_RENUMBER,
+        flags: 0,
+        request_id: 870,
+        args: fd_renumber_args(3, 7),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    // fd 3 is now closed; fd 7 holds the CharDevice entry.
+    assert!(k.fds(pid).unwrap().get(3).is_none());
+    assert!(matches!(
+        k.fds(pid).unwrap().get(7).map(|e| e.object),
+        Some(FdObject::CharDevice(n)) if n == DEV_CONSOLE
+    ));
+}
+
+#[test]
+fn fd_renumber_when_from_equals_to_is_noop_success_on_open_fd() {
+    // POSIX dup2(fd, fd) = fd; WASI fd_renumber honours the same
+    // contract. The fd stays open and the entry is unchanged.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renumself", 0);
+    k.install_fd(pid, 5, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let before = *k.fds(pid).unwrap().get(5).unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_RENUMBER,
+        flags: 0,
+        request_id: 871,
+        args: fd_renumber_args(5, 5),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let after = *k.fds(pid).unwrap().get(5).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn fd_renumber_closes_prior_to_then_installs() {
+    // Both `from` and `to` are open pre-call. Expect `to`'s prior
+    // entry to be released (via release_object — matters for pipe
+    // / socket refs; here the prior is a CharDevice which is a
+    // no-op release) and `from`'s entry to land at `to`.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renumover", 0);
+    k.install_fd(pid, 3, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(pid, 7, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_RENUMBER,
+        flags: 0,
+        request_id: 872,
+        args: fd_renumber_args(3, 7),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert!(k.fds(pid).unwrap().get(3).is_none(), "from closed");
+    assert!(matches!(
+        k.fds(pid).unwrap().get(7).map(|e| e.object),
+        Some(FdObject::CharDevice(n)) if n == DEV_CONSOLE,
+    ));
+}
+
+#[test]
+fn fd_renumber_from_unopened_fd_returns_ebadf() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renumghost", 0);
+    k.install_fd(pid, 7, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_RENUMBER,
+        flags: 0,
+        request_id: 873,
+        args: fd_renumber_args(99, 7),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+    // `to` is untouched.
+    assert!(k.fds(pid).unwrap().get(7).is_some());
+}
+
+#[test]
+fn fd_renumber_from_equals_to_on_unopened_fd_returns_ebadf() {
+    // POSIX dup2(bad, bad) = EBADF. WASI's noop-success-on-equal
+    // contract only applies when the fd is actually open.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "renumghost2", 0);
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_RENUMBER,
+        flags: 0,
+        request_id: 874,
+        args: fd_renumber_args(42, 42),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn fd_renumber_preserves_offset_and_flags() {
+    // A Vnode fd with a non-zero offset + NONBLOCK flag round-trips
+    // through renumber without losing either.
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "renumofs", "/o.txt", b"0123456789");
+    {
+        let table = k.fds_mut(pid).unwrap();
+        let entry = table.get_mut(fd).unwrap();
+        entry.offset = 7;
+        entry.flags.insert(FdFlags::NONBLOCK);
+    }
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_RENUMBER,
+        flags: 0,
+        request_id: 875,
+        args: fd_renumber_args(fd, 42),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let e = k.fds(pid).unwrap().get(42).expect("landed at 42");
+    assert_eq!(e.offset, 7);
+    assert!(e.flags.contains(FdFlags::NONBLOCK));
+}
+
 // ---- fd_seek ----------------------------------------------------------
 //
 // WASI's seek combines three distinct file-position operations into a
