@@ -1532,6 +1532,241 @@ fn ipc_accept_flags_nonblock_preserves_eagain() {
     assert!(k.pending_wakes_is_empty());
 }
 
+// ---- ipc_accept SIGTERM-interrupts-parked-accept (slice 2b) ------
+
+#[test]
+fn sigterm_interrupts_parked_accept_with_eintr() {
+    // Pid A (display-server stand-in) parks on `ipc_accept`. Pid B
+    // (init stand-in, set as A's ppid) calls `proc_kill(A,
+    // Signal::Term)`. A must transition BlockedOnIpc -> Ready; the
+    // listener's `parked_acceptor` slot must be cleared; a wake
+    // with `-EINTR` must land on `pending_wakes`; A's SignalInbox
+    // must hold SIGTERM (orthogonal to the park interrupt — the
+    // signal-inbox delivery and the EINTR wake BOTH fire).
+    let mut k = make_kernel();
+    // Init (parent) — ordinary caps plus ability to signal its
+    // child. `proc_kill` on a child requires only parent-ness, no
+    // ProcKillAny, per `sys.rs:1296-1307`.
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    // Display-server with init as parent.
+    let ds_caps = CapSet::from_caps(&[
+        Cap::DisplayServer,
+        Cap::DisplayClient,
+        Cap::DevBlock,
+    ]);
+    let ds = k
+        .register_process(RegisterArgs {
+            name: "display-server",
+            ppid: init,
+            caps: ds_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(ds).unwrap();
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    // Park ds on the listener.
+    let req_id = 0xe17fu32;
+    k.park_on_accept(ds, listener_fd, req_id).unwrap();
+    assert_eq!(
+        k.procs.get(ds).unwrap().state,
+        kernel::proc::ProcState::BlockedOnIpc
+    );
+
+    // init delivers SIGTERM + triggers the park interrupt. The
+    // `Kernel::proc_kill` path queues Term on ds's SignalInbox (no
+    // zombie transition — Term is catchable). The subsequent
+    // `Kernel::interrupt_parked_accept(ds)` call clears the
+    // listener's parked slot, pushes the EINTR wake onto
+    // pending_wakes, transitions ds Ready + clears block_reason.
+    k.proc_kill(init, ds, kernel::proc::Signal::Term).unwrap();
+    let interrupted = k.interrupt_parked_accept(ds);
+    assert!(interrupted, "SIGTERM on parked ds must interrupt the park");
+
+    // ds is Ready again, block_reason cleared.
+    let proc = k.procs.get(ds).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Ready);
+    assert!(proc.block_reason.is_none());
+
+    // Listener's parked_acceptor is cleared.
+    let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
+    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
+    assert_eq!(listener.parked_acceptor, None);
+
+    // Exactly one pending wake: (ds, Response::err(req_id,
+    // -EINTR)). Negative sign convention matches every other
+    // `Response::err` producer in the codebase (e.g. EBADF path in
+    // `park_on_accept_clears_on_listener_close` in syscall.rs
+    // asserts `resp.status, -abi::errno::EBADF`).
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp) = &wakes[0];
+    assert_eq!(*wake_pid, ds);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, -abi::errno::EINTR);
+
+    // ds's SignalInbox holds Term (signal-inbox delivery runs
+    // orthogonally to the park interrupt).
+    let drained = k.drain_signals(ds).unwrap();
+    assert_eq!(drained, alloc::vec![kernel::proc::Signal::Term]);
+}
+
+#[test]
+fn signum_zero_probe_does_not_wake_parked_accept() {
+    // POSIX `kill(pid, 0)` on a BlockedOnIpc pid is an
+    // existence/permission probe with NO signal delivered. The
+    // parker stays parked, the listener's parked_acceptor slot
+    // stays intact, no wake is queued, no signal lands in the
+    // inbox. Pins the no-op-on-park invariant documented at design
+    // §3.1.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+
+    let ds_caps = CapSet::from_caps(&[
+        Cap::DisplayServer,
+        Cap::DisplayClient,
+        Cap::DevBlock,
+    ]);
+    let ds = k
+        .register_process(RegisterArgs {
+            name: "display-server",
+            ppid: init,
+            caps: ds_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(ds).unwrap();
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    let req_id = 0x51abu32;
+    k.park_on_accept(ds, listener_fd, req_id).unwrap();
+
+    // signum=0 probe. The dispatcher's PROC_KILL path routes this
+    // to `Kernel::proc_check_signal` which returns `Ok(())` on a
+    // valid sender/target pair. No signal is delivered; the park
+    // interrupt is NOT invoked (the `handle_proc_kill` dispatcher
+    // returns before reaching the `Signal::Term` arm for signum=0).
+    k.proc_check_signal(init, ds).unwrap();
+
+    // ds is still parked.
+    assert_eq!(
+        k.procs.get(ds).unwrap().state,
+        kernel::proc::ProcState::BlockedOnIpc
+    );
+
+    // Listener still records the parker.
+    let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
+    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
+    assert_eq!(listener.parked_acceptor, Some((ds, req_id)));
+
+    // No wakes queued.
+    assert!(k.pending_wakes_is_empty());
+
+    // SignalInbox empty — signum=0 never posts a signal.
+    assert_eq!(k.pending_signals(ds).unwrap(), 0);
+}
+
+#[test]
+fn sigkill_on_parked_accept_exits_without_eintr_wake() {
+    // SIGKILL is non-catchable: `Kernel::proc_kill`'s SIGKILL arm
+    // at `sys.rs:1316-1329` transitions the target to Zombie
+    // synchronously with `ExitStatus::Signaled(9)`, which routes
+    // through `proc_exit` -> `cleanup_proc` ->
+    // `ipc.clear_parked_acceptor_for_pid` (sys.rs:1101). The
+    // listener's parked slot gets cleared by that sweep — NOT by
+    // `interrupt_parked_accept`. No EINTR wake is queued (the pid
+    // is dead, not interrupted). This test pins the
+    // "non-catchable path is orthogonal" invariant: even without
+    // slice 2b touching this code path, the parked_acceptor slot
+    // gets cleared for a SIGKILL'd parker, because proc_exit's
+    // existing cleanup_proc sweep already handles it. This test
+    // therefore pins an existing invariant rather than being a
+    // red->green test.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+
+    let ds_caps = CapSet::from_caps(&[
+        Cap::DisplayServer,
+        Cap::DisplayClient,
+        Cap::DevBlock,
+    ]);
+    let ds = k
+        .register_process(RegisterArgs {
+            name: "display-server",
+            ppid: init,
+            caps: ds_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(ds).unwrap();
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    let req_id = 0x9c1du32;
+    k.park_on_accept(ds, listener_fd, req_id).unwrap();
+    let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
+
+    // init SIGKILLs ds. Synchronously transitions ds to Zombie
+    // with ExitStatus::Signaled(9).
+    k.proc_kill(init, ds, kernel::proc::Signal::Kill).unwrap();
+
+    // ds is zombie with Signaled(9).
+    let proc = k.procs.get(ds).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Zombie);
+    assert!(matches!(
+        proc.exit_status,
+        Some(kernel::proc::ExitStatus::Signaled(9))
+    ));
+
+    // Listener's parked_acceptor is cleared (by cleanup_proc's
+    // IpcTable::clear_parked_acceptor_for_pid sweep during the
+    // SIGKILL path's proc_exit call).
+    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
+    assert_eq!(listener.parked_acceptor, None);
+
+    // No EINTR wake queued — the pid is dead, not interrupted.
+    // (The SIGKILL path at sys.rs:1316-1329 does not route through
+    // interrupt_parked_accept; only the catchable-signal arm in
+    // `handle_proc_kill` does. This is the load-bearing assertion.)
+    assert!(k.pending_wakes_is_empty());
+}
+
 // ---- proc_exit cleanup ---------------------------------------------
 //
 // `proc_exit` is the moment a process's kernel-side resources

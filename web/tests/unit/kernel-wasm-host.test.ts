@@ -3533,6 +3533,73 @@ describe("dispatch: IPC_ACCEPT blocking", () => {
     // A second take returns null — the queue is drained.
     expect(host.takeNextWakeForPid(dsPid)).toBeNull();
   });
+
+  it("SIGTERM wakes parked acceptor with EINTR; take-wake delivers error response", async () => {
+    const { host } = await freshHost();
+
+    // Display-server pid parks on the listener. init (CAPSET_ALL)
+    // holds Cap::ProcKillAny so the proc_kill cap check at
+    // `sys.rs:1296-1307` passes via the ProcKillAny branch (no
+    // ppid relationship needed for the cap check — parent-ness
+    // only matters when the sender lacks ProcKillAny).
+    const initPid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(initPid, 0);
+    host.installConsoleFd(initPid, 1);
+    host.installConsoleFd(initPid, 2);
+    host.markRunning(initPid);
+
+    const dsPid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(dsPid, 0);
+    host.installConsoleFd(dsPid, 1);
+    host.installConsoleFd(dsPid, 2);
+    host.markRunning(dsPid);
+
+    // Bind the listener at /run/display.
+    const bindResult = host.dispatch(dsPid, {
+      opcode: OP_EXT.DISPLAY_BIND,
+      requestId: 1,
+    });
+    expect(bindResult.response).toBeDefined();
+    expect(bindResult.response!.status).toBe(0);
+    const listenerFd = Number(bindResult.response!.value);
+
+    // Park the display-server on the listener with flags=0.
+    const acceptArgs = new Uint8Array(16);
+    new DataView(acceptArgs.buffer).setUint32(0, listenerFd, true);
+    const acceptResult = host.dispatch(dsPid, {
+      opcode: OP_EXT.IPC_ACCEPT,
+      requestId: 77,
+      args: acceptArgs,
+    });
+    expect(acceptResult.parked).toBe(true);
+    expect(acceptResult.response).toBeUndefined();
+
+    // init sends SIGTERM (signum=15) to display-server.
+    // PROC_KILL args: args[0..4] = target_pid (i32),
+    // args[4..6] = signum (u16), rest zero-padded.
+    const killArgs = new Uint8Array(16);
+    const killView = new DataView(killArgs.buffer);
+    killView.setInt32(0, dsPid, true);
+    killView.setUint16(4, 15, true);
+    const killResult = host.dispatch(initPid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 5,
+      args: killArgs,
+    });
+    expect(killResult.response).toBeDefined();
+    expect(killResult.response!.status).toBe(0);
+
+    // Take the wake for ds. The response must carry:
+    //   request_id === 77 (the parked accept's req_id)
+    //   status === -EINTR (27)
+    const wake = host.takeNextWakeForPid(dsPid);
+    expect(wake).not.toBeNull();
+    expect(wake!.requestId).toBe(77);
+    expect(wake!.status).toBe(-27);
+
+    // A second take returns null — the queue is drained.
+    expect(host.takeNextWakeForPid(dsPid)).toBeNull();
+  });
 });
 
 // ---- dispatch: SOCK_SHUTDOWN ---------------------------------------

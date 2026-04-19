@@ -509,6 +509,30 @@ impl IpcTable {
         }
     }
 
+    /// Walk every live socket, find one whose `parked_acceptor` pid
+    /// matches, clear the slot, and return the parker's `req_id`.
+    /// Returns `None` if no parked acceptor on any listener matches
+    /// `pid`. Mirrors [`clear_parked_acceptor_for_pid`] but
+    /// surfaces the `req_id` so the caller can build the EINTR
+    /// wake Response.
+    ///
+    /// v1's one-parker-per-listener invariant means there is at
+    /// most one match across the socket table — the walk stops on
+    /// the first hit. Called from `Kernel::interrupt_parked_accept`
+    /// during `proc_kill(SIGTERM)` handling against a BlockedOnIpc
+    /// target.
+    pub fn take_parked_acceptor_for_pid(&mut self, pid: Pid) -> Option<u32> {
+        for sock in self.sockets.values_mut() {
+            if let Some((parker_pid, req_id)) = sock.parked_acceptor {
+                if parker_pid == pid {
+                    sock.parked_acceptor = None;
+                    return Some(req_id);
+                }
+            }
+        }
+        None
+    }
+
     /// Iterate all live socket ids. Used by test helpers that need
     /// to reconcile the IpcTable against an externally-observed
     /// fd-table state (notably `Kernel::drain_closed_object_side_

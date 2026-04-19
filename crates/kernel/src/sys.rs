@@ -834,6 +834,38 @@ impl Kernel {
         Ok(())
     }
 
+    /// Interrupt any parked `ipc_accept` on `pid` with `-EINTR`.
+    /// Clears the listener's `parked_acceptor` slot, queues a wake
+    /// with `Response::err(req_id, -EINTR)` onto `pending_wakes`,
+    /// transitions `pid` Ready, clears `block_reason`. No-op if
+    /// `pid` is not parked on any listener.
+    ///
+    /// Called from `handle_proc_kill` when a catchable signal
+    /// (SIGTERM in v1) targets a BlockedOnIpc pid. The wake runs
+    /// AFTER the signal-inbox delivery so userland that drains fd
+    /// 3 on observing the EINTR wake finds the queued signal
+    /// there — both halves of the contract (inbox + EINTR) fire
+    /// for every SIGTERM against a parked pid.
+    ///
+    /// Returns `true` iff a park was interrupted. Production
+    /// callers discard the bool; tests use it to assert the
+    /// positive-path invariant.
+    pub fn interrupt_parked_accept(&mut self, pid: Pid) -> bool {
+        let Some(req_id) = self.ipc.take_parked_acceptor_for_pid(pid) else {
+            return false;
+        };
+        let wake_resp = abi::ring::Response::err(req_id, abi::errno::EINTR);
+        self.pending_wakes.push((pid, wake_resp));
+        // Best-effort state transition. If the pid isn't in
+        // BlockedOnIpc for some reason (e.g. a race with another
+        // wake path), ignore the transition error — the wake is
+        // still queued and the user Worker will observe it on the
+        // next dispatch pass.
+        let _ = self.procs.transition(pid, ProcState::Ready);
+        self.procs.clear_block_reason(pid);
+        true
+    }
+
     // --- Generic IPC sockets -------------------------------------
     //
     // Thin wrappers around the `IpcTable` socket primitives that
@@ -1318,6 +1350,14 @@ impl Kernel {
                 // pick_next can resurrect the pid after it's
                 // been marked zombie.
                 self.sched.remove(target_pid);
+                // If the SIGKILL'd pid is parked on any listener,
+                // clear the slot so the listener doesn't hold a
+                // stale reference after the pid transitions Zombie.
+                // Mirror of `proc_exit`'s equivalent sweep — the
+                // SIGKILL path bypasses `proc_exit` entirely and
+                // so needs its own call. No EINTR wake is queued
+                // here (the pid is dead, not interrupted).
+                self.ipc.clear_parked_acceptor_for_pid(target_pid);
                 let target_ppid = target.ppid;
                 self.procs
                     .exit(target_pid, ExitStatus::Signaled(signal.number()))

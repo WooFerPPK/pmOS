@@ -619,6 +619,8 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let signum = u16::from_le_bytes([req.args[4], req.args[5]]);
     if signum == 0 {
         // POSIX kill(pid, 0): existence + permission probe only.
+        // Never touches the park interrupt — a probe against a
+        // BlockedOnIpc pid leaves the park intact.
         return match kernel.proc_check_signal(pid, target_pid) {
             Ok(()) => Response::ok(req.request_id, 0),
             Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
@@ -633,7 +635,19 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
         _ => return Response::err(req.request_id, EINVAL),
     };
     match kernel.proc_kill(pid, target_pid, signal) {
-        Ok(()) => Response::ok(req.request_id, 0),
+        Ok(()) => {
+            // Slice 2b: SIGTERM additionally interrupts any parked
+            // ipc_accept on the target with -EINTR. Runs AFTER the
+            // signal-inbox delivery inside `Kernel::proc_kill` so
+            // userland draining fd 3 on the EINTR wake finds Term
+            // queued. Other catchable signals (Interrupt, Pipe,
+            // Child) don't interrupt parks in v1 — deferred until
+            // a caller needs them (design §2 non-goal).
+            if signal == Signal::Term {
+                let _ = kernel.interrupt_parked_accept(target_pid);
+            }
+            Response::ok(req.request_id, 0)
+        }
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }

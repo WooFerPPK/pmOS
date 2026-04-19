@@ -16,10 +16,21 @@
 //!                                               reused for every served
 //!                                               client.
 //!   3. Outer loop (at most `MAX_CLIENTS = 4` iterations):
-//!      a. `ipc_accept(listener)` (EAGAIN poll).
-//!         * poll exhausts with `served_any == false` → exit 17.
-//!         * poll exhausts with `served_any == true`  → break (clean drain).
-//!      b. `fd_read(server, buf)` (EAGAIN poll) — read pixel payload.
+//!      a. `ipc_accept(listener)` (blocking — slice 2a's kernel
+//!          park/wake; flags=0 is the blocking default).
+//!         * returns `server fd >= 0`  → proceed to fd_read.
+//!         * any negative rc → fatal, exit 12. Includes
+//!           `-EAGAIN` (not expected: blocking calls never
+//!           return EAGAIN), `-EINTR` (slice 2b does not yet
+//!           wire signal-driven exit), and `-ESRCH` (surfaces
+//!           under vitest `runAllSpawns` where spawned pids
+//!           stay Ready and `park_on_accept` fails its state
+//!           transition — matches slice 1's "non-EAGAIN error"
+//!           exit semantics).
+//!      b. `fd_read(server, buf)` (EAGAIN poll via `MAX_POLLS`)
+//!         — read pixel payload. `MAX_POLLS` remains alive for
+//!         `fd_read` until a future slice migrates it to blocking
+//!         semantics too.
 //!      c. `fd_write(fb_fd, buf)`                — relay to `/dev/fb0`.
 //!      d. `fd_close(server)`                    — release the client fd
 //!                                                  so the next iteration's
@@ -31,22 +42,26 @@
 //!   5. fall off the end of `main`            — std emits
 //!      `__wasi_proc_exit(0)`.
 //!
-//! `MAX_CLIENTS = 4` is a testing fiction. The outer loop can't run
-//! unbounded in v1 because `ipc_accept` still returns `-EAGAIN` on an
-//! empty backlog (no blocking semantic). Without a ceiling the
-//! vitest composition helper would spin forever when no more clients
-//! arrive. A future slice (kernel `ipc_accept` blocking + signal-
-//! driven exit via fd 3) removes the ceiling.
+//! `MAX_CLIENTS = 4` is a testing fiction. The outer loop is still
+//! bounded because (a) the vitest composition helper (`runAllSpawns`,
+//! strictly sequential) would otherwise spin forever when no more
+//! clients arrive, and (b) signal-driven exit via fd 3 polling is
+//! not yet wired. A future slice removes the ceiling and adds the
+//! fd-3 poll.
 //!
 //! Exit codes:
 //!
-//!   * 0  = success (served >= 1 client, loop drained or hit `MAX_CLIENTS`)
+//!   * 0  = success (loop completed `MAX_CLIENTS` iterations)
 //!   * 10 = `display_bind` failed
-//!   * 12 = `ipc_accept` returned a non-EAGAIN error
+//!   * 12 = `ipc_accept` returned any negative rc (fatal: any
+//!          error path on the blocking accept — includes
+//!          `-EAGAIN`, `-EINTR`, `-ESRCH`)
 //!   * 14 = `fd_read` returned a non-EAGAIN error or read 0 bytes
 //!   * 15 = `path_open("/dev/fb0")` failed
 //!   * 16 = framebuffer `fd_write` failed or short-wrote
-//!   * 17 = first `ipc_accept` poll exhausted (0 clients served)
+//!   * 17 = (reserved: first-accept poll exhaustion from slice
+//!          1, no longer reachable now that the inner busy-poll
+//!          is gone)
 //!   * 18 = `fd_read` poll exhausted for a connected client
 //!   * 19 = `fd_close` on the client fd returned a non-zero errno
 
@@ -110,16 +125,15 @@ fn main() {
     // (`ipc_accept`, `display_bind`) negate into `-errno`. Both
     // conventions agree on the numeric value.
     const EAGAIN: i32 = 6;
-    // Safety valve: bounded iteration count so the vitest
-    // in-process composition test (`runAllSpawns`, strictly
-    // sequential) doesn't spin forever when no sibling client
-    // process exists. Real Playwright (concurrent Workers) lands
-    // a connection within the first handful of passes.
+    // Bounded-iteration safety valve for the vitest harness'
+    // `fd_read` path. Slice 2a migrated `ipc_accept` to blocking
+    // kernel semantics; `fd_read` remains EAGAIN-polled until a
+    // future slice applies the same park/wake pattern to it.
     const MAX_POLLS: u32 = 10_000;
-    // Outer-loop ceiling. Bounded for the same reason `MAX_POLLS`
-    // is bounded: the vitest harness is sequential. Removed by a
-    // future slice once `ipc_accept` has real blocking semantics
-    // and the server exits on SIGTERM instead of by draining.
+    // Outer-loop ceiling. Bounded because (a) the vitest harness
+    // is sequential and would otherwise spin forever when no more
+    // clients arrive, and (b) signal-driven exit via fd 3 polling
+    // is not yet wired. Removed by a future slice.
     const MAX_CLIENTS: u32 = 4;
 
     unsafe {
@@ -145,26 +159,22 @@ fn main() {
             std::process::exit(15);
         }
 
-        let mut served_any = false;
         for i in 0..MAX_CLIENTS {
-            let mut server: i32 = -1;
-            for _ in 0..MAX_POLLS {
-                let rc = ipc_accept(listener);
-                if rc >= 0 {
-                    server = rc;
-                    break;
-                }
-                if rc == -EAGAIN {
-                    continue;
-                }
+            // Slice 2a's kernel park/wake makes this a blocking
+            // call by default (flags=0). The inner 10k-iteration
+            // busy-poll is gone — every prior iteration succeeded
+            // on pass 0 anyway once blocking semantics landed.
+            // Any non-zero return is fatal (exit 12): includes
+            // `-EAGAIN` (not expected from a blocking call),
+            // `-EINTR` (slice 2b doesn't yet wire signal-driven
+            // exit), and `-ESRCH` (vitest `runAllSpawns` where
+            // `park_on_accept`'s state transition fails —
+            // matches slice 1's "non-EAGAIN error" semantic).
+            let rc = ipc_accept(listener);
+            if rc < 0 {
                 std::process::exit(12);
             }
-            if server < 0 {
-                if served_any {
-                    break;
-                }
-                std::process::exit(17);
-            }
+            let server: i32 = rc;
 
             let mut recv_buf = [0u8; 32];
             let read_iov = Iovec {
@@ -214,7 +224,6 @@ fn main() {
             }
 
             println!("display-server served client {}", i);
-            served_any = true;
         }
     }
 
