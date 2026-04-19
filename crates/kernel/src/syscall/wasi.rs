@@ -2085,10 +2085,13 @@ fn handle_sock_send(
         .send_on_socket(crate::ipc::SocketId(socket_id), bytes, alloc::vec::Vec::new())
     {
         Ok(n) => Response::ok(req.request_id, n as i64),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::from(e)),
-        ),
+        Err(e) => {
+            let kerr = KernelError::from(e);
+            if matches!(kerr, KernelError::PipeBroken) {
+                kernel.post_sigpipe(pid);
+            }
+            Response::err(req.request_id, kerr_to_errno(kerr))
+        }
     }
 }
 

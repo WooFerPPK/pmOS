@@ -9,13 +9,17 @@
 //!   SIGKILL does NOT go through the inbox — there is nothing
 //!   for userland to catch.
 //!
-//! * [`Signal::Term`] (15) and [`Signal::Interrupt`] (2) are
-//!   "catchable": `proc_kill` buffers them in the target's
-//!   [`SignalInbox`]. A future slice will wake the process via
-//!   the `FdObject::SignalChannel` fd variant so a
-//!   `fd_read` on fd 3 drains pending signals; until then the
-//!   kernel exposes `Kernel::drain_signals` as a direct API so
-//!   tests can observe delivery.
+//! * [`Signal::Term`] (15), [`Signal::Interrupt`] (2), and
+//!   [`Signal::Pipe`] (13) are "catchable": `proc_kill` buffers
+//!   them in the target's [`SignalInbox`]. A future slice will
+//!   wake the process via the `FdObject::SignalChannel` fd
+//!   variant so a `fd_read` on fd 3 drains pending signals;
+//!   until then the kernel exposes `Kernel::drain_signals` as a
+//!   direct API so tests can observe delivery. SIGPIPE in
+//!   particular is kernel-generated: it is posted to the caller's
+//!   own inbox whenever an `fd_write` on a pipe or socket
+//!   returns `PipeBroken` (matching POSIX `write(2)`'s SIGPIPE
+//!   delivery alongside the EPIPE errno).
 //!
 //! The inbox is a bounded FIFO: repeated deliveries of the
 //! same signal are coalesced (classical POSIX behaviour for
@@ -27,9 +31,9 @@ use alloc::collections::VecDeque;
 
 /// Signals the v1 kernel understands.
 ///
-/// The numeric repr matches POSIX `SIGKILL`, `SIGTERM`, and
-/// `SIGINT` so userland code that hard-codes these values keeps
-/// working without a translation table.
+/// The numeric repr matches POSIX `SIGKILL`, `SIGTERM`, `SIGINT`,
+/// and `SIGPIPE` so userland code that hard-codes these values
+/// keeps working without a translation table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Signal {
@@ -39,6 +43,9 @@ pub enum Signal {
     Term = 15,
     /// Interrupt (ctrl-c equivalent).
     Interrupt = 2,
+    /// Kernel-generated: a write to a pipe or socket whose peer
+    /// has closed or had its read-side shut down.
+    Pipe = 13,
 }
 
 impl Signal {
@@ -118,10 +125,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_catchable_distinguishes_kill_from_term_interrupt() {
+    fn is_catchable_distinguishes_kill_from_other_signals() {
         assert!(!Signal::Kill.is_catchable());
         assert!(Signal::Term.is_catchable());
         assert!(Signal::Interrupt.is_catchable());
+        assert!(Signal::Pipe.is_catchable());
     }
 
     #[test]
@@ -129,6 +137,7 @@ mod tests {
         assert_eq!(Signal::Kill.number(), 9);
         assert_eq!(Signal::Term.number(), 15);
         assert_eq!(Signal::Interrupt.number(), 2);
+        assert_eq!(Signal::Pipe.number(), 13);
     }
 
     #[test]

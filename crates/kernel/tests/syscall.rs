@@ -33,7 +33,7 @@ use kernel::fd::{FdFlags, FdObject};
 use kernel::fs::devfs::{DevFs, DEV_CONSOLE};
 use kernel::fs::procfs::ProcFs;
 use kernel::fs::tmpfs::TmpFs;
-use kernel::proc::{ExitStatus, ProcState};
+use kernel::proc::{ExitStatus, ProcState, Signal};
 use kernel::sys::{Kernel, RegisterArgs};
 use kernel::syscall::{dispatch, Dispatcher};
 use ring::Sab;
@@ -6729,6 +6729,175 @@ fn sock_send_on_socket_with_peer_read_shutdown_returns_epipe() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, -errno::EPIPE);
+}
+
+// ---- PipeBroken → SIGPIPE delivery ---------------------------------
+//
+// POSIX `write(2)` on a broken pipe or socket delivers SIGPIPE to the
+// writer alongside the EPIPE errno. PMos v1 has no signal handlers
+// yet, so SIGPIPE is posted to the caller's signal inbox and can be
+// observed via `Kernel::pending_signals` / `Kernel::drain_signals`.
+// The three paths that surface PipeBroken at the syscall layer — a
+// pipe write after the reader has closed, an fd_write on a socket
+// whose peer closed or whose own write-side shut down, and
+// sock_send on a socket whose peer's read-side shut down — each
+// post SIGPIPE. Successful writes do NOT touch the inbox.
+
+#[test]
+fn fd_write_on_broken_pipe_posts_sigpipe_alongside_epipe() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe();
+    k.ipc.drop_pipe_reader(pipe_id).unwrap();
+    k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..2].copy_from_slice(b"hi");
+
+    assert_eq!(k.pending_signals(pid).unwrap(), 0);
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 2100,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EPIPE);
+    assert_eq!(k.pending_signals(pid).unwrap(), 1);
+    assert_eq!(k.drain_signals(pid).unwrap(), alloc::vec![Signal::Pipe]);
+}
+
+#[test]
+fn fd_write_on_broken_socket_posts_sigpipe_alongside_epipe() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sender", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.ipc.close_socket(b).unwrap();
+
+    let mut heap = vec![0u8; 16];
+    heap[..2].copy_from_slice(b"hi");
+    assert_eq!(k.pending_signals(pid).unwrap(), 0);
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 2101,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EPIPE);
+    assert_eq!(k.drain_signals(pid).unwrap(), alloc::vec![Signal::Pipe]);
+}
+
+#[test]
+fn sock_send_on_broken_socket_posts_sigpipe_alongside_epipe() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sender", 0);
+    let a = k.ipc.create_socket(SocketType::Stream);
+    let b = k.ipc.create_socket(SocketType::Stream);
+    {
+        let sa = k.ipc.socket_mut(a).unwrap();
+        sa.state = SocketState::Connected;
+        sa.peer = Some(b);
+    }
+    {
+        let sb = k.ipc.socket_mut(b).unwrap();
+        sb.state = SocketState::Connected;
+        sb.peer = Some(a);
+    }
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    // Peer shuts down its read side; a's send must EPIPE + SIGPIPE.
+    k.ipc.shutdown_socket(b, true, false).unwrap();
+
+    let mut heap = vec![0u8; 16];
+    heap[..2].copy_from_slice(b"hi");
+    assert_eq!(k.pending_signals(pid).unwrap(), 0);
+    let req = Request {
+        opcode: op_wasi::SOCK_SEND,
+        flags: 0,
+        request_id: 2102,
+        args: {
+            let mut a = [0u8; 16];
+            a[0..4].copy_from_slice(&3u32.to_le_bytes());
+            a
+        },
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EPIPE);
+    assert_eq!(k.drain_signals(pid).unwrap(), alloc::vec![Signal::Pipe]);
+}
+
+#[test]
+fn successful_fd_write_on_pipe_does_not_queue_sigpipe() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe();
+    // Both ends open; the write succeeds.
+    k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..2].copy_from_slice(b"ok");
+
+    let req = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 2103,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 2);
+    assert_eq!(k.pending_signals(pid).unwrap(), 0);
+}
+
+#[test]
+fn repeated_broken_writes_coalesce_to_single_sigpipe_entry() {
+    // SignalInbox::post dedupes on signal identity, so even ten
+    // consecutive broken writes post the caller's inbox only once.
+    // Observable state after the loop: exactly one SIGPIPE pending.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe();
+    k.ipc.drop_pipe_reader(pipe_id).unwrap();
+    k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    heap[..1].copy_from_slice(b"x");
+
+    for i in 0..10 {
+        let req = Request {
+            opcode: op_wasi::FD_WRITE,
+            flags: 0,
+            request_id: 2200 + i,
+            args: u32_args(3),
+            heap_ptr: 0,
+            heap_len: 1,
+        };
+        let resp = dispatch(&mut k, pid, &req, &mut heap);
+        assert_eq!(resp.status, -errno::EPIPE);
+    }
+    assert_eq!(k.drain_signals(pid).unwrap(), alloc::vec![Signal::Pipe]);
 }
 
 // ---- fd_prestat_dir_name --------------------------------------------

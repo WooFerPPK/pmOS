@@ -502,6 +502,16 @@ impl Kernel {
     }
 
     /// `fd_write(pid, fd, buf) -> bytes_written`.
+    ///
+    /// A broken-pipe outcome on a [`FdObject::PipeWrite`] or
+    /// [`FdObject::Socket`] fd additionally posts [`Signal::Pipe`]
+    /// to the caller's signal inbox alongside the
+    /// [`KernelError::PipeBroken`] return — POSIX `write(2)`
+    /// specifies SIGPIPE delivery in lockstep with the EPIPE
+    /// errno. A broken write on any other fd variant (Vnode,
+    /// CharDevice, pipe-read, display conn, signal channel) does
+    /// not post a signal: those either cannot surface
+    /// PipeBroken or have their own error paths.
     pub fn fd_write(
         &mut self,
         pid: Pid,
@@ -514,34 +524,63 @@ impl Kernel {
             .ok_or(KernelError::NoSuchPid)?
             .get(fd)
             .ok_or(KernelError::BadFd)?;
-        match entry.object {
+        let result: Result<usize, KernelError> = match entry.object {
             FdObject::Vnode { mount_id, ino } => {
-                let n = self.vfs.write_ino(mount_id, ino, entry.offset, buf)?;
-                let slot = self
-                    .fds
-                    .get_mut(&pid)
-                    .and_then(|t| t.get_mut(fd))
-                    .ok_or(KernelError::BadFd)?;
-                slot.offset = slot.offset.saturating_add(n as u64);
-                Ok(n)
+                match self.vfs.write_ino(mount_id, ino, entry.offset, buf) {
+                    Ok(n) => match self
+                        .fds
+                        .get_mut(&pid)
+                        .and_then(|t| t.get_mut(fd))
+                        .ok_or(KernelError::BadFd)
+                    {
+                        Ok(slot) => {
+                            slot.offset = slot.offset.saturating_add(n as u64);
+                            Ok(n)
+                        }
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(KernelError::Fs(e)),
+                }
             }
-            FdObject::CharDevice(devnum) => Ok(self.devs.write(devnum, buf)?),
-            FdObject::Socket(id) => {
-                let n = self.ipc.send_on_socket(SocketId(id), buf, Vec::new())?;
-                Ok(n)
+            FdObject::CharDevice(devnum) => {
+                self.devs.write(devnum, buf).map_err(KernelError::from)
             }
+            FdObject::Socket(id) => self
+                .ipc
+                .send_on_socket(SocketId(id), buf, Vec::new())
+                .map_err(KernelError::from),
             FdObject::PipeWrite(id) => {
                 use crate::ipc::{PipeId, PipeWriteResult};
-                let pipe = self.ipc.pipe_mut(PipeId(id))?;
-                match pipe.try_write(buf) {
-                    PipeWriteResult::Wrote(n) => Ok(n),
-                    PipeWriteResult::Broken => Err(KernelError::PipeBroken),
-                    PipeWriteResult::WouldBlock => Err(KernelError::WouldBlock),
+                match self.ipc.pipe_mut(PipeId(id)) {
+                    Ok(pipe) => match pipe.try_write(buf) {
+                        PipeWriteResult::Wrote(n) => Ok(n),
+                        PipeWriteResult::Broken => Err(KernelError::PipeBroken),
+                        PipeWriteResult::WouldBlock => Err(KernelError::WouldBlock),
+                    },
+                    Err(e) => Err(KernelError::from(e)),
                 }
             }
             FdObject::PipeRead(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel => Err(KernelError::NotSupportedOnFd),
+        };
+        if matches!(result, Err(KernelError::PipeBroken)) {
+            self.post_sigpipe(pid);
+        }
+        result
+    }
+
+    /// Deliver [`Signal::Pipe`] into `pid`'s signal inbox, if
+    /// the process has one. Called by every syscall path that
+    /// can surface [`KernelError::PipeBroken`] — currently
+    /// [`Self::fd_write`] and the `handle_sock_send` opcode arm.
+    /// Missing inboxes (a pid whose process table entry is gone)
+    /// silently no-op: by the time the write was dispatched the
+    /// caller existed; a disappearing inbox between dispatch and
+    /// this point is a test-only race, not a delivery failure.
+    pub fn post_sigpipe(&mut self, pid: Pid) {
+        if let Some(inbox) = self.signal_inboxes.get_mut(&pid) {
+            inbox.post(Signal::Pipe);
         }
     }
 
@@ -1022,11 +1061,11 @@ impl Kernel {
         }
 
         // Deliver. SIGKILL terminates synchronously; catchable
-        // signals (Term, Interrupt) are queued on the target's
-        // per-process SignalInbox for `drain_signals` to pick
-        // up. Coalescing is handled by `SignalInbox::post`:
-        // repeated Terms against a target that already has Term
-        // pending do not grow the queue.
+        // signals (Term, Interrupt, Pipe) are queued on the
+        // target's per-process SignalInbox for `drain_signals`
+        // to pick up. Coalescing is handled by
+        // `SignalInbox::post`: repeated Terms against a target
+        // that already has Term pending do not grow the queue.
         match signal {
             Signal::Kill => {
                 // Remove from the scheduler immediately so no
@@ -1037,7 +1076,7 @@ impl Kernel {
                     .exit(target_pid, ExitStatus::Signaled(signal.number()))
                     .map_err(|_| KernelError::NoSuchPid)?;
             }
-            Signal::Term | Signal::Interrupt => {
+            Signal::Term | Signal::Interrupt | Signal::Pipe => {
                 if let Some(inbox) = self.signal_inboxes.get_mut(&target_pid) {
                     inbox.post(signal);
                 }
