@@ -19,6 +19,7 @@
     "assets/bin/hello_raise.wasm",
     "assets/bin/hello_self_probe.wasm",
     "assets/bin/hello_sigchld.wasm",
+    "assets/bin/hello_wait_noop.wasm",
     "assets/bin/hello_wasi_bootstrap.wasm",
     "assets/bin/hello_wasi_min.wasm",
     "assets/bin/hello_wasi_spawner.wasm",

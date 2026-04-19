@@ -131,6 +131,7 @@ let helloSelfProbeWasmBytes: ArrayBuffer;
 let helloPpidWasmBytes: ArrayBuffer;
 let helloCapsWasmBytes: ArrayBuffer;
 let helloRaiseWasmBytes: ArrayBuffer;
+let helloWaitNoopWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -203,6 +204,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_raise.wasm",
   );
+  const helloWaitNoopPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_wait_noop.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -247,6 +252,7 @@ beforeAll(() => {
     helloPpidPath,
     helloCapsPath,
     helloRaisePath,
+    helloWaitNoopPath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -286,6 +292,7 @@ beforeAll(() => {
   helloPpidWasmBytes = loadWasm(helloPpidPath);
   helloCapsWasmBytes = loadWasm(helloCapsPath);
   helloRaiseWasmBytes = loadWasm(helloRaisePath);
+  helloWaitNoopWasmBytes = loadWasm(helloWaitNoopPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1477,6 +1484,66 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getUint16(0, true);
     expect(signum).toBe(15);
     expect(consoleWrites[0]![2]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-wait-noop calls proc_wait(-1, 0, 0) on a childless process and writes -ECHILD (i32 LE) + newline", async () => {
+    // End-to-end proof of the proc_wait pmos_ext shim's error path
+    // (98a3341 ext opcode wiring) through a real wasm32-wasip1
+    // binary. The child has no children of its own — it's a leaf
+    // process — so proc_wait(-1) hits the kernel's
+    // WaitOutcome::NoChildren -> ECHILD arm at
+    // crates/kernel/src/syscall/ext.rs:563. The binary writes the
+    // 4-byte i32 LE -9 plus a trailing newline = 5 bytes.
+    //
+    // ECHILD = 9, so -ECHILD = -9, distinct from EAGAIN (-6),
+    // EINVAL (-28), ESRCH (-71) — the byte sequence is sharp.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-wait-noop", helloWaitNoopWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-wait-noop",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const rc = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(rc).toBe(-ERRNO.ECHILD);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 
   it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {
