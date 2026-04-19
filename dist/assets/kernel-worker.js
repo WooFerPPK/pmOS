@@ -649,6 +649,9 @@ var KernelWasmHost = class _KernelWasmHost {
       }
     }
     const rc = this.exports.kernel_dispatch(pid);
+    if (rc === 1) {
+      return { heapOut: new Uint8Array(0), parked: true };
+    }
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.dispatch: kernel_dispatch returned ${rc}`);
     }
@@ -665,6 +668,69 @@ var KernelWasmHost = class _KernelWasmHost {
       heapOut = new Uint8Array(src);
     }
     return { response, heapOut };
+  }
+  /**
+   * Test-only: pop one wake for `pid` through the kernel's
+   * `kernel_take_next_wake_for_pid` export and return the decoded
+   * Response directly, without pushing onto any SAB. Used by unit
+   * tests that want to assert wake-response shape without building
+   * a full SAB transport.
+   *
+   * Production callers use `drainWakesForPid` (which pushes onto
+   * the pid's SAB so the user Worker's Atomics.wait returns).
+   */
+  takeNextWakeForPid(pid) {
+    if (this.exports.kernel_take_next_wake_for_pid(pid) !== 1) {
+      return null;
+    }
+    const respPtr = this.exports.kernel_resp_ptr();
+    const respBytes = new Uint8Array(
+      new Uint8Array(this.exports.memory.buffer, respPtr, SLOT_SIZE)
+    );
+    return decodeResponse(respBytes);
+  }
+  /**
+   * Drain any pending wakes queued for `pid` and push each response
+   * onto `sab`'s response ring. Called by `startDispatchLoop` before
+   * `serviceSab` on each pid so a previously-parked acceptor sees
+   * its completed accept response on the next round-robin pass.
+   *
+   * Returns the number of wake responses pushed (0 if nothing was
+   * queued). Uses the same push shape as `serviceSab` — decode via
+   * RESP_SCRATCH, encode via `encodeResponse`, advance RES_HEAD.
+   */
+  drainWakesForPid(pid, sab) {
+    if (sab.byteLength < SAB_SIZE) {
+      throw new Error(
+        `KernelWasmHost.drainWakesForPid: sab is ${sab.byteLength} bytes, need ${SAB_SIZE}`
+      );
+    }
+    const buffer = sab.buffer;
+    const baseOffset = sab.byteOffset;
+    const header = new Int32Array(buffer, baseOffset, OFF_HEAP_SCRATCH / 4);
+    let pushed = 0;
+    while (this.exports.kernel_take_next_wake_for_pid(pid) === 1) {
+      const respPtr = this.exports.kernel_resp_ptr();
+      const respBytes = new Uint8Array(
+        new Uint8Array(this.exports.memory.buffer, respPtr, SLOT_SIZE)
+      );
+      const response = decodeResponse(respBytes);
+      const resHead = Atomics.load(header, OFF_RES_HEAD / 4);
+      const resTail = Atomics.load(header, OFF_RES_TAIL / 4);
+      const nextResHead = (resHead + 1 >>> 0) % RES_SLOT_COUNT;
+      if (nextResHead === resTail) {
+        throw new Error(
+          `KernelWasmHost.drainWakesForPid: response ring full for pid ${pid}`
+        );
+      }
+      const resSlotIx = (resHead >>> 0) % RES_SLOT_COUNT;
+      const resSlotOffset = baseOffset + OFF_RES_RING + resSlotIx * SLOT_SIZE;
+      const encoded = encodeResponse(response);
+      new Uint8Array(buffer, resSlotOffset, SLOT_SIZE).set(encoded);
+      Atomics.store(header, OFF_RES_HEAD / 4, nextResHead);
+      pushed += 1;
+    }
+    return pushed;
   }
   /**
    * Service one pending request on the per-pid SAB ring.
@@ -733,7 +799,7 @@ var KernelWasmHost = class _KernelWasmHost {
         new Uint8Array(buffer, heapOffset, decoded.heapLen)
       );
     }
-    const { response, heapOut } = this.dispatch(
+    const dispatchResult = this.dispatch(
       pid,
       {
         opcode: decoded.opcode,
@@ -747,6 +813,11 @@ var KernelWasmHost = class _KernelWasmHost {
     );
     const nextTail = (reqTail + 1 >>> 0) % REQ_SLOT_COUNT;
     Atomics.store(header, OFF_REQ_TAIL / 4, nextTail);
+    if (dispatchResult.parked === true) {
+      return 0;
+    }
+    const response = dispatchResult.response;
+    const heapOut = dispatchResult.heapOut;
     const resHead = Atomics.load(header, OFF_RES_HEAD / 4);
     const resTail = Atomics.load(header, OFF_RES_TAIL / 4);
     const nextResHead = (resHead + 1 >>> 0) % RES_SLOT_COUNT;
@@ -866,6 +937,7 @@ var KernelWasmHost = class _KernelWasmHost {
         const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
         const sabIsShared = haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
         for (let i = 0; i < budget; i++) {
+          this.drainWakesForPid(pid, view);
           const rc = this.serviceSab(pid, view);
           if (rc === 1) break;
           anyServiced = true;
@@ -1860,6 +1932,11 @@ async function runBootBinary(host, bootBinary, pidMap, lifecycle) {
     },
     manifest.heap
   );
+  if (response === void 0) {
+    throw new Error(
+      `kernel-worker: PROC_SPAWN(${bootBinary}) returned no response (parked?)`
+    );
+  }
   if (response.status !== 0) {
     throw new Error(
       `kernel-worker: PROC_SPAWN(${bootBinary}) failed with status ${response.status}`

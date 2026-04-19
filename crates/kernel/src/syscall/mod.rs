@@ -37,4 +37,27 @@ pub mod dispatch;
 pub mod ext;
 pub mod wasi;
 
-pub use dispatch::{dispatch, kerr_to_errno, Dispatcher};
+pub use dispatch::{kerr_to_errno, Dispatcher, ServiceOutcome};
+
+/// Convenience wrapper over [`dispatch::dispatch`] that unwraps a
+/// [`ServiceOutcome::Done`] response. Tests and call-sites that do not
+/// need to distinguish `Parked` from `Done` use this; call-sites that
+/// DO care (e.g. `wasm_entry::kernel_dispatch`) call
+/// `dispatch::dispatch` directly and match on the outcome.
+///
+/// Panics if the outcome is `Parked` — that variant is not reachable
+/// until Task 5 lands `handle_ipc_accept`'s park path, so a panic
+/// here is the right canary.
+pub fn dispatch(
+    kernel: &mut crate::sys::Kernel,
+    pid: abi::ext::Pid,
+    req: &abi::ring::Request,
+    heap: &mut [u8],
+) -> abi::ring::Response {
+    match dispatch::dispatch(kernel, pid, req, heap) {
+        ServiceOutcome::Done(resp) => resp,
+        ServiceOutcome::Parked => {
+            panic!("dispatch: unexpected Parked outcome before park-on-accept lands")
+        }
+    }
+}

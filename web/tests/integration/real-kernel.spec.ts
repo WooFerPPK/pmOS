@@ -64,19 +64,29 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
 
   await page.goto("/index.html");
 
-  // Poll until display-server's trailing "fb blit ok" line arrives
-  // — that's the last observable signal of a successful boot (it
-  // only prints after the full IPC round-trip has traversed
-  // display-client-demo's connect + fd_write(PIXELS) AND
-  // display-server's accept + fd_read + path_open("/dev/fb0") +
-  // fd_write(fb_fd), so its presence implies every earlier line has
-  // already landed). On a local dev-server the full four-pid boot
-  // completes in ~400 ms cold; the 15 s timeout is for cold-start CI.
-  const blitOkLine = () =>
-    consoleLines.find((l) =>
-      l.includes("[real-kernel] display-server fb blit ok"),
-    ) ?? null;
-  await expect.poll(blitOkLine, { timeout: 15_000 }).not.toBeNull();
+  // Slice 2a (kernel ipc_accept blocking) changed the terminal
+  // observable signal. Pre-slice: display-server's inner EAGAIN
+  // poll exhausted on iteration 2 of the outer loop (no 3rd
+  // client ever arrives), the loop broke cleanly on `served_any`,
+  // and display-server printed "fb blit ok" before exiting. Post-
+  // slice: display-server's ipc_accept on iteration 2 blocks
+  // indefinitely in the kernel (parked on the listener with no
+  // peer to wake it), so "fb blit ok" NEVER prints and display-
+  // server stays live. This is the correct long-running-server
+  // shape the arc is building toward — slice 2b's signal-driven
+  // exit is what will make display-server exit cleanly on
+  // SIGTERM. For this slice, the terminal observable shifts from
+  // "fb blit ok" to "display-server served client 1" (the second
+  // served-client line) — its presence still implies every
+  // earlier line is on the console, and both clients got their
+  // pixels relayed to /dev/fb0. 15 s timeout for cold-start CI.
+  const secondServedLine = () => {
+    const served = consoleLines.filter((l) =>
+      /\[real-kernel\] display-server served client \d+/.test(l),
+    );
+    return served.length >= 2 ? served[1]! : null;
+  };
+  await expect.poll(secondServedLine, { timeout: 15_000 }).not.toBeNull();
 
   // With the trailing display-server line observed, every other
   // line MUST already be present. Pull the indices and assert the
@@ -104,9 +114,6 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   );
   const displayServerStartIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] display-server starting"),
-  );
-  const displayServerBlitIdx = consoleLines.findIndex((l) =>
-    l.includes("[real-kernel] display-server fb blit ok"),
   );
   const displayClientStartIndices = consoleLines
     .map((l, i) =>
@@ -137,18 +144,19 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   expect(helloStdIdx).toBeGreaterThan(initExitIdx);
   expect(displayServerStartIdx).toBeGreaterThan(initExitIdx);
   expect(displayClientStartIdx).toBeGreaterThan(initExitIdx);
-  // Within display-server's own output, "starting" must precede
-  // "fb blit ok" (single pid, sequential prints).
-  expect(displayServerBlitIdx).toBeGreaterThan(displayServerStartIdx);
   // Within display-client-demo's own output, "starting" must precede
   // "sent pixels" (single pid, sequential prints).
   expect(displayClientSentIdx).toBeGreaterThan(displayClientStartIdx);
-  // Protocol ordering: display-server's fd_read unblocks only after
-  // display-client-demo's fd_write lands. display-server prints
-  // "fb blit ok" immediately after the fb write, display-client-demo
-  // prints "sent pixels" immediately after its fd_write. So the
-  // client's "sent pixels" MUST come before the server's "fb blit ok".
-  expect(displayServerBlitIdx).toBeGreaterThan(displayClientSentIdx);
+  // Protocol ordering: display-server's accept unblocks only after
+  // display-client-demo's ipc_connect lands. display-client-demo
+  // prints "sent pixels" immediately after its fd_write, and
+  // display-server prints "served client {i}" immediately after
+  // relaying the payload to /dev/fb0. So the client's first
+  // "sent pixels" MUST come before the server's first
+  // "served client" line.
+  expect(displayServerServedIndices[0]!).toBeGreaterThan(
+    displayClientSentIndices[0]!,
+  );
   // Two display-client-demo pids → two "starting" + two "sent
   // pixels" lines on the console.
   expect(displayClientStartIndices).toHaveLength(2);
@@ -158,15 +166,11 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   // server's iteration counter — the order relative to client
   // pids is not pinned because the clients run concurrently).
   expect(displayServerServedIndices).toHaveLength(2);
-  // The trailing "fb blit ok" line only prints after the outer
-  // loop breaks, so BOTH served-client lines and BOTH sent-pixels
-  // lines must precede it.
-  expect(displayServerBlitIdx).toBeGreaterThan(
-    displayServerServedIndices[1]!,
-  );
-  expect(displayServerBlitIdx).toBeGreaterThan(
-    displayClientSentIndices[1]!,
-  );
+  // Slice 2a deliberately does not assert "fb blit ok" — display-
+  // server parks indefinitely on iteration 2 of its outer loop
+  // (kernel blocks on the empty listener backlog with no 3rd
+  // client). Slice 2b lands signal-driven exit and the trailing
+  // "fb blit ok" line becomes observable again.
 
   expect(consoleLines.some((l) => l.includes("real kernel ready"))).toBe(true);
   expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
@@ -187,20 +191,14 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   expect(domText).toContain("init exiting");
   expect(domText).toContain("hello from std");
   expect(domText).toContain("display-server starting");
-  expect(domText).toContain("display-server fb blit ok");
   expect(domText).toContain("display-client-demo starting");
   expect(domText).toContain("display-client-demo sent pixels");
+  expect(domText).toMatch(/display-server served client \d+/);
   expect(domText.indexOf("init starting")).toBeLessThan(
     domText.indexOf("hello from std"),
   );
-  expect(domText.indexOf("display-server starting")).toBeLessThan(
-    domText.indexOf("display-server fb blit ok"),
-  );
   expect(domText.indexOf("display-client-demo starting")).toBeLessThan(
     domText.indexOf("display-client-demo sent pixels"),
-  );
-  expect(domText.indexOf("display-client-demo sent pixels")).toBeLessThan(
-    domText.indexOf("display-server fb blit ok"),
   );
 
   // Five concurrent pids (init + hello-std + display-server +

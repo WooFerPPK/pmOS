@@ -208,6 +208,22 @@ impl ProcessTable {
         Ok(())
     }
 
+    /// Set the block reason on `pid`. Called alongside a transition
+    /// to BlockedOn*; no-op if pid is not in the table.
+    pub fn set_block_reason(&mut self, pid: Pid, reason: BlockReason) {
+        if let Some(p) = self.procs.get_mut(&pid) {
+            p.block_reason = Some(reason);
+        }
+    }
+
+    /// Clear any previously-set block reason on `pid`. Used by the
+    /// syscall dispatcher when unblocking a parked process.
+    pub fn clear_block_reason(&mut self, pid: Pid) {
+        if let Some(p) = self.procs.get_mut(&pid) {
+            p.block_reason = None;
+        }
+    }
+
     /// Wake a process that was blocked on a specific syscall.
     /// Returns true iff the process was indeed blocked on that
     /// request_id and is now Ready.

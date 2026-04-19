@@ -447,8 +447,8 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // The spawn was captured, not yet run. The response carries
     // the new pid; the capture callback returned `{ ok: true }`
     // so the kernel accepted the spawn.
-    expect(spawnResult.response.status).toBe(0);
-    const childPid = Number(spawnResult.response.value);
+    expect(spawnResult.response!.status).toBe(0);
+    const childPid = Number(spawnResult.response!.value);
     expect(childPid).toBeGreaterThan(parent);
     expect(captures).toHaveLength(1);
     expect(captures[0]!.pid).toBe(childPid);
@@ -526,8 +526,8 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
-    const spawnerPid = Number(spawnResult.response.value);
+    expect(spawnResult.response!.status).toBe(0);
+    const spawnerPid = Number(spawnResult.response!.value);
     expect(spawnerPid).toBeGreaterThan(init);
 
     // One captured spawn (the spawner); hello isn't captured yet
@@ -602,7 +602,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
 
     // -EIO per the PROC_SPAWN rollback semantics (any platform
     // failure becomes EIO regardless of the specific errno).
-    expect(spawnResult.response.status).toBeLessThan(0);
+    expect(spawnResult.response!.status).toBeLessThan(0);
     expect(captures).toHaveLength(0);
     expect(consoleWrites).toHaveLength(0);
   });
@@ -662,7 +662,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     // The binary exits 0 iff every IPC step succeeded. The exit
     // code shows up in `history` below; the side effect — the
@@ -742,7 +742,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
 
@@ -824,7 +824,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     // Exit code is the step-by-step diagnostic; exit 0 means every
     // step succeeded. Codes 10..16 indicate which step bailed —
@@ -895,7 +895,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
 
@@ -964,7 +964,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
 
@@ -1053,7 +1053,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
 
@@ -1117,8 +1117,8 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
-    const childPid = Number(spawnResult.response.value);
+    expect(spawnResult.response!.status).toBe(0);
+    const childPid = Number(spawnResult.response!.value);
     expect(captures).toHaveLength(1);
     expect(captures[0]!.pid).toBe(childPid);
 
@@ -1135,7 +1135,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(killResult.response.status).toBe(0);
+    expect(killResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1196,8 +1196,8 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
-    const childPid = Number(spawnResult.response.value);
+    expect(spawnResult.response!.status).toBe(0);
+    const childPid = Number(spawnResult.response!.value);
     expect(captures).toHaveLength(1);
     expect(captures[0]!.pid).toBe(childPid);
 
@@ -1263,7 +1263,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1329,7 +1329,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1386,7 +1386,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1448,7 +1448,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1512,7 +1512,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1572,7 +1572,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1632,7 +1632,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1696,7 +1696,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1760,7 +1760,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1821,7 +1821,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1885,7 +1885,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -1946,7 +1946,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -2007,7 +2007,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
     expect(history).toHaveLength(1);
@@ -2027,8 +2027,8 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(readResult.response.status).toBe(0);
-    expect(Number(readResult.response.value)).toBe(2);
+    expect(readResult.response!.status).toBe(0);
+    expect(Number(readResult.response!.value)).toBe(2);
     const sigchld = new DataView(
       readResult.heapOut.buffer,
       readResult.heapOut.byteOffset,
@@ -2044,7 +2044,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(drainedResult.response.status).toBe(-ERRNO.EAGAIN);
+    expect(drainedResult.response!.status).toBe(-ERRNO.EAGAIN);
   });
 
   it("hello-std: a real Rust `std` binary (println! + fn main) runs to completion through the PMos WASI shim", async () => {
@@ -2096,7 +2096,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
 
@@ -2189,7 +2189,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       },
       manifest.heap,
     );
-    expect(spawnResult.response.status).toBe(0);
+    expect(spawnResult.response!.status).toBe(0);
 
     const history = await runAllSpawns(kernel, captures);
 
@@ -2199,14 +2199,22 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(history[0]!.exitCode).toBe(0);
     expect(history[1]!.path).toBe("/bin/hello-std");
     expect(history[1]!.exitCode).toBe(0);
-    // display-server's outer accept loop poll-exhausts on its
-    // first iteration (no concurrent client under sequential
-    // `runAllSpawns`). `served_any` is still false, so exit code
-    // 17 fires — unchanged from the single-shot shape. See
-    // `crates/display-server/src/main.rs` for the full exit-code
-    // table.
+    // After slice 2a (kernel ipc_accept blocking): display-server's
+    // first ipc_accept call sends flags=0 (blocking by default). The
+    // kernel's park_on_accept attempts Running→BlockedOnIpc, but the
+    // sequential runAllSpawns harness leaves spawned pids in the
+    // Ready state that PROC_SPAWN installs — it doesn't call
+    // markRunning the way production (kernel-worker-entry) does. The
+    // illegal Ready→BlockedOnIpc transition produces KernelError::
+    // NoSuchPid (sys.rs's transition-error mapping), which the shim
+    // surfaces to display-server as errno -ESRCH. display-server's
+    // inner loop sees rc != 0 && rc != -EAGAIN and hits exit 12
+    // ("ipc_accept returned non-EAGAIN error"). In production
+    // (Playwright), the kernel-worker dispatch loop marks spawned
+    // pids Running, the blocking accept parks cleanly, and the peer's
+    // display_connect wakes it — see real-kernel.spec.ts.
     expect(history[2]!.path).toBe("/bin/display-server");
-    expect(history[2]!.exitCode).toBe(17);
+    expect(history[2]!.exitCode).toBe(12);
     // Both display-client-demo spawns run after display-server has
     // torn down, so each `display_connect` poll exhausts
     // -ECONNREFUSED and exits with code 10. The second spawn is

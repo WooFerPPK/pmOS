@@ -24,6 +24,8 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
 
+use abi::ext::Pid;
+
 /// Per-socket identifier handed out by the kernel's IPC table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SocketId(pub u32);
@@ -92,6 +94,19 @@ pub struct Socket {
     /// semantic as the peer having been fully closed, but without
     /// tearing down the fd (the caller can still call `fd_close`).
     pub shutdown_write: bool,
+    /// If Some((pid, request_id)), a process is parked waiting for
+    /// this listener's backlog to grow. Cleared by:
+    ///   * `IpcTable::accept_socket` completing the parked accept,
+    ///   * `IpcTable::close_socket` on the listener (drains with
+    ///     -EBADF into `Kernel.pending_wakes`),
+    ///   * `Kernel::cleanup_proc` on parker exit,
+    ///   * (slice 2b) signal-driven interrupt with -EINTR.
+    ///
+    /// v1 invariant: at most one parker per listener. A second
+    /// blocking accept while one is parked returns -EAGAIN
+    /// regardless of flags. Documented as a future-slice lift
+    /// (v1 display-server only needs one acceptor at a time).
+    pub parked_acceptor: Option<(Pid, u32)>,
 }
 
 impl Socket {
@@ -110,6 +125,7 @@ impl Socket {
             closed: false,
             shutdown_read: false,
             shutdown_write: false,
+            parked_acceptor: None,
         }
     }
 

@@ -42,7 +42,7 @@
 // which in a real OS might span several reads) can be layered on
 // without changing the backend interface.
 
-import type { KernelWasmHost, DispatchResult } from "./kernel-wasm-host";
+import type { KernelWasmHost } from "./kernel-wasm-host";
 import {
   encodeSpawnManifest,
   ERRNO,
@@ -51,14 +51,32 @@ import {
   POLL_EVENT_SIZE,
   POLL_SUBSCRIPTION_SIZE,
   type SyscallRequest,
+  type SyscallResponse,
 } from "./shared/syscall";
 
 // ---- Backend interface -----------------------------------------------
 
 /**
+ * Dispatch result seen by the WASI shim. Parked outcomes are never
+ * possible in this path: the WASI shim never issues a blocking
+ * opcode (the opcodes that park, notably `IPC_ACCEPT` with flags=0,
+ * are PMos extensions exposed only through the production
+ * user-wasm-host → SAB-ring transport, not through the in-process
+ * WASI shim). The backend adapter enforces this by throwing if the
+ * host ever signals Parked, so this type can carry a required
+ * `response` without extra ceremony in the shim's 60-odd dispatch
+ * sites.
+ */
+export interface NonParkedDispatchResult {
+  readonly response: SyscallResponse;
+  readonly heapOut: Uint8Array;
+}
+
+/**
  * Synchronous syscall dispatcher the WASI shim calls into. Any
  * object that can accept a [`SyscallRequest`] + optional heap
- * input and return a [`DispatchResult`] is a valid backend.
+ * input and return a [`NonParkedDispatchResult`] is a valid
+ * backend.
  *
  * The pid is NOT part of this interface because backends are
  * bound to a specific pid at construction — the runtime that
@@ -67,7 +85,7 @@ import {
  * leaking process identity into the shim layer.
  */
 export interface KernelBackend {
-  dispatch(request: SyscallRequest, heapIn?: Uint8Array): DispatchResult;
+  dispatch(request: SyscallRequest, heapIn?: Uint8Array): NonParkedDispatchResult;
 }
 
 /**
@@ -80,6 +98,10 @@ export interface KernelBackend {
  * runtime module is self-contained: a caller that wants to run a
  * user binary against a kernel host needs exactly one import
  * (`UserWasmRuntime` + `KernelWasmHostBackend`) from this file.
+ *
+ * Throws if the underlying host ever signals Parked — the WASI
+ * shim never issues a blocking opcode, so Parked here is always a
+ * programming error the caller must see.
  */
 export class KernelWasmHostBackend implements KernelBackend {
   constructor(
@@ -87,8 +109,14 @@ export class KernelWasmHostBackend implements KernelBackend {
     private readonly pid: number,
   ) {}
 
-  dispatch(request: SyscallRequest, heapIn?: Uint8Array): DispatchResult {
-    return this.host.dispatch(this.pid, request, heapIn);
+  dispatch(request: SyscallRequest, heapIn?: Uint8Array): NonParkedDispatchResult {
+    const result = this.host.dispatch(this.pid, request, heapIn);
+    if (result.parked === true || result.response === undefined) {
+      throw new Error(
+        `KernelWasmHostBackend.dispatch: WASI shim issued a blocking opcode (0x${request.opcode.toString(16)}) that parked pid ${this.pid}; WASI backends do not support parking`,
+      );
+    }
+    return { response: result.response, heapOut: result.heapOut };
   }
 }
 

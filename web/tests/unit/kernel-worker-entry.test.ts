@@ -398,7 +398,7 @@ describe("installWorkerEntry with useRealKernel", () => {
       },
       message,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
 
     const writes = msg.posted.filter((m) => m.kind === "console:write");
     expect(writes).toHaveLength(1);

@@ -228,7 +228,7 @@ describe("SabBackend: PATH_OPEN on a missing path", () => {
     );
 
     expectByteEquivalent(subResult, refResult);
-    expect(subResult.response.status).toBe(-ERRNO.ENOENT);
+    expect(subResult.response!.status).toBe(-ERRNO.ENOENT);
   });
 });
 
@@ -256,9 +256,9 @@ describe("SabBackend: PROC_EXIT", () => {
     const subResult = makeSabBackend(sub.host, subPid, sab).dispatch(request);
 
     expectByteEquivalent(subResult, refResult);
-    expect(subResult.response.status).toBe(0);
-    expect(subResult.response.value).toBe(0n);
-    expect(subResult.response.extraLen).toBe(0);
+    expect(subResult.response!.status).toBe(0);
+    expect(subResult.response!.value).toBe(0n);
+    expect(subResult.response!.extraLen).toBe(0);
   });
 });
 
@@ -304,7 +304,7 @@ describe("SabBackend: production wake protocol (T234)", () => {
     });
     const result = backend.dispatch(request, message);
 
-    expect(result.response.status).toBe(0);
+    expect(result.response!.status).toBe(0);
     // serviceHook ran the kernel inline — wake slot unchanged.
     expect(Atomics.load(wakeSlot, 0)).toBe(beforeWake);
     // user_wait_slot also untouched — the production pre-stage that
@@ -344,7 +344,7 @@ describe("SabBackend: production wake protocol (T234)", () => {
     // ourselves, run serviceSab to land the response, THEN call
     // dispatch with a different request to verify the wake-protocol
     // writes happen on the dispatch path. Hmm — that conflates two
-    // pids' worth of state. Simpler: pre-canned response.
+    // pids' worth of state. Simpler: pre-canned response!.
     const message = new TextEncoder().encode("hi\n");
     const request: SyscallRequest = {
       opcode: OP_WASI.FD_WRITE,
@@ -408,10 +408,10 @@ describe("SabBackend: production wake protocol (T234)", () => {
     });
     const result = backend.dispatch(request, message);
 
-    // Result decoded the pre-canned response.
-    expect(result.response.requestId).toBe(1);
-    expect(result.response.status).toBe(0);
-    expect(result.response.value).toBe(2n);
+    // Result decoded the pre-canned response!.
+    expect(result.response!.requestId).toBe(1);
+    expect(result.response!.status).toBe(0);
+    expect(result.response!.value).toBe(2n);
 
     // Pre-stage of STATUS_REQUESTED happened before push.
     expect(Atomics.load(header, OFF_USER_WAIT_SLOT / 4)).toBe(STATUS_REQUESTED);

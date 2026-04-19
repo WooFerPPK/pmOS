@@ -57,7 +57,9 @@ use crate::platform;
 use crate::proc::{ExitStatus, Signal};
 use crate::sys::{Kernel, SpawnArgs, WaitOutcome, WaitTarget};
 
-use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno};
+use super::dispatch::{
+    args_u16, args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno, ServiceOutcome,
+};
 
 /// Dispatch a request whose opcode is in the PMos extension range.
 /// The caller has already guarded with [`abi::ext::is_ext`].
@@ -66,25 +68,25 @@ pub fn dispatch_ext(
     pid: Pid,
     req: &Request,
     heap: &mut [u8],
-) -> Response {
+) -> ServiceOutcome {
     match req.opcode {
-        op::IPC_SOCKET => handle_ipc_socket(kernel, pid, req),
-        op::IPC_BIND => handle_ipc_bind(kernel, pid, req, heap),
-        op::IPC_LISTEN => handle_ipc_listen(kernel, pid, req),
-        op::IPC_CONNECT => handle_ipc_connect(kernel, pid, req, heap),
+        op::IPC_SOCKET => ServiceOutcome::Done(handle_ipc_socket(kernel, pid, req)),
+        op::IPC_BIND => ServiceOutcome::Done(handle_ipc_bind(kernel, pid, req, heap)),
+        op::IPC_LISTEN => ServiceOutcome::Done(handle_ipc_listen(kernel, pid, req)),
+        op::IPC_CONNECT => ServiceOutcome::Done(handle_ipc_connect(kernel, pid, req, heap)),
         op::IPC_ACCEPT => handle_ipc_accept(kernel, pid, req),
-        op::IPC_PIPE => handle_ipc_pipe(kernel, pid, req, heap),
-        op::PROC_SELF => handle_proc_self(pid, req),
-        op::PROC_PARENT => handle_proc_parent(kernel, pid, req),
-        op::CAP_CHECK => handle_cap_check(kernel, pid, req),
-        op::CAP_LIST => handle_cap_list(kernel, pid, req),
-        op::PROC_SPAWN => handle_proc_spawn(kernel, pid, req, heap),
-        op::PROC_WAIT => handle_proc_wait(kernel, pid, req, heap),
-        op::PROC_KILL => handle_proc_kill(kernel, pid, req),
-        op::PROC_CAPS_GET => handle_proc_caps_get(kernel, pid, req),
-        op::DISPLAY_CONNECT => handle_display_connect(kernel, pid, req),
-        op::DISPLAY_BIND => handle_display_bind(kernel, pid, req),
-        _ => Response::err(req.request_id, ENOSYS),
+        op::IPC_PIPE => ServiceOutcome::Done(handle_ipc_pipe(kernel, pid, req, heap)),
+        op::PROC_SELF => ServiceOutcome::Done(handle_proc_self(pid, req)),
+        op::PROC_PARENT => ServiceOutcome::Done(handle_proc_parent(kernel, pid, req)),
+        op::CAP_CHECK => ServiceOutcome::Done(handle_cap_check(kernel, pid, req)),
+        op::CAP_LIST => ServiceOutcome::Done(handle_cap_list(kernel, pid, req)),
+        op::PROC_SPAWN => ServiceOutcome::Done(handle_proc_spawn(kernel, pid, req, heap)),
+        op::PROC_WAIT => ServiceOutcome::Done(handle_proc_wait(kernel, pid, req, heap)),
+        op::PROC_KILL => ServiceOutcome::Done(handle_proc_kill(kernel, pid, req)),
+        op::PROC_CAPS_GET => ServiceOutcome::Done(handle_proc_caps_get(kernel, pid, req)),
+        op::DISPLAY_CONNECT => ServiceOutcome::Done(handle_display_connect(kernel, pid, req)),
+        op::DISPLAY_BIND => ServiceOutcome::Done(handle_display_bind(kernel, pid, req)),
+        _ => ServiceOutcome::Done(Response::err(req.request_id, ENOSYS)),
     }
 }
 
@@ -262,19 +264,44 @@ fn handle_ipc_connect(
 //
 // Layout:
 //   args[0..4] = listener fd (u32)
+//   args[4..6] = flags (u16) — accept_flags::NONBLOCK bit toggles
+//                the -EAGAIN-on-empty-backlog semantic. flags=0
+//                blocks the caller until a client connects.
 // Response:
 //   value = freshly-allocated server-side fd of the accepted
 //           connection, or -EAGAIN if the listener has no pending
-//           clients.
-//
-// Reuses the existing `Kernel::accept_socket` method — same thing
-// `DISPLAY_CONNECT`'s server side will eventually use.
+//           clients and NONBLOCK is set.
+// Parked (new in slice 2a):
+//   No response is produced when flags=0 and backlog is empty;
+//   instead the caller is parked on the listener via
+//   `Kernel::park_on_accept`. A later `ipc_connect` from a peer
+//   unparks the caller through `Kernel.pending_wakes` +
+//   `kernel_take_next_wake_for_pid`.
 
-fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> ServiceOutcome {
+    use abi::ext::accept_flags;
     let listener_fd = args_u32(req, 0);
+    let flags = args_u16(req, 4);
+    let nonblock = (flags & accept_flags::NONBLOCK) != 0;
+
     match kernel.accept_socket(pid, listener_fd) {
-        Ok(fd) => Response::ok(req.request_id, fd as i64),
-        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+        Ok(fd) => ServiceOutcome::Done(Response::ok(req.request_id, fd as i64)),
+        Err(crate::sys::KernelError::WouldBlock) if nonblock => {
+            ServiceOutcome::Done(Response::err(req.request_id, EAGAIN))
+        }
+        Err(crate::sys::KernelError::WouldBlock) => {
+            match kernel.park_on_accept(pid, listener_fd, req.request_id) {
+                Ok(()) => ServiceOutcome::Parked,
+                Err(crate::sys::KernelError::WouldBlock) => {
+                    ServiceOutcome::Done(Response::err(req.request_id, EAGAIN))
+                }
+                Err(e) => ServiceOutcome::Done(Response::err(
+                    req.request_id,
+                    kerr_to_errno(e),
+                )),
+            }
+        }
+        Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
     }
 }
 

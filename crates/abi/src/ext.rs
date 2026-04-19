@@ -34,6 +34,16 @@ pub mod ipc_flags {
     pub const CLOEXEC:  u16 = 0x0002;
 }
 
+/// Flag bits accepted by syscalls that have a `flags: u16` parameter
+/// on the opcode surface. Mirrors the POSIX `SOCK_*` / `O_*` flag
+/// families but PMos-namespaced.
+pub mod accept_flags {
+    /// Return -EAGAIN on empty backlog instead of parking the caller.
+    /// Default (absence of this bit) is POSIX `accept(2)` — block
+    /// until a client connects or the process is signalled.
+    pub const NONBLOCK: u16 = 0x0001;
+}
+
 // --- 3.2 Process management (posix_spawn-style, no fork) ------------------
 pub const PROC_SPAWN:     u16 = 0x1100;
 pub const PROC_WAIT:      u16 = 0x1101;

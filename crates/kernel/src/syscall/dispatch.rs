@@ -28,6 +28,20 @@ use crate::dev::DevError;
 use crate::sys::{Kernel, KernelError};
 use crate::vfs::FsError;
 
+/// Outcome of a `dispatch()` call. Distinguishes "handler produced a
+/// response" (today's universal path) from "handler parked the
+/// caller" (new in slice 2a for `IPC_ACCEPT` with flags=0).
+///
+/// The caller (`Dispatcher::service_one`) pushes the response on
+/// `Done`; on `Parked`, the caller's user Worker stays on
+/// `Atomics.wait` until a future dispatch pass drains a wake for it
+/// via `kernel_take_next_wake_for_pid`.
+#[derive(Debug)]
+pub enum ServiceOutcome {
+    Done(Response),
+    Parked,
+}
+
 /// Per-process syscall dispatcher. Holds the bits every handler
 /// needs to know about — the kernel and the pid whose ring is
 /// being serviced — and nothing else. Rebuilt on every service
@@ -65,9 +79,18 @@ impl<'k> Dispatcher<'k> {
         let Some(req) = sab.try_pop_request() else {
             return false;
         };
-        let resp = dispatch(self.kernel, self.pid, &req, heap);
-        let ok = sab.try_push_response(&resp);
-        debug_assert!(ok, "syscall dispatcher: response ring overflow");
+        match dispatch(self.kernel, self.pid, &req, heap) {
+            ServiceOutcome::Done(resp) => {
+                let ok = sab.try_push_response(&resp);
+                debug_assert!(ok, "syscall dispatcher: response ring overflow");
+            }
+            ServiceOutcome::Parked => {
+                // Caller blocked; no response push. A future dispatch
+                // pass that unblocks them (via a peer's ipc_connect
+                // → `kernel.pending_wakes` append) will push the
+                // response through `kernel_take_next_wake_for_pid`.
+            }
+        }
         true
     }
 }
@@ -81,13 +104,18 @@ impl<'k> Dispatcher<'k> {
 /// assert that a given request shape produces a given response
 /// shape. [`Dispatcher::service_one`] wraps this with the ring
 /// pop/push pair.
-pub fn dispatch(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
+pub fn dispatch(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> ServiceOutcome {
     if is_wasi(req.opcode) {
-        super::wasi::dispatch_wasi(kernel, pid, req, heap)
+        ServiceOutcome::Done(super::wasi::dispatch_wasi(kernel, pid, req, heap))
     } else if is_ext(req.opcode) {
         super::ext::dispatch_ext(kernel, pid, req, heap)
     } else {
-        Response::err(req.request_id, ENOSYS)
+        ServiceOutcome::Done(Response::err(req.request_id, ENOSYS))
     }
 }
 
@@ -109,6 +137,18 @@ pub(super) fn args_u32(req: &Request, offset: usize) -> u32 {
         req.args[offset + 2],
         req.args[offset + 3],
     ])
+}
+
+/// Read a `u16` little-endian from `req.args` at `offset`. Mirror of
+/// [`args_u32`] / [`args_u64`]. Used by handlers that pack a 16-bit
+/// flag word into the inline args window (notably `IPC_ACCEPT`,
+/// which carries an `accept_flags` u16 at `args[4..6]`).
+///
+/// Panics (debug only) if `offset + 2 > 16`.
+#[inline]
+pub(super) fn args_u16(req: &Request, offset: usize) -> u16 {
+    debug_assert!(offset + 2 <= 16);
+    u16::from_le_bytes([req.args[offset], req.args[offset + 1]])
 }
 
 /// Read a `u64` little-endian from `req.args` at `offset`. Used by

@@ -462,6 +462,14 @@ async function runBootBinary(
     },
     manifest.heap,
   );
+  // PROC_SPAWN is not a parking opcode; a `dispatch` return without
+  // a response here is a programming error, not a legitimate Parked
+  // outcome.
+  if (response === undefined) {
+    throw new Error(
+      `kernel-worker: PROC_SPAWN(${bootBinary}) returned no response (parked?)`,
+    );
+  }
   if (response.status !== 0) {
     throw new Error(
       `kernel-worker: PROC_SPAWN(${bootBinary}) failed with status ${response.status}`,

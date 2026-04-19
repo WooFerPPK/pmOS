@@ -8453,7 +8453,12 @@ fn ipc_accept_on_empty_listener_returns_eagain() {
             opcode: op_ext::IPC_ACCEPT,
             flags: 0,
             request_id: 133,
-            args: u32_args(listener_fd),
+            args: {
+                let mut a = [0u8; 16];
+                a[0..4].copy_from_slice(&listener_fd.to_le_bytes());
+                a[4..6].copy_from_slice(&abi::ext::accept_flags::NONBLOCK.to_le_bytes());
+                a
+            },
             heap_ptr: 0,
             heap_len: 0,
         },
@@ -10508,4 +10513,85 @@ fn proc_caps_get_on_non_child_without_proc_inspect_returns_enotcapable() {
     let mut heap = vec![0u8; 16];
     let resp = dispatch(&mut k, a, &req, &mut heap);
     assert_eq!(resp.status, -errno::ENOTCAPABLE);
+}
+
+// ---- ipc_accept blocking semantics — one-parker invariant --------
+
+#[test]
+fn second_accept_on_parked_listener_returns_eagain() {
+    // v1 invariant: at most one parker per listener. A second
+    // blocking accept while one is parked gets -EAGAIN even with
+    // flags=0.
+    let mut k = make_kernel();
+    let ds = k
+        .register_process(RegisterArgs {
+            name: "display-server",
+            ppid: 0,
+            caps: abi::cap::initial::DISPLAY_SERVER,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(ds).unwrap();
+    k.procs.transition(ds, ProcState::Running).unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    // First parker lands.
+    k.park_on_accept(ds, listener_fd, 1).unwrap();
+
+    // Register a second display-server-capable pid (share the cap
+    // so it can observe the same fd lookup semantics). For the
+    // purposes of the parked-listener check, the second parker
+    // uses the same listener fd through a cloned handle — the
+    // simplest way to exercise this is to attempt to re-park
+    // the same pid on the same fd.
+    //
+    // The second call MUST fail with WouldBlock.
+    let err = k.park_on_accept(ds, listener_fd, 2).unwrap_err();
+    assert_eq!(err, kernel::sys::KernelError::WouldBlock);
+}
+
+#[test]
+fn park_on_accept_clears_on_listener_close() {
+    // If the listener closes while a parker is asleep, the parker
+    // must be woken with -EBADF (the listener fd/socket it was
+    // blocked on no longer exists) so it can observe the error
+    // rather than sitting parked forever.
+    let mut k = make_kernel();
+    let ds = k
+        .register_process(RegisterArgs {
+            name: "display-server",
+            ppid: 0,
+            caps: abi::cap::initial::DISPLAY_SERVER,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(ds).unwrap();
+    k.procs.transition(ds, ProcState::Running).unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    let req_id = 0xbadfu32;
+    k.park_on_accept(ds, listener_fd, req_id).unwrap();
+    assert_eq!(
+        k.procs.get(ds).unwrap().state,
+        kernel::proc::ProcState::BlockedOnIpc
+    );
+
+    // Close the listener via the fd table. This funnels through
+    // `release_object` -> `IpcTable::close_socket`, which detects
+    // the `parked_acceptor` slot and queues the -EBADF wake.
+    let table = k.fds_mut(ds).unwrap();
+    table.close(listener_fd).unwrap();
+    k.drain_closed_object_side_effects(); // processes the deferred socket close
+
+    // Parker is Ready again, with an EBADF wake queued.
+    assert_eq!(
+        k.procs.get(ds).unwrap().state,
+        kernel::proc::ProcState::Ready
+    );
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (pid, resp) = &wakes[0];
+    assert_eq!(*pid, ds);
+    assert_eq!(resp.request_id, req_id);
+    assert_eq!(resp.status, -abi::errno::EBADF);
 }

@@ -68,8 +68,7 @@ import {
   SLOT_SIZE,
   type SyscallRequest,
 } from "./shared/syscall";
-import type { DispatchResult } from "./kernel-wasm-host";
-import type { KernelBackend } from "./user-wasm-runtime";
+import type { KernelBackend, NonParkedDispatchResult } from "./user-wasm-runtime";
 
 /** Constructor options for [`SabBackend`]. */
 export interface SabBackendOptions {
@@ -185,7 +184,7 @@ export class SabBackend implements KernelBackend {
    * `serviceHook` runs (the hook should have serviced before
    * returning), or if a heap payload exceeds [`HEAP_SCRATCH_BYTES`].
    */
-  dispatch(request: SyscallRequest, heapIn?: Uint8Array): DispatchResult {
+  dispatch(request: SyscallRequest, heapIn?: Uint8Array): NonParkedDispatchResult {
     const heapPtr = request.heapPtr ?? 0;
 
     // Stage the heap payload into the SAB heap-scratch region at

@@ -69,7 +69,7 @@ use crate::fs::procfs::ProcFs;
 use crate::fs::tmpfs::TmpFs;
 use crate::proc::ProcState;
 use crate::sys::{Kernel, RegisterArgs};
-use crate::syscall::dispatch;
+use crate::syscall::dispatch::{self, ServiceOutcome};
 
 /// Size of the heap scratch region the dispatcher reads/writes
 /// variable-length payloads through. Picked as a round number
@@ -291,11 +291,41 @@ pub extern "C" fn kernel_dispatch(pid: Pid) -> i32 {
     let kernel = kernel_mut();
     let req = unsafe { Request::from_le_bytes(&REQ_SCRATCH) };
     let heap = unsafe { &mut HEAP_SCRATCH[..] };
-    let resp = dispatch(kernel, pid, &req, heap);
+    match dispatch::dispatch(kernel, pid, &req, heap) {
+        ServiceOutcome::Done(resp) => {
+            unsafe {
+                RESP_SCRATCH = resp.to_le_bytes();
+            }
+            0
+        }
+        ServiceOutcome::Parked => {
+            // Caller parked; no response written. JS side must NOT
+            // push to the caller's SAB — caller stays on
+            // Atomics.wait until a future drainWakesForPid pushes
+            // the delayed response.
+            1
+        }
+    }
+}
+
+/// Take the next pending wake for `pid` out of `Kernel.pending_wakes`,
+/// write its 32-byte Response into RESP_SCRATCH, and return 1. If
+/// nothing is queued for this pid, return 0. The JS dispatch loop
+/// drains by calling this repeatedly and pushing each RESP_SCRATCH
+/// snapshot onto the pid's SAB response ring (the same push path
+/// `serviceSab` uses for a Done response).
+#[no_mangle]
+pub extern "C" fn kernel_take_next_wake_for_pid(pid: Pid) -> i32 {
+    let kernel = kernel_mut();
+    let idx = match kernel.pending_wakes.iter().position(|(p, _)| *p == pid) {
+        Some(i) => i,
+        None => return 0,
+    };
+    let (_, resp) = kernel.pending_wakes.remove(idx);
     unsafe {
         RESP_SCRATCH = resp.to_le_bytes();
     }
-    0
+    1
 }
 
 // ---- device-input injection --------------------------------------------

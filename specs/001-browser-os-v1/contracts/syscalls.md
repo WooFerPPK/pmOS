@@ -209,6 +209,22 @@ ipc_accept(fd, flags: u16) -> fd
 **Semantics**: dequeues a pending connect and returns a new
 connected socket fd on the server side.
 
+- `flags = 0` (default): blocks the caller until a client
+  `ipc_connect`s to the listener or the process is signalled.
+  Corresponds to POSIX `accept(2)`. The kernel parks the caller
+  on the listener via `BlockReason::Ipc { endpoint_id }`; the
+  peer's `ipc_connect` wakes the parker with the new fd via the
+  kernel's pending-wakes queue.
+- `flags & accept_flags::NONBLOCK` (bit 0x0001): returns
+  `-EAGAIN` immediately when the backlog is empty. Corresponds
+  to POSIX `accept4(SOCK_NONBLOCK)`. Preserves v1's historical
+  non-blocking-by-default behaviour for callers that want it.
+
+Other flag bits are reserved and MUST be zero. A second blocking
+`ipc_accept` on a listener that already has a parked acceptor
+returns `-EAGAIN` regardless of flags (one-parker-per-listener
+invariant; v1 display-server needs only one acceptor at a time).
+
 #### `ipc_send` (0x1005)
 
 ```

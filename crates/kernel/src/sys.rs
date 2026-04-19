@@ -220,6 +220,13 @@ pub struct Kernel {
     /// signals (Term / Interrupt); SIGKILL is delivered
     /// synchronously without being queued.
     signal_inboxes: BTreeMap<Pid, SignalInbox>,
+    /// Responses queued for pids that were parked on a blocking
+    /// syscall and have since been unblocked (by a peer's action
+    /// or a kernel event). Drained per-pid by the dispatcher via
+    /// `kernel_take_next_wake_for_pid`, which pops one entry at
+    /// a time and writes its Response bytes into RESP_SCRATCH for
+    /// the JS side to push onto the pid's SAB response ring.
+    pub(crate) pending_wakes: alloc::vec::Vec<(Pid, abi::ring::Response)>,
 }
 
 impl Kernel {
@@ -233,6 +240,7 @@ impl Kernel {
             devs: DeviceDispatcher::new(),
             fds: BTreeMap::new(),
             signal_inboxes: BTreeMap::new(),
+            pending_wakes: alloc::vec::Vec::new(),
         }
     }
 
@@ -694,9 +702,12 @@ impl Kernel {
             return Err(KernelError::NotCapable);
         }
         let socket_id = self.ipc.create_socket(SocketType::Stream);
-        self.ipc.connect_socket(socket_id, DISPLAY_SOCKET_PATH)?;
+        let parker = self
+            .ipc
+            .connect_socket(socket_id, DISPLAY_SOCKET_PATH)?;
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
+        self.wake_parked_acceptor_if_any(parker)?;
         Ok(fd)
     }
 
@@ -731,6 +742,96 @@ impl Kernel {
             .ok_or(KernelError::NoSuchPid)?;
         let fd = table.alloc(FdEntry::new(FdObject::Socket(server_id.0)))?;
         Ok(fd)
+    }
+
+    /// Park `pid` on the listener socket at `listener_fd`, recording
+    /// `request_id` so a later `ipc_connect` can build the accept
+    /// response. Transitions `pid` from `Running` to `BlockedOnIpc`.
+    ///
+    /// Returns `WouldBlock` if the listener already has a parked
+    /// acceptor (v1 one-parker invariant), `BadFd` if the fd is
+    /// missing, `NotSupportedOnFd` if it isn't a socket,
+    /// `InvalidArgument` if the socket isn't in `Listening` state.
+    pub fn park_on_accept(
+        &mut self,
+        pid: Pid,
+        listener_fd: u32,
+        request_id: u32,
+    ) -> Result<(), KernelError> {
+        let listener_id = self.socket_id_from_fd(pid, listener_fd)?;
+        {
+            let sock = self
+                .ipc
+                .sockets_get_mut(listener_id)
+                .ok_or(KernelError::BadFd)?;
+            if sock.state != crate::ipc::SocketState::Listening {
+                return Err(KernelError::InvalidArgument);
+            }
+            if sock.parked_acceptor.is_some() {
+                return Err(KernelError::WouldBlock);
+            }
+            sock.parked_acceptor = Some((pid, request_id));
+        }
+        self.procs
+            .transition(pid, ProcState::BlockedOnIpc)
+            .map_err(|_| KernelError::NoSuchPid)?;
+        self.procs.set_block_reason(
+            pid,
+            crate::proc::BlockReason::Ipc { endpoint_id: listener_id.0 },
+        );
+        Ok(())
+    }
+
+    /// Companion to `park_on_accept`. Called from `ipc_connect`
+    /// (indirectly via `wake_parked_acceptor_if_any`) when a client
+    /// connect has just pushed onto the listener's backlog and a
+    /// parked acceptor is waiting. Completes the accept inline:
+    /// pops the client from the backlog, mints the server-side
+    /// socket + fd on `acceptor_pid`'s fd table, pairs the sockets,
+    /// returns the new fd.
+    ///
+    /// Symmetric to `accept_socket`, but the fd is allocated on a
+    /// different pid from the one driving the dispatcher cycle.
+    pub fn complete_parked_accept(
+        &mut self,
+        acceptor_pid: Pid,
+        listener_id: crate::ipc::SocketId,
+    ) -> Result<u32, KernelError> {
+        let server_id = self.ipc.accept_socket(listener_id)?;
+        let table = self
+            .fds
+            .get_mut(&acceptor_pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        let fd = table.alloc(FdEntry::new(FdObject::Socket(server_id.0)))?;
+        Ok(fd)
+    }
+
+    /// If `connect_socket` returned a parker tuple, complete the
+    /// parked accept inline, queue the wake response, and transition
+    /// the parker back to `Ready`. Called from `ipc_connect` and
+    /// `display_connect`.
+    ///
+    /// Failures in `complete_parked_accept` (e.g. the parker's fd
+    /// table is EMFILE) turn into error wakes — the parker gets
+    /// notified with the errno rather than sitting parked forever.
+    fn wake_parked_acceptor_if_any(
+        &mut self,
+        parker: Option<(Pid, u32, crate::ipc::SocketId)>,
+    ) -> Result<(), KernelError> {
+        let Some((acceptor_pid, req_id, listener_id)) = parker else {
+            return Ok(());
+        };
+        let wake_resp = match self.complete_parked_accept(acceptor_pid, listener_id) {
+            Ok(fd) => abi::ring::Response::ok(req_id, fd as i64),
+            Err(e) => abi::ring::Response::err(
+                req_id,
+                crate::syscall::dispatch::kerr_to_errno(e),
+            ),
+        };
+        self.pending_wakes.push((acceptor_pid, wake_resp));
+        let _ = self.procs.transition(acceptor_pid, ProcState::Ready);
+        self.procs.clear_block_reason(acceptor_pid);
+        Ok(())
     }
 
     // --- Generic IPC sockets -------------------------------------
@@ -830,7 +931,8 @@ impl Kernel {
         path: &str,
     ) -> Result<(), KernelError> {
         let socket_id = self.socket_id_from_fd(pid, fd)?;
-        self.ipc.connect_socket(socket_id, path)?;
+        let parker = self.ipc.connect_socket(socket_id, path)?;
+        self.wake_parked_acceptor_if_any(parker)?;
         Ok(())
     }
 
@@ -850,6 +952,76 @@ impl Kernel {
         }
     }
 
+    /// Public version of [`socket_id_from_fd`] for tests that want
+    /// to inspect the IpcTable's per-socket state by fd.
+    #[doc(hidden)]
+    pub fn socket_id_from_fd_public(
+        &self,
+        pid: Pid,
+        fd: u32,
+    ) -> Result<crate::ipc::SocketId, KernelError> {
+        self.socket_id_from_fd(pid, fd)
+    }
+
+    /// Test helper: True iff `pending_wakes` is empty.
+    #[doc(hidden)]
+    pub fn pending_wakes_is_empty(&self) -> bool {
+        self.pending_wakes.is_empty()
+    }
+
+    /// Test helper: clone of `pending_wakes` for assertions.
+    #[doc(hidden)]
+    pub fn pending_wakes_snapshot(&self) -> alloc::vec::Vec<(Pid, abi::ring::Response)> {
+        self.pending_wakes.clone()
+    }
+
+    /// Drain queued object-release side effects after an fd-table
+    /// close has run. Reconciles the IpcTable against the live fd
+    /// tables: any socket whose id is still in `self.ipc` but is no
+    /// longer referenced by *any* fd in *any* pid's fd table is an
+    /// orphan left behind by a direct `FdTable::close` call (see the
+    /// `park_on_accept_clears_on_listener_close` test), and gets the
+    /// same close-socket side effects `release_object` would've run
+    /// synchronously from `fd_close`.
+    #[doc(hidden)]
+    pub fn drain_closed_object_side_effects(&mut self) {
+        use alloc::collections::BTreeSet;
+        let mut live: BTreeSet<u32> = BTreeSet::new();
+        for table in self.fds.values() {
+            for (_fd, entry) in table.iter() {
+                if let FdObject::Socket(id) = entry.object {
+                    live.insert(id);
+                }
+            }
+        }
+        let orphans: alloc::vec::Vec<crate::ipc::SocketId> = self
+            .ipc
+            .sockets_iter_ids()
+            .filter(|id| {
+                if live.contains(&id.0) {
+                    return false;
+                }
+                match self.ipc.sockets_get(*id) {
+                    Some(s) => !s.closed,
+                    None => false,
+                }
+            })
+            .collect();
+        for id in orphans {
+            match self.ipc.close_socket(id) {
+                Ok(Some((parker_pid, req_id))) => {
+                    self.pending_wakes.push((
+                        parker_pid,
+                        abi::ring::Response::err(req_id, abi::errno::EBADF),
+                    ));
+                    let _ = self.procs.transition(parker_pid, ProcState::Ready);
+                    self.procs.clear_block_reason(parker_pid);
+                }
+                _ => {}
+            }
+        }
+    }
+
     // --- Private helpers -----------------------------------------
 
     /// Release any per-fd-object resources on the kernel side.
@@ -865,7 +1037,18 @@ impl Kernel {
                 let _ = self.ipc.drop_pipe_writer(crate::ipc::PipeId(id));
             }
             FdObject::Socket(id) => {
-                let _ = self.ipc.close_socket(crate::ipc::SocketId(id));
+                match self.ipc.close_socket(crate::ipc::SocketId(id)) {
+                    Ok(Some((parker_pid, req_id))) => {
+                        self.pending_wakes.push((
+                            parker_pid,
+                            abi::ring::Response::err(req_id, abi::errno::EBADF),
+                        ));
+                        let _ = self.procs.transition(parker_pid, ProcState::Ready);
+                        self.procs.clear_block_reason(parker_pid);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
             }
             FdObject::Vnode { .. }
             | FdObject::CharDevice(_)
@@ -912,6 +1095,10 @@ impl Kernel {
     /// cap-table + signal-inbox sweep.
     pub fn proc_exit(&mut self, pid: Pid, status: ExitStatus) -> Result<(), KernelError> {
         self.sched.remove(pid);
+        // If this pid is parked on any listener, clear the slot so
+        // the listener doesn't hold a stale reference after the
+        // process dies.
+        self.ipc.clear_parked_acceptor_for_pid(pid);
         self.release_fd_table_resources(pid);
         let ppid = self.procs.get(pid).map(|p| p.ppid).unwrap_or(0);
         self.procs

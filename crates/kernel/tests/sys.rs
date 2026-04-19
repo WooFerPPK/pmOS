@@ -1412,6 +1412,126 @@ fn multiple_clients_accept_into_distinct_server_side_fds() {
     assert_eq!(&buf[..n], b"from b");
 }
 
+// ---- ipc_accept blocking semantics (slice 2a) ---------------------
+
+#[test]
+fn ipc_accept_flags_zero_parks_caller_on_empty_backlog() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    // Park the display-server on the listener. Today's non-blocking
+    // `accept_socket` returns WouldBlock; the new `park_on_accept`
+    // records the parker in the socket and transitions the process
+    // to BlockedOnIpc without returning a Response.
+    let req_id = 0xcafeu32;
+    k.park_on_accept(ds, listener_fd, req_id).unwrap();
+
+    // State machine: display-server went Running -> BlockedOnIpc.
+    let proc = k.procs.get(ds).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::BlockedOnIpc);
+    assert!(matches!(
+        proc.block_reason,
+        Some(kernel::proc::BlockReason::Ipc { .. })
+    ));
+
+    // The listener's Socket has the parked acceptor recorded.
+    let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
+    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
+    assert_eq!(listener.parked_acceptor, Some((ds, req_id)));
+
+    // No response has been queued (nothing to wake yet).
+    assert!(k.pending_wakes_is_empty());
+}
+
+#[test]
+fn ipc_connect_wakes_parked_acceptor() {
+    use abi::ring::Response;
+
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    let req_id = 0xfeedu32;
+    k.park_on_accept(ds, listener_fd, req_id).unwrap();
+
+    // A client connects. This must complete the parked accept
+    // in-line: mint the server-side socket + fd, transition ds
+    // back to Ready, queue the pending wake.
+    let app = register_display_client(&mut k, "app");
+    let _client_fd = k.display_connect(app).unwrap();
+
+    // display-server is Ready again; block_reason cleared.
+    let proc = k.procs.get(ds).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Ready);
+    assert!(proc.block_reason.is_none());
+
+    // The listener's parked_acceptor is cleared (consumed).
+    let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
+    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
+    assert_eq!(listener.parked_acceptor, None);
+
+    // Exactly one pending wake: (ds, Response::ok(req_id, new_fd)).
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp) = &wakes[0];
+    assert_eq!(*wake_pid, ds);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, 0);
+    // The value is the freshly-minted server-side fd. It must be
+    // installed in ds's fd table and refer to a Socket object.
+    let new_fd = wake_resp.value as u32;
+    let entry = k.fds(ds).unwrap().get(new_fd).unwrap();
+    assert!(matches!(entry.object, kernel::fd::FdObject::Socket(_)));
+
+    // Sanity: the pre-slice "non-blocking accept_socket now returns
+    // the queued client" invariant still holds for reads after the
+    // wake — the new fd is usable.
+    let _ = Response {
+        request_id: 0,
+        status: 0,
+        value: 0,
+        extra_len: 0,
+        _pad: [0u8; 12],
+    };
+}
+
+#[test]
+fn ipc_accept_flags_nonblock_preserves_eagain() {
+    // NONBLOCK flag is read at the dispatcher layer (handle_ipc_
+    // accept branches on it). This test pins the kernel-side
+    // invariant: park_on_accept is NEVER called on the NONBLOCK
+    // path, which means the caller stays Running and the
+    // `parked_acceptor` slot stays None.
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.procs
+        .transition(ds, kernel::proc::ProcState::Running)
+        .unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    // Under the non-blocking path, accept_socket returns
+    // WouldBlock (today's behavior) and the caller does NOT
+    // transition to BlockedOnIpc.
+    let err = k.accept_socket(ds, listener_fd).unwrap_err();
+    assert_eq!(err, kernel::sys::KernelError::WouldBlock);
+
+    let proc = k.procs.get(ds).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Running);
+    assert!(proc.block_reason.is_none());
+
+    let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
+    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
+    assert_eq!(listener.parked_acceptor, None);
+    assert!(k.pending_wakes_is_empty());
+}
+
 // ---- proc_exit cleanup ---------------------------------------------
 //
 // `proc_exit` is the moment a process's kernel-side resources

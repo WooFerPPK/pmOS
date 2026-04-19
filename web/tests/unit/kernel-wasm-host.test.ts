@@ -12,7 +12,7 @@
 //     callback; FD_READ round trip after `injectInput` populates the
 //     console input ring; PROC_SELF / CAP_LIST for no-heap opcodes;
 //     PATH_OPEN for a heap-in + heap-out variant.
-//   * Error propagation: bad fd -> -EBADF in response.status; unknown
+//   * Error propagation: bad fd -> -EBADF in response!.status; unknown
 //     opcode -> -ENOSYS; heap overflow -> KernelWasmHost throws with
 //     a useful message.
 //   * `injectInput` rejects non-console devnums.
@@ -198,10 +198,10 @@ describe("dispatch: no-heap opcodes", () => {
       opcode: OP_EXT.PROC_SELF,
       requestId: 1,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(BigInt(pid));
-    expect(response.requestId).toBe(1);
-    expect(response.extraLen).toBe(0);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(BigInt(pid));
+    expect(response!.requestId).toBe(1);
+    expect(response!.extraLen).toBe(0);
   });
 
   it("CAP_LIST returns the full bitset (u64::MAX reinterprets as -1n)", async () => {
@@ -213,9 +213,9 @@ describe("dispatch: no-heap opcodes", () => {
       opcode: OP_EXT.CAP_LIST,
       requestId: 2,
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     // u64::MAX bit pattern reinterpreted as i64 is -1.
-    expect(response.value).toBe(-1n);
+    expect(response!.value).toBe(-1n);
   });
 
   it("CAP_CHECK returns 1 for a held cap and 0 for an absent cap", async () => {
@@ -231,7 +231,7 @@ describe("dispatch: no-heap opcodes", () => {
       requestId: 3,
       arg0: CAP.DISPLAY_CLIENT,
     });
-    expect(held.response.value).toBe(1n);
+    expect(held.response!.value).toBe(1n);
 
     // Absent: desktop shell does NOT hold DisplayServer. This
     // doubles as a regression test for the cap split.
@@ -240,7 +240,7 @@ describe("dispatch: no-heap opcodes", () => {
       requestId: 4,
       arg0: CAP.DISPLAY_SERVER,
     });
-    expect(absent.response.value).toBe(0n);
+    expect(absent.response!.value).toBe(0n);
   });
 });
 
@@ -266,8 +266,8 @@ describe("dispatch: FD_WRITE → /dev/console → onConsoleWrite", () => {
       message,
     );
 
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(BigInt(message.length));
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(BigInt(message.length));
     // The console driver only flushes complete lines; "hello\n" is
     // exactly one line, so we expect one callback with exact bytes.
     expect(consoleWrites).toHaveLength(1);
@@ -288,7 +288,7 @@ describe("dispatch: FD_WRITE → /dev/console → onConsoleWrite", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
     expect(consoleWrites).toHaveLength(0);
   });
 });
@@ -312,9 +312,9 @@ describe("dispatch: injectInput → FD_READ round trip", () => {
       heapLen: 16,
     });
 
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(3n);
-    expect(response.extraLen).toBe(3);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(3n);
+    expect(response!.extraLen).toBe(3);
     expect(Array.from(heapOut)).toEqual([
       "a".charCodeAt(0),
       "b".charCodeAt(0),
@@ -368,8 +368,8 @@ describe("dispatch: PATH_OPEN", () => {
       pathBytes,
     );
 
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -ENOENT for a missing path", async () => {
@@ -389,7 +389,7 @@ describe("dispatch: PATH_OPEN", () => {
       },
       pathBytes,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
   });
 });
 
@@ -440,7 +440,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
 
     // The file is now visible via PATH_FILESTAT_GET with filetype =
     // REGULAR_FILE.
@@ -455,7 +455,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(st.status).toBe(0);
+    expect(st!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.REGULAR_FILE);
   });
 
@@ -490,7 +490,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(response.status).toBe(-ERRNO.EEXIST);
+    expect(response!.status).toBe(-ERRNO.EEXIST);
   });
 
   it("returns -ENOTDIR when DIRECTORY targets a regular file", async () => {
@@ -524,7 +524,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(response.status).toBe(-ERRNO.ENOTDIR);
+    expect(response!.status).toBe(-ERRNO.ENOTDIR);
   });
 
   it("returns -EINVAL for CREAT|DIRECTORY", async () => {
@@ -544,7 +544,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("TRUNC zeroes an existing regular file", async () => {
@@ -565,8 +565,8 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(openResp.status).toBe(0);
-    const fd = Number(openResp.value);
+    expect(openResp!.status).toBe(0);
+    const fd = Number(openResp!.value);
 
     const writeBuf = new TextEncoder().encode("hello");
     const { response: wrResp } = host.dispatch(
@@ -580,7 +580,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       writeBuf,
     );
-    expect(wrResp.status).toBe(0);
+    expect(wrResp!.status).toBe(0);
 
     // Now re-open with TRUNC. The file should be 0 bytes post-open.
     const { response: truncResp } = host.dispatch(
@@ -594,7 +594,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(truncResp.status).toBe(0);
+    expect(truncResp!.status).toBe(0);
 
     // Stat confirms size = 0.
     const { response: st, heapOut } = host.dispatch(
@@ -608,7 +608,7 @@ describe("dispatch: PATH_OPEN oflags", () => {
       },
       pathBytes,
     );
-    expect(st.status).toBe(0);
+    expect(st!.status).toBe(0);
     const size = new DataView(heapOut.buffer, heapOut.byteOffset).getBigUint64(32, true);
     expect(size).toBe(0n);
   });
@@ -672,8 +672,8 @@ describe("dispatch: PATH_OPEN lookup_flags", () => {
       },
       linkPath,
     );
-    expect(response.status).toBe(0);
-    const fd = Number(response.value);
+    expect(response!.status).toBe(0);
+    const fd = Number(response!.value);
 
     const { response: stat, heapOut } = host.dispatch(
       pid,
@@ -685,7 +685,7 @@ describe("dispatch: PATH_OPEN lookup_flags", () => {
         heapLen: 0,
       },
     );
-    expect(stat.status).toBe(0);
+    expect(stat!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
   });
 
@@ -732,8 +732,8 @@ describe("dispatch: PATH_OPEN lookup_flags", () => {
       },
       linkPath,
     );
-    expect(response.status).toBe(0);
-    const fd = Number(response.value);
+    expect(response!.status).toBe(0);
+    const fd = Number(response!.value);
 
     // Stat the opened fd: filetype should be SYMBOLIC_LINK (7),
     // not DIRECTORY (3).
@@ -747,7 +747,7 @@ describe("dispatch: PATH_OPEN lookup_flags", () => {
         heapLen: 0,
       },
     );
-    expect(stat.status).toBe(0);
+    expect(stat!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.SYMBOLIC_LINK);
   });
 });
@@ -764,8 +764,8 @@ describe("dispatch: ENOSYS", () => {
       opcode: 0x4242,
       requestId: 40,
     });
-    expect(response.status).toBe(-ERRNO.ENOSYS);
-    expect(response.requestId).toBe(40);
+    expect(response!.status).toBe(-ERRNO.ENOSYS);
+    expect(response!.requestId).toBe(40);
   });
 
   it("returns -ENOSYS for a known WASI opcode without a handler", async () => {
@@ -784,7 +784,7 @@ describe("dispatch: ENOSYS", () => {
       opcode: OP_WASI.FD_FDSTAT_SET_RIGHTS,
       requestId: 41,
     });
-    expect(response.status).toBe(-ERRNO.ENOSYS);
+    expect(response!.status).toBe(-ERRNO.ENOSYS);
   });
 });
 
@@ -804,9 +804,9 @@ describe("dispatch: CLOCK_TIME_GET", () => {
       requestId: 50,
       arg0: CLOCKID.MONOTONIC,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1_234_567_890_000n);
-    expect(response.requestId).toBe(50);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1_234_567_890_000n);
+    expect(response!.requestId).toBe(50);
   });
 
   it("returns the `nowRealtimeNs` host import value for CLOCKID.REALTIME", async () => {
@@ -825,8 +825,8 @@ describe("dispatch: CLOCK_TIME_GET", () => {
       requestId: 51,
       arg0: CLOCKID.REALTIME,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1_700_000_000_000_000_000n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1_700_000_000_000_000_000n);
   });
 
   it("returns -ENOTSUP for CLOCKID.PROCESS_CPUTIME_ID", async () => {
@@ -839,8 +839,8 @@ describe("dispatch: CLOCK_TIME_GET", () => {
       requestId: 52,
       arg0: CLOCKID.PROCESS_CPUTIME_ID,
     });
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -ENOTSUP for CLOCKID.THREAD_CPUTIME_ID", async () => {
@@ -853,8 +853,8 @@ describe("dispatch: CLOCK_TIME_GET", () => {
       requestId: 53,
       arg0: CLOCKID.THREAD_CPUTIME_ID,
     });
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -EINVAL for an unknown clock id", async () => {
@@ -867,8 +867,8 @@ describe("dispatch: CLOCK_TIME_GET", () => {
       requestId: 54,
       arg0: 99,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
+    expect(response!.value).toBe(0n);
   });
 });
 
@@ -891,9 +891,9 @@ describe("dispatch: CLOCK_RES_GET", () => {
       requestId: 60,
       arg0: CLOCKID.MONOTONIC,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
-    expect(response.requestId).toBe(60);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
+    expect(response!.requestId).toBe(60);
   });
 
   it("returns 1 ns for CLOCKID.REALTIME", async () => {
@@ -906,8 +906,8 @@ describe("dispatch: CLOCK_RES_GET", () => {
       requestId: 61,
       arg0: CLOCKID.REALTIME,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
   });
 
   it("returns -ENOTSUP for CLOCKID.PROCESS_CPUTIME_ID", async () => {
@@ -920,8 +920,8 @@ describe("dispatch: CLOCK_RES_GET", () => {
       requestId: 62,
       arg0: CLOCKID.PROCESS_CPUTIME_ID,
     });
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -ENOTSUP for CLOCKID.THREAD_CPUTIME_ID", async () => {
@@ -934,8 +934,8 @@ describe("dispatch: CLOCK_RES_GET", () => {
       requestId: 63,
       arg0: CLOCKID.THREAD_CPUTIME_ID,
     });
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -EINVAL for an unknown clock id", async () => {
@@ -948,8 +948,8 @@ describe("dispatch: CLOCK_RES_GET", () => {
       requestId: 64,
       arg0: 99,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
+    expect(response!.value).toBe(0n);
   });
 });
 
@@ -1010,8 +1010,8 @@ describe("dispatch: FD_FILESTAT_GET", () => {
       heapPtr: 0,
       heapLen: 64,
     });
-    expect(response.status).toBe(0);
-    expect(response.extraLen).toBe(64);
+    expect(response!.status).toBe(0);
+    expect(response!.extraLen).toBe(64);
     const st = decodeFilestat(heapOut);
     expect(st.filetype).toBe(FILETYPE.CHARACTER_DEVICE);
     expect(st.nlink).toBe(1n);
@@ -1041,8 +1041,8 @@ describe("dispatch: FD_FILESTAT_GET", () => {
       requestId: 711,
       arg0: 0,
     });
-    expect(sockResp.response.status).toBe(0);
-    const sockFd = Number(sockResp.response.value);
+    expect(sockResp.response!.status).toBe(0);
+    const sockFd = Number(sockResp.response!.value);
 
     const { response, heapOut } = host.dispatch(pid, {
       opcode: OP_WASI.FD_FILESTAT_GET,
@@ -1051,8 +1051,8 @@ describe("dispatch: FD_FILESTAT_GET", () => {
       heapPtr: 0,
       heapLen: 64,
     });
-    expect(response.status).toBe(0);
-    expect(response.extraLen).toBe(64);
+    expect(response!.status).toBe(0);
+    expect(response!.extraLen).toBe(64);
     const st = decodeFilestat(heapOut);
     expect(st.filetype).toBe(FILETYPE.SOCKET_STREAM);
     expect(st.nlink).toBe(1n);
@@ -1071,8 +1071,8 @@ describe("dispatch: FD_FILESTAT_GET", () => {
       heapPtr: 0,
       heapLen: 64,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
-    expect(response.extraLen).toBe(0);
+    expect(response!.status).toBe(-ERRNO.EBADF);
+    expect(response!.extraLen).toBe(0);
   });
 
   it("reports the heap-out layout with times and size defaulting to 0 for non-Vnode fds", async () => {
@@ -1092,7 +1092,7 @@ describe("dispatch: FD_FILESTAT_GET", () => {
       heapPtr: 0,
       heapLen: 64,
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     const st = decodeFilestat(heapOut);
     expect(st.atim).toBe(0n);
     expect(st.mtim).toBe(0n);
@@ -1135,8 +1135,8 @@ describe("dispatch: PATH_FILESTAT_GET", () => {
       },
       path,
     );
-    expect(response.status).toBe(0);
-    expect(response.extraLen).toBe(64);
+    expect(response!.status).toBe(0);
+    expect(response!.extraLen).toBe(64);
     const st = decodeFilestat(heapOut);
     expect(st.filetype).toBe(FILETYPE.CHARACTER_DEVICE);
     expect(st.nlink).toBe(1n);
@@ -1160,8 +1160,8 @@ describe("dispatch: PATH_FILESTAT_GET", () => {
       },
       path,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
-    expect(response.extraLen).toBe(0);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
+    expect(response!.extraLen).toBe(0);
   });
 
   it("returns filetype=DIRECTORY for the root path /", async () => {
@@ -1181,8 +1181,8 @@ describe("dispatch: PATH_FILESTAT_GET", () => {
       },
       path,
     );
-    expect(response.status).toBe(0);
-    expect(response.extraLen).toBe(64);
+    expect(response!.status).toBe(0);
+    expect(response!.extraLen).toBe(64);
     const st = decodeFilestat(heapOut);
     expect(st.filetype).toBe(FILETYPE.DIRECTORY);
     // Root directory's nlink is 1 in tmpfs; size is 0 (directory).
@@ -1250,7 +1250,7 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
   });
 
   it("returns -EROFS for a /dev path (devfs is read-only)", async () => {
@@ -1270,7 +1270,7 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 
   it("returns -EINVAL when SET_ATIM and SET_ATIM_NOW are both set", async () => {
@@ -1297,7 +1297,7 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when SET_MTIM and SET_MTIM_NOW are both set", async () => {
@@ -1321,7 +1321,7 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when heap is shorter than the 16-byte atim/mtim prefix", async () => {
@@ -1341,7 +1341,7 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       },
       shortHeap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns 0 (no-op success) when fstflags is 0 on an existing path", async () => {
@@ -1364,7 +1364,7 @@ describe("dispatch: PATH_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 });
 
@@ -1401,8 +1401,8 @@ function openProcDirFd(host: KernelWasmHost, pid: number): number {
     },
     pathBytes,
   );
-  expect(response.status).toBe(0);
-  return Number(response.value);
+  expect(response!.status).toBe(0);
+  return Number(response!.value);
 }
 
 describe("dispatch: FD_READDIR", () => {
@@ -1418,7 +1418,7 @@ describe("dispatch: FD_READDIR", () => {
       heapPtr: 0,
       heapLen: 256,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns -EINVAL for a non-Vnode fd (/dev/console)", async () => {
@@ -1434,7 +1434,7 @@ describe("dispatch: FD_READDIR", () => {
       heapPtr: 0,
       heapLen: 256,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -ENOTDIR when the Vnode points at a regular file", async () => {
@@ -1450,7 +1450,7 @@ describe("dispatch: FD_READDIR", () => {
       heapPtr: 0,
       heapLen: 256,
     });
-    expect(response.status).toBe(-ERRNO.ENOTDIR);
+    expect(response!.status).toBe(-ERRNO.ENOTDIR);
   });
 
   it("returns 0 bytes written for a zero-capacity buffer (probe)", async () => {
@@ -1466,9 +1466,9 @@ describe("dispatch: FD_READDIR", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
-    expect(response.extraLen).toBe(0);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
+    expect(response!.extraLen).toBe(0);
   });
 
   it("lists /proc directory entries with valid dirent headers", async () => {
@@ -1484,10 +1484,10 @@ describe("dispatch: FD_READDIR", () => {
       heapPtr: 0,
       heapLen: 1024,
     });
-    expect(response.status).toBe(0);
-    const total = Number(response.value);
+    expect(response!.status).toBe(0);
+    const total = Number(response!.value);
     expect(total).toBeGreaterThan(0);
-    expect(response.extraLen).toBe(total);
+    expect(response!.extraLen).toBe(total);
 
     // Decode one entry — the first one — and verify the header
     // fields + name round-trip cleanly.
@@ -1563,7 +1563,7 @@ describe("dispatch: PATH_UNLINK_FILE", () => {
       },
       path,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
   });
 
   it("returns -EROFS for a /dev path (devfs is read-only)", async () => {
@@ -1583,7 +1583,7 @@ describe("dispatch: PATH_UNLINK_FILE", () => {
       },
       path,
     );
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 });
 
@@ -1605,7 +1605,7 @@ describe("dispatch: PATH_RENAME", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
   });
 
   it("returns -EROFS when renaming a devfs entry (read-only filesystem)", async () => {
@@ -1625,7 +1625,7 @@ describe("dispatch: PATH_RENAME", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 
   it("returns -EINVAL for zero old_len", async () => {
@@ -1645,7 +1645,7 @@ describe("dispatch: PATH_RENAME", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when old_len >= heap_len (empty new path)", async () => {
@@ -1665,7 +1665,7 @@ describe("dispatch: PATH_RENAME", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -1725,7 +1725,7 @@ describe("dispatch: PATH_LINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
   });
 
   it("returns -EROFS when linking within /dev (devfs inherits default)", async () => {
@@ -1745,7 +1745,7 @@ describe("dispatch: PATH_LINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 
   it("returns -ENOTSUP for cross-mount links", async () => {
@@ -1767,7 +1767,7 @@ describe("dispatch: PATH_LINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
   });
 
   it("returns -EINVAL for zero old_len", async () => {
@@ -1787,7 +1787,7 @@ describe("dispatch: PATH_LINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when old_len >= heap_len (empty new path)", async () => {
@@ -1807,7 +1807,7 @@ describe("dispatch: PATH_LINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when old_len > heap_len", async () => {
@@ -1827,7 +1827,7 @@ describe("dispatch: PATH_LINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -1878,7 +1878,7 @@ describe("dispatch: PATH_SYMLINK", () => {
       },
       heap,
     );
-    expect(mk.status).toBe(0);
+    expect(mk!.status).toBe(0);
 
     // Stat the created link; v1's resolver doesn't follow symlinks,
     // so stat returns the symlink's own metadata.
@@ -1894,8 +1894,8 @@ describe("dispatch: PATH_SYMLINK", () => {
       },
       pathHeap,
     );
-    expect(st.status).toBe(0);
-    expect(st.extraLen).toBe(64);
+    expect(st!.status).toBe(0);
+    expect(st!.extraLen).toBe(64);
     const filestat = decodeFilestat(heapOut);
     expect(filestat.filetype).toBe(FILETYPE.SYMBOLIC_LINK);
     // size = target byte length per POSIX.
@@ -1933,7 +1933,7 @@ describe("dispatch: PATH_SYMLINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EEXIST);
+    expect(response!.status).toBe(-ERRNO.EEXIST);
   });
 
   it("returns -ENOTSUP when creating a symlink in /dev", async () => {
@@ -1953,7 +1953,7 @@ describe("dispatch: PATH_SYMLINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
   });
 
   it("returns -EINVAL for zero old_len", async () => {
@@ -1973,7 +1973,7 @@ describe("dispatch: PATH_SYMLINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when old_len >= heap_len (empty new path)", async () => {
@@ -1993,7 +1993,7 @@ describe("dispatch: PATH_SYMLINK", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -2051,7 +2051,7 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
       },
       mkHeap,
     );
-    expect(mk.response.status).toBe(0);
+    expect(mk.response!.status).toBe(0);
 
     // Stat /link with lookup_flags=0x1 — follow the final symlink.
     const linkPath = new TextEncoder().encode("/link");
@@ -2066,7 +2066,7 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
       },
       linkPath,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
   });
 
@@ -2115,7 +2115,7 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
       },
       linkPath,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.SYMBOLIC_LINK);
   });
 
@@ -2151,7 +2151,7 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
       },
       probe,
     );
-    expect(response.status).toBe(-ERRNO.ELOOP);
+    expect(response!.status).toBe(-ERRNO.ELOOP);
   });
 
   it("reaches target through a three-link chain when follow is set", async () => {
@@ -2214,7 +2214,7 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
       },
       probe,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
   });
 
@@ -2285,7 +2285,7 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
       },
       probe,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.REGULAR_FILE);
   });
 });
@@ -2347,8 +2347,8 @@ describe("dispatch: PATH_READLINK", () => {
       },
       rlHeap,
     );
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(target.length);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(target.length);
     // Kernel writes target bytes at heap[0..n] (overwriting path).
     const decoded = new TextDecoder().decode(
       heapOut.subarray(0, target.length),
@@ -2392,7 +2392,7 @@ describe("dispatch: PATH_READLINK", () => {
       },
       rlHeap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -ENOENT on a missing path", async () => {
@@ -2414,7 +2414,7 @@ describe("dispatch: PATH_READLINK", () => {
       },
       rlHeap,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
   });
 
   it("returns -ENOTSUP on /dev (devfs inherits NotSupported default)", async () => {
@@ -2436,7 +2436,7 @@ describe("dispatch: PATH_READLINK", () => {
       },
       rlHeap,
     );
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
   });
 
   it("returns -EINVAL for zero path_len", async () => {
@@ -2456,7 +2456,7 @@ describe("dispatch: PATH_READLINK", () => {
       },
       rlHeap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -2482,7 +2482,7 @@ describe("dispatch: FD_PRESTAT_DIR_NAME", () => {
       heapPtr: 0,
       heapLen: 64,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns -EBADF even for an installed fd", async () => {
@@ -2498,7 +2498,7 @@ describe("dispatch: FD_PRESTAT_DIR_NAME", () => {
       heapPtr: 0,
       heapLen: 64,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -2538,7 +2538,7 @@ describe("dispatch: PATH_CREATE_DIRECTORY", () => {
       },
       path,
     );
-    expect(mk.status).toBe(0);
+    expect(mk!.status).toBe(0);
 
     // Verify the new directory exists via PATH_FILESTAT_GET.
     const { response: st, heapOut } = host.dispatch(
@@ -2552,8 +2552,8 @@ describe("dispatch: PATH_CREATE_DIRECTORY", () => {
       },
       path,
     );
-    expect(st.status).toBe(0);
-    expect(st.extraLen).toBe(64);
+    expect(st!.status).toBe(0);
+    expect(st!.extraLen).toBe(64);
     const filestat = decodeFilestat(heapOut);
     expect(filestat.filetype).toBe(FILETYPE.DIRECTORY);
   });
@@ -2588,7 +2588,7 @@ describe("dispatch: PATH_CREATE_DIRECTORY", () => {
       },
       path,
     );
-    expect(response.status).toBe(-ERRNO.EEXIST);
+    expect(response!.status).toBe(-ERRNO.EEXIST);
   });
 
   it("returns -EROFS on /dev (read-only filesystem)", async () => {
@@ -2608,7 +2608,7 @@ describe("dispatch: PATH_CREATE_DIRECTORY", () => {
       },
       path,
     );
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 });
 
@@ -2643,7 +2643,7 @@ describe("dispatch: PATH_REMOVE_DIRECTORY", () => {
       },
       path,
     );
-    expect(rm.status).toBe(0);
+    expect(rm!.status).toBe(0);
 
     // Subsequent PATH_FILESTAT_GET should report ENOENT.
     const { response: st } = host.dispatch(
@@ -2657,7 +2657,7 @@ describe("dispatch: PATH_REMOVE_DIRECTORY", () => {
       },
       path,
     );
-    expect(st.status).toBe(-ERRNO.ENOENT);
+    expect(st!.status).toBe(-ERRNO.ENOENT);
   });
 
   it("returns -ENOTEMPTY when the directory is not empty", async () => {
@@ -2705,7 +2705,7 @@ describe("dispatch: PATH_REMOVE_DIRECTORY", () => {
       },
       outer,
     );
-    expect(response.status).toBe(-ERRNO.ENOTEMPTY);
+    expect(response!.status).toBe(-ERRNO.ENOTEMPTY);
   });
 
   it("returns -ENOENT for a path that does not exist", async () => {
@@ -2725,7 +2725,7 @@ describe("dispatch: PATH_REMOVE_DIRECTORY", () => {
       },
       path,
     );
-    expect(response.status).toBe(-ERRNO.ENOENT);
+    expect(response!.status).toBe(-ERRNO.ENOENT);
   });
 });
 
@@ -2763,7 +2763,7 @@ describe("dispatch: FD_FDSTAT_SET_FLAGS", () => {
       requestId: 940,
       args: encodeFdFdstatSetFlagsArgs(1, FDFLAGS.NONBLOCK),
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("accepts DSYNC + RSYNC + SYNC bits as no-op success", async () => {
@@ -2778,7 +2778,7 @@ describe("dispatch: FD_FDSTAT_SET_FLAGS", () => {
       requestId: 941,
       args: encodeFdFdstatSetFlagsArgs(1, combined),
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -2791,7 +2791,7 @@ describe("dispatch: FD_FDSTAT_SET_FLAGS", () => {
       requestId: 942,
       args: encodeFdFdstatSetFlagsArgs(99, FDFLAGS.NONBLOCK),
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -2830,7 +2830,7 @@ describe("dispatch: FD_FILESTAT_SET_SIZE", () => {
       requestId: 950,
       args: encodeFdFilestatSetSizeArgs(1, 0n),
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -2843,7 +2843,7 @@ describe("dispatch: FD_FILESTAT_SET_SIZE", () => {
       requestId: 951,
       args: encodeFdFilestatSetSizeArgs(99, 100n),
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns -EROFS when truncating a procfs vnode (/proc/version)", async () => {
@@ -2866,15 +2866,15 @@ describe("dispatch: FD_FILESTAT_SET_SIZE", () => {
       },
       path,
     );
-    expect(open.status).toBe(0);
-    const fd = Number(open.value);
+    expect(open!.status).toBe(0);
+    const fd = Number(open!.value);
 
     const { response } = host.dispatch(pid, {
       opcode: OP_WASI.FD_FILESTAT_SET_SIZE,
       requestId: 953,
       args: encodeFdFilestatSetSizeArgs(fd, 0n),
     });
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 });
 
@@ -2929,8 +2929,8 @@ describe("dispatch: FD_PREAD", () => {
       },
       path,
     );
-    expect(open.status).toBe(0);
-    const fd = Number(open.value);
+    expect(open!.status).toBe(0);
+    const fd = Number(open!.value);
 
     const { response, heapOut } = host.dispatch(pid, {
       opcode: OP_WASI.FD_PREAD,
@@ -2939,9 +2939,9 @@ describe("dispatch: FD_PREAD", () => {
       heapPtr: 0,
       heapLen: 32,
     });
-    expect(response.status).toBe(0);
-    expect(response.value > 0n).toBe(true);
-    expect(response.extraLen).toBeGreaterThan(0);
+    expect(response!.status).toBe(0);
+    expect(response!.value > 0n).toBe(true);
+    expect(response!.extraLen).toBeGreaterThan(0);
     // First byte must be a printable ASCII char (procfs emits a
     // text-like version string, not zero bytes).
     expect(heapOut[0]).not.toBe(0);
@@ -2960,7 +2960,7 @@ describe("dispatch: FD_PREAD", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -2975,7 +2975,7 @@ describe("dispatch: FD_PREAD", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -2999,8 +2999,8 @@ describe("dispatch: FD_PWRITE", () => {
       },
       path,
     );
-    expect(open.status).toBe(0);
-    const fd = Number(open.value);
+    expect(open!.status).toBe(0);
+    const fd = Number(open!.value);
 
     const heap = new TextEncoder().encode("hi");
     const { response } = host.dispatch(
@@ -3014,7 +3014,7 @@ describe("dispatch: FD_PWRITE", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 
   it("returns -EINVAL on a char-device fd (non-Vnode)", async () => {
@@ -3035,7 +3035,7 @@ describe("dispatch: FD_PWRITE", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -3055,7 +3055,7 @@ describe("dispatch: FD_PWRITE", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -3108,7 +3108,7 @@ describe("dispatch: SOCK_SEND", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -3123,7 +3123,7 @@ describe("dispatch: SOCK_SEND", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns 0 on IPC_PIPE and the round-trip via fd_read/fd_write works", async () => {
@@ -3142,8 +3142,8 @@ describe("dispatch: SOCK_SEND", () => {
       heapPtr: 0,
       heapLen: 8,
     });
-    expect(response.status).toBe(0);
-    expect(response.extraLen).toBe(8);
+    expect(response!.status).toBe(0);
+    expect(response!.extraLen).toBe(8);
     const readFd = new DataView(
       heapOut.buffer,
       heapOut.byteOffset,
@@ -3169,8 +3169,8 @@ describe("dispatch: SOCK_SEND", () => {
       },
       payload,
     );
-    expect(writeRes.response.status).toBe(0);
-    expect(Number(writeRes.response.value)).toBe(4);
+    expect(writeRes.response!.status).toBe(0);
+    expect(Number(writeRes.response!.value)).toBe(4);
 
     // Read via the read fd and confirm.
     const readRes = host.dispatch(pid, {
@@ -3180,8 +3180,8 @@ describe("dispatch: SOCK_SEND", () => {
       heapPtr: 0,
       heapLen: 16,
     });
-    expect(readRes.response.status).toBe(0);
-    expect(Number(readRes.response.value)).toBe(4);
+    expect(readRes.response!.status).toBe(0);
+    expect(Number(readRes.response!.value)).toBe(4);
     const decoded = new TextDecoder().decode(readRes.heapOut.subarray(0, 4));
     expect(decoded).toBe("pipe");
   });
@@ -3198,7 +3198,7 @@ describe("dispatch: SOCK_SEND", () => {
       heapPtr: 0,
       heapLen: 4, // too short for (read_fd, write_fd) u32 pair
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("IPC_PIPE then close read fd then fd_write returns -EPIPE", async () => {
@@ -3246,7 +3246,7 @@ describe("dispatch: SOCK_SEND", () => {
       },
       payload,
     );
-    expect(response.status).toBe(-ERRNO.EPIPE);
+    expect(response!.status).toBe(-ERRNO.EPIPE);
   });
 
   it("returns -EPIPE after own write side is shut down", async () => {
@@ -3265,7 +3265,7 @@ describe("dispatch: SOCK_SEND", () => {
       requestId: 1070,
       arg0: 0,
     });
-    const srvFd = Number(srvResp.response.value);
+    const srvFd = Number(srvResp.response!.value);
 
     const bindPath = new TextEncoder().encode("/tmp/pair");
     host.dispatch(
@@ -3295,7 +3295,7 @@ describe("dispatch: SOCK_SEND", () => {
       requestId: 1073,
       arg0: 0,
     });
-    const clientFd = Number(clientResp.response.value);
+    const clientFd = Number(clientResp.response!.value);
 
     const connectArgs = new Uint8Array(16);
     new DataView(connectArgs.buffer).setUint32(0, clientFd, true);
@@ -3338,7 +3338,7 @@ describe("dispatch: SOCK_SEND", () => {
       },
       payload,
     );
-    expect(response.status).toBe(-ERRNO.EPIPE);
+    expect(response!.status).toBe(-ERRNO.EPIPE);
   });
 });
 
@@ -3356,7 +3356,7 @@ describe("dispatch: SOCK_RECV", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -3371,7 +3371,7 @@ describe("dispatch: SOCK_RECV", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -3406,7 +3406,7 @@ describe("dispatch: SOCK_ACCEPT", () => {
       requestId: 980,
       args: encodeSockAcceptArgs(1, 0),
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL on a freshly-created (Unbound) socket fd", async () => {
@@ -3422,15 +3422,15 @@ describe("dispatch: SOCK_ACCEPT", () => {
       requestId: 981,
       arg0: 0,
     });
-    expect(sockResp.response.status).toBe(0);
-    const sockFd = Number(sockResp.response.value);
+    expect(sockResp.response!.status).toBe(0);
+    const sockFd = Number(sockResp.response!.value);
 
     const { response } = host.dispatch(pid, {
       opcode: OP_WASI.SOCK_ACCEPT,
       requestId: 982,
       args: encodeSockAcceptArgs(sockFd, 0),
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -3443,7 +3443,95 @@ describe("dispatch: SOCK_ACCEPT", () => {
       requestId: 983,
       args: encodeSockAcceptArgs(99, 0),
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
+  });
+});
+
+describe("dispatch: IPC_ACCEPT blocking", () => {
+  it("flags=0 on empty backlog parks caller (no response returned)", async () => {
+    const { host } = await freshHost();
+    const dsPid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(dsPid, 0);
+    host.installConsoleFd(dsPid, 1);
+    host.installConsoleFd(dsPid, 2);
+    host.markRunning(dsPid);
+
+    // Bind the listener at /run/display.
+    const bindResult = host.dispatch(dsPid, {
+      opcode: OP_EXT.DISPLAY_BIND,
+      requestId: 1,
+    });
+    expect(bindResult.response).toBeDefined();
+    expect(bindResult.response!.status).toBe(0);
+    const listenerFd = Number(bindResult.response!.value);
+
+    // Dispatch IPC_ACCEPT with flags=0 (args-window zero-fill means
+    // args[4..6] is already zero, which is flags=0 = blocking).
+    const args = new Uint8Array(16);
+    new DataView(args.buffer).setUint32(0, listenerFd, true);
+
+    const acceptResult = host.dispatch(dsPid, {
+      opcode: OP_EXT.IPC_ACCEPT,
+      requestId: 42,
+      args,
+    });
+
+    // Parked: response is undefined, parked flag is true.
+    expect(acceptResult.parked).toBe(true);
+    expect(acceptResult.response).toBeUndefined();
+
+    // No pending wakes for ds yet — nobody has connected.
+    const wake = host.takeNextWakeForPid(dsPid);
+    expect(wake).toBeNull();
+  });
+
+  it("IPC_CONNECT from peer wakes parked acceptor; take-wake delivers response", async () => {
+    const { host } = await freshHost();
+
+    // Display-server pid parks on the listener.
+    const dsPid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(dsPid, 0);
+    host.installConsoleFd(dsPid, 1);
+    host.installConsoleFd(dsPid, 2);
+    host.markRunning(dsPid);
+    const bindResult = host.dispatch(dsPid, {
+      opcode: OP_EXT.DISPLAY_BIND,
+      requestId: 1,
+    });
+    const listenerFd = Number(bindResult.response!.value);
+
+    const acceptArgs = new Uint8Array(16);
+    new DataView(acceptArgs.buffer).setUint32(0, listenerFd, true);
+    const acceptResult = host.dispatch(dsPid, {
+      opcode: OP_EXT.IPC_ACCEPT,
+      requestId: 99,
+      args: acceptArgs,
+    });
+    expect(acceptResult.parked).toBe(true);
+
+    // Client pid connects.
+    const clientPid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(clientPid, 0);
+    host.installConsoleFd(clientPid, 1);
+    host.installConsoleFd(clientPid, 2);
+    host.markRunning(clientPid);
+    const connectResult = host.dispatch(clientPid, {
+      opcode: OP_EXT.DISPLAY_CONNECT,
+      requestId: 1,
+    });
+    expect(connectResult.response).toBeDefined();
+    expect(connectResult.response!.status).toBe(0);
+
+    // Take the wake for ds. Must return the parked accept's response:
+    // same request_id (99), status=0, value=a fresh server-side fd.
+    const wake = host.takeNextWakeForPid(dsPid);
+    expect(wake).not.toBeNull();
+    expect(wake!.requestId).toBe(99);
+    expect(wake!.status).toBe(0);
+    expect(Number(wake!.value)).toBeGreaterThan(0);
+
+    // A second take returns null — the queue is drained.
+    expect(host.takeNextWakeForPid(dsPid)).toBeNull();
   });
 });
 
@@ -3479,7 +3567,7 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
       requestId: 990,
       args: encodeSockShutdownArgs(1, SDFLAGS.RD | SDFLAGS.WR),
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("succeeds for a half-close (RD alone) on a Socket fd", async () => {
@@ -3496,15 +3584,15 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
       requestId: 991,
       arg0: 0,
     });
-    expect(sockResp.response.status).toBe(0);
-    const sockFd = Number(sockResp.response.value);
+    expect(sockResp.response!.status).toBe(0);
+    const sockFd = Number(sockResp.response!.value);
 
     const { response } = host.dispatch(pid, {
       opcode: OP_WASI.SOCK_SHUTDOWN,
       requestId: 992,
       args: encodeSockShutdownArgs(sockFd, SDFLAGS.RD),
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("succeeds for a half-close (WR alone) on a Socket fd", async () => {
@@ -3517,14 +3605,14 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
       requestId: 1060,
       arg0: 0,
     });
-    const sockFd = Number(sockResp.response.value);
+    const sockFd = Number(sockResp.response!.value);
 
     const { response } = host.dispatch(pid, {
       opcode: OP_WASI.SOCK_SHUTDOWN,
       requestId: 1061,
       args: encodeSockShutdownArgs(sockFd, SDFLAGS.WR),
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("succeeds for a full close (RD | WR) on a Socket fd", async () => {
@@ -3537,14 +3625,14 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
       requestId: 1062,
       arg0: 0,
     });
-    const sockFd = Number(sockResp.response.value);
+    const sockFd = Number(sockResp.response!.value);
 
     const { response } = host.dispatch(pid, {
       opcode: OP_WASI.SOCK_SHUTDOWN,
       requestId: 1063,
       args: encodeSockShutdownArgs(sockFd, SDFLAGS.RD | SDFLAGS.WR),
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns -EINVAL for a zero-how request on a Socket fd", async () => {
@@ -3557,14 +3645,14 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
       requestId: 993,
       arg0: 0,
     });
-    const sockFd = Number(sockResp.response.value);
+    const sockFd = Number(sockResp.response!.value);
 
     const { response } = host.dispatch(pid, {
       opcode: OP_WASI.SOCK_SHUTDOWN,
       requestId: 994,
       args: encodeSockShutdownArgs(sockFd, 0),
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF when the fd is not open", async () => {
@@ -3577,7 +3665,7 @@ describe("dispatch: SOCK_SHUTDOWN", () => {
       requestId: 995,
       args: encodeSockShutdownArgs(99, SDFLAGS.RD | SDFLAGS.WR),
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -3613,7 +3701,7 @@ describe("dispatch: FD_RENUMBER", () => {
       requestId: 870,
       args: encodeFdRenumberArgs(3, 7),
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
 
     // A write to fd 7 now reaches the console sink.
     const line = new TextEncoder().encode("hi\n");
@@ -3628,7 +3716,7 @@ describe("dispatch: FD_RENUMBER", () => {
       },
       line,
     );
-    expect(writeRes.response.status).toBe(0);
+    expect(writeRes.response!.status).toBe(0);
     expect(consoleWrites.length).toBe(1);
 
     // A write to fd 3 fails with EBADF — it was closed by the move.
@@ -3643,7 +3731,7 @@ describe("dispatch: FD_RENUMBER", () => {
       },
       line,
     );
-    expect(brokenRes.response.status).toBe(-ERRNO.EBADF);
+    expect(brokenRes.response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns 0 (no-op) when from == to on an open fd", async () => {
@@ -3657,7 +3745,7 @@ describe("dispatch: FD_RENUMBER", () => {
       requestId: 873,
       args: encodeFdRenumberArgs(5, 5),
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns -EBADF when from is unopened", async () => {
@@ -3670,7 +3758,7 @@ describe("dispatch: FD_RENUMBER", () => {
       requestId: 874,
       args: encodeFdRenumberArgs(99, 7),
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns -EBADF when from == to on an unopened fd (POSIX dup2(bad, bad))", async () => {
@@ -3683,7 +3771,7 @@ describe("dispatch: FD_RENUMBER", () => {
       requestId: 875,
       args: encodeFdRenumberArgs(42, 42),
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -3733,7 +3821,7 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns -EINVAL on a /dev/console fd (non-Vnode FdObject)", async () => {
@@ -3754,7 +3842,7 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when SET_ATIM and SET_ATIM_NOW are both set", async () => {
@@ -3777,7 +3865,7 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when SET_MTIM and SET_MTIM_NOW are both set", async () => {
@@ -3797,7 +3885,7 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns 0 (no-op success) for zero fstflags on a valid Vnode fd", async () => {
@@ -3821,7 +3909,7 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns -EROFS on a procfs Vnode fd with non-zero fstflags", async () => {
@@ -3845,7 +3933,7 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EROFS);
+    expect(response!.status).toBe(-ERRNO.EROFS);
   });
 });
 
@@ -3934,7 +4022,7 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EINVAL when heap is too short to hold the max of subs and events windows", async () => {
@@ -3955,7 +4043,7 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("CLOCK monotonic with ABSTIME in the past fires one ready event", async () => {
@@ -3982,9 +4070,9 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
-    expect(response.extraLen).toBe(POLL_EVENT_SIZE);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
+    expect(response!.extraLen).toBe(POLL_EVENT_SIZE);
     const ev = decodeEvent(heapOut, 0);
     expect(ev.userdata).toBe(42n);
     expect(ev.error).toBe(0);
@@ -4015,9 +4103,9 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
-    expect(response.extraLen).toBe(0);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
+    expect(response!.extraLen).toBe(0);
   });
 
   it("CLOCK with relative timeout 0 is ready (non-blocking semantics)", async () => {
@@ -4038,8 +4126,8 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
   });
 
   it("CLOCK invalid id emits one event with per-sub EINVAL", async () => {
@@ -4060,8 +4148,8 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
     const ev = decodeEvent(heapOut, 0);
     expect(ev.error).toBe(ERRNO.EINVAL);
     expect(ev.type).toBe(EVENTTYPE.CLOCK);
@@ -4085,8 +4173,8 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
     const ev = decodeEvent(heapOut, 0);
     expect(ev.error).toBe(ERRNO.ENOTSUP);
     expect(ev.type).toBe(EVENTTYPE.CLOCK);
@@ -4110,8 +4198,8 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
     const ev = decodeEvent(heapOut, 0);
     expect(ev.userdata).toBe(17n);
     expect(ev.error).toBe(ERRNO.EBADF);
@@ -4137,8 +4225,8 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(1n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
     const ev = decodeEvent(heapOut, 0);
     expect(ev.error).toBe(0);
     expect(ev.type).toBe(EVENTTYPE.FD_WRITE);
@@ -4164,8 +4252,8 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
   });
 
   it("events_cap clamps the output when more subs are ready than the cap allows", async () => {
@@ -4194,9 +4282,9 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(2n);
-    expect(response.extraLen).toBe(2 * POLL_EVENT_SIZE);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(2n);
+    expect(response!.extraLen).toBe(2 * POLL_EVENT_SIZE);
   });
 
   it("echoes userdata verbatim in the emitted event", async () => {
@@ -4218,7 +4306,7 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     const ev = decodeEvent(heapOut, 0);
     expect(ev.userdata).toBe(ud);
   });
@@ -4235,7 +4323,7 @@ describe("dispatch: POLL_ONEOFF", () => {
 //
 // FD_SEEK packs `(fd, whence, offset)` into the inline args window
 // (fd at 0..4, whence at 4..8, offset i64 at 8..16) and gets back the
-// new absolute offset in `response.value` — same shape as
+// new absolute offset in `response!.value` — same shape as
 // `clock_time_get` (one u64 result, no heap round-trip). The TS tests
 // pin the wire layout end-to-end through `kernel.wasm`'s dispatcher:
 // the EBADF + EINVAL paths cover the non-Vnode rejection branches
@@ -4277,8 +4365,8 @@ function openProcVersion(host: KernelWasmHost, pid: number): number {
     },
     pathBytes,
   );
-  expect(response.status).toBe(0);
-  return Number(response.value);
+  expect(response!.status).toBe(0);
+  return Number(response!.value);
 }
 
 describe("dispatch: FD_SEEK", () => {
@@ -4292,8 +4380,8 @@ describe("dispatch: FD_SEEK", () => {
       requestId: 770,
       args: encodeFdSeekArgs(99, WHENCE.SET, 0n),
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(-ERRNO.EBADF);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -EINVAL for a /dev/console fd (whence has no meaning on a CharDevice)", async () => {
@@ -4307,7 +4395,7 @@ describe("dispatch: FD_SEEK", () => {
       requestId: 771,
       args: encodeFdSeekArgs(1, WHENCE.SET, 0n),
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("SeekSet on a /proc/version Vnode fd returns the new absolute offset", async () => {
@@ -4321,8 +4409,8 @@ describe("dispatch: FD_SEEK", () => {
       requestId: 772,
       args: encodeFdSeekArgs(fd, WHENCE.SET, 7n),
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(7n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(7n);
   });
 
   it("SeekCur 0 reports the current offset (the fd_tell idiom)", async () => {
@@ -4337,15 +4425,15 @@ describe("dispatch: FD_SEEK", () => {
       requestId: 773,
       args: encodeFdSeekArgs(fd, WHENCE.SET, 4n),
     });
-    expect(seek.response.status).toBe(0);
+    expect(seek.response!.status).toBe(0);
 
     const tell = host.dispatch(pid, {
       opcode: OP_WASI.FD_SEEK,
       requestId: 774,
       args: encodeFdSeekArgs(fd, WHENCE.CUR, 0n),
     });
-    expect(tell.response.status).toBe(0);
-    expect(tell.response.value).toBe(4n);
+    expect(tell.response!.status).toBe(0);
+    expect(tell.response!.value).toBe(4n);
   });
 
   it("SeekEnd 0 returns the file size of /proc/version", async () => {
@@ -4364,7 +4452,7 @@ describe("dispatch: FD_SEEK", () => {
       heapPtr: 0,
       heapLen: 64,
     });
-    expect(stat.response.status).toBe(0);
+    expect(stat.response!.status).toBe(0);
     const size = decodeFilestat(stat.heapOut).size;
     expect(size).toBeGreaterThan(0n);
 
@@ -4373,8 +4461,8 @@ describe("dispatch: FD_SEEK", () => {
       requestId: 776,
       args: encodeFdSeekArgs(fd, WHENCE.END, 0n),
     });
-    expect(seek.response.status).toBe(0);
-    expect(seek.response.value).toBe(size);
+    expect(seek.response!.status).toBe(0);
+    expect(seek.response!.value).toBe(size);
   });
 });
 
@@ -4382,7 +4470,7 @@ describe("dispatch: FD_SEEK", () => {
 //
 // The read-only sibling of FD_SEEK: fd at a single u32 arg0 (no
 // whence + no offset — fd_tell takes nothing but an fd), response
-// carries the current absolute offset in `response.value`. Shares
+// carries the current absolute offset in `response!.value`. Shares
 // FD_SEEK's EBADF + non-Vnode-EINVAL guards; reuses the
 // `openProcVersion` + `encodeFdSeekArgs` helpers from the FD_SEEK
 // block for the after-seek integration check.
@@ -4399,8 +4487,8 @@ describe("dispatch: FD_TELL", () => {
       requestId: 780,
       arg0: fd,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns the seek'd offset after a SeekSet via FD_SEEK", async () => {
@@ -4415,15 +4503,15 @@ describe("dispatch: FD_TELL", () => {
       requestId: 781,
       args: encodeFdSeekArgs(fd, WHENCE.SET, 6n),
     });
-    expect(seek.response.status).toBe(0);
+    expect(seek.response!.status).toBe(0);
 
     const tell = host.dispatch(pid, {
       opcode: OP_WASI.FD_TELL,
       requestId: 782,
       arg0: fd,
     });
-    expect(tell.response.status).toBe(0);
-    expect(tell.response.value).toBe(6n);
+    expect(tell.response!.status).toBe(0);
+    expect(tell.response!.value).toBe(6n);
   });
 
   it("returns -EINVAL for a /dev/console fd (fd_tell has no meaning on a CharDevice)", async () => {
@@ -4437,7 +4525,7 @@ describe("dispatch: FD_TELL", () => {
       requestId: 783,
       arg0: 1,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -4471,8 +4559,8 @@ describe("dispatch: FD_ADVISE", () => {
       requestId: 790,
       arg0: fd,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -EINVAL for a /dev/console fd", async () => {
@@ -4486,7 +4574,7 @@ describe("dispatch: FD_ADVISE", () => {
       requestId: 791,
       arg0: 1,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF for an unopened fd", async () => {
@@ -4499,7 +4587,7 @@ describe("dispatch: FD_ADVISE", () => {
       requestId: 792,
       arg0: 99,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -4515,7 +4603,7 @@ describe("dispatch: FD_ALLOCATE", () => {
       requestId: 793,
       arg0: fd,
     });
-    expect(response.status).toBe(-ERRNO.ENOTSUP);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
   });
 
   it("returns -EINVAL for a /dev/console fd (non-Vnode rejection fires before ENOTSUP)", async () => {
@@ -4529,7 +4617,7 @@ describe("dispatch: FD_ALLOCATE", () => {
       requestId: 794,
       arg0: 1,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -EBADF for an unopened fd", async () => {
@@ -4542,7 +4630,7 @@ describe("dispatch: FD_ALLOCATE", () => {
       requestId: 795,
       arg0: 99,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -4558,8 +4646,8 @@ describe("dispatch: FD_SYNC", () => {
       requestId: 796,
       arg0: fd,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -EINVAL for a /dev/console fd", async () => {
@@ -4573,7 +4661,7 @@ describe("dispatch: FD_SYNC", () => {
       requestId: 797,
       arg0: 1,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -4589,8 +4677,8 @@ describe("dispatch: FD_DATASYNC", () => {
       requestId: 798,
       arg0: fd,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(0n);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(0n);
   });
 
   it("returns -EINVAL for a /dev/console fd", async () => {
@@ -4604,7 +4692,7 @@ describe("dispatch: FD_DATASYNC", () => {
       requestId: 799,
       arg0: 1,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -4612,7 +4700,7 @@ describe("dispatch: FD_DATASYNC", () => {
 //
 // PROC_WAIT (0x1101). Wire layout: args[0..4] = target_pid (i32),
 // args[4..8] = options u32 (WNOHANG=0x1). heap_len=4 writes the
-// reaped child's pid into heap[0..4]. On success, response.value
+// reaped child's pid into heap[0..4]. On success, response!.value
 // carries the packed status (low 32 exit code; 32..40 signum;
 // 40..48 flags: 0x01 Exited, 0x02 Signaled, 0x04 Crashed). Error
 // surface: EINVAL (target_pid < -1 or unknown options bits),
@@ -4643,7 +4731,7 @@ describe("dispatch: PROC_WAIT", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.ECHILD);
+    expect(response!.status).toBe(-ERRNO.ECHILD);
   });
 
   it("returns -ECHILD when the target pid is the caller itself", async () => {
@@ -4661,7 +4749,7 @@ describe("dispatch: PROC_WAIT", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.ECHILD);
+    expect(response!.status).toBe(-ERRNO.ECHILD);
   });
 
   it("returns -EINVAL when target_pid is below -1", async () => {
@@ -4679,14 +4767,14 @@ describe("dispatch: PROC_WAIT", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
 // ---- dispatch: PROC_CAPS_GET ----------------------------------------
 //
 // PROC_CAPS_GET (0x1105). Wire: args[0..4] = target_pid i32.
-// Returns CapSet as i64 in response.value on success; -ESRCH when
+// Returns CapSet as i64 in response!.value on success; -ESRCH when
 // the target doesn't exist; -ENOTCAPABLE when the sender is not
 // the target's parent, not self, and doesn't hold Cap::ProcInspect.
 
@@ -4713,10 +4801,10 @@ describe("dispatch: PROC_CAPS_GET", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     // CAPSET_ALL = u64::MAX. As an i64 that's -1; bit-pattern
     // round-trips through the value field.
-    expect(BigInt.asUintN(64, response.value)).toBe(CAPSET_ALL);
+    expect(BigInt.asUintN(64, response!.value)).toBe(CAPSET_ALL);
   });
 
   it("returns -ESRCH for an unknown target pid", async () => {
@@ -4734,7 +4822,7 @@ describe("dispatch: PROC_CAPS_GET", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.ESRCH);
+    expect(response!.status).toBe(-ERRNO.ESRCH);
   });
 });
 
@@ -4769,7 +4857,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns -ESRCH when the target pid does not exist", async () => {
@@ -4787,7 +4875,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.ESRCH);
+    expect(response!.status).toBe(-ERRNO.ESRCH);
   });
 
   it("returns 0 for self-SIGINT (POSIX kill(getpid(), SIGINT))", async () => {
@@ -4807,7 +4895,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   // POSIX `kill(pid, 0)` — the existence + permission probe. Same
@@ -4831,7 +4919,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns -ESRCH for an unknown pid with signum 0", async () => {
@@ -4849,7 +4937,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.ESRCH);
+    expect(response!.status).toBe(-ERRNO.ESRCH);
   });
 
   it("returns -ENOTCAPABLE when probing a non-child target without Cap::ProcKillAny", async () => {
@@ -4873,7 +4961,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.ENOTCAPABLE);
+    expect(response!.status).toBe(-ERRNO.ENOTCAPABLE);
   });
 
   // Signums 13 (SIGPIPE) and 17 (SIGCHLD) were added to the
@@ -4896,7 +4984,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns 0 for self-SIGCHLD (signum 17, accepted since 91c618f)", async () => {
@@ -4914,7 +5002,7 @@ describe("dispatch: PROC_KILL", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 });
 
@@ -4950,7 +5038,7 @@ describe("dispatch: PROC_RAISE", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
   it("returns 0 for self-SIGINT and queues a pending signal", async () => {
@@ -4970,7 +5058,7 @@ describe("dispatch: PROC_RAISE", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns 0 for self-SIGKILL (the response posts back before the caller is torn down)", async () => {
@@ -4992,7 +5080,7 @@ describe("dispatch: PROC_RAISE", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   // Signums 13 (SIGPIPE) and 17 (SIGCHLD) were added to the
@@ -5016,7 +5104,7 @@ describe("dispatch: PROC_RAISE", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 
   it("returns 0 for self-SIGCHLD (signum 17, accepted since 91c618f)", async () => {
@@ -5034,7 +5122,7 @@ describe("dispatch: PROC_RAISE", () => {
         heapLen: 0,
       },
     );
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
   });
 });
 
@@ -5064,7 +5152,7 @@ describe("dispatch: FD_READ on SignalChannel", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(raise.response.status).toBe(0);
+    expect(raise.response!.status).toBe(0);
 
     // Read fd 3 — expect 2 bytes = u16 LE 15.
     const { response, heapOut } = host.dispatch(pid, {
@@ -5074,8 +5162,8 @@ describe("dispatch: FD_READ on SignalChannel", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(2);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(2);
     expect(heapOut.length).toBeGreaterThanOrEqual(2);
     const signum = new DataView(
       heapOut.buffer,
@@ -5109,8 +5197,8 @@ describe("dispatch: FD_READ on SignalChannel", () => {
       heapPtr: 0,
       heapLen: 4,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(2);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(2);
     const signum = new DataView(
       heapOut.buffer,
       heapOut.byteOffset,
@@ -5134,7 +5222,7 @@ describe("dispatch: FD_READ on SignalChannel", () => {
       heapPtr: 0,
       heapLen: 8,
     });
-    expect(response.status).toBe(-ERRNO.EAGAIN);
+    expect(response!.status).toBe(-ERRNO.EAGAIN);
   });
 });
 
@@ -5157,8 +5245,8 @@ describe("dispatch: RANDOM_GET", () => {
       heapPtr: 0,
       heapLen: 8,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(8);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(8);
     expect(heapOut.length).toBe(8);
     // 8 random bytes match the all-zero buffer with chance 1 in
     // 2^64 — call it a stuck-source signal.
@@ -5187,8 +5275,8 @@ describe("dispatch: RANDOM_GET", () => {
       heapPtr: 0,
       heapLen: 8,
     });
-    expect(a.response.status).toBe(0);
-    expect(b.response.status).toBe(0);
+    expect(a.response!.status).toBe(0);
+    expect(b.response!.status).toBe(0);
     expect(Array.from(a.heapOut)).not.toEqual(Array.from(b.heapOut));
   });
 });
@@ -5211,8 +5299,8 @@ describe("dispatch: SCHED_YIELD", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(0);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(0);
   });
 });
 
@@ -5242,7 +5330,7 @@ describe("dispatch: FD_CLOSE", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 
   it("returns 0 when closing an installed console fd, then -EBADF on a re-close", async () => {
@@ -5258,7 +5346,7 @@ describe("dispatch: FD_CLOSE", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(close1.response.status).toBe(0);
+    expect(close1.response!.status).toBe(0);
 
     // Re-close — fd 1 is now released; the second call must
     // surface -EBADF (proves the close actually freed the slot,
@@ -5270,7 +5358,7 @@ describe("dispatch: FD_CLOSE", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(close2.response.status).toBe(-ERRNO.EBADF);
+    expect(close2.response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -5300,8 +5388,8 @@ describe("dispatch: CAP_CHECK", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(1);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(1);
   });
 
   it("returns value=0 when the caller doesn't hold the cap (CAPSET_ORDINARY_APP lacks Shell)", async () => {
@@ -5316,8 +5404,8 @@ describe("dispatch: CAP_CHECK", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(0);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(0);
   });
 
   it("returns -EINVAL for a cap id that doesn't correspond to a Cap discriminant", async () => {
@@ -5332,7 +5420,7 @@ describe("dispatch: CAP_CHECK", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
 
@@ -5354,9 +5442,9 @@ describe("dispatch: CAP_LIST", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
+    expect(response!.status).toBe(0);
     // u64::MAX reinterpreted as i64 is -1n (the sign bit set).
-    expect(response.value).toBe(-1n);
+    expect(response!.value).toBe(-1n);
   });
 
   it("returns CAPSET_ORDINARY_APP as i64 reinterpret when caller holds only DisplayClient", async () => {
@@ -5370,8 +5458,8 @@ describe("dispatch: CAP_LIST", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(CAPSET_ORDINARY_APP);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(CAPSET_ORDINARY_APP);
   });
 });
 
@@ -5396,9 +5484,9 @@ describe("dispatch: ARGS_SIZES_GET", () => {
       heapPtr: 0,
       heapLen: 8,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(0);
-    expect(response.extraLen).toBe(8);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(0);
+    expect(response!.extraLen).toBe(8);
     expect(heapOut.length).toBe(8);
     const view = new DataView(
       heapOut.buffer,
@@ -5422,8 +5510,8 @@ describe("dispatch: ARGS_GET", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(0);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(0);
   });
 });
 
@@ -5444,9 +5532,9 @@ describe("dispatch: ENVIRON_SIZES_GET", () => {
       heapPtr: 0,
       heapLen: 8,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(0);
-    expect(response.extraLen).toBe(8);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(0);
+    expect(response!.extraLen).toBe(8);
     expect(heapOut.length).toBe(8);
     const view = new DataView(
       heapOut.buffer,
@@ -5470,8 +5558,8 @@ describe("dispatch: ENVIRON_GET", () => {
       heapPtr: 0,
       heapLen: 0,
     });
-    expect(response.status).toBe(0);
-    expect(Number(response.value)).toBe(0);
+    expect(response!.status).toBe(0);
+    expect(Number(response!.value)).toBe(0);
   });
 });
 
@@ -5500,8 +5588,8 @@ describe("dispatch: FD_FDSTAT_GET", () => {
       heapPtr: 0,
       heapLen: 24,
     });
-    expect(response.status).toBe(0);
-    expect(response.extraLen).toBe(24);
+    expect(response!.status).toBe(0);
+    expect(response!.extraLen).toBe(24);
     expect(heapOut.length).toBe(24);
     // fdstat_t offset 0 = filetype u8
     expect(heapOut[0]).toBe(FILETYPE.CHARACTER_DEVICE);
@@ -5522,7 +5610,7 @@ describe("dispatch: FD_FDSTAT_GET", () => {
       heapPtr: 0,
       heapLen: 24,
     });
-    expect(response.status).toBe(-ERRNO.EBADF);
+    expect(response!.status).toBe(-ERRNO.EBADF);
   });
 });
 
@@ -5554,11 +5642,11 @@ describe("dispatch: PROC_SPAWN", () => {
       manifest.heap,
     );
 
-    expect(response.status).toBe(0);
-    expect(response.value).toBeGreaterThan(BigInt(parent));
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBeGreaterThan(BigInt(parent));
     expect(spawnCalls).toHaveLength(1);
     expect(spawnCalls[0]).toEqual({
-      pid: Number(response.value),
+      pid: Number(response!.value),
       path: "/usr/bin/hello",
     });
   });
@@ -5591,9 +5679,9 @@ describe("dispatch: PROC_SPAWN", () => {
     );
 
     // Kernel maps any platform spawn error to -EIO for the
-    // userland response. The exact errno is not yet threaded
+    // userland response!. The exact errno is not yet threaded
     // through (see the SpawnOutcome type doc).
-    expect(response.status).toBeLessThan(0);
+    expect(response!.status).toBeLessThan(0);
     // The callback still fired with the tentative pid so the host
     // side has a chance to log / surface the refusal.
     expect(spawnCalls).toHaveLength(1);
@@ -5619,7 +5707,7 @@ describe("dispatch: PROC_SPAWN", () => {
     // Retry uses the default outcome from this closure, which is
     // `{ ok: false, errno: EINVAL }` again — still fails for the
     // same reason, but the dispatcher itself doesn't crash.
-    expect(retry.response.status).toBeLessThan(0);
+    expect(retry.response!.status).toBeLessThan(0);
   });
 
   it("rejects spawn from a parent missing stdio with -EINVAL", async () => {
@@ -5647,7 +5735,7 @@ describe("dispatch: PROC_SPAWN", () => {
       manifest.heap,
     );
 
-    expect(response.status).toBe(-ERRNO.EINVAL);
+    expect(response!.status).toBe(-ERRNO.EINVAL);
     expect(spawnCalls).toHaveLength(0);
   });
 
@@ -5681,7 +5769,7 @@ describe("dispatch: PROC_SPAWN", () => {
     );
 
     // abi::errno::ENOTCAPABLE is 76.
-    expect(response.status).toBe(-76);
+    expect(response!.status).toBe(-76);
     expect(spawnCalls).toHaveLength(0);
   });
 });
@@ -5806,10 +5894,10 @@ describe("serviceSab: FD_WRITE → onConsoleWrite round trip", () => {
     expect(Atomics.load(header, OFF_RES_HEAD / 4)).toBe(1);
     expect(Atomics.load(header, OFF_RES_TAIL / 4)).toBe(0);
     const response = readResponseSlot(sab);
-    expect(response.requestId).toBe(100);
-    expect(response.status).toBe(0);
-    expect(response.value).toBe(BigInt(message.length));
-    expect(response.extraLen).toBe(0);
+    expect(response!.requestId).toBe(100);
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(BigInt(message.length));
+    expect(response!.extraLen).toBe(0);
 
     // Driver-side effect: the console driver saw the exact line.
     expect(consoleWrites).toHaveLength(1);
@@ -5853,15 +5941,15 @@ describe("serviceSab: PROC_EXIT", () => {
     expect(rc).toBe(0);
 
     const response = readResponseSlot(sab);
-    expect(response.requestId).toBe(200);
-    expect(response.status).toBe(0);
+    expect(response!.requestId).toBe(200);
+    expect(response!.status).toBe(0);
     // PROC_EXIT carries no return value; the dispatcher reports
     // success-with-value-zero and the user-side unwinds via the
     // `UserProcessExited` sentinel before ever reading this
-    // response. The assertion here is that the response bytes
+    // response!. The assertion here is that the response bytes
     // reach the SAB correctly.
-    expect(response.value).toBe(0n);
-    expect(response.extraLen).toBe(0);
+    expect(response!.value).toBe(0n);
+    expect(response!.extraLen).toBe(0);
 
     const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
     expect(Atomics.load(header, OFF_REQ_TAIL / 4)).toBe(1);
@@ -5885,14 +5973,14 @@ describe("serviceSab: PROC_EXIT", () => {
       opcode: OP_EXT.DISPLAY_BIND,
       requestId: 300,
     });
-    expect(bindResult.response.status).toBe(0);
+    expect(bindResult.response!.status).toBe(0);
 
     const exitResult = host.dispatch(ds, {
       opcode: OP_WASI.PROC_EXIT,
       requestId: 301,
       arg0: 0,
     });
-    expect(exitResult.response.status).toBe(0);
+    expect(exitResult.response!.status).toBe(0);
 
     const client = host.registerProcess(CAPSET_ALL);
     host.markRunning(client);
@@ -5900,7 +5988,7 @@ describe("serviceSab: PROC_EXIT", () => {
       opcode: OP_EXT.DISPLAY_CONNECT,
       requestId: 302,
     });
-    expect(connectResult.response.status).toBe(-ERRNO.ECONNREFUSED);
+    expect(connectResult.response!.status).toBe(-ERRNO.ECONNREFUSED);
   });
 
   it("frees the display-server path so a second pid can rebind it", async () => {
@@ -5917,14 +6005,14 @@ describe("serviceSab: PROC_EXIT", () => {
       opcode: OP_EXT.DISPLAY_BIND,
       requestId: 400,
     });
-    expect(firstBind.response.status).toBe(0);
+    expect(firstBind.response!.status).toBe(0);
 
     const firstExit = host.dispatch(first, {
       opcode: OP_WASI.PROC_EXIT,
       requestId: 401,
       arg0: 0,
     });
-    expect(firstExit.response.status).toBe(0);
+    expect(firstExit.response!.status).toBe(0);
 
     const second = host.registerProcess(CAPSET_ALL);
     host.markRunning(second);
@@ -5932,6 +6020,6 @@ describe("serviceSab: PROC_EXIT", () => {
       opcode: OP_EXT.DISPLAY_BIND,
       requestId: 402,
     });
-    expect(secondBind.response.status).toBe(0);
+    expect(secondBind.response!.status).toBe(0);
   });
 });

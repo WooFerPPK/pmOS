@@ -179,7 +179,17 @@ impl IpcTable {
     /// `path`. Queues a connection request on the listener's
     /// backlog and moves `client_id` to `Connecting`. The
     /// accept step (separate call) matches up pending clients.
-    pub fn connect_socket(&mut self, client_id: SocketId, path: &str) -> Result<(), IpcError> {
+    ///
+    /// If the listener has a parked acceptor at the time of
+    /// connect, the parker tuple `(pid, request_id, listener_id)`
+    /// is drained out of the socket and returned so the caller
+    /// (Kernel) can complete the parked accept inline and queue
+    /// a wake response. Otherwise returns `Ok(None)`.
+    pub fn connect_socket(
+        &mut self,
+        client_id: SocketId,
+        path: &str,
+    ) -> Result<Option<(Pid, u32, SocketId)>, IpcError> {
         let listener_id = self
             .bindings
             .get(path)
@@ -206,7 +216,8 @@ impl IpcTable {
             return Err(IpcError::ConnectionRefused);
         }
         listener.backlog.push_back(client_id);
-        Ok(())
+        let parker = listener.parked_acceptor.take();
+        Ok(parker.map(|(pid, req_id)| (pid, req_id, listener_id)))
     }
 
     /// Accept one pending connection from a listening socket,
@@ -434,8 +445,8 @@ impl IpcTable {
         Ok(())
     }
 
-    pub fn close_socket(&mut self, id: SocketId) -> Result<(), IpcError> {
-        let (_peer, bound, drained) = {
+    pub fn close_socket(&mut self, id: SocketId) -> Result<Option<(Pid, u32)>, IpcError> {
+        let (_peer, bound, drained, parker) = {
             let sock = self.sockets.get_mut(&id).ok_or(IpcError::NoSuchSocket)?;
             sock.closed = true;
             // Snapshot the pending backlog *only* if this socket
@@ -448,7 +459,8 @@ impl IpcTable {
             } else {
                 Vec::new()
             };
-            (sock.peer, sock.bound_path.clone(), drained)
+            let parker = sock.parked_acceptor.take();
+            (sock.peer, sock.bound_path.clone(), drained, parker)
         };
         if let Some(path) = bound {
             self.bindings.remove(&path);
@@ -461,12 +473,49 @@ impl IpcTable {
         // DO NOT clear the peer's .peer pointer: the peer
         // needs to reach us via that pointer to observe our
         // `closed` flag during its next send/recv.
-        Ok(())
+        Ok(parker)
     }
 
     /// Number of live sockets. Diagnostic.
     pub fn socket_count(&self) -> usize {
         self.sockets.len()
+    }
+
+    /// Look up a `Socket` by id. Used by tests that need to inspect
+    /// per-socket state (e.g. `parked_acceptor`).
+    #[doc(hidden)]
+    pub fn sockets_get(&self, id: SocketId) -> Option<&crate::ipc::socket::Socket> {
+        self.sockets.get(&id)
+    }
+
+    /// Mutable variant of [`sockets_get`]. Used by `Kernel::park_on_
+    /// accept` and close-time wake drain to flip the `parked_acceptor`
+    /// slot without borrowing the rest of the IpcTable.
+    #[doc(hidden)]
+    pub fn sockets_get_mut(&mut self, id: SocketId) -> Option<&mut crate::ipc::socket::Socket> {
+        self.sockets.get_mut(&id)
+    }
+
+    /// Walk every live socket and clear any `parked_acceptor` slot
+    /// whose pid matches. Called from `Kernel::proc_exit` when a
+    /// parked process dies.
+    pub fn clear_parked_acceptor_for_pid(&mut self, pid: Pid) {
+        for sock in self.sockets.values_mut() {
+            if let Some((parker_pid, _)) = sock.parked_acceptor {
+                if parker_pid == pid {
+                    sock.parked_acceptor = None;
+                }
+            }
+        }
+    }
+
+    /// Iterate all live socket ids. Used by test helpers that need
+    /// to reconcile the IpcTable against an externally-observed
+    /// fd-table state (notably `Kernel::drain_closed_object_side_
+    /// effects`).
+    #[doc(hidden)]
+    pub fn sockets_iter_ids(&self) -> impl Iterator<Item = SocketId> + '_ {
+        self.sockets.keys().copied()
     }
 }
 
