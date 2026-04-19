@@ -130,6 +130,7 @@ let helloPidWasmBytes: ArrayBuffer;
 let helloSelfProbeWasmBytes: ArrayBuffer;
 let helloPpidWasmBytes: ArrayBuffer;
 let helloCapsWasmBytes: ArrayBuffer;
+let helloRaiseWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -198,6 +199,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_caps.wasm",
   );
+  const helloRaisePath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_raise.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -241,6 +246,7 @@ beforeAll(() => {
     helloSelfProbePath,
     helloPpidPath,
     helloCapsPath,
+    helloRaisePath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -279,6 +285,7 @@ beforeAll(() => {
   helloSelfProbeWasmBytes = loadWasm(helloSelfProbePath);
   helloPpidWasmBytes = loadWasm(helloPpidPath);
   helloCapsWasmBytes = loadWasm(helloCapsPath);
+  helloRaiseWasmBytes = loadWasm(helloRaisePath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1406,6 +1413,70 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getBigUint64(0, true);
     expect(reportedCaps).toBe(CAPSET_ALL);
     expect(consoleWrites[0]![8]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-raise self-raises SIGTERM via WASI proc_raise and drains it from fd 3 as u16 LE", async () => {
+    // End-to-end proof of the WASI proc_raise path (cbe8959's
+    // self-signal arm) through a real wasm32-wasip1 binary —
+    // sister to hello-sigchld, which exercises the
+    // kernel-generated parent-kill path. Origin difference:
+    // hello-sigchld observes SIGTERM queued by its parent's
+    // PROC_KILL; hello-raise observes SIGTERM queued by its own
+    // proc_raise call. The fd 3 drain path is identical.
+    //
+    // Because proc_raise is synchronous (the signal is queued on
+    // the caller's inbox before the shim returns), no EAGAIN
+    // polling is required: the fd_read that follows always finds
+    // the pending signal on the first dispatch. The binary writes
+    // 2 bytes (u16 LE signum 15) plus a trailing newline = 3
+    // bytes.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-raise", helloRaiseWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-raise",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(3);
+    const signum = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getUint16(0, true);
+    expect(signum).toBe(15);
+    expect(consoleWrites[0]![2]).toBe(0x0a); // '\n'
   });
 
   it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {

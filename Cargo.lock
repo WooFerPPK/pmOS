@@ -76,6 +76,10 @@ name = "hello-ppid"
 version = "0.1.0"
 
 [[package]]
+name = "hello-raise"
+version = "0.1.0"
+
+[[package]]
 name = "hello-self-probe"
 version = "0.1.0"
 
