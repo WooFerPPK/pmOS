@@ -48,6 +48,10 @@ name = "hello-cap-check"
 version = "0.1.0"
 
 [[package]]
+name = "hello-cap-list"
+version = "0.1.0"
+
+[[package]]
 name = "hello-caps"
 version = "0.1.0"
 

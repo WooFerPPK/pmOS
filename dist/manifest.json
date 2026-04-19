@@ -10,6 +10,7 @@
     "assets/bin/hello-clock.wasm",
     "assets/bin/hello-std.wasm",
     "assets/bin/hello_cap_check.wasm",
+    "assets/bin/hello_cap_list.wasm",
     "assets/bin/hello_caps.wasm",
     "assets/bin/hello_fb_blit.wasm",
     "assets/bin/hello_fd_close_bad.wasm",

@@ -2146,6 +2146,35 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // `cap_list(caps_out_ptr: i32) -> i32`
+      //
+      // No-args "give me my own caps" primitive. Writes the
+      // caller's CapSet as a u64 LE to `caps_out_ptr` on success.
+      // Returns 0 on success, negative errno on failure (only
+      // -EINVAL if `caps_out_ptr` is 0; the kernel-side
+      // handle_cap_list itself only errors with ESRCH if the
+      // caller's pid has been removed from the process table,
+      // normally unreachable). Functionally equivalent to
+      // proc_caps_get(proc_self(), out) but saves the proc_self
+      // round-trip; mirrors POSIX `getcap()`.
+      cap_list: (capsOutPtr: number): number => {
+        if (capsOutPtr === 0 || this.memory === undefined) {
+          return -ERRNO.EINVAL;
+        }
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.CAP_LIST,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) {
+          return response.status;
+        }
+        const memView = new DataView(this.memory.buffer);
+        memView.setBigUint64(capsOutPtr, BigInt.asUintN(64, response.value), true);
+        return 0;
+      },
+
       // `cap_check(cap_id: i32) -> i32`
       //
       // Per-cap yes/no probe. Returns:

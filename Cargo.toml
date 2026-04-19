@@ -37,6 +37,7 @@ members = [
     "crates/hello-cap-check",
     "crates/hello-random",
     "crates/hello-fd-close-bad",
+    "crates/hello-cap-list",
     "crates/hello-std",
     "crates/hello-clock",
     "crates/integration-tests",
