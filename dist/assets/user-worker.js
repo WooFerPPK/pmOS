@@ -982,10 +982,17 @@ var UserWasmRuntime = class {
       // WASI `proc_raise(signum: i32) -> errno`.
       //
       // POSIX `raise(sig)`: deliver a signal to the calling process.
-      // v1 knows three (SIGINT=2, SIGTERM=15 queued on the caller's
-      // SignalInbox; SIGKILL=9 zombifies). The kernel handler packs
-      // signum into `args[0..2]` as a u16 and returns 0 on success
-      // or negative errno on failure (EINVAL for unknown signum).
+      // v1 accepts the set {2, 9, 13, 15, 17}: SIGINT=2 / SIGTERM=15
+      // / SIGPIPE=13 / SIGCHLD=17 queue on the caller's SignalInbox
+      // (and become observable via fd_read on fd 3 — the
+      // auto-installed SignalChannel from 9fbe708); SIGKILL=9
+      // zombifies the caller. Any other number returns -EINVAL
+      // before the kernel is touched. (Unlike PROC_KILL, this shim
+      // does NOT accept signum 0 — POSIX raise() with signum 0 is
+      // explicitly undefined behaviour, and the kernel rejects it
+      // with EINVAL.) The kernel handler packs signum into
+      // `args[0..2]` as a u16 and returns 0 on success or negative
+      // errno on failure.
       //
       // Unlike `proc_exit`, this shim DOES return: raise() is not
       // a fatal unwind on its own. Under SIGKILL the caller's Worker
@@ -2195,10 +2202,19 @@ var UserWasmRuntime = class {
       },
       // `proc_kill(target_pid: i32, signum: i32) -> i32`
       //
-      // Deliver a POSIX-style signal to `target_pid`. v1 knows
-      // three: SIGINT=2 (catchable, queued), SIGTERM=15 (catchable,
-      // queued), SIGKILL=9 (terminal, zombifies target). Any other
-      // signum returns -EINVAL.
+      // Deliver a POSIX-style signal to `target_pid`. v1 accepts
+      // the set {0, 2, 9, 13, 15, 17}:
+      //
+      //   * 0 (existence + permission probe per cab9dc5): runs
+      //     every precondition a real signal delivery would run
+      //     (target exists, not reaped, sender permitted via
+      //     parent / self / Cap::ProcKillAny) but delivers nothing.
+      //     POSIX `kill(pid, 0)` analogue.
+      //   * SIGINT=2 / SIGTERM=15 / SIGPIPE=13 / SIGCHLD=17:
+      //     catchable, queued on target's SignalInbox.
+      //   * SIGKILL=9: terminal, zombifies target.
+      //
+      // Any other signum returns -EINVAL.
       //
       // Returns 0 on success; negative errno on failure:
       //
