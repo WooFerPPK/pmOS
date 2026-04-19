@@ -4875,6 +4875,47 @@ describe("dispatch: PROC_KILL", () => {
     );
     expect(response.status).toBe(-ERRNO.ENOTCAPABLE);
   });
+
+  // Signums 13 (SIGPIPE) and 17 (SIGCHLD) were added to the
+  // PROC_KILL accept set by 91c618f's SIGCHLD delivery slice. The
+  // 91c618f session note explicitly flagged this gap: "the new
+  // 13 / 17 arms are reachable from TS but not exercised yet".
+  // These two self-kill tests close it.
+  it("returns 0 for self-SIGPIPE (signum 13, accepted since 91c618f)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1316,
+        args: encodeProcKillArgs(pid, 13),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
+
+  it("returns 0 for self-SIGCHLD (signum 17, accepted since 91c618f)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1317,
+        args: encodeProcKillArgs(pid, 17),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
 });
 
 // ---- dispatch: PROC_RAISE -------------------------------------------
@@ -4947,6 +4988,48 @@ describe("dispatch: PROC_RAISE", () => {
         opcode: OP_WASI.PROC_RAISE,
         requestId: 1322,
         args: encodeProcRaiseArgs(9),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
+
+  // Signums 13 (SIGPIPE) and 17 (SIGCHLD) were added to the
+  // PROC_RAISE/PROC_KILL accept set by 91c618f's SIGCHLD delivery
+  // slice. Prior to this slice the TS coverage only asserted
+  // {2, 9, 15} through the bundled kernel.wasm; the new arms for
+  // {13, 17} were reachable from TS but never exercised there.
+  // These two tests close that gap.
+  it("returns 0 for self-SIGPIPE (signum 13, accepted since 91c618f)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PROC_RAISE,
+        requestId: 1323,
+        args: encodeProcRaiseArgs(13),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
+
+  it("returns 0 for self-SIGCHLD (signum 17, accepted since 91c618f)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PROC_RAISE,
+        requestId: 1324,
+        args: encodeProcRaiseArgs(17),
         heapPtr: 0,
         heapLen: 0,
       },
