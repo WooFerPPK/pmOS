@@ -1915,6 +1915,31 @@ export class UserWasmRuntime {
         return -response.status;
       },
 
+      // WASI `fd_close(fd: i32) -> errno`.
+      //
+      // Release the FdEntry at `fd`, decrementing any underlying
+      // pipe / socket reference and freeing the fd-table slot.
+      // Returns 0 on success, positive errno on failure (EBADF if
+      // `fd` isn't open). PMos's kernel auto-closes every fd at
+      // process exit, so a wasm binary that exits cleanly without
+      // calling fd_close on its open files leaks nothing — but
+      // long-running processes (display server, term, future
+      // shell) need this shim to recycle fds across many
+      // path_open / fd_close cycles.
+      fd_close: (fd: number): number => {
+        const args = new Uint8Array(16);
+        const v = new DataView(args.buffer);
+        v.setUint32(0, fd >>> 0, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.FD_CLOSE,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        return -response.status;
+      },
+
       // WASI `random_get(buf_ptr: i32, buf_len: i32) -> errno`.
       //
       // Fill `buf_len` bytes at `buf_ptr` in user memory with

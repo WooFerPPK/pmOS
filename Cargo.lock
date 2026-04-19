@@ -60,6 +60,10 @@ name = "hello-fb-blit"
 version = "0.1.0"
 
 [[package]]
+name = "hello-fd-close-bad"
+version = "0.1.0"
+
+[[package]]
 name = "hello-framebuffer"
 version = "0.1.0"
 

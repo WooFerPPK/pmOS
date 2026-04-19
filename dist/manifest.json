@@ -12,6 +12,7 @@
     "assets/bin/hello_cap_check.wasm",
     "assets/bin/hello_caps.wasm",
     "assets/bin/hello_fb_blit.wasm",
+    "assets/bin/hello_fd_close_bad.wasm",
     "assets/bin/hello_framebuffer.wasm",
     "assets/bin/hello_input_echo.wasm",
     "assets/bin/hello_kill_probe.wasm",

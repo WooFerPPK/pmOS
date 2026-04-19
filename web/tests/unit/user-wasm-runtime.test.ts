@@ -134,6 +134,7 @@ let helloRaiseWasmBytes: ArrayBuffer;
 let helloWaitNoopWasmBytes: ArrayBuffer;
 let helloCapCheckWasmBytes: ArrayBuffer;
 let helloRandomWasmBytes: ArrayBuffer;
+let helloFdCloseBadWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -218,6 +219,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_random.wasm",
   );
+  const helloFdCloseBadPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_fd_close_bad.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -265,6 +270,7 @@ beforeAll(() => {
     helloWaitNoopPath,
     helloCapCheckPath,
     helloRandomPath,
+    helloFdCloseBadPath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -307,6 +313,7 @@ beforeAll(() => {
   helloWaitNoopWasmBytes = loadWasm(helloWaitNoopPath);
   helloCapCheckWasmBytes = loadWasm(helloCapCheckPath);
   helloRandomWasmBytes = loadWasm(helloRandomPath);
+  helloFdCloseBadWasmBytes = loadWasm(helloFdCloseBadPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1685,6 +1692,67 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     const firstHalf = consoleWrites[0]!.slice(0, 8);
     const secondHalf = consoleWrites[0]!.slice(8, 16);
     expect(firstHalf).not.toEqual(secondHalf);
+  });
+
+  it("hello-fd-close-bad calls fd_close(99) and writes EBADF (i32 LE) + newline to /dev/console", async () => {
+    // End-to-end proof of the new WASI fd_close shim through a
+    // real wasm32-wasip1 binary. fd 99 is well beyond any
+    // allocation (spawned children get fd 0/1/2 = console + fd 3
+    // = SignalChannel auto-installed), so the kernel's fd_close
+    // returns KernelError::NoSuchFd -> EBADF immediately.
+    //
+    // Unlike the proc_kill / proc_caps_get error paths which
+    // surface as NEGATIVE errno (PMos-ext convention), WASI
+    // shims return POSITIVE errno on failure (WASI standard).
+    // So the binary writes 8 (= EBADF), not -8. Bytes [0x08,
+    // 0x00, 0x00, 0x00, 0x0a].
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-fd-close-bad", helloFdCloseBadWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-fd-close-bad",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const rc = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(rc).toBe(ERRNO.EBADF);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 
   it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {
