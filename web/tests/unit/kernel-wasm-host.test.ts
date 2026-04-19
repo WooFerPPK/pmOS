@@ -4809,6 +4809,72 @@ describe("dispatch: PROC_KILL", () => {
     );
     expect(response.status).toBe(0);
   });
+
+  // POSIX `kill(pid, 0)` — the existence + permission probe. Same
+  // precondition surface as a real signal delivery (target exists
+  // and is not reaped, sender is parent / self / holds
+  // Cap::ProcKillAny) but no signal is queued. Proves the signum-0
+  // arm landed by cab9dc5 is reachable through the bundled
+  // kernel.wasm and not stripped by LTO.
+  it("returns 0 for self-probe (POSIX kill(getpid(), 0))", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1313,
+        args: encodeProcKillArgs(pid, 0),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(0);
+  });
+
+  it("returns -ESRCH for an unknown pid with signum 0", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1314,
+        args: encodeProcKillArgs(9999, 0),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.ESRCH);
+  });
+
+  it("returns -ENOTCAPABLE when probing a non-child target without Cap::ProcKillAny", async () => {
+    // Two orphan processes with CAPSET_ORDINARY_APP (DisplayClient
+    // only — no PROC_KILL_ANY). Sender is neither parent nor self
+    // of target, so the probe must reject with ENOTCAPABLE — the
+    // POSIX EPERM analogue under PMos's capability model.
+    const { host } = await freshHost();
+    const sender = host.registerProcess(CAPSET_ORDINARY_APP);
+    const target = host.registerProcess(CAPSET_ORDINARY_APP);
+    host.markRunning(sender);
+    host.markRunning(target);
+
+    const { response } = host.dispatch(
+      sender,
+      {
+        opcode: OP_EXT.PROC_KILL,
+        requestId: 1315,
+        args: encodeProcKillArgs(target, 0),
+        heapPtr: 0,
+        heapLen: 0,
+      },
+    );
+    expect(response.status).toBe(-ERRNO.ENOTCAPABLE);
+  });
 });
 
 // ---- dispatch: PROC_RAISE -------------------------------------------
