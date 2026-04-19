@@ -9,17 +9,21 @@
 //!   SIGKILL does NOT go through the inbox — there is nothing
 //!   for userland to catch.
 //!
-//! * [`Signal::Term`] (15), [`Signal::Interrupt`] (2), and
-//!   [`Signal::Pipe`] (13) are "catchable": `proc_kill` buffers
-//!   them in the target's [`SignalInbox`]. A future slice will
-//!   wake the process via the `FdObject::SignalChannel` fd
-//!   variant so a `fd_read` on fd 3 drains pending signals;
-//!   until then the kernel exposes `Kernel::drain_signals` as a
-//!   direct API so tests can observe delivery. SIGPIPE in
-//!   particular is kernel-generated: it is posted to the caller's
-//!   own inbox whenever an `fd_write` on a pipe or socket
-//!   returns `PipeBroken` (matching POSIX `write(2)`'s SIGPIPE
-//!   delivery alongside the EPIPE errno).
+//! * [`Signal::Term`] (15), [`Signal::Interrupt`] (2),
+//!   [`Signal::Pipe`] (13), and [`Signal::Child`] (17) are
+//!   "catchable": `proc_kill` buffers them in the target's
+//!   [`SignalInbox`]. With the `FdObject::SignalChannel` fd
+//!   variant auto-installed at fd 3 on every proc_spawn'd
+//!   child, `fd_read` on fd 3 drains pending signals as u16 LE
+//!   pairs; tests can also observe delivery via
+//!   `Kernel::drain_signals`. SIGPIPE is kernel-generated on
+//!   broken-pipe writes (matches POSIX `write(2)`'s SIGPIPE +
+//!   EPIPE pair); SIGCHLD is kernel-generated when a child
+//!   process transitions to Zombie (matches POSIX SIGCHLD
+//!   delivery on child exit, including the SIGKILL-triggered
+//!   path). Neither requires an explicit `proc_kill` call from
+//!   userland — a parent that polls fd 3 observes every child
+//!   exit automatically.
 //!
 //! The inbox is a bounded FIFO: repeated deliveries of the
 //! same signal are coalesced (classical POSIX behaviour for
@@ -32,8 +36,8 @@ use alloc::collections::VecDeque;
 /// Signals the v1 kernel understands.
 ///
 /// The numeric repr matches POSIX `SIGKILL`, `SIGTERM`, `SIGINT`,
-/// and `SIGPIPE` so userland code that hard-codes these values
-/// keeps working without a translation table.
+/// `SIGPIPE`, and `SIGCHLD` so userland code that hard-codes
+/// these values keeps working without a translation table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Signal {
@@ -46,6 +50,10 @@ pub enum Signal {
     /// Kernel-generated: a write to a pipe or socket whose peer
     /// has closed or had its read-side shut down.
     Pipe = 13,
+    /// Kernel-generated: a child process has transitioned to
+    /// Zombie. Delivered to the parent's signal inbox so a
+    /// supervisor can observe child exit by polling fd 3.
+    Child = 17,
 }
 
 impl Signal {
@@ -145,6 +153,7 @@ mod tests {
         assert!(Signal::Term.is_catchable());
         assert!(Signal::Interrupt.is_catchable());
         assert!(Signal::Pipe.is_catchable());
+        assert!(Signal::Child.is_catchable());
     }
 
     #[test]
@@ -153,6 +162,7 @@ mod tests {
         assert_eq!(Signal::Term.number(), 15);
         assert_eq!(Signal::Interrupt.number(), 2);
         assert_eq!(Signal::Pipe.number(), 13);
+        assert_eq!(Signal::Child.number(), 17);
     }
 
     #[test]

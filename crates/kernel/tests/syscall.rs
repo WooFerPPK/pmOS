@@ -9997,9 +9997,10 @@ fn proc_raise_sigkill_zombifies_caller() {
 
 #[test]
 fn proc_raise_unknown_signum_returns_einval() {
-    // Signum outside {2, 9, 15} → EINVAL before the kernel is
-    // touched. Mirrors PROC_KILL's unknown-signum probe so the
-    // two handlers stay symmetric on input validation.
+    // Signum outside the accepted set → EINVAL before the kernel
+    // is touched. Mirrors PROC_KILL's unknown-signum probe so the
+    // two handlers stay symmetric on input validation. Post-
+    // SIGCHLD slice the accepted set is {2, 9, 13, 15, 17}.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "self-bad-sig", 0);
 
@@ -10019,6 +10020,101 @@ fn proc_raise_unknown_signum_returns_einval() {
     assert_eq!(
         k.procs.get(pid).unwrap().state,
         kernel::proc::ProcState::Running
+    );
+}
+
+#[test]
+fn proc_raise_sigpipe_queues_on_own_inbox() {
+    // PROC_RAISE(13) → SIGPIPE queued on the caller's own inbox.
+    // Proves the dispatcher accepts signum 13 post-SIGCHLD slice.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self-pipe", 0);
+
+    let req = Request {
+        opcode: op_wasi::PROC_RAISE,
+        flags: 0,
+        request_id: 1310,
+        args: proc_raise_args(13),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.drain_signals(pid).unwrap(), alloc::vec![Signal::Pipe]);
+}
+
+#[test]
+fn proc_raise_sigchld_queues_on_own_inbox() {
+    // PROC_RAISE(17) → SIGCHLD on self. Unusual in real POSIX
+    // (usually kernel-generated) but accepted for symmetry with
+    // the PROC_KILL dispatcher.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self-chld", 0);
+
+    let req = Request {
+        opcode: op_wasi::PROC_RAISE,
+        flags: 0,
+        request_id: 1311,
+        args: proc_raise_args(17),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.drain_signals(pid).unwrap(), alloc::vec![Signal::Child]);
+}
+
+#[test]
+fn proc_kill_sigpipe_queues_on_child_inbox() {
+    // PROC_KILL(child, 13) → SIGPIPE on child's inbox; child
+    // state unchanged (catchable).
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "target");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1410,
+        args: proc_kill_args(child, 13),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(
+        k.drain_signals(child).unwrap(),
+        alloc::vec![Signal::Pipe]
+    );
+}
+
+#[test]
+fn proc_kill_sigchld_queues_on_child_inbox() {
+    // PROC_KILL(child, 17) → SIGCHLD on child's inbox. Normally
+    // SIGCHLD is kernel-generated (delivered to parent on child
+    // exit) but the dispatcher accepts userland-synthesised
+    // SIGCHLD for test + tool flexibility.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "target");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1411,
+        args: proc_kill_args(child, 17),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(
+        k.drain_signals(child).unwrap(),
+        alloc::vec![Signal::Child]
     );
 }
 

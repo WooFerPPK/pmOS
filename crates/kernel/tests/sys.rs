@@ -1621,6 +1621,149 @@ fn proc_exit_of_pending_client_leaves_listener_intact() {
     let _fd_b = k.display_connect(app_b).unwrap();
 }
 
+// ---- SIGCHLD delivery on child exit --------------------------------
+//
+// POSIX: when a child process transitions to Zombie (either via a
+// voluntary proc_exit or via SIGKILL), the kernel delivers SIGCHLD
+// to the parent. In PMos v1, SIGCHLD lands in the parent's
+// SignalInbox; combined with the auto-installed fd 3 SignalChannel,
+// a parent can observe every child exit by polling fd 3.
+
+#[test]
+fn proc_exit_posts_sigchld_to_parent_inbox() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "app");
+    assert_eq!(k.pending_signals(init).unwrap(), 0);
+
+    k.proc_exit(child, ExitStatus::Exited(0)).unwrap();
+
+    assert_eq!(k.pending_signals(init).unwrap(), 1);
+    let drained = k.drain_signals(init).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::Child]);
+}
+
+#[test]
+fn proc_kill_sigkill_posts_sigchld_to_parent_inbox() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "victim");
+
+    k.proc_kill(init, child, Signal::Kill).unwrap();
+
+    // Parent observes the child's death via SIGCHLD.
+    assert_eq!(k.drain_signals(init).unwrap(), alloc::vec![Signal::Child]);
+}
+
+#[test]
+fn proc_kill_sigterm_does_not_post_sigchld_because_target_still_alive() {
+    // SIGTERM is catchable — the child stays Ready. The parent
+    // must NOT receive SIGCHLD since no exit occurred.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "resilient");
+
+    k.proc_kill(init, child, Signal::Term).unwrap();
+
+    assert_eq!(k.pending_signals(init).unwrap(), 0);
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+}
+
+#[test]
+fn orphan_process_exit_does_not_panic() {
+    // ppid == 0 means "no parent" (init, or a child whose parent
+    // already exited and was reaped). SIGCHLD posting must silently
+    // no-op in that case.
+    let mut k = make_kernel();
+    let orphan = k
+        .register_process(RegisterArgs {
+            name: "orphan",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(orphan).unwrap();
+    k.procs
+        .transition(orphan, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    // Does not panic.
+    k.proc_exit(orphan, ExitStatus::Exited(0)).unwrap();
+}
+
+#[test]
+fn parent_fd_read_fd3_observes_sigchld_after_child_exit() {
+    // End-to-end: parent has its own SignalChannel auto-installed
+    // (via a prior proc_spawn from init), child exits, parent's
+    // fd 3 read returns 2 bytes = u16 LE SIGCHLD number.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+    // Parent is a proc_spawn'd child of init — so it has an
+    // auto-installed SignalChannel at fd 3.
+    let parent = spawn_ordinary_app(&mut k, init, "supervisor");
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    // Grandchild of init, child of parent.
+    let child = spawn_ordinary_app(&mut k, parent, "worker");
+
+    k.proc_exit(child, ExitStatus::Exited(0)).unwrap();
+
+    // Parent's fd 3 drains the SIGCHLD.
+    let mut buf = [0u8; 4];
+    let n = k.fd_read(parent, 3, &mut buf).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        u16::from_le_bytes([buf[0], buf[1]]),
+        Signal::Child.number(),
+    );
+}
+
 // ---- path_open oflags (CREAT / DIRECTORY / EXCL / TRUNC) -------------
 //
 // Pre-slice, `Kernel::path_open` took only `FdFlags` and ignored WASI

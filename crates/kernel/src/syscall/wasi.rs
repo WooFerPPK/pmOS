@@ -560,7 +560,9 @@ fn handle_proc_raise(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let signal = match signum {
         2 => Signal::Interrupt,
         9 => Signal::Kill,
+        13 => Signal::Pipe,
         15 => Signal::Term,
+        17 => Signal::Child,
         _ => return Response::err(req.request_id, EINVAL),
     };
     match kernel.proc_kill(pid, pid, signal) {

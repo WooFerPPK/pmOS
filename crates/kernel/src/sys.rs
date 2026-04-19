@@ -913,9 +913,28 @@ impl Kernel {
     pub fn proc_exit(&mut self, pid: Pid, status: ExitStatus) -> Result<(), KernelError> {
         self.sched.remove(pid);
         self.release_fd_table_resources(pid);
+        let ppid = self.procs.get(pid).map(|p| p.ppid).unwrap_or(0);
         self.procs
             .exit(pid, status)
-            .map_err(|_| KernelError::NoSuchPid)
+            .map_err(|_| KernelError::NoSuchPid)?;
+        self.post_sigchld(ppid);
+        Ok(())
+    }
+
+    /// Deliver [`Signal::Child`] to `ppid`'s signal inbox if
+    /// that pid exists and still has one. Orphans (ppid == 0)
+    /// and reaped parents silently no-op. Called by every exit
+    /// path that transitions a pid to Zombie —
+    /// [`Self::proc_exit`] and [`Self::proc_kill`]'s SIGKILL
+    /// arm — so a parent polling fd 3 observes each child exit
+    /// exactly once.
+    pub fn post_sigchld(&mut self, ppid: Pid) {
+        if ppid == 0 {
+            return;
+        }
+        if let Some(inbox) = self.signal_inboxes.get_mut(&ppid) {
+            inbox.post(Signal::Child);
+        }
     }
 
     /// Drain the named process's fd table, releasing every
@@ -1112,11 +1131,16 @@ impl Kernel {
                 // pick_next can resurrect the pid after it's
                 // been marked zombie.
                 self.sched.remove(target_pid);
+                let target_ppid = target.ppid;
                 self.procs
                     .exit(target_pid, ExitStatus::Signaled(signal.number()))
                     .map_err(|_| KernelError::NoSuchPid)?;
+                // POSIX: the parent observes the child's death
+                // via SIGCHLD regardless of whether the child
+                // called proc_exit voluntarily or was killed.
+                self.post_sigchld(target_ppid);
             }
-            Signal::Term | Signal::Interrupt | Signal::Pipe => {
+            Signal::Term | Signal::Interrupt | Signal::Pipe | Signal::Child => {
                 if let Some(inbox) = self.signal_inboxes.get_mut(&target_pid) {
                     inbox.post(signal);
                 }
