@@ -136,6 +136,7 @@ let helloCapCheckWasmBytes: ArrayBuffer;
 let helloRandomWasmBytes: ArrayBuffer;
 let helloFdCloseBadWasmBytes: ArrayBuffer;
 let helloFdCloseGoodWasmBytes: ArrayBuffer;
+let helloYieldLoopWasmBytes: ArrayBuffer;
 let helloCapListWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
@@ -229,6 +230,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_fd_close_good.wasm",
   );
+  const helloYieldLoopPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_yield_loop.wasm",
+  );
   const helloCapListPath = path.join(
     repoRoot,
     "target/wasm32-wasip1/release/hello_cap_list.wasm",
@@ -282,6 +287,7 @@ beforeAll(() => {
     helloRandomPath,
     helloFdCloseBadPath,
     helloFdCloseGoodPath,
+    helloYieldLoopPath,
     helloCapListPath,
     helloStdPath,
     helloClockPath,
@@ -327,6 +333,7 @@ beforeAll(() => {
   helloRandomWasmBytes = loadWasm(helloRandomPath);
   helloFdCloseBadWasmBytes = loadWasm(helloFdCloseBadPath);
   helloFdCloseGoodWasmBytes = loadWasm(helloFdCloseGoodPath);
+  helloYieldLoopWasmBytes = loadWasm(helloYieldLoopPath);
   helloCapListWasmBytes = loadWasm(helloCapListPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
@@ -1891,6 +1898,67 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       consoleWrites[0]!.byteOffset,
     ).getInt32(0, true);
     expect(rc).toBe(0);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-yield-loop calls sched_yield 4 times and writes the iteration count + newline", async () => {
+    // End-to-end proof of the new WASI sched_yield shim from
+    // 5dd1714 through a real wasm32-wasip1 binary. Completes the
+    // user-wasm coverage of this session's WASI shim trio
+    // (random_get + fd_close + sched_yield).
+    //
+    // PMos's scheduler is a single-threaded round-robin so yield
+    // has no behavioural effect — the load-bearing assertion is
+    // purely "the shim is callable and returns 0", but the loop
+    // iterates four times so a regression that broke the shim
+    // on the second call would still surface (binary exits 12
+    // immediately). Bytes [0x04, 0x00, 0x00, 0x00, 0x0a].
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-yield-loop", helloYieldLoopWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-yield-loop",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const iterations = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(iterations).toBe(4);
     expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 

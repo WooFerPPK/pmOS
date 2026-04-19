@@ -38,6 +38,7 @@ members = [
     "crates/hello-random",
     "crates/hello-fd-close-bad",
     "crates/hello-fd-close-good",
+    "crates/hello-yield-loop",
     "crates/hello-cap-list",
     "crates/hello-std",
     "crates/hello-clock",

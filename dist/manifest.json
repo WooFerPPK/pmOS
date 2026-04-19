@@ -28,6 +28,7 @@
     "assets/bin/hello_wasi_bootstrap.wasm",
     "assets/bin/hello_wasi_min.wasm",
     "assets/bin/hello_wasi_spawner.wasm",
+    "assets/bin/hello_yield_loop.wasm",
     "assets/bin/init.wasm",
     "assets/bin/ipc_self_test.wasm",
     "assets/bin/settings.wasm",
