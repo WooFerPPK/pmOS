@@ -9144,6 +9144,11 @@ fn proc_spawn_creates_child_and_records_platform_spawn_call() {
     assert!(child_fds.get(0).is_some());
     assert!(child_fds.get(1).is_some());
     assert!(child_fds.get(2).is_some());
+    // Signal channel auto-installed at fd 3.
+    assert_eq!(
+        child_fds.get(3).unwrap().object,
+        FdObject::SignalChannel,
+    );
 
     // Platform was asked to spawn a Worker for the new pid.
     kernel::platform::native::with_state(|s| {

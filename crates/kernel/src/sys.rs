@@ -992,6 +992,20 @@ impl Kernel {
                 .expect("stdio install within soft limit");
         }
 
+        // Auto-install the per-process signal channel at fd 3.
+        // Matches the POSIX signalfd convention referenced in
+        // `crates/kernel/src/proc/signal.rs` ("a `fd_read` on
+        // fd 3 drains pending signals"): every proc_spawn'd
+        // child can observe its own signal stream via fd_read +
+        // POLL_ONEOFF on fd 3 without an explicit install step.
+        // Processes built via `register_process` (a lower-level
+        // test primitive) do NOT get the auto-install — that
+        // primitive is deliberately minimal.
+        let table = self.fds.get_mut(&child_pid).unwrap();
+        table
+            .install_at(3, FdEntry::new(FdObject::SignalChannel))
+            .expect("signal channel install within soft limit");
+
         // Child is ready to run.
         self.procs
             .transition(child_pid, ProcState::Ready)

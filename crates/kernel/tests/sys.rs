@@ -600,8 +600,79 @@ fn proc_spawn_creates_child_with_stdio_and_marks_ready() {
             FdObject::CharDevice(DEV_CONSOLE)
         );
     }
+    // Signal channel auto-installed at fd 3 (POSIX signalfd
+    // analogue — every proc_spawn'd child can observe its own
+    // signal stream without an explicit install step).
+    assert_eq!(
+        table.get(3).unwrap().object,
+        FdObject::SignalChannel,
+    );
     // Child is on the scheduler's ready queue.
     assert!(k.sched.ready_len() >= 1);
+}
+
+#[test]
+fn proc_spawn_signal_channel_fd_reads_signals_posted_by_parent() {
+    // End-to-end: parent spawns a child, posts SIGTERM to the
+    // child, and the child's own fd 3 (SignalChannel) reads the
+    // 2-byte u16 LE signum. Proves the auto-install path gives
+    // the child a live, read-drainable signal channel.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    let child = spawn_ordinary_app(&mut k, init, "app");
+    // Child starts with an empty signal inbox.
+    assert_eq!(k.pending_signals(child).unwrap(), 0);
+
+    // Parent delivers SIGTERM.
+    k.proc_kill(init, child, Signal::Term).unwrap();
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+
+    // Child fd_read on fd 3 drains the signal as a u16 LE.
+    let mut buf = [0u8; 4];
+    let n = k.fd_read(child, 3, &mut buf).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(
+        u16::from_le_bytes([buf[0], buf[1]]),
+        Signal::Term.number(),
+    );
+    assert_eq!(k.pending_signals(child).unwrap(), 0);
+}
+
+#[test]
+fn proc_spawn_signal_channel_read_on_empty_inbox_returns_would_block() {
+    // A freshly spawned child with no signals pending surfaces
+    // WouldBlock on fd 3 reads — the kernel-level return that
+    // the syscall layer maps to -EAGAIN.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "app");
+
+    let mut buf = [0u8; 8];
+    let err = k.fd_read(child, 3, &mut buf).unwrap_err();
+    assert_eq!(err, kernel::sys::KernelError::WouldBlock);
 }
 
 #[test]
