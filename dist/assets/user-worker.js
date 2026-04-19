@@ -2001,6 +2001,58 @@ var UserWasmRuntime = class {
           heapLen: 0
         });
         return -response.status;
+      },
+      // WASI `random_get(buf_ptr: i32, buf_len: i32) -> errno`.
+      //
+      // Fill `buf_len` bytes at `buf_ptr` in user memory with
+      // random bytes from `Platform::random_bytes` (the JS host's
+      // `crypto.getRandomValues` in production, a deterministic
+      // PRNG in tests). Returns 0 on success, negative errno on
+      // failure (currently only EINVAL if heap_len is rejected by
+      // the kernel — the real random source is infallible).
+      //
+      // The kernel writes straight into the dispatch request's
+      // heap-scratch region; the shim copies that out into the
+      // caller's wasm memory at `buf_ptr`. Mirrors the
+      // input-output heap pattern of fd_filestat_get.
+      //
+      // Required by Rust's std startup whenever HashMap is used —
+      // the SipHash key gets seeded from random_get during the
+      // first HashMap allocation.
+      random_get: (bufPtr, bufLen) => {
+        if (bufLen === 0) return 0;
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const { response, heapOut } = this.backend.dispatch({
+          opcode: OP_WASI.RANDOM_GET,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: bufLen
+        });
+        if (response.status !== 0) return -response.status;
+        const writeBuf = new Uint8Array(this.memory.buffer);
+        writeBuf.set(heapOut.subarray(0, bufLen), bufPtr);
+        return 0;
+      },
+      // WASI `sched_yield() -> errno`.
+      //
+      // Cooperative-scheduling hint: "I have no more work to do
+      // right now; please let someone else run." PMos's current
+      // scheduler is a single-threaded round-robin that runs
+      // each dispatch to completion, so yield has no behavioural
+      // effect — every syscall already "yields" in the sense
+      // that the kernel can pick the next runnable process on
+      // the next dispatch loop iteration. The shim exists
+      // because Rust's std WASI libc calls sched_yield in a few
+      // spots (notably lock busy-wait loops) and would panic on
+      // -ENOSYS if the import were missing.
+      sched_yield: () => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_WASI.SCHED_YIELD,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return -response.status;
       }
     };
     const pmosExtShim = {

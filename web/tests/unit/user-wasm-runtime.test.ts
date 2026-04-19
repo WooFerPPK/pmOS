@@ -133,6 +133,7 @@ let helloCapsWasmBytes: ArrayBuffer;
 let helloRaiseWasmBytes: ArrayBuffer;
 let helloWaitNoopWasmBytes: ArrayBuffer;
 let helloCapCheckWasmBytes: ArrayBuffer;
+let helloRandomWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -213,6 +214,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_cap_check.wasm",
   );
+  const helloRandomPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_random.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -259,6 +264,7 @@ beforeAll(() => {
     helloRaisePath,
     helloWaitNoopPath,
     helloCapCheckPath,
+    helloRandomPath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -300,6 +306,7 @@ beforeAll(() => {
   helloRaiseWasmBytes = loadWasm(helloRaisePath);
   helloWaitNoopWasmBytes = loadWasm(helloWaitNoopPath);
   helloCapCheckWasmBytes = loadWasm(helloCapCheckPath);
+  helloRandomWasmBytes = loadWasm(helloRandomPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1611,6 +1618,73 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getInt32(0, true);
     expect(rc).toBe(1);
     expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-random calls WASI random_get twice and writes 16 distinct random bytes + newline to /dev/console", async () => {
+    // End-to-end proof of the new WASI random_get shim through a
+    // real wasm32-wasip1 binary. The binary calls random_get(buf,
+    // 8) twice into adjacent stack buffers. If both reads return
+    // the same bytes it exits 12 (catastrophic — 1 in 2^64 with a
+    // real entropy source); otherwise it writes both 8-byte
+    // records plus a trailing newline = 17 bytes.
+    //
+    // Asserting "the bytes differ between two reads" is a much
+    // stronger sanity check than "any bytes were written" — it
+    // catches both a no-op shim (would return zeros) and a
+    // stuck-value shim (would return identical buffers). Test
+    // assertions verify the byte count + the inequality of the
+    // two halves; the actual byte values are unpredictable so
+    // we don't decode them.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-random", helloRandomWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-random",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(17);
+    expect(consoleWrites[0]![16]).toBe(0x0a); // '\n'
+
+    // The two 8-byte halves must differ — the binary already
+    // exits 12 if they match, but the assertion here is the
+    // explicit form of the same invariant against console-side
+    // observation.
+    const firstHalf = consoleWrites[0]!.slice(0, 8);
+    const secondHalf = consoleWrites[0]!.slice(8, 16);
+    expect(firstHalf).not.toEqual(secondHalf);
   });
 
   it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {

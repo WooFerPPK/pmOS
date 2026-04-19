@@ -18,6 +18,7 @@
     "assets/bin/hello_pid.wasm",
     "assets/bin/hello_ppid.wasm",
     "assets/bin/hello_raise.wasm",
+    "assets/bin/hello_random.wasm",
     "assets/bin/hello_self_probe.wasm",
     "assets/bin/hello_sigchld.wasm",
     "assets/bin/hello_wait_noop.wasm",
