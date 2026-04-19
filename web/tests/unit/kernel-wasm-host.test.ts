@@ -5138,6 +5138,243 @@ describe("dispatch: FD_READ on SignalChannel", () => {
   });
 });
 
+// ---- dispatch: RANDOM_GET -------------------------------------------
+//
+// WASI random_get fills a heap region with random bytes from
+// Platform::random_bytes. Closes the dispatch-layer coverage gap
+// from 5dd1714's shim slice — until this slice the path was only
+// proven through real wasm (hello-random).
+
+describe("dispatch: RANDOM_GET", () => {
+  it("fills 8 bytes of heap with non-constant data", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.RANDOM_GET,
+      requestId: 1500,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(8);
+    expect(heapOut.length).toBe(8);
+    // 8 random bytes match the all-zero buffer with chance 1 in
+    // 2^64 — call it a stuck-source signal.
+    const allZero = heapOut.every((b) => b === 0);
+    expect(allZero).toBe(false);
+  });
+
+  it("two consecutive 8-byte fills produce different bytes", async () => {
+    // Strong sanity check that the source isn't returning a
+    // stuck-constant value — companion to hello-random's binary
+    // assertion. Test mirrors the same "1 in 2^64" inequality
+    // assertion at the dispatcher layer.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const a = host.dispatch(pid, {
+      opcode: OP_WASI.RANDOM_GET,
+      requestId: 1501,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    const b = host.dispatch(pid, {
+      opcode: OP_WASI.RANDOM_GET,
+      requestId: 1502,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(a.response.status).toBe(0);
+    expect(b.response.status).toBe(0);
+    expect(Array.from(a.heapOut)).not.toEqual(Array.from(b.heapOut));
+  });
+});
+
+// ---- dispatch: SCHED_YIELD -----------------------------------------
+//
+// Cooperative-scheduling hint. PMos's scheduler is a single-threaded
+// round-robin; the kernel handler is a no-op that always returns 0.
+// Closes the dispatch-layer coverage gap from 5dd1714's shim slice.
+
+describe("dispatch: SCHED_YIELD", () => {
+  it("returns 0 with no observable side effect", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.SCHED_YIELD,
+      requestId: 1510,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(0);
+  });
+});
+
+// ---- dispatch: FD_CLOSE --------------------------------------------
+//
+// Closes the dispatch-layer coverage gap from f03cf74's shim slice.
+// Two arms: closing an unopened fd surfaces -EBADF; closing an
+// installed fd succeeds with rc=0.
+
+function encodeFdCloseArgs(fd: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, fd >>> 0, true);
+  return args;
+}
+
+describe("dispatch: FD_CLOSE", () => {
+  it("returns -EBADF for an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_CLOSE,
+      requestId: 1520,
+      args: encodeFdCloseArgs(99),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+
+  it("returns 0 when closing an installed console fd, then -EBADF on a re-close", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const close1 = host.dispatch(pid, {
+      opcode: OP_WASI.FD_CLOSE,
+      requestId: 1521,
+      args: encodeFdCloseArgs(1),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(close1.response.status).toBe(0);
+
+    // Re-close — fd 1 is now released; the second call must
+    // surface -EBADF (proves the close actually freed the slot,
+    // not just no-op'd).
+    const close2 = host.dispatch(pid, {
+      opcode: OP_WASI.FD_CLOSE,
+      requestId: 1522,
+      args: encodeFdCloseArgs(1),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(close2.response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
+// ---- dispatch: CAP_CHECK -------------------------------------------
+//
+// Per-cap yes/no probe. Closes the dispatch-layer coverage gap from
+// a18cbb1's shim slice. Three arms: holds the cap (value=1), doesn't
+// hold the cap (value=0), unknown cap id (-EINVAL).
+
+function encodeCapCheckArgs(capId: number): Uint8Array {
+  const args = new Uint8Array(16);
+  const v = new DataView(args.buffer);
+  v.setUint32(0, capId >>> 0, true);
+  return args;
+}
+
+describe("dispatch: CAP_CHECK", () => {
+  it("returns value=1 when the caller holds the cap (CAPSET_ALL ⊃ Shell)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.CAP_CHECK,
+      requestId: 1530,
+      args: encodeCapCheckArgs(CAP.SHELL),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(1);
+  });
+
+  it("returns value=0 when the caller doesn't hold the cap (CAPSET_ORDINARY_APP lacks Shell)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ORDINARY_APP);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.CAP_CHECK,
+      requestId: 1531,
+      args: encodeCapCheckArgs(CAP.SHELL),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(0);
+  });
+
+  it("returns -EINVAL for a cap id that doesn't correspond to a Cap discriminant", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.CAP_CHECK,
+      requestId: 1532,
+      args: encodeCapCheckArgs(99),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(-ERRNO.EINVAL);
+  });
+});
+
+// ---- dispatch: CAP_LIST --------------------------------------------
+//
+// No-args "give me my own caps" primitive. Closes the dispatch-layer
+// coverage gap from bc5c9ad's shim slice. Two arms cover CAPSET_ALL
+// and CAPSET_ORDINARY_APP.
+
+describe("dispatch: CAP_LIST", () => {
+  it("returns CAPSET_ALL as i64 reinterpret of u64 bits when caller holds every cap", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.CAP_LIST,
+      requestId: 1540,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    // u64::MAX reinterpreted as i64 is -1n (the sign bit set).
+    expect(response.value).toBe(-1n);
+  });
+
+  it("returns CAPSET_ORDINARY_APP as i64 reinterpret when caller holds only DisplayClient", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ORDINARY_APP);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.CAP_LIST,
+      requestId: 1541,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    expect(response.value).toBe(CAPSET_ORDINARY_APP);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {
