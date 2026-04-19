@@ -137,6 +137,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     ("hello-pid", "hello_pid"),
     ("hello-self-probe", "hello_self_probe"),
     ("hello-ppid", "hello_ppid"),
+    ("hello-caps", "hello_caps"),
     // bin target (not cdylib): cargo preserves the dashes in the
     // output filename, so the assembled artefact is `hello-std.wasm`.
     ("hello-std", "hello-std"),

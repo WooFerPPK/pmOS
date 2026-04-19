@@ -129,6 +129,7 @@ let helloKillProbeWasmBytes: ArrayBuffer;
 let helloPidWasmBytes: ArrayBuffer;
 let helloSelfProbeWasmBytes: ArrayBuffer;
 let helloPpidWasmBytes: ArrayBuffer;
+let helloCapsWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -193,6 +194,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_ppid.wasm",
   );
+  const helloCapsPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_caps.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -235,6 +240,7 @@ beforeAll(() => {
     helloPidPath,
     helloSelfProbePath,
     helloPpidPath,
+    helloCapsPath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -272,6 +278,7 @@ beforeAll(() => {
   helloPidWasmBytes = loadWasm(helloPidPath);
   helloSelfProbeWasmBytes = loadWasm(helloSelfProbePath);
   helloPpidWasmBytes = loadWasm(helloPpidPath);
+  helloCapsWasmBytes = loadWasm(helloCapsPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1337,6 +1344,68 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getInt32(0, true);
     expect(reportedPpid).toBe(init);
     expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-caps calls proc_caps_get(proc_self()) and writes the u64 LE CapSet + newline to /dev/console", async () => {
+    // End-to-end proof that proc_self (c7d5c9b) and the existing
+    // proc_caps_get shim compose cleanly through the dispatcher,
+    // and that the heap-out u64 write path is reachable from a
+    // real wasm32-wasip1 binary. Self-querying always succeeds
+    // because the kernel's handle_proc_caps_get short-circuits the
+    // cap check when target == sender.
+    //
+    // The spawn manifest's caps argument is CAPSET_ALL, so the
+    // child's CapSet equals 0xffff_ffff_ffff_ffff (all 64 bits
+    // set). The binary writes those 8 bytes LE plus a trailing
+    // newline = 9 bytes total. Test decodes the first 8 bytes as
+    // u64 LE and asserts CAPSET_ALL.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-caps", helloCapsWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-caps",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(9);
+    const reportedCaps = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getBigUint64(0, true);
+    expect(reportedCaps).toBe(CAPSET_ALL);
+    expect(consoleWrites[0]![8]).toBe(0x0a); // '\n'
   });
 
   it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {

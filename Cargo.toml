@@ -31,6 +31,7 @@ members = [
     "crates/hello-pid",
     "crates/hello-self-probe",
     "crates/hello-ppid",
+    "crates/hello-caps",
     "crates/hello-std",
     "crates/hello-clock",
     "crates/integration-tests",
