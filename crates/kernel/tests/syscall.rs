@@ -10262,6 +10262,146 @@ fn proc_kill_signum_zero_on_reaped_target_returns_esrch() {
     assert_eq!(resp.status, -errno::ESRCH);
 }
 
+// ---- proc_kill <-> proc_check_signal symmetry --------------------
+//
+// cab9dc5's commit message stated: "Shares the precondition surface
+// with proc_kill by design — a future slice that tightens cap rules
+// for proc_kill should tighten both in lockstep." This invariant
+// was previously enforced only by code review (the dispatcher
+// routes signum 0 to proc_check_signal so they share the body for
+// signum 0, but a hypothetical future cap check added inside
+// Kernel::proc_kill itself for non-zero signums would not propagate
+// to proc_check_signal).
+//
+// This test pins the contract: for a representative set of
+// (sender, target) pairs, both functions must agree on
+// permit-vs-deny + the specific KernelError variant. proc_kill is
+// invoked with signum 15 (SIGTERM, catchable) so success queues a
+// signal; the test inspects only the (Ok / Err) classification, not
+// the queue side effect, since proc_check_signal has no side
+// effect to compare against.
+
+#[test]
+fn proc_kill_and_proc_check_signal_agree_across_cap_matrix() {
+    use kernel::sys::KernelError;
+    use kernel::syscall::kerr_to_errno;
+
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "child");
+    // Two ordinary apps that aren't parent/child of each other —
+    // the classic "ENOTCAPABLE on cross-sibling kill" pair.
+    let sib_a = k
+        .register_process(RegisterArgs {
+            name: "sib_a",
+            ppid: init,
+            caps: abi::cap::initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .expect("register sib_a");
+    k.mark_ready(sib_a).unwrap();
+    k.procs
+        .transition(sib_a, kernel::proc::ProcState::Running)
+        .unwrap();
+    let sib_b = k
+        .register_process(RegisterArgs {
+            name: "sib_b",
+            ppid: init,
+            caps: abi::cap::initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .expect("register sib_b");
+    k.mark_ready(sib_b).unwrap();
+    k.procs
+        .transition(sib_b, kernel::proc::ProcState::Running)
+        .unwrap();
+    // A reaped pid for the ESRCH symmetry case.
+    let reaped = register_child(&mut k, init, "reaped");
+    k.proc_exit(reaped, ExitStatus::Exited(0)).unwrap();
+    k.reap(reaped).unwrap();
+    // A nonexistent pid value far beyond any allocation.
+    let bogus: i32 = 9999;
+
+    // (sender, target, expected) tuples covering: parent->child,
+    // self->self, sibling->sibling without cap, sender holds
+    // ProcKillAny, nonexistent target, reaped target.
+    enum Outcome {
+        Ok,
+        Err(KernelError),
+    }
+    let cases: &[(i32, i32, Outcome)] = &[
+        (init, child, Outcome::Ok),                           // parent
+        (init, init, Outcome::Ok),                            // self
+        (sib_a, sib_b, Outcome::Err(KernelError::NotCapable)),// cross-sibling, no cap
+        (init, sib_a, Outcome::Ok),                           // parent w/ cap
+        (init, bogus, Outcome::Err(KernelError::NoSuchPid)),  // nonexistent
+        (init, reaped, Outcome::Err(KernelError::NoSuchPid)), // reaped (Dead state)
+    ];
+
+    for (sender, target, expected) in cases {
+        // proc_check_signal is the direct method.
+        let probe = k.proc_check_signal(*sender, *target);
+
+        // proc_kill via the dispatcher with signum 15 (SIGTERM
+        // catchable). We use the dispatcher rather than calling
+        // Kernel::proc_kill directly because the dispatcher is
+        // the actual surface a regression to the cap-check rules
+        // would flow through — proc_check_signal must agree with
+        // what userland would observe.
+        let req = Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 1430,
+            args: proc_kill_args(*target, 15),
+            heap_ptr: 0,
+            heap_len: 0,
+        };
+        let mut heap = vec![0u8; 16];
+        let resp = dispatch(&mut k, *sender, &req, &mut heap);
+
+        match expected {
+            Outcome::Ok => {
+                assert!(
+                    probe.is_ok(),
+                    "proc_check_signal({}, {}) expected Ok, got {:?}",
+                    sender,
+                    target,
+                    probe
+                );
+                assert_eq!(
+                    resp.status, 0,
+                    "proc_kill({}, {}, 15) expected 0, got {}",
+                    sender, target, resp.status
+                );
+            }
+            Outcome::Err(want_kerr) => {
+                let want_errno = -kerr_to_errno(*want_kerr);
+                assert_eq!(
+                    probe.as_ref().err(),
+                    Some(want_kerr),
+                    "proc_check_signal({}, {}) expected Err({:?}), got {:?}",
+                    sender,
+                    target,
+                    want_kerr,
+                    probe
+                );
+                assert_eq!(
+                    resp.status, want_errno,
+                    "proc_kill({}, {}, 15) expected status {}, got {}",
+                    sender, target, want_errno, resp.status
+                );
+            }
+        }
+
+        // Drain any queued signal so subsequent cases start with an
+        // empty inbox. proc_kill on the Ok arms queued SIGTERM on
+        // the target's inbox; we don't care about that side effect
+        // for symmetry, but leaving it in place would muddle later
+        // cases that revisit the same target.
+        let _ = k.drain_signals(*target);
+    }
+}
+
 // ---- proc_caps_get ---------------------------------------------------
 //
 // PROC_CAPS_GET (0x1105). Query a process's cap set. Sender may
