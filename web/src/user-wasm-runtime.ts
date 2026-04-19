@@ -2060,6 +2060,29 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // `proc_self() -> i32`
+      //
+      // The cheapest possible PMos-ext syscall — every piece of
+      // information it needs is already in the dispatcher frame.
+      // Returns the caller's pid as a positive i32. Cannot fail
+      // (the kernel-side `handle_proc_self` always answers `Ok`),
+      // so there is no errno return path. Mirrors POSIX `getpid(2)`.
+      proc_self: (): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.PROC_SELF,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) {
+          // Defensive: the kernel never errors on PROC_SELF, but
+          // surface any future error through the standard negative
+          // errno convention so callers can still see it.
+          return response.status;
+        }
+        return Number(response.value);
+      },
+
       // `proc_kill(target_pid: i32, signum: i32) -> i32`
       //
       // Deliver a POSIX-style signal to `target_pid`. v1 knows

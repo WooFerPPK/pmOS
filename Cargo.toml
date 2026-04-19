@@ -28,6 +28,7 @@ members = [
     "crates/hello-input-echo",
     "crates/hello-sigchld",
     "crates/hello-kill-probe",
+    "crates/hello-pid",
     "crates/hello-std",
     "crates/hello-clock",
     "crates/integration-tests",

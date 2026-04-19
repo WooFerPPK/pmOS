@@ -126,6 +126,7 @@ let helloFbBlitWasmBytes: ArrayBuffer;
 let helloInputEchoWasmBytes: ArrayBuffer;
 let helloSigchldWasmBytes: ArrayBuffer;
 let helloKillProbeWasmBytes: ArrayBuffer;
+let helloPidWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -178,6 +179,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_kill_probe.wasm",
   );
+  const helloPidPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_pid.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -217,6 +222,7 @@ beforeAll(() => {
     helloInputEchoPath,
     helloSigchldPath,
     helloKillProbePath,
+    helloPidPath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -251,6 +257,7 @@ beforeAll(() => {
   helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
   helloSigchldWasmBytes = loadWasm(helloSigchldPath);
   helloKillProbeWasmBytes = loadWasm(helloKillProbePath);
+  helloPidWasmBytes = loadWasm(helloPidPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1069,6 +1076,66 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getUint16(0, true);
     expect(signum).toBe(15);
     expect(consoleWrites[0]![2]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-pid calls proc_self() and writes its own pid (i32 LE) + newline to /dev/console", async () => {
+    // End-to-end proof that the new `proc_self` PMos-ext shim is
+    // reachable from a real wasm32-wasip1 binary. The child calls
+    // pmos_ext::proc_self() (PROC_SELF = 0x1103), packs the
+    // returned pid as i32 LE plus a trailing newline into a 5-byte
+    // buffer, and writes it to fd 1. The composition test asserts
+    // the decoded pid matches the value the kernel allocated for
+    // the spawned child (captured via `onSpawnProcess`).
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-pid", helloPidWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-pid",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+    const childPid = Number(spawnResult.response.value);
+    expect(captures).toHaveLength(1);
+    expect(captures[0]!.pid).toBe(childPid);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const reportedPid = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(reportedPid).toBe(childPid);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 
   it("hello-kill-probe calls proc_kill(9999, 0) and writes -ESRCH (i32 LE) + newline to /dev/console", async () => {
