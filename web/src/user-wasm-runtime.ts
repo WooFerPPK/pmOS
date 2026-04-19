@@ -2083,6 +2083,29 @@ export class UserWasmRuntime {
         return Number(response.value);
       },
 
+      // `proc_parent() -> i32`
+      //
+      // Returns the caller's parent pid (ppid) as a positive i32.
+      // A process whose parent has been reaped — or init itself —
+      // sees `ppid == 0`. Mirrors POSIX `getppid(2)`. The
+      // kernel-side `handle_proc_parent` only errors with ESRCH
+      // if the caller's pid has been removed from the process
+      // table, which in normal execution is impossible (the
+      // dispatcher itself requires the pid to exist), so the
+      // negative-errno return path is purely defensive.
+      proc_parent: (): number => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.PROC_PARENT,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) {
+          return response.status;
+        }
+        return Number(response.value);
+      },
+
       // `proc_kill(target_pid: i32, signum: i32) -> i32`
       //
       // Deliver a POSIX-style signal to `target_pid`. v1 knows

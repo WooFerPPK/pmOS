@@ -14,6 +14,7 @@
     "assets/bin/hello_input_echo.wasm",
     "assets/bin/hello_kill_probe.wasm",
     "assets/bin/hello_pid.wasm",
+    "assets/bin/hello_ppid.wasm",
     "assets/bin/hello_self_probe.wasm",
     "assets/bin/hello_sigchld.wasm",
     "assets/bin/hello_wasi_bootstrap.wasm",

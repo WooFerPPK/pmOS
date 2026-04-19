@@ -30,6 +30,7 @@ members = [
     "crates/hello-kill-probe",
     "crates/hello-pid",
     "crates/hello-self-probe",
+    "crates/hello-ppid",
     "crates/hello-std",
     "crates/hello-clock",
     "crates/integration-tests",

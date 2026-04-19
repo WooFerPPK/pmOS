@@ -68,6 +68,10 @@ name = "hello-pid"
 version = "0.1.0"
 
 [[package]]
+name = "hello-ppid"
+version = "0.1.0"
+
+[[package]]
 name = "hello-self-probe"
 version = "0.1.0"
 
