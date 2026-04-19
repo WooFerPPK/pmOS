@@ -226,6 +226,27 @@ pub extern "C" fn kernel_install_console_fd(pid: Pid, fd: u32) -> i32 {
     }
 }
 
+/// Install [`FdObject::SignalChannel`] as an fd in `pid`'s fd
+/// table. Companion to [`kernel_install_console_fd`] that gives
+/// the host a way to install the per-process signal channel
+/// without decoding `FdObject` on the TS side. Normally the
+/// kernel auto-installs SignalChannel at fd 3 on every
+/// `proc_spawn`'d child; this export is for host-side tests
+/// that start from a `register_process` primitive and want to
+/// exercise the SignalChannel read / poll paths without
+/// routing through spawn.
+///
+/// Returns `0` on success, `-1` on error (bad pid, fd-table
+/// full, fd already in use, etc.).
+#[no_mangle]
+pub extern "C" fn kernel_install_signal_channel_fd(pid: Pid, fd: u32) -> i32 {
+    let kernel = kernel_mut();
+    match kernel.install_fd(pid, fd, FdObject::SignalChannel, FdFlags::EMPTY) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 /// Transition a freshly-registered process from `Starting`
 /// through `Ready` to `Running`. Needed because several
 /// opcodes (notably `PROC_EXIT`) require the caller to be in

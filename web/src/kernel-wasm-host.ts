@@ -94,6 +94,7 @@ interface KernelExports {
   readonly kernel_init: () => number;
   readonly kernel_register_process: (caps: bigint) => number;
   readonly kernel_install_console_fd: (pid: number, fd: number) => number;
+  readonly kernel_install_signal_channel_fd: (pid: number, fd: number) => number;
   readonly kernel_mark_running: (pid: number) => number;
   readonly kernel_dispatch: (pid: number) => number;
   readonly kernel_inject_console_input: (len: number) => number;
@@ -552,6 +553,23 @@ export class KernelWasmHost implements Kernel {
     const rc = this.exports.kernel_install_console_fd(pid, fd);
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.installConsoleFd(${pid}, ${fd}): rc=${rc}`);
+    }
+  }
+
+  /**
+   * Install `FdObject::SignalChannel` at `fd` in `pid`'s fd table.
+   * Companion to {@link installConsoleFd}; gives host-side tests
+   * a way to stage the per-process signal channel on a pid
+   * that was created via `registerProcess` (which deliberately
+   * does not auto-install, unlike proc_spawn'd children which
+   * get fd 3 = SignalChannel for free).
+   */
+  installSignalChannelFd(pid: number, fd: number): void {
+    const rc = this.exports.kernel_install_signal_channel_fd(pid, fd);
+    if (rc !== 0) {
+      throw new Error(
+        `KernelWasmHost.installSignalChannelFd(${pid}, ${fd}): rc=${rc}`,
+      );
     }
   }
 

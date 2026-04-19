@@ -591,6 +591,22 @@ var KernelWasmHost = class _KernelWasmHost {
     }
   }
   /**
+   * Install `FdObject::SignalChannel` at `fd` in `pid`'s fd table.
+   * Companion to {@link installConsoleFd}; gives host-side tests
+   * a way to stage the per-process signal channel on a pid
+   * that was created via `registerProcess` (which deliberately
+   * does not auto-install, unlike proc_spawn'd children which
+   * get fd 3 = SignalChannel for free).
+   */
+  installSignalChannelFd(pid, fd) {
+    const rc = this.exports.kernel_install_signal_channel_fd(pid, fd);
+    if (rc !== 0) {
+      throw new Error(
+        `KernelWasmHost.installSignalChannelFd(${pid}, ${fd}): rc=${rc}`
+      );
+    }
+  }
+  /**
    * Transition a newly-registered process from `Starting` through
    * `Ready` to `Running`. Required before the process can issue any
    * syscall that needs the caller to be in `Running` state (most

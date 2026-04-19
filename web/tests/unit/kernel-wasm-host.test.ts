@@ -4889,6 +4889,106 @@ describe("dispatch: PROC_RAISE", () => {
   });
 });
 
+// ---- dispatch: FD_READ on SignalChannel --------------------------
+//
+// Proves the full signal-observation pipeline through real
+// kernel.wasm: PROC_RAISE queues a signal on the caller's inbox,
+// FD_READ on an installed SignalChannel fd drains it as a u16 LE
+// signum. Combined, these demonstrate that a userland process that
+// installs fd 3 as SignalChannel + polls + reads it can observe
+// every signal that lands in its inbox — the drain path is live
+// in the distributed kernel.wasm, not just the Rust isolation
+// tests.
+
+describe("dispatch: FD_READ on SignalChannel", () => {
+  it("drains a self-raised SIGTERM as u16 LE 15", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installSignalChannelFd(pid, 3);
+    host.markRunning(pid);
+
+    // Self-raise SIGTERM.
+    const raise = host.dispatch(pid, {
+      opcode: OP_WASI.PROC_RAISE,
+      requestId: 1400,
+      args: encodeProcRaiseArgs(15),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(raise.response.status).toBe(0);
+
+    // Read fd 3 — expect 2 bytes = u16 LE 15.
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 1401,
+      arg0: 3,
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(2);
+    expect(heapOut.length).toBeGreaterThanOrEqual(2);
+    const signum = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    ).getUint16(0, true);
+    expect(signum).toBe(15);
+  });
+
+  it("drains a self-raised SIGPIPE as u16 LE 13", async () => {
+    // Proves that signum 13 (added to the dispatcher's accepted
+    // set in the SIGCHLD slice) flows through PROC_RAISE ->
+    // Signal::Pipe -> inbox -> FD_READ end-to-end.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installSignalChannelFd(pid, 3);
+    host.markRunning(pid);
+
+    host.dispatch(pid, {
+      opcode: OP_WASI.PROC_RAISE,
+      requestId: 1402,
+      args: encodeProcRaiseArgs(13),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 1403,
+      arg0: 3,
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(2);
+    const signum = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    ).getUint16(0, true);
+    expect(signum).toBe(13);
+  });
+
+  it("returns -EAGAIN when the signal inbox is empty", async () => {
+    // No signals queued — fd_read on SignalChannel reports
+    // WouldBlock surfaced as -EAGAIN.
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installSignalChannelFd(pid, 3);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 1404,
+      arg0: 3,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(response.status).toBe(-ERRNO.EAGAIN);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {
