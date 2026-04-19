@@ -7,17 +7,40 @@
 //! majority of them either return a single scalar or require no
 //! heap payload at all.
 //!
-//! ## Not-yet-implemented opcodes
+//! ## Coverage
 //!
-//! Of the ~15 extension opcodes `contracts/syscalls.md §3`
-//! defines, five have handlers below: `PROC_SELF`, `PROC_PARENT`,
-//! `CAP_CHECK`, `CAP_LIST`, and `PROC_SPAWN`. Every other extension
-//! opcode (`PROC_WAIT`, `PROC_KILL`, `IPC_*`, `DISPLAY_CONNECT`,
-//! `CAP_GRANT`, `MOUNT`, `FS_WATCH`, `HOST_FILE_RECV`, ...) falls
-//! through the `_ =>` arm and returns `ENOSYS`. Those semantic
-//! surfaces exist on `Kernel` already (`Kernel::proc_wait`,
-//! `Kernel::display_connect`, etc.) — the dispatcher just hasn't
-//! learned their argument shapes yet. Each one is a future slice.
+//! As of the SIGCHLD delivery batch, the dispatcher routes the
+//! following extension opcodes (`contracts/syscalls.md §3`):
+//! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
+//! `IPC_ACCEPT`, `IPC_PIPE`, `PROC_SELF`, `PROC_PARENT`,
+//! `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`, `PROC_CAPS_GET`,
+//! `DISPLAY_CONNECT`, `DISPLAY_BIND`, `CAP_CHECK`, `CAP_LIST`.
+//!
+//! The remaining extension opcodes fall through the `_ =>` arm
+//! and return `ENOSYS`:
+//!
+//! * `IPC_SEND` / `IPC_RECV` (0x1005/0x1006) — fd-passing
+//!   primitives; deferred until the IpcTable grows per-send fd
+//!   queues. `FD_READ` / `FD_WRITE` already cover the
+//!   send/recv-without-fd-passing case via the `FdObject::Socket`
+//!   arm, so the send/recv opcodes are the fd-passing-only path.
+//! * `CAP_GRANT` (0x1302) — intentionally deferred to v2 per the
+//!   `known_ext_opcode_without_handler_returns_enosys` probe
+//!   comment in `crates/kernel/tests/syscall.rs`; delegating
+//!   cap edits to userland is out of scope for v1.
+//! * `MOUNT` / `UMOUNT` (0x1400/0x1401) — the semantic surface
+//!   exists on `Kernel::vfs.mount` / `umount`, but a fstype →
+//!   `Box<dyn Filesystem>` factory and the privilege / config
+//!   plumbing isn't yet designed.
+//! * `FS_WATCH` (0x1402) — needs an event queue + watch-point
+//!   notification machinery that doesn't exist yet.
+//! * `HOST_FILE_RECV` (0x1500) — needs the drag-drop token
+//!   table + driver plumbing described in
+//!   `contracts/syscalls.md §3.6`.
+//!
+//! `CAP_GRANT` is also the canonical ext-range ENOSYS probe
+//! target — see `known_ext_opcode_without_handler_returns_enosys`
+//! in the syscall isolation suite.
 
 extern crate alloc;
 

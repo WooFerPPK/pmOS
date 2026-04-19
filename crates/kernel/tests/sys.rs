@@ -1764,6 +1764,77 @@ fn parent_fd_read_fd3_observes_sigchld_after_child_exit() {
     );
 }
 
+#[test]
+fn multiple_child_exits_coalesce_to_single_sigchld_in_parent_inbox() {
+    // POSIX non-realtime-signal semantics: a parent receives one
+    // SIGCHLD regardless of how many children have died since the
+    // last drain. The kernel gets this for free via
+    // SignalInbox::post's dedup-on-identity policy — each exit
+    // posts Signal::Child, but the second and later posts coalesce
+    // against the first still-pending entry. A supervisor that
+    // wakes on SIGCHLD must loop proc_wait until ECHILD to reap
+    // every dead child (the POSIX-canonical wait(2)-loop pattern).
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    // Three children, three exits. Only the FIRST post leaves a
+    // SIGCHLD entry on the inbox; the next two dedup.
+    let a = spawn_ordinary_app(&mut k, init, "a");
+    let b = spawn_ordinary_app(&mut k, init, "b");
+    let c = spawn_ordinary_app(&mut k, init, "c");
+    k.proc_exit(a, ExitStatus::Exited(0)).unwrap();
+    k.proc_exit(b, ExitStatus::Exited(0)).unwrap();
+    k.proc_exit(c, ExitStatus::Exited(0)).unwrap();
+
+    assert_eq!(k.pending_signals(init).unwrap(), 1);
+    let drained = k.drain_signals(init).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::Child]);
+    assert_eq!(k.pending_signals(init).unwrap(), 0);
+}
+
+#[test]
+fn sigchld_reposts_after_drain_when_another_child_exits() {
+    // After the parent drains its SIGCHLD, a subsequent child
+    // exit re-posts a fresh SIGCHLD — the coalescing is
+    // per-still-pending-entry, not per-kernel-lifetime. This
+    // matches POSIX: a supervisor can reliably sleep on fd 3
+    // between batches of child exits without losing edges.
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs
+        .transition(init, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    let a = spawn_ordinary_app(&mut k, init, "a");
+    k.proc_exit(a, ExitStatus::Exited(0)).unwrap();
+    // Drain — simulates the supervisor observing the first exit.
+    assert_eq!(k.drain_signals(init).unwrap(), alloc::vec![Signal::Child]);
+
+    // A later child exit must post again.
+    let b = spawn_ordinary_app(&mut k, init, "b");
+    k.proc_exit(b, ExitStatus::Exited(0)).unwrap();
+    assert_eq!(k.drain_signals(init).unwrap(), alloc::vec![Signal::Child]);
+}
+
 // ---- path_open oflags (CREAT / DIRECTORY / EXCL / TRUNC) -------------
 //
 // Pre-slice, `Kernel::path_open` took only `FdFlags` and ignored WASI
