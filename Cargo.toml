@@ -27,6 +27,7 @@ members = [
     "crates/hello-fb-blit",
     "crates/hello-input-echo",
     "crates/hello-sigchld",
+    "crates/hello-kill-probe",
     "crates/hello-std",
     "crates/hello-clock",
     "crates/integration-tests",

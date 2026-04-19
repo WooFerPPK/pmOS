@@ -12,6 +12,7 @@
     "assets/bin/hello_fb_blit.wasm",
     "assets/bin/hello_framebuffer.wasm",
     "assets/bin/hello_input_echo.wasm",
+    "assets/bin/hello_kill_probe.wasm",
     "assets/bin/hello_sigchld.wasm",
     "assets/bin/hello_wasi_bootstrap.wasm",
     "assets/bin/hello_wasi_min.wasm",

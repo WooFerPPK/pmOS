@@ -125,6 +125,7 @@ let helloWasiBootstrapWasmBytes: ArrayBuffer;
 let helloFbBlitWasmBytes: ArrayBuffer;
 let helloInputEchoWasmBytes: ArrayBuffer;
 let helloSigchldWasmBytes: ArrayBuffer;
+let helloKillProbeWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -173,6 +174,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_sigchld.wasm",
   );
+  const helloKillProbePath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_kill_probe.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -211,6 +216,7 @@ beforeAll(() => {
     helloFbBlitPath,
     helloInputEchoPath,
     helloSigchldPath,
+    helloKillProbePath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -244,6 +250,7 @@ beforeAll(() => {
   helloFbBlitWasmBytes = loadWasm(helloFbBlitPath);
   helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
   helloSigchldWasmBytes = loadWasm(helloSigchldPath);
+  helloKillProbeWasmBytes = loadWasm(helloKillProbePath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1062,6 +1069,70 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getUint16(0, true);
     expect(signum).toBe(15);
     expect(consoleWrites[0]![2]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-kill-probe calls proc_kill(9999, 0) and writes -ESRCH (i32 LE) + newline to /dev/console", async () => {
+    // End-to-end proof of the POSIX kill(pid, 0) existence-probe arm
+    // (cab9dc5) through a real wasm32-wasip1 binary. The child calls
+    // pmos_ext::proc_kill(9999, 0) — signum 0 + a pid that's never
+    // allocated. Pre-cab9dc5 the dispatcher's signum match had no arm
+    // for 0 and rejected with -EINVAL = -28; post-cab9dc5 the arm
+    // routes through Kernel::proc_check_signal which surfaces -ESRCH
+    // = -71 because the target doesn't exist. The binary packs the
+    // i32 LE return value into a 5-byte write (4 bytes errno + '\n')
+    // so the line-buffered console flushes through onConsoleWrite in
+    // one shot.
+    //
+    // The distinct errno (-71 vs -28) makes this test sharp: a
+    // regression that reverted to pre-cab9dc5 behaviour would surface
+    // as a wrong byte sequence on console, not a silent pass.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-kill-probe", helloKillProbeWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-kill-probe",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const rc = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(rc).toBe(-ERRNO.ESRCH);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 
   it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {
