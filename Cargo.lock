@@ -60,6 +60,10 @@ name = "hello-input-echo"
 version = "0.1.0"
 
 [[package]]
+name = "hello-sigchld"
+version = "0.1.0"
+
+[[package]]
 name = "hello-std"
 version = "0.1.0"
 

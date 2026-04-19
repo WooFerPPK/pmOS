@@ -123,6 +123,7 @@ let displayServerLiteWasmBytes: ArrayBuffer;
 let helloWasiBootstrapWasmBytes: ArrayBuffer;
 let helloFbBlitWasmBytes: ArrayBuffer;
 let helloInputEchoWasmBytes: ArrayBuffer;
+let helloSigchldWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -167,6 +168,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_input_echo.wasm",
   );
+  const helloSigchldPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_sigchld.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -204,6 +209,7 @@ beforeAll(() => {
     helloWasiBootstrapPath,
     helloFbBlitPath,
     helloInputEchoPath,
+    helloSigchldPath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -236,6 +242,7 @@ beforeAll(() => {
   helloWasiBootstrapWasmBytes = loadWasm(helloWasiBootstrapPath);
   helloFbBlitWasmBytes = loadWasm(helloFbBlitPath);
   helloInputEchoWasmBytes = loadWasm(helloInputEchoPath);
+  helloSigchldWasmBytes = loadWasm(helloSigchldPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -966,6 +973,94 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // ("Hi!\n" — the console driver flushes on newline).
     expect(consoleWrites).toHaveLength(1);
     expect(Array.from(consoleWrites[0]!)).toEqual([0x48, 0x69, 0x21, 0x0a]);
+  });
+
+  it("hello-sigchld reads fd 3 (auto-installed SignalChannel) and echoes the u16 LE signum", async () => {
+    // The signal-delivery pipeline end-to-end through a real user
+    // wasm binary:
+    //
+    //   init PROC_SPAWN(/bin/hello-sigchld) -> child pid allocated
+    //   with fd 3 = SignalChannel auto-installed (9fbe708).
+    //   init PROC_KILL(child, SIGTERM=15) -> parent-child cap path
+    //   queues Signal::Term on child's SignalInbox.
+    //   runAllSpawns starts child -> fd_read(3, buf) drains the
+    //   2-byte u16 LE (15) record -> fd_write(1, buf) -> the 2
+    //   bytes appear on onConsoleWrite.
+    //
+    // Load-bearing ordering: PROC_KILL runs BEFORE runAllSpawns so
+    // the child's inbox already has the signal when its first
+    // fd_read fires. The binary's EAGAIN-polling loop handles the
+    // alternative timing (post-spawn signal) but composition tests
+    // pre-stage, matching how hello-input-echo does injection.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-sigchld", helloSigchldWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-sigchld",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+    const childPid = Number(spawnResult.response.value);
+    expect(captures).toHaveLength(1);
+    expect(captures[0]!.pid).toBe(childPid);
+
+    // Dispatch PROC_KILL(child, SIGTERM=15) from init. Wire layout:
+    // args[0..4] = target_pid i32 LE, args[4..6] = signum u16 LE.
+    const killArgs = new Uint8Array(16);
+    const killView = new DataView(killArgs.buffer);
+    killView.setInt32(0, childPid, true);
+    killView.setUint16(4, 15, true);
+    const killResult = kernel.dispatch(init, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 2,
+      args: killArgs,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(killResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    // The binary reads 2 bytes from fd 3 (u16 LE signum) and
+    // writes them plus a trailing newline to fd 1 in a single
+    // 3-byte fd_write. The line-buffered console flushes on the
+    // newline and observes exactly 3 bytes.
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(3);
+    const signum = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getUint16(0, true);
+    expect(signum).toBe(15);
+    expect(consoleWrites[0]![2]).toBe(0x0a); // '\n'
   });
 
   it("hello-std: a real Rust `std` binary (println! + fn main) runs to completion through the PMos WASI shim", async () => {
