@@ -127,6 +127,7 @@ let helloInputEchoWasmBytes: ArrayBuffer;
 let helloSigchldWasmBytes: ArrayBuffer;
 let helloKillProbeWasmBytes: ArrayBuffer;
 let helloPidWasmBytes: ArrayBuffer;
+let helloSelfProbeWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -183,6 +184,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_pid.wasm",
   );
+  const helloSelfProbePath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_self_probe.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -223,6 +228,7 @@ beforeAll(() => {
     helloSigchldPath,
     helloKillProbePath,
     helloPidPath,
+    helloSelfProbePath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -258,6 +264,7 @@ beforeAll(() => {
   helloSigchldWasmBytes = loadWasm(helloSigchldPath);
   helloKillProbeWasmBytes = loadWasm(helloKillProbePath);
   helloPidWasmBytes = loadWasm(helloPidPath);
+  helloSelfProbeWasmBytes = loadWasm(helloSelfProbePath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1199,6 +1206,72 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       consoleWrites[0]!.byteOffset,
     ).getInt32(0, true);
     expect(rc).toBe(-ERRNO.ESRCH);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-self-probe calls proc_kill(proc_self(), 0) and writes 0 (i32 LE) + newline — the success arm of cab9dc5", async () => {
+    // End-to-end proof of the SUCCESS arm of cab9dc5's POSIX
+    // kill(getpid(), 0) existence + permission probe through a
+    // real wasm32-wasip1 binary. Companion to hello-kill-probe
+    // (which exercises the ESRCH arm via probing pid 9999) — this
+    // binary self-targets, which always succeeds because the
+    // kernel's proc_check_signal permits any sender to signal
+    // itself regardless of caps.
+    //
+    // The composition of two PMos-ext shims (proc_self + proc_kill)
+    // in one binary also proves the c7d5c9b proc_self shim and the
+    // proc_kill signum-0 path are wired through the same
+    // dispatcher without interference.
+    //
+    // Pre-cab9dc5: -EINVAL = -28 -> bytes [0xe4, 0xff, 0xff, 0xff].
+    // Post-cab9dc5: 0 -> bytes [0x00, 0x00, 0x00, 0x00]. The 0 vs
+    // -28 distinction makes the test sharp.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-self-probe", helloSelfProbeWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-self-probe",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const rc = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(rc).toBe(0);
     expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 
