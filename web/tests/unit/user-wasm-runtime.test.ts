@@ -2194,31 +2194,29 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     const history = await runAllSpawns(kernel, captures);
 
     expect(captures).toHaveLength(0);
-    expect(history).toHaveLength(4);
+    expect(history).toHaveLength(5);
     expect(history[0]!.path).toBe("/bin/init");
     expect(history[0]!.exitCode).toBe(0);
     expect(history[1]!.path).toBe("/bin/hello-std");
     expect(history[1]!.exitCode).toBe(0);
-    // display-server's accept poll loop exhausts (no concurrent
-    // client under sequential `runAllSpawns`), exiting with code
-    // 17. See `crates/display-server/src/main.rs` for the exit-code
+    // display-server's outer accept loop poll-exhausts on its
+    // first iteration (no concurrent client under sequential
+    // `runAllSpawns`). `served_any` is still false, so exit code
+    // 17 fires — unchanged from the single-shot shape. See
+    // `crates/display-server/src/main.rs` for the full exit-code
     // table.
     expect(history[2]!.path).toBe("/bin/display-server");
     expect(history[2]!.exitCode).toBe(17);
-    // display-client-demo's `display_connect` poll loop exhausts,
-    // exiting with code 10. Under sequential `runAllSpawns`,
-    // display-server has already exited by the time
-    // display-client-demo runs; the kernel releases display-server's
-    // `/run/display` binding at `proc_exit` (the socket-cleanup
-    // slice), so every `display_connect` iteration here returns
-    // `-ECONNREFUSED` against a now-empty path. The bounded poll
-    // exhausts without ever promoting the client socket past
-    // `Unbound`, so the downstream `fd_write` retry loop is
-    // unreachable in this flow. See
-    // `crates/display-client-demo/src/main.rs` for the exit-code
-    // table.
+    // Both display-client-demo spawns run after display-server has
+    // torn down, so each `display_connect` poll exhausts
+    // -ECONNREFUSED and exits with code 10. The second spawn is
+    // added in init (see `crates/init/src/main.rs`) to exercise
+    // the outer accept loop under Playwright's concurrent-Worker
+    // scheduling.
     expect(history[3]!.path).toBe("/bin/display-client-demo");
     expect(history[3]!.exitCode).toBe(10);
+    expect(history[4]!.path).toBe("/bin/display-client-demo");
+    expect(history[4]!.exitCode).toBe(10);
 
     const combined = new TextDecoder().decode(
       new Uint8Array(
@@ -2239,11 +2237,13 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(lines[1]).toMatch(/^init spawned hello-std pid=\d+$/);
     expect(lines[2]).toMatch(/^init spawned display-server pid=\d+$/);
     expect(lines[3]).toMatch(/^init spawned display-client-demo pid=\d+$/);
-    expect(lines[4]).toBe("init exiting");
-    expect(lines[5]).toBe("hello from std");
-    expect(lines[6]).toBe("display-server starting");
-    expect(lines[7]).toBe("display-client-demo starting");
-    expect(lines).toHaveLength(8);
+    expect(lines[4]).toMatch(/^init spawned display-client-demo pid=\d+$/);
+    expect(lines[5]).toBe("init exiting");
+    expect(lines[6]).toBe("hello from std");
+    expect(lines[7]).toBe("display-server starting");
+    expect(lines[8]).toBe("display-client-demo starting");
+    expect(lines[9]).toBe("display-client-demo starting");
+    expect(lines).toHaveLength(10);
 
     // No /dev/fb0 writes — the sequential in-process harness can't
     // drive the IPC round-trip, so neither binary reaches its fb

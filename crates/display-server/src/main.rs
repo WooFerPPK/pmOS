@@ -11,31 +11,44 @@
 //! from.
 //!
 //! Flow:
-//!   1. `display_bind()`                        — claim `/run/display`.
-//!   2. `ipc_accept(listener)` (EAGAIN poll)   — wait for a client.
-//!   3. `fd_read(server, buf)` (EAGAIN poll)   — read pixel payload.
-//!   4. `path_open("/dev/fb0")`                  — open framebuffer.
-//!   5. `fd_write(fb_fd, buf)`                   — relay to `/dev/fb0`.
-//!   6. fall off the end of `main`               — std emits `__wasi_proc_exit(0)`.
+//!   1. `display_bind()`                     — claim `/run/display`.
+//!   2. `path_open("/dev/fb0")`               — open framebuffer once,
+//!                                               reused for every served
+//!                                               client.
+//!   3. Outer loop (at most `MAX_CLIENTS = 4` iterations):
+//!      a. `ipc_accept(listener)` (EAGAIN poll).
+//!         * poll exhausts with `served_any == false` → exit 17.
+//!         * poll exhausts with `served_any == true`  → break (clean drain).
+//!      b. `fd_read(server, buf)` (EAGAIN poll) — read pixel payload.
+//!      c. `fd_write(fb_fd, buf)`                — relay to `/dev/fb0`.
+//!      d. `fd_close(server)`                    — release the client fd
+//!                                                  so the next iteration's
+//!                                                  accept starts against a
+//!                                                  clean fd table.
+//!      e. `println!("display-server served client {i}")`.
+//!   4. `println!("display-server fb blit ok")` — trailing observable
+//!      line, same as the pre-slice shape.
+//!   5. fall off the end of `main`            — std emits
+//!      `__wasi_proc_exit(0)`.
 //!
-//! The accept poll loop is bounded so the vitest in-process
-//! composition helper (`runAllSpawns`) doesn't hang when no
-//! real-Worker client ever connects. Under production Playwright
-//! a `/bin/display-client-demo` sibling lands a connection within
-//! the first few dispatch passes. Same shape as
-//! `hello-input-echo`'s EAGAIN poll on `fd_read` — precedent for
-//! bounded polling exists in the workspace.
+//! `MAX_CLIENTS = 4` is a testing fiction. The outer loop can't run
+//! unbounded in v1 because `ipc_accept` still returns `-EAGAIN` on an
+//! empty backlog (no blocking semantic). Without a ceiling the
+//! vitest composition helper would spin forever when no more clients
+//! arrive. A future slice (kernel `ipc_accept` blocking + signal-
+//! driven exit via fd 3) removes the ceiling.
 //!
 //! Exit codes:
 //!
-//!   * 0  = success
+//!   * 0  = success (served >= 1 client, loop drained or hit `MAX_CLIENTS`)
 //!   * 10 = `display_bind` failed
 //!   * 12 = `ipc_accept` returned a non-EAGAIN error
 //!   * 14 = `fd_read` returned a non-EAGAIN error or read 0 bytes
 //!   * 15 = `path_open("/dev/fb0")` failed
 //!   * 16 = framebuffer `fd_write` failed or short-wrote
-//!   * 17 = `ipc_accept` poll loop exhausted (no client arrived)
-//!   * 18 = `fd_read` poll loop exhausted (client never wrote)
+//!   * 17 = first `ipc_accept` poll exhausted (0 clients served)
+//!   * 18 = `fd_read` poll exhausted for a connected client
+//!   * 19 = `fd_close` on the client fd returned a non-zero errno
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
@@ -63,6 +76,7 @@ extern "C" {
         iovs_len: i32,
         nread_ptr: *mut u32,
     ) -> i32;
+    fn fd_close(fd: i32) -> i32;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -91,10 +105,10 @@ fn main() {
     println!("display-server starting");
 
     // EAGAIN is positive `abi::errno::EAGAIN = 6`. WASI syscalls
-    // (`fd_read`, `fd_write`, `path_open`) surface errno directly
-    // as positive on error; PMos extension syscalls (`ipc_accept`,
-    // `display_bind`) negate into `-errno`. Both conventions
-    // agree on the numeric value.
+    // (`fd_read`, `fd_write`, `path_open`, `fd_close`) surface
+    // errno directly as positive on error; PMos extension syscalls
+    // (`ipc_accept`, `display_bind`) negate into `-errno`. Both
+    // conventions agree on the numeric value.
     const EAGAIN: i32 = 6;
     // Safety valve: bounded iteration count so the vitest
     // in-process composition test (`runAllSpawns`, strictly
@@ -102,50 +116,16 @@ fn main() {
     // process exists. Real Playwright (concurrent Workers) lands
     // a connection within the first handful of passes.
     const MAX_POLLS: u32 = 10_000;
+    // Outer-loop ceiling. Bounded for the same reason `MAX_POLLS`
+    // is bounded: the vitest harness is sequential. Removed by a
+    // future slice once `ipc_accept` has real blocking semantics
+    // and the server exits on SIGTERM instead of by draining.
+    const MAX_CLIENTS: u32 = 4;
 
     unsafe {
         let listener = display_bind();
         if listener < 0 {
             std::process::exit(10);
-        }
-
-        let mut server: i32 = -1;
-        for _ in 0..MAX_POLLS {
-            let rc = ipc_accept(listener);
-            if rc >= 0 {
-                server = rc;
-                break;
-            }
-            if rc == -EAGAIN {
-                continue;
-            }
-            std::process::exit(12);
-        }
-        if server < 0 {
-            std::process::exit(17);
-        }
-
-        let mut recv_buf = [0u8; 32];
-        let read_iov = Iovec {
-            buf: recv_buf.as_mut_ptr(),
-            buf_len: recv_buf.len() as u32,
-        };
-        let mut nread: u32 = 0;
-        let mut got_bytes = false;
-        for _ in 0..MAX_POLLS {
-            let rc = fd_read(server, &read_iov, 1, &mut nread);
-            if rc == 0 && nread > 0 {
-                got_bytes = true;
-                break;
-            }
-            if rc == 0 || rc == EAGAIN {
-                nread = 0;
-                continue;
-            }
-            std::process::exit(14);
-        }
-        if !got_bytes {
-            std::process::exit(18);
         }
 
         const FB_PATH: &[u8] = b"/dev/fb0";
@@ -165,19 +145,76 @@ fn main() {
             std::process::exit(15);
         }
 
-        // Writing from `recv_buf` (not a local constant) is
-        // deliberate: it pins the IPC round-trip as load-bearing,
-        // so a regression that broke `fd_read` but left everything
-        // else intact surfaces as wrong framebuffer bytes rather
-        // than a green test.
-        let fb_iov = Ciovec {
-            buf: recv_buf.as_ptr(),
-            buf_len: nread,
-        };
-        let mut fb_written: u32 = 0;
-        let rc = fd_write(fb_fd as i32, &fb_iov, 1, &mut fb_written);
-        if rc != 0 || fb_written != nread {
-            std::process::exit(16);
+        let mut served_any = false;
+        for i in 0..MAX_CLIENTS {
+            let mut server: i32 = -1;
+            for _ in 0..MAX_POLLS {
+                let rc = ipc_accept(listener);
+                if rc >= 0 {
+                    server = rc;
+                    break;
+                }
+                if rc == -EAGAIN {
+                    continue;
+                }
+                std::process::exit(12);
+            }
+            if server < 0 {
+                if served_any {
+                    break;
+                }
+                std::process::exit(17);
+            }
+
+            let mut recv_buf = [0u8; 32];
+            let read_iov = Iovec {
+                buf: recv_buf.as_mut_ptr(),
+                buf_len: recv_buf.len() as u32,
+            };
+            let mut nread: u32 = 0;
+            let mut got_bytes = false;
+            for _ in 0..MAX_POLLS {
+                let rc = fd_read(server, &read_iov, 1, &mut nread);
+                if rc == 0 && nread > 0 {
+                    got_bytes = true;
+                    break;
+                }
+                if rc == 0 || rc == EAGAIN {
+                    nread = 0;
+                    continue;
+                }
+                std::process::exit(14);
+            }
+            if !got_bytes {
+                std::process::exit(18);
+            }
+
+            // Writing from `recv_buf` (not a local constant) is
+            // deliberate: it pins the IPC round-trip as load-
+            // bearing, so a regression that broke `fd_read` but
+            // left everything else intact surfaces as wrong
+            // framebuffer bytes rather than a green test.
+            let fb_iov = Ciovec {
+                buf: recv_buf.as_ptr(),
+                buf_len: nread,
+            };
+            let mut fb_written: u32 = 0;
+            let rc = fd_write(fb_fd as i32, &fb_iov, 1, &mut fb_written);
+            if rc != 0 || fb_written != nread {
+                std::process::exit(16);
+            }
+
+            // Release the client-side server fd so the next
+            // iteration's `ipc_accept` starts against a clean
+            // fd table. `fd_close` returns positive errno per
+            // the WASI convention.
+            let rc = fd_close(server);
+            if rc != 0 {
+                std::process::exit(19);
+            }
+
+            println!("display-server served client {}", i);
+            served_any = true;
         }
     }
 

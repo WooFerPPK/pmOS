@@ -89,5 +89,21 @@ fn main() {
         println!("init spawned display-client-demo pid={}", rc);
     }
 
+    let rc = unsafe {
+        proc_spawn(
+            DISPLAY_CLIENT_DEMO.as_ptr(),
+            DISPLAY_CLIENT_DEMO.len() as u32,
+            u64::MAX,
+        )
+    };
+    if rc < 0 {
+        println!(
+            "init: proc_spawn /bin/display-client-demo failed errno={}",
+            -rc
+        );
+    } else {
+        println!("init spawned display-client-demo pid={}", rc);
+    }
+
     println!("init exiting");
 }

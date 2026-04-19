@@ -108,12 +108,23 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   const displayServerBlitIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] display-server fb blit ok"),
   );
-  const displayClientStartIdx = consoleLines.findIndex((l) =>
-    l.includes("[real-kernel] display-client-demo starting"),
-  );
-  const displayClientSentIdx = consoleLines.findIndex((l) =>
-    l.includes("[real-kernel] display-client-demo sent pixels"),
-  );
+  const displayClientStartIndices = consoleLines
+    .map((l, i) =>
+      l.includes("[real-kernel] display-client-demo starting") ? i : -1,
+    )
+    .filter((i) => i >= 0);
+  const displayClientSentIndices = consoleLines
+    .map((l, i) =>
+      l.includes("[real-kernel] display-client-demo sent pixels") ? i : -1,
+    )
+    .filter((i) => i >= 0);
+  const displayClientStartIdx = displayClientStartIndices[0] ?? -1;
+  const displayClientSentIdx = displayClientSentIndices[0] ?? -1;
+  const displayServerServedIndices = consoleLines
+    .map((l, i) =>
+      /\[real-kernel\] display-server served client \d+/.test(l) ? i : -1,
+    )
+    .filter((i) => i >= 0);
 
   expect(initStartIdx).toBeGreaterThanOrEqual(0);
   expect(initSpawnHelloStdIdx).toBeGreaterThan(initStartIdx);
@@ -138,6 +149,24 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   // prints "sent pixels" immediately after its fd_write. So the
   // client's "sent pixels" MUST come before the server's "fb blit ok".
   expect(displayServerBlitIdx).toBeGreaterThan(displayClientSentIdx);
+  // Two display-client-demo pids → two "starting" + two "sent
+  // pixels" lines on the console.
+  expect(displayClientStartIndices).toHaveLength(2);
+  expect(displayClientSentIndices).toHaveLength(2);
+  // display-server's outer accept loop serves both clients, so
+  // two "served client {i}" lines land (indices 0 and 1 from the
+  // server's iteration counter — the order relative to client
+  // pids is not pinned because the clients run concurrently).
+  expect(displayServerServedIndices).toHaveLength(2);
+  // The trailing "fb blit ok" line only prints after the outer
+  // loop breaks, so BOTH served-client lines and BOTH sent-pixels
+  // lines must precede it.
+  expect(displayServerBlitIdx).toBeGreaterThan(
+    displayServerServedIndices[1]!,
+  );
+  expect(displayServerBlitIdx).toBeGreaterThan(
+    displayClientSentIndices[1]!,
+  );
 
   expect(consoleLines.some((l) => l.includes("real kernel ready"))).toBe(true);
   expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
@@ -150,7 +179,11 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   expect(domText).toContain("init starting");
   expect(domText).toMatch(/init spawned hello-std pid=\d+/);
   expect(domText).toMatch(/init spawned display-server pid=\d+/);
-  expect(domText).toMatch(/init spawned display-client-demo pid=\d+/);
+  const domClientSpawnMatches = domText.match(
+    /init spawned display-client-demo pid=\d+/g,
+  );
+  expect(domClientSpawnMatches).not.toBeNull();
+  expect(domClientSpawnMatches!).toHaveLength(2);
   expect(domText).toContain("init exiting");
   expect(domText).toContain("hello from std");
   expect(domText).toContain("display-server starting");
@@ -170,21 +203,21 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
     domText.indexOf("display-server fb blit ok"),
   );
 
-  // Four concurrent pids (init + hello-std + display-server +
-  // display-client-demo) MUST each live in their own user Worker
-  // under `createSpawnRouter`'s management. `peakLiveWorkers` is
-  // the high-water mark of `router.liveWorkers.size` across every
-  // message the bootstrap's listener observes. The peak reaches 4
-  // during the window where init has spawned all three children
-  // and none have exited yet; this is the load-bearing evidence
-  // that the substrate round-robins across FOUR per-pid SAB rings,
-  // not just three. The kernel Worker is NOT counted — only user
+  // Five concurrent pids (init + hello-std + display-server +
+  // display-client-demo × 2) MUST each live in their own user
+  // Worker under `createSpawnRouter`'s management. `peakLiveWorkers`
+  // is the high-water mark of `router.liveWorkers.size` across
+  // every message the bootstrap's listener observes. The peak
+  // reaches 5 during the window where init has spawned all four
+  // children and none have exited yet; this is the load-bearing
+  // evidence that the substrate round-robins across FIVE per-pid
+  // SAB rings. The kernel Worker is NOT counted — only user
   // Workers under the router's management.
   const peakAttr = await page
     .locator("body")
     .getAttribute("data-pmos-peak-live-workers");
   expect(peakAttr).not.toBeNull();
-  expect(Number(peakAttr)).toBeGreaterThanOrEqual(4);
+  expect(Number(peakAttr)).toBeGreaterThanOrEqual(5);
 
   // T234: the kernel-wake-slot transport landed before any user Worker
   // spawned. Without this, every spawn would race the SAB-allocation
