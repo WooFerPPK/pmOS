@@ -495,9 +495,35 @@ impl Kernel {
                     PipeReadResult::WouldBlock => Err(KernelError::WouldBlock),
                 }
             }
-            FdObject::PipeWrite(_)
-            | FdObject::DisplayConn(_)
-            | FdObject::SignalChannel => Err(KernelError::NotSupportedOnFd),
+            FdObject::SignalChannel => {
+                // v1 wire format: each pending signal serialises
+                // as a u16 LE signum. buf.len() < 2 returns 0
+                // without touching the inbox (no room for even
+                // one record); empty inbox returns WouldBlock.
+                let capacity = buf.len() / 2;
+                if capacity == 0 {
+                    return Ok(0);
+                }
+                let pending = self
+                    .signal_inboxes
+                    .get(&pid)
+                    .ok_or(KernelError::NoSuchPid)?
+                    .len();
+                if pending == 0 {
+                    return Err(KernelError::WouldBlock);
+                }
+                let signals = self.drain_signals_up_to(pid, capacity)?;
+                let mut written = 0;
+                for sig in signals {
+                    let bytes = sig.number().to_le_bytes();
+                    buf[written..written + 2].copy_from_slice(&bytes);
+                    written += 2;
+                }
+                Ok(written)
+            }
+            FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => {
+                Err(KernelError::NotSupportedOnFd)
+            }
         }
     }
 
@@ -1130,6 +1156,24 @@ impl Kernel {
             .get_mut(&pid)
             .ok_or(KernelError::NoSuchPid)?;
         Ok(inbox.drain())
+    }
+
+    /// Drain up to `max` pending signals from `pid`'s inbox.
+    /// Returns them in delivery order; any signals past `max`
+    /// stay queued in their original position and surface on the
+    /// next drain. Used by the SignalChannel `fd_read` path
+    /// (each signal serialises to 2 bytes, so `max = buf.len()
+    /// / 2`). See [`SignalInbox::drain_bounded`].
+    pub fn drain_signals_up_to(
+        &mut self,
+        pid: Pid,
+        max: usize,
+    ) -> Result<Vec<Signal>, KernelError> {
+        let inbox = self
+            .signal_inboxes
+            .get_mut(&pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        Ok(inbox.drain_bounded(max))
     }
 
     /// Peek at the inbox without draining. Diagnostic only.

@@ -2337,6 +2337,7 @@ fn build_event(userdata: u64, error: u16, ty: u8, nbytes: u64, flags: u16) -> [u
 /// success event with the returned nbytes + flags.
 fn fd_readiness(
     kernel: &mut Kernel,
+    pid: Pid,
     entry: &FdEntry,
     is_read: bool,
 ) -> (bool, u64, u16, Option<i32>) {
@@ -2361,14 +2362,35 @@ fn fd_readiness(
         }
         FdObject::CharDevice(devnum) => char_device_readiness(kernel, devnum, is_read),
         FdObject::Socket(id) => socket_readiness(kernel, SocketId(id), is_read),
+        FdObject::SignalChannel => signal_channel_readiness(kernel, pid, is_read),
         FdObject::PipeRead(_)
         | FdObject::PipeWrite(_)
-        | FdObject::DisplayConn(_)
-        | FdObject::SignalChannel => {
+        | FdObject::DisplayConn(_) => {
             // v1 doesn't wire these through fd_read / fd_write; poll
             // on them is meaningless → per-subscription EINVAL.
             (false, 0, 0, Some(EINVAL))
         }
+    }
+}
+
+fn signal_channel_readiness(
+    kernel: &Kernel,
+    pid: Pid,
+    is_read: bool,
+) -> (bool, u64, u16, Option<i32>) {
+    if !is_read {
+        // SignalChannel is read-only. A poll on the write side is
+        // meaningless — pin that as EINVAL so userland can tell the
+        // difference between "not ready" and "ill-posed".
+        return (false, 0, 0, Some(EINVAL));
+    }
+    match kernel.pending_signals(pid) {
+        Ok(0) => (false, 0, 0, None),
+        // `nbytes` is the 2-bytes-per-signal serialised size; this
+        // lets a caller with a small buffer pre-compute how many
+        // signals they can consume in one read.
+        Ok(n) => (true, (n as u64) * 2, 0, None),
+        Err(_) => (false, 0, 0, Some(EINVAL)),
     }
 }
 
@@ -2571,7 +2593,7 @@ fn handle_poll_oneoff(
                     continue;
                 };
                 let (ready, nbytes, rwflags, err_opt) =
-                    fd_readiness(kernel, &entry, tag == et::FD_READ);
+                    fd_readiness(kernel, pid, &entry, tag == et::FD_READ);
                 if let Some(errno_code) = err_opt {
                     events.push(build_event(userdata, errno_code as u16, tag, 0, 0));
                 } else if ready {

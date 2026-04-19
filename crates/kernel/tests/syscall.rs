@@ -2700,9 +2700,11 @@ fn poll_oneoff_fd_write_socket_with_peer_capacity_ready() {
 }
 
 #[test]
-fn poll_oneoff_fd_read_on_signal_channel_emits_einval_event() {
-    // FD_READ on a SignalChannel fd is meaningless in v1 — the
-    // read path returns NotSupportedOnFd. Per-subscription EINVAL.
+fn poll_oneoff_fd_read_on_empty_signal_channel_not_ready() {
+    // FD_READ on a SignalChannel with no pending signals is
+    // simply not-ready — no event emitted, not a per-sub EINVAL.
+    // This lets a caller poll fd 3 alongside other fds without
+    // burning CPU on a meaningless error.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sigrd", 0);
     k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY).unwrap();
@@ -2714,6 +2716,64 @@ fn poll_oneoff_fd_read_on_signal_channel_emits_einval_event() {
         opcode: op_wasi::POLL_ONEOFF,
         flags: 0,
         request_id: 843,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+}
+
+#[test]
+fn poll_oneoff_fd_read_on_signal_channel_with_pending_signals_ready() {
+    // With signals pending in the inbox, FD_READ on a
+    // SignalChannel fd reports ready with nbytes = 2 * pending
+    // (each signal serialises to 2 bytes).
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    // Self-signal SIGTERM + SIGPIPE to fill two inbox slots.
+    k.proc_kill(init, init, Signal::Term).unwrap();
+    k.proc_kill(init, init, Signal::Pipe).unwrap();
+    k.install_fd(init, 5, FdObject::SignalChannel, FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(17, abi::wasi::eventtype::FD_READ, 5);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 844,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: 48 + 32,
+    };
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    let (_ud, err, ty, nb, _fl) = decode_event(&heap, 0);
+    assert_eq!(err, 0);
+    assert_eq!(ty, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nb, 4);
+    // Poll does not drain — the signals stay queued for the
+    // actual fd_read that follows.
+    assert_eq!(k.pending_signals(init).unwrap(), 2);
+}
+
+#[test]
+fn poll_oneoff_fd_write_on_signal_channel_emits_einval() {
+    // SignalChannel is read-only. FD_WRITE on it is ill-posed.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sigwr", 0);
+    k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY).unwrap();
+    let mut heap = vec![0u8; 128];
+    let s = sub_fd_rw(19, abi::wasi::eventtype::FD_WRITE, 5);
+    heap[..48].copy_from_slice(&s);
+
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 845,
         args: poll_oneoff_args(1, 1),
         heap_ptr: 0,
         heap_len: 48 + 32,
@@ -6898,6 +6958,180 @@ fn repeated_broken_writes_coalesce_to_single_sigpipe_entry() {
         assert_eq!(resp.status, -errno::EPIPE);
     }
     assert_eq!(k.drain_signals(pid).unwrap(), alloc::vec![Signal::Pipe]);
+}
+
+// ---- fd_read on SignalChannel --------------------------------------
+//
+// v1 wire format: each pending signal serialises as a u16 LE signum
+// byte pair. An empty inbox surfaces WouldBlock → EAGAIN so callers
+// polling fd 3 for signal delivery behave like any other readable fd
+// with no data. A buffer smaller than 2 bytes returns 0 without
+// consuming anything — there's no room for even one record. The
+// drain-order matches POSIX FIFO with dedup coalescing.
+
+#[test]
+fn fd_read_on_signal_channel_with_empty_inbox_returns_eagain() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sigreader", 0);
+    k.install_fd(pid, 3, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 2300,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EAGAIN);
+}
+
+#[test]
+fn fd_read_on_signal_channel_drains_pending_signals_as_u16_pairs() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    // Self-signal two catchable signals so both land in the inbox.
+    k.proc_kill(init, init, Signal::Term).unwrap();
+    k.proc_kill(init, init, Signal::Interrupt).unwrap();
+    k.install_fd(init, 3, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 2301,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 4);
+    // Two signals, FIFO order: Term (15) first, then Interrupt (2).
+    assert_eq!(
+        u16::from_le_bytes([heap[0], heap[1]]),
+        Signal::Term.number(),
+    );
+    assert_eq!(
+        u16::from_le_bytes([heap[2], heap[3]]),
+        Signal::Interrupt.number(),
+    );
+    // Inbox is empty post-read.
+    assert_eq!(k.pending_signals(init).unwrap(), 0);
+}
+
+#[test]
+fn fd_read_on_signal_channel_with_one_byte_buffer_returns_zero_preserving_queue() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sigreader", 0);
+    k.proc_kill(pid, pid, Signal::Term).unwrap();
+    k.install_fd(pid, 3, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 2302,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 1, // Too small for one 2-byte record.
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    // Signal still queued — the kernel did not drop it.
+    assert_eq!(k.pending_signals(pid).unwrap(), 1);
+}
+
+#[test]
+fn fd_read_on_signal_channel_with_partial_buffer_drains_only_what_fits() {
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    // Three distinct catchable signals.
+    k.proc_kill(init, init, Signal::Term).unwrap();
+    k.proc_kill(init, init, Signal::Interrupt).unwrap();
+    k.proc_kill(init, init, Signal::Pipe).unwrap();
+    k.install_fd(init, 3, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    // Buffer for exactly one record (2 bytes). One signal gets
+    // drained; the other two stay queued.
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 2303,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 2,
+    };
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 2);
+    assert_eq!(
+        u16::from_le_bytes([heap[0], heap[1]]),
+        Signal::Term.number(),
+    );
+    assert_eq!(k.pending_signals(init).unwrap(), 2);
+
+    // Second read drains the rest.
+    heap.iter_mut().for_each(|b| *b = 0);
+    let req2 = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 2304,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp2 = dispatch(&mut k, init, &req2, &mut heap);
+    assert_eq!(resp2.status, 0);
+    assert_eq!(resp2.value, 4);
+    assert_eq!(
+        u16::from_le_bytes([heap[0], heap[1]]),
+        Signal::Interrupt.number(),
+    );
+    assert_eq!(
+        u16::from_le_bytes([heap[2], heap[3]]),
+        Signal::Pipe.number(),
+    );
+    assert_eq!(k.pending_signals(init).unwrap(), 0);
+}
+
+#[test]
+fn fd_read_on_signal_channel_coalesces_repeated_same_signal() {
+    // Ten SIGTERMs posted via proc_kill dedup to one entry via
+    // SignalInbox::post. The fd_read path reads exactly one
+    // 2-byte record, not ten.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "sigreader", 0);
+    for _ in 0..10 {
+        k.proc_kill(pid, pid, Signal::Term).unwrap();
+    }
+    k.install_fd(pid, 3, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 32];
+
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 2305,
+        args: u32_args(3),
+        heap_ptr: 0,
+        heap_len: 32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 2);
+    assert_eq!(
+        u16::from_le_bytes([heap[0], heap[1]]),
+        Signal::Term.number(),
+    );
 }
 
 // ---- fd_prestat_dir_name --------------------------------------------

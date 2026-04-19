@@ -109,6 +109,21 @@ impl SignalInbox {
         self.queue.drain(..).collect()
     }
 
+    /// Remove and return up to `max` pending signals, in
+    /// delivery order. If the inbox holds fewer than `max`, all
+    /// of them are returned (same outcome as [`Self::drain`]).
+    /// If the inbox holds more than `max`, the first `max`
+    /// entries are returned and the rest stay queued in their
+    /// original order — the next `drain_bounded` or `drain` call
+    /// picks up where this one left off.
+    ///
+    /// Used by the SignalChannel fd_read path so a small-buffer
+    /// caller only consumes as many signals as fit.
+    pub fn drain_bounded(&mut self, max: usize) -> alloc::vec::Vec<Signal> {
+        let take = max.min(self.queue.len());
+        self.queue.drain(..take).collect()
+    }
+
     /// True iff the next `drain` would return no signals.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
@@ -157,6 +172,28 @@ mod tests {
         let mut i = SignalInbox::new();
         assert!(i.post(Signal::Term));
         assert!(!i.post(Signal::Term));
+        assert_eq!(i.len(), 1);
+    }
+
+    #[test]
+    fn drain_bounded_returns_prefix_in_order_and_leaves_remainder() {
+        let mut i = SignalInbox::new();
+        assert!(i.post(Signal::Term));
+        assert!(i.post(Signal::Pipe));
+        assert!(i.post(Signal::Interrupt));
+        let first = i.drain_bounded(2);
+        assert_eq!(first, alloc::vec![Signal::Term, Signal::Pipe]);
+        assert_eq!(i.len(), 1);
+        let rest = i.drain_bounded(8);
+        assert_eq!(rest, alloc::vec![Signal::Interrupt]);
+        assert!(i.is_empty());
+    }
+
+    #[test]
+    fn drain_bounded_with_zero_returns_empty_and_preserves_queue() {
+        let mut i = SignalInbox::new();
+        assert!(i.post(Signal::Term));
+        assert!(i.drain_bounded(0).is_empty());
         assert_eq!(i.len(), 1);
     }
 
