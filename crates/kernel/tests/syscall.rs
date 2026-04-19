@@ -10118,6 +10118,150 @@ fn proc_kill_sigchld_queues_on_child_inbox() {
     );
 }
 
+// ---- proc_kill(pid, 0) existence probe ---------------------------
+//
+// POSIX: kill(pid, 0) doesn't deliver a signal — it checks whether
+// `pid` exists and whether the caller would be permitted to signal
+// it. Returns 0 on success, ESRCH if pid doesn't exist / is reaped,
+// ENOTCAPABLE on permission denied. Shares the precondition surface
+// with the signum != 0 path, so the dispatcher routes signum 0 to
+// Kernel::proc_check_signal instead of Kernel::proc_kill.
+
+#[test]
+fn proc_kill_signum_zero_on_live_child_returns_ok_and_queues_nothing() {
+    // Parent -> live child with signum 0: permission check + target
+    // existence both pass -> 0 return. No signal delivered.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "target");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1420,
+        args: proc_kill_args(child, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(child).unwrap(), 0);
+}
+
+#[test]
+fn proc_kill_signum_zero_on_self_returns_ok() {
+    // Self-probe: sender == target always permitted. No signal
+    // delivered either way.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "self", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1421,
+        args: proc_kill_args(pid, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(pid).unwrap(), 0);
+}
+
+#[test]
+fn proc_kill_signum_zero_on_nonexistent_target_returns_esrch() {
+    // POSIX kill(bogus_pid, 0) returns ESRCH — the existence-check
+    // role of the probe.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1422,
+        args: proc_kill_args(9999, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ESRCH);
+}
+
+#[test]
+fn proc_kill_signum_zero_on_non_child_without_proc_kill_any_returns_enotcapable() {
+    // Two ordinary apps that aren't parent/child of each other;
+    // neither holds ProcKillAny. Signum 0 still gates on the
+    // permission check and returns ENOTCAPABLE.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    // Manually register two children with minimal caps (no
+    // ProcKillAny) and re-home their ppid so they are NOT in a
+    // parent-child relationship to each other.
+    let a = k
+        .register_process(RegisterArgs {
+            name: "a",
+            ppid: init,
+            caps: abi::cap::initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .expect("register a");
+    k.mark_ready(a).unwrap();
+    k.procs
+        .transition(a, kernel::proc::ProcState::Running)
+        .unwrap();
+    let b = k
+        .register_process(RegisterArgs {
+            name: "b",
+            ppid: init,
+            caps: abi::cap::initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .expect("register b");
+    k.mark_ready(b).unwrap();
+    k.procs
+        .transition(b, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    // a probes b — neither is a parent of the other, and
+    // ORDINARY_APP doesn't carry ProcKillAny. Must ENOTCAPABLE.
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1423,
+        args: proc_kill_args(b, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, a, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+}
+
+#[test]
+fn proc_kill_signum_zero_on_reaped_target_returns_esrch() {
+    // A zombified + reaped target is as good as non-existent.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "doomed");
+    k.proc_exit(child, ExitStatus::Exited(0)).unwrap();
+    k.reap(child).unwrap();
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 1424,
+        args: proc_kill_args(child, 0),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ESRCH);
+}
+
 // ---- proc_caps_get ---------------------------------------------------
 //
 // PROC_CAPS_GET (0x1105). Query a process's cap set. Sender may

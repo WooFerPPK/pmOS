@@ -1149,6 +1149,40 @@ impl Kernel {
         Ok(())
     }
 
+    /// POSIX `kill(pid, 0)` — the existence + permission probe.
+    /// Runs every precondition `proc_kill` would run (sender
+    /// exists, target exists, target not Dead, sender permitted
+    /// to signal target via parent/self/ProcKillAny) but
+    /// delivers no signal. Returns `Ok(())` if a real
+    /// `proc_kill(sender, target, ...)` would succeed on this
+    /// sender/target pair; otherwise the same `KernelError`
+    /// variant `proc_kill` would produce.
+    ///
+    /// The dispatcher maps `PROC_KILL` with `signum == 0` onto
+    /// this method — POSIX-style userland calling `kill(pid, 0)`
+    /// to check "is this pid alive and could I signal it" gets
+    /// a clean yes/no answer via the ext opcode.
+    pub fn proc_check_signal(
+        &self,
+        sender_pid: Pid,
+        target_pid: Pid,
+    ) -> Result<(), KernelError> {
+        let sender_caps = self.caps.list(sender_pid)?;
+        let target = self
+            .procs
+            .get(target_pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        if target.state == ProcState::Dead {
+            return Err(KernelError::NoSuchPid);
+        }
+        let is_parent = target.ppid == sender_pid;
+        let is_self = sender_pid == target_pid;
+        if !is_parent && !is_self && !sender_caps.contains(Cap::ProcKillAny) {
+            return Err(KernelError::NotCapable);
+        }
+        Ok(())
+    }
+
     /// Return the capability set held by `target_pid`.
     ///
     /// Cap rules: querying one's own caps never requires any

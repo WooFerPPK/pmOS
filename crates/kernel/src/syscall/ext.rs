@@ -569,14 +569,20 @@ fn handle_proc_wait(
 //
 // Layout:
 //   args[0..4] = target_pid (i32).
-//   args[4..6] = signum (u16). v1 knows three: SIGINT=2, SIGKILL=9,
-//                SIGTERM=15. Any other number → EINVAL before the
-//                kernel is touched (a future SIGCHLD / SIGHUP wiring
-//                extends this match without a wire-format break).
+//   args[4..6] = signum (u16). v1 accepts {0, 2, 9, 13, 15, 17}:
+//                0 = POSIX kill(pid, 0) existence + permission
+//                    probe — runs every precondition proc_kill
+//                    would run but delivers no signal.
+//                2 = SIGINT, 9 = SIGKILL, 13 = SIGPIPE,
+//                15 = SIGTERM, 17 = SIGCHLD. Any other number →
+//                EINVAL before the kernel is touched (a future
+//                SIGHUP / SIGQUIT wiring extends this match
+//                without a wire-format break).
 //
 // Response: value = 0 on success; negative errno on failure.
 //
-// Cap rules are enforced by Kernel::proc_kill: sender must be
+// Cap rules are enforced by Kernel::proc_kill (for signum != 0)
+// or Kernel::proc_check_signal (for signum == 0): sender must be
 // target's parent OR sender == target (self-signal) OR hold
 // Cap::ProcKillAny. Other cases → -ENOTCAPABLE. Non-existent or
 // already-reaped target → -ESRCH.
@@ -584,6 +590,13 @@ fn handle_proc_wait(
 fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let target_pid = i32::from_le_bytes([req.args[0], req.args[1], req.args[2], req.args[3]]);
     let signum = u16::from_le_bytes([req.args[4], req.args[5]]);
+    if signum == 0 {
+        // POSIX kill(pid, 0): existence + permission probe only.
+        return match kernel.proc_check_signal(pid, target_pid) {
+            Ok(()) => Response::ok(req.request_id, 0),
+            Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+        };
+    }
     let signal = match signum {
         2 => Signal::Interrupt,
         9 => Signal::Kill,
