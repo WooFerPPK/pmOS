@@ -132,6 +132,7 @@ let helloPpidWasmBytes: ArrayBuffer;
 let helloCapsWasmBytes: ArrayBuffer;
 let helloRaiseWasmBytes: ArrayBuffer;
 let helloWaitNoopWasmBytes: ArrayBuffer;
+let helloCapCheckWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
@@ -208,6 +209,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_wait_noop.wasm",
   );
+  const helloCapCheckPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_cap_check.wasm",
+  );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
@@ -253,6 +258,7 @@ beforeAll(() => {
     helloCapsPath,
     helloRaisePath,
     helloWaitNoopPath,
+    helloCapCheckPath,
     helloStdPath,
     helloClockPath,
     initPath,
@@ -293,6 +299,7 @@ beforeAll(() => {
   helloCapsWasmBytes = loadWasm(helloCapsPath);
   helloRaiseWasmBytes = loadWasm(helloRaisePath);
   helloWaitNoopWasmBytes = loadWasm(helloWaitNoopPath);
+  helloCapCheckWasmBytes = loadWasm(helloCapCheckPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
   initWasmBytes = loadWasm(initPath);
@@ -1543,6 +1550,66 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       consoleWrites[0]!.byteOffset,
     ).getInt32(0, true);
     expect(rc).toBe(-ERRNO.ECHILD);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-cap-check calls cap_check(SHELL) and writes 1 (i32 LE) + newline to /dev/console", async () => {
+    // End-to-end proof that the new `cap_check` PMos-ext shim is
+    // reachable from a real wasm32-wasip1 binary. cap_check is the
+    // per-cap yes/no probe — companion to cap_list /
+    // proc_caps_get's bitset query — useful when userland wants to
+    // gate a code path on one specific cap without materialising
+    // the full bitset.
+    //
+    // Composition test spawns the binary with CAPSET_ALL, so
+    // cap_check(CAP_SHELL = 3) returns 1. Bytes [0x01, 0x00,
+    // 0x00, 0x00, 0x0a].
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-cap-check", helloCapCheckWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-cap-check",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const rc = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(rc).toBe(1);
     expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 

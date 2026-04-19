@@ -2060,6 +2060,40 @@ export class UserWasmRuntime {
         return 0;
       },
 
+      // `cap_check(cap_id: i32) -> i32`
+      //
+      // Per-cap yes/no probe. Returns:
+      //
+      //   * 1 if the caller holds the requested cap.
+      //   * 0 if not.
+      //   * -EINVAL if `cap_id` doesn't correspond to a known
+      //     `Cap` discriminant (guards userland against typos and
+      //     forward-compatibility probing).
+      //   * -ESRCH if the caller's pid has been removed from the
+      //     process table — defensive only, normally unreachable.
+      //
+      // Companion to `cap_list` / `proc_caps_get`: those return a
+      // u64 bitset of every cap; `cap_check` is the per-cap query
+      // for callers that only care about one specific cap and
+      // don't want to materialise the full set.
+      cap_check: (capId: number): number => {
+        const args = new Uint8Array(16);
+        const v = new DataView(args.buffer);
+        v.setUint32(0, capId >>> 0, true);
+
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.CAP_CHECK,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0,
+        });
+        if (response.status !== 0) {
+          return response.status;
+        }
+        return Number(response.value);
+      },
+
       // `proc_self() -> i32`
       //
       // The cheapest possible PMos-ext syscall — every piece of

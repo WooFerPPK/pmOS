@@ -34,6 +34,7 @@ members = [
     "crates/hello-caps",
     "crates/hello-raise",
     "crates/hello-wait-noop",
+    "crates/hello-cap-check",
     "crates/hello-std",
     "crates/hello-clock",
     "crates/integration-tests",
