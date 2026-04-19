@@ -135,6 +135,7 @@ let helloWaitNoopWasmBytes: ArrayBuffer;
 let helloCapCheckWasmBytes: ArrayBuffer;
 let helloRandomWasmBytes: ArrayBuffer;
 let helloFdCloseBadWasmBytes: ArrayBuffer;
+let helloFdCloseGoodWasmBytes: ArrayBuffer;
 let helloCapListWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
@@ -224,6 +225,10 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello_fd_close_bad.wasm",
   );
+  const helloFdCloseGoodPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/hello_fd_close_good.wasm",
+  );
   const helloCapListPath = path.join(
     repoRoot,
     "target/wasm32-wasip1/release/hello_cap_list.wasm",
@@ -276,6 +281,7 @@ beforeAll(() => {
     helloCapCheckPath,
     helloRandomPath,
     helloFdCloseBadPath,
+    helloFdCloseGoodPath,
     helloCapListPath,
     helloStdPath,
     helloClockPath,
@@ -320,6 +326,7 @@ beforeAll(() => {
   helloCapCheckWasmBytes = loadWasm(helloCapCheckPath);
   helloRandomWasmBytes = loadWasm(helloRandomPath);
   helloFdCloseBadWasmBytes = loadWasm(helloFdCloseBadPath);
+  helloFdCloseGoodWasmBytes = loadWasm(helloFdCloseGoodPath);
   helloCapListWasmBytes = loadWasm(helloCapListPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
@@ -1821,6 +1828,70 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getBigUint64(0, true);
     expect(reportedCaps).toBe(CAPSET_ALL);
     expect(consoleWrites[0]![8]).toBe(0x0a); // '\n'
+  });
+
+  it("hello-fd-close-good closes fd 2, re-closes to verify -EBADF, and writes 0 (i32 LE) + newline", async () => {
+    // End-to-end proof of the SUCCESS arm of f03cf74's fd_close
+    // shim through a real wasm32-wasip1 binary. Companion to
+    // hello-fd-close-bad (which exercises the EBADF arm via
+    // closing an unopened fd).
+    //
+    // The binary closes fd 2 (auto-installed /dev/console
+    // stderr), then immediately re-closes fd 2 to verify the
+    // slot was actually freed (a no-op shim that returned 0 on
+    // every close would silently pass the first close but the
+    // re-close would also return 0 — the binary exits 14 on that
+    // invariant violation, surfacing as a non-zero exit code
+    // observable in the test). After the close + re-check the
+    // binary writes the FIRST close's rc (0) plus a newline to
+    // fd 1 (still open).
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-fd-close-good", helloFdCloseGoodWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-fd-close-good",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+
+    expect(consoleWrites).toHaveLength(1);
+    expect(consoleWrites[0]!.length).toBe(5);
+    const rc = new DataView(
+      consoleWrites[0]!.buffer,
+      consoleWrites[0]!.byteOffset,
+    ).getInt32(0, true);
+    expect(rc).toBe(0);
+    expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 
   it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {

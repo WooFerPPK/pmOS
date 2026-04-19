@@ -68,6 +68,10 @@ name = "hello-fd-close-bad"
 version = "0.1.0"
 
 [[package]]
+name = "hello-fd-close-good"
+version = "0.1.0"
+
+[[package]]
 name = "hello-framebuffer"
 version = "0.1.0"
 
