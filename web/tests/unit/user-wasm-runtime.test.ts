@@ -54,6 +54,7 @@ import {
   encodeSpawnManifest,
   ERRNO,
   OP_EXT,
+  OP_WASI,
 } from "../../src/shared/syscall";
 
 /**
@@ -1061,6 +1062,91 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     ).getUint16(0, true);
     expect(signum).toBe(15);
     expect(consoleWrites[0]![2]).toBe(0x0a); // '\n'
+  });
+
+  it("init's fd 3 observes SIGCHLD after a spawned user wasm child exits cleanly", async () => {
+    // End-to-end proof that 91c618f's SIGCHLD-on-child-exit path
+    // reaches userland through fd 3 after running REAL user
+    // wasm. init stages fd 3 as SignalChannel via the test-harness
+    // install export (init uses registerProcess, which
+    // deliberately does not auto-install — only proc_spawn'd
+    // children inherit fd 3 per 9fbe708), spawns hello-wasi-min,
+    // runAllSpawns runs the child which writes "hello from
+    // userland\n" and proc_exits. The child's PROC_EXIT posts
+    // SIGCHLD to init's inbox; init's fd_read on fd 3 drains
+    // the u16 LE record = 17.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/hello-wasi-min", helloWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.installSignalChannelFd(init, 3);
+    kernel.markRunning(init);
+
+    const manifest = encodeSpawnManifest({
+      path: "/bin/hello-wasi-min",
+      caps: CAPSET_ALL,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    expect(history[0]!.exitCode).toBe(0);
+    // Child wrote its message to the shared /dev/console.
+    expect(consoleWrites).toHaveLength(1);
+    expect(new TextDecoder().decode(consoleWrites[0]!)).toBe(
+      "hello from userland\n",
+    );
+
+    // init's inbox now has SIGCHLD. FD_READ on fd 3 drains it
+    // as a u16 LE signum = 17.
+    const readResult = kernel.dispatch(init, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 2,
+      arg0: 3,
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(readResult.response.status).toBe(0);
+    expect(Number(readResult.response.value)).toBe(2);
+    const sigchld = new DataView(
+      readResult.heapOut.buffer,
+      readResult.heapOut.byteOffset,
+      readResult.heapOut.byteLength,
+    ).getUint16(0, true);
+    expect(sigchld).toBe(17);
+
+    // A subsequent read finds an empty inbox.
+    const drainedResult = kernel.dispatch(init, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 3,
+      arg0: 3,
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(drainedResult.response.status).toBe(-ERRNO.EAGAIN);
   });
 
   it("hello-std: a real Rust `std` binary (println! + fn main) runs to completion through the PMos WASI shim", async () => {
