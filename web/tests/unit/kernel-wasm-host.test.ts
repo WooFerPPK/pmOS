@@ -5375,6 +5375,157 @@ describe("dispatch: CAP_LIST", () => {
   });
 });
 
+// ---- dispatch: ARGS_SIZES_GET / ARGS_GET ---------------------------
+//
+// PMos v1 has no command-line argument propagation — proc_spawn's
+// SpawnManifest doesn't carry argv. The kernel handlers always
+// answer "argc=0, args_buf_size=0" / no-op, mirroring an empty
+// argv vector. Closes the dispatch-layer coverage gap; the
+// shims at user-wasm-runtime.ts:737/760 have existed since hello-std
+// landed but were never tested at the dispatcher.
+
+describe("dispatch: ARGS_SIZES_GET", () => {
+  it("writes two zero u32s (argc=0, args_buf_size=0) and reports value=0 + extra_len=8", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.ARGS_SIZES_GET,
+      requestId: 1600,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(0);
+    expect(response.extraLen).toBe(8);
+    expect(heapOut.length).toBe(8);
+    const view = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    );
+    expect(view.getUint32(0, true)).toBe(0);
+    expect(view.getUint32(4, true)).toBe(0);
+  });
+});
+
+describe("dispatch: ARGS_GET", () => {
+  it("returns 0 (no-op since argc=0)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.ARGS_GET,
+      requestId: 1610,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(0);
+  });
+});
+
+// ---- dispatch: ENVIRON_SIZES_GET / ENVIRON_GET ---------------------
+//
+// Mirror of ARGS_*: PMos v1 has no environ propagation. The kernel
+// handlers answer "envc=0, environ_buf_size=0" / no-op.
+
+describe("dispatch: ENVIRON_SIZES_GET", () => {
+  it("writes two zero u32s (envc=0, environ_buf_size=0) and reports value=0 + extra_len=8", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.ENVIRON_SIZES_GET,
+      requestId: 1620,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(0);
+    expect(response.extraLen).toBe(8);
+    expect(heapOut.length).toBe(8);
+    const view = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      heapOut.byteLength,
+    );
+    expect(view.getUint32(0, true)).toBe(0);
+    expect(view.getUint32(4, true)).toBe(0);
+  });
+});
+
+describe("dispatch: ENVIRON_GET", () => {
+  it("returns 0 (no-op since envc=0)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.ENVIRON_GET,
+      requestId: 1630,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(response.status).toBe(0);
+    expect(Number(response.value)).toBe(0);
+  });
+});
+
+// ---- dispatch: FD_FDSTAT_GET ---------------------------------------
+//
+// Returns a 24-byte fdstat_t whose filetype field is derived from
+// the FdObject variant. /dev/console is a CharDevice ->
+// filetype CHARACTER_DEVICE = 2; an unopened fd surfaces -EBADF.
+// Closes the dispatch-layer coverage gap; the shim at
+// user-wasm-runtime.ts:790 was untested directly.
+
+describe("dispatch: FD_FDSTAT_GET", () => {
+  it("returns CHARACTER_DEVICE filetype for an installed /dev/console fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const args = new Uint8Array(16);
+    new DataView(args.buffer).setUint32(0, 1, true);
+
+    const { response, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FDSTAT_GET,
+      requestId: 1640,
+      args,
+      heapPtr: 0,
+      heapLen: 24,
+    });
+    expect(response.status).toBe(0);
+    expect(response.extraLen).toBe(24);
+    expect(heapOut.length).toBe(24);
+    // fdstat_t offset 0 = filetype u8
+    expect(heapOut[0]).toBe(FILETYPE.CHARACTER_DEVICE);
+  });
+
+  it("returns -EBADF for an unopened fd", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const args = new Uint8Array(16);
+    new DataView(args.buffer).setUint32(0, 99, true);
+
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FDSTAT_GET,
+      requestId: 1641,
+      args,
+      heapPtr: 0,
+      heapLen: 24,
+    });
+    expect(response.status).toBe(-ERRNO.EBADF);
+  });
+});
+
 // ---- dispatch: PROC_SPAWN → onSpawnProcess --------------------------
 
 describe("dispatch: PROC_SPAWN", () => {
