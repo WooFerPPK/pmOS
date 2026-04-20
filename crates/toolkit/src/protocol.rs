@@ -67,6 +67,17 @@ pub trait Connection {
     /// real transport (or by tests that want to assert on
     /// what was sent).
     fn drain_outbound(&mut self) -> Vec<u8>;
+
+    /// Pull whatever bytes the peer has made available for
+    /// inbound delivery. Returns an empty vec when nothing is
+    /// ready. Transports that are strictly outbound (the
+    /// default [`MemoryConnection`] used by existing tests
+    /// that only drive requests) inherit the default empty
+    /// implementation; bidirectional transports override to
+    /// surface server events.
+    fn recv(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// In-memory [`Connection`] for tests. `send` appends to the
@@ -159,6 +170,11 @@ pub enum ClientError {
     /// Partial message at the end of a byte stream — the
     /// caller should buffer more bytes and retry.
     NeedMoreBytes { have: usize, need: usize },
+    /// A required global was not advertised by the server
+    /// during the [`crate::app::App::connect`] bootstrap
+    /// handshake. Carried name is the interface wire name
+    /// (e.g. `"pmd_compositor"`).
+    MissingGlobal(&'static str),
 }
 
 impl From<WireError> for ClientError {

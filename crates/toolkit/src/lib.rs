@@ -27,6 +27,7 @@ pub mod theme;
 pub mod widget;
 pub mod window;
 
+pub use app::App;
 pub use protocol::{
     Client, ClientError, ClientEvent, ClientEventWithPayload, Connection, MemoryConnection,
 };
