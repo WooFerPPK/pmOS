@@ -232,3 +232,165 @@ fn repl_style_sequence_echo_help_exit() {
     assert_eq!(exit.exit_code, Some(7));
     assert!(s.has_exited());
 }
+
+// -----------------------------------------------------------------------------
+// `sh::run` REPL driver tests (T123)
+//
+// These cover the userland-binary-facing entry point: a
+// minimal REPL that reads stdin, tokenises by whitespace,
+// dispatches against the four-builtin slice (echo / exit /
+// cd / pwd), and reports an `ExitStatus` to the caller.
+// Distinct from the `Shell::eval` tests above — those
+// cover the library state machine embedded in other crates
+// (term, integration-tests); these cover the binary loop.
+// -----------------------------------------------------------------------------
+
+use sh::{run, ExitStatus};
+use std::io::{BufReader, Cursor};
+
+/// Drive `run` with a byte-string stdin and return
+/// `(status, stdout, stderr)` for assertion.
+fn drive(input: &str) -> (ExitStatus, String, String) {
+    let stdin = BufReader::new(Cursor::new(input.as_bytes().to_vec()));
+    let mut stdout = Vec::<u8>::new();
+    let mut stderr = Vec::<u8>::new();
+    let status = run(stdin, &mut stdout, &mut stderr);
+    let out = String::from_utf8(stdout).expect("stdout must be utf-8");
+    let err = String::from_utf8(stderr).expect("stderr must be utf-8");
+    (status, out, err)
+}
+
+#[test]
+fn run_eof_exits_clean() {
+    let (status, stdout, stderr) = drive("");
+    assert_eq!(status, ExitStatus::Eof);
+    // With no input the prompt still prints once before
+    // `read_line` hits EOF; nothing else may appear.
+    assert_eq!(stdout, "$ ");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn run_echo_writes_args_with_spaces_and_newline() {
+    let (status, stdout, stderr) = drive("echo hello world\n");
+    // EOF after the echo line → clean.
+    assert_eq!(status, ExitStatus::Eof);
+    assert!(
+        stdout.contains("hello world\n"),
+        "stdout missing echo output: {stdout:?}"
+    );
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn run_echo_with_no_args_emits_just_newline() {
+    let (status, stdout, stderr) = drive("echo\n");
+    assert_eq!(status, ExitStatus::Eof);
+    // The prompt + a bare newline (echo's output) + the
+    // second prompt before EOF. Guarantees the line
+    // exists in the stream, exact-match on the two-prompt
+    // shape.
+    assert_eq!(stdout, "$ \n$ ");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn run_exit_zero_returns_exit_status() {
+    let (status, _stdout, stderr) = drive("exit\n");
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn run_exit_with_code_returns_that_code() {
+    let (status, _stdout, stderr) = drive("exit 42\n");
+    assert_eq!(status, ExitStatus::Exit(42));
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn run_exit_with_invalid_code_returns_exit_two() {
+    let (status, _stdout, stderr) = drive("exit notanumber\n");
+    assert_eq!(status, ExitStatus::Exit(2));
+    assert!(
+        stderr.contains("numeric argument required"),
+        "stderr missing error: {stderr:?}"
+    );
+    assert!(stderr.contains("notanumber"));
+}
+
+#[test]
+fn run_unknown_command_writes_to_stderr_and_continues() {
+    let (status, _stdout, stderr) = drive("foo\nexit\n");
+    // The REPL survived the unknown command and ran
+    // `exit` on the next line.
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stderr.contains("sh: command not found: foo"),
+        "stderr missing error: {stderr:?}"
+    );
+}
+
+#[test]
+fn run_pwd_writes_current_dir() {
+    let (status, stdout, stderr) = drive("pwd\nexit\n");
+    assert_eq!(status, ExitStatus::Exit(0));
+    // Stream shape: `"$ <path>\n$ "`. Strip the leading
+    // prompt and grab the pwd output up to its newline.
+    let after_prompt = stdout
+        .strip_prefix("$ ")
+        .unwrap_or_else(|| panic!("stdout missing initial prompt: {stdout:?}"));
+    let (pwd_output, _rest) = after_prompt
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("stdout missing pwd newline: {stdout:?}"));
+    assert!(
+        pwd_output.starts_with('/'),
+        "pwd output should be an absolute path: {pwd_output:?}"
+    );
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn run_cd_changes_current_dir_and_affects_pwd() {
+    // `cd /tmp` → `pwd` should report `/tmp`.
+    // Tracked in a local PathBuf inside `run` so this works
+    // even when the underlying std::env::set_current_dir is
+    // a no-op (e.g. wasip1).
+    let (status, stdout, _stderr) = drive("cd /tmp\npwd\nexit\n");
+    assert_eq!(status, ExitStatus::Exit(0));
+    // `pwd` writes `/tmp` + newline somewhere in the stream
+    // between the prompts. Use a substring check against
+    // the raw bytes rather than splitting on newline (the
+    // prompt never emits one, so `stdout.lines()` produces
+    // concatenated prompt+output segments).
+    assert!(
+        stdout.contains("/tmp\n"),
+        "stdout missing `/tmp` pwd line: {stdout:?}"
+    );
+}
+
+#[test]
+fn run_blank_line_reprints_prompt() {
+    // Blank line is a no-op that just re-prints `"$ "`.
+    // The sequence is:
+    //   prompt #1 — before we read the blank line.
+    //   blank line is a no-op (no output).
+    //   prompt #2 — before we read `"exit"`.
+    //   exit runs, prompt is NOT re-printed.
+    let (status, stdout, _stderr) = drive("\nexit\n");
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(stdout, "$ $ ");
+}
+
+#[test]
+fn run_cd_with_no_args_returns_to_root_and_pwd_reflects_it() {
+    // cd without args defaults to `/`. Preceded by a
+    // non-trivial cd so the test actually exercises the
+    // "reset" path.
+    let (status, stdout, _stderr) = drive("cd /tmp\ncd\npwd\nexit\n");
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stdout.contains("/\n"),
+        "stdout missing `/` pwd line: {stdout:?}"
+    );
+}

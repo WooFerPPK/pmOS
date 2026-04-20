@@ -12,5 +12,15 @@ path = "src/lib.rs"
 name = "sh"
 path = "src/main.rs"
 
+[features]
+# `std` adds the `run` REPL driver (see `crates/sh/src/run.rs`).
+# Default-on so `cargo test -p sh` and the userland `sh` binary
+# both pick it up without extra flags. `no_std + alloc` consumers
+# (embedding `Shell::eval` into a restricted environment) can
+# `default-features = false` and keep using the tokenizer + shell
+# state machine without the REPL layer.
+default = ["std"]
+std = []
+
 [dependencies]
 abi = { path = "../abi" }
