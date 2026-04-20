@@ -85,6 +85,28 @@ pub struct Theme {
     pub button_border: Color,
     /// Default caption text colour for a button.
     pub button_text: Color,
+
+    /// Default fill for a [`crate::widget::text_input::TextInput`]
+    /// in its resting state. Slightly lighter than the
+    /// window background so an empty input is still visible
+    /// against the chrome.
+    pub text_input_bg: Color,
+    /// Fill for a [`crate::widget::text_input::TextInput`]
+    /// when the pointer is hovering over it.
+    pub text_input_bg_hover: Color,
+    /// Fill for a [`crate::widget::text_input::TextInput`]
+    /// while it has keyboard focus.
+    pub text_input_bg_focused: Color,
+    /// Text colour inside a
+    /// [`crate::widget::text_input::TextInput`]. Also used
+    /// for the 1-pixel caret bar.
+    pub text_input_fg: Color,
+    /// Dimmed colour used to paint the placeholder string
+    /// when the input is empty and unfocused.
+    pub text_input_placeholder_fg: Color,
+    /// 1-pixel border drawn around a
+    /// [`crate::widget::text_input::TextInput`].
+    pub text_input_border: Color,
 }
 
 impl Theme {
@@ -111,6 +133,12 @@ impl Theme {
         button_fill_pressed: Color::rgb(0xc2, 0xc6, 0xcf),
         button_border: Color::rgb(0x8a, 0x8e, 0x96),
         button_text: Color::rgb(0x1a, 0x1a, 0x1a),
+        text_input_bg: Color::rgb(0xff, 0xff, 0xff),
+        text_input_bg_hover: Color::rgb(0xf8, 0xf9, 0xfc),
+        text_input_bg_focused: Color::rgb(0xff, 0xff, 0xff),
+        text_input_fg: Color::rgb(0x1a, 0x1a, 0x1a),
+        text_input_placeholder_fg: Color::rgb(0x8a, 0x8a, 0x8a),
+        text_input_border: Color::rgb(0x8a, 0x8e, 0x96),
     };
 
     /// Placeholder dark theme. The titlebar / border /
@@ -137,6 +165,12 @@ impl Theme {
         button_fill_pressed: Color::rgb(0x22, 0x26, 0x2e),
         button_border: Color::rgb(0x54, 0x58, 0x60),
         button_text: Color::rgb(0xec, 0xec, 0xec),
+        text_input_bg: Color::rgb(0x14, 0x17, 0x1c),
+        text_input_bg_hover: Color::rgb(0x1a, 0x1d, 0x24),
+        text_input_bg_focused: Color::rgb(0x20, 0x24, 0x2c),
+        text_input_fg: Color::rgb(0xec, 0xec, 0xec),
+        text_input_placeholder_fg: Color::rgb(0x6a, 0x6a, 0x6a),
+        text_input_border: Color::rgb(0x54, 0x58, 0x60),
     };
 }
 
