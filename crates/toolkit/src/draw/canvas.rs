@@ -107,16 +107,50 @@ impl Rect {
     }
 }
 
-/// A plain RGBA8888 pixel buffer.
-pub struct Canvas {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
+/// Internal pixel storage for [`Canvas`] — either an
+/// owned `Vec<u8>` (produced by [`Canvas::new`]) or a
+/// mutably borrowed slice (produced by
+/// [`Canvas::from_slice`], used by
+/// [`crate::draw::BufferPool`] to hand the back buffer
+/// out to callers for painting without copying).
+enum CanvasStorage<'a> {
+    Owned(Vec<u8>),
+    Borrowed(&'a mut [u8]),
 }
 
-impl Canvas {
+impl<'a> CanvasStorage<'a> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            CanvasStorage::Owned(v) => v.as_slice(),
+            CanvasStorage::Borrowed(s) => s,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            CanvasStorage::Owned(v) => v.as_mut_slice(),
+            CanvasStorage::Borrowed(s) => s,
+        }
+    }
+}
+
+/// A plain RGBA8888 pixel buffer.
+///
+/// The lifetime parameter tracks the borrow of an
+/// externally-owned pixel slice when the canvas is built
+/// through [`Canvas::from_slice`]; [`Canvas::new`] returns
+/// a `Canvas<'static>` backed by its own `Vec<u8>` so
+/// existing call sites keep compiling with inferred
+/// lifetime.
+pub struct Canvas<'a> {
+    width: u32,
+    height: u32,
+    pixels: CanvasStorage<'a>,
+}
+
+impl Canvas<'static> {
     /// Allocate a fresh zero-filled canvas of `width ×
-    /// height` pixels.
+    /// height` pixels, backed by a fresh `Vec<u8>`.
     ///
     /// # Panics
     ///
@@ -131,7 +165,40 @@ impl Canvas {
         Canvas {
             width,
             height,
-            pixels: vec![0u8; total],
+            pixels: CanvasStorage::Owned(vec![0u8; total]),
+        }
+    }
+}
+
+impl<'a> Canvas<'a> {
+    /// Wrap an externally-owned pixel slice in a
+    /// [`Canvas`] without copying. The slice's length must
+    /// exactly equal `width * height * 4`; callers pass in
+    /// the back-buffer view returned by
+    /// [`crate::draw::BufferPool::acquire_back_canvas`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pixels.len()` does not equal
+    /// `width * height * 4`.
+    pub fn from_slice(pixels: &'a mut [u8], width: u32, height: u32) -> Self {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(BYTES_PER_PIXEL))
+            .expect("canvas dimensions overflow usize");
+        assert_eq!(
+            pixels.len(),
+            expected,
+            "slice length {} does not match {}x{}x{}",
+            pixels.len(),
+            width,
+            height,
+            BYTES_PER_PIXEL
+        );
+        Canvas {
+            width,
+            height,
+            pixels: CanvasStorage::Borrowed(pixels),
         }
     }
 
@@ -146,23 +213,36 @@ impl Canvas {
     /// Borrow the raw pixel bytes. Length is
     /// `width * height * 4`.
     pub fn pixels(&self) -> &[u8] {
-        &self.pixels
+        self.pixels.as_slice()
     }
 
     /// Mutable raw bytes. Useful when an external caller
     /// (e.g. a font rasterizer or a blit source) writes
     /// directly into the canvas backbuffer.
     pub fn pixels_mut(&mut self) -> &mut [u8] {
-        &mut self.pixels
+        self.pixels.as_mut_slice()
     }
+}
 
+impl Canvas<'static> {
     /// Take ownership of the pixel bytes, consuming the
     /// canvas. The caller typically ships the bytes into
     /// an shm pool via `toolkit::Client::shm_pool_create_buffer`.
+    ///
+    /// Only available on `Canvas<'static>` (the owning
+    /// variant from [`Canvas::new`]); a borrowed canvas
+    /// has no `Vec<u8>` to give up.
     pub fn into_pixels(self) -> Vec<u8> {
-        self.pixels
+        match self.pixels {
+            CanvasStorage::Owned(v) => v,
+            CanvasStorage::Borrowed(_) => {
+                unreachable!("Canvas<'static>::into_pixels always has owned storage")
+            }
+        }
     }
+}
 
+impl<'a> Canvas<'a> {
     /// Borrow one pixel as `[R, G, B, A]`. Returns `None`
     /// if `(x, y)` is out of bounds.
     pub fn pixel(&self, x: u32, y: u32) -> Option<&[u8]> {
@@ -170,13 +250,13 @@ impl Canvas {
             return None;
         }
         let idx = ((y * self.width + x) as usize) * BYTES_PER_PIXEL;
-        self.pixels.get(idx..idx + BYTES_PER_PIXEL)
+        self.pixels.as_slice().get(idx..idx + BYTES_PER_PIXEL)
     }
 
     /// Paint every pixel with `color`.
     pub fn clear(&mut self, color: Color) {
         let (r, g, b, a) = (color.r(), color.g(), color.b(), color.a());
-        for chunk in self.pixels.chunks_exact_mut(BYTES_PER_PIXEL) {
+        for chunk in self.pixels.as_mut_slice().chunks_exact_mut(BYTES_PER_PIXEL) {
             chunk[0] = r;
             chunk[1] = g;
             chunk[2] = b;
@@ -191,13 +271,14 @@ impl Canvas {
             return;
         }
         let idx = ((y as u32 * self.width + x as u32) as usize) * BYTES_PER_PIXEL;
-        if idx + BYTES_PER_PIXEL > self.pixels.len() {
+        let pixels = self.pixels.as_mut_slice();
+        if idx + BYTES_PER_PIXEL > pixels.len() {
             return;
         }
-        self.pixels[idx] = color.r();
-        self.pixels[idx + 1] = color.g();
-        self.pixels[idx + 2] = color.b();
-        self.pixels[idx + 3] = color.a();
+        pixels[idx] = color.r();
+        pixels[idx + 1] = color.g();
+        pixels[idx + 2] = color.b();
+        pixels[idx + 3] = color.a();
     }
 
     /// Fill every pixel inside `rect` with `color`. Clipped

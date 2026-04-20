@@ -28,6 +28,7 @@ pub mod widget;
 pub mod window;
 
 pub use app::App;
+pub use draw::BufferPool;
 pub use protocol::{
     Client, ClientError, ClientEvent, ClientEventWithPayload, Connection, MemoryConnection,
 };

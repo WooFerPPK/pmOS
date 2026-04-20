@@ -15,10 +15,12 @@
 //! toolkit client that needs text — term, files, edit,
 //! settings, etc. See `font.rs` for the glyph table.
 
+pub mod buffer;
 pub mod canvas;
 pub mod font;
 pub mod text;
 
+pub use buffer::BufferPool;
 pub use canvas::{Canvas, Color, Rect, BYTES_PER_PIXEL};
 pub use font::{
     glyph_for, glyph_pixel, Glyph, CELL_HEIGHT, CELL_WIDTH, FIRST_CHAR, GLYPH_COUNT,
