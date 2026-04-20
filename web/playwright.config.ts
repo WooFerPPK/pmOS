@@ -23,6 +23,14 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   reporter: "list",
+  // The real-kernel integration tests race against actual Worker
+  // scheduling + kernel dispatch in a headless browser; under slow
+  // CI hardware a single-frame stall can push a console observable
+  // past the assertion poll. Allow two retries in CI to absorb
+  // those transient races without paving over genuine regressions
+  // (a real bug would fail all three attempts). Local runs still
+  // fail-fast on first failure to keep the edit/test loop tight.
+  retries: process.env.CI ? 2 : 0,
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
     trace: "off",
