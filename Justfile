@@ -21,7 +21,12 @@ build:
         -p hello-wasi-spawner -p ipc-self-test -p hello-framebuffer \
         -p display-server-lite -p hello-wasi-bootstrap \
         -p hello-fb-blit -p hello-input-echo \
-        -p hello-std -p hello-clock
+        -p hello-std -p hello-clock \
+        -p hello-sigchld -p hello-kill-probe -p hello-pid \
+        -p hello-self-probe -p hello-ppid -p hello-caps \
+        -p hello-raise -p hello-wait-noop -p hello-cap-check \
+        -p hello-random -p hello-fd-close-bad -p hello-fd-close-good \
+        -p hello-yield-loop -p hello-cap-list
     cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
     cd web && npx esbuild src/kernel-worker-entry.ts --bundle --outfile=../build/assets/kernel-worker.js --format=esm
     cd web && npx esbuild src/user-worker-entry.ts --bundle --outfile=../build/assets/user-worker.js --format=esm
