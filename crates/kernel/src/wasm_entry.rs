@@ -51,6 +51,19 @@
 //! all browser-specific. Native isolation coverage for the
 //! dispatcher lives in `crates/kernel/tests/syscall.rs`, which
 //! calls `kernel::syscall::dispatch` directly.
+//!
+//! ## Test-only scaffolding
+//!
+//! `kernel_register_process_for_spawn` and
+//! `kernel_mark_running`'s idempotent-against-Ready branch (the
+//! skip-`mark_ready`-when-pid-is-already-Ready arm) exist purely
+//! for TS dispatcher tests that compose `spawnChildForTest` with
+//! `markRunning`. Production init never takes the idempotent
+//! branch because freshly-registered pids start in `Starting`
+//! state, not `Ready`. Both live in the production `kernel.wasm`
+//! export surface for simplicity (no feature-gated dev build),
+//! but neither should be called from production TS code —
+//! `PROC_SPAWN` is the real process-creation path.
 
 #![cfg(all(not(feature = "native-platform"), target_arch = "wasm32"))]
 #![allow(static_mut_refs)]
@@ -368,7 +381,7 @@ pub extern "C" fn kernel_dispatch(pid: Pid) -> i32 {
 /// Take the next pending wake for `pid` out of `Kernel.pending_wakes`,
 /// write its 32-byte Response into RESP_SCRATCH, and if the entry
 /// has a heap payload write it into `HEAP_SCRATCH[0..extra_len]`
-/// AND record the user's original heap_ptr in `RESP_HEAP_PTR`
+/// and record the user's original heap_ptr in `RESP_HEAP_PTR`
 /// (readable via `kernel_resp_heap_ptr`). Returns 1 if an entry
 /// was drained, 0 if nothing is queued for this pid.
 #[no_mangle]

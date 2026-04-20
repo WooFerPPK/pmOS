@@ -636,10 +636,11 @@ var KernelWasmHost = class _KernelWasmHost {
    * needs to dispatch its own syscalls).
    */
   spawnChildForTest(parent, name) {
+    const nameLen = this.writeNameToHeapScratch(name);
     const rc = this.exports.kernel_register_process_for_spawn(
       parent,
-      this.encodeStringToHeap(name),
-      name.length
+      0,
+      nameLen
     );
     if (rc < 0) {
       throw new Error(
@@ -648,18 +649,21 @@ var KernelWasmHost = class _KernelWasmHost {
     }
     return rc;
   }
-  encodeStringToHeap(s) {
-    const encoder = new TextEncoder();
-    const bytes = encoder.encode(s);
+  // The kernel export reads the name from `HEAP_SCRATCH[0..name_len]`;
+  // the ptr argument is unused but preserved for export-signature
+  // stability. Returns UTF-8 byte length (not UTF-16 code-unit count)
+  // so the kernel sees the exact byte window the JS side wrote.
+  writeNameToHeapScratch(s) {
+    const bytes = new TextEncoder().encode(s);
     const heapCap = this.exports.kernel_heap_len();
     if (bytes.length > heapCap) {
       throw new Error(
-        `KernelWasmHost.encodeStringToHeap: ${bytes.length} > heap capacity ${heapCap}`
+        `KernelWasmHost.writeNameToHeapScratch: ${bytes.length} > heap capacity ${heapCap}`
       );
     }
     const heapPtr = this.exports.kernel_heap_ptr();
     new Uint8Array(this.exports.memory.buffer, heapPtr, bytes.length).set(bytes);
-    return 0;
+    return bytes.length;
   }
   // ---- syscall dispatch ---------------------------------------------
   /**
