@@ -190,6 +190,26 @@ export class UserWasmRuntime {
 
     try {
       exports._start();
+      // `_start` returned normally — Rust's wasm32-wasip1 std runtime
+      // does NOT call `__wasi_proc_exit(0)` when `main()` returns
+      // cleanly; it just returns from `_start`. The kernel still
+      // needs to observe the exit (transitioning the pid to Zombie)
+      // so a parent's `proc_wait` can reap it. Dispatch PROC_EXIT(0)
+      // ourselves so the kernel's transition + wake_parked_waiter_for_child
+      // path runs. Without this, a `_start`-returning child leaves
+      // its kernel-side proc entry alive and any parked parent
+      // never reaps it.
+      try {
+        this.backend.dispatch({
+          opcode: OP_WASI.PROC_EXIT,
+          requestId: 0,
+          arg0: 0,
+        });
+      } catch {
+        // Best-effort: if the dispatch throws (e.g. kernel already
+        // reaped us via a parallel SIGKILL path), the Worker is
+        // about to be terminated anyway.
+      }
       return 0;
     } catch (err) {
       if (err instanceof UserProcessExited) {

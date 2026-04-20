@@ -1028,13 +1028,26 @@ var KernelWasmHost = class _KernelWasmHost {
         const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
         const sabIsShared = haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
         for (let i = 0; i < budget; i++) {
-          this.drainWakesForPid(pid, view);
+          const resHeadBefore = Atomics.load(header, OFF_RES_HEAD / 4);
+          const wakesPushed = this.drainWakesForPid(pid, view);
+          if (wakesPushed > 0) {
+            try {
+              this.markRunning(pid);
+            } catch {
+            }
+          }
           const rc = this.serviceSab(pid, view);
-          if (rc === 1) break;
-          anyServiced = true;
-          Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
-          if (sabIsShared) {
-            Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+          const resHeadAfter = Atomics.load(header, OFF_RES_HEAD / 4);
+          const responsePushed = resHeadAfter !== resHeadBefore;
+          if (responsePushed) {
+            Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+            if (sabIsShared) {
+              Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+            }
+            anyServiced = true;
+          }
+          if (rc === 1) {
+            break;
           }
         }
       }
@@ -1857,6 +1870,12 @@ function installWorkerEntry(messaging, options = {}) {
     if (msg.kind === "proc:sab") {
       pidMap.set(msg.pid, msg.sab);
       lifecycle.hasEverSpawned = true;
+      if (realKernel !== void 0) {
+        try {
+          realKernel.markRunning(msg.pid);
+        } catch {
+        }
+      }
       return;
     }
     if (msg.kind === "proc:exited") {

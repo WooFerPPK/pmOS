@@ -2116,35 +2116,41 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
   });
 
   it("init (std) spawns hello-std AND display-server AND display-client-demo via pmos_ext.proc_spawn, all three children run after init exits", async () => {
-    // The four-pid substrate slice: init fires three fire-and-forget
+    // The four-pid substrate slice: init fires four fire-and-forget
     // `pmos_ext.proc_spawn` calls (`/bin/hello-std`,
-    // `/bin/display-server`, `/bin/display-client-demo`) and exits.
+    // `/bin/display-server`, `/bin/display-client-demo` ×2), then
+    // enters a blocking `proc_wait` supervision loop (T095).
     //
     // Under `runAllSpawns` (the vitest composition helper) children
-    // run strictly sequentially — init completes, then hello-std,
-    // then display-server, then display-client-demo. That sequential
-    // shape is deliberately the WRONG shape for the IPC round-trip:
-    // display-server runs alone (no concurrent client), spins its
-    // bounded `ipc_accept` poll loop, exhausts, and exits 17; then
-    // display-client-demo runs alone (server already torn down),
-    // spins its bounded `display_connect` poll loop, exhausts, and
-    // exits 10. Neither "fb blit ok" nor "sent pixels" prints —
-    // both are gated on successful IPC.
+    // run strictly sequentially AND spawned pids stay Ready (no
+    // `markRunning`). Init's first blocking `proc_wait` trips
+    // `park_on_wait`'s Running→BlockedOnWait transition check —
+    // init itself is Ready, so the transition fails with
+    // `KernelError::NoSuchPid` → shim surfaces `-ESRCH`. Init's
+    // early-exit arm prints
+    // `init proc_wait returned errno=71; exiting with 4 children
+    // unreaped` + `init exiting` and falls through. Children then
+    // run one at a time: hello-std exits 0, display-server's first
+    // `ipc_accept` trips the same Ready→BlockedOnIpc transition
+    // failure (→ `-ESRCH` → exit 12), display-client-demo's
+    // `display_connect` exhausts against the torn-down listener
+    // (→ exit 10).
     //
-    // The vitest layer therefore validates that:
-    //   1. init spawns all three children and every expected
-    //      `init spawned ...` line prints;
-    //   2. hello-std still runs cleanly alongside the new siblings
+    // The vitest layer validates that:
+    //   1. init spawns all four children (three distinct paths);
+    //   2. init's proc_wait supervision loop degrades gracefully
+    //      under the sequential harness (no infinite spin);
+    //   3. hello-std still runs cleanly alongside the new siblings
     //      (no regression in the std startup path);
-    //   3. display-server + display-client-demo both survive their
-    //      bounded poll loops and exit through `std::process::exit`
+    //   4. display-server + display-client-demo both survive their
+    //      bounded loops and exit through `std::process::exit`
     //      rather than hanging or trapping.
     //
-    // The three-binary IPC round-trip (display-server accepts
-    // display-client-demo's connection, relays pixels to /dev/fb0)
-    // is validated only under Playwright, where real concurrent
-    // Workers in separate WASM linear memories give the required
-    // interleaving. See `web/tests/integration/real-kernel.spec.ts`.
+    // The four-binary IPC round-trip + SIGTERM-driven
+    // display-server shutdown is validated only under Playwright,
+    // where real concurrent Workers in separate WASM linear
+    // memories give the required interleaving. See
+    // `web/tests/integration/real-kernel.spec.ts`.
     const consoleWrites: Uint8Array[] = [];
     const fbWrites: Uint8Array[] = [];
     const captures: CapturedSpawn[] = [];
@@ -2199,28 +2205,27 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(history[0]!.exitCode).toBe(0);
     expect(history[1]!.path).toBe("/bin/hello-std");
     expect(history[1]!.exitCode).toBe(0);
-    // After slice 2a (kernel ipc_accept blocking): display-server's
-    // first ipc_accept call sends flags=0 (blocking by default). The
-    // kernel's park_on_accept attempts Running→BlockedOnIpc, but the
-    // sequential runAllSpawns harness leaves spawned pids in the
-    // Ready state that PROC_SPAWN installs — it doesn't call
-    // markRunning the way production (kernel-worker-entry) does. The
-    // illegal Ready→BlockedOnIpc transition produces KernelError::
-    // NoSuchPid (sys.rs's transition-error mapping), which the shim
-    // surfaces to display-server as errno -ESRCH. display-server's
-    // inner loop sees rc != 0 && rc != -EAGAIN and hits exit 12
-    // ("ipc_accept returned non-EAGAIN error"). In production
-    // (Playwright), the kernel-worker dispatch loop marks spawned
-    // pids Running, the blocking accept parks cleanly, and the peer's
-    // display_connect wakes it — see real-kernel.spec.ts.
+    // After T095 (init proc_wait supervision loop) + T110
+    // (display-server unbounded accept with signal-driven exit):
+    // display-server's first ipc_accept call sends flags=0
+    // (blocking by default). The kernel's park_on_accept attempts
+    // Running→BlockedOnIpc, but the sequential runAllSpawns
+    // harness leaves spawned pids in the Ready state that
+    // PROC_SPAWN installs — it doesn't call markRunning the way
+    // production (kernel-worker-entry) does. The illegal
+    // Ready→BlockedOnIpc transition produces KernelError::
+    // NoSuchPid, which the shim surfaces as errno -ESRCH. The
+    // new display-server body sees `rc < 0 && rc != -EINTR` and
+    // exits 12. In production (Playwright), the kernel-worker
+    // dispatch loop marks spawned pids Running, blocking accept
+    // parks cleanly, peer's display_connect wakes it, and
+    // SIGTERM from init drives a clean exit 0 — see
+    // real-kernel.spec.ts.
     expect(history[2]!.path).toBe("/bin/display-server");
     expect(history[2]!.exitCode).toBe(12);
     // Both display-client-demo spawns run after display-server has
     // torn down, so each `display_connect` poll exhausts
-    // -ECONNREFUSED and exits with code 10. The second spawn is
-    // added in init (see `crates/init/src/main.rs`) to exercise
-    // the outer accept loop under Playwright's concurrent-Worker
-    // scheduling.
+    // -ECONNREFUSED and exits with code 10.
     expect(history[3]!.path).toBe("/bin/display-client-demo");
     expect(history[3]!.exitCode).toBe(10);
     expect(history[4]!.path).toBe("/bin/display-client-demo");
@@ -2234,24 +2239,30 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
         ),
       ),
     );
-    // Sequential ordering: init's 5 lines, then hello-std's 1,
+    // Sequential ordering: init's 7 lines (starting, 4× spawned,
+    // proc_wait early-exit note, exiting), then hello-std's 1,
     // then display-server's 1 ("starting" only — no "fb blit ok"
     // because accept never succeeded), then display-client-demo's
-    // 1 ("starting" only — no "sent pixels" because connect never
-    // succeeded). The pids the kernel allocates are dynamic so each
-    // "spawned" line matches on prefix.
+    // 2× "starting" (both exhaust display_connect and never print
+    // "sent pixels"). The pids the kernel allocates are dynamic
+    // so each "spawned" line matches on prefix, and the exact
+    // unreaped-count in the proc_wait note depends on how many
+    // spawns actually succeeded (expect 4).
     const lines = combined.split("\n").filter((l) => l.length > 0);
     expect(lines[0]).toBe("init starting");
     expect(lines[1]).toMatch(/^init spawned hello-std pid=\d+$/);
     expect(lines[2]).toMatch(/^init spawned display-server pid=\d+$/);
     expect(lines[3]).toMatch(/^init spawned display-client-demo pid=\d+$/);
     expect(lines[4]).toMatch(/^init spawned display-client-demo pid=\d+$/);
-    expect(lines[5]).toBe("init exiting");
-    expect(lines[6]).toBe("hello from std");
-    expect(lines[7]).toBe("display-server starting");
-    expect(lines[8]).toBe("display-client-demo starting");
+    expect(lines[5]).toBe(
+      "init proc_wait returned errno=71; exiting with 4 children unreaped",
+    );
+    expect(lines[6]).toBe("init exiting");
+    expect(lines[7]).toBe("hello from std");
+    expect(lines[8]).toBe("display-server starting");
     expect(lines[9]).toBe("display-client-demo starting");
-    expect(lines).toHaveLength(10);
+    expect(lines[10]).toBe("display-client-demo starting");
+    expect(lines).toHaveLength(11);
 
     // No /dev/fb0 writes — the sequential in-process harness can't
     // drive the IPC round-trip, so neither binary reaches its fb

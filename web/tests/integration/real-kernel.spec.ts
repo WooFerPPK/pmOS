@@ -5,35 +5,44 @@
 // `/manifest.json`, registers a synthetic boot-loader pid,
 // dispatches `PROC_SPAWN(/bin/init)`, and `init` runs to
 // completion through the real Rust kernel. Init itself fires
-// THREE fire-and-forget `pmos_ext.proc_spawn` calls — first
+// FOUR fire-and-forget `pmos_ext.proc_spawn` calls — first
 // `/bin/hello-std`, then `/bin/display-server`, then
-// `/bin/display-client-demo` — and exits. The substrate's spawn
+// `/bin/display-client-demo` twice — then enters a blocking
+// `proc_wait` supervision loop (T095). The substrate's spawn
 // router creates a dedicated user Worker per child, so init +
-// hello-std + display-server + display-client-demo overlap:
-// four concurrent pids, four distinct linear memories, four
+// hello-std + display-server + display-client-demo × 2 overlap:
+// five concurrent pids, five distinct linear memories, five
 // per-pid SAB rings serviced round-robin by the kernel Worker's
 // dispatch loop.
 //
-// This is the first slice where two separate WASM binaries in
-// separate user Workers actually exchange bytes through a PMos
-// IPC socket: display-server binds `/run/display` and spins on
-// `ipc_accept` (EAGAIN poll), display-client-demo connects
-// (ECONNREFUSED poll) + `fd_write(PIXELS)` + exits, and
-// display-server's next accept returns a real server fd → reads
-// the 16-byte RGBA payload → relays it to `/dev/fb0` → prints
-// `"fb blit ok"` → exits.
+// IPC round-trip: display-server binds `/run/display` and parks
+// on blocking `ipc_accept` (slice 2a kernel park/wake);
+// display-client-demo connects (ECONNREFUSED poll) +
+// `fd_write(PIXELS)` + exits; display-server's accept wakes →
+// reads the 16-byte RGBA payload → relays it to `/dev/fb0` →
+// prints `"display-server served client N"` → re-parks on the
+// next accept. After both clients exit, init's reap loop drains
+// their Zombie states via `proc_wait`, prints
+// `"init reaped child pid=..."` for each, then fires
+// `proc_kill(ds_pid, SIGTERM)` to signal display-server. The
+// display-server's pre-accept fd-3 poll picks up the SIGTERM,
+// breaks the accept loop, and prints `"display-server fb blit ok"`
+// before exiting. Init's final reaps collect display-server and
+// hello-std, then prints `"init exiting"` and exits PID 1.
 //
 // The observable signal is the page console — `bootstrap.ts`
 // in real-kernel mode prefixes every flushed `/dev/console`
 // line with `[real-kernel]`. The test scrapes those lines via
 // `page.on('console', ...)` and asserts the expected sequence
-// from all four pids reaches the browser. Ordering is pinned
+// from all five pids reaches the browser. Ordering is pinned
 // within each pid (and within init → child, since children can
 // only start after `proc_spawn` returns); between children,
-// interleaving is expected EXCEPT for the protocol-ordered pair
-// — `display-server fb blit ok` MUST come after
-// `display-client-demo sent pixels` because the server's
-// `fd_read` unblocks only after the client's `fd_write` lands.
+// interleaving is expected EXCEPT for the protocol-ordered chain
+// — `display-server served client` MUST come after
+// `display-client-demo sent pixels`, `init sent SIGTERM` MUST
+// come after both clients' exits (and therefore both
+// `served client` lines), and `display-server fb blit ok` MUST
+// come after `init sent SIGTERM`.
 //
 // The bare URL `/index.html` (no hash) is what a fresh visitor
 // hits, so the test deliberately uses that: if real-kernel is
@@ -64,36 +73,29 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
 
   await page.goto("/index.html");
 
-  // Slice 2a (kernel ipc_accept blocking) changed the terminal
-  // observable signal. Pre-slice: display-server's inner EAGAIN
-  // poll exhausted on iteration 2 of the outer loop (no 3rd
-  // client ever arrives), the loop broke cleanly on `served_any`,
-  // and display-server printed "fb blit ok" before exiting. Post-
-  // slice: display-server's ipc_accept on iteration 2 blocks
-  // indefinitely in the kernel (parked on the listener with no
-  // peer to wake it), so "fb blit ok" NEVER prints and display-
-  // server stays live. This is the correct long-running-server
-  // shape the arc is building toward — slice 2b's signal-driven
-  // exit is what will make display-server exit cleanly on
-  // SIGTERM. For this slice, the terminal observable shifts from
-  // "fb blit ok" to "display-server served client 1" (the second
-  // served-client line) — its presence still implies every
-  // earlier line is on the console, and both clients got their
-  // pixels relayed to /dev/fb0. 15 s timeout for cold-start CI.
-  const secondServedLine = () => {
-    const served = consoleLines.filter((l) =>
-      /\[real-kernel\] display-server served client \d+/.test(l),
-    );
-    return served.length >= 2 ? served[1]! : null;
-  };
-  await expect.poll(secondServedLine, { timeout: 15_000 }).not.toBeNull();
+  // T095/T110 slice: the trailing observable is `init exiting`,
+  // printed after init's proc_wait supervision loop has reaped
+  // every spawned child. The reap order is driven by child exit
+  // timing: display-client-demo × 2 exit first (after fd_write
+  // landing the pixels), hello-std exits early (self-contained
+  // std startup + one println + exit), display-server exits last
+  // (only after init's SIGTERM interrupts its pre-accept fd-3
+  // poll + it prints `fb blit ok`). `init exiting` arriving
+  // means every earlier line — including the restored
+  // `display-server fb blit ok` and the two `display-server
+  // served client {i}` lines — is already on the console. 15 s
+  // timeout for cold-start CI.
+  const initExitingLine = () =>
+    consoleLines.find((l) => l === "[real-kernel] init exiting") ?? null;
+  await expect.poll(initExitingLine, { timeout: 15_000 }).not.toBeNull();
 
-  // With the trailing display-server line observed, every other
-  // line MUST already be present. Pull the indices and assert the
-  // ordering that IS stable (within a single pid + init → child,
-  // plus the protocol-ordered pair client-sent → server-blit).
-  // Ordering BETWEEN hello-std and the display pair is NOT asserted
-  // — they run concurrently in separate Workers.
+  // With init's trailing line observed, every other line MUST
+  // already be present. Pull the indices and assert the ordering
+  // that IS stable (within a single pid + init → child, plus the
+  // protocol-ordered chain client-sent → server-served →
+  // SIGTERM → fb-blit). Ordering BETWEEN hello-std and the
+  // display pair is NOT asserted — they run concurrently in
+  // separate Workers.
   const initStartIdx = consoleLines.findIndex((l) =>
     l.includes("[real-kernel] init starting"),
   );
@@ -133,17 +135,36 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
     )
     .filter((i) => i >= 0);
 
+  // T095/T110 observables: init's SIGTERM line, display-server's
+  // fb-blit-ok line, and init's reap lines are each located here
+  // so the ordering assertions below can reference them.
+  const initSigtermIdx = consoleLines.findIndex((l) =>
+    /\[real-kernel\] init sent SIGTERM to display-server pid=\d+/.test(l),
+  );
+  const fbBlitOkIdx = consoleLines.findIndex((l) =>
+    l.includes("[real-kernel] display-server fb blit ok"),
+  );
+  const initReapedIndices = consoleLines
+    .map((l, i) =>
+      /\[real-kernel\] init reaped child pid=\d+/.test(l) ? i : -1,
+    )
+    .filter((i) => i >= 0);
+
   expect(initStartIdx).toBeGreaterThanOrEqual(0);
   expect(initSpawnHelloStdIdx).toBeGreaterThan(initStartIdx);
   expect(initSpawnDisplayServerIdx).toBeGreaterThan(initSpawnHelloStdIdx);
   expect(initSpawnDisplayClientIdx).toBeGreaterThan(initSpawnDisplayServerIdx);
+  // init's trailing line comes after every child's final print —
+  // init's supervision loop is the last thing to finish.
   expect(initExitIdx).toBeGreaterThan(initSpawnDisplayClientIdx);
-  // Children start only after init's proc_spawn returns — init's
-  // remaining fd_writes + proc_exit finishes long before any
-  // child's std startup completes.
-  expect(helloStdIdx).toBeGreaterThan(initExitIdx);
-  expect(displayServerStartIdx).toBeGreaterThan(initExitIdx);
-  expect(displayClientStartIdx).toBeGreaterThan(initExitIdx);
+  // Children start only after init's proc_spawn returns; under
+  // Playwright's concurrent-Worker scheduling the children's
+  // starts interleave with init's supervision loop, so we only
+  // assert their starts come after init's first spawn (not after
+  // init's final "exiting" line).
+  expect(helloStdIdx).toBeGreaterThan(initSpawnHelloStdIdx);
+  expect(displayServerStartIdx).toBeGreaterThan(initSpawnDisplayServerIdx);
+  expect(displayClientStartIdx).toBeGreaterThan(initSpawnDisplayClientIdx);
   // Within display-client-demo's own output, "starting" must precede
   // "sent pixels" (single pid, sequential prints).
   expect(displayClientSentIdx).toBeGreaterThan(displayClientStartIdx);
@@ -166,11 +187,29 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   // server's iteration counter — the order relative to client
   // pids is not pinned because the clients run concurrently).
   expect(displayServerServedIndices).toHaveLength(2);
-  // Slice 2a deliberately does not assert "fb blit ok" — display-
-  // server parks indefinitely on iteration 2 of its outer loop
-  // (kernel blocks on the empty listener backlog with no 3rd
-  // client). Slice 2b lands signal-driven exit and the trailing
-  // "fb blit ok" line becomes observable again.
+  // T095: init's SIGTERM to display-server fires after both
+  // clients have been reaped — therefore AFTER both `sent pixels`
+  // AND AFTER at least the first `served client` line (the
+  // servers serve before the clients exit). Asserting `>` both
+  // `sent pixels` indices and the first `served client` index
+  // pins the ordering.
+  expect(initSigtermIdx).toBeGreaterThanOrEqual(0);
+  expect(initSigtermIdx).toBeGreaterThan(displayClientSentIndices[1]!);
+  expect(initSigtermIdx).toBeGreaterThan(displayServerServedIndices[0]!);
+  // T110: display-server's "fb blit ok" prints only after SIGTERM
+  // breaks the accept loop. Restored observable (deferred in
+  // slice 2a/2b).
+  expect(fbBlitOkIdx).toBeGreaterThanOrEqual(0);
+  expect(fbBlitOkIdx).toBeGreaterThan(initSigtermIdx);
+  // T095: at least two `init reaped child pid=N` lines land
+  // before `init exiting`. Exact count depends on Playwright
+  // timing (children can exit before or during init's first
+  // proc_wait), but the supervision loop must reap at least the
+  // two clients before firing SIGTERM.
+  expect(initReapedIndices.length).toBeGreaterThanOrEqual(2);
+  for (const idx of initReapedIndices) {
+    expect(idx).toBeLessThan(initExitIdx);
+  }
 
   expect(consoleLines.some((l) => l.includes("real kernel ready"))).toBe(true);
   expect(consoleLines.some((l) => l.includes("real kernel panic"))).toBe(false);
@@ -178,7 +217,7 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   // DOM surface: real-kernel mode renders each captured line into a
   // `<pre id="pmos-real-console">` so the page itself shows the
   // boot output (not just dev tools). The element's text must
-  // include every line all four pids produced.
+  // include every line all five pids produced.
   const domText = await page.locator("#pmos-real-console").innerText();
   expect(domText).toContain("init starting");
   expect(domText).toMatch(/init spawned hello-std pid=\d+/);
@@ -194,12 +233,21 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   expect(domText).toContain("display-client-demo starting");
   expect(domText).toContain("display-client-demo sent pixels");
   expect(domText).toMatch(/display-server served client \d+/);
+  // T095/T110: the DOM also shows init's reap + SIGTERM lines and
+  // display-server's fb-blit-ok trailing line.
+  expect(domText).toMatch(/init reaped child pid=\d+/);
+  expect(domText).toMatch(/init sent SIGTERM to display-server pid=\d+/);
+  expect(domText).toContain("display-server fb blit ok");
   expect(domText.indexOf("init starting")).toBeLessThan(
     domText.indexOf("hello from std"),
   );
   expect(domText.indexOf("display-client-demo starting")).toBeLessThan(
     domText.indexOf("display-client-demo sent pixels"),
   );
+  // T110: SIGTERM precedes fb blit ok on the DOM too.
+  expect(
+    domText.indexOf("init sent SIGTERM to display-server"),
+  ).toBeLessThan(domText.indexOf("display-server fb blit ok"));
 
   // Five concurrent pids (init + hello-std + display-server +
   // display-client-demo × 2) MUST each live in their own user

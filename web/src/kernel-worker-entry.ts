@@ -164,6 +164,27 @@ export function installWorkerEntry(
     if (msg.kind === "proc:sab") {
       pidMap.set(msg.pid, msg.sab);
       lifecycle.hasEverSpawned = true;
+      // T095/T110: the user Worker owning this SAB is about to run
+      // `_start` and issue syscalls. Transition the pid from Ready
+      // to Running so blocking syscalls (`proc_wait`, `ipc_accept`
+      // with `flags=0`) can take the kernel's Running→Blocked*
+      // transitions rather than failing with ESRCH. Guarded on
+      // `realKernel` because proc:sab may arrive before the boot
+      // binary finishes instantiating under tight races — the
+      // kernel-worker scaffold is built and real kernel held here.
+      // Errors are swallowed (the kernel asserts on inconsistent
+      // states; any error here is a harness race that a future
+      // proc:sab duplicate will also hit).
+      if (realKernel !== undefined) {
+        try {
+          realKernel.markRunning(msg.pid);
+        } catch {
+          // Already Running (harness replay), or pid was reaped
+          // between PROC_SPAWN + this message — both are safe to
+          // ignore. The kernel's transition check is the source of
+          // truth.
+        }
+      }
       return;
     }
     if (msg.kind === "proc:exited") {

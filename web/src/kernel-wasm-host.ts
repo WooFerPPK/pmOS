@@ -1084,25 +1084,61 @@ export class KernelWasmHost implements Kernel {
         const sabIsShared =
           haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
         for (let i = 0; i < budget; i++) {
-          this.drainWakesForPid(pid, view);
+          // T095/T110 (slice 2c.2): a delayed wake (parked
+          // proc_wait's reap, parked ipc_accept's connect wake,
+          // EINTR interrupt) may land via drainWakesForPid even
+          // when the request ring is empty. The RES_HEAD delta
+          // across drainWakesForPid + serviceSab is the
+          // authoritative "did anything reach the user's response
+          // ring?" signal, since serviceSab returns 0 for BOTH a
+          // normal-service response push AND a park (no push).
+          const resHeadBefore = Atomics.load(header, OFF_RES_HEAD / 4);
+          const wakesPushed = this.drainWakesForPid(pid, view);
+          if (wakesPushed > 0) {
+            // The kernel's wake paths (`wake_parked_waiter_for_child`,
+            // `interrupt_parked_*`, `ipc_connect`) transition the
+            // woken pid from Blocked* back to Ready — but the pid's
+            // next syscall, which for a loop like init's proc_wait
+            // supervisor is often another blocking call, needs the
+            // pid to be Running so park_on_wait's Running→Blocked*
+            // transition succeeds. Bump it here. Errors swallowed —
+            // already-Running or reaped are both safe no-ops.
+            try {
+              this.markRunning(pid);
+            } catch {
+              // pass
+            }
+          }
           const rc = this.serviceSab(pid, view);
-          if (rc === 1) break;
-          anyServiced = true;
-          // T234 production wake protocol step 5: now that `serviceSab`
-          // has pushed the response into the ring, wake the user
-          // Worker's `Atomics.wait(header, OFF_USER_WAIT_SLOT/4,
-          // STATUS_REQUESTED)`. Storing any value other than
-          // `STATUS_REQUESTED` makes a pre-existing waiter return "ok"
-          // on the subsequent notify, AND makes a not-yet-parked waiter
-          // return "not-equal" immediately when it does call `wait`.
-          // Both paths land in the same place: the user pops the
-          // response. `Atomics.notify` only accepts `SharedArrayBuffer`-
-          // backed views, so guard it; the `Atomics.store` itself is
-          // legal on either backing and is harmless when the user
-          // Worker is the legacy synchronous `serviceHook` path.
-          Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
-          if (sabIsShared) {
-            Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+          const resHeadAfter = Atomics.load(header, OFF_RES_HEAD / 4);
+          const responsePushed = resHeadAfter !== resHeadBefore;
+          if (responsePushed) {
+            // T234 production wake protocol step 5: now that a
+            // response (service push or drained wake) has landed
+            // in the ring, wake the user Worker's
+            // `Atomics.wait(header, OFF_USER_WAIT_SLOT/4,
+            // STATUS_REQUESTED)`. Storing any value other than
+            // `STATUS_REQUESTED` makes a pre-existing waiter
+            // return "ok" on the subsequent notify, AND makes a
+            // not-yet-parked waiter return "not-equal" immediately
+            // when it does call `wait`. Both paths land in the
+            // same place: the user pops the response.
+            // `Atomics.notify` only accepts `SharedArrayBuffer`-
+            // backed views, so guard it; the `Atomics.store`
+            // itself is legal on either backing and is harmless
+            // when the user Worker is the legacy synchronous
+            // `serviceHook` path.
+            Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+            if (sabIsShared) {
+              Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+            }
+            anyServiced = true;
+          }
+          if (rc === 1) {
+            // Ring empty (or handler parked without push). Any
+            // wakes drained above have been notified. Stop
+            // spinning so the next pass can visit other pids.
+            break;
           }
         }
       }

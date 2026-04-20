@@ -1,67 +1,62 @@
 //! PMos display server binary — persistent-accept-loop std binary.
 //!
 //! Long-running server over the M1 multi-process substrate. Binds
-//! `/run/display`, then parks on an `ipc_accept` poll loop waiting
-//! for a real client process (not a self-connect). First client's
-//! pixel payload is relayed to `/dev/fb0`; the binary then exits
-//! cleanly so the dispatch loop can reap it alongside init's other
-//! children. The companion client this slice ships is
-//! `/bin/display-client-demo` (see `crates/display-client-demo/`);
-//! init spawns both so display-server has a real peer to accept
-//! from.
+//! `/run/display`, opens `/dev/fb0` once, then enters an **unbounded**
+//! outer accept loop that exits on SIGTERM (delivered by init once
+//! every display-client-demo child has been reaped). Each served
+//! iteration relays the client's 16-byte RGBA payload to `/dev/fb0`.
+//! Signal-driven exit is the leg that closes the long-running-server
+//! arc — `MAX_CLIENTS = 4` has been removed along with the bounded-
+//! exit semantics.
 //!
 //! Flow:
-//!   1. `display_bind()`                     — claim `/run/display`.
-//!   2. `path_open("/dev/fb0")`               — open framebuffer once,
-//!                                               reused for every served
-//!                                               client.
-//!   3. Outer loop (at most `MAX_CLIENTS = 4` iterations):
-//!      a. `ipc_accept(listener)` (blocking — slice 2a's kernel
+//!   1. `display_bind()`                      — claim `/run/display`.
+//!   2. `path_open("/dev/fb0")`                — open framebuffer once,
+//!                                                reused for every served
+//!                                                client.
+//!   3. Outer loop (unbounded `'outer: loop`):
+//!      a. **Pre-accept signal poll** — non-blocking `fd_read` on
+//!         fd 3 (the auto-installed `SignalChannel`) drains up to
+//!         four queued signals as u16 LE pairs; if any of them is
+//!         SIGTERM (signum 15), `break 'outer` + clean exit 0.
+//!         `-EAGAIN` (empty inbox) → continue to the blocking
+//!         accept.
+//!      b. `ipc_accept(listener)` (blocking — slice 2a's kernel
 //!          park/wake; flags=0 is the blocking default).
 //!         * returns `server fd >= 0`  → proceed to fd_read.
-//!         * any negative rc → fatal, exit 12. Includes
-//!           `-EAGAIN` (not expected: blocking calls never
-//!           return EAGAIN), `-EINTR` (slice 2b does not yet
-//!           wire signal-driven exit), and `-ESRCH` (surfaces
-//!           under vitest `runAllSpawns` where spawned pids
+//!         * `-EINTR` (slice 2b — SIGTERM interrupted the parked
+//!           accept; kernel queued `Response::err(req_id, EINTR)`
+//!           alongside the signal delivery on fd 3) → re-poll fd 3
+//!           for SIGTERM + break-or-continue.
+//!         * `-ESRCH` (vitest `runAllSpawns` where spawned pids
 //!           stay Ready and `park_on_accept` fails its state
-//!           transition — matches slice 1's "non-EAGAIN error"
-//!           exit semantics).
-//!      b. `fd_read(server, buf)` (EAGAIN poll via `MAX_POLLS`)
+//!           transition) → fatal exit 12. Preserves the sequential
+//!           harness's termination shape.
+//!         * any other negative rc → fatal exit 12.
+//!      c. `fd_read(server, buf)` (EAGAIN poll via `MAX_POLLS`)
 //!         — read pixel payload. `MAX_POLLS` remains alive for
 //!         `fd_read` until a future slice migrates it to blocking
 //!         semantics too.
-//!      c. `fd_write(fb_fd, buf)`                — relay to `/dev/fb0`.
-//!      d. `fd_close(server)`                    — release the client fd
+//!      d. `fd_write(fb_fd, buf)`                — relay to `/dev/fb0`.
+//!      e. `fd_close(server)`                    — release the client fd
 //!                                                  so the next iteration's
 //!                                                  accept starts against a
 //!                                                  clean fd table.
-//!      e. `println!("display-server served client {i}")`.
+//!      f. `println!("display-server served client {i}")`.
 //!   4. `println!("display-server fb blit ok")` — trailing observable
-//!      line, same as the pre-slice shape.
+//!      line printed after SIGTERM-driven exit.
 //!   5. fall off the end of `main`            — std emits
 //!      `__wasi_proc_exit(0)`.
 //!
-//! `MAX_CLIENTS = 4` is a testing fiction. The outer loop is still
-//! bounded because (a) the vitest composition helper (`runAllSpawns`,
-//! strictly sequential) would otherwise spin forever when no more
-//! clients arrive, and (b) signal-driven exit via fd 3 polling is
-//! not yet wired. A future slice removes the ceiling and adds the
-//! fd-3 poll.
-//!
 //! Exit codes:
 //!
-//!   * 0  = success (loop completed `MAX_CLIENTS` iterations)
+//!   * 0  = success (outer loop broke on SIGTERM)
 //!   * 10 = `display_bind` failed
-//!   * 12 = `ipc_accept` returned any negative rc (fatal: any
-//!          error path on the blocking accept — includes
-//!          `-EAGAIN`, `-EINTR`, `-ESRCH`)
+//!   * 12 = `ipc_accept` returned an unexpected negative rc
+//!          (ESRCH under vitest sequential harness; not EINTR)
 //!   * 14 = `fd_read` returned a non-EAGAIN error or read 0 bytes
 //!   * 15 = `path_open("/dev/fb0")` failed
 //!   * 16 = framebuffer `fd_write` failed or short-wrote
-//!   * 17 = (reserved: first-accept poll exhaustion from slice
-//!          1, no longer reachable now that the inner busy-poll
-//!          is gone)
 //!   * 18 = `fd_read` poll exhausted for a connected client
 //!   * 19 = `fd_close` on the client fd returned a non-zero errno
 
@@ -115,6 +110,45 @@ struct Iovec {
     buf_len: u32,
 }
 
+/// Fd 3 is the auto-installed per-process `SignalChannel` — every
+/// proc_spawn'd child gets one for free. A non-blocking `fd_read`
+/// on this fd drains pending signals as u16 LE pairs.
+#[cfg(target_arch = "wasm32")]
+const SIGNAL_FD: i32 = 3;
+
+/// Drain up to four signals from fd 3. Returns `true` iff SIGTERM
+/// (signum 15) was observed in the drained batch.
+#[cfg(target_arch = "wasm32")]
+unsafe fn poll_sigterm() -> bool {
+    // 8 bytes = 4 u16 signum records — plenty for v1's coalesced
+    // inbox (max 8 distinct signals) and we only care whether
+    // SIGTERM is among them.
+    let mut buf = [0u8; 8];
+    let iov = Iovec {
+        buf: buf.as_mut_ptr(),
+        buf_len: buf.len() as u32,
+    };
+    let mut nread: u32 = 0;
+    let rc = fd_read(SIGNAL_FD, &iov, 1, &mut nread);
+    // Positive errno on error (WASI convention). `EAGAIN = 6`
+    // means the inbox is empty — nothing to do. Any other error
+    // (including an unexpected bad fd) is silent here: the
+    // signal-poll is a best-effort pre-accept check.
+    if rc != 0 {
+        return false;
+    }
+    let n = nread as usize;
+    let mut i = 0;
+    while i + 2 <= n {
+        let signum = u16::from_le_bytes([buf[i], buf[i + 1]]);
+        if signum == 15 {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     println!("display-server starting");
@@ -125,16 +159,16 @@ fn main() {
     // (`ipc_accept`, `display_bind`) negate into `-errno`. Both
     // conventions agree on the numeric value.
     const EAGAIN: i32 = 6;
+    // EINTR is positive `abi::errno::EINTR = 27`. Extension
+    // syscalls return `-EINTR` when a parked call was interrupted
+    // by SIGTERM — we handle that by falling back to the signal
+    // poll to decide whether to exit or continue.
+    const EINTR: i32 = 27;
     // Bounded-iteration safety valve for the vitest harness'
-    // `fd_read` path. Slice 2a migrated `ipc_accept` to blocking
-    // kernel semantics; `fd_read` remains EAGAIN-polled until a
-    // future slice applies the same park/wake pattern to it.
+    // `fd_read` path on the accepted client socket. `fd_read` is
+    // still EAGAIN-polled until a future slice applies the same
+    // park/wake pattern to it.
     const MAX_POLLS: u32 = 10_000;
-    // Outer-loop ceiling. Bounded because (a) the vitest harness
-    // is sequential and would otherwise spin forever when no more
-    // clients arrive, and (b) signal-driven exit via fd 3 polling
-    // is not yet wired. Removed by a future slice.
-    const MAX_CLIENTS: u32 = 4;
 
     unsafe {
         let listener = display_bind();
@@ -159,11 +193,33 @@ fn main() {
             std::process::exit(15);
         }
 
-        for i in 0..MAX_CLIENTS {
-            // Blocking since slice 2a (flags=0 default); any
-            // negative rc is fatal — see module docstring.
+        let mut i: u32 = 0;
+        'outer: loop {
+            // Pre-accept signal poll: drain fd 3 for queued
+            // signals. SIGTERM → clean exit. Anything else (or
+            // empty inbox) → fall through to the blocking accept.
+            if poll_sigterm() {
+                break 'outer;
+            }
+
+            // Blocking since slice 2a (flags=0 default).
             let rc = ipc_accept(listener);
             if rc < 0 {
+                if rc == -EINTR {
+                    // SIGTERM interrupted a parked accept — re-
+                    // poll fd 3 to confirm and exit cleanly. If
+                    // no SIGTERM surfaces (rare race), fall
+                    // through to the next accept attempt.
+                    if poll_sigterm() {
+                        break 'outer;
+                    }
+                    continue 'outer;
+                }
+                // Anything else (notably `-ESRCH` under vitest
+                // runAllSpawns where spawned pids stay Ready and
+                // park_on_accept fails its state transition, and
+                // `-EAGAIN` which blocking accept should never
+                // produce) is fatal.
                 std::process::exit(12);
             }
             let server: i32 = rc;
@@ -216,6 +272,7 @@ fn main() {
             }
 
             println!("display-server served client {}", i);
+            i += 1;
         }
     }
 

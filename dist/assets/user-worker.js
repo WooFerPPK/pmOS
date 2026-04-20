@@ -562,6 +562,14 @@ var UserWasmRuntime = class {
     this.memory = exports.memory;
     try {
       exports._start();
+      try {
+        this.backend.dispatch({
+          opcode: OP_WASI.PROC_EXIT,
+          requestId: 0,
+          arg0: 0
+        });
+      } catch {
+      }
       return 0;
     } catch (err) {
       if (err instanceof UserProcessExited) {
