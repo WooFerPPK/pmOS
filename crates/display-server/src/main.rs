@@ -160,16 +160,8 @@ fn main() {
         }
 
         for i in 0..MAX_CLIENTS {
-            // Slice 2a's kernel park/wake makes this a blocking
-            // call by default (flags=0). The inner 10k-iteration
-            // busy-poll is gone — every prior iteration succeeded
-            // on pass 0 anyway once blocking semantics landed.
-            // Any non-zero return is fatal (exit 12): includes
-            // `-EAGAIN` (not expected from a blocking call),
-            // `-EINTR` (slice 2b doesn't yet wire signal-driven
-            // exit), and `-ESRCH` (vitest `runAllSpawns` where
-            // `park_on_accept`'s state transition fails —
-            // matches slice 1's "non-EAGAIN error" semantic).
+            // Blocking since slice 2a (flags=0 default); any
+            // negative rc is fatal — see module docstring.
             let rc = ipc_accept(listener);
             if rc < 0 {
                 std::process::exit(12);

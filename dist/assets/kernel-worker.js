@@ -368,6 +368,10 @@ var ERRNO = {
   ECHILD: 9,
   ECONNREFUSED: 14,
   EEXIST: 20,
+  /** Interrupted function. Surfaced on a blocking syscall
+   * (currently only `ipc_accept` with `flags=0`) when a signal
+   * interrupts the park. Mirrors `abi::errno::EINTR`. */
+  EINTR: 27,
   EINVAL: 28,
   EISDIR: 31,
   /** Too many levels of symbolic links. Returned from path

@@ -3538,10 +3538,10 @@ describe("dispatch: IPC_ACCEPT blocking", () => {
     const { host } = await freshHost();
 
     // Display-server pid parks on the listener. init (CAPSET_ALL)
-    // holds Cap::ProcKillAny so the proc_kill cap check at
-    // `sys.rs:1296-1307` passes via the ProcKillAny branch (no
-    // ppid relationship needed for the cap check — parent-ness
-    // only matters when the sender lacks ProcKillAny).
+    // holds Cap::ProcKillAny so the cap check in `Kernel::proc_kill`
+    // passes via the ProcKillAny branch (no ppid relationship
+    // needed for the cap check — parent-ness only matters when
+    // the sender lacks ProcKillAny).
     const initPid = host.registerProcess(CAPSET_ALL);
     host.installConsoleFd(initPid, 0);
     host.installConsoleFd(initPid, 1);
@@ -3591,11 +3591,11 @@ describe("dispatch: IPC_ACCEPT blocking", () => {
 
     // Take the wake for ds. The response must carry:
     //   request_id === 77 (the parked accept's req_id)
-    //   status === -EINTR (27)
+    //   status === -EINTR
     const wake = host.takeNextWakeForPid(dsPid);
     expect(wake).not.toBeNull();
     expect(wake!.requestId).toBe(77);
-    expect(wake!.status).toBe(-27);
+    expect(wake!.status).toBe(-ERRNO.EINTR);
 
     // A second take returns null — the queue is drained.
     expect(host.takeNextWakeForPid(dsPid)).toBeNull();

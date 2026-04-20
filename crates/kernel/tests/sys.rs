@@ -1544,9 +1544,10 @@ fn sigterm_interrupts_parked_accept_with_eintr() {
     // must hold SIGTERM (orthogonal to the park interrupt — the
     // signal-inbox delivery and the EINTR wake BOTH fire).
     let mut k = make_kernel();
-    // Init (parent) — ordinary caps plus ability to signal its
-    // child. `proc_kill` on a child requires only parent-ness, no
-    // ProcKillAny, per `sys.rs:1296-1307`.
+    // init is `CapSet::ALL` so the cap check in `Kernel::proc_kill`
+    // passes via the `ProcKillAny` branch; the `ppid: init` on ds
+    // below pins the parent relationship but is not load-bearing
+    // for the cap check.
     let init = k
         .register_process(RegisterArgs {
             name: "init",
@@ -1610,9 +1611,9 @@ fn sigterm_interrupts_parked_accept_with_eintr() {
 
     // Exactly one pending wake: (ds, Response::err(req_id,
     // -EINTR)). Negative sign convention matches every other
-    // `Response::err` producer in the codebase (e.g. EBADF path in
-    // `park_on_accept_clears_on_listener_close` in syscall.rs
-    // asserts `resp.status, -abi::errno::EBADF`).
+    // `Response::err` producer in the codebase (e.g. the EBADF
+    // path in `park_on_accept_clears_on_listener_close` asserts
+    // `resp.status == -abi::errno::EBADF`).
     let wakes = k.pending_wakes_snapshot();
     assert_eq!(wakes.len(), 1);
     let (wake_pid, wake_resp) = &wakes[0];
@@ -1694,20 +1695,20 @@ fn signum_zero_probe_does_not_wake_parked_accept() {
 
 #[test]
 fn sigkill_on_parked_accept_exits_without_eintr_wake() {
-    // SIGKILL is non-catchable: `Kernel::proc_kill`'s SIGKILL arm
-    // at `sys.rs:1316-1329` transitions the target to Zombie
-    // synchronously with `ExitStatus::Signaled(9)`, which routes
-    // through `proc_exit` -> `cleanup_proc` ->
-    // `ipc.clear_parked_acceptor_for_pid` (sys.rs:1101). The
-    // listener's parked slot gets cleared by that sweep — NOT by
-    // `interrupt_parked_accept`. No EINTR wake is queued (the pid
-    // is dead, not interrupted). This test pins the
-    // "non-catchable path is orthogonal" invariant: even without
-    // slice 2b touching this code path, the parked_acceptor slot
-    // gets cleared for a SIGKILL'd parker, because proc_exit's
-    // existing cleanup_proc sweep already handles it. This test
-    // therefore pins an existing invariant rather than being a
-    // red->green test.
+    // SIGKILL is non-catchable. `Kernel::proc_kill`'s `Signal::Kill`
+    // match arm calls `self.procs.exit` synchronously with
+    // `ExitStatus::Signaled(9)`, bypassing `Kernel::proc_exit`
+    // entirely. Prior to this slice that path did NOT clear the
+    // listener's `parked_acceptor` slot (proc_exit's existing
+    // `clear_parked_acceptor_for_pid` sweep was unreachable from
+    // the SIGKILL arm). This slice adds a surgical
+    // `self.ipc.clear_parked_acceptor_for_pid(target_pid)` call
+    // directly in the SIGKILL arm to close that gap. No EINTR
+    // wake is queued (the pid is dead, not interrupted —
+    // `interrupt_parked_accept` is reserved for the
+    // catchable-signal arm). Red->green: without the surgical
+    // fix the `parked_acceptor == None` assertion below would
+    // fail.
     let mut k = make_kernel();
     let init = k
         .register_process(RegisterArgs {
@@ -1754,16 +1755,17 @@ fn sigkill_on_parked_accept_exits_without_eintr_wake() {
         Some(kernel::proc::ExitStatus::Signaled(9))
     ));
 
-    // Listener's parked_acceptor is cleared (by cleanup_proc's
-    // IpcTable::clear_parked_acceptor_for_pid sweep during the
-    // SIGKILL path's proc_exit call).
+    // Listener's parked_acceptor is cleared by the surgical
+    // `clear_parked_acceptor_for_pid` call this slice added
+    // inside the `Signal::Kill` arm of `Kernel::proc_kill`.
     let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
     assert_eq!(listener.parked_acceptor, None);
 
     // No EINTR wake queued — the pid is dead, not interrupted.
-    // (The SIGKILL path at sys.rs:1316-1329 does not route through
-    // interrupt_parked_accept; only the catchable-signal arm in
-    // `handle_proc_kill` does. This is the load-bearing assertion.)
+    // The SIGKILL arm of `Kernel::proc_kill` does not route
+    // through `interrupt_parked_accept`; only the catchable-signal
+    // arm in `handle_proc_kill` does. This is the load-bearing
+    // assertion.
     assert!(k.pending_wakes_is_empty());
 }
 
