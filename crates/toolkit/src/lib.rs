@@ -31,6 +31,7 @@ pub use app::App;
 pub use protocol::{
     Client, ClientError, ClientEvent, ClientEventWithPayload, Connection, MemoryConnection,
 };
+pub use window::Window;
 
 // Re-export the shared protocol types so toolkit callers get
 // a single namespace (`toolkit::Interface`, `toolkit::ObjectId`,

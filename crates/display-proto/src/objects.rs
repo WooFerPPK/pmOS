@@ -329,13 +329,31 @@ const XDG_SHELL_EVENTS: &[Opcode] = &[];
 // pmd_xdg_toplevel — per-window object. Clients set the
 // title + app_id; the server assigns geometry via its
 // auto-layout policy. `destroy` tears the window down.
+//
+// Note on the configure/ack_configure handshake: the spec
+// tables in `contracts/display-protocol.md` split it across
+// `pmd_xdg_surface` (§11: event `configure(serial)`, request
+// `ack_configure(serial)`) and `pmd_xdg_toplevel` (§12:
+// event `configure(w, h, states)`, event `close`). The v1
+// codebase collapses `pmd_xdg_surface` into
+// `pmd_xdg_toplevel` (see `client.rs`'s single
+// `xdg_shell.get_toplevel(new_id, surface)` that skips the
+// intermediate `get_xdg_surface`), so we fold both configure
+// events into one `configure(serial, width, height)` here
+// and land `ack_configure(serial)` as a request on the same
+// interface. The toolkit `Window` facade parses this merged
+// payload and replies with `ack_configure`.
 const XDG_TOPLEVEL_REQUESTS: &[Opcode] = &[
     Opcode { number: 1, direction: Direction::Request, name: "set_title" },
     Opcode { number: 2, direction: Direction::Request, name: "set_app_id" },
     Opcode { number: 3, direction: Direction::Request, name: "destroy" },
+    Opcode { number: 4, direction: Direction::Request, name: "ack_configure" },
 ];
 
-const XDG_TOPLEVEL_EVENTS: &[Opcode] = &[];
+const XDG_TOPLEVEL_EVENTS: &[Opcode] = &[
+    Opcode { number: 1, direction: Direction::Event, name: "configure" },
+    Opcode { number: 2, direction: Direction::Event, name: "close" },
+];
 
 // pmd_seat — narrowed Wayland wl_seat. Clients bind the
 // global and then derive per-capability objects via

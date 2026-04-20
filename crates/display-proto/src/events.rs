@@ -404,3 +404,60 @@ impl KeyboardKey {
         write_u32(out, self.state);
     }
 }
+
+// ---- pmd_xdg_toplevel events (§11 + §12 merged) ---------------
+
+/// `pmd_xdg_toplevel.configure(u32 serial, i32 width,
+/// i32 height)` — the server is proposing a size for the
+/// window.
+///
+/// Spec §11 + §12: the `serial` value (from `pmd_xdg_surface`)
+/// and the suggested `width` / `height` (from
+/// `pmd_xdg_toplevel`) are merged into one event in the v1
+/// collapsed `pmd_xdg_toplevel`. The client must reply with
+/// [`crate::requests::XdgToplevelAckConfigure`] carrying
+/// the same `serial`.
+///
+/// `width == 0` and `height == 0` mean "the server defers to
+/// the client's preferred size" — v1 always sends an
+/// explicit size, but the sentinel is kept for forward
+/// compatibility with the spec.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct XdgToplevelConfigure {
+    pub serial: u32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl XdgToplevelConfigure {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgToplevelConfigure {
+            serial: read_u32(payload, 0)?,
+            width: read_i32(payload, 4)?,
+            height: read_i32(payload, 8)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.serial);
+        write_i32(out, self.width);
+        write_i32(out, self.height);
+    }
+}
+
+/// `pmd_xdg_toplevel.close` — the server / user asked
+/// this window to close. The client decides what to do:
+/// prompt for unsaved-work confirmation, save state, etc.,
+/// then destroy the toplevel. No payload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct XdgToplevelClose;
+
+impl XdgToplevelClose {
+    pub fn decode(_payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgToplevelClose)
+    }
+
+    pub fn encode(&self, _out: &mut Vec<u8>) {
+        // Empty payload.
+    }
+}

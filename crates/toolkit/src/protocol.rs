@@ -492,6 +492,24 @@ impl<C: Connection> Client<C> {
         self.send_request(toplevel_id, 2 /* set_app_id */, &payload)
     }
 
+    /// Send `pmd_xdg_toplevel.ack_configure(u32 serial)`
+    /// — ack the server's most recent `configure` event so
+    /// the server knows the client has seen the proposed
+    /// geometry. The `Window` facade calls this from its
+    /// `dispatch` cycle; callers speaking the protocol
+    /// directly may also invoke it.
+    pub fn xdg_toplevel_ack_configure(
+        &mut self,
+        toplevel_id: ObjectId,
+        serial: u32,
+    ) -> Result<(), ClientError> {
+        self.send_request(
+            toplevel_id,
+            4, /* ack_configure */
+            &serial.to_le_bytes(),
+        )
+    }
+
     /// Parse as many complete server-bound events out of the
     /// input byte stream as possible. Stops at the first
     /// partial message (returning the events parsed so far

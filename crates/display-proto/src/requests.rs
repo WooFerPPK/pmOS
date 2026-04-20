@@ -298,6 +298,30 @@ impl XdgToplevelSetAppId {
     }
 }
 
+/// `pmd_xdg_toplevel.ack_configure(u32 serial)` — ack a
+/// previously-received `configure` event.
+///
+/// Spec §11 places `ack_configure` on `pmd_xdg_surface`;
+/// the v1 codebase collapses `pmd_xdg_surface` into
+/// `pmd_xdg_toplevel` (see `client.rs`'s single
+/// `xdg_shell.get_toplevel(new_id, surface)` that skips
+/// the intermediate `get_xdg_surface`), so the ack lands
+/// as a request on the toplevel. The `serial` value is
+/// the one the server sent in the preceding `configure`
+/// event.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct XdgToplevelAckConfigure {
+    pub serial: u32,
+}
+
+impl XdgToplevelAckConfigure {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgToplevelAckConfigure {
+            serial: read_u32(payload, 0)?,
+        })
+    }
+}
+
 // ---- pmd_seat (narrowed Wayland wl_seat) ----------------------
 
 /// `pmd_seat.get_pointer(new_id pointer)` — carve a new
