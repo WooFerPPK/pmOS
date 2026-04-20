@@ -81,7 +81,7 @@ pub fn dispatch_ext(
         op::CAP_CHECK => ServiceOutcome::Done(handle_cap_check(kernel, pid, req)),
         op::CAP_LIST => ServiceOutcome::Done(handle_cap_list(kernel, pid, req)),
         op::PROC_SPAWN => ServiceOutcome::Done(handle_proc_spawn(kernel, pid, req, heap)),
-        op::PROC_WAIT => ServiceOutcome::Done(handle_proc_wait(kernel, pid, req, heap)),
+        op::PROC_WAIT => handle_proc_wait(kernel, pid, req, heap),
         op::PROC_KILL => ServiceOutcome::Done(handle_proc_kill(kernel, pid, req)),
         op::PROC_CAPS_GET => ServiceOutcome::Done(handle_proc_caps_get(kernel, pid, req)),
         op::DISPLAY_CONNECT => ServiceOutcome::Done(handle_display_connect(kernel, pid, req)),
@@ -534,7 +534,7 @@ fn handle_proc_spawn(
 // (target < -1) is out of scope for v1's flat process model; returning
 // EINVAL steers userland away from a feature we don't implement.
 
-fn pack_exit_status(status: ExitStatus) -> i64 {
+pub(crate) fn pack_exit_status(status: ExitStatus) -> i64 {
     match status {
         ExitStatus::Exited(code) => {
             let low = (code as u32) as u64;
@@ -556,26 +556,28 @@ fn handle_proc_wait(
     pid: Pid,
     req: &Request,
     heap: &mut [u8],
-) -> Response {
+) -> ServiceOutcome {
     let target_pid = i32::from_le_bytes([req.args[0], req.args[1], req.args[2], req.args[3]]);
     let options = args_u32(req, 4);
     if options & !abi::ext::wait_opts::WNOHANG != 0 {
-        return Response::err(req.request_id, EINVAL);
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
     if target_pid < -1 {
-        return Response::err(req.request_id, EINVAL);
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
     let target = if target_pid == 0 || target_pid == -1 {
         WaitTarget::Any
     } else {
         if target_pid == pid {
-            return Response::err(req.request_id, ECHILD);
+            return ServiceOutcome::Done(Response::err(req.request_id, ECHILD));
         }
         WaitTarget::Specific(target_pid)
     };
+    let nohang = (options & abi::ext::wait_opts::WNOHANG) != 0;
 
     match kernel.proc_wait(pid, target) {
         Ok(WaitOutcome::Reaped(child, status)) => {
+            // Synchronous-reap path — unchanged from pre-2c.1.
             let packed = pack_exit_status(status);
             let mut resp = Response::ok(req.request_id, packed);
             if (req.heap_len as usize) >= 4 {
@@ -584,11 +586,30 @@ fn handle_proc_wait(
                     resp.extra_len = 4;
                 }
             }
-            resp
+            ServiceOutcome::Done(resp)
         }
-        Ok(WaitOutcome::WouldBlock) => Response::err(req.request_id, EAGAIN),
-        Ok(WaitOutcome::NoChildren) => Response::err(req.request_id, ECHILD),
-        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+        Ok(WaitOutcome::WouldBlock) if nohang => {
+            ServiceOutcome::Done(Response::err(req.request_id, EAGAIN))
+        }
+        Ok(WaitOutcome::WouldBlock) => {
+            // Blocking path: park the caller. If park_on_wait
+            // reports WouldBlock (one-waiter-per-parent
+            // invariant), surface EAGAIN.
+            match kernel.park_on_wait(pid, req.request_id, target, req.heap_ptr, req.heap_len) {
+                Ok(()) => ServiceOutcome::Parked,
+                Err(crate::sys::KernelError::WouldBlock) => {
+                    ServiceOutcome::Done(Response::err(req.request_id, EAGAIN))
+                }
+                Err(e) => ServiceOutcome::Done(Response::err(
+                    req.request_id,
+                    kerr_to_errno(e),
+                )),
+            }
+        }
+        Ok(WaitOutcome::NoChildren) => {
+            ServiceOutcome::Done(Response::err(req.request_id, ECHILD))
+        }
+        Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
     }
 }
 
@@ -645,6 +666,7 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
             // a caller needs them (design §2 non-goal).
             if signal == Signal::Term {
                 let _ = kernel.interrupt_parked_accept(target_pid);
+                let _ = kernel.interrupt_parked_wait(target_pid);
             }
             Response::ok(req.request_id, 0)
         }

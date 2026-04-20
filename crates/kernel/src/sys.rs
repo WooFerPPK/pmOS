@@ -221,12 +221,77 @@ pub struct Kernel {
     /// synchronously without being queued.
     signal_inboxes: BTreeMap<Pid, SignalInbox>,
     /// Responses queued for pids that were parked on a blocking
-    /// syscall and have since been unblocked (by a peer's action
-    /// or a kernel event). Drained per-pid by the dispatcher via
-    /// `kernel_take_next_wake_for_pid`, which pops one entry at
-    /// a time and writes its Response bytes into RESP_SCRATCH for
-    /// the JS side to push onto the pid's SAB response ring.
-    pub(crate) pending_wakes: alloc::vec::Vec<(Pid, abi::ring::Response)>,
+    /// syscall and have since been unblocked. Drained per-pid by
+    /// the dispatcher via `kernel_take_next_wake_for_pid`, which
+    /// writes each entry's 32-byte Response into `RESP_SCRATCH`
+    /// AND any heap payload into `HEAP_SCRATCH[0..extra_len]`,
+    /// surfacing the user's original `heap_ptr` via the companion
+    /// `kernel_resp_heap_ptr` export so the TS drainer can write
+    /// the heap bytes back into the user's SAB heap scratch.
+    ///
+    /// `WakeHeap = None` for wakes that don't need a heap readback
+    /// (every slice-2a/2b producer). Slice 2c.1's parked-wait wake
+    /// sets it to `Some(PendingHeap { heap_ptr, bytes })` with a
+    /// 4-byte reaped-child-pid payload when the parker recorded
+    /// `heap_len >= 4`.
+    pub(crate) pending_wakes: alloc::vec::Vec<(Pid, abi::ring::Response, WakeHeap)>,
+    /// Parents parked on a blocking `proc_wait`. Keyed by parent
+    /// pid so the child-exit wake path does an O(log n) lookup on
+    /// `ppid`.
+    ///
+    /// v1 invariant: at most one parker per parent. A second
+    /// blocking `proc_wait` from a parent that's already parked
+    /// returns -EAGAIN regardless of WNOHANG (see design §3.1).
+    /// POSIX allows reentrant waits from multiple threads sharing
+    /// a pid; PMos v1 rejects them. Future slice can lift this if
+    /// a multi-threaded-pid arc lands.
+    pub(crate) parked_waiters: alloc::collections::BTreeMap<Pid, WaitParker>,
+}
+
+/// Optional heap payload attached to a pending wake. Slice 2c.1.
+pub(crate) type WakeHeap = Option<PendingHeap>;
+
+/// Heap bytes the kernel wants the TS drainer to copy into the
+/// parker's SAB heap scratch at `heap_ptr`. `bytes` is at most
+/// `HEAP_SCRATCH_SIZE` in length; in practice for 2c.1 it's
+/// always 4 bytes (the reaped child pid as u32 LE), but the type
+/// is general to admit larger heap readbacks in future slices
+/// without another shape change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingHeap {
+    pub heap_ptr: u32,
+    pub bytes: alloc::vec::Vec<u8>,
+}
+
+/// Parked-waiter record. One entry per parked parent in
+/// `Kernel.parked_waiters`. Constructed by
+/// [`Kernel::park_on_wait`]; consumed by child-exit wake paths +
+/// [`Kernel::interrupt_parked_wait`] + the SIGKILL arm's surgical
+/// `parked_waiters.remove` call.
+///
+/// `target` determines which child-exit events this parker
+/// responds to: `Any` matches every child of the parked pid;
+/// `Specific(p)` matches only child pid `p`.
+///
+/// `heap_ptr` + `heap_len` are captured at park time so the wake
+/// path knows where in the user's SAB heap scratch to write the
+/// 4-byte reaped-child-pid readback. `heap_len >= 4` means the
+/// wake emits `Response.extra_len = 4`; otherwise the wake is
+/// status-only.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WaitParker {
+    pub req_id: u32,
+    pub target: WaitTarget,
+    pub heap_ptr: u32,
+    pub heap_len: u32,
+}
+
+/// Test helper: expose the `ext.rs`-private `pack_exit_status`
+/// helper so tests can build expected-value assertions
+/// identical to what the synchronous-reap path produces.
+#[doc(hidden)]
+pub fn pack_exit_status_public(status: crate::proc::ExitStatus) -> i64 {
+    crate::syscall::ext::pack_exit_status(status)
 }
 
 impl Kernel {
@@ -241,6 +306,7 @@ impl Kernel {
             fds: BTreeMap::new(),
             signal_inboxes: BTreeMap::new(),
             pending_wakes: alloc::vec::Vec::new(),
+            parked_waiters: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -828,7 +894,7 @@ impl Kernel {
                 crate::syscall::dispatch::kerr_to_errno(e),
             ),
         };
-        self.pending_wakes.push((acceptor_pid, wake_resp));
+        self.pending_wakes.push((acceptor_pid, wake_resp, None));
         let _ = self.procs.transition(acceptor_pid, ProcState::Ready);
         self.procs.clear_block_reason(acceptor_pid);
         Ok(())
@@ -855,7 +921,7 @@ impl Kernel {
             return false;
         };
         let wake_resp = abi::ring::Response::err(req_id, abi::errno::EINTR);
-        self.pending_wakes.push((pid, wake_resp));
+        self.pending_wakes.push((pid, wake_resp, None));
         // Best-effort state transition. If the pid isn't in
         // BlockedOnIpc for some reason (e.g. a race with another
         // wake path), ignore the transition error — the wake is
@@ -1003,8 +1069,16 @@ impl Kernel {
 
     /// Test helper: clone of `pending_wakes` for assertions.
     #[doc(hidden)]
-    pub fn pending_wakes_snapshot(&self) -> alloc::vec::Vec<(Pid, abi::ring::Response)> {
+    pub fn pending_wakes_snapshot(
+        &self,
+    ) -> alloc::vec::Vec<(Pid, abi::ring::Response, WakeHeap)> {
         self.pending_wakes.clone()
+    }
+
+    /// Test helper: look up a parker by parent pid.
+    #[doc(hidden)]
+    pub fn parked_waiters_get_public(&self, pid: Pid) -> Option<WaitParker> {
+        self.parked_waiters.get(&pid).copied()
     }
 
     /// Drain queued object-release side effects after an fd-table
@@ -1045,6 +1119,7 @@ impl Kernel {
                     self.pending_wakes.push((
                         parker_pid,
                         abi::ring::Response::err(req_id, abi::errno::EBADF),
+                        None,
                     ));
                     let _ = self.procs.transition(parker_pid, ProcState::Ready);
                     self.procs.clear_block_reason(parker_pid);
@@ -1074,6 +1149,7 @@ impl Kernel {
                         self.pending_wakes.push((
                             parker_pid,
                             abi::ring::Response::err(req_id, abi::errno::EBADF),
+                            None,
                         ));
                         let _ = self.procs.transition(parker_pid, ProcState::Ready);
                         self.procs.clear_block_reason(parker_pid);
@@ -1131,12 +1207,20 @@ impl Kernel {
         // the listener doesn't hold a stale reference after the
         // process dies.
         self.ipc.clear_parked_acceptor_for_pid(pid);
+        // If the exiting pid is itself parked on a blocking
+        // proc_wait, clear the slot so the exit-time sweep
+        // mirrors the ipc_accept side.
+        self.parked_waiters.remove(&pid);
         self.release_fd_table_resources(pid);
         let ppid = self.procs.get(pid).map(|p| p.ppid).unwrap_or(0);
         self.procs
             .exit(pid, status)
             .map_err(|_| KernelError::NoSuchPid)?;
         self.post_sigchld(ppid);
+        // If the exiting pid's parent is parked on wait AND the
+        // parker's target matches this child, reap + wake inline.
+        // The helper is a no-op if either condition fails.
+        self.wake_parked_waiter_for_child(pid, ppid, status);
         Ok(())
     }
 
@@ -1301,6 +1385,171 @@ impl Kernel {
         }
     }
 
+    /// Park `parent_pid` on a blocking `proc_wait`. Records the
+    /// parker's request_id + target + heap_ptr + heap_len, then
+    /// transitions the parent Running -> BlockedOnWait and sets
+    /// `block_reason = BlockReason::Wait { pid }` where `pid =
+    /// -1` for `WaitTarget::Any` or the specific child pid
+    /// otherwise.
+    ///
+    /// Precondition: the handler layer has already called
+    /// `Kernel::proc_wait` and observed `WaitOutcome::WouldBlock`
+    /// (a live matching child exists but no zombie). This method
+    /// does NOT re-check that precondition; calling it on a
+    /// parent with no live matching child would leave it parked
+    /// forever. The handler layer's branching (§3.4 of the
+    /// design) is the single source of truth for the
+    /// "should-park vs return-ECHILD" decision.
+    ///
+    /// Returns `WouldBlock` if `parent_pid` is already parked
+    /// (v1 one-waiter-per-parent invariant). `NoSuchPid` if the
+    /// state transition fails (e.g. the parent was reaped
+    /// between the `proc_wait` check and this call — a
+    /// harness-only race).
+    pub fn park_on_wait(
+        &mut self,
+        parent_pid: Pid,
+        req_id: u32,
+        target: WaitTarget,
+        heap_ptr: u32,
+        heap_len: u32,
+    ) -> Result<(), KernelError> {
+        if self.parked_waiters.contains_key(&parent_pid) {
+            return Err(KernelError::WouldBlock);
+        }
+        self.parked_waiters.insert(
+            parent_pid,
+            WaitParker { req_id, target, heap_ptr, heap_len },
+        );
+        self.procs
+            .transition(parent_pid, ProcState::BlockedOnWait)
+            .map_err(|_| {
+                // Roll back the parker insertion on transition
+                // failure so we don't leak a parker slot on a
+                // now-dead parent.
+                self.parked_waiters.remove(&parent_pid);
+                KernelError::NoSuchPid
+            })?;
+        let reason_pid = match target {
+            WaitTarget::Any => -1,
+            WaitTarget::Specific(p) => p,
+        };
+        self.procs
+            .set_block_reason(parent_pid, crate::proc::BlockReason::Wait { pid: reason_pid });
+        Ok(())
+    }
+
+    /// Companion to `park_on_wait`. Invoked from
+    /// `Kernel::proc_exit` and `Kernel::proc_kill`'s Signal::Kill
+    /// arm when a child transitions to Zombie. If the child's
+    /// parent has a parked waiter whose target matches the child,
+    /// this:
+    ///
+    ///   1. Reaps the child inline (releases its kernel-side
+    ///      resources, removes it from procs).
+    ///   2. Queues the wake on `pending_wakes` with the packed
+    ///      exit status + (if the parker's heap_len >= 4) the
+    ///      child pid in the heap bytes.
+    ///   3. Transitions the parent Ready + clears block_reason.
+    ///   4. Removes the parker slot from `parked_waiters`.
+    ///
+    /// Returns true iff a wake was fired. Production callers
+    /// discard the bool; tests use it.
+    ///
+    /// If the parent has no parked waiter, or the parker's target
+    /// doesn't match the child, this is a no-op — the child stays
+    /// Zombie (to be reaped by a later non-blocking wait) and no
+    /// wake is queued.
+    pub(crate) fn wake_parked_waiter_for_child(
+        &mut self,
+        child_pid: Pid,
+        ppid: Pid,
+        status: ExitStatus,
+    ) -> bool {
+        // ppid == 0 = orphan; cannot have a parker.
+        if ppid == 0 {
+            return false;
+        }
+        // Target-match check: any parker whose target is Any
+        // matches every child; Specific(p) matches only p.
+        let matches = match self.parked_waiters.get(&ppid) {
+            Some(p) => match p.target {
+                WaitTarget::Any => true,
+                WaitTarget::Specific(target_pid) => target_pid == child_pid,
+            },
+            None => return false,
+        };
+        if !matches {
+            return false;
+        }
+
+        // Reap inline. The reap removes the child from procs +
+        // releases its cap set. Failure shouldn't happen — the
+        // caller has just transitioned the child Zombie — but we
+        // treat a reap error as a no-op wake (the child's state
+        // is inconsistent, but the parent is better off parked
+        // than woken with an incorrect status).
+        let reap_ok = self.reap(child_pid).is_ok();
+        if !reap_ok {
+            return false;
+        }
+
+        // Dequeue the parker + build the wake response.
+        let parker = self
+            .parked_waiters
+            .remove(&ppid)
+            .expect("parked_waiters entry vanished between get and remove");
+        let packed = crate::syscall::ext::pack_exit_status(status);
+        let mut resp = abi::ring::Response::ok(parker.req_id, packed);
+        let heap = if parker.heap_len >= 4 {
+            resp.extra_len = 4;
+            Some(PendingHeap {
+                heap_ptr: parker.heap_ptr,
+                bytes: (child_pid as u32).to_le_bytes().to_vec(),
+            })
+        } else {
+            None
+        };
+        self.pending_wakes.push((ppid, resp, heap));
+
+        // Best-effort state transition. If the parent isn't in
+        // BlockedOnWait for some reason (race with another wake
+        // path), ignore the transition error — the wake is still
+        // queued and the user Worker will observe it.
+        let _ = self.procs.transition(ppid, ProcState::Ready);
+        self.procs.clear_block_reason(ppid);
+        true
+    }
+
+    /// Interrupt any parked `proc_wait` on `pid` with `-EINTR`.
+    /// Clears `parked_waiters[&pid]`, queues a wake with
+    /// `Response::err(req_id, EINTR)` onto `pending_wakes`,
+    /// transitions `pid` Ready + clears `block_reason`. No-op if
+    /// `pid` is not parked on wait.
+    ///
+    /// Called from `handle_proc_kill`'s `Signal::Term` arm
+    /// alongside the existing `interrupt_parked_accept` call. The
+    /// two methods are idempotent against each other: at most one
+    /// of them observes the parker slot (a pid parks on at most
+    /// one primitive at a time in v1).
+    ///
+    /// Returns `true` iff a park was interrupted. Production
+    /// callers discard the bool; tests use it.
+    pub fn interrupt_parked_wait(&mut self, pid: Pid) -> bool {
+        let Some(parker) = self.parked_waiters.remove(&pid) else {
+            return false;
+        };
+        let wake_resp = abi::ring::Response::err(parker.req_id, abi::errno::EINTR);
+        self.pending_wakes.push((pid, wake_resp, None));
+        // Best-effort state transition. If the pid isn't in
+        // BlockedOnWait for some reason (race with another wake
+        // path), ignore the transition error — the wake is still
+        // queued and the user Worker will observe it.
+        let _ = self.procs.transition(pid, ProcState::Ready);
+        self.procs.clear_block_reason(pid);
+        true
+    }
+
     /// Deliver `signal` to `target_pid`. The v1 kernel only
     /// actually terminates on `Kill`; other signals succeed
     /// syntactically (cap checks apply) but are otherwise
@@ -1358,6 +1607,13 @@ impl Kernel {
                 // so needs its own call. No EINTR wake is queued
                 // here (the pid is dead, not interrupted).
                 self.ipc.clear_parked_acceptor_for_pid(target_pid);
+                // Same surgical sweep for parked_waiters. A
+                // SIGKILL'd parent parked on wait is dead, not
+                // interrupted — no EINTR wake is queued (that's
+                // `interrupt_parked_wait`'s job from the
+                // catchable-signal arm). This just clears the
+                // stale slot.
+                self.parked_waiters.remove(&target_pid);
                 let target_ppid = target.ppid;
                 self.procs
                     .exit(target_pid, ExitStatus::Signaled(signal.number()))
@@ -1366,6 +1622,15 @@ impl Kernel {
                 // via SIGCHLD regardless of whether the child
                 // called proc_exit voluntarily or was killed.
                 self.post_sigchld(target_ppid);
+                // SIGKILL'd target transitioned Zombie — if its
+                // parent is parked on wait AND the parker's
+                // target matches, reap + wake. Status is
+                // Signaled(9) per the exit call above.
+                self.wake_parked_waiter_for_child(
+                    target_pid,
+                    target_ppid,
+                    ExitStatus::Signaled(signal.number()),
+                );
             }
             Signal::Term | Signal::Interrupt | Signal::Pipe | Signal::Child => {
                 if let Some(inbox) = self.signal_inboxes.get_mut(&target_pid) {

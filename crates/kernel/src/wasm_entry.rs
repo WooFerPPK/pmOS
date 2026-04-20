@@ -88,6 +88,12 @@ static mut REQ_SCRATCH: [u8; SLOT_SIZE] = [0u8; SLOT_SIZE];
 /// and the host reads after [`kernel_dispatch`] returns.
 static mut RESP_SCRATCH: [u8; SLOT_SIZE] = [0u8; SLOT_SIZE];
 
+/// User-SAB heap_ptr associated with the most recent wake drained
+/// via `kernel_take_next_wake_for_pid`. Readable by the TS side
+/// via `kernel_resp_heap_ptr`. Zero when no heap bytes were
+/// written. Slice 2c.1.
+static mut RESP_HEAP_PTR: u32 = 0;
+
 /// Heap scratch region used for variable-length payloads
 /// (FD_WRITE bytes, PATH_OPEN path strings, FD_READ destination
 /// buffer). See [`kernel_heap_ptr`] / [`kernel_heap_len`].
@@ -211,6 +217,45 @@ pub extern "C" fn kernel_register_process(caps_bits: u64) -> i32 {
     }
 }
 
+/// Test-only: register a child process under `parent` with the
+/// `ORDINARY_APP` cap set + console stdio, equivalent to the
+/// Rust-level `spawn_ordinary_app` test helper but callable from
+/// the TS side for dispatcher tests. Returns the child pid on
+/// success, -1 on failure.
+///
+/// The name is read from `HEAP_SCRATCH[0..name_len]` as UTF-8 + ASCII.
+/// Typical name_len is 8-16; shorter names are zero-padded by the
+/// caller (irrelevant since the exact bytes are copied).
+#[no_mangle]
+pub extern "C" fn kernel_register_process_for_spawn(
+    parent: Pid,
+    _name_ptr: u32,
+    name_len: u32,
+) -> i32 {
+    let kernel = kernel_mut();
+    let name_bytes = unsafe { &HEAP_SCRATCH[..name_len as usize] };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match kernel.proc_spawn(
+        parent,
+        crate::sys::SpawnArgs {
+            name,
+            caps: abi::cap::initial::ORDINARY_APP,
+            cwd: "/",
+            argv: alloc::vec::Vec::new(),
+            envp: alloc::collections::BTreeMap::new(),
+            stdin: FdObject::CharDevice(DEV_CONSOLE),
+            stdout: FdObject::CharDevice(DEV_CONSOLE),
+            stderr: FdObject::CharDevice(DEV_CONSOLE),
+        },
+    ) {
+        Ok(pid) => pid as i32,
+        Err(_) => -1,
+    }
+}
+
 /// Install `/dev/console` as an fd in `pid`'s fd table.
 /// Convenience wrapper so the host can set up stdin/stdout/stderr
 /// without having to decode `FdObject` on the TS side.
@@ -253,12 +298,24 @@ pub extern "C" fn kernel_install_signal_channel_fd(pid: Pid, fd: u32) -> i32 {
 /// `Running` state — the dispatcher does not handle
 /// state transitions itself; the host has to stage them.
 ///
+/// If the pid is already `Ready` (e.g. created via `proc_spawn`
+/// which auto-transitions to Ready), the `mark_ready` step is
+/// skipped — this allows `spawnChildForTest` + `markRunning`
+/// composition to work without the double-Ready error.
+///
 /// Returns `0` on success, `-1` on any state-machine error.
 #[no_mangle]
 pub extern "C" fn kernel_mark_running(pid: Pid) -> i32 {
     let kernel = kernel_mut();
-    if kernel.mark_ready(pid).is_err() {
-        return -1;
+    let already_ready = kernel
+        .procs
+        .get(pid)
+        .map(|p| p.state == ProcState::Ready)
+        .unwrap_or(false);
+    if !already_ready {
+        if kernel.mark_ready(pid).is_err() {
+            return -1;
+        }
     }
     if kernel.procs.transition(pid, ProcState::Running).is_err() {
         return -1;
@@ -309,23 +366,47 @@ pub extern "C" fn kernel_dispatch(pid: Pid) -> i32 {
 }
 
 /// Take the next pending wake for `pid` out of `Kernel.pending_wakes`,
-/// write its 32-byte Response into RESP_SCRATCH, and return 1. If
-/// nothing is queued for this pid, return 0. The JS dispatch loop
-/// drains by calling this repeatedly and pushing each RESP_SCRATCH
-/// snapshot onto the pid's SAB response ring (the same push path
-/// `serviceSab` uses for a Done response).
+/// write its 32-byte Response into RESP_SCRATCH, and if the entry
+/// has a heap payload write it into `HEAP_SCRATCH[0..extra_len]`
+/// AND record the user's original heap_ptr in `RESP_HEAP_PTR`
+/// (readable via `kernel_resp_heap_ptr`). Returns 1 if an entry
+/// was drained, 0 if nothing is queued for this pid.
 #[no_mangle]
 pub extern "C" fn kernel_take_next_wake_for_pid(pid: Pid) -> i32 {
     let kernel = kernel_mut();
-    let idx = match kernel.pending_wakes.iter().position(|(p, _)| *p == pid) {
+    let idx = match kernel.pending_wakes.iter().position(|(p, _, _)| *p == pid) {
         Some(i) => i,
         None => return 0,
     };
-    let (_, resp) = kernel.pending_wakes.remove(idx);
+    let (_, resp, heap) = kernel.pending_wakes.remove(idx);
     unsafe {
         RESP_SCRATCH = resp.to_le_bytes();
     }
+    if let Some(h) = heap {
+        // Copy heap bytes into HEAP_SCRATCH[0..len]. Capped at
+        // HEAP_SCRATCH_SIZE — the TS drainer reads `resp.extra_len`
+        // bytes, which the handler layer guaranteed <= heap_len <=
+        // HEAP_SCRATCH_SIZE at park time.
+        let len = h.bytes.len().min(HEAP_SCRATCH_SIZE);
+        unsafe {
+            HEAP_SCRATCH[..len].copy_from_slice(&h.bytes[..len]);
+            RESP_HEAP_PTR = h.heap_ptr;
+        }
+    } else {
+        unsafe {
+            RESP_HEAP_PTR = 0;
+        }
+    }
     1
+}
+
+/// Pointer-equivalent getter: returns the user-SAB heap_ptr
+/// recorded by the most recent `kernel_take_next_wake_for_pid`
+/// call. Meaningful only when that call returned 1 AND the
+/// response's `extra_len > 0`; otherwise zero.
+#[no_mangle]
+pub extern "C" fn kernel_resp_heap_ptr() -> u32 {
+    unsafe { RESP_HEAP_PTR }
 }
 
 // ---- device-input injection --------------------------------------------

@@ -10590,7 +10590,7 @@ fn park_on_accept_clears_on_listener_close() {
     );
     let wakes = k.pending_wakes_snapshot();
     assert_eq!(wakes.len(), 1);
-    let (pid, resp) = &wakes[0];
+    let (pid, resp, _heap) = &wakes[0];
     assert_eq!(*pid, ds);
     assert_eq!(resp.request_id, req_id);
     assert_eq!(resp.status, -abi::errno::EBADF);

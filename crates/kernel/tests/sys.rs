@@ -1480,7 +1480,7 @@ fn ipc_connect_wakes_parked_acceptor() {
     // Exactly one pending wake: (ds, Response::ok(req_id, new_fd)).
     let wakes = k.pending_wakes_snapshot();
     assert_eq!(wakes.len(), 1);
-    let (wake_pid, wake_resp) = &wakes[0];
+    let (wake_pid, wake_resp, _wake_heap) = &wakes[0];
     assert_eq!(*wake_pid, ds);
     assert_eq!(wake_resp.request_id, req_id);
     assert_eq!(wake_resp.status, 0);
@@ -1616,7 +1616,7 @@ fn sigterm_interrupts_parked_accept_with_eintr() {
     // `resp.status == -abi::errno::EBADF`).
     let wakes = k.pending_wakes_snapshot();
     assert_eq!(wakes.len(), 1);
-    let (wake_pid, wake_resp) = &wakes[0];
+    let (wake_pid, wake_resp, _wake_heap) = &wakes[0];
     assert_eq!(*wake_pid, ds);
     assert_eq!(wake_resp.request_id, req_id);
     assert_eq!(wake_resp.status, -abi::errno::EINTR);
@@ -1766,6 +1766,526 @@ fn sigkill_on_parked_accept_exits_without_eintr_wake() {
     // through `interrupt_parked_accept`; only the catchable-signal
     // arm in `handle_proc_kill` does. This is the load-bearing
     // assertion.
+    assert!(k.pending_wakes_is_empty());
+}
+
+// ---- proc_wait blocking semantics (slice 2c.1) ---------------------
+
+#[test]
+fn proc_wait_options_zero_parks_parent_when_no_zombie() {
+    // Parent has one live, non-zombie child. proc_wait(target=-1,
+    // options=0) must park the parent: no response queued, state
+    // transitions to BlockedOnWait, block_reason gains
+    // BlockReason::Wait { pid: -1 }, parked_waiters records the
+    // (req_id, target, heap_ptr, heap_len).
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(parent).unwrap();
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _child = spawn_ordinary_app(&mut k, parent, "child");
+
+    // Park the parent. `park_on_wait` takes (parent_pid, req_id,
+    // target, heap_ptr, heap_len) and performs the same set-of-
+    // preconditions the handler layer runs (target is a live
+    // child + not already parked).
+    let req_id = 0xc0deu32;
+    k.park_on_wait(
+        parent,
+        req_id,
+        kernel::sys::WaitTarget::Any,
+        0,
+        0,
+    )
+    .unwrap();
+
+    // State transitioned to BlockedOnWait.
+    let proc = k.procs.get(parent).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::BlockedOnWait);
+    assert_eq!(
+        proc.block_reason,
+        Some(kernel::proc::BlockReason::Wait { pid: -1 }),
+    );
+
+    // parked_waiters contains the expected record.
+    let parker = k.parked_waiters_get_public(parent).unwrap();
+    assert_eq!(parker.req_id, req_id);
+    assert_eq!(parker.target, kernel::sys::WaitTarget::Any);
+    assert_eq!(parker.heap_ptr, 0);
+    assert_eq!(parker.heap_len, 0);
+
+    // No wake queued yet.
+    assert!(k.pending_wakes_is_empty());
+}
+
+#[test]
+fn child_exit_wakes_parked_parent() {
+    use abi::ring::Response;
+
+    // Parent parks; child calls proc_exit; wake is queued with the
+    // packed exit status + reaped child pid in the heap bytes; the
+    // child is reaped (no longer in procs).
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(parent).unwrap();
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    let child = spawn_ordinary_app(&mut k, parent, "child");
+
+    // Park on `Any` with heap_len = 4 so the wake carries the pid.
+    let req_id = 0xfeedu32;
+    k.park_on_wait(
+        parent,
+        req_id,
+        kernel::sys::WaitTarget::Any,
+        0,
+        4,
+    )
+    .unwrap();
+
+    // Child exits voluntarily.
+    k.proc_exit(child, kernel::proc::ExitStatus::Exited(42))
+        .unwrap();
+
+    // Parent transitioned back to Ready with block_reason cleared.
+    let proc = k.procs.get(parent).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Ready);
+    assert!(proc.block_reason.is_none());
+
+    // parked_waiters slot is cleared.
+    assert!(k.parked_waiters_get_public(parent).is_none());
+
+    // Child is reaped (fully removed from procs).
+    assert!(!k.procs.is_alive(child));
+
+    // Exactly one wake queued: (parent, ok, packed status, heap[0..4] = child_pid).
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp, wake_heap) = &wakes[0];
+    assert_eq!(*wake_pid, parent);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, 0);
+    assert_eq!(wake_resp.extra_len, 4);
+    // value is the packed exit status — identical to what the
+    // synchronous-reap path produces.
+    let expected_value = {
+        let tmp = Response::ok(
+            0,
+            kernel::sys::pack_exit_status_public(
+                kernel::proc::ExitStatus::Exited(42),
+            ),
+        );
+        tmp.value
+    };
+    assert_eq!(wake_resp.value, expected_value);
+    // Heap bytes carry the reaped child pid as u32 LE.
+    let heap = wake_heap.as_ref().expect("wake has heap payload");
+    assert_eq!(heap.heap_ptr, 0);
+    assert_eq!(heap.bytes.len(), 4);
+    let decoded = u32::from_le_bytes([
+        heap.bytes[0],
+        heap.bytes[1],
+        heap.bytes[2],
+        heap.bytes[3],
+    ]);
+    assert_eq!(decoded, child as u32);
+}
+
+#[test]
+fn wnohang_preserves_eagain() {
+    // Parent with a live non-zombie child calls proc_wait with
+    // WNOHANG. The handler must NOT park; it returns EAGAIN
+    // synchronously. Parent stays Running; parked_waiters stays
+    // empty.
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(parent).unwrap();
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _child = spawn_ordinary_app(&mut k, parent, "child");
+
+    // Direct kernel call — no dispatcher required. proc_wait
+    // returns WouldBlock when a live child exists but no zombie;
+    // that's the kernel-level precondition the park path
+    // consumes. With WNOHANG the handler layer turns that into
+    // EAGAIN; this test pins the kernel-level invariant that
+    // park_on_wait is NOT called on the WNOHANG path.
+    let outcome = k.proc_wait(parent, kernel::sys::WaitTarget::Any).unwrap();
+    assert!(matches!(outcome, kernel::sys::WaitOutcome::WouldBlock));
+
+    // Parent stays Running; no parker slot.
+    let proc = k.procs.get(parent).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Running);
+    assert!(proc.block_reason.is_none());
+    assert!(k.parked_waiters_get_public(parent).is_none());
+    assert!(k.pending_wakes_is_empty());
+}
+
+#[test]
+fn second_wait_on_parked_parent_returns_eagain() {
+    // v1 invariant: at most one parker per parent. A second
+    // park_on_wait against an already-parked pid returns
+    // WouldBlock (the kernel-level precondition; the handler
+    // layer turns it into EAGAIN).
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(parent).unwrap();
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _child = spawn_ordinary_app(&mut k, parent, "child");
+
+    // First park lands.
+    k.park_on_wait(
+        parent,
+        1,
+        kernel::sys::WaitTarget::Any,
+        0,
+        0,
+    )
+    .unwrap();
+
+    // Second park against the same parent must fail with
+    // WouldBlock. Original parker's req_id is preserved.
+    let err = k
+        .park_on_wait(parent, 2, kernel::sys::WaitTarget::Any, 0, 0)
+        .unwrap_err();
+    assert_eq!(err, kernel::sys::KernelError::WouldBlock);
+
+    // Original parker unchanged.
+    let parker = k.parked_waiters_get_public(parent).unwrap();
+    assert_eq!(parker.req_id, 1);
+
+    // Parent stays BlockedOnWait.
+    let proc = k.procs.get(parent).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::BlockedOnWait);
+}
+
+#[test]
+fn sigterm_interrupts_parked_wait_with_eintr() {
+    // Parent parks on wait; grandparent sends SIGTERM to parent.
+    // Mirror of slice 2b's sigterm_interrupts_parked_accept_with_
+    // eintr: the handler-layer Term arm calls BOTH
+    // interrupt_parked_accept AND interrupt_parked_wait; one of
+    // the two fires (the pid parks on at most one primitive at a
+    // time).
+    let mut k = make_kernel();
+
+    // Grandparent (init) holds INIT caps so it can spawn a parent
+    // and later signal it.
+    let grandparent = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(grandparent).unwrap();
+    k.procs
+        .transition(grandparent, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    // Parent is spawned as a child of grandparent (so the cap
+    // check in proc_kill passes via the is_parent arm).
+    let parent = spawn_ordinary_app(&mut k, grandparent, "parent");
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    // Parent has a live child of its own (the child the parent
+    // parks waiting on).
+    let child = spawn_ordinary_app(&mut k, parent, "child");
+
+    // Parent parks on wait.
+    let req_id = 0xe171u32;
+    k.park_on_wait(
+        parent,
+        req_id,
+        kernel::sys::WaitTarget::Any,
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        k.procs.get(parent).unwrap().state,
+        kernel::proc::ProcState::BlockedOnWait,
+    );
+
+    // Grandparent sends SIGTERM to parent. This must do two things:
+    //   (a) post Signal::Term to parent's signal inbox
+    //   (b) wake the parked wait with -EINTR
+    k.proc_kill(grandparent, parent, kernel::proc::Signal::Term)
+        .unwrap();
+    let interrupted = k.interrupt_parked_wait(parent);
+    assert!(interrupted);
+
+    // Parent is Ready; block_reason cleared.
+    let proc = k.procs.get(parent).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Ready);
+    assert!(proc.block_reason.is_none());
+    assert!(k.parked_waiters_get_public(parent).is_none());
+
+    // Signal inbox has Term queued.
+    assert_eq!(k.pending_signals(parent).unwrap(), 1);
+
+    // Exactly one wake queued: (parent, err(req_id, EINTR), no heap).
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp, wake_heap) = &wakes[0];
+    assert_eq!(*wake_pid, parent);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, -abi::errno::EINTR);
+    assert_eq!(wake_resp.extra_len, 0);
+    assert!(wake_heap.is_none());
+
+    // The child is still alive, not reaped — EINTR fires before
+    // any reap happens.
+    assert!(k.procs.is_alive(child));
+}
+
+#[test]
+fn sigkill_on_parked_wait_exits_without_eintr_wake() {
+    // SIGKILL is non-catchable. `Kernel::proc_kill`'s Signal::Kill
+    // arm calls procs.exit synchronously with
+    // ExitStatus::Signaled(9), bypassing proc_exit entirely. The
+    // arm must sweep parked_waiters for the target pid (new in
+    // 2c.1, mirror of 2b's ipc.clear_parked_acceptor_for_pid call)
+    // but MUST NOT queue an EINTR wake (the pid is dead, not
+    // interrupted). Mirror of
+    // sigkill_on_parked_accept_exits_without_eintr_wake.
+    let mut k = make_kernel();
+
+    let grandparent = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(grandparent).unwrap();
+    k.procs
+        .transition(grandparent, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    let parent = spawn_ordinary_app(&mut k, grandparent, "parent");
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    let child = spawn_ordinary_app(&mut k, parent, "child");
+
+    // Parent parks on wait.
+    let req_id = 0x9c1du32;
+    k.park_on_wait(
+        parent,
+        req_id,
+        kernel::sys::WaitTarget::Any,
+        0,
+        0,
+    )
+    .unwrap();
+
+    // Grandparent SIGKILLs parent.
+    k.proc_kill(grandparent, parent, kernel::proc::Signal::Kill)
+        .unwrap();
+
+    // Parent is zombie with Signaled(9).
+    let proc = k.procs.get(parent).unwrap();
+    assert_eq!(proc.state, kernel::proc::ProcState::Zombie);
+    assert!(matches!(
+        proc.exit_status,
+        Some(kernel::proc::ExitStatus::Signaled(9)),
+    ));
+
+    // parked_waiters swept clean by the Signal::Kill arm's
+    // surgical parked_waiters.remove call.
+    assert!(k.parked_waiters_get_public(parent).is_none());
+
+    // No EINTR wake queued — the pid is dead, not interrupted.
+    // NB: grandparent may have received SIGCHLD via post_sigchld,
+    // which does NOT queue anything on pending_wakes (the
+    // grandparent is not parked on wait).
+    assert!(k.pending_wakes_is_empty());
+
+    // The child is still alive, not reaped (parent didn't reach
+    // the reap path — it was killed before any wake fired).
+    assert!(k.procs.is_alive(child));
+}
+
+#[test]
+fn specific_target_wake_only_matches_specific_child() {
+    // Parent with two live children (A and B). Parks on
+    // Specific(B). A exits first. Because A doesn't match the
+    // park's target, no wake fires and the parent keeps parking;
+    // A becomes a regular zombie that a later non-blocking
+    // PROC_WAIT could reap. Then B exits. Now the park's target
+    // matches; the wake fires + B is reaped.
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(parent).unwrap();
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    let child_a = spawn_ordinary_app(&mut k, parent, "child_a");
+    let child_b = spawn_ordinary_app(&mut k, parent, "child_b");
+
+    // Park specifically on child_b.
+    let req_id = 0xb0b0u32;
+    k.park_on_wait(
+        parent,
+        req_id,
+        kernel::sys::WaitTarget::Specific(child_b),
+        0,
+        4,
+    )
+    .unwrap();
+
+    // A exits first — doesn't match. Parent keeps parking; no
+    // wake; A transitions to Zombie but is NOT reaped (reap only
+    // happens when the park's target matches).
+    k.proc_exit(child_a, kernel::proc::ExitStatus::Exited(1))
+        .unwrap();
+    assert_eq!(
+        k.procs.get(parent).unwrap().state,
+        kernel::proc::ProcState::BlockedOnWait,
+    );
+    assert!(k.parked_waiters_get_public(parent).is_some());
+    assert!(k.pending_wakes_is_empty());
+    // A is zombie, NOT reaped.
+    assert_eq!(
+        k.procs.get(child_a).unwrap().state,
+        kernel::proc::ProcState::Zombie,
+    );
+
+    // B exits — matches the park's Specific(child_b) target.
+    k.proc_exit(child_b, kernel::proc::ExitStatus::Exited(7))
+        .unwrap();
+
+    // Parent is Ready; parker cleared.
+    assert_eq!(
+        k.procs.get(parent).unwrap().state,
+        kernel::proc::ProcState::Ready,
+    );
+    assert!(k.parked_waiters_get_public(parent).is_none());
+
+    // B is fully reaped.
+    assert!(!k.procs.is_alive(child_b));
+
+    // Exactly one wake queued, for parent, carrying B's packed
+    // status + B's pid in the heap bytes.
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp, wake_heap) = &wakes[0];
+    assert_eq!(*wake_pid, parent);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, 0);
+    assert_eq!(wake_resp.extra_len, 4);
+    let heap = wake_heap.as_ref().expect("wake has heap payload");
+    let decoded = u32::from_le_bytes([
+        heap.bytes[0],
+        heap.bytes[1],
+        heap.bytes[2],
+        heap.bytes[3],
+    ]);
+    assert_eq!(decoded, child_b as u32);
+
+    // A is still a zombie — a later non-blocking PROC_WAIT(WNOHANG)
+    // with WaitTarget::Any would reap it.
+    assert_eq!(
+        k.procs.get(child_a).unwrap().state,
+        kernel::proc::ProcState::Zombie,
+    );
+}
+
+#[test]
+fn parent_exit_clears_parked_waiter_slot() {
+    // A parent parks on wait, then exits directly via proc_exit
+    // (simulating a Worker-crash path observed by the host). The
+    // proc_exit call must sweep parked_waiters for the exiting
+    // pid — mirror of 2a's ipc.clear_parked_acceptor_for_pid
+    // sweep at the top of proc_exit. No spurious wake queued.
+    let mut k = make_kernel();
+
+    let grandparent = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(grandparent).unwrap();
+    k.procs
+        .transition(grandparent, kernel::proc::ProcState::Running)
+        .unwrap();
+
+    let parent = spawn_ordinary_app(&mut k, grandparent, "parent");
+    k.procs
+        .transition(parent, kernel::proc::ProcState::Running)
+        .unwrap();
+    let _child = spawn_ordinary_app(&mut k, parent, "child");
+
+    // Parent parks.
+    k.park_on_wait(
+        parent,
+        0xdeadu32,
+        kernel::sys::WaitTarget::Any,
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(k.parked_waiters_get_public(parent).is_some());
+
+    // Parent exits directly with Crashed (simulates host-side
+    // Worker crash observer calling proc_exit on the crashed pid).
+    k.proc_exit(parent, kernel::proc::ExitStatus::Crashed)
+        .unwrap();
+
+    // parked_waiters is empty — the sweep ran.
+    assert!(k.parked_waiters_get_public(parent).is_none());
+
+    // No spurious wake queued. (The parent is Zombie now — a wake
+    // against a zombie pid would be dropped by the drainer anyway,
+    // but the invariant is cleaner if we never queue it.)
     assert!(k.pending_wakes_is_empty());
 }
 

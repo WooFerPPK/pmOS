@@ -622,6 +622,45 @@ var KernelWasmHost = class _KernelWasmHost {
       throw new Error(`KernelWasmHost.markRunning(${pid}): rc=${rc}`);
     }
   }
+  /**
+   * Test-only: spawn a child process of `parent` with
+   * ORDINARY_APP caps + console stdio, returning the child pid.
+   * Mirror of the kernel-tests `spawn_ordinary_app` Rust helper.
+   * Used by slice-2c.1 dispatcher tests to build parent/child
+   * pairs for PROC_WAIT blocking scenarios.
+   *
+   * `parent` must already be registered + markedRunning; the
+   * child is left in `Ready` state (the kernel's `proc_spawn`
+   * auto-transitions children to `Ready`; the test harness may
+   * bump to `Running` via `markRunning(child)` if the child
+   * needs to dispatch its own syscalls).
+   */
+  spawnChildForTest(parent, name) {
+    const rc = this.exports.kernel_register_process_for_spawn(
+      parent,
+      this.encodeStringToHeap(name),
+      name.length
+    );
+    if (rc < 0) {
+      throw new Error(
+        `KernelWasmHost.spawnChildForTest: kernel_register_process_for_spawn returned ${rc}`
+      );
+    }
+    return rc;
+  }
+  encodeStringToHeap(s) {
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(s);
+    const heapCap = this.exports.kernel_heap_len();
+    if (bytes.length > heapCap) {
+      throw new Error(
+        `KernelWasmHost.encodeStringToHeap: ${bytes.length} > heap capacity ${heapCap}`
+      );
+    }
+    const heapPtr = this.exports.kernel_heap_ptr();
+    new Uint8Array(this.exports.memory.buffer, heapPtr, bytes.length).set(bytes);
+    return 0;
+  }
   // ---- syscall dispatch ---------------------------------------------
   /**
    * Dispatch one syscall on behalf of `pid`. Encodes `request`,
@@ -694,6 +733,38 @@ var KernelWasmHost = class _KernelWasmHost {
     return decodeResponse(respBytes);
   }
   /**
+   * Test-only: pop one wake for `pid` and return the decoded
+   * Response PLUS any heap bytes the wake carries. Heap bytes
+   * are cloned from kernel HEAP_SCRATCH[0..extra_len]; `heapBytes
+   * === null` when `response.extraLen === 0`.
+   *
+   * Mirrors `takeNextWakeForPid` but surfaces the `extra_len`
+   * payload that `drainWakesForPid` would copy back into the SAB.
+   * Used by dispatcher tests that assert the reaped-child-pid
+   * readback shape without a full SAB round-trip.
+   */
+  takeNextWakeForPidWithHeap(pid) {
+    if (this.exports.kernel_take_next_wake_for_pid(pid) !== 1) {
+      return null;
+    }
+    const respPtr = this.exports.kernel_resp_ptr();
+    const respBytes = new Uint8Array(
+      new Uint8Array(this.exports.memory.buffer, respPtr, SLOT_SIZE)
+    );
+    const response = decodeResponse(respBytes);
+    if (response.extraLen === 0) {
+      return { response, heapBytes: null };
+    }
+    const heapPtrInKernel = this.exports.kernel_heap_ptr();
+    const kernelHeap = new Uint8Array(
+      this.exports.memory.buffer,
+      heapPtrInKernel,
+      response.extraLen
+    );
+    const heapBytes = new Uint8Array(kernelHeap);
+    return { response, heapBytes };
+  }
+  /**
    * Drain any pending wakes queued for `pid` and push each response
    * onto `sab`'s response ring. Called by `startDispatchLoop` before
    * `serviceSab` on each pid so a previously-parked acceptor sees
@@ -731,6 +802,18 @@ var KernelWasmHost = class _KernelWasmHost {
       const resSlotOffset = baseOffset + OFF_RES_RING + resSlotIx * SLOT_SIZE;
       const encoded = encodeResponse(response);
       new Uint8Array(buffer, resSlotOffset, SLOT_SIZE).set(encoded);
+      if (response.extraLen > 0) {
+        const heapPtrInSab = this.exports.kernel_resp_heap_ptr();
+        const heapPtrInKernel = this.exports.kernel_heap_ptr();
+        const kernelHeap = new Uint8Array(
+          this.exports.memory.buffer,
+          heapPtrInKernel,
+          response.extraLen
+        );
+        const copy = new Uint8Array(kernelHeap);
+        const sabHeapOffset = baseOffset + OFF_HEAP_SCRATCH + heapPtrInSab;
+        new Uint8Array(buffer, sabHeapOffset, response.extraLen).set(copy);
+      }
       Atomics.store(header, OFF_RES_HEAD / 4, nextResHead);
       pushed += 1;
     }

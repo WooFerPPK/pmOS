@@ -4838,6 +4838,187 @@ describe("dispatch: PROC_WAIT", () => {
   });
 });
 
+// ---- dispatch: PROC_WAIT blocking ----------------------------------
+//
+// Slice 2c.1. When options=0 and a matching live child exists but
+// no zombie, handle_proc_wait returns ServiceOutcome::Parked (no
+// response push). A later child-exit transitions the parent Ready
+// and queues the wake via kernel.pending_wakes; drainWakesForPid
+// copies the wake response + heap bytes (child pid as u32 LE) onto
+// the parent's SAB.
+
+describe("dispatch: PROC_WAIT blocking", () => {
+  it("options=0 on live child parks caller (no response push)", async () => {
+    const { host } = await freshHost();
+
+    // Parent holds CAPSET_ALL. Spawn a child with CAP_SPAWN via
+    // PROC_SPAWN so the kernel's proc_wait sees a live child.
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    // Spawn a child via the kernel's own register_process path —
+    // the test-only `spawnChildForTest` helper mirrors what Rust's
+    // spawn_ordinary_app does, installing a child pid under the
+    // parent with ORDINARY_APP caps + console stdio.
+    const child = host.spawnChildForTest(parent, "child");
+    expect(child).toBeGreaterThan(parent);
+
+    // Dispatch PROC_WAIT(target=-1, options=0). Because the child
+    // is live and non-zombie, the handler parks the parent.
+    const waitArgs = new Uint8Array(16);
+    const waitView = new DataView(waitArgs.buffer);
+    waitView.setInt32(0, -1, true);
+    waitView.setUint32(4, 0, true);
+    const waitResult = host.dispatch(parent, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 0x2c01,
+      args: waitArgs,
+      heapPtr: 0,
+      heapLen: 4,
+    });
+
+    // Parked: no response, parked flag true.
+    expect(waitResult.parked).toBe(true);
+    expect(waitResult.response).toBeUndefined();
+
+    // No wake queued yet.
+    const wake = host.takeNextWakeForPid(parent);
+    expect(wake).toBeNull();
+  });
+
+  it("child exit wakes parked parent with packed status + pid heap readback", async () => {
+    const { host } = await freshHost();
+
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    const child = host.spawnChildForTest(parent, "child");
+    host.markRunning(child);
+
+    // Park the parent with heap_len = 4 so the wake carries the
+    // reaped child's pid in the heap bytes.
+    const waitArgs = new Uint8Array(16);
+    const waitView = new DataView(waitArgs.buffer);
+    waitView.setInt32(0, -1, true);
+    waitView.setUint32(4, 0, true);
+    const waitResult = host.dispatch(parent, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 0x2c02,
+      args: waitArgs,
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(waitResult.parked).toBe(true);
+
+    // Child calls PROC_EXIT(0). This transitions the child to
+    // Zombie; the kernel's wake_parked_waiter_for_child helper
+    // runs during proc_exit, reaps the child inline, queues the
+    // wake.
+    const exitArgs = new Uint8Array(16);
+    new DataView(exitArgs.buffer).setInt32(0, 0, true);
+    const exitResult = host.dispatch(child, {
+      opcode: OP_WASI.PROC_EXIT,
+      requestId: 0x2c03,
+      args: exitArgs,
+    });
+    // proc_exit produces no response (the exiting pid is gone);
+    // the wake for the PARENT is queued on pending_wakes.
+    expect(exitResult.parked).toBeUndefined();
+
+    // Take the wake for the parent — the response carries the
+    // packed exit status. WaitOutcome::Reaped with Exited(0)
+    // packs to bits 40..48 = 0x01 (Exited flag), bits 0..32 = 0
+    // (the exit code): the u64 value is 0x0000_0100_0000_0000.
+    const wake = host.takeNextWakeForPidWithHeap(parent);
+    expect(wake).not.toBeNull();
+    expect(wake!.response.requestId).toBe(0x2c02);
+    expect(wake!.response.status).toBe(0);
+    // Packed status: Exited(0) — flag 0x01 at bits 40..48, rest 0.
+    const expectedValue = BigInt(0x01) << BigInt(40);
+    expect(wake!.response.value).toBe(expectedValue);
+    // extra_len = 4 with the child pid.
+    expect(wake!.response.extraLen).toBe(4);
+    expect(wake!.heapBytes).not.toBeNull();
+    expect(wake!.heapBytes!.byteLength).toBe(4);
+    const heapView = new DataView(
+      wake!.heapBytes!.buffer,
+      wake!.heapBytes!.byteOffset,
+      4,
+    );
+    expect(heapView.getUint32(0, true)).toBe(child);
+
+    // A second take returns null — queue drained.
+    expect(host.takeNextWakeForPidWithHeap(parent)).toBeNull();
+  });
+
+  it("SIGTERM wakes parked parent with EINTR", async () => {
+    const { host } = await freshHost();
+
+    // Grandparent registers with CAPSET_ALL so it holds
+    // ProcKillAny; parent is spawned as a child of grandparent so
+    // the is_parent cap-check arm applies to the PROC_KILL.
+    const grandparent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(grandparent, 0);
+    host.installConsoleFd(grandparent, 1);
+    host.installConsoleFd(grandparent, 2);
+    host.markRunning(grandparent);
+
+    const parent = host.spawnChildForTest(grandparent, "parent");
+    host.markRunning(parent);
+
+    // Parent needs a child of its own so the proc_wait doesn't
+    // hit the NoChildren → ECHILD early-reject.
+    const _child = host.spawnChildForTest(parent, "child");
+
+    // Parent parks on PROC_WAIT(target=-1, options=0).
+    const waitArgs = new Uint8Array(16);
+    const waitView = new DataView(waitArgs.buffer);
+    waitView.setInt32(0, -1, true);
+    waitView.setUint32(4, 0, true);
+    const waitResult = host.dispatch(parent, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 0x2c04,
+      args: waitArgs,
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(waitResult.parked).toBe(true);
+
+    // Grandparent sends SIGTERM (signum=15) to parent.
+    // PROC_KILL args: args[0..4] = target_pid (i32),
+    // args[4..6] = signum (u16).
+    const killArgs = new Uint8Array(16);
+    const killView = new DataView(killArgs.buffer);
+    killView.setInt32(0, parent, true);
+    killView.setUint16(4, 15, true);
+    const killResult = host.dispatch(grandparent, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 0x2c05,
+      args: killArgs,
+    });
+    expect(killResult.response).toBeDefined();
+    expect(killResult.response!.status).toBe(0);
+
+    // Take the wake for the parent. status === -EINTR, request_id
+    // matches the parked PROC_WAIT's request_id. extra_len === 0
+    // (EINTR wakes carry no heap payload).
+    const wake = host.takeNextWakeForPid(parent);
+    expect(wake).not.toBeNull();
+    expect(wake!.requestId).toBe(0x2c04);
+    expect(wake!.status).toBe(-ERRNO.EINTR);
+    expect(wake!.extraLen).toBe(0);
+
+    // A second take returns null — queue drained.
+    expect(host.takeNextWakeForPid(parent)).toBeNull();
+  });
+});
+
 // ---- dispatch: PROC_CAPS_GET ----------------------------------------
 //
 // PROC_CAPS_GET (0x1105). Wire: args[0..4] = target_pid i32.
