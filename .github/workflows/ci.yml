@@ -40,15 +40,20 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
-      - name: Cargo cache
+      - name: Cargo registry cache
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+        # Deliberately NOT caching `target/`. Cached target artifacts
+        # between runs have caused stale wasm binaries to survive
+        # source changes (cargo fingerprint + restored mtimes interact
+        # in unpredictable ways across cache hits), producing test
+        # failures against behaviourally-old hello-* binaries. Full
+        # fresh builds are ~2 minutes and safer.
 
       - name: Build everything
         run: just build
