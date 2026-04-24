@@ -11,3 +11,4 @@ path = "src/main.rs"
 [dependencies]
 abi = { path = "../abi" }
 toolkit = { path = "../toolkit" }
+preferences = { path = "../preferences" }
