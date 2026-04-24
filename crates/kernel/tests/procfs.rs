@@ -24,6 +24,7 @@ use abi::ext::Pid;
 
 use kernel::fs::procfs::{
     ProcFs, ProcFsSource, ProcStatusSnapshot, ProcStatusState, StaticProcFsSource,
+    StorageSnapshot,
 };
 use kernel::proc::{
     table::ProcessTable,
@@ -339,4 +340,110 @@ fn source_with_no_pids_still_serves_top_level_files() {
     let mut buf = [0u8; 64];
     let n = vfs.read("/proc/version", 0, &mut buf).unwrap();
     assert!(core::str::from_utf8(&buf[..n]).unwrap().starts_with("PMos"));
+}
+
+// ---- /proc/storage — structured StorageSnapshot seam (T169) --------
+
+/// Local test source that exercises the *default* `storage()` impl
+/// on the `ProcFsSource` trait — i.e. the formatter path that
+/// projects a `StorageSnapshot` into `"quota used files\n"`.
+/// `StaticProcFsSource` overrides `storage()` directly (for
+/// backwards-compat with the pre-T169 canned-line tests), so a
+/// separate type is required to cover the default arm.
+struct StorageOnlyTestSource {
+    snapshot: Option<StorageSnapshot>,
+}
+
+impl ProcFsSource for StorageOnlyTestSource {
+    fn version(&self) -> String {
+        String::from("test\n")
+    }
+    fn uptime(&self) -> String {
+        String::from("0 0\n")
+    }
+    fn meminfo(&self) -> String {
+        String::from("0 0 0\n")
+    }
+    fn loadavg(&self) -> String {
+        String::from("0.00 0.00 0.00 0/0 0\n")
+    }
+    fn storage_info(&self) -> Option<StorageSnapshot> {
+        self.snapshot.clone()
+    }
+}
+
+#[test]
+fn storage_info_none_on_default_static_source() {
+    // Default source has no structured storage counters yet; the
+    // placeholder `"0 0 0\n"` contract from pre-T169 callers must
+    // still hold.
+    let source = StaticProcFsSource::default();
+    assert!(source.storage_info().is_none());
+    assert_eq!(source.storage(), "0 0 0\n");
+}
+
+#[test]
+fn storage_info_some_populates_storage_line() {
+    // Populating `storage_info` does not change the
+    // `StaticProcFsSource::storage()` override (which still returns
+    // `storage_line`); the snapshot accessor is what the future
+    // kernel-bridge projects. This test pins both paths so
+    // overriding behaviour stays explicit.
+    let source = StaticProcFsSource {
+        storage_line: String::from("canned override\n"),
+        storage_info: Some(StorageSnapshot {
+            quota_bytes: 10_000,
+            used_bytes: 500,
+            file_count: 7,
+        }),
+        ..StaticProcFsSource::default()
+    };
+    assert_eq!(source.storage(), "canned override\n");
+    assert_eq!(
+        source.storage_info(),
+        Some(StorageSnapshot {
+            quota_bytes: 10_000,
+            used_bytes: 500,
+            file_count: 7,
+        })
+    );
+}
+
+#[test]
+fn storage_info_direct_accessor() {
+    // Round-trip: set a snapshot on the canned source, pull it back
+    // out via the accessor, assert equality.
+    let snap = StorageSnapshot {
+        quota_bytes: 1 << 30,
+        used_bytes: (1 << 20) * 42,
+        file_count: 128,
+    };
+    let source = StaticProcFsSource {
+        storage_info: Some(snap.clone()),
+        ..StaticProcFsSource::default()
+    };
+    assert_eq!(source.storage_info(), Some(snap));
+}
+
+#[test]
+fn custom_source_with_only_storage_info_returns_formatted_storage_line() {
+    // A source that only overrides `storage_info` (and leaves the
+    // default `storage()` in place) must format the snapshot into
+    // the documented `"{quota} {used} {files}\n"` layout. This is
+    // the contract the `KernelProcFsSource` boot-path bridge will
+    // rely on when it projects the live block-driver counters
+    // without re-implementing the formatter.
+    let source = StorageOnlyTestSource {
+        snapshot: Some(StorageSnapshot {
+            quota_bytes: 10_000,
+            used_bytes: 500,
+            file_count: 7,
+        }),
+    };
+    assert_eq!(source.storage(), "10000 500 7\n");
+
+    // And the `None` arm of the default impl falls back to the
+    // placeholder — same contract a pre-T169 caller saw.
+    let empty = StorageOnlyTestSource { snapshot: None };
+    assert_eq!(empty.storage(), "0 0 0\n");
 }

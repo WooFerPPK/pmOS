@@ -50,7 +50,30 @@ pub trait ProcFsSource: Send + Sync {
     fn uptime(&self) -> String;
     fn meminfo(&self) -> String;
     fn loadavg(&self) -> String;
-    fn storage(&self) -> String;
+
+    /// Pre-formatted `/proc/storage` body.
+    ///
+    /// Default: if [`storage_info`](Self::storage_info) returns
+    /// `Some`, format it as `"{quota_bytes} {used_bytes} {file_count}\n"`;
+    /// otherwise return the canned placeholder `"0 0 0\n"`. Sources
+    /// that carry a fully-formatted line (the canned test source)
+    /// may override this directly.
+    fn storage(&self) -> String {
+        match self.storage_info() {
+            Some(snap) => format_storage_snapshot(&snap),
+            None => String::from("0 0 0\n"),
+        }
+    }
+
+    /// Structured `/proc/storage` snapshot, or `None` if the
+    /// source has no live storage counters to project.
+    ///
+    /// Default: `None`. The future kernel-bridge
+    /// (`KernelProcFsSource`) will override this to project the
+    /// block driver's quota + used + file-count counters.
+    fn storage_info(&self) -> Option<StorageSnapshot> {
+        None
+    }
 
     /// Return the process-table snapshot for `pid`, or `None` if
     /// no such live pid exists.
@@ -70,6 +93,32 @@ pub trait ProcFsSource: Send + Sync {
     }
 }
 
+/// Structured counters that back `/proc/storage`.
+///
+/// Mirrors the block driver's quota / used / file-count triad; the
+/// future `KernelProcFsSource` will project the live driver
+/// counters into this struct at snapshot time. Owned values (no
+/// borrows) so that an emit-time read can release the driver
+/// borrow before formatting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageSnapshot {
+    pub quota_bytes: u64,
+    pub used_bytes: u64,
+    pub file_count: u64,
+}
+
+/// Format a [`StorageSnapshot`] into the exact bytes
+/// `/proc/storage` serves: three decimal fields on one line,
+/// trailing newline. Kept inside the module so every backend
+/// produces byte-identical output — callers that want different
+/// output must override [`ProcFsSource::storage`] directly.
+fn format_storage_snapshot(snap: &StorageSnapshot) -> String {
+    format!(
+        "{} {} {}\n",
+        snap.quota_bytes, snap.used_bytes, snap.file_count,
+    )
+}
+
 /// Canned values — used in tests and as the default before the
 /// kernel's real data source is installed.
 pub struct StaticProcFsSource {
@@ -78,6 +127,7 @@ pub struct StaticProcFsSource {
     pub meminfo_line: String,
     pub loadavg_line: String,
     pub storage_line: String,
+    pub storage_info: Option<StorageSnapshot>,
     pub pid_statuses: BTreeMap<Pid, ProcStatusSnapshot>,
 }
 
@@ -89,6 +139,7 @@ impl Default for StaticProcFsSource {
             meminfo_line: String::from("0 0 0\n"),
             loadavg_line: String::from("0.00 0.00 0.00 0/0 0\n"),
             storage_line: String::from("0 0 0\n"),
+            storage_info: None,
             pid_statuses: BTreeMap::new(),
         }
     }
@@ -119,6 +170,9 @@ impl ProcFsSource for StaticProcFsSource {
     }
     fn storage(&self) -> String {
         self.storage_line.clone()
+    }
+    fn storage_info(&self) -> Option<StorageSnapshot> {
+        self.storage_info.clone()
     }
     fn pid_status(&self, pid: Pid) -> Option<ProcStatusSnapshot> {
         self.pid_statuses.get(&pid).cloned()
