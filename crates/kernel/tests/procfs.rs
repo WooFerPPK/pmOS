@@ -23,8 +23,8 @@ use abi::cap::CapSet;
 use abi::ext::Pid;
 
 use kernel::fs::procfs::{
-    fd_symlink_ino, pid_subtree_ino, ProcFdSnapshot, ProcFs, ProcFsSource, ProcStatusSnapshot,
-    ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
+    fd_symlink_ino, pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs, ProcFsSource,
+    ProcStatusSnapshot, ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
 };
 use kernel::proc::{
     table::ProcessTable,
@@ -640,4 +640,115 @@ fn fd_dir_listed_in_pid_subtree_readdir() {
         .find(|e| e.name == "fd")
         .expect("fd entry present");
     assert_eq!(fd_entry.ty, NodeType::Directory);
+}
+
+// ---- KernelProcFsSource — live-kernel bridge (T169 partial) --------
+
+#[test]
+fn kernel_procfs_source_pid_status_returns_spawned_process() {
+    // Bridge reads `pid=42 name="edit"` from the live ProcessTable
+    // via `pid_status(42)`. The returned snapshot mirrors the
+    // process record byte-for-byte — same shape the VFS serves at
+    // `/proc/42/status` under StaticProcFsSource.
+    let mut table = ProcessTable::new();
+    // PidAllocator hands out pids sequentially from 1; to land on
+    // pid 42 we burn 1..=41 first. allocate_pid() returns the pid
+    // to assign *this* call, so allocating 41 throwaways yields
+    // the 42nd allocation next.
+    for _ in 0..41 {
+        let _ = table.allocate_pid();
+    }
+    let pid = table.allocate_pid();
+    assert_eq!(pid, 42);
+    table.insert(make_process(pid, 1, "edit")).unwrap();
+
+    let source = KernelProcFsSource::new(&table);
+    let snap = source.pid_status(42).expect("pid 42 is live");
+    assert_eq!(
+        snap,
+        ProcStatusSnapshot {
+            pid: 42,
+            ppid: 1,
+            name: "edit".into(),
+            state: ProcStatusState::Sleeping,
+        },
+    );
+}
+
+#[test]
+fn kernel_procfs_source_live_pids_lists_spawned() {
+    // Two spawns → `live_pids()` surfaces them in ascending order.
+    // Matches the `ProcessTable::live_pids` contract the bridge
+    // delegates to; we pin the order here so a later re-arrangement
+    // of the process table's iteration surface shows up as a test
+    // failure rather than a silent breakage in `/proc` readdir.
+    let mut table = ProcessTable::new();
+    let pid1 = table.allocate_pid();
+    table.insert(make_process(pid1, 0, "init")).unwrap();
+    let pid2 = table.allocate_pid();
+    table.insert(make_process(pid2, pid1, "sh")).unwrap();
+
+    let source = KernelProcFsSource::new(&table);
+    let pids = source.live_pids();
+    assert_eq!(pids, vec![pid1, pid2]);
+    assert!(pid1 < pid2, "pids must be ascending by construction");
+}
+
+#[test]
+fn kernel_procfs_source_pid_status_returns_none_for_missing_pid() {
+    // Empty table — pid 999 has never existed, so the bridge
+    // returns `None`. This is what `/proc/999/status` uses to
+    // decide FsError::NotFound.
+    let table = ProcessTable::new();
+    let source = KernelProcFsSource::new(&table);
+    assert!(source.pid_status(999).is_none());
+    assert!(source.live_pids().is_empty());
+}
+
+#[test]
+fn kernel_procfs_source_state_reflects_process_state() {
+    // Flip Running → Zombie on the ProcessTable; the bridge's
+    // snapshot reflects the change without any cache — each
+    // `pid_status` call projects fresh state from the live table.
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    table.insert(make_process(pid, 1, "worker")).unwrap();
+    table.transition(pid, ProcState::Ready).unwrap();
+    table.transition(pid, ProcState::Running).unwrap();
+
+    let running = KernelProcFsSource::new(&table)
+        .pid_status(pid)
+        .expect("pid live");
+    assert_eq!(running.state, ProcStatusState::Running);
+
+    table.exit(pid, ExitStatus::Exited(0)).unwrap();
+
+    let zombie = KernelProcFsSource::new(&table)
+        .pid_status(pid)
+        .expect("zombie still listed until reaped");
+    assert_eq!(zombie.state, ProcStatusState::Zombie);
+    assert_eq!(zombie.name, "worker");
+    assert_eq!(zombie.pid, pid);
+    assert_eq!(zombie.ppid, 1);
+}
+
+#[test]
+fn kernel_procfs_source_version_uptime_meminfo_loadavg_are_placeholders() {
+    // The version string carries the `-alpha (native-test)` marker
+    // that flags the bridge as not-yet-using a build-time banner.
+    // uptime / meminfo / loadavg are all zeroed until a clock
+    // source + memory-accounting are plumbed through (separate
+    // follow-up slices); the default-impl `storage()` falls back
+    // to `"0 0 0\n"` because `storage_info()` returns `None`.
+    let table = ProcessTable::new();
+    let source = KernelProcFsSource::new(&table);
+    assert_eq!(source.version(), "PMos 0.1.0-alpha (native-test)\n");
+    assert_eq!(source.uptime(), "0 0\n");
+    assert_eq!(source.meminfo(), "0 0 0\n");
+    assert_eq!(source.loadavg(), "0.00 0.00 0.00 0/0 0\n");
+    assert!(source.storage_info().is_none());
+    assert_eq!(source.storage(), "0 0 0\n");
+    // Default fd impl is untouched until block-driver + vfs reverse
+    // lookup wiring lands; pid_fds on a live pid is still empty.
+    assert!(source.pid_fds(1).is_empty());
 }

@@ -51,6 +51,7 @@ use alloc::vec::Vec;
 use abi::ext::Pid;
 
 use crate::platform;
+use crate::proc::{ProcState, ProcessTable};
 use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NodeType};
 
 /// Per-file snapshot as a plain string that procfs serves on `read`.
@@ -220,6 +221,102 @@ impl ProcFsSource for StaticProcFsSource {
     }
     fn live_pids(&self) -> Vec<Pid> {
         self.pid_statuses.keys().copied().collect()
+    }
+}
+
+/// Live-kernel bridge: projects the running [`ProcessTable`] into
+/// the [`ProcFsSource`] trait so procfs reflects real state instead
+/// of canned [`StaticProcFsSource`] values.
+///
+/// Scope of this slice (T169 partial):
+///
+/// * `pid_status`, `live_pids` — implemented against the borrowed
+///   [`ProcessTable`]. `/proc/<pid>/status` now shows whatever the
+///   kernel actually holds for that pid, including live state
+///   transitions (Running → Zombie, etc.).
+/// * `version` — hardcoded `"PMos 0.1.0-alpha (native-test)\n"`
+///   until a build-time banner is plumbed through.
+/// * `uptime`, `meminfo`, `loadavg` — placeholders (`"0 0\n"`,
+///   `"0 0 0\n"`, `"0.00 0.00 0.00 0/0 0\n"`). Real values need a
+///   clock source + memory accounting, both of which are follow-ups.
+/// * `storage_info` — returns `None`; the block-driver counter
+///   wiring is a separate follow-up slice, and the default
+///   `storage()` impl falls back to the `"0 0 0\n"` placeholder.
+/// * `pid_fds` — inherits the default empty impl. The
+///   per-process fd tables live inside the `Kernel` struct
+///   (`Kernel.fds: BTreeMap<Pid, FdTable>`, private), not on the
+///   `ProcessTable`, and a `Vnode`-to-path reverse lookup does not
+///   yet exist in the VFS. Wiring this requires either widening
+///   the bridge to hold a full `&Kernel` or adding a path-cache to
+///   the VFS — both are separate slices.
+///
+/// Integration wiring (mounting this source at `/proc` in the
+/// real boot path) is deliberately deferred: the module doc and
+/// T169 itself call out that the bridge is landed first as a unit
+/// then snapped into the boot path once the fd-table + storage
+/// follow-ups land.
+pub struct KernelProcFsSource<'a> {
+    process_table: &'a ProcessTable,
+}
+
+impl<'a> KernelProcFsSource<'a> {
+    /// Wrap a borrowed [`ProcessTable`]. The borrow must outlive
+    /// any call to a trait method; this is always the case inside
+    /// the kernel's single-threaded syscall dispatch because
+    /// procfs reads happen on the same tick as the read-lock.
+    pub fn new(process_table: &'a ProcessTable) -> Self {
+        KernelProcFsSource { process_table }
+    }
+}
+
+/// Map the kernel's [`ProcState`] enum to the coarser
+/// [`ProcStatusState`] the `/proc/<pid>/status` file serves. The
+/// mapping matches `project_state` in `tests/procfs.rs`.
+#[inline]
+fn proc_state_to_status(state: ProcState) -> ProcStatusState {
+    match state {
+        ProcState::Running => ProcStatusState::Running,
+        ProcState::Starting
+        | ProcState::Ready
+        | ProcState::BlockedOnSyscall
+        | ProcState::BlockedOnIpc
+        | ProcState::BlockedOnWait => ProcStatusState::Sleeping,
+        ProcState::Zombie | ProcState::Dead => ProcStatusState::Zombie,
+    }
+}
+
+impl<'a> ProcFsSource for KernelProcFsSource<'a> {
+    fn version(&self) -> String {
+        String::from("PMos 0.1.0-alpha (native-test)\n")
+    }
+
+    fn uptime(&self) -> String {
+        String::from("0 0\n")
+    }
+
+    fn meminfo(&self) -> String {
+        String::from("0 0 0\n")
+    }
+
+    fn loadavg(&self) -> String {
+        String::from("0.00 0.00 0.00 0/0 0\n")
+    }
+
+    fn pid_status(&self, pid: Pid) -> Option<ProcStatusSnapshot> {
+        let proc = self.process_table.get(pid)?;
+        if proc.state == ProcState::Dead {
+            return None;
+        }
+        Some(ProcStatusSnapshot {
+            pid: proc.pid,
+            ppid: proc.ppid,
+            name: proc.name.clone(),
+            state: proc_state_to_status(proc.state),
+        })
+    }
+
+    fn live_pids(&self) -> Vec<Pid> {
+        self.process_table.live_pids()
     }
 }
 
