@@ -130,6 +130,15 @@ then third-party app sample and layering test.
   (performance) impact note. See `specs/001-browser-os-v1/plan.md`
   for the template.
 
+### Accessibility (v1 non-goal)
+
+Per FR-045, v1 makes no accessibility claim. The toolkit's focus
+and event-routing surfaces are the documented v2 amendment target
+when a11y is in scope. Apps SHOULD NOT advertise a11y support in
+v1, and tests that assert a11y semantics are out of scope until
+the v2 amendment lands. Developer-facing tutorial: see
+`docs/apps.md` §Accessibility.
+
 ## Recent changes
 
 - **001-browser-os-v1** (2026-04-13): initial release — kernel,
