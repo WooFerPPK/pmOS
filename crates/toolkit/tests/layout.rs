@@ -1,7 +1,7 @@
-//! Isolation tests for `toolkit::layout::{Row, Column}`.
+//! Isolation tests for `toolkit::layout::{Row, Column, row_with_grow, col_with_grow}`.
 
 use toolkit::draw::Rect;
-use toolkit::layout::{Column, Row};
+use toolkit::layout::{col_with_grow, row_with_grow, Column, Item, Row};
 
 // ---- Row: placement -----------------------------------------------
 
@@ -233,4 +233,251 @@ fn column_interior_matches_parent_minus_padding() {
     let col = Column::new(Rect::new(100, 200, 400, 80), 10, 0);
     assert_eq!(col.interior_width(), 400 - 20);
     assert_eq!(col.interior_height(), 80 - 20);
+}
+
+// ---- row_with_grow ------------------------------------------------
+
+#[test]
+fn row_grow_single_child_claims_all_leftover() {
+    // Interior = 200 wide. One Grow child → gets all 200 px.
+    let rects = row_with_grow(
+        Rect::new(0, 0, 200, 50),
+        0,
+        0,
+        &[Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects.len(), 1);
+    assert_eq!(rects[0].x, 0);
+    assert_eq!(rects[0].width, 200);
+}
+
+#[test]
+fn row_grow_two_equal_weights_split_evenly() {
+    // Interior = 200, no padding, no spacing. Two Grow(1) → 100 each.
+    let rects = row_with_grow(
+        Rect::new(0, 0, 200, 50),
+        0,
+        0,
+        &[Item::Grow(1), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects.len(), 2);
+    assert_eq!(rects[0].width, 100);
+    assert_eq!(rects[1].width, 100);
+    assert_eq!(rects[0].x, 0);
+    assert_eq!(rects[1].x, 100);
+}
+
+#[test]
+fn row_grow_mixed_fixed_and_grow() {
+    // Interior = 300. Fixed(50) uses 50 px; Grow(1) gets remaining 250.
+    let rects = row_with_grow(
+        Rect::new(0, 0, 300, 50),
+        0,
+        0,
+        &[Item::Fixed(50), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects.len(), 2);
+    assert_eq!(rects[0].width, 50);
+    assert_eq!(rects[1].width, 250);
+    assert_eq!(rects[1].x, 50);
+}
+
+#[test]
+fn row_grow_unequal_weights_1_to_2() {
+    // Interior = 300. Grow(1) + Grow(2) → 100 + 200.
+    let rects = row_with_grow(
+        Rect::new(0, 0, 300, 50),
+        0,
+        0,
+        &[Item::Grow(1), Item::Grow(2)],
+        20,
+    );
+    assert_eq!(rects.len(), 2);
+    assert_eq!(rects[0].width, 100);
+    assert_eq!(rects[1].width, 200);
+}
+
+#[test]
+fn row_grow_zero_leftover_produces_zero_width_grow_rects() {
+    // Interior = 100; Fixed(100) consumes everything.
+    // The Grow child has nothing left → width 0.
+    let rects = row_with_grow(
+        Rect::new(0, 0, 100, 50),
+        0,
+        0,
+        &[Item::Fixed(100), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects.len(), 2);
+    assert_eq!(rects[0].width, 100);
+    assert_eq!(rects[1].width, 0);
+}
+
+#[test]
+fn row_grow_spacing_deducted_before_grow_split() {
+    // Interior = 210, spacing = 10, two Grow(1).
+    // Gap between two items = 1 × 10 = 10.
+    // Leftover for Grow = 210 - 10 = 200 → each gets 100.
+    let rects = row_with_grow(
+        Rect::new(0, 0, 210, 50),
+        0,
+        10,
+        &[Item::Grow(1), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects.len(), 2);
+    assert_eq!(rects[0].width, 100);
+    assert_eq!(rects[0].x, 0);
+    assert_eq!(rects[1].width, 100);
+    // x = 0 + 100 (child_w) + 10 (spacing) = 110.
+    assert_eq!(rects[1].x, 110);
+}
+
+#[test]
+fn row_grow_cross_axis_height_and_centring() {
+    // Interior height = 50 (parent 60, padding 5). Child height = 30.
+    // y_offset = (50-30)/2 = 10. child_y = 5 + 10 = 15.
+    let rects = row_with_grow(
+        Rect::new(0, 0, 200, 60),
+        5,
+        0,
+        &[Item::Grow(1)],
+        30,
+    );
+    assert_eq!(rects[0].y, 15);
+    assert_eq!(rects[0].height, 30);
+}
+
+#[test]
+fn row_grow_empty_items_returns_empty_vec() {
+    let rects = row_with_grow(Rect::new(0, 0, 200, 50), 0, 0, &[], 20);
+    assert!(rects.is_empty());
+}
+
+#[test]
+fn row_grow_grow_weight_zero_treated_as_one() {
+    // Two Grow(0) children should share equally (both treated as weight 1).
+    let rects = row_with_grow(
+        Rect::new(0, 0, 200, 50),
+        0,
+        0,
+        &[Item::Grow(0), Item::Grow(0)],
+        20,
+    );
+    assert_eq!(rects[0].width, 100);
+    assert_eq!(rects[1].width, 100);
+}
+
+// ---- col_with_grow ------------------------------------------------
+
+#[test]
+fn col_grow_single_child_claims_all_leftover() {
+    let rects = col_with_grow(
+        Rect::new(0, 0, 50, 200),
+        0,
+        0,
+        &[Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects.len(), 1);
+    assert_eq!(rects[0].y, 0);
+    assert_eq!(rects[0].height, 200);
+}
+
+#[test]
+fn col_grow_two_equal_weights_split_evenly() {
+    let rects = col_with_grow(
+        Rect::new(0, 0, 50, 200),
+        0,
+        0,
+        &[Item::Grow(1), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects[0].height, 100);
+    assert_eq!(rects[1].height, 100);
+    assert_eq!(rects[0].y, 0);
+    assert_eq!(rects[1].y, 100);
+}
+
+#[test]
+fn col_grow_mixed_fixed_and_grow() {
+    // Interior = 300 tall. Fixed(50) + Grow(1) → Grow gets 250.
+    let rects = col_with_grow(
+        Rect::new(0, 0, 50, 300),
+        0,
+        0,
+        &[Item::Fixed(50), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects[0].height, 50);
+    assert_eq!(rects[1].height, 250);
+    assert_eq!(rects[1].y, 50);
+}
+
+#[test]
+fn col_grow_unequal_weights_1_to_2() {
+    let rects = col_with_grow(
+        Rect::new(0, 0, 50, 300),
+        0,
+        0,
+        &[Item::Grow(1), Item::Grow(2)],
+        20,
+    );
+    assert_eq!(rects[0].height, 100);
+    assert_eq!(rects[1].height, 200);
+}
+
+#[test]
+fn col_grow_zero_leftover_produces_zero_height_grow_rects() {
+    let rects = col_with_grow(
+        Rect::new(0, 0, 50, 100),
+        0,
+        0,
+        &[Item::Fixed(100), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects[0].height, 100);
+    assert_eq!(rects[1].height, 0);
+}
+
+#[test]
+fn col_grow_spacing_deducted_before_grow_split() {
+    // Interior = 210 tall, spacing = 10, two Grow(1).
+    // Leftover = 210 - 10 = 200 → each gets 100.
+    let rects = col_with_grow(
+        Rect::new(0, 0, 50, 210),
+        0,
+        10,
+        &[Item::Grow(1), Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects[0].height, 100);
+    assert_eq!(rects[0].y, 0);
+    assert_eq!(rects[1].height, 100);
+    // y = 0 + 100 (child_h) + 10 (spacing) = 110.
+    assert_eq!(rects[1].y, 110);
+}
+
+#[test]
+fn col_grow_cross_axis_width_and_centring() {
+    // Interior width = 40 (parent 50, padding 5). Child width = 20.
+    // x_offset = (40-20)/2 = 10. child_x = 5 + 10 = 15.
+    let rects = col_with_grow(
+        Rect::new(0, 0, 50, 200),
+        5,
+        0,
+        &[Item::Grow(1)],
+        20,
+    );
+    assert_eq!(rects[0].x, 15);
+    assert_eq!(rects[0].width, 20);
+}
+
+#[test]
+fn col_grow_empty_items_returns_empty_vec() {
+    let rects = col_with_grow(Rect::new(0, 0, 50, 200), 0, 0, &[], 20);
+    assert!(rects.is_empty());
 }
