@@ -541,6 +541,30 @@ is the deviation **register** the constitution refers to.
    This is the single biggest Principle V delta in the
    project's history.
 
+6. **`web/src/drivers/common.ts` naming bifurcation** —
+   the plan (this file, §"Source Code") calls for a single
+   `web/src/drivers/common.ts` carrying the `Driver` interface,
+   `DevId` enum, message envelopes, and ring-buffer helpers.
+   The Phase 2 implementation landed them across
+   `web/src/drivers/types.ts` (`Driver`, `DriverHost`,
+   `DriverResult`, `DriverErrorCode`) and
+   `web/src/shared/platform-constants.ts` (`DriverId`, the
+   byte-for-byte mirror of `kernel::platform::DevId`). T079
+   (commit `b0baf01`, 2026-04-24) closes the naming gap by
+   shipping `web/src/drivers/common.ts` as a re-export facade
+   that publishes the existing types under the spec-mandated
+   identifiers (including a `DevId` alias of `DriverId`) and
+   adds two genuinely new additions: generic message envelopes
+   `ToDriver<Op, Payload>` / `FromDriver<Op, Payload>` and the
+   test-harness factories `createMockRing()` /
+   `createMockRingPair()`. 12 isolation tests at
+   `web/tests/unit/drivers-common.test.ts` include a
+   byte-for-byte `DevId` kernel-parity assertion so future
+   TS↔Rust drift fails at the driver-common boundary rather
+   than at a downstream ioctl call site. Migrating the landed
+   drivers (`console.ts`, `fb.ts`, `input.ts`) to import from
+   `common.ts` is a separate follow-up slice.
+
 ### Planning Complete
 
 `/speckit.plan` is finished. The feature is ready for
