@@ -12,7 +12,11 @@ use kernel::fs::opfs::block::{BlockDevice, MockBlockDevice};
 use kernel::fs::opfs::layout::{
     BLOCK_SIZE, DEFAULT_INODE_TABLE_BLOCKS, DEFAULT_JOURNAL_BLOCKS, ROOT_INO,
 };
-use kernel::fs::opfs::mkfs::{default_init_conf, mkfs, starter_editing, starter_readme, starter_welcome};
+use kernel::fs::opfs::mkfs::{
+    default_edit_desktop, default_files_desktop, default_init_conf, default_settings_desktop,
+    default_sysmon_desktop, default_terminal_desktop, mkfs, starter_editing, starter_readme,
+    starter_welcome,
+};
 use kernel::fs::opfs::OpfsFs;
 use kernel::vfs::{Filesystem, FsError, NodeType};
 
@@ -584,4 +588,53 @@ fn mkfs_installs_default_init_conf() {
     let mut buf = vec![0u8; default_init_conf().len()];
     let n = fs.read(conf_ino, 0, &mut buf).unwrap();
     assert_eq!(&buf[..n], default_init_conf());
+}
+
+// ---- T125: /usr/share/applications default desktop entries ----------
+
+#[test]
+fn mkfs_installs_default_desktop_entries() {
+    let mut fs = fresh_fs();
+    let usr_ino = fs.lookup(ROOT_INO, "usr").unwrap();
+    let share_ino = fs.lookup(usr_ino, "share").unwrap();
+    let apps_ino = fs.lookup(share_ino, "applications").unwrap();
+
+    let cases: &[(&str, &[u8])] = &[
+        ("terminal.desktop", default_terminal_desktop()),
+        ("files.desktop", default_files_desktop()),
+        ("edit.desktop", default_edit_desktop()),
+        ("settings.desktop", default_settings_desktop()),
+        ("sysmon.desktop", default_sysmon_desktop()),
+    ];
+
+    for (name, expected) in cases {
+        let ino = fs.lookup(apps_ino, name).unwrap_or_else(|_| {
+            panic!("mkfs missing /usr/share/applications/{name}")
+        });
+        let st = fs.stat(ino).unwrap();
+        assert_eq!(st.ty, NodeType::RegularFile, "{name} not a regular file");
+        assert_eq!(st.mode, 0o644, "{name} wrong mode");
+        assert_eq!(st.size as usize, expected.len(), "{name} wrong size");
+
+        let mut buf = vec![0u8; expected.len()];
+        let n = fs.read(ino, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], *expected, "{name} content mismatch");
+
+        // Spot-check: every entry declares at least DISPLAY_CLIENT.
+        let content = core::str::from_utf8(*expected).unwrap();
+        assert!(
+            content.contains("X-PMos-Caps=") && content.contains("DISPLAY_CLIENT"),
+            "{name} missing X-PMos-Caps=...DISPLAY_CLIENT"
+        );
+    }
+
+    // Check cap hints specific to settings and sysmon.
+    let settings_content =
+        core::str::from_utf8(default_settings_desktop()).unwrap();
+    assert!(settings_content.contains("KEYMAP_ADMIN"), "settings.desktop missing KEYMAP_ADMIN");
+
+    let sysmon_content =
+        core::str::from_utf8(default_sysmon_desktop()).unwrap();
+    assert!(sysmon_content.contains("PROC_ENUMERATE"), "sysmon.desktop missing PROC_ENUMERATE");
+    assert!(sysmon_content.contains("PROC_KILL_ANY"), "sysmon.desktop missing PROC_KILL_ANY");
 }

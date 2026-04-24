@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Exec=/usr/bin/term
+Categories=Utility;System;
+X-PMos-Caps=DISPLAY_CLIENT

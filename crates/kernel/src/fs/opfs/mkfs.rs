@@ -148,6 +148,7 @@ pub fn mkfs(mut device: DynBlockDevice) -> Result<OpfsFs, FsError> {
     create_system_tree(&mut fs)?;
     create_starter_kit(&mut fs)?;
     create_etc_defaults(&mut fs)?;
+    create_usr_share_applications(&mut fs)?;
 
     // Step 8: final flush so everything is durable before we
     // return. `sync()` applies the journal and flushes.
@@ -277,6 +278,54 @@ fn create_etc_defaults(fs: &mut OpfsFs) -> Result<(), FsError> {
 
 pub fn default_init_conf() -> &'static [u8] {
     INIT_CONF
+}
+
+// --- /usr/share/applications defaults --------------------------------
+
+const TERMINAL_DESKTOP: &[u8] =
+    include_bytes!("../../../assets/usr/share/applications/terminal.desktop");
+const FILES_DESKTOP: &[u8] =
+    include_bytes!("../../../assets/usr/share/applications/files.desktop");
+const EDIT_DESKTOP: &[u8] =
+    include_bytes!("../../../assets/usr/share/applications/edit.desktop");
+const SETTINGS_DESKTOP: &[u8] =
+    include_bytes!("../../../assets/usr/share/applications/settings.desktop");
+const SYSMON_DESKTOP: &[u8] =
+    include_bytes!("../../../assets/usr/share/applications/sysmon.desktop");
+
+fn create_usr_share_applications(fs: &mut OpfsFs) -> Result<(), FsError> {
+    let usr_ino = fs.lookup(ROOT_INO, "usr")?;
+    let share_ino = fs.lookup(usr_ino, "share")?;
+    let apps_ino = fs.lookup(share_ino, "applications")?;
+
+    let entries: &[(&str, &[u8])] = &[
+        ("terminal.desktop", TERMINAL_DESKTOP),
+        ("files.desktop", FILES_DESKTOP),
+        ("edit.desktop", EDIT_DESKTOP),
+        ("settings.desktop", SETTINGS_DESKTOP),
+        ("sysmon.desktop", SYSMON_DESKTOP),
+    ];
+    for (name, content) in entries {
+        let ino = fs.create(apps_ino, name, 0o644)?;
+        fs.write(ino, 0, content)?;
+    }
+    Ok(())
+}
+
+pub fn default_terminal_desktop() -> &'static [u8] {
+    TERMINAL_DESKTOP
+}
+pub fn default_files_desktop() -> &'static [u8] {
+    FILES_DESKTOP
+}
+pub fn default_edit_desktop() -> &'static [u8] {
+    EDIT_DESKTOP
+}
+pub fn default_settings_desktop() -> &'static [u8] {
+    SETTINGS_DESKTOP
+}
+pub fn default_sysmon_desktop() -> &'static [u8] {
+    SYSMON_DESKTOP
 }
 
 // --- Starter-kit content accessors (used by T061 tests) --------------

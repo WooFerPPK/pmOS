@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Exec=/usr/bin/files
+Categories=Utility;
+X-PMos-Caps=DISPLAY_CLIENT

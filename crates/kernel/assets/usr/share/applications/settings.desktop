@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+Exec=/usr/bin/settings
+Categories=System;
+X-PMos-Caps=DISPLAY_CLIENT;KEYMAP_ADMIN
