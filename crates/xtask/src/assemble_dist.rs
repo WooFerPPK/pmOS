@@ -153,6 +153,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     // `coreutils` crate ships multiple bin targets; the wasm file is
     // named after the bin, not the crate. First up: `cat`.
     ("coreutils", "cat"),
+    ("coreutils", "grep"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {

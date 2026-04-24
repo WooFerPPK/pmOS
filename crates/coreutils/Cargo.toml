@@ -16,3 +16,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "cat"
 path = "src/bin/cat.rs"
+
+[[bin]]
+name = "grep"
+path = "src/bin/grep.rs"
