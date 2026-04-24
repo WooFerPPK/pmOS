@@ -379,6 +379,104 @@ fn fd_close_frees_the_slot() {
     assert_eq!(k.fd_close(pid, fd).unwrap_err(), KernelError::BadFd);
 }
 
+// ---- Kernel::fd_readdir --------------------------------------------
+//
+// These drive the semantic-layer method directly (not the WASI wire
+// adapter in `handle_fd_readdir`). The wire layout / dirent byte
+// encoding / cookie pagination all live in `tests/syscall.rs`; the
+// tests below only verify the Kernel API: fd resolution, directory
+// guard, regular-file-rejects-as-ENOTDIR, and bad-fd / non-vnode
+// errno categories. Together they cover the three error branches
+// the dispatcher depends on.
+
+#[test]
+fn fd_readdir_returns_directory_entries_by_name() {
+    let mut k = make_kernel();
+    k.vfs.mkdir("/etc", 0o755).unwrap();
+    k.vfs.mkdir("/usr", 0o755).unwrap();
+    k.vfs.create("/hello.txt", 0o644).unwrap();
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "app",
+            ppid: 1,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    let dir_fd = k
+        .path_open(pid, "/", 0, abi::wasi::oflags::DIRECTORY, 0, FdFlags::EMPTY)
+        .unwrap();
+    let entries = k.fd_readdir(pid, dir_fd).unwrap();
+    let names: alloc::vec::Vec<&str> =
+        entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"etc"));
+    assert!(names.contains(&"usr"));
+    assert!(names.contains(&"hello.txt"));
+}
+
+#[test]
+fn fd_readdir_on_regular_file_vnode_returns_not_a_directory() {
+    let mut k = make_kernel();
+    k.vfs.create("/note.txt", 0o644).unwrap();
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "app",
+            ppid: 1,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    let fd = k.path_open(pid, "/note.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    // The fd IS a Vnode — so the kernel must forward to the fs
+    // readdir, which reports NotADirectory. The errno layer
+    // translates this to ENOTDIR; here we verify the typed
+    // KernelError so the mapping is unambiguous at the semantic
+    // seam.
+    assert_eq!(
+        k.fd_readdir(pid, fd).unwrap_err(),
+        KernelError::Fs(FsError::NotADirectory),
+    );
+}
+
+#[test]
+fn fd_readdir_on_char_device_fd_is_not_supported_on_fd() {
+    let mut k = make_kernel();
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "app",
+            ppid: 1,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    // CharDevice fds have no directory listing; the semantic
+    // layer reports NotSupportedOnFd (dispatcher → EINVAL), NOT
+    // Fs(NotADirectory) — those are distinct: "this fd is not a
+    // vnode at all" vs. "the vnode this fd points at is a file".
+    assert_eq!(
+        k.fd_readdir(pid, fd).unwrap_err(),
+        KernelError::NotSupportedOnFd,
+    );
+}
+
+#[test]
+fn fd_readdir_on_bad_fd_returns_bad_fd() {
+    let mut k = make_kernel();
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "app",
+            ppid: 1,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    assert_eq!(
+        k.fd_readdir(pid, 9999).unwrap_err(),
+        KernelError::BadFd,
+    );
+}
+
 // ---- install_fd: used by proc_spawn to seed stdin/stdout/stderr ---
 
 #[test]

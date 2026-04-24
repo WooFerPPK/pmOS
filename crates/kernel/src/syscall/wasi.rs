@@ -1375,26 +1375,9 @@ fn handle_fd_readdir(
     let cookie = args_u64(req, 4);
     let buf_len = req.heap_len as usize;
 
-    let entry = match kernel.fds(pid) {
-        Ok(t) => match t.get(fd) {
-            Some(e) => *e,
-            None => return Response::err(req.request_id, EBADF),
-        },
-        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
-    };
-    let (mount_id, ino) = match entry.object {
-        FdObject::Vnode { mount_id, ino } => (mount_id, ino),
-        _ => return Response::err(req.request_id, EINVAL),
-    };
-
-    let entries = match kernel.vfs.readdir_ino(mount_id, ino) {
+    let entries = match kernel.fd_readdir(pid, fd) {
         Ok(v) => v,
-        Err(e) => {
-            return Response::err(
-                req.request_id,
-                kerr_to_errno(KernelError::Fs(e)),
-            )
-        }
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
 
     let Some(buf) = heap_out_mut(req, heap, buf_len) else {

@@ -40,7 +40,7 @@ use crate::proc::{
     ExitStatus, ProcState, Process, ProcessTable, Scheduler, SignalInbox,
 };
 pub use crate::proc::Signal;
-use crate::vfs::{FsError, Ino, MountId, NodeType, Vfs};
+use crate::vfs::{DirEntry, FsError, Ino, MountId, NodeType, Vfs};
 
 /// Error returned by the high-level kernel API.
 ///
@@ -712,6 +712,48 @@ impl Kernel {
         let entry = table.close(fd)?;
         self.release_object(entry.object);
         Ok(())
+    }
+
+    /// `fd_readdir(pid, fd) -> Vec<DirEntry>`. Resolves `fd` in
+    /// `pid`'s fd table and, if the fd points at a directory
+    /// vnode, returns its entries as they live on disk (no `.`
+    /// / `..` injection — WASI doesn't require them and the v1
+    /// VFS doesn't track parent inodes).
+    ///
+    /// The caller is responsible for cookie-based pagination
+    /// and serialisation into the WASI `dirent_t` wire layout —
+    /// those concerns are owned by the syscall adapter
+    /// ([`crate::syscall::wasi::dispatch_wasi`]), not the
+    /// semantic kernel API. Returning the full `Vec<DirEntry>`
+    /// here keeps the kernel method filesystem-agnostic and
+    /// mirrors the shape of [`Vfs::readdir_ino`].
+    ///
+    /// Errors:
+    /// * [`KernelError::NoSuchPid`] — unknown pid.
+    /// * [`KernelError::BadFd`] — fd is not open.
+    /// * [`KernelError::NotSupportedOnFd`] — fd does not point
+    ///   at a [`FdObject::Vnode`] (char device / socket / pipe
+    ///   / signal channel fds have no directory listing).
+    /// * [`KernelError::Fs`]`(FsError::NotADirectory)` — the
+    ///   vnode is a regular file / symlink rather than a
+    ///   directory; the errno-mapping layer translates this to
+    ///   ENOTDIR.
+    pub fn fd_readdir(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+    ) -> Result<Vec<DirEntry>, KernelError> {
+        let entry = *self
+            .fds
+            .get(&pid)
+            .ok_or(KernelError::NoSuchPid)?
+            .get(fd)
+            .ok_or(KernelError::BadFd)?;
+        let (mount_id, ino) = match entry.object {
+            FdObject::Vnode { mount_id, ino } => (mount_id, ino),
+            _ => return Err(KernelError::NotSupportedOnFd),
+        };
+        Ok(self.vfs.readdir_ino(mount_id, ino)?)
     }
 
     // --- Display server IPC --------------------------------------
