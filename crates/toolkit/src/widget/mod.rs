@@ -21,18 +21,22 @@
 //! * [`text_input::TextInput`] — single-line editable text
 //!   with cursor, visual states, pointer hit-test, and
 //!   keyboard handlers.
+//! * [`container::Container`] — layout primitive with
+//!   optional border + uniform padding that delegates child
+//!   painting to an opaque `FnMut` closure.
 //!
-//! `List` and `Container` (the rest of T116) land in later
-//! slices.
+//! `List` (the rest of T116) lands in a later slice.
 
 pub mod alignment;
 pub mod button;
+pub mod container;
 pub mod frame;
 pub mod label;
 pub mod text_input;
 
 pub use alignment::Alignment;
 pub use button::{Button, ButtonState, BUTTON_HPAD, BUTTON_VPAD};
+pub use container::Container;
 pub use frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
     TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, TITLEBAR_HEIGHT,
