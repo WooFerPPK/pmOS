@@ -3,11 +3,12 @@
 //! Top-level directory skeleton — `/proc/version`, `/proc/uptime`,
 //! `/proc/meminfo`, `/proc/loadavg`, `/proc/storage` — plus a
 //! per-pid subtree under `/proc/<pid>/` that surfaces live
-//! process-table fields. In this slice only `/proc/<pid>/status`
-//! is populated (with Name / State / Pid / PPid); follow-up
-//! slices add `cmdline`, `stat`, `maps`, etc. alongside the
-//! memory-tracking fields (`VmSize`, `VmPeak`) once the process
-//! table owns that accounting.
+//! process-table fields. Populated in this slice:
+//! `/proc/<pid>/status` (Name / State / Pid / PPid) plus
+//! `/proc/<pid>/fd/<n>` symlinks describing each open file
+//! descriptor. Follow-up slices add `cmdline`, `stat`, `maps`,
+//! etc. alongside the memory-tracking fields (`VmSize`, `VmPeak`)
+//! once the process table owns that accounting.
 //!
 //! Data sources are injected through the [`ProcFsSource`] trait.
 //! The v1 slice provides a [`StaticProcFsSource`] that returns
@@ -23,10 +24,23 @@
 //! * `2..=6` — the fixed top-level files (version, uptime,
 //!   meminfo, loadavg, storage).
 //! * `PID_DIR_BASE + pid * PID_STRIDE + offset` — per-pid nodes.
-//!   Stride is chosen large enough to admit future fields
+//!   Stride (16) is chosen large enough to admit future fields
 //!   (`cmdline`, `stat`, `maps`, ...) without renumbering. A
 //!   `pid_of(ino)` helper rounds back to the pid; an out-of-range
-//!   offset yields `FsError::NotFound`.
+//!   offset yields `FsError::NotFound`. Slot offsets in use:
+//!     * `0` — the pid directory itself.
+//!     * `1` — `status`.
+//!     * `2` — `fd/` directory.
+//!     * `3..15` — reserved for `cmdline`, `maps`, `environ`, ...
+//! * `FD_INO_BASE + pid * FD_PID_STRIDE + fd_number` — per-fd
+//!   symlink nodes beneath `/proc/<pid>/fd/<n>`. A dedicated
+//!   region is required because stride-16 cannot hold arbitrary
+//!   fd counts; `FD_PID_STRIDE = 1024` gives room for the kernel's
+//!   fd-per-process cap without colliding. `FD_INO_BASE` is chosen
+//!   well above `PID_DIR_BASE + PID_STRIDE * MAX_PID` so the two
+//!   regions never overlap — see
+//!   `fd_ino_region_does_not_collide_with_pid_subtree` in
+//!   `tests/procfs.rs`.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -84,6 +98,21 @@ pub trait ProcFsSource: Send + Sync {
         None
     }
 
+    /// Return the open-fd snapshots for `pid`, in ascending fd
+    /// order. Backs the `/proc/<pid>/fd/` directory: one symlink
+    /// per entry, name = decimal fd number, target = path or
+    /// pseudo-path the fd refers to (e.g. `/etc/preferences.toml`,
+    /// `pipe:[42]`, `socket:[17]`, `/dev/console`).
+    ///
+    /// Default: empty. The future `KernelProcFsSource` will project
+    /// the process's descriptor table; a pid that exists but has no
+    /// open fds (rare for a live process, but possible during
+    /// bring-up) yields an empty vec — the VFS turns that into an
+    /// empty directory listing.
+    fn pid_fds(&self, _pid: Pid) -> Vec<ProcFdSnapshot> {
+        Vec::new()
+    }
+
     /// Ascending list of live pids used by readdir on `/proc`.
     ///
     /// Default: empty. Overriding this + `pid_status` together is
@@ -129,6 +158,7 @@ pub struct StaticProcFsSource {
     pub storage_line: String,
     pub storage_info: Option<StorageSnapshot>,
     pub pid_statuses: BTreeMap<Pid, ProcStatusSnapshot>,
+    pub pid_fds: BTreeMap<Pid, Vec<ProcFdSnapshot>>,
 }
 
 impl Default for StaticProcFsSource {
@@ -141,6 +171,7 @@ impl Default for StaticProcFsSource {
             storage_line: String::from("0 0 0\n"),
             storage_info: None,
             pid_statuses: BTreeMap::new(),
+            pid_fds: BTreeMap::new(),
         }
     }
 }
@@ -151,6 +182,13 @@ impl StaticProcFsSource {
     /// expression.
     pub fn set_pid_status(&mut self, snap: ProcStatusSnapshot) -> &mut Self {
         self.pid_statuses.insert(snap.pid, snap);
+        self
+    }
+
+    /// Register or replace the open-fd list for `pid`. Returns
+    /// `self` by `&mut` for chaining.
+    pub fn set_pid_fds(&mut self, pid: Pid, fds: Vec<ProcFdSnapshot>) -> &mut Self {
+        self.pid_fds.insert(pid, fds);
         self
     }
 }
@@ -176,6 +214,9 @@ impl ProcFsSource for StaticProcFsSource {
     }
     fn pid_status(&self, pid: Pid) -> Option<ProcStatusSnapshot> {
         self.pid_statuses.get(&pid).cloned()
+    }
+    fn pid_fds(&self, pid: Pid) -> Vec<ProcFdSnapshot> {
+        self.pid_fds.get(&pid).cloned().unwrap_or_default()
     }
     fn live_pids(&self) -> Vec<Pid> {
         self.pid_statuses.keys().copied().collect()
@@ -241,6 +282,24 @@ pub struct ProcStatusSnapshot {
     pub state: ProcStatusState,
 }
 
+/// A snapshot of one open file descriptor in a process, as
+/// surfaced under `/proc/<pid>/fd/<n>`.
+///
+/// * `fd` — the descriptor number; appears verbatim as the entry
+///   name (decimal, no leading zeros), matching Linux procfs.
+/// * `target` — the path or pseudo-path the fd refers to. Regular
+///   files and devices carry an absolute path; pipes and sockets
+///   carry the Linux-style pseudo form `pipe:[N]` / `socket:[N]`
+///   where `N` is the kernel-assigned pipe/socket ino.
+///
+/// Owned values so an emit-time read can release the source borrow
+/// before formatting — same contract as [`ProcStatusSnapshot`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcFdSnapshot {
+    pub fd: u32,
+    pub target: String,
+}
+
 // Inode layout — ino 1 is the root directory; each top-level file
 // has a fixed ino so tests can assert on them.
 const INO_ROOT:    Ino = 1;
@@ -252,16 +311,32 @@ const INO_STORAGE: Ino = 6;
 
 /// Start of the per-pid inode range. Chosen well above the fixed
 /// top-level inos so a stray `2..=6` never aliases a per-pid ino.
-const PID_DIR_BASE: Ino = 1_000_000;
+pub const PID_DIR_BASE: Ino = 1_000_000;
 /// Bytes reserved per pid. Slot 0 is the pid's directory itself;
-/// slot 1 is `status`; further slots are for future files.
-const PID_STRIDE: Ino = 16;
+/// slot 1 is `status`; slot 2 is `fd/`; further slots are reserved
+/// for future per-pid files (`cmdline`, `maps`, `environ`, ...).
+pub const PID_STRIDE: Ino = 16;
 /// Offset within a pid's stride for the `status` file.
 const PID_OFFSET_STATUS: Ino = 1;
+/// Offset within a pid's stride for the `fd/` directory.
+const PID_OFFSET_FD_DIR: Ino = 2;
+
+/// Start of the per-fd symlink inode range — one stride per pid,
+/// within that the raw fd number is the offset. Chosen well above
+/// `PID_DIR_BASE + PID_STRIDE * MAX_PID` so the two regions never
+/// overlap; asserted by
+/// `fd_ino_region_does_not_collide_with_pid_subtree` in
+/// `tests/procfs.rs`.
+pub const FD_INO_BASE: Ino = 100_000_000;
+/// Bytes reserved per pid inside the fd region. Must be larger
+/// than the kernel's per-process fd cap — 1024 covers every
+/// WASI-facing cap we plan to ship in v1 (RLIMIT_NOFILE default is
+/// 256, so 1024 is 4× headroom).
+pub const FD_PID_STRIDE: Ino = 1024;
 
 /// Map a pid to its directory ino (slot 0 within its stride).
 #[inline]
-const fn pid_dir_ino(pid: Pid) -> Ino {
+pub const fn pid_dir_ino(pid: Pid) -> Ino {
     PID_DIR_BASE + (pid as u64) * PID_STRIDE
 }
 
@@ -271,11 +346,46 @@ const fn pid_status_ino(pid: Pid) -> Ino {
     pid_dir_ino(pid) + PID_OFFSET_STATUS
 }
 
+/// Map a pid to its `fd/` directory ino.
+#[inline]
+pub const fn pid_fd_dir_ino(pid: Pid) -> Ino {
+    pid_dir_ino(pid) + PID_OFFSET_FD_DIR
+}
+
+/// Map a `(pid, fd)` pair to the symlink ino that represents
+/// `/proc/<pid>/fd/<fd>`. Lives in a separate region from the
+/// per-pid stride; see module doc for the numbering rationale.
+#[inline]
+pub const fn fd_symlink_ino(pid: Pid, fd: u32) -> Ino {
+    FD_INO_BASE + (pid as u64) * FD_PID_STRIDE + (fd as u64)
+}
+
+/// Map a pid and per-stride `offset` to the pid-subtree ino at
+/// that slot. Used by tests to assert the fd region never overlaps
+/// with any `PID_DIR_BASE + pid * PID_STRIDE + offset` for
+/// `offset in 0..PID_STRIDE`.
+#[inline]
+pub const fn pid_subtree_ino(pid: Pid, offset: Ino) -> Ino {
+    pid_dir_ino(pid) + offset
+}
+
+/// Inverse of `fd_symlink_ino`. Returns the `(pid, fd)` pair, or
+/// `None` if `ino` is not in the fd region.
+fn decode_fd_ino(ino: Ino) -> Option<(Pid, u32)> {
+    if ino < FD_INO_BASE {
+        return None;
+    }
+    let rel = ino - FD_INO_BASE;
+    let pid = (rel / FD_PID_STRIDE) as Pid;
+    let fd = (rel % FD_PID_STRIDE) as u32;
+    Some((pid, fd))
+}
+
 /// Inverse of `pid_dir_ino` + `pid_status_ino`. Returns the pid
 /// and the slot within its stride, or `None` if `ino` is not in
 /// the per-pid range.
 fn decode_pid_ino(ino: Ino) -> Option<(Pid, Ino)> {
-    if ino < PID_DIR_BASE {
+    if ino < PID_DIR_BASE || ino >= FD_INO_BASE {
         return None;
     }
     let rel = ino - PID_DIR_BASE;
@@ -351,6 +461,12 @@ impl ProcFs {
         if let Some(s) = static_text {
             return Some(s.into_bytes());
         }
+        // Per-fd symlink targets — checked before the per-pid
+        // range so the fd-region dispatch short-circuits cleanly.
+        if let Some((pid, fd)) = decode_fd_ino(ino) {
+            let snap = self.source.pid_fds(pid).into_iter().find(|s| s.fd == fd)?;
+            return Some(snap.target.into_bytes());
+        }
         // Per-pid files.
         let (pid, slot) = decode_pid_ino(ino)?;
         if slot == PID_OFFSET_STATUS {
@@ -366,6 +482,15 @@ impl ProcFs {
             return false;
         };
         slot == 0 && self.source.pid_status(pid).is_some()
+    }
+
+    /// True iff `ino` is the `/proc/<pid>/fd` directory for a
+    /// currently-live pid.
+    fn is_live_fd_dir(&self, ino: Ino) -> bool {
+        let Some((pid, slot)) = decode_pid_ino(ino) else {
+            return false;
+        };
+        slot == PID_OFFSET_FD_DIR && self.source.pid_status(pid).is_some()
     }
 }
 
@@ -387,13 +512,24 @@ impl Filesystem for ProcFs {
             }
             return Err(FsError::NotFound);
         }
-        // Per-pid directory: only `status` is served in this slice.
+        // Per-pid directory: `status` file + `fd/` directory.
         if self.is_live_pid_dir(dir) {
             let (pid, _) = decode_pid_ino(dir).expect("is_live_pid_dir implies decode ok");
             return match name {
                 "status" => Ok(pid_status_ino(pid)),
+                "fd" => Ok(pid_fd_dir_ino(pid)),
                 _ => Err(FsError::NotFound),
             };
+        }
+        // `/proc/<pid>/fd/<n>`: numeric fd names only; must match a
+        // live snapshot entry.
+        if self.is_live_fd_dir(dir) {
+            let (pid, _) = decode_pid_ino(dir).expect("is_live_fd_dir implies decode ok");
+            let fd = name.parse::<u32>().map_err(|_| FsError::NotFound)?;
+            if self.source.pid_fds(pid).iter().any(|s| s.fd == fd) {
+                return Ok(fd_symlink_ino(pid, fd));
+            }
+            return Err(FsError::NotFound);
         }
         Err(FsError::NotADirectory)
     }
@@ -402,7 +538,7 @@ impl Filesystem for ProcFs {
         if ino == INO_ROOT {
             return Err(FsError::IsADirectory);
         }
-        if self.is_live_pid_dir(ino) {
+        if self.is_live_pid_dir(ino) || self.is_live_fd_dir(ino) {
             return Err(FsError::IsADirectory);
         }
         let bytes = self.contents_for(ino).ok_or(FsError::NotFound)?;
@@ -445,6 +581,22 @@ impl Filesystem for ProcFs {
                 ino: pid_status_ino(pid),
                 ty: NodeType::RegularFile,
             });
+            out.push(DirEntry {
+                name: "fd".to_string(),
+                ino: pid_fd_dir_ino(pid),
+                ty: NodeType::Directory,
+            });
+            return Ok(());
+        }
+        if self.is_live_fd_dir(dir) {
+            let (pid, _) = decode_pid_ino(dir).expect("is_live_fd_dir implies decode ok");
+            for snap in self.source.pid_fds(pid) {
+                out.push(DirEntry {
+                    name: snap.fd.to_string(),
+                    ino: fd_symlink_ino(pid, snap.fd),
+                    ty: NodeType::SymLink,
+                });
+            }
             return Ok(());
         }
         Err(FsError::NotADirectory)
@@ -497,7 +649,7 @@ impl Filesystem for ProcFs {
                 ctime_ns: now,
             });
         }
-        if self.is_live_pid_dir(ino) {
+        if self.is_live_pid_dir(ino) || self.is_live_fd_dir(ino) {
             return Ok(FileStat {
                 ino,
                 ty: NodeType::Directory,
@@ -522,6 +674,28 @@ impl Filesystem for ProcFs {
                 ctime_ns: now,
             });
         }
+        // Per-fd symlinks — checked before the per-pid range since
+        // the two regions do not overlap. Mode 0o777 matches Linux
+        // procfs convention (symlink permission bits are advisory;
+        // the target's own mode governs any follow).
+        if let Some((pid, fd)) = decode_fd_ino(ino) {
+            let snap = self
+                .source
+                .pid_fds(pid)
+                .into_iter()
+                .find(|s| s.fd == fd)
+                .ok_or(FsError::NotFound)?;
+            return Ok(FileStat {
+                ino,
+                ty: NodeType::SymLink,
+                mode: 0o777,
+                nlink: 1,
+                size: snap.target.len() as u64,
+                atime_ns: now,
+                mtime_ns: now,
+                ctime_ns: now,
+            });
+        }
         // Per-pid regular files: recognise the stride offset.
         if let Some((_pid, slot)) = decode_pid_ino(ino) {
             if slot == PID_OFFSET_STATUS {
@@ -539,6 +713,23 @@ impl Filesystem for ProcFs {
             }
         }
         Err(FsError::NotFound)
+    }
+
+    fn readlink(&mut self, ino: Ino, out: &mut [u8]) -> Result<usize, FsError> {
+        // Only fd-region inos are symlinks; anything else is either
+        // a directory or a regular file, both of which are EINVAL
+        // per POSIX.
+        let (pid, fd) = decode_fd_ino(ino).ok_or(FsError::InvalidArgument)?;
+        let snap = self
+            .source
+            .pid_fds(pid)
+            .into_iter()
+            .find(|s| s.fd == fd)
+            .ok_or(FsError::NotFound)?;
+        let target = snap.target.as_bytes();
+        let n = core::cmp::min(out.len(), target.len());
+        out[..n].copy_from_slice(&target[..n]);
+        Ok(n)
     }
 
     fn truncate(&mut self, _ino: Ino, _new_size: u64) -> Result<(), FsError> {

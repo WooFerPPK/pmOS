@@ -23,8 +23,8 @@ use abi::cap::CapSet;
 use abi::ext::Pid;
 
 use kernel::fs::procfs::{
-    ProcFs, ProcFsSource, ProcStatusSnapshot, ProcStatusState, StaticProcFsSource,
-    StorageSnapshot,
+    fd_symlink_ino, pid_subtree_ino, ProcFdSnapshot, ProcFs, ProcFsSource, ProcStatusSnapshot,
+    ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
 };
 use kernel::proc::{
     table::ProcessTable,
@@ -446,4 +446,198 @@ fn custom_source_with_only_storage_info_returns_formatted_storage_line() {
     // placeholder — same contract a pre-T169 caller saw.
     let empty = StorageOnlyTestSource { snapshot: None };
     assert_eq!(empty.storage(), "0 0 0\n");
+}
+
+// ---- /proc/<pid>/fd/ — open-fd directory (T168 follow-up) ----------
+
+/// Build a Vfs with a ProcFs backed by a StaticProcFsSource
+/// populated from both a status snapshot list *and* a per-pid fd
+/// map. The canned `status` snapshot makes the pid directory live;
+/// `pid_fds` then populates the `fd/` subtree.
+fn vfs_with_fds(
+    statuses: Vec<ProcStatusSnapshot>,
+    fds: Vec<(Pid, Vec<ProcFdSnapshot>)>,
+) -> Vfs {
+    let mut source = StaticProcFsSource::default();
+    for snap in statuses {
+        source.set_pid_status(snap);
+    }
+    for (pid, pid_fds) in fds {
+        source.set_pid_fds(pid, pid_fds);
+    }
+    let mut vfs = Vfs::new();
+    vfs.mount("/", Box::new(kernel::fs::tmpfs::TmpFs::new()))
+        .unwrap();
+    vfs.mount("/proc", Box::new(ProcFs::new(Box::new(source))))
+        .unwrap();
+    vfs
+}
+
+/// Build a status snapshot for a bare-bones test process.
+fn stub_status(pid: Pid, ppid: Pid, name: &str) -> ProcStatusSnapshot {
+    ProcStatusSnapshot {
+        pid,
+        ppid,
+        name: name.into(),
+        state: ProcStatusState::Sleeping,
+    }
+}
+
+#[test]
+fn fd_dir_readdir_lists_open_fds() {
+    // Four open fds — stdin/stdout/stderr wired to /dev/console
+    // plus a regular file at fd 3. readdir on `/proc/42/fd` must
+    // yield exactly those four entries, all of type SymLink.
+    let pid: Pid = 42;
+    let fds = vec![
+        ProcFdSnapshot { fd: 0, target: String::from("/dev/console") },
+        ProcFdSnapshot { fd: 1, target: String::from("/dev/console") },
+        ProcFdSnapshot { fd: 2, target: String::from("/dev/console") },
+        ProcFdSnapshot { fd: 3, target: String::from("/etc/preferences.toml") },
+    ];
+    let mut vfs = vfs_with_fds(
+        vec![stub_status(pid, 1, "sh")],
+        vec![(pid, fds)],
+    );
+
+    let entries = vfs.readdir(&format!("/proc/{pid}/fd")).unwrap();
+    assert_eq!(entries.len(), 4, "unexpected fd dir entries: {:?}", entries);
+
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["0", "1", "2", "3"]);
+    for e in &entries {
+        assert_eq!(e.ty, NodeType::SymLink, "entry {:?} not a symlink", e);
+    }
+}
+
+#[test]
+fn fd_symlink_read_returns_target_path() {
+    // read on `/proc/42/fd/3` returns the target bytes — same
+    // contract a readlink(2) would satisfy, but projected through
+    // the byte-read path so a userland caller that doesn't
+    // implement readlink can still surface the target.
+    let pid: Pid = 42;
+    let fds = vec![
+        ProcFdSnapshot { fd: 3, target: String::from("/etc/preferences.toml") },
+    ];
+    let mut source = StaticProcFsSource::default();
+    source.set_pid_status(stub_status(pid, 1, "sh"));
+    source.set_pid_fds(pid, fds);
+    let mut procfs = ProcFs::new(Box::new(source));
+
+    // Drive the Filesystem trait directly: look up the symlink,
+    // then read from its ino. No VFS resolve, so no auto-follow.
+    use kernel::vfs::Filesystem as _;
+    let proc_root = procfs.root();
+    let pid_dir = procfs.lookup(proc_root, &pid.to_string()).unwrap();
+    let fd_dir = procfs.lookup(pid_dir, "fd").unwrap();
+    let fd3 = procfs.lookup(fd_dir, "3").unwrap();
+
+    let mut buf = [0u8; 64];
+    let n = procfs.read(fd3, 0, &mut buf).unwrap();
+    let got = core::str::from_utf8(&buf[..n]).unwrap();
+    assert_eq!(got, "/etc/preferences.toml");
+}
+
+#[test]
+fn fd_symlink_stat_reports_symlink_node_type() {
+    // stat on `/proc/42/fd/3` returns SymLink with mode 0o777 —
+    // the Linux procfs convention. Uses vfs.stat which routes
+    // through resolve_nofollow, preserving the symlink's own
+    // metadata rather than dereferencing to the target.
+    let pid: Pid = 42;
+    let target = String::from("/etc/preferences.toml");
+    let fds = vec![ProcFdSnapshot { fd: 3, target: target.clone() }];
+    let mut vfs = vfs_with_fds(
+        vec![stub_status(pid, 1, "sh")],
+        vec![(pid, fds)],
+    );
+
+    let st = vfs.stat(&format!("/proc/{pid}/fd/3")).unwrap();
+    assert_eq!(st.ty, NodeType::SymLink);
+    assert_eq!(st.mode, 0o777);
+    assert_eq!(st.size as usize, target.len());
+}
+
+#[test]
+fn fd_dir_empty_for_pid_with_no_fds() {
+    // pid 1 is live (has a status snapshot) but has no open fds
+    // registered. readdir on `/proc/1/fd` must succeed and return
+    // an empty list — not NotADirectory, not NotFound.
+    let pid: Pid = 1;
+    let mut vfs = vfs_with_fds(
+        vec![stub_status(pid, 0, "init")],
+        vec![],
+    );
+
+    let entries = vfs.readdir(&format!("/proc/{pid}/fd")).unwrap();
+    assert!(entries.is_empty(), "expected empty fd dir, got: {:?}", entries);
+}
+
+#[test]
+fn fd_dir_lookup_rejects_nonexistent_fd_number() {
+    // lookup on `/proc/42/fd/99` when the process has only fd 3
+    // open must return NotFound. The stride-based inode scheme
+    // would otherwise be happy to hand out a number; the
+    // snapshot-set check is what gates the response.
+    let pid: Pid = 42;
+    let fds = vec![
+        ProcFdSnapshot { fd: 3, target: String::from("/etc/preferences.toml") },
+    ];
+    let mut vfs = vfs_with_fds(
+        vec![stub_status(pid, 1, "sh")],
+        vec![(pid, fds)],
+    );
+
+    let err = vfs.stat(&format!("/proc/{pid}/fd/99")).unwrap_err();
+    assert_eq!(err, FsError::NotFound);
+}
+
+#[test]
+fn fd_ino_region_does_not_collide_with_pid_subtree() {
+    // For a spread of pids and fds, the fd-region ino must never
+    // collide with any stride slot in the same pid's per-pid
+    // subtree — the stride-16 region and the fd-1024-per-pid
+    // region must be disjoint across every legal input.
+    for &pid in &[1 as Pid, 2, 42, 1024, 65_535, 100_000] {
+        let mut pid_subtree = std::collections::HashSet::new();
+        for offset in 0..PID_STRIDE {
+            pid_subtree.insert(pid_subtree_ino(pid, offset));
+        }
+        for &fd in &[0u32, 1, 2, 3, 7, 42, 255, 1023] {
+            let fd_ino = fd_symlink_ino(pid, fd);
+            assert!(
+                !pid_subtree.contains(&fd_ino),
+                "fd ino {fd_ino} for (pid={pid}, fd={fd}) collides with pid subtree",
+            );
+        }
+    }
+}
+
+#[test]
+fn fd_dir_listed_in_pid_subtree_readdir() {
+    // readdir on `/proc/42` must include both `status` and `fd`
+    // entries; `status` stays a regular file, `fd` is a directory.
+    let pid: Pid = 42;
+    let fds = vec![
+        ProcFdSnapshot { fd: 0, target: String::from("/dev/console") },
+    ];
+    let mut vfs = vfs_with_fds(
+        vec![stub_status(pid, 1, "sh")],
+        vec![(pid, fds)],
+    );
+
+    let entries = vfs.readdir(&format!("/proc/{pid}")).unwrap();
+
+    let status_entry = entries
+        .iter()
+        .find(|e| e.name == "status")
+        .expect("status entry present");
+    assert_eq!(status_entry.ty, NodeType::RegularFile);
+
+    let fd_entry = entries
+        .iter()
+        .find(|e| e.name == "fd")
+        .expect("fd entry present");
+    assert_eq!(fd_entry.ty, NodeType::Directory);
 }
