@@ -147,6 +147,7 @@ pub fn mkfs(mut device: DynBlockDevice) -> Result<OpfsFs, FsError> {
     // atomic with respect to a crash.
     create_system_tree(&mut fs)?;
     create_starter_kit(&mut fs)?;
+    create_etc_defaults(&mut fs)?;
 
     // Step 8: final flush so everything is durable before we
     // return. `sync()` applies the journal and flushes.
@@ -262,6 +263,21 @@ Everything under `/home/user/` persists to your browser's
 private OPFS storage. Everything under `/tmp/` is wiped on
 reboot. Nothing leaves your machine.
 ";
+
+// --- /etc defaults ---------------------------------------------------
+
+const INIT_CONF: &[u8] = include_bytes!("../../../assets/etc/init.conf");
+
+fn create_etc_defaults(fs: &mut OpfsFs) -> Result<(), FsError> {
+    let etc_ino = fs.lookup(ROOT_INO, "etc")?;
+    let conf_ino = fs.create(etc_ino, "init.conf", 0o644)?;
+    fs.write(conf_ino, 0, INIT_CONF)?;
+    Ok(())
+}
+
+pub fn default_init_conf() -> &'static [u8] {
+    INIT_CONF
+}
 
 // --- Starter-kit content accessors (used by T061 tests) --------------
 

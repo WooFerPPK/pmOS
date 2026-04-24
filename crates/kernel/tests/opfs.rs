@@ -12,7 +12,7 @@ use kernel::fs::opfs::block::{BlockDevice, MockBlockDevice};
 use kernel::fs::opfs::layout::{
     BLOCK_SIZE, DEFAULT_INODE_TABLE_BLOCKS, DEFAULT_JOURNAL_BLOCKS, ROOT_INO,
 };
-use kernel::fs::opfs::mkfs::{mkfs, starter_editing, starter_readme, starter_welcome};
+use kernel::fs::opfs::mkfs::{default_init_conf, mkfs, starter_editing, starter_readme, starter_welcome};
 use kernel::fs::opfs::OpfsFs;
 use kernel::vfs::{Filesystem, FsError, NodeType};
 
@@ -566,4 +566,22 @@ fn opfs_timestamps_survive_remount() {
     assert_eq!(after.mtime_ns, before.mtime_ns);
     assert_eq!(after.ctime_ns, before.ctime_ns);
     assert_eq!(after.atime_ns, before.atime_ns);
+}
+
+// ---- T096: /etc/init.conf default asset ----------------------------
+
+#[test]
+fn mkfs_installs_default_init_conf() {
+    let mut fs = fresh_fs();
+    let etc_ino = fs.lookup(ROOT_INO, "etc").unwrap();
+    let conf_ino = fs.lookup(etc_ino, "init.conf").unwrap();
+
+    let st = fs.stat(conf_ino).unwrap();
+    assert_eq!(st.ty, NodeType::RegularFile);
+    assert_eq!(st.mode, 0o644);
+    assert_eq!(st.size as usize, default_init_conf().len());
+
+    let mut buf = vec![0u8; default_init_conf().len()];
+    let n = fs.read(conf_ino, 0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], default_init_conf());
 }
