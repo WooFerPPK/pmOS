@@ -15,6 +15,7 @@ members = [
     "crates/term",
     "crates/files",
     "crates/edit",
+    "crates/coreutils",
     "crates/settings",
     "crates/sysmon",
     "crates/sample-app",

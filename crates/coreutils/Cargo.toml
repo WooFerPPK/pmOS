@@ -1,0 +1,18 @@
+[package]
+name = "coreutils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Shared library entry reserved for helpers once multiple coreutils
+# ship. For the cat-only slice it is effectively empty but kept so
+# future binaries (ls, grep, mkdir, rm, cp, mv) can land without
+# reshaping the crate.
+
+[lib]
+name = "coreutils"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"

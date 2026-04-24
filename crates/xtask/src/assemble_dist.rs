@@ -150,6 +150,9 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     // output filename, so the assembled artefact is `hello-std.wasm`.
     ("hello-std", "hello-std"),
     ("hello-clock", "hello-clock"),
+    // `coreutils` crate ships multiple bin targets; the wasm file is
+    // named after the bin, not the crate. First up: `cat`.
+    ("coreutils", "cat"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {
