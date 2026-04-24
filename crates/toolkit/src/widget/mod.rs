@@ -24,14 +24,21 @@
 //! * [`container::Container`] — layout primitive with
 //!   optional border + uniform padding that delegates child
 //!   painting to an opaque `FnMut` closure.
+//! * [`list::List`] — scrollable single-column list with
+//!   pointer + keyboard selection.
 //!
-//! `List` (the rest of T116) lands in a later slice.
+//! With `List` and `Container` landed, the "Widget trait +
+//! primitives" scope of T116 is complete. No `Widget` trait
+//! was introduced — each widget stands alone with inherent
+//! `paint` / `hit_test` methods, matching the style of
+//! `Label`, `Button`, and `TextInput`.
 
 pub mod alignment;
 pub mod button;
 pub mod container;
 pub mod frame;
 pub mod label;
+pub mod list;
 pub mod text_input;
 
 pub use alignment::Alignment;
@@ -42,4 +49,5 @@ pub use frame::{
     TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, TITLEBAR_HEIGHT,
 };
 pub use label::{Label, LABEL_HPAD, LABEL_VPAD};
+pub use list::{List, ListDimensions, ListKey, ListKeyOutcome, LIST_HPAD, LIST_ROW_HEIGHT};
 pub use text_input::{Key, KeyOutcome, TextInput, TextInputState, TEXT_INPUT_PADDING_X};
