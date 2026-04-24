@@ -29,6 +29,7 @@ extern crate alloc;
 
 pub mod client;
 pub mod compositor;
+pub mod protocol;
 pub mod server;
 
 // Re-export the shared protocol types so existing callers
