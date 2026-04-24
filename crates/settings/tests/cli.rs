@@ -214,3 +214,157 @@ fn malformed_toml_exits_one_and_stderr_has_error_class() {
         "stderr should contain error variant name: {stderr:?}"
     );
 }
+
+#[test]
+fn set_theme_writes_new_theme_name_to_fresh_config() {
+    let path = temp_file("set-theme-fresh");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-theme", "dark", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-theme");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    assert!(
+        written.contains("theme.name = \"dark\"")
+            || written.contains("[theme]\nname = \"dark\""),
+        "written config should contain theme.name = dark: {written:?}"
+    );
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_theme_preserves_other_fields() {
+    let original = b"[theme]\n\
+        name = \"light\"\n\
+        fit  = \"stretch\"\n\
+        \n\
+        [wallpaper]\n\
+        name = \"mountains.png\"\n\
+        \n\
+        [keyboard]\n\
+        layout = \"us-qwerty\"\n\
+        \n\
+        [timezone]\n\
+        iana = \"America/New_York\"\n\
+        \n\
+        [terminal]\n\
+        font = \"unifont-mono-14.pbm\"\n";
+    let path = write_temp("set-theme-preserve", original);
+
+    let out = Command::new(SETTINGS)
+        .args(["set-theme", "dark", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-theme");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read(&path).expect("read written config");
+    let prefs = preferences::Preferences::parse(&written)
+        .expect("written config must round-trip through parse");
+
+    assert_eq!(prefs.theme_name.as_deref(), Some("dark"));
+    assert_eq!(prefs.theme_fit.as_deref(), Some("stretch"));
+    assert_eq!(prefs.wallpaper_name.as_deref(), Some("mountains.png"));
+    assert_eq!(prefs.keyboard_layout.as_deref(), Some("us-qwerty"));
+    assert_eq!(prefs.timezone_iana.as_deref(), Some("America/New_York"));
+    assert_eq!(prefs.terminal_font.as_deref(), Some("unifont-mono-14.pbm"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_theme_overwrites_existing_theme_name() {
+    let path = write_temp(
+        "set-theme-overwrite",
+        b"[theme]\nname = \"light\"\n",
+    );
+
+    let out = Command::new(SETTINGS)
+        .args(["set-theme", "dark", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-theme");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    let dark_occurrences = written.matches("\"dark\"").count();
+    let light_occurrences = written.matches("\"light\"").count();
+    assert_eq!(
+        dark_occurrences, 1,
+        "theme.name = dark should appear exactly once: {written:?}"
+    );
+    assert_eq!(
+        light_occurrences, 0,
+        "old theme.name = light should be gone: {written:?}"
+    );
+
+    let prefs = preferences::Preferences::parse(written.as_bytes())
+        .expect("written config round-trips");
+    assert_eq!(prefs.theme_name.as_deref(), Some("dark"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_theme_empty_name_exits_one() {
+    let path = temp_file("set-theme-empty");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-theme", "", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-theme empty");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("set-theme"),
+        "stderr should mention set-theme: {stderr:?}"
+    );
+}
+
+#[test]
+fn set_theme_missing_name_arg_exits_one_with_usage() {
+    let path = temp_file("set-theme-missing");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-theme", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-theme missing");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("usage:"),
+        "stderr should contain 'usage:': {stderr:?}"
+    );
+}
+
+#[test]
+fn set_theme_invalid_toml_exits_one() {
+    let path = write_temp(
+        "set-theme-garbage",
+        b"garbage bytes without any section\n",
+    );
+
+    let out = Command::new(SETTINGS)
+        .args(["set-theme", "dark", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-theme garbage");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to parse") || stderr.contains("set-theme"),
+        "stderr should explain failure: {stderr:?}"
+    );
+}

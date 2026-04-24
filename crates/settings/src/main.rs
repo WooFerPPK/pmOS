@@ -1,23 +1,32 @@
 //! `/usr/bin/settings` — CLI preview of `/etc/preferences.toml` + About pane
-//! (T184 partial + T192 partial).
+//! + write subcommands (T184 partial + T192 partial).
 //!
 //! The tabbed graphical UI (T184..T192) is blocked on the toolkit
 //! `Container` widget and T110's display-server protocol dispatch,
 //! so this slice ships a debugging CLI. Subcommand dispatch is a
 //! deliberate single hand-rolled `match` on `argv[1]` rather than a
-//! `clap` dep — the About pane is the only subcommand today and the
-//! preferences-dump is the bare default, so a two-arm match stays
-//! smaller than the dependency cost.
+//! `clap` dep — established by T192 (cbbebf6) when `about` was added,
+//! and extended here by T184 to add `set-theme`. The two-arm match
+//! grew to three arms without reaching the size where clap would
+//! pay for itself.
 //!
 //! Invocations:
 //!   settings                              # dump /etc/preferences.toml
 //!   settings <path>                       # dump preferences from <path>
 //!   settings about                        # print About (version + ABI + LICENSE + CREDITS)
 //!   settings about --doc-root <dir>       # About with doc fixtures from <dir> (tests)
+//!   settings set-theme <name>             # write theme.name to /etc/preferences.toml
+//!   settings set-theme <name> --config <path>
+//!                                         # write theme.name to <path> (test hook)
 //!
 //! Deferred T192 scope: `/proc/version` (procfs emits a placeholder
 //! line today and is not yet a stable source) and `/proc/storage`
 //! (blocked on T169). Both land in follow-up slices.
+//!
+//! Deferred T184 scope: valid-theme allow-list. `set-theme` accepts
+//! any non-empty string; the GUI will enforce the allow-list when it
+//! ships. Empty strings are rejected so the TOML round-trip cannot
+//! silently erase the field.
 
 use std::process::ExitCode;
 
@@ -32,12 +41,16 @@ const PMOS_VERSION: &str = "v0.1.0-alpha";
 /// Default directory for bundled docs, mounted by mkfs at T193.
 const DEFAULT_DOC_ROOT: &str = "/usr/share/doc/pmos/";
 
+/// Default preferences path, used by both dump and `set-theme`.
+const DEFAULT_CONFIG: &str = "/etc/preferences.toml";
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
         Some("about") => run_about(&args[1..]),
-        _ => run_preferences(args.first().map(String::as_str).unwrap_or("/etc/preferences.toml")),
+        Some("set-theme") => run_set_theme(&args[1..]),
+        _ => run_preferences(args.first().map(String::as_str).unwrap_or(DEFAULT_CONFIG)),
     }
 }
 
@@ -126,6 +139,160 @@ fn run_about(rest: &[String]) -> ExitCode {
     }
 
     ExitCode::from(0)
+}
+
+/// `set-theme <name> [--config <path>]` — read-modify-write
+/// `theme.name` on the preferences file, preserving every other
+/// field.
+///
+/// Read-modify-write rather than a naive overwrite so the other
+/// five preference fields survive untouched. We hand-serialise
+/// because the `preferences` crate is intentionally parse-only and
+/// `#![no_std]`; widening it to emit TOML would pull serialisation
+/// concerns into init's `no_std + alloc` universe for no gain
+/// today (only `settings` writes the file in v1). The canonical
+/// emitter here is the inverse of the crate's parser: quoted
+/// plain-string values, five sections in a fixed order, blank
+/// lines between sections.
+fn run_set_theme(rest: &[String]) -> ExitCode {
+    let mut name: Option<&str> = None;
+    let mut config_path: &str = DEFAULT_CONFIG;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--config" => {
+                let Some(next) = rest.get(i + 1) else {
+                    eprintln!("settings: set-theme: --config requires a path argument");
+                    return ExitCode::from(1);
+                };
+                config_path = next.as_str();
+                i += 2;
+            }
+            other => {
+                if name.is_none() {
+                    name = Some(other);
+                    i += 1;
+                } else {
+                    eprintln!("settings: set-theme: unexpected argument {:?}", other);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    }
+
+    let Some(name) = name else {
+        eprintln!("settings: set-theme: usage: set-theme <name>");
+        return ExitCode::from(1);
+    };
+
+    if name.is_empty() {
+        eprintln!("settings: set-theme: theme name must be non-empty");
+        return ExitCode::from(1);
+    }
+
+    if name.contains('"') || name.contains('\n') {
+        eprintln!(
+            "settings: set-theme: theme name must not contain quotes or newlines"
+        );
+        return ExitCode::from(1);
+    }
+
+    let mut prefs = match std::fs::read(config_path) {
+        Ok(bytes) => match preferences::Preferences::parse(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "settings: set-theme: failed to parse {}: {:?}",
+                    config_path, e
+                );
+                return ExitCode::from(1);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            preferences::Preferences::empty()
+        }
+        Err(e) => {
+            eprintln!(
+                "settings: set-theme: failed to open {}: {}",
+                config_path, e
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    prefs.theme_name = Some(name.to_string());
+
+    let serialised = serialise_preferences(&prefs);
+
+    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+        eprintln!(
+            "settings: set-theme: failed to write {}: {}",
+            config_path, e
+        );
+        return ExitCode::from(1);
+    }
+
+    // Mode 0o644 is left to the kernel VFS default; std::fs on the
+    // host cannot set Unix permissions portably and the kernel
+    // ignores host permission bits.
+
+    ExitCode::from(0)
+}
+
+/// Emit a TOML document that round-trips through `preferences::Preferences::parse`.
+///
+/// Sections are emitted in the canonical order used throughout the
+/// spec: theme, wallpaper, keyboard, timezone, terminal. Empty
+/// sections (all fields `None`) are skipped so the resulting file
+/// stays minimal. Values are plain ASCII-quoted strings; callers
+/// must reject names that contain embedded `"` or newlines before
+/// calling here.
+fn serialise_preferences(prefs: &preferences::Preferences) -> String {
+    let mut out = String::new();
+
+    let theme_pairs: &[(&str, Option<&str>)] = &[
+        ("name", prefs.theme_name.as_deref()),
+        ("fit", prefs.theme_fit.as_deref()),
+    ];
+    emit_section(&mut out, "theme", theme_pairs);
+
+    let wallpaper_pairs: &[(&str, Option<&str>)] =
+        &[("name", prefs.wallpaper_name.as_deref())];
+    emit_section(&mut out, "wallpaper", wallpaper_pairs);
+
+    let keyboard_pairs: &[(&str, Option<&str>)] =
+        &[("layout", prefs.keyboard_layout.as_deref())];
+    emit_section(&mut out, "keyboard", keyboard_pairs);
+
+    let timezone_pairs: &[(&str, Option<&str>)] =
+        &[("iana", prefs.timezone_iana.as_deref())];
+    emit_section(&mut out, "timezone", timezone_pairs);
+
+    let terminal_pairs: &[(&str, Option<&str>)] =
+        &[("font", prefs.terminal_font.as_deref())];
+    emit_section(&mut out, "terminal", terminal_pairs);
+
+    out
+}
+
+fn emit_section(out: &mut String, name: &str, pairs: &[(&str, Option<&str>)]) {
+    if pairs.iter().all(|(_, v)| v.is_none()) {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push('[');
+    out.push_str(name);
+    out.push_str("]\n");
+    for (key, value) in pairs {
+        if let Some(v) = value {
+            out.push_str(key);
+            out.push_str(" = \"");
+            out.push_str(v);
+            out.push_str("\"\n");
+        }
+    }
 }
 
 fn join_doc(root: &str, file: &str) -> String {
