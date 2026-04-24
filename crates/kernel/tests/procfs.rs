@@ -23,7 +23,8 @@ use abi::cap::CapSet;
 use abi::ext::Pid;
 
 use kernel::fs::procfs::{
-    fd_symlink_ino, pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs, ProcFsSource,
+    fd_symlink_ino, format_argv_cmdline, pid_cmdline_ino, pid_fd_dir_ino, pid_status_ino,
+    pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs, ProcFsSource,
     ProcStatusSnapshot, ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
 };
 use kernel::proc::{
@@ -751,4 +752,214 @@ fn kernel_procfs_source_version_uptime_meminfo_loadavg_are_placeholders() {
     // Default fd impl is untouched until block-driver + vfs reverse
     // lookup wiring lands; pid_fds on a live pid is still empty.
     assert!(source.pid_fds(1).is_empty());
+}
+
+// ---- /proc/<pid>/cmdline — argv projection (T168 follow-up) --------
+
+/// Build a Vfs with a ProcFs backed by a StaticProcFsSource
+/// populated with both a status snapshot and a cmdline byte
+/// sequence. The canned `status` snapshot makes the pid directory
+/// live; `pid_cmdline` then populates the `cmdline` file.
+fn vfs_with_cmdline(
+    statuses: Vec<ProcStatusSnapshot>,
+    cmdlines: Vec<(Pid, Vec<u8>)>,
+) -> Vfs {
+    let mut source = StaticProcFsSource::default();
+    for snap in statuses {
+        source.set_pid_status(snap);
+    }
+    for (pid, bytes) in cmdlines {
+        source.set_pid_cmdline(pid, bytes);
+    }
+    let mut vfs = Vfs::new();
+    vfs.mount("/", Box::new(kernel::fs::tmpfs::TmpFs::new()))
+        .unwrap();
+    vfs.mount("/proc", Box::new(ProcFs::new(Box::new(source))))
+        .unwrap();
+    vfs
+}
+
+#[test]
+fn cmdline_lookup_returns_regular_file_for_pid_with_cmdline() {
+    let pid: Pid = 42;
+    let cmdline: Vec<u8> = b"/usr/bin/edit\0file.txt\0".to_vec();
+    let mut vfs = vfs_with_cmdline(
+        vec![stub_status(pid, 1, "edit")],
+        vec![(pid, cmdline)],
+    );
+
+    let st = vfs.stat(&format!("/proc/{pid}/cmdline")).unwrap();
+    assert_eq!(st.ty, NodeType::RegularFile);
+}
+
+#[test]
+fn cmdline_read_returns_nul_separated_bytes() {
+    let pid: Pid = 42;
+    let expected: Vec<u8> = b"/usr/bin/edit\0file.txt\0".to_vec();
+    let mut vfs = vfs_with_cmdline(
+        vec![stub_status(pid, 1, "edit")],
+        vec![(pid, expected.clone())],
+    );
+
+    let path = format!("/proc/{pid}/cmdline");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 32];
+    let mut off: u64 = 0;
+    loop {
+        let n = vfs.read(&path, off, &mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        off += n as u64;
+    }
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn cmdline_stat_reports_mode_0o444_and_correct_size() {
+    let pid: Pid = 42;
+    let cmdline: Vec<u8> = b"/usr/bin/edit\0file.txt\0".to_vec();
+    let expected_size = cmdline.len() as u64;
+    let mut vfs = vfs_with_cmdline(
+        vec![stub_status(pid, 1, "edit")],
+        vec![(pid, cmdline)],
+    );
+
+    let st = vfs.stat(&format!("/proc/{pid}/cmdline")).unwrap();
+    assert_eq!(st.mode, 0o444);
+    assert_eq!(st.size, expected_size);
+}
+
+#[test]
+fn cmdline_lookup_rejects_pid_without_cmdline() {
+    // pid 99 is live (has a status snapshot) but no cmdline set —
+    // `/proc/99/cmdline` must report NotFound, not serve an empty
+    // regular file.
+    let pid: Pid = 99;
+    let mut vfs = vfs_with_cmdline(
+        vec![stub_status(pid, 1, "sh")],
+        vec![],
+    );
+
+    let err = vfs.stat(&format!("/proc/{pid}/cmdline")).unwrap_err();
+    assert_eq!(err, FsError::NotFound);
+
+    let err = vfs
+        .read(&format!("/proc/{pid}/cmdline"), 0, &mut [0u8; 16])
+        .unwrap_err();
+    assert_eq!(err, FsError::NotFound);
+}
+
+#[test]
+fn cmdline_listed_in_pid_subtree_readdir() {
+    // readdir on `/proc/42` must include `cmdline` alongside
+    // `status` and `fd` when the source records a cmdline.
+    let pid: Pid = 42;
+    let mut vfs = vfs_with_cmdline(
+        vec![stub_status(pid, 1, "edit")],
+        vec![(pid, b"/usr/bin/edit\0".to_vec())],
+    );
+
+    let entries = vfs.readdir(&format!("/proc/{pid}")).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"status"), "missing status: {:?}", names);
+    assert!(names.contains(&"fd"), "missing fd: {:?}", names);
+
+    let cmdline_entry = entries
+        .iter()
+        .find(|e| e.name == "cmdline")
+        .expect("cmdline entry present");
+    assert_eq!(cmdline_entry.ty, NodeType::RegularFile);
+}
+
+#[test]
+fn cmdline_ino_does_not_collide_with_status_or_fd_dir() {
+    // Pin the stride-offset numbering: cmdline must live at a slot
+    // distinct from both the status file and the fd/ directory.
+    // Spread across several pids so a future stride change shows up
+    // as a test failure.
+    for &pid in &[1 as Pid, 2, 42, 1024, 65_535] {
+        let cmdline = pid_cmdline_ino(pid);
+        let status = pid_status_ino(pid);
+        let fd_dir = pid_fd_dir_ino(pid);
+        assert_ne!(cmdline, status, "cmdline/status collision at pid {pid}");
+        assert_ne!(cmdline, fd_dir, "cmdline/fd-dir collision at pid {pid}");
+    }
+}
+
+#[test]
+fn cmdline_empty_argv_yields_empty_bytes() {
+    // Safety net: a pid with an empty argv (kernel thread or a
+    // process before exec) serves an empty cmdline file — the
+    // file exists (lookup succeeds) but reads as zero bytes. The
+    // Some(vec![]) vs None distinction is deliberate.
+    let pid: Pid = 7;
+    let mut vfs = vfs_with_cmdline(
+        vec![stub_status(pid, 1, "kthread")],
+        vec![(pid, Vec::new())],
+    );
+
+    let st = vfs.stat(&format!("/proc/{pid}/cmdline")).unwrap();
+    assert_eq!(st.size, 0);
+
+    let mut buf = [0u8; 16];
+    let n = vfs.read(&format!("/proc/{pid}/cmdline"), 0, &mut buf).unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn format_argv_cmdline_joins_with_nul_and_trailing_nul() {
+    // Pin the byte layout the bridge relies on: each argv entry
+    // followed by a single NUL, including the last, so readers can
+    // split on 0x00 without special-casing the terminator.
+    let argv = vec![
+        "/usr/bin/edit".to_string(),
+        "file.txt".to_string(),
+    ];
+    let bytes = format_argv_cmdline(&argv);
+    assert_eq!(bytes, b"/usr/bin/edit\0file.txt\0".to_vec());
+
+    // Empty argv yields zero bytes.
+    assert!(format_argv_cmdline(&[]).is_empty());
+}
+
+#[test]
+fn kernel_procfs_source_pid_cmdline_projects_argv() {
+    // Live bridge: spawn a process with argv = ["/bin/sh", "-c",
+    // "echo hi"] and assert `pid_cmdline` returns the matching
+    // NUL-joined bytes. This is the KernelProcFsSource wiring
+    // decision for this slice: Process already owns `argv`, so
+    // projecting it is free.
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    let argv = vec![
+        String::from("/bin/sh"),
+        String::from("-c"),
+        String::from("echo hi"),
+    ];
+    let proc = Process::new_starting(
+        pid,
+        1,
+        "sh",
+        argv.clone(),
+        BTreeMap::new(),
+        "/",
+        CapSet::EMPTY,
+        0,
+        0,
+        0,
+    );
+    table.insert(proc).unwrap();
+
+    let source = KernelProcFsSource::new(&table);
+    let got = source.pid_cmdline(pid).expect("live pid has cmdline");
+    assert_eq!(got, b"/bin/sh\0-c\0echo hi\0".to_vec());
+}
+
+#[test]
+fn kernel_procfs_source_pid_cmdline_none_for_missing_pid() {
+    let table = ProcessTable::new();
+    let source = KernelProcFsSource::new(&table);
+    assert!(source.pid_cmdline(999).is_none());
 }

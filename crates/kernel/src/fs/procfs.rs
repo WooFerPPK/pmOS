@@ -4,11 +4,13 @@
 //! `/proc/meminfo`, `/proc/loadavg`, `/proc/storage` — plus a
 //! per-pid subtree under `/proc/<pid>/` that surfaces live
 //! process-table fields. Populated in this slice:
-//! `/proc/<pid>/status` (Name / State / Pid / PPid) plus
+//! `/proc/<pid>/status` (Name / State / Pid / PPid),
 //! `/proc/<pid>/fd/<n>` symlinks describing each open file
-//! descriptor. Follow-up slices add `cmdline`, `stat`, `maps`,
-//! etc. alongside the memory-tracking fields (`VmSize`, `VmPeak`)
-//! once the process table owns that accounting.
+//! descriptor, and `/proc/<pid>/cmdline` with the process's
+//! NUL-separated argv. Follow-up slices add `stat`, `maps`,
+//! `environ`, etc. alongside the memory-tracking fields
+//! (`VmSize`, `VmPeak`) once the process table owns that
+//! accounting.
 //!
 //! Data sources are injected through the [`ProcFsSource`] trait.
 //! The v1 slice provides a [`StaticProcFsSource`] that returns
@@ -25,13 +27,14 @@
 //!   meminfo, loadavg, storage).
 //! * `PID_DIR_BASE + pid * PID_STRIDE + offset` — per-pid nodes.
 //!   Stride (16) is chosen large enough to admit future fields
-//!   (`cmdline`, `stat`, `maps`, ...) without renumbering. A
+//!   (`stat`, `maps`, ...) without renumbering. A
 //!   `pid_of(ino)` helper rounds back to the pid; an out-of-range
 //!   offset yields `FsError::NotFound`. Slot offsets in use:
 //!     * `0` — the pid directory itself.
 //!     * `1` — `status`.
 //!     * `2` — `fd/` directory.
-//!     * `3..15` — reserved for `cmdline`, `maps`, `environ`, ...
+//!     * `3` — `cmdline`.
+//!     * `4..15` — reserved for `maps`, `environ`, ...
 //! * `FD_INO_BASE + pid * FD_PID_STRIDE + fd_number` — per-fd
 //!   symlink nodes beneath `/proc/<pid>/fd/<n>`. A dedicated
 //!   region is required because stride-16 cannot hold arbitrary
@@ -114,6 +117,21 @@ pub trait ProcFsSource: Send + Sync {
         Vec::new()
     }
 
+    /// Return the raw `/proc/<pid>/cmdline` bytes: argv elements
+    /// joined with NUL separators and a trailing NUL, matching the
+    /// Linux convention. `None` if the pid has no cmdline recorded
+    /// (or if the source doesn't know). An `Some(Vec::new())` is
+    /// distinct from `None` and represents a live pid with an empty
+    /// argv — in that case the cmdline file exists but reads as
+    /// zero bytes.
+    ///
+    /// Default: `None`. `StaticProcFsSource` populates this via
+    /// `set_pid_cmdline`; `KernelProcFsSource` projects the
+    /// [`Process::argv`](crate::proc::Process) list.
+    fn pid_cmdline(&self, _pid: Pid) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Ascending list of live pids used by readdir on `/proc`.
     ///
     /// Default: empty. Overriding this + `pid_status` together is
@@ -160,6 +178,7 @@ pub struct StaticProcFsSource {
     pub storage_info: Option<StorageSnapshot>,
     pub pid_statuses: BTreeMap<Pid, ProcStatusSnapshot>,
     pub pid_fds: BTreeMap<Pid, Vec<ProcFdSnapshot>>,
+    pub pid_cmdlines: BTreeMap<Pid, Vec<u8>>,
 }
 
 impl Default for StaticProcFsSource {
@@ -173,6 +192,7 @@ impl Default for StaticProcFsSource {
             storage_info: None,
             pid_statuses: BTreeMap::new(),
             pid_fds: BTreeMap::new(),
+            pid_cmdlines: BTreeMap::new(),
         }
     }
 }
@@ -190,6 +210,16 @@ impl StaticProcFsSource {
     /// `self` by `&mut` for chaining.
     pub fn set_pid_fds(&mut self, pid: Pid, fds: Vec<ProcFdSnapshot>) -> &mut Self {
         self.pid_fds.insert(pid, fds);
+        self
+    }
+
+    /// Register or replace the raw cmdline bytes for `pid`. Callers
+    /// pass the fully NUL-joined / NUL-terminated byte sequence
+    /// `/proc/<pid>/cmdline` will serve; `format_argv_cmdline` is
+    /// the canonical builder for that form. Returns `self` by `&mut`
+    /// for chaining.
+    pub fn set_pid_cmdline(&mut self, pid: Pid, cmdline: Vec<u8>) -> &mut Self {
+        self.pid_cmdlines.insert(pid, cmdline);
         self
     }
 }
@@ -219,6 +249,9 @@ impl ProcFsSource for StaticProcFsSource {
     fn pid_fds(&self, pid: Pid) -> Vec<ProcFdSnapshot> {
         self.pid_fds.get(&pid).cloned().unwrap_or_default()
     }
+    fn pid_cmdline(&self, pid: Pid) -> Option<Vec<u8>> {
+        self.pid_cmdlines.get(&pid).cloned()
+    }
     fn live_pids(&self) -> Vec<Pid> {
         self.pid_statuses.keys().copied().collect()
     }
@@ -234,6 +267,10 @@ impl ProcFsSource for StaticProcFsSource {
 ///   [`ProcessTable`]. `/proc/<pid>/status` now shows whatever the
 ///   kernel actually holds for that pid, including live state
 ///   transitions (Running → Zombie, etc.).
+/// * `pid_cmdline` — projects [`Process::argv`](crate::proc::Process)
+///   through [`format_argv_cmdline`]. Returns `None` for a dead or
+///   never-spawned pid; returns `Some(vec![])` for a live pid whose
+///   argv is empty (the file exists but reads as zero bytes).
 /// * `version` — hardcoded `"PMos 0.1.0-alpha (native-test)\n"`
 ///   until a build-time banner is plumbed through.
 /// * `uptime`, `meminfo`, `loadavg` — placeholders (`"0 0\n"`,
@@ -313,6 +350,14 @@ impl<'a> ProcFsSource for KernelProcFsSource<'a> {
             name: proc.name.clone(),
             state: proc_state_to_status(proc.state),
         })
+    }
+
+    fn pid_cmdline(&self, pid: Pid) -> Option<Vec<u8>> {
+        let proc = self.process_table.get(pid)?;
+        if proc.state == ProcState::Dead {
+            return None;
+        }
+        Some(format_argv_cmdline(&proc.argv))
     }
 
     fn live_pids(&self) -> Vec<Pid> {
@@ -417,6 +462,8 @@ pub const PID_STRIDE: Ino = 16;
 const PID_OFFSET_STATUS: Ino = 1;
 /// Offset within a pid's stride for the `fd/` directory.
 const PID_OFFSET_FD_DIR: Ino = 2;
+/// Offset within a pid's stride for the `cmdline` file.
+const PID_OFFSET_CMDLINE: Ino = 3;
 
 /// Start of the per-fd symlink inode range — one stride per pid,
 /// within that the raw fd number is the offset. Chosen well above
@@ -439,7 +486,7 @@ pub const fn pid_dir_ino(pid: Pid) -> Ino {
 
 /// Map a pid to its `status` file ino.
 #[inline]
-const fn pid_status_ino(pid: Pid) -> Ino {
+pub const fn pid_status_ino(pid: Pid) -> Ino {
     pid_dir_ino(pid) + PID_OFFSET_STATUS
 }
 
@@ -447,6 +494,12 @@ const fn pid_status_ino(pid: Pid) -> Ino {
 #[inline]
 pub const fn pid_fd_dir_ino(pid: Pid) -> Ino {
     pid_dir_ino(pid) + PID_OFFSET_FD_DIR
+}
+
+/// Map a pid to its `cmdline` file ino.
+#[inline]
+pub const fn pid_cmdline_ino(pid: Pid) -> Ino {
+    pid_dir_ino(pid) + PID_OFFSET_CMDLINE
 }
 
 /// Map a `(pid, fd)` pair to the symlink ino that represents
@@ -506,6 +559,22 @@ fn format_pid_status(snap: &ProcStatusSnapshot) -> Vec<u8> {
         snap.ppid,
     );
     text.into_bytes()
+}
+
+/// Serialise an `argv` slice into the exact byte layout
+/// `/proc/<pid>/cmdline` serves — each element followed by a NUL
+/// byte, matching the Linux convention (`argv[0]\0argv[1]\0...\0`).
+/// An empty `argv` yields an empty byte vector (Linux behaviour for
+/// kernel threads / pre-exec processes). No terminating newline;
+/// downstream readers rely on NUL boundaries.
+pub fn format_argv_cmdline(argv: &[String]) -> Vec<u8> {
+    let total: usize = argv.iter().map(|s| s.len() + 1).sum();
+    let mut out = Vec::with_capacity(total);
+    for arg in argv {
+        out.extend_from_slice(arg.as_bytes());
+        out.push(0);
+    }
+    out
 }
 
 pub struct ProcFs {
@@ -570,6 +639,9 @@ impl ProcFs {
             let snap = self.source.pid_status(pid)?;
             return Some(format_pid_status(&snap));
         }
+        if slot == PID_OFFSET_CMDLINE {
+            return self.source.pid_cmdline(pid);
+        }
         None
     }
 
@@ -609,12 +681,21 @@ impl Filesystem for ProcFs {
             }
             return Err(FsError::NotFound);
         }
-        // Per-pid directory: `status` file + `fd/` directory.
+        // Per-pid directory: `status` file + `fd/` directory +
+        // optional `cmdline` file (present only when the source
+        // records one for this pid).
         if self.is_live_pid_dir(dir) {
             let (pid, _) = decode_pid_ino(dir).expect("is_live_pid_dir implies decode ok");
             return match name {
                 "status" => Ok(pid_status_ino(pid)),
                 "fd" => Ok(pid_fd_dir_ino(pid)),
+                "cmdline" => {
+                    if self.source.pid_cmdline(pid).is_some() {
+                        Ok(pid_cmdline_ino(pid))
+                    } else {
+                        Err(FsError::NotFound)
+                    }
+                }
                 _ => Err(FsError::NotFound),
             };
         }
@@ -683,6 +764,13 @@ impl Filesystem for ProcFs {
                 ino: pid_fd_dir_ino(pid),
                 ty: NodeType::Directory,
             });
+            if self.source.pid_cmdline(pid).is_some() {
+                out.push(DirEntry {
+                    name: "cmdline".to_string(),
+                    ino: pid_cmdline_ino(pid),
+                    ty: NodeType::RegularFile,
+                });
+            }
             return Ok(());
         }
         if self.is_live_fd_dir(dir) {
@@ -795,7 +883,7 @@ impl Filesystem for ProcFs {
         }
         // Per-pid regular files: recognise the stride offset.
         if let Some((_pid, slot)) = decode_pid_ino(ino) {
-            if slot == PID_OFFSET_STATUS {
+            if slot == PID_OFFSET_STATUS || slot == PID_OFFSET_CMDLINE {
                 let content = self.contents_for(ino).ok_or(FsError::NotFound)?;
                 return Ok(FileStat {
                     ino,
