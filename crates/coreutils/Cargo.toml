@@ -28,3 +28,7 @@ path = "src/bin/cp.rs"
 [[bin]]
 name = "mkdir"
 path = "src/bin/mkdir.rs"
+
+[[bin]]
+name = "rm"
+path = "src/bin/rm.rs"
