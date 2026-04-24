@@ -41,8 +41,9 @@ dev: build
 # Test
 # ---------------------------------------------------------------------------
 
-# Run every test layer in sequence (the CI gate)
-test: test-kernel test-display-server test-toolkit test-drivers test-integration test-perf
+# Run every test layer in sequence (the CI gate). test-non-goal-audit
+# is a non-blocking gate in v1 (runs but never fails just test).
+test: test-kernel test-display-server test-toolkit test-drivers test-integration test-perf test-non-goal-audit
 
 # Kernel isolation tests (native host target via the Platform abstraction)
 test-kernel:
@@ -67,6 +68,13 @@ test-integration: build
 # Native-Rust perf harness (input latency p95 gate, per T220)
 test-perf: build
     cargo run --release -p integration-tests --bin input-latency
+
+# Non-goal compliance audit (T222). Runs scripts/non-goal-audit.sh and
+# prints a one-line summary. Always exits 0 — the baseline classification
+# lives hand-maintained in docs/non-goal-compliance.md.
+test-non-goal-audit:
+    @bash scripts/non-goal-audit.sh > /tmp/pmos-non-goal-audit.log
+    @echo "[just] non-goal audit: $(wc -l < /tmp/pmos-non-goal-audit.log) lines across $(grep -c '^##' /tmp/pmos-non-goal-audit.log) categories (see docs/non-goal-compliance.md)"
 
 # ---------------------------------------------------------------------------
 # Packaging and release
