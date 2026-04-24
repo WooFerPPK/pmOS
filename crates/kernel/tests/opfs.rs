@@ -13,9 +13,9 @@ use kernel::fs::opfs::layout::{
     BLOCK_SIZE, DEFAULT_INODE_TABLE_BLOCKS, DEFAULT_JOURNAL_BLOCKS, ROOT_INO,
 };
 use kernel::fs::opfs::mkfs::{
-    default_edit_desktop, default_files_desktop, default_init_conf, default_settings_desktop,
-    default_sysmon_desktop, default_terminal_desktop, mkfs, starter_editing, starter_readme,
-    starter_welcome,
+    default_credits_txt, default_edit_desktop, default_files_desktop, default_init_conf,
+    default_license_txt, default_settings_desktop, default_sysmon_desktop,
+    default_terminal_desktop, mkfs, starter_editing, starter_readme, starter_welcome,
 };
 use kernel::fs::opfs::OpfsFs;
 use kernel::vfs::{Filesystem, FsError, NodeType};
@@ -112,6 +112,53 @@ fn fr_013a_starter_kit_is_present_and_matches_source() {
     let mut entries = Vec::new();
     fs.readdir(pictures_ino, &mut entries).unwrap();
     assert!(entries.is_empty());
+}
+
+#[test]
+fn mkfs_installs_default_license_and_credits() {
+    let mut fs = fresh_fs();
+
+    // Walk to /usr/share/doc/pmos.
+    let usr_ino = fs.lookup(ROOT_INO, "usr").unwrap();
+    let share_ino = fs.lookup(usr_ino, "share").unwrap();
+    let doc_ino = fs.lookup(share_ino, "doc").unwrap();
+    let pmos_ino = fs.lookup(doc_ino, "pmos").unwrap();
+
+    // LICENSE.txt exists as a regular file at mode 0o644, byte-
+    // equal to the bundled asset.
+    let license_ino = fs.lookup(pmos_ino, "LICENSE.txt").unwrap();
+    let license_stat = fs.stat(license_ino).unwrap();
+    assert_eq!(license_stat.ty, NodeType::RegularFile);
+    assert_eq!(license_stat.mode, 0o644);
+    let mut buf = vec![0u8; default_license_txt().len()];
+    let n = fs.read(license_ino, 0, &mut buf).unwrap();
+    assert_eq!(n, default_license_txt().len());
+    assert_eq!(&buf[..n], default_license_txt());
+
+    // Light "not a placeholder" check: header mentions MIT License.
+    let license_text = core::str::from_utf8(default_license_txt()).unwrap();
+    assert!(
+        license_text.contains("MIT License"),
+        "LICENSE.txt does not advertise the MIT License header",
+    );
+
+    // CREDITS.txt exists as a regular file at mode 0o644, byte-
+    // equal to the bundled asset.
+    let credits_ino = fs.lookup(pmos_ino, "CREDITS.txt").unwrap();
+    let credits_stat = fs.stat(credits_ino).unwrap();
+    assert_eq!(credits_stat.ty, NodeType::RegularFile);
+    assert_eq!(credits_stat.mode, 0o644);
+    let mut buf = vec![0u8; default_credits_txt().len()];
+    let n = fs.read(credits_ino, 0, &mut buf).unwrap();
+    assert_eq!(n, default_credits_txt().len());
+    assert_eq!(&buf[..n], default_credits_txt());
+
+    // Light "not a placeholder" check: mentions PMos.
+    let credits_text = core::str::from_utf8(default_credits_txt()).unwrap();
+    assert!(
+        credits_text.contains("PMos"),
+        "CREDITS.txt does not mention PMos",
+    );
 }
 
 // ---- Filesystem trait coverage --------------------------------------

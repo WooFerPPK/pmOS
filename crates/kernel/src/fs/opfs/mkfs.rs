@@ -149,6 +149,7 @@ pub fn mkfs(mut device: DynBlockDevice) -> Result<OpfsFs, FsError> {
     create_starter_kit(&mut fs)?;
     create_etc_defaults(&mut fs)?;
     create_usr_share_applications(&mut fs)?;
+    create_usr_share_doc_pmos(&mut fs)?;
 
     // Step 8: final flush so everything is durable before we
     // return. `sync()` applies the journal and flushes.
@@ -340,4 +341,36 @@ pub fn starter_welcome() -> &'static [u8] {
 
 pub fn starter_editing() -> &'static [u8] {
     EDITING_MD
+}
+
+// --- Initramfs doc bundle (T193 partial) -----------------------------
+
+const LICENSE_TXT: &[u8] = include_bytes!("../../../assets/LICENSE.txt");
+const CREDITS_TXT: &[u8] = include_bytes!("../../../assets/CREDITS.txt");
+
+/// Install `LICENSE.txt` + `CREDITS.txt` under
+/// `/usr/share/doc/pmos/` at mode 0o644. `create_system_tree`
+/// already built `/usr/share`, so this helper only needs to
+/// `mkdir` the `doc/` and `doc/pmos/` levels before writing.
+fn create_usr_share_doc_pmos(fs: &mut OpfsFs) -> Result<(), FsError> {
+    let usr_ino = fs.lookup(ROOT_INO, "usr")?;
+    let share_ino = fs.lookup(usr_ino, "share")?;
+    let doc_ino = fs.mkdir(share_ino, "doc", 0o755)?;
+    let pmos_ino = fs.mkdir(doc_ino, "pmos", 0o755)?;
+
+    let license_ino = fs.create(pmos_ino, "LICENSE.txt", 0o644)?;
+    fs.write(license_ino, 0, LICENSE_TXT)?;
+
+    let credits_ino = fs.create(pmos_ino, "CREDITS.txt", 0o644)?;
+    fs.write(credits_ino, 0, CREDITS_TXT)?;
+
+    Ok(())
+}
+
+pub fn default_license_txt() -> &'static [u8] {
+    LICENSE_TXT
+}
+
+pub fn default_credits_txt() -> &'static [u8] {
+    CREDITS_TXT
 }
