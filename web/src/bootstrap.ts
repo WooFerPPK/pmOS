@@ -1057,7 +1057,7 @@ function showFallbackMessage(error: string): void {
     </div>`;
 }
 
-function showPanic(message: string): void {
+export function showPanic(message: string): void {
   const panel = document.getElementById("pmos-panic");
   const msg = document.getElementById("pmos-panic-message");
   if (panel && msg) {
