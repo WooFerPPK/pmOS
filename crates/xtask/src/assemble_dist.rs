@@ -154,6 +154,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     // named after the bin, not the crate. First up: `cat`.
     ("coreutils", "cat"),
     ("coreutils", "grep"),
+    ("coreutils", "cp"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {

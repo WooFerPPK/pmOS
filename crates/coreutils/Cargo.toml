@@ -20,3 +20,7 @@ path = "src/bin/cat.rs"
 [[bin]]
 name = "grep"
 path = "src/bin/grep.rs"
+
+[[bin]]
+name = "cp"
+path = "src/bin/cp.rs"
