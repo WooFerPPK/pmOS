@@ -37,9 +37,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod launcher;
 pub mod paint;
 pub mod session;
 
+pub use launcher::{
+    DesktopEntry, DesktopEntryStore, Launcher, LauncherError, MemoryStore,
+};
 pub use paint::{run_shell, ShellExit, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 pub use session::{
     GlobalEntry, Session, SessionError, SessionStep, INTERESTING_INTERFACES,
