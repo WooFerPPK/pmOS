@@ -136,6 +136,65 @@ fn missing_file_exits_one_and_stderr_has_path() {
 }
 
 #[test]
+fn about_prints_version_abi_license_credits() {
+    let dir = env::temp_dir().join(format!(
+        "pmos-settings-about-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("mkdir about doc-root");
+    fs::write(dir.join("LICENSE.txt"), b"MIT-licensed. See full text in repo root.\n")
+        .expect("write LICENSE fixture");
+    fs::write(dir.join("CREDITS.txt"), b"PMos contributors.\n").expect("write CREDITS fixture");
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&dir)
+        .output()
+        .expect("spawn settings about");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+
+    assert!(stdout.contains("PMos v0.1.0-alpha"), "stdout = {stdout:?}");
+    assert!(
+        stdout.contains("Kernel ABI version: 1.1"),
+        "stdout = {stdout:?}"
+    );
+    assert!(stdout.contains("License:"), "stdout = {stdout:?}");
+    assert!(
+        stdout.contains("MIT-licensed. See full text in repo root."),
+        "stdout = {stdout:?}"
+    );
+    assert!(stdout.contains("Credits:"), "stdout = {stdout:?}");
+    assert!(stdout.contains("PMos contributors."), "stdout = {stdout:?}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn about_missing_doc_root_exits_one() {
+    let missing = env::temp_dir().join(format!(
+        "pmos-settings-about-missing-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&missing)
+        .output()
+        .expect("spawn settings about missing");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to read"),
+        "stderr should explain read failure: {stderr:?}"
+    );
+}
+
+#[test]
 fn malformed_toml_exits_one_and_stderr_has_error_class() {
     let path = write_temp("malformed", b"[unterminated\nfoo = \"bar\"\n");
 
