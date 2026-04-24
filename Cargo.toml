@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/abi",
     "crates/ring",
+    "crates/preferences",
     "crates/kernel",
     "crates/init",
     "crates/display-proto",
