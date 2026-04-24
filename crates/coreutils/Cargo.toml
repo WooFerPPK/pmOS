@@ -24,3 +24,7 @@ path = "src/bin/grep.rs"
 [[bin]]
 name = "cp"
 path = "src/bin/cp.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/bin/mkdir.rs"
