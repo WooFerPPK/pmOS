@@ -22,10 +22,16 @@
 //! the leading signed integer parsed via `parse_leading_int` (lines
 //! whose leading non-whitespace token isn't numeric compare as 0,
 //! so they cluster among themselves in input order — POSIX leaves
-//! that order unspecified for v1). `-ru` / `-ur` / `-nr` / `-nu` /
-//! `-nru` etc. apply the chosen combination. Unknown flags write
-//! `sort: unknown flag: <flag>` to stderr and exit 2 (matching
-//! grep's open-error/usage exit code).
+//! that order unspecified for v1); `-f` folds ASCII lowercase to
+//! uppercase for the comparison key only (output bytes are the
+//! original input bytes — only the sort/dedup KEY is folded), via
+//! `fold_to_upper_bytes`. Non-ASCII bytes pass through unchanged
+//! (no Unicode case-folding in v1). When both `-n` and `-f` are
+//! set, numeric dominates: case-folding is a no-op for the
+//! integer-parsing key. `-ru` / `-ur` / `-nr` / `-nu` / `-nru` /
+//! `-fr` / `-fu` / `-fnu` etc. apply the chosen combination.
+//! Unknown flags write `sort: unknown flag: <flag>` to stderr and
+//! exit 2 (matching grep's open-error/usage exit code).
 //!
 //! Pattern precedent: `crates/coreutils/src/bin/{cat,grep,wc,head}.rs`.
 
@@ -39,6 +45,7 @@ fn main() -> ExitCode {
     let mut reverse = false;
     let mut unique = false;
     let mut numeric = false;
+    let mut fold = false;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -52,6 +59,7 @@ fn main() -> ExitCode {
                     'r' => reverse = true,
                     'u' => unique = true,
                     'n' => numeric = true,
+                    'f' => fold = true,
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -89,6 +97,8 @@ fn main() -> ExitCode {
 
     if numeric {
         lines.sort_by_key(|line| parse_leading_int(line));
+    } else if fold {
+        lines.sort_by_key(|line| fold_to_upper_bytes(line));
     } else {
         lines.sort();
     }
@@ -96,7 +106,11 @@ fn main() -> ExitCode {
         lines.reverse();
     }
     if unique {
-        lines.dedup();
+        if fold && !numeric {
+            lines.dedup_by_key(|line| fold_to_upper_bytes(line));
+        } else {
+            lines.dedup();
+        }
     }
 
     let stdout = io::stdout();
@@ -119,6 +133,12 @@ fn append_lines(text: &str, sink: &mut Vec<String>) {
     for p in parts {
         sink.push(p.to_string());
     }
+}
+
+fn fold_to_upper_bytes(s: &str) -> Vec<u8> {
+    s.bytes()
+        .map(|b| if b.is_ascii_lowercase() { b - 32 } else { b })
+        .collect()
 }
 
 fn parse_leading_int(s: &str) -> i64 {

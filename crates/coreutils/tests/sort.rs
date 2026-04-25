@@ -288,3 +288,123 @@ fn dash_n_handles_lines_with_trailing_text() {
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
     cleanup(&dir);
 }
+
+#[test]
+fn dash_f_sorts_case_insensitively() {
+    let dir = scratch_dir("f_basic");
+    let path = write_file(&dir, "in.txt", b"Banana\napple\nCherry\n");
+
+    let out = Command::new(SORT)
+        .arg("-f")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"apple\nBanana\nCherry\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_f_preserves_original_case_in_output() {
+    let dir = scratch_dir("f_preserve");
+    let path = write_file(&dir, "in.txt", b"Apple\nbanana\n");
+
+    let out = Command::new(SORT)
+        .arg("-f")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"Apple\nbanana\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_fu_dedupes_case_insensitive_duplicates() {
+    let dir = scratch_dir("fu");
+    let path = write_file(&dir, "in.txt", b"Apple\napple\nAPPLE\nbanana\n");
+
+    let out = Command::new(SORT)
+        .arg("-fu")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"Apple\nbanana\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_fr_reverses_case_insensitive_sort() {
+    let dir = scratch_dir("fr");
+    let path = write_file(&dir, "in.txt", b"apple\nBanana\nCherry\n");
+
+    let out = Command::new(SORT)
+        .arg("-fr")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"Cherry\nBanana\napple\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_fn_combines_but_n_dominates() {
+    let dir = scratch_dir("fn");
+    let path = write_file(&dir, "in.txt", b"2\n10\n");
+
+    let out = Command::new(SORT)
+        .arg("-fn")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"2\n10\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_f_handles_non_ascii_bytes_passthrough() {
+    let dir = scratch_dir("f_nonascii");
+    let path = write_file(&dir, "in.txt", b"\xc3\xa9\nApple\nbanana\n");
+
+    let out = Command::new(SORT)
+        .arg("-f")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"Apple\nbanana\n\xc3\xa9\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_f_alone_with_no_input_is_empty_output() {
+    let mut child = Command::new(SORT)
+        .arg("-f")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sort");
+
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait sort");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
