@@ -155,3 +155,86 @@ fn missing_pattern_arg_exits_two() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("usage"), "stderr = {stderr:?}");
 }
+
+#[test]
+fn dash_i_matches_uppercase_pattern_against_lowercase_line() {
+    let dir = scratch_dir("ci-up");
+    let path = write_file(&dir, "a.txt", b"alpha\nhello world\nbeta\n");
+
+    let out = Command::new(GREP)
+        .arg("-i")
+        .arg("HELLO")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"hello world\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_i_matches_lowercase_pattern_against_uppercase_line() {
+    let dir = scratch_dir("ci-down");
+    let path = write_file(&dir, "a.txt", b"FOO BAR\nbaz\n");
+
+    let out = Command::new(GREP)
+        .arg("-i")
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"FOO BAR\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_i_preserves_match_count_on_mixed_case() {
+    let dir = scratch_dir("ci-mixed");
+    let path = write_file(&dir, "a.txt", b"Apple\napple pie\nBANANA\nApricot\n");
+
+    let out = Command::new(GREP)
+        .arg("-i")
+        .arg("apple")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"Apple\napple pie\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn without_dash_i_case_sensitive_still_holds() {
+    let dir = scratch_dir("cs");
+    let path = write_file(&dir, "a.txt", b"FOO\nfoo\n");
+
+    let out = Command::new(GREP).arg("foo").arg(&path).output().expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"foo\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn unknown_flag_exits_two_for_grep() {
+    let dir = scratch_dir("badflag");
+    let path = write_file(&dir, "a.txt", b"x\n");
+
+    let out = Command::new(GREP)
+        .arg("-x")
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert_eq!(out.status.code(), Some(2), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag"), "stderr = {stderr:?}");
+    cleanup(&dir);
+}
