@@ -286,3 +286,83 @@ fn directory_src_without_dash_r_errors_as_before() {
     assert!(!dst.exists(), "dst should not have been created");
     cleanup(&dir);
 }
+
+#[test]
+fn dash_n_skips_existing_dst_file() {
+    let dir = scratch_dir("dash-n-existing");
+    let src = write_file(&dir, "src.txt", b"new content");
+    let dst = write_file(&dir, "dst.txt", b"old");
+
+    let out = Command::new(CP)
+        .arg("-n")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let preserved = fs::read(&dst).expect("read dst");
+    assert_eq!(preserved, b"old");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_writes_to_nonexistent_dst() {
+    let dir = scratch_dir("dash-n-fresh");
+    let src = write_file(&dir, "src.txt", b"fresh content");
+    let dst = dir.join("dst.txt");
+    assert!(!dst.exists(), "precondition: dst must not exist");
+
+    let out = Command::new(CP)
+        .arg("-n")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let copied = fs::read(&dst).expect("read dst");
+    assert_eq!(copied, b"fresh content");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_with_dash_r_skips_existing_files_in_tree() {
+    let dir = scratch_dir("dash-rn");
+    let src = dir.join("src");
+    fs::create_dir(&src).expect("create src");
+    write_file(&src, "kept.txt", b"src kept");
+    write_file(&src, "fresh.txt", b"src fresh");
+    let dst = dir.join("dst");
+    fs::create_dir(&dst).expect("create dst");
+    let landed = dst.join("src");
+    fs::create_dir(&landed).expect("pre-create dst/src");
+    write_file(&landed, "kept.txt", b"existing");
+
+    let out = Command::new(CP)
+        .arg("-r")
+        .arg("-n")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(
+        fs::read(landed.join("kept.txt")).expect("read kept"),
+        b"existing",
+        "existing file inside dst tree must be preserved"
+    );
+    assert_eq!(
+        fs::read(landed.join("fresh.txt")).expect("read fresh"),
+        b"src fresh",
+        "missing file inside dst tree must be copied"
+    );
+    cleanup(&dir);
+}

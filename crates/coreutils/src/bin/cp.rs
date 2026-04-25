@@ -11,22 +11,28 @@
 //! existing directory, copy src into dst" semantics — chosen
 //! deliberately so re-running `cp -r src/ dst/` doesn't merge into
 //! dst's root). If `dst` exists as a regular file when `src` is a
-//! directory, error out without clobbering. File overwrites inside
-//! the tree are unconditional in this slice (no `-n` / `-i`).
+//! directory, error out without clobbering.
+//!
+//! With `-n` (no-clobber), an existing dst is silently skipped
+//! instead of overwritten — single-file mode short-circuits before
+//! `fs::write`, and `-r` mode skips per-file overwrites inside the
+//! walk so new files copy and existing ones survive untouched
+//! (matches GNU `cp -n`).
 //!
 //! Symlinks: `fs::copy` follows symlinks and copies the target's
 //! bytes — preserving symlinks-as-symlinks is a future flag follow-up.
 //!
 //! Flag parsing mirrors `ls -l` (commit `c3d1aa7`): single-pass
-//! arg split; `-r` and `-R` toggle recursion; everything after `--`
-//! is forced into paths regardless of leading `-`. Unknown flags
-//! write `cp: unknown flag: <flag>` to stderr and exit 2 (distinct
-//! from per-path exit 1).
+//! arg split; `-r` and `-R` toggle recursion; `-n` toggles
+//! no-clobber; everything after `--` is forced into paths
+//! regardless of leading `-`. Unknown flags write
+//! `cp: unknown flag: <flag>` to stderr and exit 2 (distinct from
+//! per-path exit 1).
 //!
 //! Explicitly deferred (each its own future single-slice
-//! follow-up): `-n` (no-clobber), `-i` (interactive), `-v`
-//! (verbose), `-p` (preserve metadata), preserving symlinks as
-//! symlinks, multi-source variadic invocations (`cp a b c dst/`).
+//! follow-up): `-i` (interactive), `-v` (verbose), `-p` (preserve
+//! metadata), preserving symlinks as symlinks, multi-source
+//! variadic invocations (`cp a b c dst/`).
 
 use std::env;
 use std::fs;
@@ -37,6 +43,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut recursive = false;
+    let mut no_clobber = false;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -47,6 +54,8 @@ fn main() -> ExitCode {
         if !sep_seen && arg.starts_with('-') && arg != "-" {
             if arg == "-r" || arg == "-R" {
                 recursive = true;
+            } else if arg == "-n" {
+                no_clobber = true;
             } else {
                 let _ = writeln!(io::stderr(), "cp: unknown flag: {arg}");
                 return ExitCode::from(2);
@@ -87,10 +96,14 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        if let Err(e) = copy_tree(src_path, &target) {
+        if let Err(e) = copy_tree(src_path, &target, no_clobber) {
             let _ = writeln!(io::stderr(), "cp: {e}");
             return ExitCode::from(1);
         }
+        return ExitCode::from(0);
+    }
+
+    if no_clobber && fs::symlink_metadata(dst_path).is_ok() {
         return ExitCode::from(0);
     }
 
@@ -125,7 +138,7 @@ fn resolve_dir_target(src: &Path, dst: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
+fn copy_tree(src: &Path, dst: &Path, no_clobber: bool) -> io::Result<()> {
     match fs::symlink_metadata(dst) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => {
@@ -148,8 +161,11 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", entry.path().display())))?;
         let entry_dst = dst.join(entry.file_name());
         if entry_meta.is_dir() {
-            copy_tree(&entry.path(), &entry_dst)?;
+            copy_tree(&entry.path(), &entry_dst, no_clobber)?;
         } else {
+            if no_clobber && fs::symlink_metadata(&entry_dst).is_ok() {
+                continue;
+            }
             fs::copy(entry.path(), &entry_dst).map_err(|e| {
                 io::Error::new(e.kind(), format!("{}: {e}", entry_dst.display()))
             })?;
