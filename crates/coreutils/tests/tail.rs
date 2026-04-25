@@ -191,3 +191,127 @@ fn negative_count_is_error_exits_one() {
     assert!(stderr.contains("invalid count"), "stderr = {stderr:?}");
     cleanup(&dir);
 }
+
+#[test]
+fn dash_c_prints_last_n_bytes() {
+    let dir = scratch_dir("dashc");
+    let path = write_file(&dir, "input.txt", b"hello world\n");
+
+    let out = Command::new(TAIL)
+        .arg("-c")
+        .arg("5")
+        .arg(&path)
+        .output()
+        .expect("spawn tail");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"orld\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_with_multiple_files_prefixes_each() {
+    let dir = scratch_dir("dashc-multi");
+    let a = write_file(&dir, "a.txt", b"alphabravo");
+    let b = write_file(&dir, "b.txt", b"charliedelta");
+
+    let out = Command::new(TAIL)
+        .arg("-c")
+        .arg("5")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .expect("spawn tail");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    let expected = format!(
+        "==> {} <==\nbravo\n==> {} <==\ndelta",
+        a.display(),
+        b.display(),
+    );
+    assert_eq!(out.stdout, expected.as_bytes());
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_zero_prints_nothing() {
+    let dir = scratch_dir("dashc-zero");
+    let path = write_file(&dir, "input.txt", b"some bytes here\n");
+
+    let out = Command::new(TAIL)
+        .arg("-c")
+        .arg("0")
+        .arg(&path)
+        .output()
+        .expect("spawn tail");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_larger_than_input_prints_whole_input() {
+    let dir = scratch_dir("dashc-large");
+    let path = write_file(&dir, "input.txt", b"abc\n");
+
+    let out = Command::new(TAIL)
+        .arg("-c")
+        .arg("100")
+        .arg(&path)
+        .output()
+        .expect("spawn tail");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"abc\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_via_stdin() {
+    let mut child = Command::new(TAIL)
+        .arg("-c")
+        .arg("4")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tail");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"abcdefghij")
+        .expect("write stdin");
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait tail");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"ghij");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn dash_c_overrides_dash_n_when_both_given() {
+    let dir = scratch_dir("dashc-overrides");
+    let path = write_file(&dir, "input.txt", b"line1\nline2\nline3\n");
+
+    let out = Command::new(TAIL)
+        .arg("-n")
+        .arg("2")
+        .arg("-c")
+        .arg("3")
+        .arg(&path)
+        .output()
+        .expect("spawn tail");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"e3\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}

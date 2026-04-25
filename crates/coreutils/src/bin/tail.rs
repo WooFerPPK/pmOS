@@ -16,6 +16,18 @@
 //! -<N>` to stderr, exit 1. GNU's `tail -n -K` "all but first K"
 //! semantic is intentionally deferred to a future slice.
 //!
+//! Byte-count mode: `-c N` switches the count selector from lines
+//! to bytes — print the last N bytes of each input instead of the
+//! last N lines. Same multi-file headers, same stdin fallback,
+//! same partial-success diagnostic shape. `N=0` prints nothing
+//! (still opens the file so missing-file diagnostics fire). When
+//! both `-n N` and `-c N` are passed in the same argv, the latest
+//! count-selection flag wins (matches GNU behavior — argv left-to-
+//! right, last selector binds the mode + count). The forms
+//! `-c -N` (GNU "all but first N bytes" — symmetric to head's
+//! deferred form) and `-c N[KMG]` (suffix multipliers) are
+//! intentionally deferred to future slices.
+//!
 //! Implementation: read the file fully (v1 has small files; the
 //! streaming O(N)-window form is a future slice if/when it matters),
 //! split on `\n`, take the last N. Mirror cat/grep/cp/mkdir/rm/mv/ls/
@@ -24,8 +36,9 @@
 //! count. Detection: if an arg matches `-?-?\d+` exactly (one
 //! optional sign character then all digits), treat the whole arg as
 //! a count specifier — that distinguishes the bare `-5` form from a
-//! short-flag cluster like `-lc`. Unknown flags write
-//! `tail: unknown flag: <flag>` to stderr and exit 1.
+//! short-flag cluster like `-lc`. `-c N` mirrors `-n N`'s value-
+//! follows-the-flag shape (also accepts `-cN` no-space). Unknown
+//! flags write `tail: unknown flag: <flag>` to stderr and exit 1.
 //!
 //! Pattern precedent: `crates/coreutils/src/bin/{cat,grep,cp,mkdir,rm,mv,ls,head}.rs`.
 
@@ -34,9 +47,16 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
+#[derive(Clone, Copy)]
+enum Mode {
+    Lines,
+    Bytes,
+}
+
 fn main() -> ExitCode {
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut count: u64 = 10;
+    let mut mode = Mode::Lines;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     let mut iter = raw.into_iter();
@@ -48,7 +68,10 @@ fn main() -> ExitCode {
         if !sep_seen && arg.starts_with('-') && arg != "-" {
             if let Some(parsed) = parse_count_arg(&arg) {
                 match parsed {
-                    Ok(n) => count = n,
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Lines;
+                    }
                     Err(bad) => {
                         let _ = writeln!(io::stderr(), "tail: invalid count: {bad}");
                         return ExitCode::from(1);
@@ -62,9 +85,42 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 };
                 match next.parse::<u64>() {
-                    Ok(n) => count = n,
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Lines;
+                    }
                     Err(_) => {
                         let _ = writeln!(io::stderr(), "tail: invalid count: {next}");
+                        return ExitCode::from(1);
+                    }
+                }
+                continue;
+            }
+            if arg == "-c" {
+                let Some(next) = iter.next() else {
+                    let _ = writeln!(io::stderr(), "tail: option requires an argument: -c");
+                    return ExitCode::from(1);
+                };
+                match next.parse::<u64>() {
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Bytes;
+                    }
+                    Err(_) => {
+                        let _ = writeln!(io::stderr(), "tail: invalid count: {next}");
+                        return ExitCode::from(1);
+                    }
+                }
+                continue;
+            }
+            if let Some(rest) = arg.strip_prefix("-c") {
+                match rest.parse::<u64>() {
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Bytes;
+                    }
+                    Err(_) => {
+                        let _ = writeln!(io::stderr(), "tail: invalid count: {rest}");
                         return ExitCode::from(1);
                     }
                 }
@@ -84,7 +140,7 @@ fn main() -> ExitCode {
         let mut buf = Vec::new();
         match io::stdin().lock().read_to_end(&mut buf) {
             Ok(_) => {
-                if let Err(e) = emit_last_n(&buf, count, &mut out) {
+                if let Err(e) = emit_last(&buf, count, mode, &mut out) {
                     let _ = writeln!(io::stderr(), "tail: stdin: {e}");
                     had_error = true;
                 }
@@ -107,7 +163,7 @@ fn main() -> ExitCode {
                             continue;
                         }
                     }
-                    if let Err(e) = emit_last_n(&bytes, count, &mut out) {
+                    if let Err(e) = emit_last(&bytes, count, mode, &mut out) {
                         let _ = writeln!(io::stderr(), "tail: {path}: {e}");
                         had_error = true;
                     }
@@ -155,7 +211,14 @@ fn parse_count_arg(arg: &str) -> Option<Result<u64, String>> {
     None
 }
 
-fn emit_last_n<W: Write>(bytes: &[u8], count: u64, out: &mut W) -> io::Result<()> {
+fn emit_last<W: Write>(bytes: &[u8], count: u64, mode: Mode, out: &mut W) -> io::Result<()> {
+    match mode {
+        Mode::Lines => emit_last_n_lines(bytes, count, out),
+        Mode::Bytes => emit_last_n_bytes(bytes, count, out),
+    }
+}
+
+fn emit_last_n_lines<W: Write>(bytes: &[u8], count: u64, out: &mut W) -> io::Result<()> {
     if count == 0 || bytes.is_empty() {
         return Ok(());
     }
@@ -165,6 +228,16 @@ fn emit_last_n<W: Write>(bytes: &[u8], count: u64, out: &mut W) -> io::Result<()
     for slice in &lines[start..] {
         out.write_all(slice)?;
     }
+    Ok(())
+}
+
+fn emit_last_n_bytes<W: Write>(bytes: &[u8], count: u64, out: &mut W) -> io::Result<()> {
+    if count == 0 || bytes.is_empty() {
+        return Ok(());
+    }
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    let start = bytes.len().saturating_sub(count);
+    out.write_all(&bytes[start..])?;
     Ok(())
 }
 
