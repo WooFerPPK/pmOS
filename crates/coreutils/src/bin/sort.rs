@@ -28,10 +28,22 @@
 //! `fold_to_upper_bytes`. Non-ASCII bytes pass through unchanged
 //! (no Unicode case-folding in v1). When both `-n` and `-f` are
 //! set, numeric dominates: case-folding is a no-op for the
-//! integer-parsing key. `-ru` / `-ur` / `-nr` / `-nu` / `-nru` /
-//! `-fr` / `-fu` / `-fnu` etc. apply the chosen combination.
-//! Unknown flags write `sort: unknown flag: <flag>` to stderr and
-//! exit 2 (matching grep's open-error/usage exit code).
+//! integer-parsing key. `-c` switches sort into check-only mode:
+//! emit no stdout, walk consecutive line pairs computing the same
+//! comparison key the sort path would have used, and on the FIRST
+//! out-of-order pair write `sort: -:<line-num>: disorder: <line>\n`
+//! to stderr (POSIX-conformant diagnostic; the `-:` prefix is
+//! POSIX's "stdin file name" since v1 sort doesn't accept file args
+//! in check mode either) and exit 1; otherwise exit 0 with no
+//! output. `-c` composes with the comparison flags: `-cn` checks
+//! numeric ordering, `-cf` checks fold ordering, `-cr` checks
+//! descending order, `-cu` ALSO checks uniqueness (equal adjacent
+//! keys count as a violation, since under `-u` the input would have
+//! been collapsed). `-ru` / `-ur` / `-nr` / `-nu` / `-nru` /
+//! `-fr` / `-fu` / `-fnu` / `-cn` / `-cf` / `-cr` / `-cu` etc.
+//! apply the chosen combination. Unknown flags write
+//! `sort: unknown flag: <flag>` to stderr and exit 2 (matching
+//! grep's open-error/usage exit code).
 //!
 //! Pattern precedent: `crates/coreutils/src/bin/{cat,grep,wc,head}.rs`.
 
@@ -46,6 +58,7 @@ fn main() -> ExitCode {
     let mut unique = false;
     let mut numeric = false;
     let mut fold = false;
+    let mut check_only = false;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -60,6 +73,7 @@ fn main() -> ExitCode {
                     'u' => unique = true,
                     'n' => numeric = true,
                     'f' => fold = true,
+                    'c' => check_only = true,
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -95,6 +109,10 @@ fn main() -> ExitCode {
         }
     }
 
+    if check_only {
+        return check_sorted(&lines, numeric, fold, reverse, unique);
+    }
+
     if numeric {
         lines.sort_by_key(|line| parse_leading_int(line));
     } else if fold {
@@ -123,6 +141,53 @@ fn main() -> ExitCode {
     }
 
     if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+    Numeric(i64),
+    Bytes(Vec<u8>),
+}
+
+fn key_for(line: &str, numeric: bool, fold: bool) -> Key {
+    if numeric {
+        Key::Numeric(parse_leading_int(line))
+    } else if fold {
+        Key::Bytes(fold_to_upper_bytes(line))
+    } else {
+        Key::Bytes(line.as_bytes().to_vec())
+    }
+}
+
+fn check_sorted(
+    lines: &[String],
+    numeric: bool,
+    fold: bool,
+    reverse: bool,
+    unique: bool,
+) -> ExitCode {
+    use std::cmp::Ordering;
+    for i in 1..lines.len() {
+        let prev = key_for(&lines[i - 1], numeric, fold);
+        let curr = key_for(&lines[i], numeric, fold);
+        let ord = prev.cmp(&curr);
+        let violation = match (reverse, unique) {
+            (false, false) => ord == Ordering::Greater,
+            (false, true) => ord != Ordering::Less,
+            (true, false) => ord == Ordering::Less,
+            (true, true) => ord != Ordering::Greater,
+        };
+        if violation {
+            let _ = writeln!(
+                io::stderr(),
+                "sort: -:{}: disorder: {}",
+                i + 1,
+                lines[i]
+            );
+            return ExitCode::from(1);
+        }
+    }
+    ExitCode::from(0)
 }
 
 fn append_lines(text: &str, sink: &mut Vec<String>) {

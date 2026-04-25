@@ -408,3 +408,133 @@ fn dash_f_alone_with_no_input_is_empty_output() {
     assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
 }
+
+fn run_check(args: &[&str], stdin_bytes: &[u8]) -> std::process::Output {
+    let mut child = Command::new(SORT)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sort");
+
+    if !stdin_bytes.is_empty() {
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe")
+            .write_all(stdin_bytes)
+            .expect("write stdin");
+    }
+    drop(child.stdin.take());
+    child.wait_with_output().expect("wait sort")
+}
+
+#[test]
+fn dash_c_exits_zero_for_sorted_input() {
+    let out = run_check(&["-c"], b"apple\nbanana\ncherry\n");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn dash_c_exits_one_for_unsorted_input() {
+    let out = run_check(&["-c"], b"banana\napple\ncherry\n");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: -:2: disorder: apple"),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_c_emits_diagnostic_for_first_violation_only() {
+    let out = run_check(&["-c"], b"a\nc\nb\nd\nf\ne\n");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let count = stderr.matches("disorder").count();
+    assert_eq!(count, 1, "stderr = {stderr:?} (expected exactly one disorder line)");
+    assert!(
+        stderr.contains("sort: -:3: disorder: b"),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_cn_checks_numeric_order() {
+    let sorted_numeric = run_check(&["-cn"], b"1\n2\n10\n");
+    assert!(
+        sorted_numeric.status.success(),
+        "exit status: {:?}",
+        sorted_numeric.status
+    );
+    assert!(sorted_numeric.stderr.is_empty());
+
+    let lex_only = run_check(&["-c"], b"1\n2\n10\n");
+    assert_eq!(lex_only.status.code(), Some(1), "lex check should fail on numerically-sorted but lex-unsorted input");
+    let stderr = String::from_utf8_lossy(&lex_only.stderr);
+    assert!(stderr.contains("disorder"), "stderr = {stderr:?}");
+}
+
+#[test]
+fn dash_cf_checks_case_insensitive_order() {
+    let sorted_fold = run_check(&["-cf"], b"Apple\nbanana\nCherry\n");
+    assert!(
+        sorted_fold.status.success(),
+        "exit status: {:?}, stderr: {:?}",
+        sorted_fold.status,
+        String::from_utf8_lossy(&sorted_fold.stderr)
+    );
+    assert!(sorted_fold.stderr.is_empty());
+
+    let lex_only = run_check(&["-c"], b"Apple\nbanana\nCherry\n");
+    assert_eq!(lex_only.status.code(), Some(1), "lex check should fail since lowercase b > uppercase C");
+}
+
+#[test]
+fn dash_cr_checks_reverse_order() {
+    let sorted_rev = run_check(&["-cr"], b"cherry\nbanana\napple\n");
+    assert!(
+        sorted_rev.status.success(),
+        "exit status: {:?}",
+        sorted_rev.status
+    );
+    assert!(sorted_rev.stderr.is_empty());
+
+    let ascending_under_reverse = run_check(&["-cr"], b"apple\nbanana\ncherry\n");
+    assert_eq!(
+        ascending_under_reverse.status.code(),
+        Some(1),
+        "reverse check should fail on ascending input"
+    );
+}
+
+#[test]
+fn dash_c_empty_input_exits_zero() {
+    let out = run_check(&["-c"], b"");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn dash_c_single_line_exits_zero() {
+    let out = run_check(&["-c"], b"only\n");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn dash_cu_treats_duplicate_as_violation() {
+    let out = run_check(&["-cu"], b"apple\napple\n");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: -:2: disorder: apple"),
+        "stderr = {stderr:?}"
+    );
+}
