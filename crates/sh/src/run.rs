@@ -201,6 +201,17 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 /// * `${NAME}` is the explicit braced form, semantically
 ///   identical to the greedy bare form once the name is
 ///   isolated by `{` / `}`.
+/// * `${NAME:-default}` is the POSIX "use default value"
+///   parameter expansion. If NAME is unset OR set to the
+///   empty string, the expansion is the literal `default`
+///   bytes (everything between `:-` and the first `}`). If
+///   NAME is set to a non-empty value, the expansion is
+///   that value (the default is discarded). The default
+///   part is a literal string — `$VAR` references inside
+///   the default are NOT recursively expanded in this
+///   slice (so `${UNSET:-$X}` produces the literal `$X`,
+///   not the value of `X`). Recursive expansion is
+///   deferred to a future T142 partial.
 /// * Unset names expand to the empty string. We do NOT
 ///   error and we do NOT remove the token — `echo $UNSET`
 ///   tokenises as `["echo", ""]` post-expansion. This
@@ -219,6 +230,15 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 ///   as a malformed ref: the literal `${NAME` is
 ///   preserved up to end-of-token. POSIX errors here; v1
 ///   prefers leniency over surfacing an error mid-line.
+/// * Other parameter-expansion modifiers are NOT
+///   implemented in this slice and are deferred to future
+///   T142 partials: `${VAR-default}` (no colon — only-if-
+///   unset, treats empty-string as set); `${VAR:=default}`
+///   (default-and-assign — would mutate env);
+///   `${VAR:?error}` (error-if-unset); `${VAR:+alt}`
+///   (alternate-if-set); `${VAR:offset:length}` (substring).
+///   Each of these would extend the `:-` parser path with a
+///   new modifier-byte branch.
 pub(crate) fn expand_vars(token: &str, env: &BTreeMap<String, String>) -> String {
     let bytes = token.as_bytes();
     let mut out = String::with_capacity(token.len());
@@ -240,22 +260,51 @@ pub(crate) fn expand_vars(token: &str, env: &BTreeMap<String, String>) -> String
         match next {
             Some(b'{') => {
                 // Braced form: scan to a matching `}`.
+                // Nested braces are NOT handled — the close
+                // is the FIRST `}` after `${`, matching the
+                // simple-brace existing behavior. A literal
+                // `}` inside the default would need escaping
+                // in a future slice.
                 let name_start = i + 2;
-                let mut name_end = name_start;
-                while name_end < bytes.len() && bytes[name_end] != b'}' {
-                    name_end += 1;
+                let mut close = name_start;
+                while close < bytes.len() && bytes[close] != b'}' {
+                    close += 1;
                 }
-                if name_end >= bytes.len() {
+                if close >= bytes.len() {
                     // Unterminated `${...` — preserve literal.
+                    // Covers both `${X` and `${X:-default`.
                     out.push_str(&token[i..]);
                     return out;
                 }
-                let name = &token[name_start..name_end];
-                if let Some(value) = env.get(name) {
-                    out.push_str(value);
+                // Look for the `:-` modifier inside the brace
+                // region. The name part is everything up to
+                // the modifier; the default part is everything
+                // after, up to the closing `}`. Without the
+                // modifier the whole region is the name (the
+                // existing simple-brace behavior).
+                let region = &token[name_start..close];
+                if let Some(sep) = find_colon_dash(region.as_bytes()) {
+                    let name = &region[..sep];
+                    let default = &region[sep + 2..];
+                    let use_default = match env.get(name) {
+                        None => true,
+                        Some(v) => v.is_empty(),
+                    };
+                    if use_default {
+                        out.push_str(default);
+                    } else {
+                        // Safe: matched `Some(v)` above and
+                        // the empty branch ruled out the
+                        // empty-value case.
+                        out.push_str(env.get(name).expect("checked above"));
+                    }
+                } else {
+                    if let Some(value) = env.get(region) {
+                        out.push_str(value);
+                    }
+                    // Else: unset name → empty string (no append).
                 }
-                // Else: unset name → empty string (no append).
-                i = name_end + 1;
+                i = close + 1;
             }
             Some(c) if is_name_start(c) => {
                 // Bare greedy form: scan name chars.
@@ -288,6 +337,23 @@ fn is_name_start(b: u8) -> bool {
 
 fn is_name_continue(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
+}
+
+/// Find the byte offset of the first `:-` two-byte sequence
+/// inside the given slice, or `None` if absent. Used by the
+/// braced-form expander to split `${NAME:-default}` into the
+/// name and default halves. Returns the offset of the `:`
+/// (so the caller can take `&region[..sep]` for the name and
+/// `&region[sep + 2..]` for the default).
+fn find_colon_dash(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b':' && bytes[i + 1] == b'-' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// One segment of a tokenised word.
@@ -591,5 +657,113 @@ mod expand_tests {
         // literal `\` is preserved, then `$X` expands.
         let env = env_with(&[("X", "v")]);
         assert_eq!(expand_vars("\\$X", &env), "\\v");
+    }
+
+    #[test]
+    fn default_value_used_when_var_is_unset() {
+        // `${UNSET:-fallback}` with no env entry → `fallback`.
+        // This is the canonical use-case for `:-`: a guard
+        // against missing env vars.
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("${UNSET:-fallback}", &env), "fallback");
+    }
+
+    #[test]
+    fn default_value_used_when_var_is_empty() {
+        // `${X:-fallback}` with `X=""` → `fallback`. The colon
+        // in `:-` is what makes the empty-string case use the
+        // default; the no-colon `${X-fallback}` form (NOT
+        // implemented this slice) would treat empty-string as
+        // "set" and skip the default.
+        let env = env_with(&[("X", "")]);
+        assert_eq!(expand_vars("${X:-fallback}", &env), "fallback");
+    }
+
+    #[test]
+    fn actual_value_used_when_var_is_set_to_nonempty() {
+        // `${X:-fallback}` with `X=hello` → `hello`. The
+        // default is discarded — only consulted when the var
+        // is unset or empty.
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(expand_vars("${X:-fallback}", &env), "hello");
+    }
+
+    #[test]
+    fn default_value_can_be_empty() {
+        // `${UNSET:-}` is a valid POSIX form — explicit
+        // "expand to empty if unset", which is exactly what
+        // the bare `${UNSET}` already does. Test exists to
+        // guard against the parser rejecting an empty default
+        // (it should accept the zero-byte tail after `:-`).
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("${UNSET:-}", &env), "");
+    }
+
+    #[test]
+    fn default_value_can_contain_spaces() {
+        // `${UNSET:-some default}` → `some default`. Spaces
+        // inside the brace region survive because the brace
+        // parser scans the whole region as one chunk; this
+        // test drives `expand_vars` directly because the
+        // unquoted shell tokeniser would split on the space
+        // BEFORE expansion runs (so `echo ${UNSET:-some
+        // default}` would tokenise as `["echo",
+        // "${UNSET:-some", "default}"]`). The work-around at
+        // the user level is to wrap the expansion in double
+        // quotes, which the existing T142 partial supports.
+        let env = env_with(&[]);
+        assert_eq!(
+            expand_vars("${UNSET:-some default}", &env),
+            "some default"
+        );
+    }
+
+    #[test]
+    fn default_value_does_not_recursively_expand_vars() {
+        // `${UNSET:-$X}` with `X=hello` → literal `$X`, NOT
+        // `hello`. Recursive expansion of the default part is
+        // explicitly deferred — keeping the default as a
+        // literal string keeps the parser shape simple
+        // (one-pass, no recursion) and matches the slice-scope
+        // boundary documented in the doc-comment.
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(expand_vars("${UNSET:-$X}", &env), "$X");
+    }
+
+    #[test]
+    fn unterminated_brace_in_default_form_preserves_literal() {
+        // `${X:-no_close` with no closing `}` → preserved
+        // as-is, mirroring the existing `${X` unterminated
+        // behavior. POSIX errors here; v1 prefers leniency
+        // over surfacing a mid-line error.
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(
+            expand_vars("${X:-no_close", &env),
+            "${X:-no_close"
+        );
+    }
+
+    #[test]
+    fn default_value_with_set_var_ignores_default() {
+        // Regression guard combining the set-var path with a
+        // default that contains noise: the default must NOT
+        // appear in the output when the var is set.
+        let env = env_with(&[("X", "actual")]);
+        assert_eq!(
+            expand_vars("${X:-this is junk}", &env),
+            "actual"
+        );
+    }
+
+    #[test]
+    fn default_value_in_middle_of_token_concatenates() {
+        // Surrounding text on either side of the brace region
+        // is preserved — the scanner advances past the closing
+        // `}` and resumes literal copying.
+        let env = env_with(&[]);
+        assert_eq!(
+            expand_vars("a${UNSET:-mid}b", &env),
+            "amidb"
+        );
     }
 }

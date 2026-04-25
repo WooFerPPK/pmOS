@@ -107,3 +107,40 @@ fn echo_braced_form_lets_literal_chars_follow() {
         "stdout missing braced expansion: {stdout:?}"
     );
 }
+
+#[test]
+fn echo_default_value_used_when_var_is_unset() {
+    // `echo ${UNSET:-fallback}` with no env entry → stdout
+    // contains `fallback\n`. End-to-end check that the new
+    // `:-` modifier reaches the REPL dispatch path.
+    let (status, stdout, stderr, _env) =
+        drive("echo ${UNSET:-fallback}\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("fallback\n"),
+        "stdout missing default value: {stdout:?}"
+    );
+}
+
+#[test]
+fn echo_default_value_skipped_when_var_is_set() {
+    // `echo ${X:-fallback}` with `X=hello` → stdout
+    // contains `hello\n`, NOT `fallback`. Confirms the
+    // set-var branch wins over the default at the REPL
+    // surface.
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "hello".to_string());
+    let (status, stdout, stderr, _env) =
+        drive("echo ${X:-fallback}\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("hello\n"),
+        "stdout missing set value: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("fallback"),
+        "stdout should not contain the default: {stdout:?}"
+    );
+}
