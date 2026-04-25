@@ -167,6 +167,14 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 
         match dispatch_builtin(&expanded_refs, &mut cwd, env, &mut stdout, &mut stderr) {
             BuiltinOutcome::Continue => {}
+            BuiltinOutcome::Status(_) => {
+                // Builtin reported a non-zero exit status but
+                // the REPL continues (e.g. `false` always
+                // returns Status(1)). The status byte is
+                // currently dropped — a future slice will
+                // stash it and surface it as `$?` for the
+                // next command's expansion.
+            }
             BuiltinOutcome::Exit(code) => return ExitStatus::Exit(code),
             BuiltinOutcome::IoError => return ExitStatus::IoError,
             BuiltinOutcome::NotBuiltin => {

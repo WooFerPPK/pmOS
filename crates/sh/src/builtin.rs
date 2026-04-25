@@ -8,11 +8,11 @@
 //! [`dispatch_builtin`] from this module the same way it
 //! used to consume them as same-file items.
 //!
-//! The set is the minimal v1 dispatch: `:`, `true`, `echo`,
-//! `exit`, `cd`, `pwd`, `env`, `export`, `unset`. Anything
-//! else returns [`BuiltinOutcome::NotBuiltin`] so the REPL
-//! can fall through to the "command not found" path until a
-//! future slice wires `proc_spawn` into userland.
+//! The set is the minimal v1 dispatch: `:`, `true`, `false`,
+//! `echo`, `exit`, `cd`, `pwd`, `env`, `export`, `unset`.
+//! Anything else returns [`BuiltinOutcome::NotBuiltin`] so
+//! the REPL can fall through to the "command not found" path
+//! until a future slice wires `proc_spawn` into userland.
 
 use core::str::FromStr;
 use std::collections::BTreeMap;
@@ -24,6 +24,12 @@ use std::path::{Path, PathBuf};
 pub(crate) enum BuiltinOutcome {
     /// Builtin ran; continue the REPL.
     Continue,
+    /// Builtin ran with this non-zero exit status; the REPL
+    /// continues. Distinct from [`BuiltinOutcome::Exit`],
+    /// which terminates the whole shell. Used by `false` so
+    /// `cmd || false` semantics are recoverable. A future
+    /// slice will surface this as `$?` for the next command.
+    Status(i32),
     /// `exit` was invoked; terminate with this code.
     Exit(i32),
     /// Stdout / stderr write failed.
@@ -46,6 +52,7 @@ pub(crate) fn dispatch_builtin<W: Write, E: Write>(
     match tokens[0] {
         ":" => BuiltinOutcome::Continue,
         "true" => BuiltinOutcome::Continue,
+        "false" => BuiltinOutcome::Status(1),
         "echo" => builtin_echo(&tokens[1..], stdout),
         "exit" => builtin_exit(&tokens[1..], stderr),
         "cd" => builtin_cd(&tokens[1..], cwd),
