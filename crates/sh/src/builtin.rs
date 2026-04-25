@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 /// Shell-wide mode flags toggled at runtime by `set`.
 ///
 /// Surfaces the POSIX `errexit` (`set -e` / `set -o
-/// errexit`) and `nounset` (`set -u` / `set -o nounset`)
-/// modes. Future flags (`set -x` for "trace each
-/// command", `set -n` for "syntax-check only") slot in as
+/// errexit`), `nounset` (`set -u` / `set -o nounset`), and
+/// `xtrace` (`set -x` / `set -o xtrace`) modes. Future
+/// flags (`set -n` for "syntax-check only") slot in as
 /// sibling fields on this struct without changing any
 /// existing call site — `dispatch_builtin` already takes
 /// `flags: &mut ShellFlags`, so a new mode is one extra
@@ -46,6 +46,26 @@ pub struct ShellFlags {
     /// always defined. Off by default — POSIX shells start
     /// with nounset cleared.
     pub nounset: bool,
+    /// `set -x` / `set -o xtrace`: write each command to
+    /// stderr BEFORE executing it, prefixed by `+ ` (the
+    /// default POSIX PS4 prompt). The trace shows the
+    /// EXPANDED tokens joined by single spaces, NOT the
+    /// original input bytes — so `echo $X` with `X=hello`
+    /// traces as `+ echo hello`. The trace fires AFTER
+    /// expansion succeeds (so var refs are resolved) but
+    /// BEFORE dispatch (so it precedes execution). Blank
+    /// lines, quote errors, and expansion errors all skip
+    /// the trace because they short-circuit before reaching
+    /// the trace point — POSIX-aligned because none of those
+    /// cases produce an executed command. The first `set -x`
+    /// line does NOT trace itself: at its trace point xtrace
+    /// is still false (the dispatch hasn't run yet); only
+    /// subsequent commands trace. Conversely `set +x` DOES
+    /// trace itself because at ITS trace point xtrace is
+    /// still true from the previous line; the clear happens
+    /// during dispatch. Off by default — POSIX shells start
+    /// with xtrace cleared.
+    pub xtrace: bool,
 }
 
 /// Outcome of dispatching one builtin.
@@ -279,13 +299,15 @@ fn builtin_unset<E: Write>(
 
 /// POSIX `set` builtin — mode-flag toggle.
 ///
-/// v1 supports the `errexit` and `nounset` flags in two
-/// equivalent shapes each:
+/// v1 supports the `errexit`, `nounset`, and `xtrace`
+/// flags in two equivalent shapes each:
 ///
 /// * `set -e` / `set -o errexit` — turn errexit ON.
 /// * `set +e` / `set +o errexit` — turn errexit OFF.
 /// * `set -u` / `set -o nounset` — turn nounset ON.
 /// * `set +u` / `set +o nounset` — turn nounset OFF.
+/// * `set -x` / `set -o xtrace` — turn xtrace ON.
+/// * `set +x` / `set +o xtrace` — turn xtrace OFF.
 ///
 /// `set` with no args is a no-op in v1 (POSIX defines this
 /// as "print every shell variable" but the v1 `env` builtin
@@ -303,7 +325,12 @@ fn builtin_unset<E: Write>(
 /// errexit check naturally skips `set` invocations. The
 /// same property holds for nounset: `set -u` doesn't itself
 /// reference any variable, so the expansion-layer nounset
-/// check can never trigger on the `set` line.
+/// check can never trigger on the `set` line. xtrace
+/// follows a similar pattern: the trace point is in the
+/// dispatch loop AFTER expansion and BEFORE dispatch, so
+/// the `set -x` line itself prints under whatever value
+/// xtrace had BEFORE the line was processed — the first
+/// `set -x` doesn't trace itself; subsequent commands do.
 fn builtin_set<E: Write>(
     args: &[&str],
     flags: &mut ShellFlags,
@@ -329,6 +356,8 @@ fn builtin_set<E: Write>(
             "+e" => flags.errexit = false,
             "-u" => flags.nounset = true,
             "+u" => flags.nounset = false,
+            "-x" => flags.xtrace = true,
+            "+x" => flags.xtrace = false,
             "-o" | "+o" => {
                 // `set -o NAME` / `set +o NAME` — the
                 // long-option form. The polarity (`-` vs
@@ -344,6 +373,7 @@ fn builtin_set<E: Write>(
                 match *name {
                     "errexit" => flags.errexit = on,
                     "nounset" => flags.nounset = on,
+                    "xtrace" => flags.xtrace = on,
                     other => {
                         let _ = writeln!(
                             stderr,
