@@ -246,6 +246,16 @@ pub struct Kernel {
     /// a pid; PMos v1 rejects them. Future slice can lift this if
     /// a multi-threaded-pid arc lands.
     pub(crate) parked_waiters: alloc::collections::BTreeMap<Pid, WaitParker>,
+    /// Pids parked on a blocking `ipc_recv`. Keyed by parker pid so
+    /// the proc-exit / SIGKILL cleanup paths do an O(log n) drop;
+    /// the wake path (`wake_parked_recver_if_any`) walks the map
+    /// looking for the entry whose `socket_id` matches the peer
+    /// the bytes just landed on.
+    ///
+    /// v1 invariant: at most one parker per pid. A second blocking
+    /// ipc_recv from an already-parked pid returns -EAGAIN. Mirror
+    /// of the `parked_acceptor`/`parked_waiters` one-parker rules.
+    pub(crate) parked_recvers: alloc::collections::BTreeMap<Pid, RecvParker>,
 }
 
 /// Optional heap payload attached to a pending wake. Slice 2c.1.
@@ -286,6 +296,30 @@ pub struct WaitParker {
     pub heap_len: u32,
 }
 
+/// Parked-recver record. One entry per parked pid in
+/// `Kernel.parked_recvers`. Constructed by [`Kernel::park_on_recv`];
+/// consumed by the peer-send wake path
+/// ([`Kernel::wake_parked_recver_if_any`]) +
+/// [`Kernel::interrupt_parked_recv`] + the SIGKILL/proc_exit
+/// surgical `parked_recvers.remove` calls + the socket-close drain
+/// in [`Kernel::wake_parked_recvers_on_socket_close`].
+///
+/// `socket_id` is the receive-side socket the parker is draining.
+/// The peer's send hook compares `peer_id == parker.socket_id` to
+/// route the wake. `max_len` / `recv_fd_slot` / `heap_ptr` /
+/// `heap_len` mirror the in-flight `IPC_RECV` parameters so the
+/// wake builds the same fd-leading heap layout f00e559's non-
+/// blocking path produces.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RecvParker {
+    pub req_id: u32,
+    pub socket_id: SocketId,
+    pub max_len: u32,
+    pub recv_fd_slot: i32,
+    pub heap_ptr: u32,
+    pub heap_len: u32,
+}
+
 /// Test helper: expose the `ext.rs`-private `pack_exit_status`
 /// helper so tests can build expected-value assertions
 /// identical to what the synchronous-reap path produces.
@@ -307,6 +341,7 @@ impl Kernel {
             signal_inboxes: BTreeMap::new(),
             pending_wakes: alloc::vec::Vec::new(),
             parked_waiters: alloc::collections::BTreeMap::new(),
+            parked_recvers: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -645,10 +680,26 @@ impl Kernel {
             FdObject::CharDevice(devnum) => {
                 self.devs.write(devnum, buf).map_err(KernelError::from)
             }
-            FdObject::Socket(id) => self
-                .ipc
-                .send_on_socket(SocketId(id), buf, Vec::new())
-                .map_err(KernelError::from),
+            FdObject::Socket(id) => {
+                let r = self
+                    .ipc
+                    .send_on_socket(SocketId(id), buf, Vec::new())
+                    .map_err(KernelError::from);
+                if r.is_ok() {
+                    // Bytes landed on the peer's rx_buf — if any pid
+                    // is parked on a blocking ipc_recv against the
+                    // peer socket, wake it now with the freshly-
+                    // available bytes.
+                    if let Some(peer_id) = self
+                        .ipc
+                        .sockets_get(SocketId(id))
+                        .and_then(|s| s.peer)
+                    {
+                        let _ = self.wake_parked_recver_if_any(peer_id);
+                    }
+                }
+                r
+            }
             FdObject::PipeWrite(id) => {
                 use crate::ipc::{PipeId, PipeWriteResult};
                 match self.ipc.pipe_mut(PipeId(id)) {
@@ -974,6 +1025,242 @@ impl Kernel {
         true
     }
 
+    // --- ipc_recv blocking primitives ----------------------------
+
+    /// Park `pid` on a connected socket waiting for bytes (or fds)
+    /// to arrive, recording the in-flight `IPC_RECV` parameters so
+    /// a future `ipc_send` from the peer can build the response
+    /// the non-blocking path would have produced inline. Transitions
+    /// `pid` from `Running` to `BlockedOnIpc`.
+    ///
+    /// Returns `WouldBlock` if `pid` is already parked on a recv
+    /// (v1 one-parker-per-pid invariant — a second blocking recv
+    /// from an already-parked pid is an apparent deadlock and the
+    /// caller must drain its existing wake first). Returns
+    /// `BadFd` / `NotSupportedOnFd` / `InvalidArgument` for the
+    /// usual fd-resolution failures (mirrors the non-blocking
+    /// recv's `socket_id_from_fd` precondition).
+    ///
+    /// Called from `handle_ipc_recv` ONLY after the non-blocking
+    /// recv path returns `WouldBlock` AND the caller's `flags & 0x01
+    /// == 0` (default-blocking). The handler is the single source
+    /// of truth for the should-park decision; this method does not
+    /// re-check rx_buf / rx_fds emptiness.
+    pub fn park_on_recv(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+        request_id: u32,
+        max_len: u32,
+        recv_fd_slot: i32,
+        heap_ptr: u32,
+        heap_len: u32,
+    ) -> Result<(), KernelError> {
+        if self.parked_recvers.contains_key(&pid) {
+            return Err(KernelError::WouldBlock);
+        }
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        // Validate the socket is in a state where a recv could
+        // legitimately have parked. `recv_on_socket` would have
+        // returned `InvalidState` for non-Connected sockets and
+        // the non-blocking handler would have surfaced that as
+        // `-EINVAL` rather than parking — guard against the harness
+        // mistake of parking on a non-Connected socket.
+        let sock = self
+            .ipc
+            .sockets_get(socket_id)
+            .ok_or(KernelError::BadFd)?;
+        if sock.state != crate::ipc::SocketState::Connected {
+            return Err(KernelError::InvalidArgument);
+        }
+        self.parked_recvers.insert(
+            pid,
+            RecvParker {
+                req_id: request_id,
+                socket_id,
+                max_len,
+                recv_fd_slot,
+                heap_ptr,
+                heap_len,
+            },
+        );
+        self.procs
+            .transition(pid, ProcState::BlockedOnIpc)
+            .map_err(|_| {
+                // Roll back the parker insertion on transition
+                // failure so we don't leak a parker slot on a
+                // now-dead pid.
+                self.parked_recvers.remove(&pid);
+                KernelError::NoSuchPid
+            })?;
+        self.procs.set_block_reason(
+            pid,
+            crate::proc::BlockReason::Ipc { endpoint_id: socket_id.0 },
+        );
+        Ok(())
+    }
+
+    /// Companion to `park_on_recv`. Called from `ipc_send`'s
+    /// success path with the PEER socket id (the receive-side
+    /// socket the bytes / fds just landed on — NOT the sender's
+    /// own socket). If any pid is parked on `socket_id`, this:
+    ///
+    ///   1. Drains rx_buf + rx_fds inline via `ipc_recv` (which
+    ///      reuses the non-blocking path's fd-translation logic)
+    ///      with the parker's recorded `max_len` / `recv_fd_slot`.
+    ///   2. Builds the same fd-leading heap layout the non-blocking
+    ///      `handle_ipc_recv` produces — leading 4-byte fd-number
+    ///      when `want_fd && new_fd.is_some()`, payload bytes
+    ///      after — and queues a `Response { value = bytes,
+    ///      extra_len = total }` on `pending_wakes` together with
+    ///      a `PendingHeap { heap_ptr, bytes }` so the TS drainer
+    ///      copies the heap bytes back into the parker's SAB
+    ///      heap-scratch window.
+    ///   3. Transitions the parker Ready, clears block_reason,
+    ///      removes the parker slot.
+    ///
+    /// If the inline recv fails (shouldn't happen — the parker's
+    /// socket id was validated at park time and the wake is fired
+    /// right after a successful send), the wake is queued as an
+    /// errno wake so the parker doesn't sit BlockedOnIpc forever.
+    ///
+    /// Returns `true` iff a parker was woken. Production callers
+    /// discard the bool; tests use it.
+    pub(crate) fn wake_parked_recver_if_any(&mut self, socket_id: SocketId) -> bool {
+        // Find the parker (if any) by socket_id. The map is keyed
+        // by pid for O(log n) cleanup, but the wake path needs a
+        // socket-id lookup — a linear walk is fine in v1 (parker
+        // count == active blocking recvs, which is small).
+        let parker_pid = self
+            .parked_recvers
+            .iter()
+            .find_map(|(pid, parker)| {
+                if parker.socket_id == socket_id {
+                    Some(*pid)
+                } else {
+                    None
+                }
+            });
+        let Some(parker_pid) = parker_pid else {
+            return false;
+        };
+        let parker = self
+            .parked_recvers
+            .remove(&parker_pid)
+            .expect("parker entry vanished between find and remove");
+
+        // Reuse the non-blocking semantic: drain bytes + optional
+        // fd via `Kernel::ipc_recv`, which routes through the same
+        // `IpcTable::recv_on_socket` + `translate_passed_fd` flow
+        // the f00e559 handler uses. We need an fd here — derive it
+        // by reverse-looking-up the socket id in the parker's fd
+        // table. The parker's socket fd may have been closed in
+        // the window between park and wake; if so, queue an EBADF
+        // wake (the parker's fd is gone) instead of a successful
+        // wake against a stale socket.
+        let parker_fd = self
+            .fds
+            .get(&parker_pid)
+            .and_then(|table| {
+                table.iter().find_map(|(fd, entry)| match entry.object {
+                    FdObject::Socket(id) if id == parker.socket_id.0 => Some(fd),
+                    _ => None,
+                })
+            });
+        let want_fd = parker.recv_fd_slot >= 0;
+        let wake_resp_and_heap = match parker_fd {
+            Some(fd) => match self.ipc_recv(parker_pid, fd, parker.max_len as usize, want_fd) {
+                Ok((bytes, new_fd)) => {
+                    let installed = new_fd.is_some();
+                    let payload_offset = if installed { 4 } else { 0 };
+                    let total = payload_offset + bytes.len();
+                    let mut heap_bytes = alloc::vec![0u8; total];
+                    if let Some(n) = new_fd {
+                        heap_bytes[0..4].copy_from_slice(&n.to_le_bytes());
+                    }
+                    heap_bytes[payload_offset..payload_offset + bytes.len()]
+                        .copy_from_slice(&bytes);
+                    let resp = abi::ring::Response {
+                        request_id: parker.req_id,
+                        status: 0,
+                        value: bytes.len() as i64,
+                        extra_len: total as u32,
+                        _pad: [0u8; 12],
+                    };
+                    let heap = if total > 0 {
+                        Some(PendingHeap {
+                            heap_ptr: parker.heap_ptr,
+                            bytes: heap_bytes,
+                        })
+                    } else {
+                        None
+                    };
+                    (resp, heap)
+                }
+                Err(crate::sys::KernelError::NotSupportedOnFd) => (
+                    abi::ring::Response::err(parker.req_id, abi::errno::EBADF),
+                    None,
+                ),
+                Err(e) => (
+                    abi::ring::Response::err(
+                        parker.req_id,
+                        crate::syscall::dispatch::kerr_to_errno(e),
+                    ),
+                    None,
+                ),
+            },
+            None => (
+                abi::ring::Response::err(parker.req_id, abi::errno::EBADF),
+                None,
+            ),
+        };
+        let (wake_resp, wake_heap) = wake_resp_and_heap;
+        self.pending_wakes.push((parker_pid, wake_resp, wake_heap));
+        let _ = self.procs.transition(parker_pid, ProcState::Ready);
+        self.procs.clear_block_reason(parker_pid);
+        true
+    }
+
+    /// Interrupt any parked `ipc_recv` on `pid` with `-EINTR`.
+    /// Removes the `parked_recvers` slot, queues a wake with
+    /// `Response::err(req_id, -EINTR)` onto `pending_wakes`,
+    /// transitions `pid` Ready, clears `block_reason`. No-op if
+    /// `pid` is not parked on recv.
+    ///
+    /// Called from `handle_proc_kill`'s `Signal::Term` arm
+    /// alongside the existing `interrupt_parked_accept` /
+    /// `interrupt_parked_wait` calls. The three methods are
+    /// idempotent against each other: at most one of them observes
+    /// the parker slot (a pid parks on at most one primitive at a
+    /// time in v1).
+    ///
+    /// Returns `true` iff a park was interrupted. Production
+    /// callers discard the bool; tests use it.
+    pub fn interrupt_parked_recv(&mut self, pid: Pid) -> bool {
+        let Some(parker) = self.parked_recvers.remove(&pid) else {
+            return false;
+        };
+        let wake_resp = abi::ring::Response::err(parker.req_id, abi::errno::EINTR);
+        self.pending_wakes.push((pid, wake_resp, None));
+        // Best-effort state transition (mirrors interrupt_parked_
+        // accept's race comment).
+        let _ = self.procs.transition(pid, ProcState::Ready);
+        self.procs.clear_block_reason(pid);
+        true
+    }
+
+    /// Test helper: True iff `pid` has a `RecvParker` recorded.
+    #[doc(hidden)]
+    pub fn parked_recvers_contains(&self, pid: Pid) -> bool {
+        self.parked_recvers.contains_key(&pid)
+    }
+
+    /// Test helper: clone of a parker entry by pid for assertions.
+    #[doc(hidden)]
+    pub fn parked_recvers_get(&self, pid: Pid) -> Option<RecvParker> {
+        self.parked_recvers.get(&pid).copied()
+    }
+
     // --- Generic IPC sockets -------------------------------------
     //
     // Thin wrappers around the `IpcTable` socket primitives that
@@ -1139,9 +1426,24 @@ impl Kernel {
                     Some(f) => alloc::vec![f],
                     None => Vec::new(),
                 };
-                self.ipc
+                let r = self
+                    .ipc
                     .send_on_socket(SocketId(id), buf, passed)
-                    .map_err(KernelError::from)
+                    .map_err(KernelError::from);
+                if r.is_ok() {
+                    // Bytes / fds landed on the peer's rx side — if
+                    // any pid is parked on a blocking ipc_recv
+                    // against the peer socket, wake it now with the
+                    // freshly-available payload + ancillary fd.
+                    if let Some(peer_id) = self
+                        .ipc
+                        .sockets_get(SocketId(id))
+                        .and_then(|s| s.peer)
+                    {
+                        let _ = self.wake_parked_recver_if_any(peer_id);
+                    }
+                }
+                r
             }
             FdObject::PipeWrite(id) => {
                 if fd_to_pass.is_some() {
@@ -1186,13 +1488,13 @@ impl Kernel {
     /// semantic, distinct from FD_READ's EINVAL on a non-readable
     /// fd).
     ///
-    /// Non-blocking only in v1: an empty rx_buf AND empty rx_fds
-    /// surfaces as [`KernelError::WouldBlock`] which the dispatcher
-    /// turns into EAGAIN. Blocking-recv would need a parking
-    /// primitive (sibling to `park_on_accept`) plus a wake hook on
-    /// `send_on_socket`'s rx-buf grow path; that's the next slice's
-    /// scope — documented here so the missing piece is visible to
-    /// the next agent that needs blocking semantics.
+    /// Empty-socket semantics: an empty rx_buf AND empty rx_fds
+    /// surfaces as [`KernelError::WouldBlock`]. The dispatcher
+    /// chooses behavior based on the IPC_RECV `flags & 0x01` bit:
+    /// non-blocking returns `-EAGAIN`; blocking calls
+    /// [`Self::park_on_recv`] to put the caller into BlockedOnIpc
+    /// and wakes them via [`Self::wake_parked_recver_if_any`] on
+    /// the next peer-side `ipc_send` (or `fd_write`) success.
     ///
     /// `want_fd = false` semantics: the rx_fds queue is left
     /// untouched even if it has entries waiting. A subsequent
@@ -1372,6 +1674,11 @@ impl Kernel {
             })
             .collect();
         for id in orphans {
+            // Mirror release_object's recv-parker drain: wake any
+            // parked recver on this socket (or its peer) with EBADF
+            // BEFORE closing the socket, so the parker observes
+            // the error path rather than sitting parked forever.
+            self.wake_parked_recvers_on_socket_close(id);
             match self.ipc.close_socket(id) {
                 Ok(Some((parker_pid, req_id))) => {
                     self.pending_wakes.push((
@@ -1402,6 +1709,13 @@ impl Kernel {
                 let _ = self.ipc.drop_pipe_writer(crate::ipc::PipeId(id));
             }
             FdObject::Socket(id) => {
+                // Wake any blocking-recv parker waiting on this
+                // socket BEFORE the close — their socket is going
+                // away, so the wake response is EBADF (the fd they
+                // were parked on no longer exists). Mirror of the
+                // close_socket parker drain that handles the accept
+                // side.
+                self.wake_parked_recvers_on_socket_close(crate::ipc::SocketId(id));
                 match self.ipc.close_socket(crate::ipc::SocketId(id)) {
                     Ok(Some((parker_pid, req_id))) => {
                         self.pending_wakes.push((
@@ -1420,6 +1734,47 @@ impl Kernel {
             | FdObject::CharDevice(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel => {}
+        }
+    }
+
+    /// Drain any parked-recver entries whose `socket_id` matches
+    /// `socket_id` (or whose `socket_id` matches the peer of
+    /// `socket_id` — closing one end of a connected pair makes the
+    /// peer effectively unreadable). For each match, queue a
+    /// `Response::err(req_id, -EBADF)` wake on `pending_wakes`,
+    /// transition the parker Ready, clear `block_reason`, drop the
+    /// parker slot.
+    ///
+    /// Mirror of `IpcTable::close_socket`'s parked-acceptor drain
+    /// for the recv side. v1's one-parker-per-pid invariant means
+    /// at most one match per side, but the implementation walks
+    /// the map anyway in case future slices lift that invariant.
+    fn wake_parked_recvers_on_socket_close(&mut self, socket_id: crate::ipc::SocketId) {
+        // Identify the peer (if any) so a close on one end of a
+        // connected pair wakes a parker on the other end too.
+        let peer_id = self
+            .ipc
+            .sockets_get(socket_id)
+            .and_then(|s| s.peer);
+        let to_wake: alloc::vec::Vec<(Pid, u32)> = self
+            .parked_recvers
+            .iter()
+            .filter_map(|(pid, parker)| {
+                let matches = parker.socket_id == socket_id
+                    || peer_id.map(|p| p == parker.socket_id).unwrap_or(false);
+                if matches {
+                    Some((*pid, parker.req_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (parker_pid, req_id) in to_wake {
+            self.parked_recvers.remove(&parker_pid);
+            let resp = abi::ring::Response::err(req_id, abi::errno::EBADF);
+            self.pending_wakes.push((parker_pid, resp, None));
+            let _ = self.procs.transition(parker_pid, ProcState::Ready);
+            self.procs.clear_block_reason(parker_pid);
         }
     }
 
@@ -1469,6 +1824,9 @@ impl Kernel {
         // proc_wait, clear the slot so the exit-time sweep
         // mirrors the ipc_accept side.
         self.parked_waiters.remove(&pid);
+        // Same surgical sweep for the blocking ipc_recv parker
+        // slot — an exiting pid can't observe a recv wake.
+        self.parked_recvers.remove(&pid);
         self.release_fd_table_resources(pid);
         let ppid = self.procs.get(pid).map(|p| p.ppid).unwrap_or(0);
         self.procs
@@ -1872,6 +2230,11 @@ impl Kernel {
                 // catchable-signal arm). This just clears the
                 // stale slot.
                 self.parked_waiters.remove(&target_pid);
+                // Same surgical sweep for parked_recvers. SIGKILL
+                // takes the parker out without an EINTR wake — the
+                // process is dead, no userland will observe the
+                // wake response.
+                self.parked_recvers.remove(&target_pid);
                 let target_ppid = target.ppid;
                 self.procs
                     .exit(target_pid, ExitStatus::Signaled(signal.number()))

@@ -1530,9 +1530,17 @@ fn ipc_recv_with_fd_pass_installs_fd_in_receiver_table() {
 }
 
 #[test]
-fn ipc_recv_on_empty_socket_returns_eagain() {
+fn ipc_recv_with_flags_one_is_nonblocking_returns_eagain() {
     // No IPC_SEND has happened — rx_buf and rx_fds are both empty.
-    // v1 doesn't park; the dispatcher must surface EAGAIN.
+    // With `flags = 1` (non-blocking, the legacy f00e559 default
+    // semantic), the dispatcher must surface EAGAIN rather than
+    // park the caller.
+    //
+    // Renamed from the original `ipc_recv_on_empty_socket_returns_
+    // eagain` test: blocking-recv is now the default (flags & 0x01
+    // == 0); the eagain semantic is opt-in via the NONBLOCK flag
+    // bit. The blocking sibling lives at
+    // `ipc_recv_on_empty_socket_blocking_parks_caller`.
     let mut k = make_kernel();
     let server = make_running_proc(&mut k, "srv", 0);
     let client = make_running_proc(&mut k, "cli", 0);
@@ -1547,13 +1555,21 @@ fn ipc_recv_on_empty_socket_returns_eagain() {
             opcode: op_ext::IPC_RECV,
             flags: 0,
             request_id: 550,
-            args: ipc_recv_args(srv_conn, 32, -1, 0),
+            args: ipc_recv_args(srv_conn, 32, -1, 1),
             heap_ptr: 0,
             heap_len: 32,
         },
         &mut heap,
     );
     assert_eq!(recv_resp.status, -errno::EAGAIN);
+
+    // Caller must NOT have parked: the non-blocking path bypasses
+    // park_on_recv entirely. Verify the parker slot is still empty.
+    assert!(!k.parked_recvers_contains(server));
+    assert_eq!(
+        k.procs.get(server).unwrap().state,
+        ProcState::Running
+    );
 }
 
 #[test]
@@ -1585,10 +1601,16 @@ fn ipc_recv_on_non_socket_fd_returns_ebadf() {
 }
 
 #[test]
-fn ipc_recv_with_invalid_flags_returns_einval_atomically() {
-    // flags = 1 isn't a recognised v1 bit; the handler must reject
-    // with EINVAL BEFORE touching rx state. Verify the rx_buf still
-    // holds the bytes the prior IPC_SEND deposited.
+fn ipc_recv_with_invalid_flag_bit_returns_einval_atomically() {
+    // flags = 2 sets a reserved bit (only bit 0 = NONBLOCK is
+    // recognised in v1); the handler must reject with EINVAL
+    // BEFORE touching rx state. Verify the rx_buf still holds the
+    // bytes the prior IPC_SEND deposited.
+    //
+    // Replaces the original `ipc_recv_with_invalid_flags_returns_
+    // einval_atomically` test: that test used `flags = 1` which is
+    // now valid (non-blocking); the invalid-flag-bit invariant now
+    // requires probing a bit other than 0x01.
     let mut k = make_kernel();
     let server = make_running_proc(&mut k, "srv", 0);
     let client = make_running_proc(&mut k, "cli", 0);
@@ -1620,7 +1642,7 @@ fn ipc_recv_with_invalid_flags_returns_einval_atomically() {
             opcode: op_ext::IPC_RECV,
             flags: 0,
             request_id: 581,
-            args: ipc_recv_args(srv_conn, 16, -1, 1),
+            args: ipc_recv_args(srv_conn, 16, -1, 2),
             heap_ptr: 0,
             heap_len: 16,
         },
@@ -1706,6 +1728,405 @@ fn ipc_recv_with_negative_fd_slot_leaves_rx_fds_queued() {
         .expect("server-side socket present");
     assert_eq!(sock.rx_len(), 0, "bytes were consumed");
     assert_eq!(sock.rx_fd_count(), 1, "fd stayed queued");
+}
+
+// ---- ipc_recv blocking semantics (T072 follow-up) -----------------
+
+#[test]
+fn ipc_recv_on_empty_socket_blocking_parks_caller() {
+    // With `flags & 0x01 == 0` (the new default-blocking semantic)
+    // and no pending bytes / fds, the dispatcher must park the
+    // caller via `Kernel::park_on_recv` rather than return EAGAIN.
+    // Asserts the ServiceOutcome is Parked, the parker slot is
+    // populated, the caller's state went Running -> BlockedOnIpc,
+    // block_reason carries the socket id, and no Response was
+    // queued in pending_wakes (nothing to wake yet).
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (_cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-park", 700);
+
+    let req_id = 0x7100u32;
+    let mut heap = vec![0u8; 64];
+    let outcome = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: req_id,
+            args: ipc_recv_args(srv_conn, 32, -1, 0),
+            heap_ptr: 0,
+            heap_len: 32,
+        },
+        &mut heap,
+    );
+    assert!(matches!(
+        outcome,
+        kernel::syscall::ServiceOutcome::Parked
+    ));
+
+    // Parker slot is populated with the in-flight recv params.
+    let parker = k
+        .parked_recvers_get(server)
+        .expect("server should be parked");
+    assert_eq!(parker.req_id, req_id);
+    assert_eq!(parker.max_len, 32);
+    assert_eq!(parker.recv_fd_slot, -1);
+    assert_eq!(parker.heap_ptr, 0);
+    assert_eq!(parker.heap_len, 32);
+
+    // State machine: server went Running -> BlockedOnIpc with the
+    // socket id in BlockReason::Ipc.
+    let proc = k.procs.get(server).unwrap();
+    assert_eq!(proc.state, ProcState::BlockedOnIpc);
+    let srv_socket_id = k.socket_id_from_fd_public(server, srv_conn).unwrap();
+    assert!(matches!(
+        proc.block_reason,
+        Some(kernel::proc::BlockReason::Ipc { endpoint_id })
+            if endpoint_id == srv_socket_id.0
+    ));
+
+    // No wake queued: nothing has happened to unblock the parker.
+    assert!(k.pending_wakes_is_empty());
+}
+
+#[test]
+fn ipc_send_wakes_parked_recver_with_bytes() {
+    // Server parks on ipc_recv with default-blocking flags. Client
+    // sends "hello" via IPC_SEND. The send hook on the peer's rx_buf
+    // grow path must wake the server: parker slot cleared, server
+    // back to Ready, pending_wakes carries one OK Response with the
+    // payload bytes in the wake heap.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-wake", 710);
+
+    let req_id = 0x7200u32;
+    let mut heap = vec![0u8; 64];
+    let outcome = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: req_id,
+            args: ipc_recv_args(srv_conn, 32, -1, 0),
+            heap_ptr: 0,
+            heap_len: 32,
+        },
+        &mut heap,
+    );
+    assert!(matches!(
+        outcome,
+        kernel::syscall::ServiceOutcome::Parked
+    ));
+
+    // Client sends bytes — this must wake the parker inline.
+    let payload = b"hello";
+    heap[..payload.len()].copy_from_slice(payload);
+    let send_resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 720,
+            args: ipc_send_args(cli_fd, payload.len() as u32, -1, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(send_resp.status, 0);
+
+    // Parker slot is cleared, server is Ready again.
+    assert!(!k.parked_recvers_contains(server));
+    let proc = k.procs.get(server).unwrap();
+    assert_eq!(proc.state, ProcState::Ready);
+    assert!(proc.block_reason.is_none());
+
+    // Exactly one wake: (server, OK response with value=5,
+    // extra_len=5, heap bytes "hello").
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp, wake_heap) = &wakes[0];
+    assert_eq!(*wake_pid, server);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, 0);
+    assert_eq!(wake_resp.value, payload.len() as i64);
+    assert_eq!(wake_resp.extra_len, payload.len() as u32);
+    let pending = wake_heap
+        .as_ref()
+        .expect("wake heap should carry the drained payload");
+    assert_eq!(pending.heap_ptr, 0);
+    assert_eq!(&pending.bytes[..], payload);
+
+    // The server-side socket's rx_buf is empty again — the wake
+    // path drained it.
+    let srv_socket_id = k.socket_id_from_fd_public(server, srv_conn).unwrap();
+    let sock = k.ipc.sockets_get(srv_socket_id).unwrap();
+    assert_eq!(sock.rx_len(), 0);
+}
+
+#[test]
+fn ipc_send_wakes_parked_recver_with_fd() {
+    // Server parks on ipc_recv with `recv_fd_slot = 0` (asks for
+    // an ancillary fd). Client sends payload + an ancillary fd
+    // (a /dev/console fd). The wake response must include the new
+    // fd-number at heap[0..4] AND the payload bytes after — the
+    // same fd-leading layout the non-blocking path produces.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-wakefd", 730);
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    let req_id = 0x7300u32;
+    let mut heap = vec![0u8; 64];
+    let outcome = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: req_id,
+            // recv_fd_slot = 0 (any non-negative = "install in
+            // lowest-free slot"). heap_len must be >= len + 4
+            // for the fd-prefix layout.
+            args: ipc_recv_args(srv_conn, 32, 0, 0),
+            heap_ptr: 0,
+            heap_len: 36,
+        },
+        &mut heap,
+    );
+    assert!(matches!(
+        outcome,
+        kernel::syscall::ServiceOutcome::Parked
+    ));
+
+    let payload = b"xyz";
+    heap[..payload.len()].copy_from_slice(payload);
+    let send_resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 740,
+            args: ipc_send_args(cli_fd, payload.len() as u32, 9, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(send_resp.status, 0);
+
+    // Parker slot is cleared, server is Ready, one wake queued.
+    assert!(!k.parked_recvers_contains(server));
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp, wake_heap) = &wakes[0];
+    assert_eq!(*wake_pid, server);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, 0);
+    assert_eq!(wake_resp.value, payload.len() as i64);
+    // extra_len = 4 (fd-prefix) + 3 (payload).
+    assert_eq!(wake_resp.extra_len, 4 + payload.len() as u32);
+
+    let pending = wake_heap
+        .as_ref()
+        .expect("wake heap should carry fd + payload");
+    assert_eq!(pending.heap_ptr, 0);
+    assert_eq!(pending.bytes.len(), 4 + payload.len());
+    let new_fd = u32::from_le_bytes([
+        pending.bytes[0],
+        pending.bytes[1],
+        pending.bytes[2],
+        pending.bytes[3],
+    ]);
+    assert_eq!(&pending.bytes[4..4 + payload.len()], payload);
+
+    // The receiver's fd table now has a new entry pointing at the
+    // same underlying object the sender's fd referred to.
+    let server_fds = k.fds(server).expect("server fds");
+    let installed = server_fds.get(new_fd).expect("new fd entry");
+    match installed.object {
+        FdObject::CharDevice(devnum) => assert_eq!(devnum, DEV_CONSOLE),
+        other => panic!("unexpected installed fd object: {:?}", other),
+    }
+}
+
+#[test]
+fn ipc_recv_blocking_second_call_from_parked_pid_returns_eagain() {
+    // v1 invariant: at most one parker per pid. A blocking ipc_recv
+    // from a pid that already has a parker slot returns -EAGAIN
+    // (mirror of the parked_acceptor / parked_waiters one-parker
+    // rule). The dispatcher does NOT park-then-EAGAIN; it surfaces
+    // the second call's EAGAIN as a Done outcome.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (_cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-twice", 750);
+
+    let mut heap = vec![0u8; 64];
+    // First blocking recv parks the server.
+    let outcome1 = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 760,
+            args: ipc_recv_args(srv_conn, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(
+        outcome1,
+        kernel::syscall::ServiceOutcome::Parked
+    ));
+    assert!(k.parked_recvers_contains(server));
+
+    // Second blocking recv from the same pid hits the one-parker
+    // invariant. The harness here calls `park_on_recv` directly —
+    // production callers go through the dispatcher, but the
+    // dispatcher would hand the same EAGAIN back as a Done outcome
+    // with `status = -EAGAIN` (the WouldBlock arm of park_on_recv
+    // maps via kerr_to_errno).
+    let err = k
+        .park_on_recv(server, srv_conn, 770, 16, -1, 0, 16)
+        .unwrap_err();
+    assert_eq!(err, kernel::sys::KernelError::WouldBlock);
+}
+
+#[test]
+fn sigterm_interrupts_parked_recv_with_eintr() {
+    // Pid A parks on ipc_recv (default-blocking). Pid B (init,
+    // A's parent) sends SIGTERM via PROC_KILL. A must transition
+    // BlockedOnIpc -> Ready; the parker slot must be cleared; a
+    // wake with -EINTR must land on pending_wakes; A's signal
+    // inbox must hold SIGTERM (orthogonal to the park interrupt
+    // — both halves of the contract fire).
+    use abi::cap::{initial, Cap, CapSet};
+    let mut k = make_kernel();
+
+    // init holds CapSet::ALL so the cap check in proc_kill passes.
+    let init = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs.transition(init, ProcState::Running).unwrap();
+
+    // A is a server pid (init as parent so the cap check passes
+    // via the parent-relationship arm).
+    let a_caps = CapSet::from_caps(&[Cap::DisplayClient]);
+    let a = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "server",
+            ppid: init,
+            caps: a_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(a).unwrap();
+    k.procs.transition(a, ProcState::Running).unwrap();
+
+    // Client B for the connected pair (uses init as ppid too —
+    // not load-bearing for this test).
+    let b = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "client",
+            ppid: init,
+            caps: a_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(b).unwrap();
+    k.procs.transition(b, ProcState::Running).unwrap();
+
+    let (_b_fd, a_conn) =
+        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-eintr", 800);
+
+    // A parks on the recv.
+    let req_id = 0xe17fu32;
+    let mut heap = vec![0u8; 64];
+    let outcome = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        a,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: req_id,
+            args: ipc_recv_args(a_conn, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(
+        outcome,
+        kernel::syscall::ServiceOutcome::Parked
+    ));
+    assert_eq!(
+        k.procs.get(a).unwrap().state,
+        ProcState::BlockedOnIpc
+    );
+
+    // init delivers SIGTERM via PROC_KILL. The handler's Term arm
+    // composes interrupt_parked_accept + interrupt_parked_wait +
+    // interrupt_parked_recv; only the recv interrupt should
+    // observe a parker.
+    let mut kill_args = [0u8; 16];
+    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[4..6].copy_from_slice(&15u16.to_le_bytes());
+    let kill_resp = dispatch(
+        &mut k,
+        init,
+        &Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 810,
+            args: kill_args,
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(kill_resp.status, 0);
+
+    // Parker slot is cleared, A is Ready again, block_reason
+    // cleared.
+    assert!(!k.parked_recvers_contains(a));
+    let proc = k.procs.get(a).unwrap();
+    assert_eq!(proc.state, ProcState::Ready);
+    assert!(proc.block_reason.is_none());
+
+    // Exactly one wake: the EINTR Response on A's request_id.
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, wake_resp, _wake_heap) = &wakes[0];
+    assert_eq!(*wake_pid, a);
+    assert_eq!(wake_resp.request_id, req_id);
+    assert_eq!(wake_resp.status, -errno::EINTR);
+
+    // A's signal inbox holds SIGTERM (signal-inbox delivery runs
+    // orthogonally to the park interrupt).
+    let drained = k.drain_signals(a).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::Term]);
 }
 
 // ---- clock_time_get --------------------------------------------------

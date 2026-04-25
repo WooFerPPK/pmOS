@@ -67,7 +67,7 @@ pub fn dispatch_ext(
         op::IPC_CONNECT => ServiceOutcome::Done(handle_ipc_connect(kernel, pid, req, heap)),
         op::IPC_ACCEPT => handle_ipc_accept(kernel, pid, req),
         op::IPC_SEND => ServiceOutcome::Done(handle_ipc_send(kernel, pid, req, heap)),
-        op::IPC_RECV => ServiceOutcome::Done(handle_ipc_recv(kernel, pid, req, heap)),
+        op::IPC_RECV => handle_ipc_recv(kernel, pid, req, heap),
         op::IPC_PIPE => ServiceOutcome::Done(handle_ipc_pipe(kernel, pid, req, heap)),
         op::PROC_SELF => ServiceOutcome::Done(handle_proc_self(pid, req)),
         op::PROC_PARENT => ServiceOutcome::Done(handle_proc_parent(kernel, pid, req)),
@@ -451,10 +451,23 @@ fn handle_ipc_send(
 //                       slot of my fd table; v1 ignores the actual
 //                       value beyond the sign — slot-targeted install
 //                       is a future extension."
-//   args[12..16] = flags (u32) — reserved. v1 accepts only flags=0
-//                  (any other value → EINVAL before any side effect,
-//                  mirroring the ipc_send invariant). Future:
-//                  MSG_DONTWAIT, MSG_PEEK, MSG_CMSG_CLOEXEC, etc.
+//   args[12..16] = flags (u32) — bit 0 (`0x01`) toggles non-blocking
+//                  semantics; every other bit is reserved (any set
+//                  → -EINVAL before any side effect):
+//                    flags & 0x01 == 0 (default) → blocking. An
+//                      empty rx_buf + rx_fds parks the caller via
+//                      `Kernel::park_on_recv`; a future ipc_send
+//                      from the peer wakes them with the bytes /
+//                      fds the non-blocking path would have produced.
+//                    flags & 0x01 != 0           → non-blocking.
+//                      An empty rx_buf + rx_fds returns -EAGAIN
+//                      (the f00e559 default; preserved here for
+//                      callers that explicitly want the legacy
+//                      semantic, e.g. an event-loop poller).
+//                  Future flag bits: MSG_PEEK, MSG_CMSG_CLOEXEC.
+//                  Bit 0 mirrors `accept_flags::NONBLOCK` (bit 0 of
+//                  the ipc_accept flags u16) so the same convention
+//                  applies across both blocking-recv-style opcodes.
 //   heap_ptr / heap_len = the OUTPUT region the kernel writes payload
 //                  bytes into. heap_len MUST be >= 4 if recv_fd_slot
 //                  >= 0 (the first 4 bytes hold the new fd-number
@@ -472,11 +485,21 @@ fn handle_ipc_send(
 //                   bytes are the new receiver-side fd-number as
 //                   little-endian u32; payload follows from offset 4).
 //   status    = -EBADF if the main fd is unknown or not a socket.
-//               -EINVAL if flags != 0, the heap range is out of
-//                  bounds, or recv_fd_slot >= 0 with heap_len < 4.
+//               -EINVAL if any flag bit other than 0x01 is set, the
+//                  heap range is out of bounds, or recv_fd_slot >= 0
+//                  with heap_len < 4.
 //               -EAGAIN if the socket has no bytes AND no queued
-//                  fds (v1 doesn't park — see Kernel::ipc_recv's
-//                  block-recv deferral note).
+//                  fds AND `flags & 0x01 != 0` (non-blocking mode);
+//                  blocking mode parks the caller instead (no
+//                  Response is produced — `ServiceOutcome::Parked`).
+// Parked:
+//   No response is produced when `flags & 0x01 == 0` AND the
+//   socket has no bytes AND no queued fds. The caller is parked
+//   on the socket via `Kernel::park_on_recv`; a later `ipc_send`
+//   from the peer (or `fd_write` on the peer's socket fd) drains
+//   the parker via `Kernel.pending_wakes` +
+//   `kernel_take_next_wake_for_pid`, the same machinery
+//   `handle_ipc_accept`'s park path uses.
 //
 // Heap layout decision — fd-leading: when an fd is installed, the
 // 4-byte fd-number lives at heap[0..4] and the payload at
@@ -503,28 +526,64 @@ fn handle_ipc_recv(
     pid: Pid,
     req: &Request,
     heap: &mut [u8],
-) -> Response {
+) -> ServiceOutcome {
+    /// `flags & RECV_NONBLOCK` selects the non-blocking semantic
+    /// (legacy f00e559 behavior — empty socket → -EAGAIN). Bit 0;
+    /// every other bit is reserved.
+    const RECV_NONBLOCK: u32 = 0x01;
     let fd = args_u32(req, 0);
     let len = args_u32(req, 4) as usize;
     let recv_fd_slot = args_u32(req, 8) as i32;
     let flags = args_u32(req, 12);
 
-    if flags != 0 {
-        return Response::err(req.request_id, EINVAL);
+    if (flags & !RECV_NONBLOCK) != 0 {
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
+    let nonblock = (flags & RECV_NONBLOCK) != 0;
     let want_fd = recv_fd_slot >= 0;
     let fd_prefix = if want_fd { 4 } else { 0 };
     let needed = len.saturating_add(fd_prefix);
     if (req.heap_len as usize) < needed {
-        return Response::err(req.request_id, EINVAL);
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
 
     let (bytes, new_fd) = match kernel.ipc_recv(pid, fd, len, want_fd) {
         Ok(pair) => pair,
         Err(crate::sys::KernelError::NotSupportedOnFd) => {
-            return Response::err(req.request_id, EBADF)
+            return ServiceOutcome::Done(Response::err(req.request_id, EBADF))
         }
-        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+        Err(crate::sys::KernelError::WouldBlock) if nonblock => {
+            return ServiceOutcome::Done(Response::err(req.request_id, EAGAIN))
+        }
+        Err(crate::sys::KernelError::WouldBlock) => {
+            // Blocking-recv path: park the caller on the socket and
+            // return without producing a Response. A future ipc_send
+            // from the peer will queue the wake response via
+            // `wake_parked_recver_if_any`. If the park itself fails
+            // (one-parker-per-pid invariant), surface the errno —
+            // userland sees -EAGAIN for that race rather than a
+            // silent never-wake.
+            return match kernel.park_on_recv(
+                pid,
+                fd,
+                req.request_id,
+                len as u32,
+                recv_fd_slot,
+                req.heap_ptr,
+                req.heap_len,
+            ) {
+                Ok(()) => ServiceOutcome::Parked,
+                Err(crate::sys::KernelError::NotSupportedOnFd) => {
+                    ServiceOutcome::Done(Response::err(req.request_id, EBADF))
+                }
+                Err(e) => {
+                    ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e)))
+                }
+            };
+        }
+        Err(e) => {
+            return ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e)))
+        }
     };
 
     let installed = new_fd.is_some();
@@ -540,20 +599,20 @@ fn handle_ipc_recv(
         // bytes / un-install the fd — both are awkward inversions that
         // belong on a future hardening pass once a real heap-aliasing
         // failure mode shows up in practice.
-        return Response::err(req.request_id, EINVAL);
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     };
     if let Some(new_fd_num) = new_fd {
         out[0..4].copy_from_slice(&new_fd_num.to_le_bytes());
     }
     out[payload_offset..payload_offset + bytes.len()].copy_from_slice(&bytes);
 
-    Response {
+    ServiceOutcome::Done(Response {
         request_id: req.request_id,
         status: 0,
         value: bytes.len() as i64,
         extra_len: total as u32,
         _pad: [0u8; 12],
-    }
+    })
 }
 
 // ---- ipc_pipe ---------------------------------------------------------
@@ -918,6 +977,7 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
             if signal == Signal::Term {
                 let _ = kernel.interrupt_parked_accept(target_pid);
                 let _ = kernel.interrupt_parked_wait(target_pid);
+                let _ = kernel.interrupt_parked_recv(target_pid);
             }
             Response::ok(req.request_id, 0)
         }
