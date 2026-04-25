@@ -43,4 +43,4 @@ pub use shell::{Shell, ShellOutput, BUILTINS};
 pub use tokenize::tokenize;
 
 #[cfg(feature = "std")]
-pub use run::{run, ExitStatus};
+pub use run::{run, run_with_env, ExitStatus};

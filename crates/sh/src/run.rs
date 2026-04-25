@@ -11,7 +11,8 @@
 //! * tokenise the line by whitespace (no quoting, no
 //!   escaping, no variable expansion — that's T142);
 //! * dispatch the first token against the minimal
-//!   builtin set (`echo`, `exit`, `cd`, `pwd`);
+//!   builtin set (`echo`, `exit`, `cd`, `pwd`, `env`,
+//!   `export`);
 //! * on `exit [code]`, return [`ExitStatus::Exit(code)`];
 //! * on unknown command, write `sh: command not found:
 //!   <token>\n` to `stderr` and loop.
@@ -22,8 +23,14 @@
 //! `set_current_dir` is either a no-op or an error on the
 //! wasip1 target. Tracking it locally keeps `cd` / `pwd`
 //! round-tripping in isolation tests.
+//!
+//! The env map is tracked locally in a [`BTreeMap`] so
+//! `env` / `export` output is deterministically sorted by
+//! key — both for human readability and for tests that
+//! assert on byte-exact stdout.
 
 use core::str::FromStr;
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -51,7 +58,7 @@ impl ExitStatus {
     }
 }
 
-/// Run the minimal REPL loop.
+/// Run the minimal REPL loop with a fresh empty env map.
 ///
 /// Prints `"$ "`, reads one line, dispatches the first
 /// whitespace-separated token against the builtin set, and
@@ -59,10 +66,27 @@ impl ExitStatus {
 /// `Cursor<Vec<u8>>` for `stdin`, `Vec<u8>` buffers for
 /// `stdout` / `stderr`, and assert on the bytes `run`
 /// writes.
-pub fn run<R: BufRead, W: Write, E: Write>(
+///
+/// Thin wrapper over [`run_with_env`] — the userland `sh`
+/// binary calls this; tests that need to pre-seed env
+/// entries call [`run_with_env`] directly.
+pub fn run<R: BufRead, W: Write, E: Write>(stdin: R, stdout: W, stderr: E) -> ExitStatus {
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    run_with_env(stdin, stdout, stderr, &mut env)
+}
+
+/// Run the REPL loop against a caller-provided env map.
+///
+/// Test entry point: lets a test pre-seed entries (so
+/// `env` / `export` output can be asserted against a
+/// known-non-empty map without having to run `export`
+/// commands first) and observe mutations after the loop
+/// returns.
+pub fn run_with_env<R: BufRead, W: Write, E: Write>(
     mut stdin: R,
     mut stdout: W,
     mut stderr: E,
+    env: &mut BTreeMap<String, String>,
 ) -> ExitStatus {
     // Seed cwd from the real process cwd when std gives us
     // one — on wasip1 this may just be `/`. Fall back to
@@ -95,7 +119,7 @@ pub fn run<R: BufRead, W: Write, E: Write>(
             continue;
         }
 
-        match dispatch_builtin(&tokens, &mut cwd, &mut stdout, &mut stderr) {
+        match dispatch_builtin(&tokens, &mut cwd, env, &mut stdout, &mut stderr) {
             BuiltinOutcome::Continue => {}
             BuiltinOutcome::Exit(code) => return ExitStatus::Exit(code),
             BuiltinOutcome::IoError => return ExitStatus::IoError,
@@ -132,6 +156,7 @@ pub(crate) enum BuiltinOutcome {
 pub(crate) fn dispatch_builtin<W: Write, E: Write>(
     tokens: &[&str],
     cwd: &mut PathBuf,
+    env: &mut BTreeMap<String, String>,
     stdout: &mut W,
     stderr: &mut E,
 ) -> BuiltinOutcome {
@@ -140,6 +165,8 @@ pub(crate) fn dispatch_builtin<W: Write, E: Write>(
         "exit" => builtin_exit(&tokens[1..], stderr),
         "cd" => builtin_cd(&tokens[1..], cwd),
         "pwd" => builtin_pwd(cwd, stdout),
+        "env" => builtin_env(&tokens[1..], env, stdout, stderr),
+        "export" => builtin_export(&tokens[1..], env, stdout, stderr),
         _ => BuiltinOutcome::NotBuiltin,
     }
 }
@@ -197,6 +224,95 @@ fn builtin_pwd<W: Write>(cwd: &Path, stdout: &mut W) -> BuiltinOutcome {
     }
     if stdout.flush().is_err() {
         return BuiltinOutcome::IoError;
+    }
+    BuiltinOutcome::Continue
+}
+
+fn builtin_env<W: Write, E: Write>(
+    args: &[&str],
+    env: &BTreeMap<String, String>,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    if !args.is_empty() {
+        // Minimal v1: no `env [-i] [NAME=VALUE]... [command]`
+        // form yet. Reject any positional args so a future
+        // slice can implement the full POSIX shape without
+        // breaking anyone who relied on the no-arg path.
+        if write!(stderr, "sh: env: too many arguments\n").is_err() {
+            return BuiltinOutcome::IoError;
+        }
+        if stderr.flush().is_err() {
+            return BuiltinOutcome::IoError;
+        }
+        return BuiltinOutcome::Continue;
+    }
+    for (k, v) in env.iter() {
+        if writeln!(stdout, "{k}={v}").is_err() {
+            return BuiltinOutcome::IoError;
+        }
+    }
+    if stdout.flush().is_err() {
+        return BuiltinOutcome::IoError;
+    }
+    BuiltinOutcome::Continue
+}
+
+fn builtin_export<W: Write, E: Write>(
+    args: &[&str],
+    env: &mut BTreeMap<String, String>,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    if args.is_empty() {
+        // bash convention: `export` with no args prints every
+        // entry as `export NAME=VALUE` lines, sorted.
+        for (k, v) in env.iter() {
+            if writeln!(stdout, "export {k}={v}").is_err() {
+                return BuiltinOutcome::IoError;
+            }
+        }
+        if stdout.flush().is_err() {
+            return BuiltinOutcome::IoError;
+        }
+        return BuiltinOutcome::Continue;
+    }
+    for arg in args {
+        match arg.find('=') {
+            Some(0) => {
+                // Empty NAME (the arg starts with `=`).
+                if write!(stderr, "sh: export: {arg}: not a valid identifier\n").is_err() {
+                    return BuiltinOutcome::IoError;
+                }
+                if stderr.flush().is_err() {
+                    return BuiltinOutcome::IoError;
+                }
+            }
+            Some(idx) => {
+                let (name, rest) = arg.split_at(idx);
+                // rest still has the leading '='; strip it.
+                let value = &rest[1..];
+                env.insert(name.to_string(), value.to_string());
+            }
+            None => {
+                // `export NAME` without `=`. POSIX sets the
+                // exported bit; the v1 minimal shell has no
+                // exported/unexported distinction, so leave
+                // an existing entry alone and seed an empty
+                // string for an absent one. Either way,
+                // post-call `env` will list NAME.
+                if arg.is_empty() {
+                    if write!(stderr, "sh: export: {arg}: not a valid identifier\n").is_err() {
+                        return BuiltinOutcome::IoError;
+                    }
+                    if stderr.flush().is_err() {
+                        return BuiltinOutcome::IoError;
+                    }
+                } else if !env.contains_key(*arg) {
+                    env.insert((*arg).to_string(), String::new());
+                }
+            }
+        }
     }
     BuiltinOutcome::Continue
 }
