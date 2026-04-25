@@ -9,7 +9,10 @@
 //! references inside it. Tests drive `run_with_env` so quoted
 //! `$VAR` cases can pre-seed the env map and verify the
 //! expand / no-expand split. Backslash escapes inside `"..."`
-//! are NOT supported in this slice (a future micro-slice).
+//! recognise `\$` / `\"` / `\\` as literal `$` / `"` / `\`;
+//! any other `\<char>` is preserved as a two-byte literal
+//! (`\n` stays `\n`, NOT a newline). Outside `"..."` (bare
+//! text or `'...'`) backslash is preserved as a literal byte.
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor};
@@ -248,5 +251,107 @@ fn double_quoted_inside_concat_with_unquoted_text() {
     assert!(
         stdout.contains("amidb\n"),
         "stdout missing concatenated token: {stdout:?}"
+    );
+}
+
+#[test]
+fn backslash_dollar_inside_double_quotes_is_literal() {
+    // Seed `X=hi`. `echo "\$X"` → stdout contains `$X\n`
+    // (NOT `hi\n`) — the `\$` escape suppresses expansion
+    // by emitting a literal `$` segment so `expand_vars`
+    // can't see the bare `$` byte.
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "hi".to_string());
+    let (status, stdout, stderr, _env) = drive("echo \"\\$X\"\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("$X\n"),
+        "stdout missing literal $X: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("hi\n"),
+        "stdout should NOT contain expanded `hi\\n`: {stdout:?}"
+    );
+}
+
+#[test]
+fn backslash_quote_inside_double_quotes_is_literal_quote() {
+    // `echo "say \"hi\""` → stdout contains `say "hi"\n` —
+    // the `\"` escape emits a literal `"` segment without
+    // closing the double quote, so `say "hi"` is one token.
+    let (status, stdout, stderr, _env) =
+        drive("echo \"say \\\"hi\\\"\"\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("say \"hi\"\n"),
+        "stdout missing escaped-quote literal: {stdout:?}"
+    );
+}
+
+#[test]
+fn backslash_backslash_inside_double_quotes_is_single_backslash() {
+    // `echo "\\"` → stdout contains `\<newline>` (one
+    // backslash byte followed by echo's trailing newline) —
+    // the `\\` escape collapses to a single literal `\`.
+    let (status, stdout, stderr, _env) =
+        drive("echo \"\\\\\"\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("\\\n"),
+        "stdout missing single backslash: {stdout:?}"
+    );
+}
+
+#[test]
+fn unrecognized_backslash_inside_double_quotes_preserves_both_chars() {
+    // `echo "\n"` → stdout contains the three bytes `\n\n`
+    // (literal backslash + literal `n` + echo's trailing
+    // newline). `\n` is NOT a recognised escape so both
+    // bytes pass through verbatim — `\n` stays `\n`, NOT
+    // a newline char.
+    let (status, stdout, stderr, _env) =
+        drive("echo \"\\n\"\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("\\n\n"),
+        "stdout missing two-char `\\n` literal: {stdout:?}"
+    );
+}
+
+#[test]
+fn mixed_backslash_dollar_and_real_dollar_var() {
+    // Seed `X=1`. `echo "\$X=$X"` → stdout contains
+    // `$X=1\n` — the first `$` is escaped so it stays
+    // literal; the second `$X` expands. The token is split
+    // into a `Literal("$")` segment + `Unquoted("X=")` +
+    // `Unquoted("$X")` (post-expansion `1`) — proves the
+    // escape only suppresses the one position it covers.
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "1".to_string());
+    let (status, stdout, stderr, _env) = drive("echo \"\\$X=$X\"\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("$X=1\n"),
+        "stdout missing mixed escape/expand output: {stdout:?}"
+    );
+}
+
+#[test]
+fn backslash_outside_quotes_unchanged() {
+    // `echo \X` → stdout contains `\X\n` — outside any
+    // quotes the backslash is preserved as a literal byte
+    // (existing behaviour, NOT processed as an escape).
+    let (status, stdout, stderr, _env) =
+        drive("echo \\X\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("\\X\n"),
+        "stdout missing literal `\\X`: {stdout:?}"
     );
 }

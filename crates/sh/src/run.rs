@@ -346,18 +346,27 @@ enum QuoteState {
 /// An unterminated `'` or `"` returns the matching
 /// [`QuoteError`] variant; the caller is expected to surface
 /// the error and skip dispatch for the current line.
-/// Backslash escapes inside `"..."` are NOT supported in this
-/// slice (a future micro-slice) — a literal `\$X` inside `"..."`
-/// will expand `$X` after assemble (the leading `\` is
-/// preserved verbatim by the tokeniser, then `expand_vars`
-/// processes the rest).
+///
+/// Backslash escapes inside `"..."` recognise three sequences:
+/// `\$` → literal `$` (suppresses `$VAR` expansion at that
+/// position), `\"` → literal `"` (does NOT close the double
+/// quote), `\\` → literal `\`. Any other `\<char>` is
+/// preserved as the two-byte sequence `\<char>` (so `\n`
+/// inside `"..."` stays the two bytes `\n`, NOT a newline).
+/// To suppress expansion the escaped char is emitted as a
+/// fresh `Literal` segment so `expand_vars` (which only sees
+/// `Unquoted` segments) cannot reach the bare `$` byte.
+/// Outside `"..."` (in unquoted text or inside `'...'`)
+/// backslash is preserved as a literal byte — no escape
+/// processing.
 pub(crate) fn tokenise_with_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, QuoteError> {
     let mut tokens: Vec<Vec<TokenPart>> = Vec::new();
     let mut current: Vec<TokenPart> = Vec::new();
     let mut buf = String::new();
     let mut state = QuoteState::Outside;
+    let mut chars = line.chars().peekable();
 
-    for c in line.chars() {
+    while let Some(c) = chars.next() {
         match state {
             QuoteState::InSingle => {
                 if c == '\'' {
@@ -368,7 +377,30 @@ pub(crate) fn tokenise_with_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, Qu
                 }
             }
             QuoteState::InDouble => {
-                if c == '"' {
+                if c == '\\' {
+                    // Peek the next char to decide if this is a
+                    // recognised escape. `\$` / `\"` / `\\` each
+                    // emit the escaped char as a `Literal`
+                    // segment so `expand_vars` (which runs only
+                    // over `Unquoted` segments) cannot see the
+                    // bare `$` / `"` / `\` byte. Other `\<char>`
+                    // sequences keep both bytes verbatim in the
+                    // current `Unquoted` buffer.
+                    match chars.peek().copied() {
+                        Some(next @ ('$' | '"' | '\\')) => {
+                            chars.next();
+                            if !buf.is_empty() {
+                                current.push(TokenPart::Unquoted(
+                                    core::mem::take(&mut buf),
+                                ));
+                            }
+                            current.push(TokenPart::Literal(next.to_string()));
+                        }
+                        _ => {
+                            buf.push('\\');
+                        }
+                    }
+                } else if c == '"' {
                     state = QuoteState::Outside;
                     // Double-quoted bytes go into an Unquoted
                     // segment so assemble_token runs expand_vars
