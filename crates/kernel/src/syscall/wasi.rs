@@ -84,6 +84,7 @@ pub fn dispatch_wasi(
         op::PATH_CREATE_DIRECTORY => handle_path_create_directory(kernel, pid, req, heap),
         op::PATH_REMOVE_DIRECTORY => handle_path_remove_directory(kernel, pid, req, heap),
         op::FD_FDSTAT_SET_FLAGS => handle_fd_fdstat_set_flags(kernel, pid, req),
+        op::FD_FDSTAT_SET_RIGHTS => handle_fd_fdstat_set_rights(req),
         op::FD_FILESTAT_SET_SIZE => handle_fd_filestat_set_size(kernel, pid, req),
         op::FD_PREAD => handle_fd_pread(kernel, pid, req, heap),
         op::FD_PWRITE => handle_fd_pwrite(kernel, pid, req, heap),
@@ -1854,6 +1855,30 @@ fn handle_fd_fdstat_set_flags(kernel: &mut Kernel, pid: Pid, req: &Request) -> R
     let new_bits = FdFlags::from_wasi_bits(wasi_bits);
     entry.flags.insert(new_bits);
     Response::ok(req.request_id, 0)
+}
+
+// ---- fd_fdstat_set_rights ------------------------------------------
+//
+// Opcode 0x0026. WASI's mechanism for narrowing the capability rights
+// (`fs_rights_base` + `fs_rights_inheriting`) on an existing fd.
+//
+// PMos uses its own capability system — the extension `cap_*` syscalls
+// (0x1300..0x1302) gate sensitive operations against `Process.caps`,
+// not the per-fd WASI rights vectors. Rights narrowing therefore has
+// no semantic meaning in PMos's model: there is no per-fd rights
+// vector to narrow.
+//
+// Returning ENOTSUP (rather than ESUCCESS as a no-op) is the honest
+// answer: a userland that calls `fd_fdstat_set_rights` is asking us
+// to enforce a capability narrowing on the fd, and PMos cannot do
+// that. Pretending success would let a caller assume rights were
+// narrowed when they weren't, which is worse than the operation
+// being explicitly unsupported. ENOTSUP takes precedence over EBADF
+// — the operation itself is unsupported regardless of fd validity,
+// so we don't bother resolving the fd before returning.
+
+fn handle_fd_fdstat_set_rights(req: &Request) -> Response {
+    Response::err(req.request_id, ENOTSUP)
 }
 
 // ---- fd_filestat_set_size ------------------------------------------

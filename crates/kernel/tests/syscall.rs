@@ -108,24 +108,26 @@ fn unknown_opcode_outside_both_ranges_returns_enosys() {
 
 #[test]
 fn known_wasi_opcode_without_handler_returns_enosys() {
-    // `FD_FDSTAT_SET_RIGHTS` is in the WASI range (0x0026) but still
-    // has no handler — and isn't planned for v1 (WASI's rights system
-    // is un-v1-relevant). Same shape as the ext-side test below:
-    // decoded as a known WASI opcode, routed to `dispatch_wasi`'s
-    // `_ =>` arm, ENOSYS echoed back with the request_id intact.
+    // Synthetic unallocated WASI-range opcode (0x0005 sits in the
+    // gap between `ENVIRON_SIZES_GET` (0x0004) and `CLOCK_RES_GET`
+    // (0x0010)) — `is_wasi` returns true, the dispatcher routes it
+    // to `dispatch_wasi`, and the `_ =>` arm returns ENOSYS with the
+    // request_id intact.
     //
     // (This probe was `FD_PRESTAT_DIR_NAME` before that handler
     // landed, then `PATH_READLINK`, `PATH_SYMLINK`, `PATH_LINK`,
-    // `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. When
-    // `FD_FDSTAT_SET_RIGHTS` grows a real handler — if ever — swap
-    // this probe to whatever's still unhandled at that point, or
-    // delete the test once every WASI opcode has real coverage.)
+    // `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`, then
+    // `FD_FDSTAT_SET_RIGHTS`. With `FD_FDSTAT_SET_RIGHTS` now stubbed
+    // to ENOTSUP, every named WASI preview 1 opcode has a handler;
+    // this test holds the `_ =>` arm against future regressions by
+    // probing an unallocated value in the same numeric range.)
+    const UNALLOCATED_WASI_OPCODE: u16 = 0x0005;
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_wasi::FD_FDSTAT_SET_RIGHTS,
+        opcode: UNALLOCATED_WASI_OPCODE,
         flags: 0,
         request_id: 42,
         args: [0u8; 16],
@@ -4405,6 +4407,57 @@ fn fd_fdstat_set_flags_with_unopened_fd_returns_ebadf() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, -errno::EBADF);
+}
+
+// ---- fd_fdstat_set_rights -------------------------------------------
+//
+// Opcode 0x0026. WASI's mechanism for narrowing per-fd rights — PMos
+// uses its own `cap_*` capability system instead of WASI rights
+// vectors, so the operation is unsupported. ENOTSUP takes precedence
+// over EBADF: the operation itself is unsupported regardless of fd
+// validity, so the handler doesn't bother resolving the fd before
+// returning the error.
+
+#[test]
+fn fd_fdstat_set_rights_returns_enotsup() {
+    let mut k = make_kernel();
+    let (pid, fd) = make_proc_with_file_fd(&mut k, "rights_caller", "/r.txt", b"hi");
+    let mut heap = vec![0u8; 16];
+
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_RIGHTS,
+        flags: 0,
+        request_id: 930,
+        args,
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.request_id, 930);
+}
+
+#[test]
+fn fd_fdstat_set_rights_with_invalid_fd_still_returns_enotsup() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "ghost_rights_caller", 0);
+    let mut heap = vec![0u8; 16];
+
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&999u32.to_le_bytes());
+    let req = Request {
+        opcode: op_wasi::FD_FDSTAT_SET_RIGHTS,
+        flags: 0,
+        request_id: 931,
+        args,
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(resp.request_id, 931);
 }
 
 // ---- fd_filestat_set_size ------------------------------------------
