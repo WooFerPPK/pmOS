@@ -1,0 +1,111 @@
+//! T146 follow-up — POSIX-ish `sort`: read each input (stdin when no
+//! file args, otherwise every path in turn) into a `Vec<String>` of
+//! lines, concatenate the results into a single bucket, sort with the
+//! Rust default `Vec::sort` (lexicographic byte-order — matches POSIX
+//! `sort` under the C / POSIX locale), and emit each line on its own
+//! `\n`-terminated row. Open/read errors write `sort: <path>: <err>`
+//! to stderr, set a had-error flag, and continue with remaining
+//! files. Exit 0 on full success, 1 on any per-file failure.
+//!
+//! Line-splitting semantics: `bytes.split('\n')` over the file as
+//! UTF-8; an exact final empty segment caused by a trailing `\n` is
+//! dropped so a file ending in `c\nb\na\n` contributes three lines
+//! `c` / `b` / `a` (not four with a phantom empty tail). A file
+//! without a trailing newline keeps every segment, so `c\nb\na`
+//! contributes the same three lines.
+//!
+//! Flags mirror grep's POSIX-style short-flag clustering (commit
+//! `f667018`): `-r` reverses the sorted result via `Vec::reverse`;
+//! `-u` collapses adjacent duplicates via `Vec::dedup` after the
+//! sort (since the input is sorted, dedup gives unique entries
+//! globally). `-ru` / `-ur` apply both. Unknown flags write
+//! `sort: unknown flag: <flag>` to stderr and exit 2 (matching
+//! grep's open-error/usage exit code).
+//!
+//! Pattern precedent: `crates/coreutils/src/bin/{cat,grep,wc,head}.rs`.
+
+use std::env;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut reverse = false;
+    let mut unique = false;
+    let mut paths: Vec<String> = Vec::new();
+    let mut sep_seen = false;
+    for arg in args {
+        if !sep_seen && arg == "--" {
+            sep_seen = true;
+            continue;
+        }
+        if !sep_seen && arg.starts_with('-') && arg != "-" {
+            for ch in arg[1..].chars() {
+                match ch {
+                    'r' => reverse = true,
+                    'u' => unique = true,
+                    _ => {
+                        let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+        } else {
+            paths.push(arg);
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut had_error = false;
+
+    if paths.is_empty() {
+        let mut buf = String::new();
+        match io::stdin().lock().read_to_string(&mut buf) {
+            Ok(_) => append_lines(&buf, &mut lines),
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "sort: stdin: {e}");
+                had_error = true;
+            }
+        }
+    } else {
+        for path in &paths {
+            match fs::read_to_string(path) {
+                Ok(text) => append_lines(&text, &mut lines),
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "sort: {path}: {e}");
+                    had_error = true;
+                }
+            }
+        }
+    }
+
+    lines.sort();
+    if reverse {
+        lines.reverse();
+    }
+    if unique {
+        lines.dedup();
+    }
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for line in &lines {
+        if writeln!(out, "{line}").is_err() {
+            had_error = true;
+            break;
+        }
+    }
+
+    if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+}
+
+fn append_lines(text: &str, sink: &mut Vec<String>) {
+    let mut parts: Vec<&str> = text.split('\n').collect();
+    if matches!(parts.last(), Some(&"")) {
+        parts.pop();
+    }
+    for p in parts {
+        sink.push(p.to_string());
+    }
+}

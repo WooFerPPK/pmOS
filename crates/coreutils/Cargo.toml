@@ -52,3 +52,7 @@ path = "src/bin/head.rs"
 [[bin]]
 name = "tail"
 path = "src/bin/tail.rs"
+
+[[bin]]
+name = "sort"
+path = "src/bin/sort.rs"

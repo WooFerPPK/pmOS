@@ -1,0 +1,167 @@
+//! Integration tests for the `sort` coreutil binary.
+//!
+//! Driven through `std::process::Command` so the tests see the exact
+//! bytes the userland binary emits. Temp files are placed under
+//! `std::env::temp_dir()` with a per-test directory keyed by the
+//! test name and process id; each test cleans up its directory on
+//! success (a failing test leaves its scratch tree intact for
+//! debugging).
+
+use std::env;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const SORT: &str = env!("CARGO_BIN_EXE_sort");
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn scratch_dir(tag: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!(
+        "pmos-sort-{}-{}-{}",
+        tag,
+        std::process::id(),
+        n
+    ));
+    fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = dir.join(name);
+    let mut f = fs::File::create(&path).expect("create temp file");
+    f.write_all(bytes).expect("write temp file");
+    path
+}
+
+fn cleanup(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn sorts_lines_alphabetically() {
+    let dir = scratch_dir("alpha");
+    let path = write_file(&dir, "in.txt", b"c\na\nb\n");
+
+    let out = Command::new(SORT).arg(&path).output().expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"a\nb\nc\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_r_reverses_order() {
+    let dir = scratch_dir("rev");
+    let path = write_file(&dir, "in.txt", b"c\na\nb\n");
+
+    let out = Command::new(SORT)
+        .arg("-r")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"c\nb\na\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_u_dedupes_duplicate_lines() {
+    let dir = scratch_dir("uniq");
+    let path = write_file(&dir, "in.txt", b"a\nb\na\nb\n");
+
+    let out = Command::new(SORT)
+        .arg("-u")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"a\nb\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_ru_combines_reverse_and_unique() {
+    let dir = scratch_dir("ru");
+    let path = write_file(&dir, "in.txt", b"a\nb\na\nb\n");
+
+    let out = Command::new(SORT)
+        .arg("-ru")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"b\na\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn multi_file_concatenates_then_sorts() {
+    let dir = scratch_dir("multi");
+    let a = write_file(&dir, "a.txt", b"delta\nbravo\n");
+    let b = write_file(&dir, "b.txt", b"alpha\ncharlie\n");
+
+    let out = Command::new(SORT)
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"alpha\nbravo\ncharlie\ndelta\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn stdin_mode_reads_until_eof_and_sorts() {
+    let mut child = Command::new(SORT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sort");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"zebra\napple\nmango\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait sort");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"apple\nmango\nzebra\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn missing_file_continues_and_exits_one() {
+    let dir = scratch_dir("missing");
+    let good = write_file(&dir, "good.txt", b"banana\napple\n");
+    let missing = dir.join("nope.txt");
+
+    let out = Command::new(SORT)
+        .arg(&missing)
+        .arg(&good)
+        .output()
+        .expect("spawn sort");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"apple\nbanana\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sort:"), "stderr = {stderr:?}");
+    assert!(stderr.contains("nope.txt"), "stderr = {stderr:?}");
+    cleanup(&dir);
+}
