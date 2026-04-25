@@ -218,3 +218,84 @@ fn unknown_flag_exits_one_for_cat() {
     assert!(stderr.contains("cat:"), "stderr = {stderr:?}");
     assert!(stderr.contains("-Q"), "stderr = {stderr:?}");
 }
+
+#[test]
+#[allow(non_snake_case)]
+fn dash_E_appends_dollar_to_line_ends() {
+    let dir = scratch_dir("dashE-single");
+    let path = write_file(&dir, "lines.txt", b"hello\nworld\n");
+
+    let out = Command::new(CAT)
+        .arg("-E")
+        .arg(&path)
+        .output()
+        .expect("spawn cat");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"hello$\nworld$\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn dash_nE_combines_line_numbers_with_dollar_markers() {
+    let dir = scratch_dir("dashnE-combo");
+    let path = write_file(&dir, "lines.txt", b"hello\nworld\n");
+
+    let out = Command::new(CAT)
+        .arg("-nE")
+        .arg(&path)
+        .output()
+        .expect("spawn cat");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"     1\thello$\n     2\tworld$\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn dash_E_in_stdin_mode() {
+    let mut child = Command::new(CAT)
+        .arg("-E")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"foo\nbar\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait cat");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"foo$\nbar$\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn dash_E_multi_file_continues() {
+    let dir = scratch_dir("dashE-multi");
+    let a = write_file(&dir, "a.txt", b"alpha\nbravo\n");
+    let b = write_file(&dir, "b.txt", b"charlie\ndelta\n");
+
+    let out = Command::new(CAT)
+        .arg("-E")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .expect("spawn cat");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"alpha$\nbravo$\ncharlie$\ndelta$\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
