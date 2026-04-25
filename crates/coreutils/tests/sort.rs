@@ -165,3 +165,126 @@ fn missing_file_continues_and_exits_one() {
     assert!(stderr.contains("nope.txt"), "stderr = {stderr:?}");
     cleanup(&dir);
 }
+
+#[test]
+fn dash_n_sorts_numerically() {
+    let dir = scratch_dir("n_basic");
+    let path = write_file(&dir, "in.txt", b"10\n2\n1\n");
+
+    let out = Command::new(SORT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"1\n2\n10\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_handles_negative_numbers() {
+    let dir = scratch_dir("n_neg");
+    let path = write_file(&dir, "in.txt", b"-5\n3\n-10\n0\n");
+
+    let out = Command::new(SORT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"-10\n-5\n0\n3\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_with_dash_r_descending_numeric() {
+    let dir = scratch_dir("nr");
+    let path = write_file(&dir, "in.txt", b"1\n10\n2\n");
+
+    let out = Command::new(SORT)
+        .arg("-nr")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"10\n2\n1\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_with_dash_u_dedupes_after_numeric_sort() {
+    let dir = scratch_dir("nu");
+    let path = write_file(&dir, "in.txt", b"5\n5\n5\n3\n");
+
+    let out = Command::new(SORT)
+        .arg("-nu")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"3\n5\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_nru_combines_all_three() {
+    let dir = scratch_dir("nru");
+    let path = write_file(&dir, "in.txt", b"5\n5\n5\n3\n10\n");
+
+    let out = Command::new(SORT)
+        .arg("-nru")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"10\n5\n3\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_treats_non_numeric_as_zero() {
+    let dir = scratch_dir("n_nonnum");
+    let path = write_file(&dir, "in.txt", b"abc\n1\n");
+
+    let out = Command::new(SORT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout.clone()).expect("utf8 stdout");
+    assert!(
+        stdout == "abc\n1\n" || stdout == "1\nabc\n",
+        "stdout = {stdout:?} (expected abc and 1 in either order)"
+    );
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_handles_lines_with_trailing_text() {
+    let dir = scratch_dir("n_trailing");
+    let path = write_file(&dir, "in.txt", b"100x\n50y\n");
+
+    let out = Command::new(SORT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"50y\n100x\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}

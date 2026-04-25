@@ -18,7 +18,12 @@
 //! `f667018`): `-r` reverses the sorted result via `Vec::reverse`;
 //! `-u` collapses adjacent duplicates via `Vec::dedup` after the
 //! sort (since the input is sorted, dedup gives unique entries
-//! globally). `-ru` / `-ur` apply both. Unknown flags write
+//! globally); `-n` switches the comparison key from byte order to
+//! the leading signed integer parsed via `parse_leading_int` (lines
+//! whose leading non-whitespace token isn't numeric compare as 0,
+//! so they cluster among themselves in input order — POSIX leaves
+//! that order unspecified for v1). `-ru` / `-ur` / `-nr` / `-nu` /
+//! `-nru` etc. apply the chosen combination. Unknown flags write
 //! `sort: unknown flag: <flag>` to stderr and exit 2 (matching
 //! grep's open-error/usage exit code).
 //!
@@ -33,6 +38,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut reverse = false;
     let mut unique = false;
+    let mut numeric = false;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -45,6 +51,7 @@ fn main() -> ExitCode {
                 match ch {
                     'r' => reverse = true,
                     'u' => unique = true,
+                    'n' => numeric = true,
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -80,7 +87,11 @@ fn main() -> ExitCode {
         }
     }
 
-    lines.sort();
+    if numeric {
+        lines.sort_by_key(|line| parse_leading_int(line));
+    } else {
+        lines.sort();
+    }
     if reverse {
         lines.reverse();
     }
@@ -108,4 +119,30 @@ fn append_lines(text: &str, sink: &mut Vec<String>) {
     for p in parts {
         sink.push(p.to_string());
     }
+}
+
+fn parse_leading_int(s: &str) -> i64 {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+        negative = bytes[i] == b'-';
+        i += 1;
+    }
+    let digits_start = i;
+    let mut value: i64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        let digit = i64::from(bytes[i] - b'0');
+        value = value
+            .saturating_mul(10)
+            .saturating_add(if negative { -digit } else { digit });
+        i += 1;
+    }
+    if i == digits_start {
+        return 0;
+    }
+    value
 }
