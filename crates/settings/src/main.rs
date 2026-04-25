@@ -24,6 +24,9 @@
 //!   settings set-keyboard <layout>        # write keyboard.layout to /etc/preferences.toml
 //!   settings set-keyboard <layout> --config <path>
 //!                                         # write keyboard.layout to <path> (test hook)
+//!   settings set-timezone <name>          # write timezone.iana to /etc/preferences.toml
+//!   settings set-timezone <name> --config <path>
+//!                                         # write timezone.iana to <path> (test hook)
 //!
 //! Deferred T192 scope: `/proc/version` (procfs emits a placeholder
 //! line today and is not yet a stable source) and `/proc/storage`
@@ -39,6 +42,9 @@
 //! the schema gains a colour field. `set-keyboard` writes the
 //! `keyboard.layout` field — the only field on the `[keyboard]`
 //! section in the v1 schema. Valid-layout allow-list deferred to
+//! the GUI for the same reason as `set-theme`. `set-timezone` writes
+//! the `timezone.iana` field — the only field on the `[timezone]`
+//! section in the v1 schema. Valid-IANA-zone allow-list deferred to
 //! the GUI for the same reason as `set-theme`.
 
 use std::process::ExitCode;
@@ -65,6 +71,7 @@ fn main() -> ExitCode {
         Some("set-theme") => run_set_theme(&args[1..]),
         Some("set-wallpaper") => run_set_wallpaper(&args[1..]),
         Some("set-keyboard") => run_set_keyboard(&args[1..]),
+        Some("set-timezone") => run_set_timezone(&args[1..]),
         _ => run_preferences(args.first().map(String::as_str).unwrap_or(DEFAULT_CONFIG)),
     }
 }
@@ -429,6 +436,98 @@ fn run_set_keyboard(rest: &[String]) -> ExitCode {
     if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
         eprintln!(
             "settings: set-keyboard: failed to write {}: {}",
+            config_path, e
+        );
+        return ExitCode::from(1);
+    }
+
+    ExitCode::from(0)
+}
+
+/// `set-timezone <name> [--config <path>]` — read-modify-write
+/// `timezone.iana` on the preferences file, preserving every other
+/// field.
+///
+/// `timezone.iana` is the only field on the `[timezone]` section
+/// in the v1 schema (see `crates/preferences/src/lib.rs`), so
+/// `set-timezone <name>` writes that field directly — no
+/// disambiguation needed today. Mirrors `set-keyboard` /
+/// `set-wallpaper` / `set-theme` byte-for-byte: same `--config`
+/// test hook, same validation (non-empty, no embedded `"` or `\n`),
+/// same exit codes, same stderr shape.
+fn run_set_timezone(rest: &[String]) -> ExitCode {
+    let mut name: Option<&str> = None;
+    let mut config_path: &str = DEFAULT_CONFIG;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--config" => {
+                let Some(next) = rest.get(i + 1) else {
+                    eprintln!("settings: set-timezone: --config requires a path argument");
+                    return ExitCode::from(1);
+                };
+                config_path = next.as_str();
+                i += 2;
+            }
+            other => {
+                if name.is_none() {
+                    name = Some(other);
+                    i += 1;
+                } else {
+                    eprintln!("settings: set-timezone: unexpected argument {:?}", other);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    }
+
+    let Some(name) = name else {
+        eprintln!("settings: set-timezone: usage: set-timezone <name>");
+        return ExitCode::from(1);
+    };
+
+    if name.is_empty() {
+        eprintln!("settings: set-timezone: timezone name must be non-empty");
+        return ExitCode::from(1);
+    }
+
+    if name.contains('"') || name.contains('\n') {
+        eprintln!(
+            "settings: set-timezone: timezone name must not contain quotes or newlines"
+        );
+        return ExitCode::from(1);
+    }
+
+    let mut prefs = match std::fs::read(config_path) {
+        Ok(bytes) => match preferences::Preferences::parse(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "settings: set-timezone: failed to parse {}: {:?}",
+                    config_path, e
+                );
+                return ExitCode::from(1);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            preferences::Preferences::empty()
+        }
+        Err(e) => {
+            eprintln!(
+                "settings: set-timezone: failed to open {}: {}",
+                config_path, e
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    prefs.timezone_iana = Some(name.to_string());
+
+    let serialised = serialise_preferences(&prefs);
+
+    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+        eprintln!(
+            "settings: set-timezone: failed to write {}: {}",
             config_path, e
         );
         return ExitCode::from(1);

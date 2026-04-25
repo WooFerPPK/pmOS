@@ -721,3 +721,193 @@ fn set_keyboard_rejects_empty_or_illegal_value() {
         "stderr should explain illegal char: {stderr:?}"
     );
 }
+
+#[test]
+fn set_timezone_writes_new_value_to_fresh_config() {
+    let path = temp_file("set-timezone-fresh");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-timezone", "America/New_York", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-timezone");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    assert!(
+        written.contains("[timezone]"),
+        "written config should contain [timezone] section: {written:?}"
+    );
+    assert!(
+        written.contains("iana = \"America/New_York\""),
+        "written config should contain timezone.iana = America/New_York: {written:?}"
+    );
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_timezone_preserves_other_fields() {
+    let original = b"[theme]\n\
+        name = \"light\"\n\
+        fit  = \"stretch\"\n\
+        \n\
+        [wallpaper]\n\
+        name = \"mountains.png\"\n\
+        \n\
+        [keyboard]\n\
+        layout = \"us-qwerty\"\n\
+        \n\
+        [timezone]\n\
+        iana = \"Europe/London\"\n\
+        \n\
+        [terminal]\n\
+        font = \"unifont-mono-14.pbm\"\n";
+    let path = write_temp("set-timezone-preserve", original);
+
+    let out = Command::new(SETTINGS)
+        .args(["set-timezone", "America/New_York", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-timezone");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read(&path).expect("read written config");
+    let prefs = preferences::Preferences::parse(&written)
+        .expect("written config must round-trip through parse");
+
+    assert_eq!(prefs.theme_name.as_deref(), Some("light"));
+    assert_eq!(prefs.theme_fit.as_deref(), Some("stretch"));
+    assert_eq!(prefs.wallpaper_name.as_deref(), Some("mountains.png"));
+    assert_eq!(prefs.keyboard_layout.as_deref(), Some("us-qwerty"));
+    assert_eq!(prefs.timezone_iana.as_deref(), Some("America/New_York"));
+    assert_eq!(prefs.terminal_font.as_deref(), Some("unifont-mono-14.pbm"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_timezone_overwrites_existing_value() {
+    let path = write_temp(
+        "set-timezone-overwrite",
+        b"[timezone]\niana = \"Europe/London\"\n",
+    );
+
+    let out = Command::new(SETTINGS)
+        .args(["set-timezone", "America/New_York", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-timezone");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    let new_occurrences = written.matches("\"America/New_York\"").count();
+    let old_occurrences = written.matches("\"Europe/London\"").count();
+    let section_occurrences = written.matches("[timezone]").count();
+    assert_eq!(
+        new_occurrences, 1,
+        "timezone.iana = America/New_York should appear exactly once: {written:?}"
+    );
+    assert_eq!(
+        old_occurrences, 0,
+        "old timezone.iana = Europe/London should be gone: {written:?}"
+    );
+    assert_eq!(
+        section_occurrences, 1,
+        "[timezone] section should appear exactly once: {written:?}"
+    );
+
+    let prefs = preferences::Preferences::parse(written.as_bytes())
+        .expect("written config round-trips");
+    assert_eq!(prefs.timezone_iana.as_deref(), Some("America/New_York"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_timezone_missing_name_arg_exits_one_with_usage() {
+    let path = temp_file("set-timezone-missing");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-timezone", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-timezone missing");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("usage:"),
+        "stderr should contain 'usage:': {stderr:?}"
+    );
+    assert!(
+        stderr.contains("set-timezone"),
+        "stderr should mention set-timezone: {stderr:?}"
+    );
+}
+
+#[test]
+fn set_timezone_rejects_empty_or_illegal_value() {
+    let path_empty = temp_file("set-timezone-empty");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-timezone", "", "--config"])
+        .arg(&path_empty)
+        .output()
+        .expect("spawn settings set-timezone empty");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "empty name should exit 1: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("set-timezone"),
+        "stderr should mention set-timezone: {stderr:?}"
+    );
+
+    let path_quote = temp_file("set-timezone-quote");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-timezone", "bad\"name", "--config"])
+        .arg(&path_quote)
+        .output()
+        .expect("spawn settings set-timezone quote");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "name with quote should exit 1: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("quotes") || stderr.contains("newlines"),
+        "stderr should explain illegal char: {stderr:?}"
+    );
+
+    let path_newline = temp_file("set-timezone-newline");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-timezone", "bad\nname", "--config"])
+        .arg(&path_newline)
+        .output()
+        .expect("spawn settings set-timezone newline");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "name with newline should exit 1: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("quotes") || stderr.contains("newlines"),
+        "stderr should explain illegal char: {stderr:?}"
+    );
+}
