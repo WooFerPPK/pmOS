@@ -13,8 +13,9 @@
 //! Invocations:
 //!   settings                              # dump /etc/preferences.toml
 //!   settings <path>                       # dump preferences from <path>
-//!   settings about                        # print About (version + ABI + LICENSE + CREDITS)
+//!   settings about                        # print About (version + ABI + LICENSE + CREDITS + Storage)
 //!   settings about --doc-root <dir>       # About with doc fixtures from <dir> (tests)
+//!   settings about --proc-storage <path>  # About with /proc/storage redirected (tests)
 //!   settings set-theme <name>             # write theme.name to /etc/preferences.toml
 //!   settings set-theme <name> --config <path>
 //!                                         # write theme.name to <path> (test hook)
@@ -29,8 +30,16 @@
 //!                                         # write timezone.iana to <path> (test hook)
 //!
 //! Deferred T192 scope: `/proc/version` (procfs emits a placeholder
-//! line today and is not yet a stable source) and `/proc/storage`
-//! (blocked on T169). Both land in follow-up slices.
+//! line today and is not yet a stable source). `/proc/storage`
+//! reading landed as a T192 follow-up after T169's
+//! `KernelProcFsSource` bridge wired the live block-driver counters
+//! into procfs — `about` now reads it as a regular file and emits a
+//! Storage section. A missing `/proc/storage` is silently elided
+//! (many test environments will not mount procfs and the existing
+//! `about_prints_*` tests would otherwise break); a malformed body
+//! warns to stderr and skips the section without failing the
+//! command. Human-readable byte formatting (KB/MB/GB) is a future
+//! flag — values render as raw decimal today.
 //!
 //! Deferred T184 scope: valid-theme allow-list. `set-theme` accepts
 //! any non-empty string; the GUI will enforce the allow-list when it
@@ -62,6 +71,12 @@ const DEFAULT_DOC_ROOT: &str = "/usr/share/doc/pmos/";
 
 /// Default preferences path, used by both dump and `set-theme`.
 const DEFAULT_CONFIG: &str = "/etc/preferences.toml";
+
+/// Default `/proc/storage` path. Populated by the kernel's procfs
+/// module (T169) once the block-driver counter source is installed.
+/// Tests redirect this via the `--proc-storage` flag on `about`
+/// because their hosts do not mount procfs.
+const DEFAULT_PROC_STORAGE: &str = "/proc/storage";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -105,6 +120,7 @@ fn run_preferences(path: &str) -> ExitCode {
 
 fn run_about(rest: &[String]) -> ExitCode {
     let mut doc_root: &str = DEFAULT_DOC_ROOT;
+    let mut proc_storage: &str = DEFAULT_PROC_STORAGE;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -114,6 +130,14 @@ fn run_about(rest: &[String]) -> ExitCode {
                     return ExitCode::from(1);
                 };
                 doc_root = next.as_str();
+                i += 2;
+            }
+            "--proc-storage" => {
+                let Some(next) = rest.get(i + 1) else {
+                    eprintln!("settings: about: --proc-storage requires a path argument");
+                    return ExitCode::from(1);
+                };
+                proc_storage = next.as_str();
                 i += 2;
             }
             other => {
@@ -141,6 +165,8 @@ fn run_about(rest: &[String]) -> ExitCode {
         }
     };
 
+    let storage = read_proc_storage(proc_storage);
+
     println!("PMos {}", PMOS_VERSION);
     println!(
         "Kernel ABI version: {}.{}",
@@ -160,7 +186,77 @@ fn run_about(rest: &[String]) -> ExitCode {
         println!();
     }
 
+    if let Some((quota, used, files)) = storage {
+        println!();
+        println!("Storage:");
+        println!("  quota: {}", quota);
+        println!("  used:  {}", used);
+        println!("  files: {}", files);
+    }
+
     ExitCode::from(0)
+}
+
+/// Read `/proc/storage` and return parsed `(quota, used, files)`.
+///
+/// File format (per T169's `format_storage_snapshot` in
+/// `crates/kernel/src/fs/procfs.rs`): `<quota> <used> <files>\n` —
+/// three space-separated u64 values on a single line.
+///
+/// Returns `None` (and silently elides the Storage section) if the
+/// file is missing — many test environments will not mount procfs
+/// and the existing `about_prints_*` tests must keep passing. A
+/// malformed body warns to stderr and also returns `None` so the
+/// command exits cleanly. Any other I/O error (permission denied,
+/// etc.) is also reported to stderr without failing the command —
+/// the About pane is informational, not a hard procfs probe.
+fn read_proc_storage(path: &str) -> Option<(u64, u64, u64)> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("settings: about: failed to read {}: {}", path, e);
+            return None;
+        }
+    };
+
+    let mut tokens = body.split_ascii_whitespace();
+    let quota_tok = tokens.next();
+    let used_tok = tokens.next();
+    let files_tok = tokens.next();
+
+    let (Some(quota_tok), Some(used_tok), Some(files_tok)) = (quota_tok, used_tok, files_tok)
+    else {
+        eprintln!(
+            "settings: failed to parse {}: expected three whitespace-separated u64 fields",
+            path
+        );
+        return None;
+    };
+
+    let quota = match quota_tok.parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("settings: failed to parse {}: quota: {}", path, e);
+            return None;
+        }
+    };
+    let used = match used_tok.parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("settings: failed to parse {}: used: {}", path, e);
+            return None;
+        }
+    };
+    let files = match files_tok.parse::<u64>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("settings: failed to parse {}: files: {}", path, e);
+            return None;
+        }
+    };
+
+    Some((quota, used, files))
 }
 
 /// `set-theme <name> [--config <path>]` — read-modify-write

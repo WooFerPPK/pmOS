@@ -173,6 +173,119 @@ fn about_prints_version_abi_license_credits() {
 }
 
 #[test]
+fn about_includes_storage_section_when_proc_storage_present() {
+    let dir = env::temp_dir().join(format!(
+        "pmos-settings-about-storage-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("mkdir about doc-root");
+    fs::write(dir.join("LICENSE.txt"), b"MIT.\n").expect("write LICENSE fixture");
+    fs::write(dir.join("CREDITS.txt"), b"PMos.\n").expect("write CREDITS fixture");
+
+    let storage_path = temp_file("about-storage-good");
+    fs::write(&storage_path, b"1024 256 5\n").expect("write storage fixture");
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&dir)
+        .args(["--proc-storage"])
+        .arg(&storage_path)
+        .output()
+        .expect("spawn settings about with storage");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+
+    assert!(stdout.contains("Storage:"), "stdout = {stdout:?}");
+    assert!(stdout.contains("quota: 1024"), "stdout = {stdout:?}");
+    assert!(stdout.contains("used:  256"), "stdout = {stdout:?}");
+    assert!(stdout.contains("files: 5"), "stdout = {stdout:?}");
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&storage_path);
+}
+
+#[test]
+fn about_skips_storage_section_when_proc_storage_missing() {
+    let dir = env::temp_dir().join(format!(
+        "pmos-settings-about-no-storage-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("mkdir about doc-root");
+    fs::write(dir.join("LICENSE.txt"), b"MIT.\n").expect("write LICENSE fixture");
+    fs::write(dir.join("CREDITS.txt"), b"PMos.\n").expect("write CREDITS fixture");
+
+    let nonexistent = temp_file("about-storage-missing");
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&dir)
+        .args(["--proc-storage"])
+        .arg(&nonexistent)
+        .output()
+        .expect("spawn settings about no-storage");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+
+    assert!(stdout.contains("PMos v0.1.0-alpha"), "stdout = {stdout:?}");
+    assert!(
+        stdout.contains("Kernel ABI version:"),
+        "stdout = {stdout:?}"
+    );
+    assert!(stdout.contains("License:"), "stdout = {stdout:?}");
+    assert!(
+        !stdout.contains("Storage:"),
+        "stdout should not contain Storage section: {stdout:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn about_warns_on_malformed_proc_storage() {
+    let dir = env::temp_dir().join(format!(
+        "pmos-settings-about-malformed-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("mkdir about doc-root");
+    fs::write(dir.join("LICENSE.txt"), b"MIT.\n").expect("write LICENSE fixture");
+    fs::write(dir.join("CREDITS.txt"), b"PMos.\n").expect("write CREDITS fixture");
+
+    let storage_path = temp_file("about-storage-malformed");
+    fs::write(&storage_path, b"not numbers\n").expect("write storage fixture");
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&dir)
+        .args(["--proc-storage"])
+        .arg(&storage_path)
+        .output()
+        .expect("spawn settings about malformed-storage");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        stderr.contains("failed to parse"),
+        "stderr should warn on parse failure: {stderr:?}"
+    );
+    assert!(stdout.contains("PMos v0.1.0-alpha"), "stdout = {stdout:?}");
+    assert!(stdout.contains("License:"), "stdout = {stdout:?}");
+    assert!(
+        !stdout.contains("Storage:"),
+        "stdout should not contain Storage section on parse failure: {stdout:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&storage_path);
+}
+
+#[test]
 fn about_missing_doc_root_exits_one() {
     let missing = env::temp_dir().join(format!(
         "pmos-settings-about-missing-{}-{}",
