@@ -36,3 +36,7 @@ path = "src/bin/rm.rs"
 [[bin]]
 name = "mv"
 path = "src/bin/mv.rs"
+
+[[bin]]
+name = "ls"
+path = "src/bin/ls.rs"
