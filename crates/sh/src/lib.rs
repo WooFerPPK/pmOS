@@ -37,6 +37,8 @@ pub mod shell;
 pub mod tokenize;
 
 #[cfg(feature = "std")]
+mod builtin;
+#[cfg(feature = "std")]
 pub mod run;
 
 pub use shell::{Shell, ShellOutput, BUILTINS};
