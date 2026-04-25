@@ -91,3 +91,61 @@ fn dash_d_with_set2_arg_is_error() {
     let stderr = String::from_utf8_lossy(&stderr);
     assert!(stderr.contains("usage:"), "stderr = {stderr:?}");
 }
+
+#[test]
+fn dash_s_squeezes_repeated_runs_in_set1() {
+    let (code, stdout, stderr) = run_with_stdin(&["-s", "a"], b"aaabbbaaa\n");
+    assert_eq!(code, Some(0), "exit code: {code:?}");
+    assert_eq!(stdout, b"abbba\n");
+    assert!(stderr.is_empty(), "stderr = {:?}", stderr);
+}
+
+#[test]
+fn dash_s_squeezes_multiple_chars_in_set1() {
+    let (code, stdout, stderr) = run_with_stdin(&["-s", "ab"], b"aaabbbcccaaa\n");
+    assert_eq!(code, Some(0), "exit code: {code:?}");
+    assert_eq!(stdout, b"abccca\n");
+    assert!(stderr.is_empty(), "stderr = {:?}", stderr);
+}
+
+#[test]
+fn dash_s_passes_non_set1_chars_through_unchanged() {
+    let (code, stdout, stderr) = run_with_stdin(&["-s", "a"], b"xxxyyyzzz\n");
+    assert_eq!(code, Some(0), "exit code: {code:?}");
+    assert_eq!(stdout, b"xxxyyyzzz\n");
+    assert!(stderr.is_empty(), "stderr = {:?}", stderr);
+}
+
+#[test]
+fn dash_s_with_empty_set1_is_no_op_pass_through() {
+    let (code, stdout, stderr) = run_with_stdin(&["-s", ""], b"aaabbbccc\n");
+    assert_eq!(code, Some(0), "exit code: {code:?}");
+    assert_eq!(stdout, b"aaabbbccc\n");
+    assert!(stderr.is_empty(), "stderr = {:?}", stderr);
+}
+
+#[test]
+fn dash_s_single_char_input_is_no_op() {
+    let (code, stdout, stderr) = run_with_stdin(&["-s", "a"], b"a");
+    assert_eq!(code, Some(0), "exit code: {code:?}");
+    assert_eq!(stdout, b"a");
+    assert!(stderr.is_empty(), "stderr = {:?}", stderr);
+}
+
+#[test]
+fn dash_s_with_set2_arg_is_error() {
+    let (code, stdout, stderr) = run_with_stdin(&["-s", "abc", "xyz"], b"");
+    assert_eq!(code, Some(1), "exit code: {code:?}");
+    assert!(stdout.is_empty(), "stdout = {:?}", stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(stderr.contains("usage:"), "stderr = {stderr:?}");
+}
+
+#[test]
+fn dash_ds_combination_is_rejected_as_usage_error() {
+    let (code, stdout, stderr) = run_with_stdin(&["-ds", "abc"], b"");
+    assert_eq!(code, Some(1), "exit code: {code:?}");
+    assert!(stdout.is_empty(), "stdout = {:?}", stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(stderr.contains("usage:"), "stderr = {stderr:?}");
+}

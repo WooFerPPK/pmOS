@@ -1,7 +1,7 @@
-//! T146 follow-up — POSIX-ish `tr`: read stdin, translate or delete
-//! characters according to one or two SET arguments, write to stdout.
-//! No file args (POSIX `tr` is always stdin-only). Exit 0 on success,
-//! 1 on usage / unknown-flag error.
+//! T146 follow-up — POSIX-ish `tr`: read stdin, translate, delete, or
+//! squeeze characters according to one or two SET arguments, write to
+//! stdout. No file args (POSIX `tr` is always stdin-only). Exit 0 on
+//! success, 1 on usage / unknown-flag error.
 //!
 //! Modes:
 //!   `tr SET1 SET2` — translate each char in SET1 to the corresponding
@@ -12,6 +12,14 @@
 //!   `tr -d SET1` — delete every char in SET1; everything else passes
 //!   through. POSIX forbids SET2 with `-d`; this implementation
 //!   matches that and rejects `tr -d SET1 SET2` as a usage error.
+//!   `tr -s SET1` — squeeze repeated runs of any char in SET1 down to a
+//!   single occurrence; chars outside SET1 pass through unchanged.
+//!   Standalone form only: `tr -s SET1 SET2` (post-translate squeeze)
+//!   and `tr -ds SET1 SET2` (delete + squeeze) are **explicitly
+//!   deferred** to future slices, as is the `tr SET1 SET2` +
+//!   post-translate-squeeze interaction. Combining `-s` with `-d` is
+//!   rejected as a usage error in v1; passing a SET2 to `-s` is also
+//!   a usage error.
 //!
 //! SETs are LITERAL char sequences in v1 (NOT regex). Range syntax
 //! (`a-z` → expanded to `abc...xyz`) is **explicitly deferred** to a
@@ -21,10 +29,10 @@
 //! shell delivers them.
 //!
 //! Errors: wrong arg count writes `tr: usage: tr SET1 SET2  or  tr -d
-//! SET1` to stderr and exits 1; unknown flag writes `tr: unknown
-//! flag: <flag>` to stderr and exits 1; SET2 with `-d` writes
-//! `tr: extra operand '<SET2>': SET2 forbidden with -d` to stderr and
-//! exits 1.
+//! SET1  or  tr -s SET1` to stderr and exits 1; unknown flag writes
+//! `tr: unknown flag: <flag>` to stderr and exits 1; SET2 with `-d`
+//! or `-s`, or `-d` combined with `-s`, also exits 1 with a usage
+//! diagnostic.
 //!
 //! Pattern precedent: `crates/coreutils/src/bin/{cat,grep,sort,head}.rs`.
 
@@ -36,6 +44,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut delete = false;
+    let mut squeeze = false;
     let mut sets: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -47,6 +56,7 @@ fn main() -> ExitCode {
             for ch in arg[1..].chars() {
                 match ch {
                     'd' => delete = true,
+                    's' => squeeze = true,
                     _ => {
                         let _ = writeln!(io::stderr(), "tr: unknown flag: {arg}");
                         return ExitCode::from(1);
@@ -58,19 +68,25 @@ fn main() -> ExitCode {
         }
     }
 
+    let usage = "tr: usage: tr SET1 SET2  or  tr -d SET1  or  tr -s SET1";
+
+    if delete && squeeze {
+        let _ = writeln!(io::stderr(), "{usage}");
+        return ExitCode::from(1);
+    }
+
     if delete {
         if sets.len() != 1 {
-            let _ = writeln!(
-                io::stderr(),
-                "tr: usage: tr SET1 SET2  or  tr -d SET1"
-            );
+            let _ = writeln!(io::stderr(), "{usage}");
+            return ExitCode::from(1);
+        }
+    } else if squeeze {
+        if sets.len() != 1 {
+            let _ = writeln!(io::stderr(), "{usage}");
             return ExitCode::from(1);
         }
     } else if sets.len() != 2 {
-        let _ = writeln!(
-            io::stderr(),
-            "tr: usage: tr SET1 SET2  or  tr -d SET1"
-        );
+        let _ = writeln!(io::stderr(), "{usage}");
         return ExitCode::from(1);
     }
 
@@ -87,6 +103,20 @@ fn main() -> ExitCode {
         let drop: BTreeSet<char> = sets[0].chars().collect();
         let filtered: String = input.chars().filter(|c| !drop.contains(c)).collect();
         if out.write_all(filtered.as_bytes()).is_err() {
+            return ExitCode::from(1);
+        }
+    } else if squeeze {
+        let set: BTreeSet<char> = sets[0].chars().collect();
+        let mut buf = String::with_capacity(input.len());
+        let mut prev: Option<char> = None;
+        for c in input.chars() {
+            if set.contains(&c) && prev == Some(c) {
+                continue;
+            }
+            buf.push(c);
+            prev = Some(c);
+        }
+        if out.write_all(buf.as_bytes()).is_err() {
             return ExitCode::from(1);
         }
     } else {
