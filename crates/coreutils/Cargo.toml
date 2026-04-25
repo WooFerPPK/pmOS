@@ -56,3 +56,7 @@ path = "src/bin/tail.rs"
 [[bin]]
 name = "sort"
 path = "src/bin/sort.rs"
+
+[[bin]]
+name = "uniq"
+path = "src/bin/uniq.rs"
