@@ -8,10 +8,10 @@
 //! [`dispatch_builtin`] from this module the same way it
 //! used to consume them as same-file items.
 //!
-//! The set is the minimal v1 dispatch: `:`, `echo`, `exit`,
-//! `cd`, `pwd`, `env`, `export`, `unset`. Anything else
-//! returns [`BuiltinOutcome::NotBuiltin`] so the REPL can
-//! fall through to the "command not found" path until a
+//! The set is the minimal v1 dispatch: `:`, `true`, `echo`,
+//! `exit`, `cd`, `pwd`, `env`, `export`, `unset`. Anything
+//! else returns [`BuiltinOutcome::NotBuiltin`] so the REPL
+//! can fall through to the "command not found" path until a
 //! future slice wires `proc_spawn` into userland.
 
 use core::str::FromStr;
@@ -45,6 +45,7 @@ pub(crate) fn dispatch_builtin<W: Write, E: Write>(
 ) -> BuiltinOutcome {
     match tokens[0] {
         ":" => BuiltinOutcome::Continue,
+        "true" => BuiltinOutcome::Continue,
         "echo" => builtin_echo(&tokens[1..], stdout),
         "exit" => builtin_exit(&tokens[1..], stderr),
         "cd" => builtin_cd(&tokens[1..], cwd),
