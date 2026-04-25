@@ -247,7 +247,7 @@ fn unknown_flag_exits_two_with_stderr() {
     let dir = scratch_dir("unknown-flag");
 
     let out = Command::new(LS)
-        .arg("-a")
+        .arg("-Q")
         .arg(&dir)
         .output()
         .expect("spawn ls");
@@ -256,6 +256,74 @@ fn unknown_flag_exits_two_with_stderr() {
     assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unknown flag"), "stderr = {stderr:?}");
-    assert!(stderr.contains("-a"), "stderr = {stderr:?}");
+    assert!(stderr.contains("-Q"), "stderr = {stderr:?}");
+    cleanup(&dir);
+}
+
+#[test]
+fn default_hides_dotfiles() {
+    let dir = scratch_dir("hide-dotfiles");
+    write_file(&dir, ".hidden", b"h");
+    write_file(&dir, "visible", b"v");
+
+    let out = Command::new(LS).arg(&dir).output().expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(out.stdout, b"visible\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_a_shows_dotfiles() {
+    let dir = scratch_dir("dash-a-dotfiles");
+    write_file(&dir, ".hidden", b"h");
+    write_file(&dir, "visible", b"v");
+
+    let out = Command::new(LS)
+        .arg("-a")
+        .arg(&dir)
+        .output()
+        .expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(out.stdout, b".hidden\nvisible\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_la_combines_long_format_and_dotfiles() {
+    let dir = scratch_dir("dash-la-combo");
+    write_file(&dir, ".hidden", b"hh");
+    write_file(&dir, "visible", b"vvvv");
+
+    let out = Command::new(LS)
+        .arg("-la")
+        .arg(&dir)
+        .output()
+        .expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(out.stdout, b"- 2 .hidden\n- 4 visible\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_a_with_only_dotfiles() {
+    let dir = scratch_dir("only-dotfiles");
+    write_file(&dir, ".foo", b"f");
+    write_file(&dir, ".bar", b"b");
+
+    let out = Command::new(LS)
+        .arg("-a")
+        .arg(&dir)
+        .output()
+        .expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(out.stdout, b".bar\n.foo\n");
     cleanup(&dir);
 }

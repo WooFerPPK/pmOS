@@ -10,6 +10,15 @@
 //! is `metadata.len()` for files and `0` for directories — no
 //! recursive sum). `-l` is a per-row formatter toggle; multi-path /
 //! file-arg / no-arg / partial-success / sort behaviour is unchanged.
+//! `-a` (show-all: include directory entries whose name starts with
+//! `.`; without `-a`, dotfiles are filtered out from directory
+//! listings — POSIX hide-by-default). v1 simplification: `-a` does
+//! NOT synthesise `.` / `..` entries, only real on-disk entries
+//! whose name happens to start with `.`. `-a` and `-l` combine
+//! freely (`ls -la` = long format including dotfiles). `-a` only
+//! affects directory listings; a file argument whose own name
+//! starts with `.` is always printed regardless of `-a` (the user
+//! named it explicitly).
 //! Flags may appear before or after path args (`ls /tmp -l /home`)
 //! or after a `--` separator. Unknown flags exit 2 with `ls: unknown
 //! flag: <flag>` to stderr (distinct from per-path exit 1, so the
@@ -17,7 +26,7 @@
 //!
 //! Explicitly deferred (each its own future single-slice follow-up):
 //! mode bits (`rwxrwxrwx`), owner / group, mtime, alignment-padded
-//! columns, `-a` / `-1` / `-h` / `-R` / `-r` flags, char / block /
+//! columns, `-1` / `-h` / `-R` / `-r` / `-A` flags, char / block /
 //! socket / fifo type letters (only `d` / `l` / `-` are recognised
 //! today; everything else also formats as `-`).
 
@@ -30,6 +39,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut long_format = false;
+    let mut show_all = false;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -40,6 +50,11 @@ fn main() -> ExitCode {
         if !sep_seen && arg.starts_with('-') && arg != "-" {
             if arg == "-l" {
                 long_format = true;
+            } else if arg == "-a" {
+                show_all = true;
+            } else if arg == "-la" || arg == "-al" {
+                long_format = true;
+                show_all = true;
             } else {
                 let _ = writeln!(io::stderr(), "ls: unknown flag: {arg}");
                 return ExitCode::from(2);
@@ -64,7 +79,7 @@ fn main() -> ExitCode {
             }
             let _ = writeln!(out, "{path}:");
         }
-        if let Err(e) = list_one(&mut out, Path::new(path), long_format) {
+        if let Err(e) = list_one(&mut out, Path::new(path), long_format, show_all) {
             let _ = writeln!(io::stderr(), "ls: {path}: {e}");
             had_error = true;
         }
@@ -73,13 +88,21 @@ fn main() -> ExitCode {
     if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
 }
 
-fn list_one<W: Write>(out: &mut W, path: &Path, long_format: bool) -> io::Result<()> {
+fn list_one<W: Write>(
+    out: &mut W,
+    path: &Path,
+    long_format: bool,
+    show_all: bool,
+) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
         let mut rows: Vec<(String, Metadata)> = Vec::new();
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_all && name.starts_with('.') {
+                continue;
+            }
             let entry_meta = fs::symlink_metadata(entry.path())?;
             rows.push((name, entry_meta));
         }
