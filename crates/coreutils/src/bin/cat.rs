@@ -2,45 +2,129 @@
 //! to stdout. A failed file prints a diagnostic to stderr, flips the
 //! had-error flag, and does not abort the remaining files — matching
 //! the behaviour users expect from `cat a missing b`.
+//!
+//! Flag parsing mirrors `cp -r` / `mkdir -p` / `rm -r` / `grep -i`:
+//! single-pass arg split with `--` as a hard separator. The only
+//! flag accepted today is `-n`, which prefixes each output line
+//! with a 1-indexed line number formatted in a right-justified
+//! 6-char field followed by a tab (GNU coreutils shape, e.g.
+//! `     1\thello`). Line numbers are CONTINUOUS across multiple
+//! file args (so the second of two 3-line files starts at 4).
+//! Stdin mode in `-n` counts from 1 the same way. Unknown flags
+//! write `cat: unknown flag: <flag>` to stderr and exit 1 (cat's
+//! existing exit-1 convention, not grep's exit-2).
+//!
+//! Implementation has two paths: without `-n` we keep the existing
+//! `fs::read` + bulk `write_all` fast path (raw bytes streamed
+//! verbatim — no UTF-8 inspection, no line splitting); with `-n`
+//! we switch to `BufReader::lines()` so we can interleave the
+//! line-number prefix. `lines()` strips the trailing `\n` (we
+//! re-emit one via `writeln!`) and treats a missing-final-newline
+//! input as a single trailing line, matching GNU cat -n.
 
 use std::env;
-use std::fs;
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let mut had_error = false;
-
-    if args.is_empty() {
-        let mut buf = Vec::new();
-        if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
-            let _ = writeln!(io::stderr(), "cat: stdin: {e}");
-            return ExitCode::from(1);
+    let raw: Vec<String> = env::args().skip(1).collect();
+    let mut number_lines = false;
+    let mut paths: Vec<String> = Vec::new();
+    let mut sep_seen = false;
+    for arg in raw {
+        if !sep_seen && arg == "--" {
+            sep_seen = true;
+            continue;
         }
-        if let Err(e) = io::stdout().lock().write_all(&buf) {
-            let _ = writeln!(io::stderr(), "cat: stdout: {e}");
-            return ExitCode::from(1);
+        if !sep_seen && arg.starts_with('-') && arg != "-" {
+            if arg == "-n" {
+                number_lines = true;
+            } else {
+                let _ = writeln!(io::stderr(), "cat: unknown flag: {arg}");
+                return ExitCode::from(1);
+            }
+        } else {
+            paths.push(arg);
         }
-        return ExitCode::from(0);
     }
 
+    let mut had_error = false;
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    for path in &args {
-        match fs::read(path) {
-            Ok(bytes) => {
-                if let Err(e) = out.write_all(&bytes) {
+    let mut lineno: u64 = 1;
+
+    if paths.is_empty() {
+        if number_lines {
+            let stdin = io::stdin();
+            if let Err(e) = number_reader(stdin.lock(), &mut lineno, &mut out, "stdin") {
+                let _ = writeln!(io::stderr(), "cat: stdin: {e}");
+                had_error = true;
+            }
+        } else {
+            let mut buf = Vec::new();
+            if let Err(e) = io::stdin().lock().read_to_end(&mut buf) {
+                let _ = writeln!(io::stderr(), "cat: stdin: {e}");
+                return ExitCode::from(1);
+            }
+            if let Err(e) = out.write_all(&buf) {
+                let _ = writeln!(io::stderr(), "cat: stdout: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        return if had_error { ExitCode::from(1) } else { ExitCode::from(0) };
+    }
+
+    for path in &paths {
+        if number_lines {
+            match File::open(path) {
+                Ok(f) => {
+                    if let Err(e) = number_reader(BufReader::new(f), &mut lineno, &mut out, path) {
+                        let _ = writeln!(io::stderr(), "cat: {path}: {e}");
+                        had_error = true;
+                    }
+                }
+                Err(e) => {
                     let _ = writeln!(io::stderr(), "cat: {path}: {e}");
                     had_error = true;
                 }
             }
-            Err(e) => {
-                let _ = writeln!(io::stderr(), "cat: {path}: {e}");
-                had_error = true;
+        } else {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    if let Err(e) = out.write_all(&bytes) {
+                        let _ = writeln!(io::stderr(), "cat: {path}: {e}");
+                        had_error = true;
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "cat: {path}: {e}");
+                    had_error = true;
+                }
             }
         }
     }
 
     if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+}
+
+fn number_reader<R: BufRead, W: Write>(
+    r: R,
+    lineno: &mut u64,
+    out: &mut W,
+    label: &str,
+) -> io::Result<()> {
+    for line in r.lines() {
+        match line {
+            Ok(s) => {
+                writeln!(out, "{:>6}\t{s}", *lineno)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let _ = writeln!(io::stderr(), "cat: {label}: invalid utf-8 at line {}", *lineno);
+            }
+            Err(e) => return Err(e),
+        }
+        *lineno += 1;
+    }
+    Ok(())
 }

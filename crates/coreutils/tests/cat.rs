@@ -138,3 +138,83 @@ fn cat_continues_after_missing_file_but_reports_error() {
     assert!(stderr.contains("nope.txt"), "stderr = {stderr:?}");
     cleanup(&dir);
 }
+
+#[test]
+fn dash_n_prefixes_each_line_with_number() {
+    let dir = scratch_dir("dashn-single");
+    let path = write_file(&dir, "lines.txt", b"line-a\nline-b\nline-c\n");
+
+    let out = Command::new(CAT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn cat");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"     1\tline-a\n     2\tline-b\n     3\tline-c\n"
+    );
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_continues_across_multiple_files() {
+    let dir = scratch_dir("dashn-multi");
+    let a = write_file(&dir, "a.txt", b"alpha\nbravo\n");
+    let b = write_file(&dir, "b.txt", b"charlie\ndelta\n");
+
+    let out = Command::new(CAT)
+        .arg("-n")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .expect("spawn cat");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"     1\talpha\n     2\tbravo\n     3\tcharlie\n     4\tdelta\n"
+    );
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_in_stdin_mode_starts_from_one() {
+    let mut child = Command::new(CAT)
+        .arg("-n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"first\nsecond\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait cat");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"     1\tfirst\n     2\tsecond\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn unknown_flag_exits_one_for_cat() {
+    let out = Command::new(CAT)
+        .arg("-Q")
+        .output()
+        .expect("spawn cat");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cat:"), "stderr = {stderr:?}");
+    assert!(stderr.contains("-Q"), "stderr = {stderr:?}");
+}
