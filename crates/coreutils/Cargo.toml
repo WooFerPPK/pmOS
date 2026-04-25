@@ -48,3 +48,7 @@ path = "src/bin/wc.rs"
 [[bin]]
 name = "head"
 path = "src/bin/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/bin/tail.rs"
