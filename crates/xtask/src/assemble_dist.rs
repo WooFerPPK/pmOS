@@ -160,6 +160,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     ("coreutils", "mv"),
     ("coreutils", "ls"),
     ("coreutils", "wc"),
+    ("coreutils", "head"),
 ];
 
 fn copy(src: &Path, dst: &Path, manifest: &mut Vec<String>) -> Result<()> {
