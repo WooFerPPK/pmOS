@@ -8,8 +8,9 @@
 //! * read one newline-terminated line from `stdin`;
 //! * on EOF, return [`ExitStatus::Eof`];
 //! * on stdin I/O error, return [`ExitStatus::IoError`];
-//! * tokenise the line by whitespace (no quoting, no
-//!   escaping, no variable expansion — that's T142);
+//! * tokenise the line — whitespace outside `'...'` splits
+//!   tokens, single-quoted bytes pass through verbatim
+//!   (no `$VAR` expansion, no whitespace splitting);
 //! * dispatch the first token against the minimal
 //!   builtin set (`echo`, `exit`, `cd`, `pwd`, `env`,
 //!   `export`);
@@ -114,17 +115,39 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // arguments. Leave any embedded whitespace alone.
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
-        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        if tokens.is_empty() {
+        // Tokenise with single-quote awareness. `'...'` is a
+        // literal segment (no whitespace splitting, no `$VAR`
+        // expansion); everything else is an "unquoted" segment
+        // that DOES expand. Adjacent segments concat into one
+        // token (`a'bc'd` → `abcd`). An unterminated `'` is a
+        // recoverable error: write to stderr, skip dispatch
+        // for this iteration, REPL stays alive.
+        let parts = match tokenise_with_single_quotes(trimmed) {
+            Ok(p) => p,
+            Err(_) => {
+                if write!(stderr, "sh: unterminated single quote\n").is_err() {
+                    return ExitStatus::IoError;
+                }
+                if stderr.flush().is_err() {
+                    return ExitStatus::IoError;
+                }
+                continue;
+            }
+        };
+        if parts.is_empty() {
             continue;
         }
 
-        // Expand `$NAME` / `${NAME}` references against the
-        // env map BEFORE dispatch — see `expand_vars` for the
-        // exact rules. Unset names expand to the empty string
-        // but the token is preserved (matches POSIX `set -u`-
-        // off semantics; we never silently drop an arg).
-        let expanded: Vec<String> = tokens.iter().map(|t| expand_vars(t, env)).collect();
+        // Assemble each token by walking its parts: literal
+        // parts pass through as-is; unquoted parts run through
+        // `expand_vars` so `$NAME` / `${NAME}` references resolve
+        // against the env map. Unset names expand to the empty
+        // string but the token is preserved (matches POSIX
+        // `set -u`-off semantics; we never silently drop an arg).
+        let expanded: Vec<String> = parts
+            .iter()
+            .map(|token| assemble_token(token, env))
+            .collect();
         let expanded_refs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
 
         match dispatch_builtin(&expanded_refs, &mut cwd, env, &mut stdout, &mut stderr) {
@@ -461,6 +484,111 @@ fn is_name_start(b: u8) -> bool {
 
 fn is_name_continue(b: u8) -> bool {
     matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
+}
+
+/// One segment of a tokenised word.
+///
+/// A token is a sequence of these — adjacent segments concat
+/// into one token. The distinction between `Literal` and
+/// `Unquoted` controls whether `expand_vars` runs over the
+/// segment's content during [`assemble_token`]: `Literal`
+/// segments come from inside `'...'` and pass through verbatim;
+/// `Unquoted` segments come from outside any quoting and DO
+/// expand `$NAME` / `${NAME}` references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TokenPart {
+    /// Came from inside `'...'` — pass through, no expansion.
+    Literal(String),
+    /// Outside any quoting — `expand_vars` runs over the content.
+    Unquoted(String),
+}
+
+/// Tokenise `line` into a list of words, where each word is a
+/// list of [`TokenPart`] segments.
+///
+/// Splits on whitespace OUTSIDE single quotes; preserves all
+/// bytes (including whitespace) BETWEEN matching `'`s as a
+/// single `Literal` segment. Adjacency without intervening
+/// whitespace concatenates into one word: `a'bc'd` produces
+/// `[Unquoted("a"), Literal("bc"), Unquoted("d")]` — a single
+/// word with three parts. Two adjacent quoted strings (`'a''b'`)
+/// produce `[Literal("a"), Literal("b")]`, also a single word.
+///
+/// An unterminated `'` returns `Err(())` — the caller is
+/// expected to surface the error and skip dispatch for the
+/// current line. Everything else (including bare `\` and
+/// `"..."`) passes through as part of an `Unquoted` segment;
+/// double-quote handling is a separate, deferred slice.
+pub(crate) fn tokenise_with_single_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, ()> {
+    let mut tokens: Vec<Vec<TokenPart>> = Vec::new();
+    let mut current: Vec<TokenPart> = Vec::new();
+    let mut buf = String::new();
+    let mut in_single = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+                current.push(TokenPart::Literal(core::mem::take(&mut buf)));
+            } else {
+                buf.push(c);
+            }
+            continue;
+        }
+
+        if c == '\'' {
+            // Flush any pending unquoted bytes into the current
+            // token; the literal segment opens fresh. Adjacency
+            // with bare text is handled by NOT closing the
+            // current token here.
+            if !buf.is_empty() {
+                current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
+            }
+            in_single = true;
+            continue;
+        }
+
+        if c.is_whitespace() {
+            // Whitespace closes the current token. Flush any
+            // pending bytes first; only push the token if it
+            // has at least one part.
+            if !buf.is_empty() {
+                current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
+            }
+            if !current.is_empty() {
+                tokens.push(core::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        buf.push(c);
+    }
+
+    if in_single {
+        return Err(());
+    }
+    if !buf.is_empty() {
+        current.push(TokenPart::Unquoted(buf));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+/// Assemble one token's parts into a final `String`,
+/// running `expand_vars` over `Unquoted` segments and
+/// passing `Literal` segments through verbatim.
+pub(crate) fn assemble_token(parts: &[TokenPart], env: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            TokenPart::Literal(s) => out.push_str(s),
+            TokenPart::Unquoted(s) => out.push_str(&expand_vars(s, env)),
+        }
+    }
+    out
 }
 
 /// Collapse `.` / `..` / repeated `/` segments in `path`,
