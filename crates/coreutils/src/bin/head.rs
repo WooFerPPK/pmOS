@@ -16,14 +16,27 @@
 //! GNU's `head -n -K` "all but last K" semantic is intentionally
 //! deferred to a future slice.
 //!
+//! Byte-count mode: `-c N` switches the count selector from lines
+//! to bytes — print the first N bytes of each input instead of the
+//! first N lines. Same multi-file headers, same stdin fallback,
+//! same partial-success diagnostic shape. `N=0` prints nothing
+//! (still opens the file so missing-file diagnostics fire). When
+//! both `-n N` and `-c N` are passed in the same argv, the latest
+//! count-selection flag wins (matches GNU behavior — argv left-to-
+//! right, last selector binds the mode + count). The forms
+//! `-c -N` (GNU "all but last N bytes") and `-c N[KMG]` (suffix
+//! multipliers) are intentionally deferred to future slices.
+//!
 //! Flag parsing extends the cluster pattern from cat/grep/cp/rm with
 //! a value-consuming flag: `-n N` reads the next argv as a u64;
 //! `-nN` (no space) and `-N` (bare digit, GNU-style `head -5 file`)
 //! both parse as the count. Detection: if an arg matches `-?-?\d+`
 //! exactly (one optional sign character then all digits), treat the
 //! whole arg as a count specifier — that distinguishes the bare
-//! `-5` form from a short-flag cluster like `-lc`. Unknown flags
-//! write `head: unknown flag: <flag>` to stderr and exit 1.
+//! `-5` form from a short-flag cluster like `-lc`. `-c N` mirrors
+//! `-n N`'s value-follows-the-flag shape (also accepts `-cN` no-
+//! space). Unknown flags write `head: unknown flag: <flag>` to
+//! stderr and exit 1.
 //!
 //! Pattern precedent: `crates/coreutils/src/bin/{cat,grep,cp,mkdir,rm,mv,ls}.rs`.
 
@@ -32,9 +45,16 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::ExitCode;
 
+#[derive(Clone, Copy)]
+enum Mode {
+    Lines,
+    Bytes,
+}
+
 fn main() -> ExitCode {
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut count: u64 = 10;
+    let mut mode = Mode::Lines;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     let mut iter = raw.into_iter();
@@ -46,7 +66,10 @@ fn main() -> ExitCode {
         if !sep_seen && arg.starts_with('-') && arg != "-" {
             if let Some(parsed) = parse_count_arg(&arg) {
                 match parsed {
-                    Ok(n) => count = n,
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Lines;
+                    }
                     Err(bad) => {
                         let _ = writeln!(io::stderr(), "head: invalid count: {bad}");
                         return ExitCode::from(1);
@@ -60,9 +83,42 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 };
                 match next.parse::<u64>() {
-                    Ok(n) => count = n,
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Lines;
+                    }
                     Err(_) => {
                         let _ = writeln!(io::stderr(), "head: invalid count: {next}");
+                        return ExitCode::from(1);
+                    }
+                }
+                continue;
+            }
+            if arg == "-c" {
+                let Some(next) = iter.next() else {
+                    let _ = writeln!(io::stderr(), "head: option requires an argument: -c");
+                    return ExitCode::from(1);
+                };
+                match next.parse::<u64>() {
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Bytes;
+                    }
+                    Err(_) => {
+                        let _ = writeln!(io::stderr(), "head: invalid count: {next}");
+                        return ExitCode::from(1);
+                    }
+                }
+                continue;
+            }
+            if let Some(rest) = arg.strip_prefix("-c") {
+                match rest.parse::<u64>() {
+                    Ok(n) => {
+                        count = n;
+                        mode = Mode::Bytes;
+                    }
+                    Err(_) => {
+                        let _ = writeln!(io::stderr(), "head: invalid count: {rest}");
                         return ExitCode::from(1);
                     }
                 }
@@ -80,7 +136,7 @@ fn main() -> ExitCode {
 
     if paths.is_empty() {
         let stdin = io::stdin();
-        if let Err(e) = emit_first_n(stdin.lock(), count, &mut out) {
+        if let Err(e) = emit_first(stdin.lock(), count, mode, &mut out) {
             let _ = writeln!(io::stderr(), "head: stdin: {e}");
             had_error = true;
         }
@@ -97,7 +153,7 @@ fn main() -> ExitCode {
                             continue;
                         }
                     }
-                    if let Err(e) = emit_first_n(BufReader::new(f), count, &mut out) {
+                    if let Err(e) = emit_first(BufReader::new(f), count, mode, &mut out) {
                         let _ = writeln!(io::stderr(), "head: {path}: {e}");
                         had_error = true;
                     }
@@ -145,7 +201,23 @@ fn parse_count_arg(arg: &str) -> Option<Result<u64, String>> {
     None
 }
 
-fn emit_first_n<R: BufRead, W: Write>(mut r: R, count: u64, out: &mut W) -> io::Result<()> {
+fn emit_first<R: BufRead, W: Write>(
+    r: R,
+    count: u64,
+    mode: Mode,
+    out: &mut W,
+) -> io::Result<()> {
+    match mode {
+        Mode::Lines => emit_first_n_lines(r, count, out),
+        Mode::Bytes => emit_first_n_bytes(r, count, out),
+    }
+}
+
+fn emit_first_n_lines<R: BufRead, W: Write>(
+    mut r: R,
+    count: u64,
+    out: &mut W,
+) -> io::Result<()> {
     if count == 0 {
         let mut sink = Vec::new();
         let _ = r.read_to_end(&mut sink);
@@ -166,5 +238,15 @@ fn emit_first_n<R: BufRead, W: Write>(mut r: R, count: u64, out: &mut W) -> io::
             break;
         }
     }
+    Ok(())
+}
+
+fn emit_first_n_bytes<R: BufRead, W: Write>(
+    r: R,
+    count: u64,
+    out: &mut W,
+) -> io::Result<()> {
+    let mut take = r.take(count);
+    io::copy(&mut take, out)?;
     Ok(())
 }
