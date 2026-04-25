@@ -238,3 +238,88 @@ fn unknown_flag_exits_two_for_grep() {
     assert!(stderr.contains("unknown flag"), "stderr = {stderr:?}");
     cleanup(&dir);
 }
+
+#[test]
+fn dash_n_emits_line_numbers_for_single_file() {
+    let dir = scratch_dir("ln-single");
+    let path = write_file(&dir, "a.txt", b"first-line\nsecond-line\nthird-line\n");
+
+    let out = Command::new(GREP)
+        .arg("-n")
+        .arg("second")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"2:second-line\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_with_multiple_files_includes_path_and_number() {
+    let dir = scratch_dir("ln-multi");
+    let a = write_file(&dir, "a.txt", b"apple\nfruit-line\n");
+    let b = write_file(&dir, "b.txt", b"banana\nfruit-line-two\n");
+
+    let out = Command::new(GREP)
+        .arg("-n")
+        .arg("fruit")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected_a = format!("{}:2:fruit-line\n", a.display());
+    let expected_b = format!("{}:2:fruit-line-two\n", b.display());
+    assert_eq!(stdout, format!("{expected_a}{expected_b}"));
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_combined_with_dash_i_works() {
+    let dir = scratch_dir("ln-ci");
+    let path = write_file(&dir, "a.txt", b"alpha\nhello world\nbeta\n");
+
+    let out = Command::new(GREP)
+        .arg("-i")
+        .arg("-n")
+        .arg("HELLO")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"2:hello world\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_n_in_stdin_mode_counts_from_one() {
+    let mut child = Command::new(GREP)
+        .arg("-n")
+        .arg("alpha")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn grep");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"alpha\nbeta\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait grep");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"1:alpha\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
