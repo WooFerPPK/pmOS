@@ -126,3 +126,63 @@ fn export_no_args_prints_exported_form() {
         "stdout missing `export X=1` line: {stdout:?}"
     );
 }
+
+#[test]
+fn unset_removes_named_entry() {
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "1".to_string());
+    seed.insert("Y".to_string(), "2".to_string());
+
+    let (status, stdout, stderr, env) = drive("unset X\nenv\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(stdout.contains("Y=2\n"), "stdout = {stdout:?}");
+    assert!(!stdout.contains("X="), "stdout should not contain X=: {stdout:?}");
+    assert!(env.get("X").is_none());
+    assert_eq!(env.get("Y"), Some(&"2".to_string()));
+}
+
+#[test]
+fn unset_multiple_args_removes_all() {
+    let mut seed = BTreeMap::new();
+    seed.insert("A".to_string(), "1".to_string());
+    seed.insert("B".to_string(), "2".to_string());
+    seed.insert("C".to_string(), "3".to_string());
+
+    let (status, stdout, _stderr, env) = drive("unset A C\nenv\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stdout.contains("B=2\n"), "stdout = {stdout:?}");
+    assert!(!stdout.contains("A="));
+    assert!(!stdout.contains("C="));
+    assert!(env.get("A").is_none());
+    assert_eq!(env.get("B"), Some(&"2".to_string()));
+    assert!(env.get("C").is_none());
+}
+
+#[test]
+fn unset_nonexistent_is_silent_ok() {
+    let (status, _stdout, stderr, env) =
+        drive("unset MISSING\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(env.is_empty());
+}
+
+#[test]
+fn unset_with_no_args_errors_continues() {
+    let (status, _stdout, stderr, _env) = drive("unset\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.contains("usage:"), "stderr = {stderr:?}");
+}
+
+#[test]
+fn unset_followed_by_export_round_trips() {
+    let (status, stdout, _stderr, env) = drive(
+        "export X=1\nunset X\nexport X=2\nenv\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stdout.contains("X=2\n"), "stdout = {stdout:?}");
+    assert!(!stdout.contains("X=1\n"));
+    assert_eq!(env.get("X"), Some(&"2".to_string()));
+}

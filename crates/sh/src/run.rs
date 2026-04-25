@@ -180,6 +180,7 @@ pub(crate) fn dispatch_builtin<W: Write, E: Write>(
         "pwd" => builtin_pwd(cwd, stdout),
         "env" => builtin_env(&tokens[1..], env, stdout, stderr),
         "export" => builtin_export(&tokens[1..], env, stdout, stderr),
+        "unset" => builtin_unset(&tokens[1..], env, stderr),
         _ => BuiltinOutcome::NotBuiltin,
     }
 }
@@ -326,6 +327,35 @@ fn builtin_export<W: Write, E: Write>(
                 }
             }
         }
+    }
+    BuiltinOutcome::Continue
+}
+
+fn builtin_unset<E: Write>(
+    args: &[&str],
+    env: &mut BTreeMap<String, String>,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    if args.is_empty() {
+        if writeln!(stderr, "sh: unset: usage: unset NAME...").is_err() {
+            return BuiltinOutcome::IoError;
+        }
+        if stderr.flush().is_err() {
+            return BuiltinOutcome::IoError;
+        }
+        return BuiltinOutcome::Continue;
+    }
+    for arg in args {
+        if arg.is_empty() || arg.contains('=') {
+            if writeln!(stderr, "sh: unset: {arg}: not a valid identifier").is_err() {
+                return BuiltinOutcome::IoError;
+            }
+            if stderr.flush().is_err() {
+                return BuiltinOutcome::IoError;
+            }
+            continue;
+        }
+        env.remove(*arg);
     }
     BuiltinOutcome::Continue
 }
