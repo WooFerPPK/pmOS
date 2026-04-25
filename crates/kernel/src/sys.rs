@@ -1165,6 +1165,133 @@ impl Kernel {
         result
     }
 
+    /// `ipc_recv(pid, fd, max_len, want_fd)` — drain bytes (and
+    /// optionally one ancillary fd) from a connected socket.
+    /// Returns `(bytes_read, optionally a freshly-installed
+    /// receiver-side fd-number)`.
+    ///
+    /// The fd-number in the returned tuple is a NEW number in the
+    /// caller's fd table — the kernel allocates the lowest free
+    /// slot via `FdTable::alloc` and installs a clone of the
+    /// underlying [`FdObject`] the sender's fd referred to. This is
+    /// the receiver side of the cross-process fd-passing primitive
+    /// POSIX `recvmsg(2) + SCM_RIGHTS` provides (Wayland's
+    /// `wl_keyboard.keymap` and friends rely on the equivalent).
+    ///
+    /// Routing by fd object: the caller's `fd` MUST resolve to
+    /// [`FdObject::Socket`] — any other kind returns
+    /// [`KernelError::NotSupportedOnFd`] which the dispatcher
+    /// remaps to EBADF (mirroring `ipc_send`'s wire surface; the
+    /// IPC opcodes use POSIX `recv(2)`'s "wrong fd kind" → EBADF
+    /// semantic, distinct from FD_READ's EINVAL on a non-readable
+    /// fd).
+    ///
+    /// Non-blocking only in v1: an empty rx_buf AND empty rx_fds
+    /// surfaces as [`KernelError::WouldBlock`] which the dispatcher
+    /// turns into EAGAIN. Blocking-recv would need a parking
+    /// primitive (sibling to `park_on_accept`) plus a wake hook on
+    /// `send_on_socket`'s rx-buf grow path; that's the next slice's
+    /// scope — documented here so the missing piece is visible to
+    /// the next agent that needs blocking semantics.
+    ///
+    /// `want_fd = false` semantics: the rx_fds queue is left
+    /// untouched even if it has entries waiting. A subsequent
+    /// `ipc_recv` with `want_fd = true` can drain them. This
+    /// matches POSIX `recvmsg(2)` with `msg_control = NULL` —
+    /// ancillary data stays queued until a caller asks for it.
+    ///
+    /// fd-translation: when `want_fd = true` and the rx_fds queue
+    /// has at least one entry, the kernel dequeues ONE u32 number
+    /// via [`IpcTable::recv_on_socket`] and tries to translate it
+    /// into a fresh receiver-side [`FdEntry`]:
+    ///
+    ///   1. Find the peer's `SocketId` from the receive-side
+    ///      socket's `peer` field.
+    ///   2. Scan `self.fds` for the pid whose fd table contains an
+    ///      `FdObject::Socket(peer_id)` entry — that's the sender.
+    ///   3. Look up the queued u32 in the sender's fd table to get
+    ///      the underlying `FdObject`.
+    ///   4. Allocate a new fd in the receiver's fd table installing
+    ///      a clone of that object.
+    ///
+    /// If any step of the translation fails (sender process exited
+    /// between send and recv, sender closed the fd before recv,
+    /// peer pointer became `None`), the queued u32 is silently
+    /// dropped and the receiver gets `Ok((bytes, None))`. This is
+    /// a deliberate v1 degradation: a more rigorous impl would
+    /// resolve the underlying object at SEND time and queue the
+    /// `FdObject` directly (eliminating the dangling-fd race), but
+    /// the IPC_SEND slice committed to queueing only the u32 number
+    /// — changing that is a separate IPC-table refactor.
+    pub fn ipc_recv(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+        max_len: usize,
+        want_fd: bool,
+    ) -> Result<(Vec<u8>, Option<u32>), KernelError> {
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        let max_fds = if want_fd { 1 } else { 0 };
+        let mut buf = alloc::vec![0u8; max_len];
+        let (n, fds) = self
+            .ipc
+            .recv_on_socket(socket_id, &mut buf, max_fds)
+            .map_err(KernelError::from)?;
+        buf.truncate(n);
+
+        let new_fd = if let Some(&sender_fd_num) = fds.first() {
+            self.translate_passed_fd(socket_id, pid, sender_fd_num)
+        } else {
+            None
+        };
+
+        Ok((buf, new_fd))
+    }
+
+    /// Resolve a queued u32 fd-number into a receiver-side
+    /// [`FdEntry`]. Returns `Some(new_fd)` on success, `None` if
+    /// any step fails (sender exited, peer cleared, sender's fd
+    /// closed, or fd-table install errored).
+    ///
+    /// Encapsulated as a separate method so [`Self::ipc_recv`]
+    /// reads as a single linear flow — the lookup-and-install dance
+    /// is enough machinery to deserve its own name.
+    fn translate_passed_fd(
+        &mut self,
+        receiver_socket: SocketId,
+        receiver_pid: Pid,
+        sender_fd_num: u32,
+    ) -> Option<u32> {
+        let peer_id = self.ipc.sockets_get(receiver_socket)?.peer?;
+        let sender_pid = self.find_pid_owning_socket(peer_id)?;
+        let sender_object = self.fds.get(&sender_pid)?.get(sender_fd_num)?.object;
+        let table = self.fds.get_mut(&receiver_pid)?;
+        table
+            .alloc(FdEntry::new(sender_object))
+            .ok()
+    }
+
+    /// Linear scan helper: find the pid whose fd table contains an
+    /// `FdObject::Socket(socket_id)` entry. v1 invariant: each
+    /// socket id is referenced by at most one process's fd table.
+    /// Returns `None` if no process owns the socket — this is the
+    /// "sender exited between send and recv" path for
+    /// [`Self::translate_passed_fd`]. O(P * F) but P and F are
+    /// small in v1 (handful of processes, soft-limit ~1024 fds);
+    /// a reverse index would optimise this when it matters.
+    fn find_pid_owning_socket(&self, socket_id: SocketId) -> Option<Pid> {
+        for (pid, table) in &self.fds {
+            for (_fd, entry) in table.iter() {
+                if let FdObject::Socket(id) = entry.object {
+                    if id == socket_id.0 {
+                        return Some(*pid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Helper: look up `fd` in `pid`'s fd table and return the
     /// `SocketId` the entry refers to, or the appropriate
     /// `KernelError` if the fd is missing / not a socket.

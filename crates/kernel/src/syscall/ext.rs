@@ -9,10 +9,10 @@
 //!
 //! ## Coverage
 //!
-//! As of the IPC_SEND delegation slice, the dispatcher routes
+//! As of the IPC_RECV delegation slice, the dispatcher routes
 //! the following extension opcodes (`contracts/syscalls.md §3`):
 //! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
-//! `IPC_ACCEPT`, `IPC_SEND`, `IPC_PIPE`, `PROC_SELF`,
+//! `IPC_ACCEPT`, `IPC_SEND`, `IPC_RECV`, `IPC_PIPE`, `PROC_SELF`,
 //! `PROC_PARENT`, `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`,
 //! `PROC_CAPS_GET`, `DISPLAY_CONNECT`, `DISPLAY_BIND`,
 //! `CAP_CHECK`, `CAP_LIST`, `CAP_GRANT`.
@@ -20,22 +20,13 @@
 //! The remaining extension opcodes fall through the `_ =>` arm
 //! and return `ENOSYS`:
 //!
-//! * `IPC_RECV` (0x1006) — fd-passing receive; deferred until the
-//!   per-receiver fd-installation step is designed (the IpcTable
-//!   already queues passed fd numbers on `Socket::rx_fds`, but
-//!   the receiver-side translation into a fresh `FdEntry` is the
-//!   IPC_RECV slice's job — see `Kernel::ipc_send` for the
-//!   send-side queueing primitive that just landed). `FD_READ`
-//!   already covers the recv-without-fd-passing case via the
-//!   `FdObject::Socket` arm, so IPC_RECV is the fd-passing-only
-//!   path. `IPC_RECV` is the canonical ext-range ENOSYS probe
-//!   target in `known_ext_opcode_without_handler_returns_enosys`;
-//!   it inherits that role from `IPC_SEND`, which now ships a
-//!   handler.
 //! * `MOUNT` / `UMOUNT` (0x1400/0x1401) — the semantic surface
 //!   exists on `Kernel::vfs.mount` / `umount`, but a fstype →
 //!   `Box<dyn Filesystem>` factory and the privilege / config
-//!   plumbing isn't yet designed.
+//!   plumbing isn't yet designed. `MOUNT` is now the canonical
+//!   ext-range ENOSYS probe target in
+//!   `known_ext_opcode_without_handler_returns_enosys`; it inherits
+//!   that role from `IPC_RECV`, which now ships a handler.
 //! * `FS_WATCH` (0x1402) — needs an event queue + watch-point
 //!   notification machinery that doesn't exist yet.
 //! * `HOST_FILE_RECV` (0x1500) — needs the drag-drop token
@@ -76,6 +67,7 @@ pub fn dispatch_ext(
         op::IPC_CONNECT => ServiceOutcome::Done(handle_ipc_connect(kernel, pid, req, heap)),
         op::IPC_ACCEPT => handle_ipc_accept(kernel, pid, req),
         op::IPC_SEND => ServiceOutcome::Done(handle_ipc_send(kernel, pid, req, heap)),
+        op::IPC_RECV => ServiceOutcome::Done(handle_ipc_recv(kernel, pid, req, heap)),
         op::IPC_PIPE => ServiceOutcome::Done(handle_ipc_pipe(kernel, pid, req, heap)),
         op::PROC_SELF => ServiceOutcome::Done(handle_proc_self(pid, req)),
         op::PROC_PARENT => ServiceOutcome::Done(handle_proc_parent(kernel, pid, req)),
@@ -439,6 +431,128 @@ fn handle_ipc_send(
             Response::err(req.request_id, EBADF)
         }
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- ipc_recv ---------------------------------------------------------
+//
+// Layout (per `contracts/syscalls.md §3.1`, mirroring `ipc_send`):
+//   args[0..4]   = fd (u32) — the connected socket the caller wants
+//                  to drain bytes (and optionally one passed fd) from.
+//   args[4..8]   = len (u32) — the maximum payload byte count the
+//                  caller will accept this call. The handler reserves
+//                  a fresh `Vec<u8>` of this size in `Kernel::ipc_recv`
+//                  and copies whatever's drained back into the
+//                  caller's heap_out window.
+//   args[8..12]  = recv_fd_slot (i32 LE) — fd-handoff opt-in:
+//                  -1 = "don't install a passed fd; leave any queued
+//                       fds on the socket's rx_fds for a later call".
+//                  >= 0 = "install one queued fd in the lowest-free
+//                       slot of my fd table; v1 ignores the actual
+//                       value beyond the sign — slot-targeted install
+//                       is a future extension."
+//   args[12..16] = flags (u32) — reserved. v1 accepts only flags=0
+//                  (any other value → EINVAL before any side effect,
+//                  mirroring the ipc_send invariant). Future:
+//                  MSG_DONTWAIT, MSG_PEEK, MSG_CMSG_CLOEXEC, etc.
+//   heap_ptr / heap_len = the OUTPUT region the kernel writes payload
+//                  bytes into. heap_len MUST be >= 4 if recv_fd_slot
+//                  >= 0 (the first 4 bytes hold the new fd-number
+//                  when one was installed; payload starts at offset
+//                  4). When recv_fd_slot < 0, heap_len just needs to
+//                  cover the requested payload bytes.
+//
+// Response:
+//   value     = number of payload bytes drained (>= 0). Independent
+//               of whether an fd was installed — even a 0-byte recv
+//               that drained one fd reports value=0 and extra_len=4.
+//   extra_len = total bytes the kernel wrote into heap_out:
+//                 - recv_fd_slot < 0 OR no fd installed: bytes_drained
+//                 - fd installed: 4 + bytes_drained (the leading 4
+//                   bytes are the new receiver-side fd-number as
+//                   little-endian u32; payload follows from offset 4).
+//   status    = -EBADF if the main fd is unknown or not a socket.
+//               -EINVAL if flags != 0, the heap range is out of
+//                  bounds, or recv_fd_slot >= 0 with heap_len < 4.
+//               -EAGAIN if the socket has no bytes AND no queued
+//                  fds (v1 doesn't park — see Kernel::ipc_recv's
+//                  block-recv deferral note).
+//
+// Heap layout decision — fd-leading: when an fd is installed, the
+// 4-byte fd-number lives at heap[0..4] and the payload at
+// heap[4..4+value]. The alternative (payload first, fd at
+// heap[value..value+4]) requires the caller to compute the offset
+// from `value`, which forces a two-pass parse. Fixed-offset fd
+// matches `proc_wait`'s child-pid-at-heap[0..4] convention and the
+// `ipc_pipe` dual-fd-at-heap[0..8] convention — every existing
+// multi-value response in the dispatcher uses fixed offsets, never
+// variable ones. The `value`-as-byte-count split keeps the most
+// common path (POSIX-shaped `recv(fd, buf, len)`) reading naturally
+// — a caller that ignores `recv_fd_slot` reads `value` and walks
+// `heap[..value]`.
+//
+// Why not pack the fd into Response.value alongside the byte count?
+// Response.value is i64 with conventional semantics "primary scalar
+// return". Squeezing two scalars into one field by bit-packing
+// would let `value` carry both, but it'd break the read pattern
+// userland already learned from FD_READ / IPC_SEND ("value == bytes").
+// The heap-extra path costs 4 bytes per recv — negligible.
+
+fn handle_ipc_recv(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let len = args_u32(req, 4) as usize;
+    let recv_fd_slot = args_u32(req, 8) as i32;
+    let flags = args_u32(req, 12);
+
+    if flags != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let want_fd = recv_fd_slot >= 0;
+    let fd_prefix = if want_fd { 4 } else { 0 };
+    let needed = len.saturating_add(fd_prefix);
+    if (req.heap_len as usize) < needed {
+        return Response::err(req.request_id, EINVAL);
+    }
+
+    let (bytes, new_fd) = match kernel.ipc_recv(pid, fd, len, want_fd) {
+        Ok(pair) => pair,
+        Err(crate::sys::KernelError::NotSupportedOnFd) => {
+            return Response::err(req.request_id, EBADF)
+        }
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
+    };
+
+    let installed = new_fd.is_some();
+    let payload_offset = if installed { 4 } else { 0 };
+    let total = payload_offset + bytes.len();
+    let Some(out) = heap_out_mut(req, heap, total) else {
+        // The caller's heap window suddenly disappeared between the
+        // up-front bounds check and this write — shouldn't happen in
+        // a well-behaved dispatcher, but guard anyway. The ipc_recv
+        // side effects (drained bytes + dequeued + installed fd) have
+        // already committed; surface EINVAL but the receiver's table
+        // now holds the new fd. A cleaner rollback would re-queue the
+        // bytes / un-install the fd — both are awkward inversions that
+        // belong on a future hardening pass once a real heap-aliasing
+        // failure mode shows up in practice.
+        return Response::err(req.request_id, EINVAL);
+    };
+    if let Some(new_fd_num) = new_fd {
+        out[0..4].copy_from_slice(&new_fd_num.to_le_bytes());
+    }
+    out[payload_offset..payload_offset + bytes.len()].copy_from_slice(&bytes);
+
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: bytes.len() as i64,
+        extra_len: total as u32,
+        _pad: [0u8; 12],
     }
 }
 
