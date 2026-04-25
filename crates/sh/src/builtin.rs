@@ -9,15 +9,35 @@
 //! used to consume them as same-file items.
 //!
 //! The set is the minimal v1 dispatch: `:`, `true`, `false`,
-//! `echo`, `exit`, `cd`, `pwd`, `env`, `export`, `unset`.
-//! Anything else returns [`BuiltinOutcome::NotBuiltin`] so
-//! the REPL can fall through to the "command not found" path
-//! until a future slice wires `proc_spawn` into userland.
+//! `echo`, `exit`, `cd`, `pwd`, `env`, `export`, `unset`,
+//! `set`. Anything else returns [`BuiltinOutcome::NotBuiltin`]
+//! so the REPL can fall through to the "command not found"
+//! path until a future slice wires `proc_spawn` into userland.
 
 use core::str::FromStr;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Shell-wide mode flags toggled at runtime by `set`.
+///
+/// Currently surfaces only the POSIX `errexit` mode (`set
+/// -e` / `set -o errexit`): when true, the REPL terminates
+/// with the failing command's exit status the first time a
+/// command returns non-zero. Future flags (`set -u` for
+/// "error on unset variable", `set -x` for "trace each
+/// command", `set -n` for "syntax-check only") slot in as
+/// sibling fields on this struct without changing any
+/// existing call site — `dispatch_builtin` already takes
+/// `flags: &mut ShellFlags`, so a new mode is one extra
+/// field plus one extra `set` arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellFlags {
+    /// `set -e` / `set -o errexit`: terminate the REPL on
+    /// the first non-zero status. Off by default — POSIX
+    /// shells start with errexit cleared.
+    pub errexit: bool,
+}
 
 /// Outcome of dispatching one builtin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +62,18 @@ pub(crate) enum BuiltinOutcome {
 /// set. Returns [`BuiltinOutcome::NotBuiltin`] when the
 /// caller should fall back to external-command logic (in
 /// v1: print "command not found").
+///
+/// `flags` is the shell's mode-flag state (see
+/// [`ShellFlags`]). The `set` builtin mutates it; every
+/// other builtin ignores it. Threading `&mut ShellFlags`
+/// through every dispatch lets a future flag (`set -u` /
+/// `set -x` / `set -n`) be observed inside any builtin
+/// without revisiting this signature.
 pub(crate) fn dispatch_builtin<W: Write, E: Write>(
     tokens: &[&str],
     cwd: &mut PathBuf,
     env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
     stdout: &mut W,
     stderr: &mut E,
 ) -> BuiltinOutcome {
@@ -60,6 +88,7 @@ pub(crate) fn dispatch_builtin<W: Write, E: Write>(
         "env" => builtin_env(&tokens[1..], env, stdout, stderr),
         "export" => builtin_export(&tokens[1..], env, stdout, stderr),
         "unset" => builtin_unset(&tokens[1..], env, stderr),
+        "set" => builtin_set(&tokens[1..], flags, stderr),
         _ => BuiltinOutcome::NotBuiltin,
     }
 }
@@ -235,6 +264,86 @@ fn builtin_unset<E: Write>(
             continue;
         }
         env.remove(*arg);
+    }
+    BuiltinOutcome::Continue
+}
+
+/// POSIX `set` builtin — mode-flag toggle.
+///
+/// v1 supports the `errexit` flag in two equivalent shapes:
+///
+/// * `set -e` / `set -o errexit` — turn errexit ON.
+/// * `set +e` / `set +o errexit` — turn errexit OFF.
+///
+/// `set` with no args is a no-op in v1 (POSIX defines this
+/// as "print every shell variable" but the v1 `env` builtin
+/// already covers the variable-listing use case, so the
+/// no-arg `set` path is reserved for future expansion
+/// without breaking compatibility). Unknown shapes write
+/// `sh: set: <arg>: invalid option\n` to stderr and return
+/// `Continue` so the REPL stays alive.
+///
+/// Always returns `BuiltinOutcome::Continue` — `set` itself
+/// must never have a non-zero exit status, otherwise an
+/// active errexit flag would terminate the REPL the moment
+/// the user typed `set -e`. The `Continue` arm in the REPL
+/// loop sets `last_status = 0`, so the post-dispatch
+/// errexit check naturally skips `set` invocations.
+fn builtin_set<E: Write>(
+    args: &[&str],
+    flags: &mut ShellFlags,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    // No args: POSIX prints every shell variable. v1 defers
+    // this — `env` already lists exported entries and there's
+    // no separate "shell variable" namespace yet. Return
+    // Continue so the no-arg path is a no-op rather than an
+    // error; future slices can wire variable-listing here
+    // without breaking existing scripts.
+    if args.is_empty() {
+        return BuiltinOutcome::Continue;
+    }
+    // Walk args left-to-right. Each recognised toggle
+    // updates the flags struct; the first unrecognised arg
+    // emits a diagnostic and short-circuits (POSIX `set`
+    // doesn't process subsequent args after a bad option).
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-e" => flags.errexit = true,
+            "+e" => flags.errexit = false,
+            "-o" | "+o" => {
+                // `set -o NAME` / `set +o NAME` — the
+                // long-option form. The polarity (`-` vs
+                // `+`) and the NAME live in adjacent args.
+                let on = args[i] == "-o";
+                let Some(name) = args.get(i + 1) else {
+                    // Bare `set -o` without a name. POSIX
+                    // would list every option's state; v1
+                    // defers (mirroring the bare-`set`
+                    // no-op convention).
+                    return BuiltinOutcome::Continue;
+                };
+                match *name {
+                    "errexit" => flags.errexit = on,
+                    other => {
+                        let _ = writeln!(
+                            stderr,
+                            "sh: set: {other}: invalid option name"
+                        );
+                        let _ = stderr.flush();
+                        return BuiltinOutcome::Continue;
+                    }
+                }
+                i += 1;
+            }
+            other => {
+                let _ = writeln!(stderr, "sh: set: {other}: invalid option");
+                let _ = stderr.flush();
+                return BuiltinOutcome::Continue;
+            }
+        }
+        i += 1;
     }
     BuiltinOutcome::Continue
 }

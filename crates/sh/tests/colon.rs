@@ -20,11 +20,14 @@
 use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor};
 
-use sh::{run_with_env, ExitStatus};
+use sh::{run_with_env, ExitStatus, ShellFlags};
 
 /// Drive `run_with_env` with a byte-string stdin and a
 /// pre-seeded env map; return `(status, stdout, stderr,
-/// env)` for assertion.
+/// env)` for assertion. Constructs a fresh default
+/// `ShellFlags` per call (errexit off) — tests that need
+/// errexit pre-set live in `set_e.rs` and call
+/// `run_with_env` directly.
 fn drive(
     input: &str,
     mut env: BTreeMap<String, String>,
@@ -32,7 +35,8 @@ fn drive(
     let stdin = BufReader::new(Cursor::new(input.as_bytes().to_vec()));
     let mut stdout = Vec::<u8>::new();
     let mut stderr = Vec::<u8>::new();
-    let status = run_with_env(stdin, &mut stdout, &mut stderr, &mut env);
+    let mut flags = ShellFlags::default();
+    let status = run_with_env(stdin, &mut stdout, &mut stderr, &mut env, &mut flags);
     let out = String::from_utf8(stdout).expect("stdout must be utf-8");
     let err = String::from_utf8(stderr).expect("stderr must be utf-8");
     (status, out, err, env)

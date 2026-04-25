@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-use crate::builtin::{dispatch_builtin, BuiltinOutcome};
+use crate::builtin::{dispatch_builtin, BuiltinOutcome, ShellFlags};
 
 /// Outcome of the REPL loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,8 @@ impl ExitStatus {
     }
 }
 
-/// Run the minimal REPL loop with a fresh empty env map.
+/// Run the minimal REPL loop with a fresh empty env map
+/// and a fresh default-cleared mode-flag struct.
 ///
 /// Prints `"$ "`, reads one line, dispatches the first
 /// whitespace-separated token against the builtin set, and
@@ -71,24 +72,37 @@ impl ExitStatus {
 ///
 /// Thin wrapper over [`run_with_env`] — the userland `sh`
 /// binary calls this; tests that need to pre-seed env
-/// entries call [`run_with_env`] directly.
+/// entries OR pre-set mode flags (e.g. start the REPL with
+/// `errexit` already on, the way `sh -e script.sh` would)
+/// call [`run_with_env`] directly.
 pub fn run<R: BufRead, W: Write, E: Write>(stdin: R, stdout: W, stderr: E) -> ExitStatus {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
-    run_with_env(stdin, stdout, stderr, &mut env)
+    let mut flags = ShellFlags::default();
+    run_with_env(stdin, stdout, stderr, &mut env, &mut flags)
 }
 
-/// Run the REPL loop against a caller-provided env map.
+/// Run the REPL loop against a caller-provided env map and
+/// mode-flag struct.
 ///
 /// Test entry point: lets a test pre-seed entries (so
 /// `env` / `export` output can be asserted against a
 /// known-non-empty map without having to run `export`
-/// commands first) and observe mutations after the loop
-/// returns.
+/// commands first), pre-set mode flags (so a test can pin
+/// "errexit terminates the REPL the moment a non-zero
+/// status arrives" without first writing `set -e`), and
+/// observe both after the loop returns.
+///
+/// `flags` is `&mut` rather than `mut` so the caller's
+/// struct sees any mutations the in-loop `set` builtin
+/// makes (e.g. a test that runs `set -e` then asserts the
+/// post-loop flags has `errexit == true`). The same shape
+/// `env` already uses.
 pub fn run_with_env<R: BufRead, W: Write, E: Write>(
     mut stdin: R,
     mut stdout: W,
     mut stderr: E,
     env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
 ) -> ExitStatus {
     // Seed cwd from the real process cwd when std gives us
     // one — on wasip1 this may just be `/`. Fall back to
@@ -185,7 +199,7 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // is never observed; only the recoverable arms
         // (`Continue`, `Status(N)`, `NotBuiltin`) update the
         // stash for the next command's `$?`.
-        match dispatch_builtin(&expanded_refs, &mut cwd, env, &mut stdout, &mut stderr) {
+        match dispatch_builtin(&expanded_refs, &mut cwd, env, flags, &mut stdout, &mut stderr) {
             BuiltinOutcome::Continue => {
                 last_status = 0;
             }
@@ -215,6 +229,33 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
                 // that wasn't found produces status 127.
                 last_status = 127;
             }
+        }
+
+        // POSIX `set -e` / errexit: if the most recent command
+        // returned a non-zero status AND errexit is enabled,
+        // terminate the REPL with the failing command's exit
+        // status. The check fires AFTER `last_status` is
+        // updated and BEFORE the next prompt — so any non-zero
+        // post-dispatch state (Status(N) from `false`, 127 from
+        // a NotBuiltin, etc.) triggers it. `set` itself can't
+        // trigger it because the builtin always returns
+        // `Continue` (status 0); `Exit(N)` and `IoError` arms
+        // already short-circuited above so they bypass the
+        // check (intentional: `exit 5` should report Exit(5)
+        // unconditionally, not get reinterpreted as an errexit
+        // termination). v1 has no `if` / `while` / `until` /
+        // `&&` / `||` / `!` constructs, so there are no POSIX
+        // exemption contexts to handle — every non-zero status
+        // triggers termination when errexit is on.
+        if flags.errexit && last_status != 0 {
+            // i32 → u8 via the same rem_euclid clamp the `sh`
+            // binary's main applies, so multi-byte status codes
+            // wrap consistently. 0 was just ruled out by the
+            // condition above, so the resulting byte is always
+            // non-zero and userland can distinguish errexit
+            // termination from a clean EOF.
+            let byte = u8::try_from(last_status.rem_euclid(256)).unwrap_or(1);
+            return ExitStatus::Exit(byte as i32);
         }
     }
 }
