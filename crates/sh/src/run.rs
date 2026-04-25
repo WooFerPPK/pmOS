@@ -95,6 +95,17 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
     // `/` when the call fails so tests stay deterministic.
     let mut cwd: PathBuf = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let mut line = String::new();
+    // POSIX `$?` parameter: the exit status of the most
+    // recently executed command. Starts at 0 before any
+    // command runs; updated AFTER each dispatch from the
+    // BuiltinOutcome (Continue → 0, Status(N) → N,
+    // IoError → 1 matching POSIX I/O failure convention,
+    // NotBuiltin / "command not found" → 127). Blank lines
+    // and quote errors leave it untouched (no command ran).
+    // Stored in a dedicated `i32` rather than the env map
+    // so userland can't `export ?=foo` and break the
+    // resolver — the `?` name is reserved by the shell.
+    let mut last_status: i32 = 0;
 
     loop {
         if write!(stdout, "$ ").is_err() {
@@ -159,21 +170,31 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // against the env map. Unset names expand to the empty
         // string but the token is preserved (matches POSIX
         // `set -u`-off semantics; we never silently drop an arg).
+        // `last_status` is threaded so `$?` resolves to the
+        // most recent command's exit code as a decimal string.
         let expanded: Vec<String> = parts
             .iter()
-            .map(|token| assemble_token(token, env))
+            .map(|token| assemble_token(token, env, last_status))
             .collect();
         let expanded_refs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
 
+        // Capture the dispatch outcome and translate to the
+        // POSIX status byte BEFORE handling REPL-terminating
+        // cases. `Exit(N)` and `IoError` short-circuit out of
+        // the loop so the new `last_status` they would imply
+        // is never observed; only the recoverable arms
+        // (`Continue`, `Status(N)`, `NotBuiltin`) update the
+        // stash for the next command's `$?`.
         match dispatch_builtin(&expanded_refs, &mut cwd, env, &mut stdout, &mut stderr) {
-            BuiltinOutcome::Continue => {}
-            BuiltinOutcome::Status(_) => {
+            BuiltinOutcome::Continue => {
+                last_status = 0;
+            }
+            BuiltinOutcome::Status(code) => {
                 // Builtin reported a non-zero exit status but
                 // the REPL continues (e.g. `false` always
-                // returns Status(1)). The status byte is
-                // currently dropped — a future slice will
-                // stash it and surface it as `$?` for the
-                // next command's expansion.
+                // returns Status(1)). Stash it for the next
+                // command's `$?` expansion.
+                last_status = code;
             }
             BuiltinOutcome::Exit(code) => return ExitStatus::Exit(code),
             BuiltinOutcome::IoError => return ExitStatus::IoError,
@@ -190,6 +211,9 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
                 if stderr.flush().is_err() {
                     return ExitStatus::IoError;
                 }
+                // POSIX-mandated: an attempt to run a command
+                // that wasn't found produces status 127.
+                last_status = 127;
             }
         }
     }
@@ -197,10 +221,21 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 
 /// Expand `$NAME` and `${NAME}` references inside one
 /// whitespace-tokenised word against the caller-provided
-/// env map.
+/// env map. `last_status` is the integer to substitute for
+/// `$?` / `${?}` (POSIX last-exit-status parameter).
 ///
 /// Rules (T142 partial — variable substitution slice):
 ///
+/// * `$?` and `${?}` expand to the most recent command's
+///   exit status as a decimal string (`0` initially, `0`
+///   after success, `N` after `Status(N)`, `127` after a
+///   "command not found"). The `?` character is NOT a
+///   name-start char (so the existing name-scanner can't
+///   match it) — the special case lives BEFORE the name
+///   scanner. As with `$1` / positional args in real
+///   shells, `?` is the WHOLE expansion (a single byte),
+///   so `$?bar` expands to `<status>bar` (not
+///   `${?bar}`).
 /// * `$NAME` where NAME starts with `[A-Za-z_]` and
 ///   continues with `[A-Za-z0-9_]*` is a variable
 ///   reference. The match is greedy: `$Xb` reads as
@@ -227,8 +262,9 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 ///   default this slice ships.
 /// * `$$`, `$@`, `$0`, `$1`, etc. are NOT supported in
 ///   this slice. A `$` followed by anything other than a
-///   name-start char (`[A-Za-z_]`) or `{` is preserved as
-///   a literal `$` and the scanner advances one byte.
+///   name-start char (`[A-Za-z_]`), `{`, or `?` is
+///   preserved as a literal `$` and the scanner advances
+///   one byte.
 /// * A trailing `$` at end-of-token is a literal `$`.
 /// * Backslash escapes (`\$X`) are NOT handled here —
 ///   those land in the quoting / escaping slice. A `\$X`
@@ -247,7 +283,11 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 ///   (alternate-if-set); `${VAR:offset:length}` (substring).
 ///   Each of these would extend the `:-` parser path with a
 ///   new modifier-byte branch.
-pub(crate) fn expand_vars(token: &str, env: &BTreeMap<String, String>) -> String {
+pub(crate) fn expand_vars(
+    token: &str,
+    env: &BTreeMap<String, String>,
+    last_status: i32,
+) -> String {
     let bytes = token.as_bytes();
     let mut out = String::with_capacity(token.len());
     let mut i = 0;
@@ -266,6 +306,14 @@ pub(crate) fn expand_vars(token: &str, env: &BTreeMap<String, String>) -> String
         // Saw `$`. Look at the next byte to decide.
         let next = bytes.get(i + 1).copied();
         match next {
+            Some(b'?') => {
+                // POSIX `$?` — last-exit-status. Single-char
+                // parameter (like `$1` would be in a shell
+                // with positional args), so any byte after
+                // the `?` resumes literal copying.
+                out.push_str(&last_status.to_string());
+                i += 2;
+            }
             Some(b'{') => {
                 // Braced form: scan to a matching `}`.
                 // Nested braces are NOT handled — the close
@@ -284,13 +332,26 @@ pub(crate) fn expand_vars(token: &str, env: &BTreeMap<String, String>) -> String
                     out.push_str(&token[i..]);
                     return out;
                 }
+                // Recognise `${?}` as the explicit braced
+                // form of `$?` BEFORE the name / modifier
+                // logic — `?` isn't a name char, and there
+                // are no parameter-expansion modifiers
+                // defined for it. A `${?:-default}` shape
+                // is not POSIX-defined, so v1 doesn't
+                // bother to support it; only the bare
+                // `${?}` falls into this arm.
+                let region = &token[name_start..close];
+                if region == "?" {
+                    out.push_str(&last_status.to_string());
+                    i = close + 1;
+                    continue;
+                }
                 // Look for the `:-` modifier inside the brace
                 // region. The name part is everything up to
                 // the modifier; the default part is everything
                 // after, up to the closing `}`. Without the
                 // modifier the whole region is the name (the
                 // existing simple-brace behavior).
-                let region = &token[name_start..close];
                 if let Some(sep) = find_colon_dash(region.as_bytes()) {
                     let name = &region[..sep];
                     let default = &region[sep + 2..];
@@ -538,14 +599,19 @@ pub(crate) fn tokenise_with_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, Qu
 }
 
 /// Assemble one token's parts into a final `String`,
-/// running `expand_vars` over `Unquoted` segments and
-/// passing `Literal` segments through verbatim.
-pub(crate) fn assemble_token(parts: &[TokenPart], env: &BTreeMap<String, String>) -> String {
+/// running `expand_vars` over `Unquoted` segments (with
+/// `last_status` threaded for `$?` resolution) and passing
+/// `Literal` segments through verbatim.
+pub(crate) fn assemble_token(
+    parts: &[TokenPart],
+    env: &BTreeMap<String, String>,
+    last_status: i32,
+) -> String {
     let mut out = String::new();
     for part in parts {
         match part {
             TokenPart::Literal(s) => out.push_str(s),
-            TokenPart::Unquoted(s) => out.push_str(&expand_vars(s, env)),
+            TokenPart::Unquoted(s) => out.push_str(&expand_vars(s, env, last_status)),
         }
     }
     out
@@ -567,20 +633,20 @@ mod expand_tests {
     #[test]
     fn unset_var_expands_to_empty() {
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$UNSET", &env), "");
+        assert_eq!(expand_vars("$UNSET", &env, 0), "");
     }
 
     #[test]
     fn set_var_expands_to_value() {
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("$X", &env), "hello");
+        assert_eq!(expand_vars("$X", &env, 0), "hello");
     }
 
     #[test]
     fn multiple_vars_in_token_concat() {
         // `$X$Y` with `X=hello`, `Y=world` → `helloworld`.
         let env = env_with(&[("X", "hello"), ("Y", "world")]);
-        assert_eq!(expand_vars("$X$Y", &env), "helloworld");
+        assert_eq!(expand_vars("$X$Y", &env, 0), "helloworld");
     }
 
     #[test]
@@ -590,7 +656,7 @@ mod expand_tests {
         // so this is the only way to insert a literal letter
         // immediately after an expansion.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${X}b", &env), "hellob");
+        assert_eq!(expand_vars("${X}b", &env, 0), "hellob");
     }
 
     #[test]
@@ -598,7 +664,7 @@ mod expand_tests {
         // `a$Xb` is `a` + `$Xb` (greedy). `Xb` is unset, so
         // the whole tail expands to empty: result is `a`.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("a$Xb", &env), "a");
+        assert_eq!(expand_vars("a$Xb", &env, 0), "a");
     }
 
     #[test]
@@ -606,13 +672,13 @@ mod expand_tests {
         // `$1` → `1` is not a name-start char, so the `$` is
         // preserved literal and the `1` is preserved literal.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$1", &env), "$1");
+        assert_eq!(expand_vars("$1", &env, 0), "$1");
     }
 
     #[test]
     fn lone_dollar_at_end_is_literal() {
         let env = env_with(&[]);
-        assert_eq!(expand_vars("foo$", &env), "foo$");
+        assert_eq!(expand_vars("foo$", &env, 0), "foo$");
     }
 
     #[test]
@@ -621,32 +687,32 @@ mod expand_tests {
         // be valid identifiers per the `[A-Za-z_][A-Za-z0-9_]*`
         // rule. Test all three shapes in one go.
         let env = env_with(&[("_X", "u"), ("FOO_BAR", "fb"), ("Z_", "zt")]);
-        assert_eq!(expand_vars("$_X", &env), "u");
-        assert_eq!(expand_vars("$FOO_BAR", &env), "fb");
-        assert_eq!(expand_vars("$Z_", &env), "zt");
+        assert_eq!(expand_vars("$_X", &env, 0), "u");
+        assert_eq!(expand_vars("$FOO_BAR", &env, 0), "fb");
+        assert_eq!(expand_vars("$Z_", &env, 0), "zt");
     }
 
     #[test]
     fn no_dollar_passes_through_verbatim() {
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("plain text", &env), "plain text");
-        assert_eq!(expand_vars("", &env), "");
+        assert_eq!(expand_vars("plain text", &env, 0), "plain text");
+        assert_eq!(expand_vars("", &env, 0), "");
     }
 
     #[test]
     fn braced_form_with_unset_name_is_empty() {
         let env = env_with(&[]);
-        assert_eq!(expand_vars("${MISSING}", &env), "");
+        assert_eq!(expand_vars("${MISSING}", &env, 0), "");
         // Surrounding text preserved.
-        assert_eq!(expand_vars("a${MISSING}b", &env), "ab");
+        assert_eq!(expand_vars("a${MISSING}b", &env, 0), "ab");
     }
 
     #[test]
     fn unterminated_brace_preserves_literal() {
         // `${X` with no closing `}` → preserved as-is.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${X", &env), "${X");
-        assert_eq!(expand_vars("a${X", &env), "a${X");
+        assert_eq!(expand_vars("${X", &env, 0), "${X");
+        assert_eq!(expand_vars("a${X", &env, 0), "a${X");
     }
 
     #[test]
@@ -656,7 +722,7 @@ mod expand_tests {
         // `$` stays literal and the scanner advances. The
         // second `$` then sees end-of-token, also literal.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$$", &env), "$$");
+        assert_eq!(expand_vars("$$", &env, 0), "$$");
     }
 
     #[test]
@@ -664,7 +730,7 @@ mod expand_tests {
         // The escaping slice will handle `\$X`. For now a
         // literal `\` is preserved, then `$X` expands.
         let env = env_with(&[("X", "v")]);
-        assert_eq!(expand_vars("\\$X", &env), "\\v");
+        assert_eq!(expand_vars("\\$X", &env, 0), "\\v");
     }
 
     #[test]
@@ -673,7 +739,7 @@ mod expand_tests {
         // This is the canonical use-case for `:-`: a guard
         // against missing env vars.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("${UNSET:-fallback}", &env), "fallback");
+        assert_eq!(expand_vars("${UNSET:-fallback}", &env, 0), "fallback");
     }
 
     #[test]
@@ -684,7 +750,7 @@ mod expand_tests {
         // implemented this slice) would treat empty-string as
         // "set" and skip the default.
         let env = env_with(&[("X", "")]);
-        assert_eq!(expand_vars("${X:-fallback}", &env), "fallback");
+        assert_eq!(expand_vars("${X:-fallback}", &env, 0), "fallback");
     }
 
     #[test]
@@ -693,7 +759,7 @@ mod expand_tests {
         // default is discarded — only consulted when the var
         // is unset or empty.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${X:-fallback}", &env), "hello");
+        assert_eq!(expand_vars("${X:-fallback}", &env, 0), "hello");
     }
 
     #[test]
@@ -704,7 +770,7 @@ mod expand_tests {
         // guard against the parser rejecting an empty default
         // (it should accept the zero-byte tail after `:-`).
         let env = env_with(&[]);
-        assert_eq!(expand_vars("${UNSET:-}", &env), "");
+        assert_eq!(expand_vars("${UNSET:-}", &env, 0), "");
     }
 
     #[test]
@@ -721,7 +787,7 @@ mod expand_tests {
         // quotes, which the existing T142 partial supports.
         let env = env_with(&[]);
         assert_eq!(
-            expand_vars("${UNSET:-some default}", &env),
+            expand_vars("${UNSET:-some default}", &env, 0),
             "some default"
         );
     }
@@ -735,7 +801,7 @@ mod expand_tests {
         // (one-pass, no recursion) and matches the slice-scope
         // boundary documented in the doc-comment.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${UNSET:-$X}", &env), "$X");
+        assert_eq!(expand_vars("${UNSET:-$X}", &env, 0), "$X");
     }
 
     #[test]
@@ -746,7 +812,7 @@ mod expand_tests {
         // over surfacing a mid-line error.
         let env = env_with(&[("X", "hello")]);
         assert_eq!(
-            expand_vars("${X:-no_close", &env),
+            expand_vars("${X:-no_close", &env, 0),
             "${X:-no_close"
         );
     }
@@ -758,7 +824,7 @@ mod expand_tests {
         // appear in the output when the var is set.
         let env = env_with(&[("X", "actual")]);
         assert_eq!(
-            expand_vars("${X:-this is junk}", &env),
+            expand_vars("${X:-this is junk}", &env, 0),
             "actual"
         );
     }
@@ -770,8 +836,77 @@ mod expand_tests {
         // `}` and resumes literal copying.
         let env = env_with(&[]);
         assert_eq!(
-            expand_vars("a${UNSET:-mid}b", &env),
+            expand_vars("a${UNSET:-mid}b", &env, 0),
             "amidb"
         );
+    }
+
+    #[test]
+    fn dollar_question_expands_to_status_zero() {
+        // `$?` with the canonical initial state (no command
+        // run yet) → `"0"`. Pin against the initial-state
+        // expectation that `run_with_env` seeds the same way.
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("$?", &env, 0), "0");
+    }
+
+    #[test]
+    fn dollar_question_expands_to_arbitrary_status() {
+        // `$?` with `last_status=42` → `"42"`. Confirms the
+        // decimal-string conversion works for non-zero,
+        // multi-digit codes — the most common shape after a
+        // `Status(N)` builtin or a `command not found` (127).
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("$?", &env, 1), "1");
+        assert_eq!(expand_vars("$?", &env, 2), "2");
+        assert_eq!(expand_vars("$?", &env, 42), "42");
+        assert_eq!(expand_vars("$?", &env, 127), "127");
+    }
+
+    #[test]
+    fn dollar_question_braced_form_works() {
+        // `${?}` is the explicit braced form of `$?` —
+        // semantically identical. The brace arm short-circuits
+        // on `region == "?"` BEFORE the modifier scan so the
+        // POSIX-undefined `${?:-default}` shape is not
+        // accidentally accepted via the existing `:-` path.
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("${?}", &env, 0), "0");
+        assert_eq!(expand_vars("${?}", &env, 7), "7");
+    }
+
+    #[test]
+    fn dollar_question_followed_by_literal_chars() {
+        // `$?bar` → `<status>bar`. The `?` is the WHOLE
+        // expansion (single byte after `$`), so the scanner
+        // advances 2 bytes and resumes literal copying — no
+        // need for a braced form to insert literal chars
+        // after `$?`. This mirrors how `$1` works in real
+        // shells with positional args.
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("$?bar", &env, 0), "0bar");
+        assert_eq!(expand_vars("$?bar", &env, 1), "1bar");
+    }
+
+    #[test]
+    fn dollar_question_in_middle_of_token() {
+        // Surrounding text on either side of `$?` is
+        // preserved — the scanner emits the literal prefix,
+        // then the status digits, then the literal suffix.
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("[$?]", &env, 42), "[42]");
+    }
+
+    #[test]
+    fn dollar_question_does_not_consume_env_lookup() {
+        // Critical regression guard: even if userland tries
+        // to `export ?=foo`, `$?` MUST resolve to the
+        // dedicated last_status, NOT the env entry — because
+        // last_status is the only argument the resolver
+        // consults for `?` / `${?}`. The env map is never
+        // checked for the `?` name.
+        let env = env_with(&[("?", "foo")]);
+        assert_eq!(expand_vars("$?", &env, 5), "5");
+        assert_eq!(expand_vars("${?}", &env, 5), "5");
     }
 }
