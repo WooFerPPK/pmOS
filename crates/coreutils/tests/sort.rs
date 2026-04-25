@@ -538,3 +538,142 @@ fn dash_cu_treats_duplicate_as_violation() {
         "stderr = {stderr:?}"
     );
 }
+
+#[test]
+fn dash_b_sorts_ignoring_leading_blanks() {
+    let dir = scratch_dir("b_basic");
+    let path = write_file(&dir, "in.txt", b"   apple\nbanana\n  cherry\n");
+
+    let out = Command::new(SORT)
+        .arg("-b")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"   apple\nbanana\n  cherry\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_b_preserves_leading_blanks_in_output() {
+    let dir = scratch_dir("b_preserve");
+    let path = write_file(&dir, "in.txt", b"   apple\nbanana\n");
+
+    let out = Command::new(SORT)
+        .arg("-b")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"   apple\nbanana\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_b_treats_lines_with_only_blanks_as_empty_key() {
+    let dir = scratch_dir("b_only_blanks");
+    let path = write_file(&dir, "in.txt", b"   \n   apple\n");
+
+    let out = Command::new(SORT)
+        .arg("-b")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"   \n   apple\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_bu_dedupes_after_trim() {
+    let dir = scratch_dir("bu");
+    let path = write_file(&dir, "in.txt", b"   apple\napple\n   apple\n");
+
+    let out = Command::new(SORT)
+        .arg("-bu")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"   apple\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_bf_combines_trim_then_fold() {
+    let dir = scratch_dir("bf");
+    let path = write_file(&dir, "in.txt", b"   apple\nApple\n   APPLE\n");
+
+    let out = Command::new(SORT)
+        .arg("-bf")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"   apple\nApple\n   APPLE\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_bn_no_op_for_numeric() {
+    let dir = scratch_dir("bn");
+    let path = write_file(&dir, "in.txt", b"   10\n   2\n   1\n");
+
+    let out = Command::new(SORT)
+        .arg("-bn")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"   1\n   2\n   10\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_b_does_not_trim_trailing_whitespace() {
+    let dir = scratch_dir("b_trailing");
+    let path = write_file(&dir, "in.txt", b"apple\napple   \n");
+
+    let out = Command::new(SORT)
+        .arg("-b")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"apple\napple   \n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_cb_checks_with_trimmed_keys() {
+    let out = run_check(&["-cb"], b"   apple\nbanana\n  cherry\n");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+
+    let plain_check = run_check(&["-c"], b"   apple\nbanana\n  cherry\n");
+    assert_eq!(
+        plain_check.status.code(),
+        Some(1),
+        "plain check should fail because banana > '  cherry' under raw lex (space is 32 < b)"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain_check.stderr);
+    assert!(
+        plain_stderr.contains("disorder"),
+        "stderr = {plain_stderr:?}"
+    );
+}

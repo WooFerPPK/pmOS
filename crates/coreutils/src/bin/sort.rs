@@ -39,8 +39,19 @@
 //! numeric ordering, `-cf` checks fold ordering, `-cr` checks
 //! descending order, `-cu` ALSO checks uniqueness (equal adjacent
 //! keys count as a violation, since under `-u` the input would have
-//! been collapsed). `-ru` / `-ur` / `-nr` / `-nu` / `-nru` /
-//! `-fr` / `-fu` / `-fnu` / `-cn` / `-cf` / `-cr` / `-cu` etc.
+//! been collapsed). `-b` ignores leading blanks (POSIX `[[:blank:]]`
+//! — space + horizontal tab only) when computing the comparison key
+//! for the lex / fold comparators (the trim is COMPARISON-ONLY:
+//! original line bytes are emitted unchanged on stdout, mirroring
+//! the `-f` case-preservation invariant); the trim is leading-only
+//! (trailing whitespace is NOT trimmed). `-b` is effectively a
+//! no-op when `-n` is set since `parse_leading_int` already trims
+//! leading whitespace internally — the test pins this. `-bf` trims
+//! THEN folds (`   Apple` and `apple` both reduce to `APPLE` for
+//! the key); `-bu` dedupes after trim (`   apple` and `apple`
+//! collapse to one), via `trim_leading_blanks`. `-ru` / `-ur` /
+//! `-nr` / `-nu` / `-nru` / `-fr` / `-fu` / `-fnu` / `-cn` / `-cf` /
+//! `-cr` / `-cu` / `-b` / `-bf` / `-bu` / `-bfu` / `-cb` etc.
 //! apply the chosen combination. Unknown flags write
 //! `sort: unknown flag: <flag>` to stderr and exit 2 (matching
 //! grep's open-error/usage exit code).
@@ -59,6 +70,7 @@ fn main() -> ExitCode {
     let mut numeric = false;
     let mut fold = false;
     let mut check_only = false;
+    let mut ignore_blanks = false;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -74,6 +86,7 @@ fn main() -> ExitCode {
                     'n' => numeric = true,
                     'f' => fold = true,
                     'c' => check_only = true,
+                    'b' => ignore_blanks = true,
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -110,13 +123,15 @@ fn main() -> ExitCode {
     }
 
     if check_only {
-        return check_sorted(&lines, numeric, fold, reverse, unique);
+        return check_sorted(&lines, numeric, fold, ignore_blanks, reverse, unique);
     }
 
     if numeric {
         lines.sort_by_key(|line| parse_leading_int(line));
     } else if fold {
-        lines.sort_by_key(|line| fold_to_upper_bytes(line));
+        lines.sort_by_key(|line| fold_to_upper_bytes(maybe_trim(line, ignore_blanks)));
+    } else if ignore_blanks {
+        lines.sort_by_key(|line| trim_leading_blanks(line).as_bytes().to_vec());
     } else {
         lines.sort();
     }
@@ -124,8 +139,12 @@ fn main() -> ExitCode {
         lines.reverse();
     }
     if unique {
-        if fold && !numeric {
-            lines.dedup_by_key(|line| fold_to_upper_bytes(line));
+        if numeric {
+            lines.dedup();
+        } else if fold {
+            lines.dedup_by_key(|line| fold_to_upper_bytes(maybe_trim(line, ignore_blanks)));
+        } else if ignore_blanks {
+            lines.dedup_by_key(|line| trim_leading_blanks(line).as_bytes().to_vec());
         } else {
             lines.dedup();
         }
@@ -149,13 +168,16 @@ enum Key {
     Bytes(Vec<u8>),
 }
 
-fn key_for(line: &str, numeric: bool, fold: bool) -> Key {
+fn key_for(line: &str, numeric: bool, fold: bool, ignore_blanks: bool) -> Key {
     if numeric {
         Key::Numeric(parse_leading_int(line))
-    } else if fold {
-        Key::Bytes(fold_to_upper_bytes(line))
     } else {
-        Key::Bytes(line.as_bytes().to_vec())
+        let s = maybe_trim(line, ignore_blanks);
+        if fold {
+            Key::Bytes(fold_to_upper_bytes(s))
+        } else {
+            Key::Bytes(s.as_bytes().to_vec())
+        }
     }
 }
 
@@ -163,13 +185,14 @@ fn check_sorted(
     lines: &[String],
     numeric: bool,
     fold: bool,
+    ignore_blanks: bool,
     reverse: bool,
     unique: bool,
 ) -> ExitCode {
     use std::cmp::Ordering;
     for i in 1..lines.len() {
-        let prev = key_for(&lines[i - 1], numeric, fold);
-        let curr = key_for(&lines[i], numeric, fold);
+        let prev = key_for(&lines[i - 1], numeric, fold, ignore_blanks);
+        let curr = key_for(&lines[i], numeric, fold, ignore_blanks);
         let ord = prev.cmp(&curr);
         let violation = match (reverse, unique) {
             (false, false) => ord == Ordering::Greater,
@@ -204,6 +227,14 @@ fn fold_to_upper_bytes(s: &str) -> Vec<u8> {
     s.bytes()
         .map(|b| if b.is_ascii_lowercase() { b - 32 } else { b })
         .collect()
+}
+
+fn trim_leading_blanks(s: &str) -> &str {
+    s.trim_start_matches([' ', '\t'])
+}
+
+fn maybe_trim(s: &str, ignore_blanks: bool) -> &str {
+    if ignore_blanks { trim_leading_blanks(s) } else { s }
 }
 
 fn parse_leading_int(s: &str) -> i64 {
