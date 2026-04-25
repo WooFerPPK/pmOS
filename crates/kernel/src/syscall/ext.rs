@@ -9,25 +9,28 @@
 //!
 //! ## Coverage
 //!
-//! As of the CAP_GRANT delegation slice, the dispatcher routes
+//! As of the IPC_SEND delegation slice, the dispatcher routes
 //! the following extension opcodes (`contracts/syscalls.md §3`):
 //! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
-//! `IPC_ACCEPT`, `IPC_PIPE`, `PROC_SELF`, `PROC_PARENT`,
-//! `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`, `PROC_CAPS_GET`,
-//! `DISPLAY_CONNECT`, `DISPLAY_BIND`, `CAP_CHECK`, `CAP_LIST`,
-//! `CAP_GRANT`.
+//! `IPC_ACCEPT`, `IPC_SEND`, `IPC_PIPE`, `PROC_SELF`,
+//! `PROC_PARENT`, `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`,
+//! `PROC_CAPS_GET`, `DISPLAY_CONNECT`, `DISPLAY_BIND`,
+//! `CAP_CHECK`, `CAP_LIST`, `CAP_GRANT`.
 //!
 //! The remaining extension opcodes fall through the `_ =>` arm
 //! and return `ENOSYS`:
 //!
-//! * `IPC_SEND` / `IPC_RECV` (0x1005/0x1006) — fd-passing
-//!   primitives; deferred until the IpcTable grows per-send fd
-//!   queues. `FD_READ` / `FD_WRITE` already cover the
-//!   send/recv-without-fd-passing case via the `FdObject::Socket`
-//!   arm, so the send/recv opcodes are the fd-passing-only path.
-//!   `IPC_SEND` is the canonical ext-range ENOSYS probe target
-//!   in `known_ext_opcode_without_handler_returns_enosys`; it
-//!   inherits that role from `CAP_GRANT`, which now ships a
+//! * `IPC_RECV` (0x1006) — fd-passing receive; deferred until the
+//!   per-receiver fd-installation step is designed (the IpcTable
+//!   already queues passed fd numbers on `Socket::rx_fds`, but
+//!   the receiver-side translation into a fresh `FdEntry` is the
+//!   IPC_RECV slice's job — see `Kernel::ipc_send` for the
+//!   send-side queueing primitive that just landed). `FD_READ`
+//!   already covers the recv-without-fd-passing case via the
+//!   `FdObject::Socket` arm, so IPC_RECV is the fd-passing-only
+//!   path. `IPC_RECV` is the canonical ext-range ENOSYS probe
+//!   target in `known_ext_opcode_without_handler_returns_enosys`;
+//!   it inherits that role from `IPC_SEND`, which now ships a
 //!   handler.
 //! * `MOUNT` / `UMOUNT` (0x1400/0x1401) — the semantic surface
 //!   exists on `Kernel::vfs.mount` / `umount`, but a fstype →
@@ -45,7 +48,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use abi::cap::{Cap, CapSet};
-use abi::errno::{EAGAIN, ECHILD, EINVAL, ENOSYS, ESRCH};
+use abi::errno::{EAGAIN, EBADF, ECHILD, EINVAL, ENOSYS, ESRCH};
 use abi::ext::{self as op, Pid};
 use abi::ring::{Request, Response};
 
@@ -72,6 +75,7 @@ pub fn dispatch_ext(
         op::IPC_LISTEN => ServiceOutcome::Done(handle_ipc_listen(kernel, pid, req)),
         op::IPC_CONNECT => ServiceOutcome::Done(handle_ipc_connect(kernel, pid, req, heap)),
         op::IPC_ACCEPT => handle_ipc_accept(kernel, pid, req),
+        op::IPC_SEND => ServiceOutcome::Done(handle_ipc_send(kernel, pid, req, heap)),
         op::IPC_PIPE => ServiceOutcome::Done(handle_ipc_pipe(kernel, pid, req, heap)),
         op::PROC_SELF => ServiceOutcome::Done(handle_proc_self(pid, req)),
         op::PROC_PARENT => ServiceOutcome::Done(handle_proc_parent(kernel, pid, req)),
@@ -352,6 +356,89 @@ fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> ServiceOut
             }
         }
         Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
+    }
+}
+
+// ---- ipc_send ---------------------------------------------------------
+//
+// Layout (per `contracts/syscalls.md §3.1`):
+//   args[0..4]   = fd (u32) — the connected socket OR pipe-write fd
+//                  the payload should land on.
+//   args[4..8]   = len (u32) — number of payload bytes living at
+//                  heap[heap_ptr .. heap_ptr + len].
+//   args[8..12]  = fd_to_pass (i32 LE) — optional ancillary fd to
+//                  attach. -1 = "no ancillary fd"; any non-negative
+//                  value is interpreted as an fd number that must
+//                  exist in the caller's fd table at call time.
+//   args[12..16] = flags (u32) — reserved. v1 accepts only flags=0
+//                  (any other value → EINVAL before any side effect).
+//                  Future: MSG_DONTWAIT, MSG_PEEK, etc.
+//   heap_ptr / heap_len = the payload bytes. heap_len MUST equal
+//                  the args[4..8] `len` field — a mismatch → EINVAL.
+//                  The duplication is deliberate: `len` lives in the
+//                  inline args window so a userland caller doesn't
+//                  have to peek at the heap descriptor to know the
+//                  payload size; the cross-check keeps a corrupt
+//                  shim from desynchronising the two.
+// Response:
+//   value = number of bytes accepted (>= 0). May be smaller than
+//           `len` if the peer's rx ring is partially full.
+//   status = -EBADF if `fd` is unknown, not a socket / pipe-write,
+//                  or `fd_to_pass >= 0` and not in the caller's
+//                  table.
+//            -EINVAL if `flags != 0`, `len` mismatches `heap_len`,
+//                  the heap range is out of bounds, OR `fd_to_pass
+//                  >= 0` is paired with a pipe-write fd (pipes have
+//                  no ancillary channel).
+//            -EPIPE if the socket peer or pipe reader has closed.
+//                  Mirrors `fd_write`'s SIGPIPE delivery — the kernel
+//                  posts `Signal::Pipe` to the caller's signal inbox
+//                  on this path so userland's POSIX-shaped EPIPE
+//                  handler runs.
+//            -EAGAIN if the underlying ring is full (v1 blocks via
+//                  the dispatcher only on accept; send currently
+//                  surfaces WouldBlock so userland can retry).
+//
+// Routing decision lives in `Kernel::ipc_send`; this handler is a
+// thin adapter that decodes the inline args window + heap-scratch
+// payload and folds NotSupportedOnFd into EBADF (rather than the
+// generic EINVAL `kerr_to_errno` would produce). The spec says
+// "wrong fd kind" on an IPC opcode is EBADF — distinct from the
+// generic FD_WRITE arm that uses EINVAL — so the wire surface
+// matches `send(2)` / `sendmsg(2)`'s documented contract.
+
+fn handle_ipc_send(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    let len = args_u32(req, 4) as usize;
+    let fd_to_pass_raw = args_u32(req, 8) as i32;
+    let flags = args_u32(req, 12);
+
+    if flags != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if len != req.heap_len as usize {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Some(buf) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let fd_to_pass = if fd_to_pass_raw < 0 {
+        None
+    } else {
+        Some(fd_to_pass_raw as u32)
+    };
+
+    match kernel.ipc_send(pid, fd, buf, fd_to_pass) {
+        Ok(n) => Response::ok(req.request_id, n as i64),
+        Err(crate::sys::KernelError::NotSupportedOnFd) => {
+            Response::err(req.request_id, EBADF)
+        }
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 

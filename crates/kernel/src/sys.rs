@@ -1076,6 +1076,95 @@ impl Kernel {
         Ok(())
     }
 
+    /// `ipc_send(pid, fd, buf, fd_to_pass)` — send `buf` (and an
+    /// optional ancillary fd) on a connected socket OR pipe-write fd.
+    /// Returns the number of bytes accepted by the underlying ring.
+    ///
+    /// Routing by fd object:
+    /// * [`FdObject::Socket`] — bytes go through
+    ///   [`IpcTable::send_on_socket`] together with the optional
+    ///   `fd_to_pass` (queued on the peer's ancillary-fd queue for a
+    ///   future `ipc_recv` to drain).
+    /// * [`FdObject::PipeWrite`] — bytes go through
+    ///   [`Pipe::try_write`]. Pipes are byte streams without an
+    ///   ancillary channel, so `fd_to_pass.is_some()` on a pipe is
+    ///   rejected as [`KernelError::InvalidArgument`] before any
+    ///   write is attempted.
+    /// * any other fd object — [`KernelError::NotSupportedOnFd`],
+    ///   which the dispatcher remaps to `EBADF` for the IPC_SEND
+    ///   wire surface (the spec calls "wrong fd kind" EBADF, not
+    ///   EINVAL, distinguishing the IPC opcodes from the more
+    ///   generic FD_WRITE arm that uses EINVAL).
+    ///
+    /// `fd_to_pass` validity is checked BEFORE the send — an invalid
+    /// ancillary fd causes EBADF without enqueuing the bytes (the
+    /// spec mandates the receiver gets nothing on this failure).
+    /// Validation is "fd exists in the caller's table"; the value
+    /// itself is shipped as a u32 to be re-installed by the eventual
+    /// IPC_RECV slice. v1's per-socket `rx_fds` queue stores the
+    /// number alone — translation into a fresh receiver-side
+    /// FdEntry is the IPC_RECV slice's job, not this one.
+    ///
+    /// Pipe-broken outcomes additionally post [`Signal::Pipe`] to
+    /// the caller's signal inbox via [`Self::post_sigpipe`], same
+    /// way [`Self::fd_write`] does — the `write(2)` POSIX contract
+    /// pairs EPIPE with SIGPIPE delivery and userland callers
+    /// expect that pairing on `ipc_send` too.
+    pub fn ipc_send(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+        buf: &[u8],
+        fd_to_pass: Option<u32>,
+    ) -> Result<usize, KernelError> {
+        let entry = *self
+            .fds
+            .get(&pid)
+            .ok_or(KernelError::NoSuchPid)?
+            .get(fd)
+            .ok_or(KernelError::BadFd)?;
+        if let Some(ancillary) = fd_to_pass {
+            // Verify the ancillary fd exists in the caller's table
+            // BEFORE enqueuing any bytes. A bad ancillary fd must
+            // not produce a partial send (the receiver would otherwise
+            // observe payload bytes without the promised fd).
+            let table = self.fds.get(&pid).ok_or(KernelError::NoSuchPid)?;
+            if table.get(ancillary).is_none() {
+                return Err(KernelError::BadFd);
+            }
+        }
+        let result: Result<usize, KernelError> = match entry.object {
+            FdObject::Socket(id) => {
+                let passed = match fd_to_pass {
+                    Some(f) => alloc::vec![f],
+                    None => Vec::new(),
+                };
+                self.ipc
+                    .send_on_socket(SocketId(id), buf, passed)
+                    .map_err(KernelError::from)
+            }
+            FdObject::PipeWrite(id) => {
+                if fd_to_pass.is_some() {
+                    return Err(KernelError::InvalidArgument);
+                }
+                use crate::ipc::{PipeId, PipeWriteResult};
+                match self.ipc.pipe_mut(PipeId(id)) {
+                    Ok(pipe) => match pipe.try_write(buf) {
+                        PipeWriteResult::Wrote(n) => Ok(n),
+                        PipeWriteResult::Broken => Err(KernelError::PipeBroken),
+                        PipeWriteResult::WouldBlock => Err(KernelError::WouldBlock),
+                    },
+                    Err(e) => Err(KernelError::from(e)),
+                }
+            }
+            _ => Err(KernelError::NotSupportedOnFd),
+        };
+        if matches!(result, Err(KernelError::PipeBroken)) {
+            self.post_sigpipe(pid);
+        }
+        result
+    }
+
     /// Helper: look up `fd` in `pid`'s fd table and return the
     /// `SocketId` the entry refers to, or the appropriate
     /// `KernelError` if the fd is missing / not a socket.

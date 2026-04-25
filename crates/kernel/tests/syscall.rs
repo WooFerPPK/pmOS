@@ -141,27 +141,30 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `IPC_SEND` is in the extension range (0x1005) but still has
-    // no handler — fd-passing primitives are deferred until the
-    // IpcTable grows per-send fd queues; `FD_READ` / `FD_WRITE`
-    // already cover the send/recv-without-fd-passing case via the
-    // `FdObject::Socket` arm, so the dedicated send/recv opcodes
-    // are the fd-passing-only path. Same shape as the WASI case
-    // above: decoded as a known extension opcode, routed to
-    // `dispatch_ext`'s `_ =>` arm, ENOSYS echoed back with the
-    // request_id intact.
+    // `IPC_RECV` is in the extension range (0x1006) but still has
+    // no handler — the receive-side fd-passing primitive is
+    // deferred until the receiver-side fd-installation step is
+    // designed (the IpcTable already queues passed fd numbers on
+    // `Socket::rx_fds` via the IPC_SEND slice that just landed,
+    // but translating the queued number into a fresh `FdEntry` in
+    // the receiver's table is the IPC_RECV slice's job). `FD_READ`
+    // already covers the recv-without-fd-passing case via the
+    // `FdObject::Socket` arm, so IPC_RECV is the fd-passing-only
+    // path. Same shape as the WASI case above: decoded as a known
+    // extension opcode, routed to `dispatch_ext`'s `_ =>` arm,
+    // ENOSYS echoed back with the request_id intact.
     //
     // (This probe was `PROC_SPAWN` before that handler landed, then
     // `PROC_WAIT`, then `PROC_KILL`, then `PROC_CAPS_GET`, then
-    // `CAP_GRANT`. Each rotation tightens the unimplemented-opcode
-    // surface; `IPC_SEND` is the next stable target until the
-    // fd-passing slice arrives.)
+    // `CAP_GRANT`, then `IPC_SEND`. Each rotation tightens the
+    // unimplemented-opcode surface; `IPC_RECV` is the next stable
+    // target until the receiver-side fd-installation slice arrives.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::IPC_SEND,
+        opcode: op_ext::IPC_RECV,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -986,6 +989,389 @@ fn cap_grant_partial_subset_violation_rejects_whole_grant() {
         !target_caps_after.contains(Cap::DisplayClient),
         "no partial application — DISPLAY_CLIENT must not land"
     );
+}
+
+// ---- ipc_send --------------------------------------------------------
+//
+// Wire layout per `contracts/syscalls.md §3.1`:
+//   args[0..4]   = fd (u32)
+//   args[4..8]   = len (u32)
+//   args[8..12]  = fd_to_pass (i32 LE; -1 = none)
+//   args[12..16] = flags (u32; v1 only accepts 0)
+//   heap[heap_ptr .. heap_ptr+len] = payload bytes
+// Response: value = bytes accepted; status = -errno on failure.
+//
+// These tests exercise the dispatcher adapter end-to-end and pin
+// the constitution-mandated invariants:
+//   * happy-path send on a connected socket returns the byte count
+//     and queues bytes on the peer's rx buffer (verified via
+//     IpcTable inspection through `socket_id_from_fd_public`).
+//   * fd-passing — `fd_to_pass >= 0` and a valid fd in caller's
+//     table — queues that fd number on the peer's `rx_fds` queue
+//     (the eventual IPC_RECV slice will translate it into a real
+//     receiver-side `FdEntry`).
+//   * EBADF for non-existent fd, non-socket / non-pipe-write fd,
+//     and invalid `fd_to_pass` (with the receiver-state-unchanged
+//     atomic-reject invariant — the bytes must NOT land if the
+//     ancillary fd is bad).
+//   * EINVAL for non-zero flags.
+
+/// Pack `fd: u32` + `len: u32` + `fd_to_pass: i32` + `flags: u32`
+/// into the 16-byte inline-args window the ipc_send opcode uses.
+fn ipc_send_args(fd: u32, len: u32, fd_to_pass: i32, flags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fd.to_le_bytes());
+    args[4..8].copy_from_slice(&len.to_le_bytes());
+    args[8..12].copy_from_slice(&(fd_to_pass as u32).to_le_bytes());
+    args[12..16].copy_from_slice(&flags.to_le_bytes());
+    args
+}
+
+/// Build a connected stream-socket pair across two pids: returns
+/// `(client_fd, server_fd)` where bytes written via `client_fd`
+/// appear on `server_fd`'s rx buffer (and vice versa). The path is
+/// `/tmp/<unique>` to keep tests independent.
+fn ipc_send_connected_pair(
+    k: &mut Kernel,
+    client: abi::ext::Pid,
+    server: abi::ext::Pid,
+    path: &[u8],
+    rid_base: u32,
+) -> (u32, u32) {
+    let mut heap = vec![0u8; 256];
+
+    // Server: socket + bind + listen.
+    let srv_listener = dispatch(
+        k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: rid_base,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+    heap[..path.len()].copy_from_slice(path);
+    let bind_resp = dispatch(
+        k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_BIND,
+            flags: 0,
+            request_id: rid_base + 1,
+            args: u32_args(srv_listener),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(bind_resp.status, 0, "bind on {:?} failed", path);
+    let listen_resp = dispatch(
+        k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_LISTEN,
+            flags: 0,
+            request_id: rid_base + 2,
+            args: u32_u32_args(srv_listener, 4),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(listen_resp.status, 0, "listen failed");
+
+    // Client: socket + connect.
+    let cli_fd = dispatch(
+        k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: rid_base + 3,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+    heap[..path.len()].copy_from_slice(path);
+    let connect_resp = dispatch(
+        k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_CONNECT,
+            flags: 0,
+            request_id: rid_base + 4,
+            args: u32_args(cli_fd),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(connect_resp.status, 0, "connect failed");
+
+    // Server: accept (blocking accept needs no flag for non-empty
+    // backlog in v1 — the connect already queued the client).
+    let srv_conn = dispatch(
+        k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_ACCEPT,
+            flags: 0,
+            request_id: rid_base + 5,
+            args: u32_args(srv_listener),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    )
+    .value as u32;
+
+    (cli_fd, srv_conn)
+}
+
+#[test]
+fn ipc_send_happy_path_writes_payload_to_connected_socket() {
+    // Set up a connected socket pair, ipc_send a payload from client
+    // to server, assert the response value == payload length and
+    // the bytes show up on the server-side socket's rx buffer.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-happy", 400);
+
+    let payload = b"hello";
+    let mut heap = vec![0u8; 256];
+    heap[..payload.len()].copy_from_slice(payload);
+
+    let resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 410,
+            args: ipc_send_args(cli_fd, payload.len() as u32, -1, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, payload.len() as i64);
+
+    // Receiver-side: the bytes are on the server's rx buffer. Use
+    // FD_READ to drain (FD_READ is already wired on socket fds via
+    // `FdObject::Socket`'s recv arm).
+    for b in heap.iter_mut() {
+        *b = 0;
+    }
+    let read_resp = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_wasi::FD_READ,
+            flags: 0,
+            request_id: 411,
+            args: u32_args(srv_conn),
+            heap_ptr: 0,
+            heap_len: 64,
+        },
+        &mut heap,
+    );
+    assert_eq!(read_resp.status, 0);
+    assert_eq!(read_resp.value, payload.len() as i64);
+    assert_eq!(&heap[..payload.len()], payload);
+}
+
+#[test]
+fn ipc_send_with_fd_to_pass_round_trips_to_receiver() {
+    // Set up a connected pair, send a payload + an extra fd. The
+    // receiver's socket should have the payload bytes on its rx
+    // buffer AND the passed-fd number on its `rx_fds` queue. The
+    // IPC_RECV slice (still ENOSYS) will eventually translate the
+    // queued number into a real receiver-side FdEntry; this slice
+    // just verifies the queue is populated.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-fd", 420);
+
+    // The ancillary fd: open /dev/console on the client side. The
+    // value gets queued as-is on the server's rx_fds; receiver-side
+    // FdEntry installation is the IPC_RECV slice's job.
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    let payload = b"xyz";
+    let mut heap = vec![0u8; 256];
+    heap[..payload.len()].copy_from_slice(payload);
+
+    let resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 430,
+            args: ipc_send_args(cli_fd, payload.len() as u32, 9, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, payload.len() as i64);
+
+    // Inspect the server-side socket's rx queues directly via the
+    // public helper. The payload should be on rx_buf and the fd
+    // number 9 should be on rx_fds.
+    let srv_socket_id = k
+        .socket_id_from_fd_public(server, srv_conn)
+        .expect("server-side socket id");
+    let sock = k
+        .ipc
+        .sockets_get(srv_socket_id)
+        .expect("server-side socket present");
+    assert_eq!(sock.rx_len(), payload.len());
+    assert_eq!(sock.rx_fd_count(), 1);
+}
+
+#[test]
+fn ipc_send_on_non_socket_fd_returns_ebadf() {
+    // fd 3 is wired to /dev/console (a CharDevice, not a Socket /
+    // PipeWrite). ipc_send must reject with EBADF — distinct from
+    // the EINVAL FD_WRITE on a wrong-kind fd would produce, since
+    // the IPC opcodes use POSIX `send(2)`'s EBADF semantic.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "confused", 0);
+    k.install_fd(pid, 3, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    let payload = b"x";
+    let mut heap = vec![0u8; 64];
+    heap[..payload.len()].copy_from_slice(payload);
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 440,
+            args: ipc_send_args(3, payload.len() as u32, -1, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn ipc_send_on_invalid_fd_returns_ebadf() {
+    // fd 99 was never opened on the caller's table; ipc_send must
+    // surface EBADF before any side effect.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "lonely", 0);
+
+    let payload = b"x";
+    let mut heap = vec![0u8; 64];
+    heap[..payload.len()].copy_from_slice(payload);
+    let resp = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 450,
+            args: ipc_send_args(99, payload.len() as u32, -1, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EBADF);
+}
+
+#[test]
+fn ipc_send_with_invalid_flags_returns_einval() {
+    // flags = 1 isn't a recognised v1 bit; the handler must reject
+    // with EINVAL before touching the kernel side.
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (cli_fd, _srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-flags", 460);
+
+    let payload = b"x";
+    let mut heap = vec![0u8; 64];
+    heap[..payload.len()].copy_from_slice(payload);
+    let resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 470,
+            args: ipc_send_args(cli_fd, payload.len() as u32, -1, 1),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn ipc_send_with_invalid_fd_to_pass_returns_ebadf() {
+    // Main fd is a valid connected socket; fd_to_pass = 999 doesn't
+    // exist in the caller's table. The handler must surface EBADF
+    // and the receiver MUST observe nothing (atomic reject — no
+    // partial send where the payload lands without the ancillary
+    // fd, which would deadlock a recv that asked for both).
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-bad-fd", 480);
+
+    let payload = b"x";
+    let mut heap = vec![0u8; 64];
+    heap[..payload.len()].copy_from_slice(payload);
+    let resp = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 490,
+            args: ipc_send_args(cli_fd, payload.len() as u32, 999, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(resp.status, -errno::EBADF);
+
+    // Receiver-side state must be untouched: no bytes on rx_buf,
+    // no fds on rx_fds.
+    let srv_socket_id = k
+        .socket_id_from_fd_public(server, srv_conn)
+        .expect("server-side socket id");
+    let sock = k
+        .ipc
+        .sockets_get(srv_socket_id)
+        .expect("server-side socket present");
+    assert_eq!(sock.rx_len(), 0, "no bytes leaked on bad ancillary fd");
+    assert_eq!(sock.rx_fd_count(), 0, "no fds leaked on bad ancillary fd");
 }
 
 // ---- clock_time_get --------------------------------------------------
