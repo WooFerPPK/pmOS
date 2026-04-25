@@ -137,3 +137,152 @@ fn wrong_arg_count_exits_one_with_usage() {
         "stderr = {stderr_one:?}"
     );
 }
+
+#[test]
+fn dash_r_copies_empty_directory() {
+    let dir = scratch_dir("dash-r-empty");
+    let src = dir.join("src");
+    fs::create_dir(&src).expect("create src");
+    let dst = dir.join("dst");
+
+    let out = Command::new(CP)
+        .arg("-r")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let dst_meta = fs::symlink_metadata(&dst).expect("stat dst");
+    assert!(dst_meta.is_dir(), "dst should be a directory");
+    let entries: Vec<_> = fs::read_dir(&dst)
+        .expect("read dst")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect entries");
+    assert!(entries.is_empty(), "dst should be empty");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_r_copies_nested_tree() {
+    let dir = scratch_dir("dash-r-nested");
+    let src = dir.join("src");
+    let sub = src.join("sub");
+    let nested = sub.join("nested");
+    fs::create_dir_all(&nested).expect("create nested tree");
+    let top_bytes: &[u8] = b"top-level\n";
+    let sub_bytes: &[u8] = b"\x00\x01\x02 mid\n";
+    let nested_bytes: &[u8] = b"deep payload";
+    write_file(&src, "top.txt", top_bytes);
+    write_file(&sub, "mid.txt", sub_bytes);
+    write_file(&nested, "deep.bin", nested_bytes);
+
+    let dst = dir.join("dst");
+    let out = Command::new(CP)
+        .arg("-R")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(fs::read(dst.join("top.txt")).expect("read top"), top_bytes);
+    assert_eq!(
+        fs::read(dst.join("sub").join("mid.txt")).expect("read mid"),
+        sub_bytes
+    );
+    assert_eq!(
+        fs::read(dst.join("sub").join("nested").join("deep.bin")).expect("read deep"),
+        nested_bytes
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_r_into_existing_dst_dir() {
+    let dir = scratch_dir("dash-r-into-existing");
+    let src = dir.join("src");
+    fs::create_dir(&src).expect("create src");
+    write_file(&src, "child.txt", b"hello");
+    let dst = dir.join("dst");
+    fs::create_dir(&dst).expect("create dst");
+
+    let out = Command::new(CP)
+        .arg("-r")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let landed = dst.join("src");
+    assert!(landed.is_dir(), "expected dst/src/ to exist as a dir");
+    assert_eq!(
+        fs::read(landed.join("child.txt")).expect("read child"),
+        b"hello"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_r_clobbering_files_inside_dst_works() {
+    let dir = scratch_dir("dash-r-clobber");
+    let src = dir.join("src");
+    fs::create_dir(&src).expect("create src");
+    write_file(&src, "f.txt", b"new content");
+    let dst = dir.join("dst");
+    fs::create_dir(&dst).expect("create dst");
+    write_file(&dst, "f.txt", b"old content");
+
+    let out = Command::new(CP)
+        .arg("-r")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(
+        fs::read(dst.join("src").join("f.txt")).expect("read landed"),
+        b"new content"
+    );
+
+    let out2 = Command::new(CP)
+        .arg("-r")
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp second time");
+    assert!(out2.status.success(), "exit status: {:?}", out2.status);
+    assert!(out2.stderr.is_empty(), "stderr = {:?}", out2.stderr);
+    assert_eq!(
+        fs::read(dst.join("src").join("f.txt")).expect("re-read landed"),
+        b"new content"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn directory_src_without_dash_r_errors_as_before() {
+    let dir = scratch_dir("dir-no-flag");
+    let src = dir.join("src");
+    fs::create_dir(&src).expect("create src");
+    let dst = dir.join("dst");
+
+    let out = Command::new(CP)
+        .arg(&src)
+        .arg(&dst)
+        .output()
+        .expect("spawn cp");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cp:"), "stderr = {stderr:?}");
+    assert!(!dst.exists(), "dst should not have been created");
+    cleanup(&dir);
+}
