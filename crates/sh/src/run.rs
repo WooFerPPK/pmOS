@@ -115,17 +115,31 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // arguments. Leave any embedded whitespace alone.
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
 
-        // Tokenise with single-quote awareness. `'...'` is a
-        // literal segment (no whitespace splitting, no `$VAR`
-        // expansion); everything else is an "unquoted" segment
-        // that DOES expand. Adjacent segments concat into one
-        // token (`a'bc'd` → `abcd`). An unterminated `'` is a
-        // recoverable error: write to stderr, skip dispatch
-        // for this iteration, REPL stays alive.
-        let parts = match tokenise_with_single_quotes(trimmed) {
+        // Tokenise with quote awareness. `'...'` is a literal
+        // segment (no whitespace splitting, no `$VAR`
+        // expansion); `"..."` is an unquoted segment that
+        // preserves whitespace but still runs `expand_vars` over
+        // its contents (so `$VAR` / `${VAR}` references DO
+        // expand inside double quotes); everything else is a
+        // bare unquoted segment that expands and splits on
+        // whitespace. Adjacent segments concat into one token
+        // (`a'bc'd` → `abcd`; `a"$X"b` → `a` + value-of-X + `b`).
+        // An unterminated `'` or `"` is a recoverable error:
+        // write to stderr, skip dispatch for this iteration,
+        // REPL stays alive.
+        let parts = match tokenise_with_quotes(trimmed) {
             Ok(p) => p,
-            Err(_) => {
+            Err(QuoteError::UnterminatedSingle) => {
                 if write!(stderr, "sh: unterminated single quote\n").is_err() {
+                    return ExitStatus::IoError;
+                }
+                if stderr.flush().is_err() {
+                    return ExitStatus::IoError;
+                }
+                continue;
+            }
+            Err(QuoteError::UnterminatedDouble) => {
+                if write!(stderr, "sh: unterminated double quote\n").is_err() {
                     return ExitStatus::IoError;
                 }
                 if stderr.flush().is_err() {
@@ -503,70 +517,120 @@ pub(crate) enum TokenPart {
     Unquoted(String),
 }
 
+/// Reason an unterminated quote was detected — distinguishes
+/// `'...` from `"...` so the caller can surface a kind-aware
+/// error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuoteError {
+    /// A `'` opened a literal segment that never closed.
+    UnterminatedSingle,
+    /// A `"` opened an unquoted segment that never closed.
+    UnterminatedDouble,
+}
+
+/// Internal state of the quote-aware tokeniser: are we currently
+/// inside `'...'`, inside `"..."`, or outside any quotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteState {
+    Outside,
+    InSingle,
+    InDouble,
+}
+
 /// Tokenise `line` into a list of words, where each word is a
 /// list of [`TokenPart`] segments.
 ///
-/// Splits on whitespace OUTSIDE single quotes; preserves all
-/// bytes (including whitespace) BETWEEN matching `'`s as a
-/// single `Literal` segment. Adjacency without intervening
-/// whitespace concatenates into one word: `a'bc'd` produces
-/// `[Unquoted("a"), Literal("bc"), Unquoted("d")]` — a single
-/// word with three parts. Two adjacent quoted strings (`'a''b'`)
-/// produce `[Literal("a"), Literal("b")]`, also a single word.
+/// Splits on whitespace OUTSIDE quotes; preserves all bytes
+/// (including whitespace) inside `'...'` or `"..."` as a
+/// single segment. Single-quoted bytes become a `Literal`
+/// segment (no `$VAR` expansion at assemble time);
+/// double-quoted bytes become an `Unquoted` segment
+/// (`$VAR` / `${VAR}` references DO expand at assemble time —
+/// only the whitespace-splitting and quote-recognition is
+/// suppressed). Adjacency without intervening whitespace
+/// concatenates into one word: `a'bc'd` produces
+/// `[Unquoted("a"), Literal("bc"), Unquoted("d")]`, and
+/// `a"$X"b` produces `[Unquoted("a"), Unquoted("$X"),
+/// Unquoted("b")]` — both single words with three parts.
 ///
-/// An unterminated `'` returns `Err(())` — the caller is
-/// expected to surface the error and skip dispatch for the
-/// current line. Everything else (including bare `\` and
-/// `"..."`) passes through as part of an `Unquoted` segment;
-/// double-quote handling is a separate, deferred slice.
-pub(crate) fn tokenise_with_single_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, ()> {
+/// An unterminated `'` or `"` returns the matching
+/// [`QuoteError`] variant; the caller is expected to surface
+/// the error and skip dispatch for the current line.
+/// Backslash escapes inside `"..."` are NOT supported in this
+/// slice (a future micro-slice) — a literal `\$X` inside `"..."`
+/// will expand `$X` after assemble (the leading `\` is
+/// preserved verbatim by the tokeniser, then `expand_vars`
+/// processes the rest).
+pub(crate) fn tokenise_with_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, QuoteError> {
     let mut tokens: Vec<Vec<TokenPart>> = Vec::new();
     let mut current: Vec<TokenPart> = Vec::new();
     let mut buf = String::new();
-    let mut in_single = false;
-    let mut chars = line.chars().peekable();
+    let mut state = QuoteState::Outside;
 
-    while let Some(c) = chars.next() {
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-                current.push(TokenPart::Literal(core::mem::take(&mut buf)));
-            } else {
-                buf.push(c);
+    for c in line.chars() {
+        match state {
+            QuoteState::InSingle => {
+                if c == '\'' {
+                    state = QuoteState::Outside;
+                    current.push(TokenPart::Literal(core::mem::take(&mut buf)));
+                } else {
+                    buf.push(c);
+                }
             }
-            continue;
+            QuoteState::InDouble => {
+                if c == '"' {
+                    state = QuoteState::Outside;
+                    // Double-quoted bytes go into an Unquoted
+                    // segment so assemble_token runs expand_vars
+                    // over them. The whitespace-split suppression
+                    // already happened (we accumulated the bytes
+                    // verbatim through the InDouble branch).
+                    current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
+                } else {
+                    buf.push(c);
+                }
+            }
+            QuoteState::Outside => {
+                if c == '\'' {
+                    // Flush any pending unquoted bytes into the
+                    // current token; the literal segment opens
+                    // fresh. Adjacency with bare text is handled
+                    // by NOT closing the current token here.
+                    if !buf.is_empty() {
+                        current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
+                    }
+                    state = QuoteState::InSingle;
+                } else if c == '"' {
+                    // Same flush-and-open shape as the single
+                    // case, but the new segment is also Unquoted
+                    // (so `$VAR` inside `"..."` expands). Adjacency
+                    // with bare text concatenates the same way:
+                    // `a"$X"b` → three Unquoted segments, one word.
+                    if !buf.is_empty() {
+                        current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
+                    }
+                    state = QuoteState::InDouble;
+                } else if c.is_whitespace() {
+                    // Whitespace closes the current token. Flush
+                    // any pending bytes first; only push the token
+                    // if it has at least one part.
+                    if !buf.is_empty() {
+                        current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
+                    }
+                    if !current.is_empty() {
+                        tokens.push(core::mem::take(&mut current));
+                    }
+                } else {
+                    buf.push(c);
+                }
+            }
         }
-
-        if c == '\'' {
-            // Flush any pending unquoted bytes into the current
-            // token; the literal segment opens fresh. Adjacency
-            // with bare text is handled by NOT closing the
-            // current token here.
-            if !buf.is_empty() {
-                current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
-            }
-            in_single = true;
-            continue;
-        }
-
-        if c.is_whitespace() {
-            // Whitespace closes the current token. Flush any
-            // pending bytes first; only push the token if it
-            // has at least one part.
-            if !buf.is_empty() {
-                current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
-            }
-            if !current.is_empty() {
-                tokens.push(core::mem::take(&mut current));
-            }
-            continue;
-        }
-
-        buf.push(c);
     }
 
-    if in_single {
-        return Err(());
+    match state {
+        QuoteState::InSingle => return Err(QuoteError::UnterminatedSingle),
+        QuoteState::InDouble => return Err(QuoteError::UnterminatedDouble),
+        QuoteState::Outside => {}
     }
     if !buf.is_empty() {
         current.push(TokenPart::Unquoted(buf));

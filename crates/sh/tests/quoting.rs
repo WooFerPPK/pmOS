@@ -1,13 +1,15 @@
-//! `sh::run` REPL driver tests for single-quote string
-//! handling (T142 partial — quoting slice).
+//! `sh::run` REPL driver tests for quote-string handling
+//! (T142 partial — quoting slice).
 //!
 //! These cover the userland-binary-facing entry point: the
-//! REPL's tokeniser now recognises `'...'` as a literal
-//! segment that preserves whitespace and SUPPRESSES `$VAR`
-//! expansion inside the quotes. Tests drive `run_with_env`
-//! so single-quoted `$VAR` cases can pre-seed the env map
-//! and verify it does NOT expand. Double-quote handling is
-//! a separate, deferred slice.
+//! REPL's tokeniser recognises `'...'` as a literal segment
+//! that preserves whitespace and SUPPRESSES `$VAR` expansion
+//! inside the quotes, and `"..."` as a non-splitting segment
+//! that preserves whitespace but STILL EXPANDS `$VAR`/`${VAR}`
+//! references inside it. Tests drive `run_with_env` so quoted
+//! `$VAR` cases can pre-seed the env map and verify the
+//! expand / no-expand split. Backslash escapes inside `"..."`
+//! are NOT supported in this slice (a future micro-slice).
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor};
@@ -130,5 +132,121 @@ fn unquoted_text_outside_quotes_still_expands_dollar_var() {
     assert!(
         stdout.contains("hi literal\n"),
         "stdout missing mixed expand/literal output: {stdout:?}"
+    );
+}
+
+#[test]
+fn double_quoted_preserves_whitespace() {
+    // `echo "hello world"` → one arg `hello world` →
+    // stdout contains `hello world\n`. Like the single-quote
+    // case, the inner space is part of one token, NOT a token
+    // splitter. The key invariant is that `"..."` suppresses
+    // whitespace splitting just as `'...'` does.
+    let (status, stdout, stderr, _env) =
+        drive("echo \"hello world\"\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("hello world\n"),
+        "stdout missing literal whitespace token: {stdout:?}"
+    );
+}
+
+#[test]
+fn double_quoted_expands_dollar_var() {
+    // Seed `X=1`. `echo "$X"` → stdout contains `1\n`
+    // (NOT `$X\n`) — double quotes preserve whitespace but
+    // $VAR DOES expand inside them. This is the key
+    // contrast with the single-quote case (where `'$X'`
+    // stays literal as `$X`).
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "1".to_string());
+    let (status, stdout, stderr, _env) = drive("echo \"$X\"\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing expanded value: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("$X\n"),
+        "stdout should NOT contain literal $X: {stdout:?}"
+    );
+}
+
+#[test]
+fn double_quoted_with_braced_var_expansion() {
+    // Seed `X=hi`. `echo "${X}there"` → stdout contains
+    // `hithere\n`. The braced form works inside double
+    // quotes the same as outside — assemble_token runs
+    // expand_vars over the whole Unquoted segment regardless
+    // of how the segment was bounded.
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "hi".to_string());
+    let (status, stdout, stderr, _env) = drive("echo \"${X}there\"\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("hithere\n"),
+        "stdout missing braced expansion: {stdout:?}"
+    );
+}
+
+#[test]
+fn double_and_single_quote_concat_in_one_token() {
+    // Seed `X=1`. `echo "$X"'$Y'` → tokens `["echo",
+    // "1$Y"]` → stdout contains `1$Y\n`. The double-quoted
+    // segment expands `$X` to `1`; the single-quoted
+    // segment keeps `$Y` literal. With no whitespace
+    // between the two quote groups they concat into one
+    // token. `Y` is unset so even if it leaked through
+    // expansion it would expand to empty — the literal
+    // `$Y\n` in stdout is the only output that proves the
+    // single quotes blocked expansion.
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "1".to_string());
+    let (status, stdout, stderr, _env) = drive("echo \"$X\"'$Y'\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1$Y\n"),
+        "stdout missing mixed-quote concat: {stdout:?}"
+    );
+}
+
+#[test]
+fn unterminated_double_quote_errors_to_stderr() {
+    // `echo "unclosed\nexit\n` — the first line has an
+    // open `"` with no matching close. The REPL must:
+    //   1. Write `sh: unterminated double quote\n` to stderr.
+    //   2. Skip dispatch for that line (so the bogus `echo`
+    //      doesn't run).
+    //   3. Stay alive — the next line's `exit` must run.
+    let (status, _stdout, stderr, _env) =
+        drive("echo \"unclosed\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stderr.contains("unterminated double quote"),
+        "stderr missing error: {stderr:?}"
+    );
+}
+
+#[test]
+fn double_quoted_inside_concat_with_unquoted_text() {
+    // Seed `X=mid`. `echo a"$X"b` → tokens `["echo",
+    // "amidb"]` → stdout contains `amidb\n`. The bare
+    // `a`, the double-quoted `$X` (expands to `mid`), and
+    // the bare `b` concat into one token. Mirror of the
+    // single-quoted `single_quoted_concat_with_unquoted_text`
+    // test, but the middle segment EXPANDS instead of
+    // staying literal.
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "mid".to_string());
+    let (status, stdout, stderr, _env) = drive("echo a\"$X\"b\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("amidb\n"),
+        "stdout missing concatenated token: {stdout:?}"
     );
 }
