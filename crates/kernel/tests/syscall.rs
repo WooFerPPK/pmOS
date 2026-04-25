@@ -141,27 +141,28 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `MOUNT` is in the extension range (0x1400) but still has no
-    // handler — privileged filesystem mount needs a fstype →
-    // `Box<dyn Filesystem>` factory + the privilege-config plumbing
-    // around it, neither of which exists yet (the semantic surface
-    // on `Kernel::vfs.mount` does, but the dispatcher-layer wiring
-    // is the next slice's job). Same shape as the WASI case above:
-    // decoded as a known extension opcode, routed to
+    // `FS_WATCH` is in the extension range (0x1402) but still has no
+    // handler — filesystem watch needs an event-queue + watch-point
+    // notification machinery on tmpfs/OPFS that doesn't exist yet
+    // (`contracts/syscalls.md §3.7`). Same shape as the WASI case
+    // above: decoded as a known extension opcode, routed to
     // `dispatch_ext`'s `_ =>` arm, ENOSYS echoed back with the
     // request_id intact.
     //
     // (This probe was `PROC_SPAWN` before that handler landed, then
     // `PROC_WAIT`, then `PROC_KILL`, then `PROC_CAPS_GET`, then
-    // `CAP_GRANT`, then `IPC_SEND`, then `IPC_RECV`. Each rotation
-    // tightens the unimplemented-opcode surface; `MOUNT` is the next
-    // stable target until the fstype-factory slice arrives.)
+    // `CAP_GRANT`, then `IPC_SEND`, then `IPC_RECV`, then `MOUNT`.
+    // Each rotation tightens the unimplemented-opcode surface;
+    // `FS_WATCH` is the next stable target until the event-queue
+    // slice arrives. The remaining fall-through opcode is
+    // `HOST_FILE_RECV` (0x1500), which depends on driver-side
+    // drag-drop plumbing that bypasses the in-kernel test surface.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::MOUNT,
+        opcode: op_ext::FS_WATCH,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -12084,4 +12085,587 @@ fn park_on_accept_clears_on_listener_close() {
     assert_eq!(*pid, ds);
     assert_eq!(resp.request_id, req_id);
     assert_eq!(resp.status, -abi::errno::EBADF);
+}
+
+// ---- mount + umount ---------------------------------------------------
+//
+// Wire layout per `contracts/syscalls.md §3.5`:
+//   MOUNT (0x1400):
+//     args[0..4]   = path_ptr (u32)
+//     args[4..8]   = path_len (u32)
+//     args[8..12]  = fstype_ptr (u32)
+//     args[12..16] = fstype_len (u32)
+//     heap input: path bytes + fstype bytes
+//   UMOUNT (0x1401):
+//     args[0..4] = path_ptr (u32)
+//     args[4..8] = path_len (u32)
+//     heap input: path bytes only
+// Response: value = 0 on success; status = -errno on failure.
+//
+// The semantic surface lives on `Kernel::mount` / `Kernel::umount`,
+// which wraps `Vfs::mount` / `Vfs::umount` with a Cap::Mount check,
+// path validity invariants, an empty-dir check, and a busy-fd
+// guard. These tests exercise the dispatcher adapter end-to-end and
+// pin every error arm documented in §3.5 + the wire-format method
+// docs above each handler in `ext.rs`.
+
+/// Pack the mount opcode's 4-u32 inline args window. Heap payload
+/// layout: path bytes at offset 0, fstype bytes immediately after
+/// (callers fill `heap[..path.len()] = path` + `heap[path.len()..
+/// path.len()+fstype.len()] = fstype` before the dispatch).
+fn mount_args(path_ptr: u32, path_len: u32, fstype_ptr: u32, fstype_len: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&path_ptr.to_le_bytes());
+    args[4..8].copy_from_slice(&path_len.to_le_bytes());
+    args[8..12].copy_from_slice(&fstype_ptr.to_le_bytes());
+    args[12..16].copy_from_slice(&fstype_len.to_le_bytes());
+    args
+}
+
+/// Pack the umount opcode's 2-u32 inline args window. Heap payload:
+/// path bytes only.
+fn umount_args(path_ptr: u32, path_len: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&path_ptr.to_le_bytes());
+    args[4..8].copy_from_slice(&path_len.to_le_bytes());
+    args
+}
+
+/// Register a process holding exactly the supplied caps and
+/// transition it to Running. Mirror of `make_running_proc` but with
+/// a non-INIT cap set so the mount tests can probe the cap-check
+/// arm without the test fixture itself granting Cap::Mount
+/// implicitly via init's `CapSet::ALL`.
+fn make_proc_with_caps(
+    k: &mut Kernel,
+    name: &str,
+    caps: abi::cap::CapSet,
+) -> abi::ext::Pid {
+    let pid = k
+        .register_process(RegisterArgs {
+            name,
+            ppid: 0,
+            caps,
+            cwd: "/",
+        })
+        .expect("register");
+    k.mark_ready(pid).expect("mark_ready");
+    k.procs
+        .transition(pid, ProcState::Running)
+        .expect("transition");
+    pid
+}
+
+#[test]
+fn mount_happy_path_mounts_tmpfs_at_dir() {
+    // Caller holds Cap::Mount; target /mnt is an existing empty
+    // directory; fstype is "tmpfs". Post-mount, a write to a file
+    // under /mnt MUST land in the freshly-mounted tmpfs (a new
+    // MountId), not in the underlying root tmpfs's /mnt directory.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    let mount_count_before = k.vfs.mount_count();
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 100,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.request_id, 100);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(k.vfs.mount_count(), mount_count_before + 1);
+
+    // Pinning assertion: a file written into /mnt/probe lives in the
+    // FRESH tmpfs (new mount_id), not the underlying root mount. We
+    // resolve the file's mount_id and compare against the root's.
+    k.vfs.create("/mnt/probe", 0o644).expect("create probe");
+    let (probe_mount, _probe_ino) = k.vfs.resolve("/mnt/probe").expect("resolve probe");
+    let (root_mount, _) = k.vfs.resolve("/").expect("resolve root");
+    assert_ne!(
+        probe_mount, root_mount,
+        "post-mount writes under /mnt MUST land in the new tmpfs, not the root"
+    );
+}
+
+#[test]
+fn mount_caller_lacks_fs_mount_returns_enotcapable() {
+    // Caller holds DisplayClient but NOT Mount → -ENOTCAPABLE
+    // before any side effect. Mount count unchanged.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "no-mount",
+        abi::cap::CapSet::from_caps(&[Cap::DisplayClient]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    let mount_count_before = k.vfs.mount_count();
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 101,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+    assert_eq!(k.vfs.mount_count(), mount_count_before, "no side effect");
+}
+
+#[test]
+fn mount_path_not_absolute_returns_einval() {
+    // Path "mnt" (no leading slash) → -EINVAL. The validity check
+    // runs BEFORE the cap check in the current ordering, but more
+    // important is that the result is -EINVAL not -ENOTCAPABLE — a
+    // caller holding Cap::Mount with a malformed path should still
+    // see EINVAL.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+
+    let mut heap = vec![0u8; 256];
+    let path = b"mnt"; // not absolute
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 102,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn mount_path_is_root_returns_einval() {
+    // Path "/" — root remount is a future slice (the boot
+    // filesystem's lifecycle is owned by the kernel, not a syscall
+    // surface), so an explicit root mount → -EINVAL.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/";
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 103,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn mount_path_does_not_exist_returns_enoent() {
+    // /nope was never created → resolve fails → ENOENT.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/nope";
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 104,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn mount_path_not_a_directory_returns_enotdir() {
+    // /file.txt is a regular file, not a directory → ENOTDIR.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.create("/file.txt", 0o644).expect("create file");
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/file.txt";
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 105,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ENOTDIR);
+}
+
+#[test]
+fn mount_path_already_a_mount_returns_ebusy() {
+    // Mount once at /mnt, then mount again at the same path. The
+    // second call sees the mountpoint already in the table and
+    // returns EBUSY (mapped from FsError::AlreadyExists by the
+    // handler — see the mount handler doc-comment for the rationale).
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    k.mount(pid, "/mnt", "tmpfs").expect("first mount");
+    let mount_count_after_first = k.vfs.mount_count();
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 106,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EBUSY);
+    assert_eq!(
+        k.vfs.mount_count(),
+        mount_count_after_first,
+        "duplicate mount must not double-install"
+    );
+}
+
+#[test]
+fn mount_unknown_fstype_returns_einval() {
+    // fstype "ext4" — unknown to the v1 factory → -EINVAL. The
+    // factory dispatch happens AFTER the path-validity checks and
+    // BEFORE the actual mount call; the assertion pins that the
+    // unknown-fstype path doesn't accidentally fall through to a
+    // generic "always succeed" branch.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    let mount_count_before = k.vfs.mount_count();
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    let fstype = b"ext4"; // unsupported
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 107,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.vfs.mount_count(), mount_count_before, "no side effect");
+}
+
+#[test]
+fn mount_invalid_utf8_path_returns_einval() {
+    // Bad UTF-8 in the path bytes → EINVAL before the cap check
+    // even matters. The handler decodes the heap range first, so a
+    // garbled path doesn't even reach the validity-check tier.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+
+    let mut heap = vec![0u8; 256];
+    // Invalid UTF-8 continuation byte sequence.
+    heap[..4].copy_from_slice(&[0xFFu8, 0xFE, 0xFD, 0xFC]);
+    let fstype = b"tmpfs";
+    heap[4..4 + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 108,
+        args: mount_args(0, 4, 4, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (4 + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn mount_target_dir_is_non_empty_returns_einval() {
+    // /mnt exists, is a dir, but has /mnt/file in it. v1 rejects
+    // mount-over-non-empty-dir with EINVAL — POSIX usually allows it
+    // (the underlying entries are silently shadowed until umount),
+    // but the project's "no foot-gun by default" stance prefers an
+    // explicit refuse. The fresh tmpfs would otherwise hide the
+    // existing /mnt/file irreversibly until the user noticed.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    k.vfs.create("/mnt/file", 0o644).expect("populate /mnt");
+    let mount_count_before = k.vfs.mount_count();
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    let fstype = b"tmpfs";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        flags: 0,
+        request_id: 109,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.vfs.mount_count(), mount_count_before, "no side effect");
+}
+
+#[test]
+fn umount_happy_path_removes_mount() {
+    // Mount /mnt, write /mnt/probe (lands in the new tmpfs), then
+    // umount /mnt. Post-umount the underlying directory is restored
+    // (now empty since the new tmpfs went away with the mount). The
+    // mount count is back to its pre-mount value.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    let mount_count_pre = k.vfs.mount_count();
+    k.mount(pid, "/mnt", "tmpfs").expect("mount");
+    k.vfs.create("/mnt/probe", 0o644).expect("create in mount");
+    assert_eq!(k.vfs.mount_count(), mount_count_pre + 1);
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_ext::UMOUNT,
+        flags: 0,
+        request_id: 110,
+        args: umount_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(k.vfs.mount_count(), mount_count_pre);
+    // The underlying /mnt is restored — empty since the tmpfs went
+    // away with its inode namespace; readdir returns no entries.
+    let entries = k.vfs.readdir("/mnt").expect("readdir restored /mnt");
+    assert!(
+        entries.is_empty(),
+        "underlying /mnt directory restored as empty"
+    );
+}
+
+#[test]
+fn umount_path_is_not_a_mount_returns_einval() {
+    // /mnt is a plain directory, not a mount point → -EINVAL.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_ext::UMOUNT,
+        flags: 0,
+        request_id: 111,
+        args: umount_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn umount_caller_lacks_fs_mount_returns_enotcapable() {
+    // /mnt is a real mount, but the umount caller has only
+    // DisplayClient → -ENOTCAPABLE. The mount stays installed.
+    let mut k = make_kernel();
+    let setup = make_proc_with_caps(
+        &mut k,
+        "setup",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    k.mount(setup, "/mnt", "tmpfs").expect("mount");
+    let mount_count_after = k.vfs.mount_count();
+
+    let unprivileged = make_proc_with_caps(
+        &mut k,
+        "no-mount",
+        abi::cap::CapSet::from_caps(&[Cap::DisplayClient]),
+    );
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    heap[..path.len()].copy_from_slice(path);
+
+    let req = Request {
+        opcode: op_ext::UMOUNT,
+        flags: 0,
+        request_id: 112,
+        args: umount_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, unprivileged, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+    assert_eq!(k.vfs.mount_count(), mount_count_after, "mount not removed");
+}
+
+#[test]
+fn umount_with_open_fds_returns_ebusy() {
+    // Mount /mnt, install an fd referencing a file under /mnt
+    // (FdObject::Vnode { mount_id = the new mount, ino }), then
+    // attempt umount. The busy-fd guard fires → -EBUSY. After
+    // closing the fd, a second umount call succeeds.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    k.mount(pid, "/mnt", "tmpfs").expect("mount");
+    k.vfs.create("/mnt/pin", 0o644).expect("create pin");
+    let (mount_id, ino) = k.vfs.resolve("/mnt/pin").expect("resolve pin");
+    k.install_fd(
+        pid,
+        7,
+        FdObject::Vnode { mount_id, ino },
+        FdFlags::EMPTY,
+    )
+    .expect("install pinning fd");
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/mnt";
+    heap[..path.len()].copy_from_slice(path);
+    let req = Request {
+        opcode: op_ext::UMOUNT,
+        flags: 0,
+        request_id: 113,
+        args: umount_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(
+        resp.status, -errno::EBUSY,
+        "open fd under the mount must pin it busy"
+    );
+
+    // Close the pinning fd; a second umount now succeeds.
+    k.fds_mut(pid).unwrap().close(7).expect("close pin");
+    let req2 = Request {
+        opcode: op_ext::UMOUNT,
+        flags: 0,
+        request_id: 114,
+        args: umount_args(0, path.len() as u32),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp2 = dispatch(&mut k, pid, &req2, &mut heap);
+    assert_eq!(resp2.status, 0, "umount succeeds after the pinning fd closes");
 }

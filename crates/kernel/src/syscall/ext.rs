@@ -9,26 +9,23 @@
 //!
 //! ## Coverage
 //!
-//! As of the IPC_RECV delegation slice, the dispatcher routes
-//! the following extension opcodes (`contracts/syscalls.md §3`):
-//! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
-//! `IPC_ACCEPT`, `IPC_SEND`, `IPC_RECV`, `IPC_PIPE`, `PROC_SELF`,
-//! `PROC_PARENT`, `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`,
-//! `PROC_CAPS_GET`, `DISPLAY_CONNECT`, `DISPLAY_BIND`,
-//! `CAP_CHECK`, `CAP_LIST`, `CAP_GRANT`.
+//! As of the MOUNT / UMOUNT delegation slice, the dispatcher
+//! routes the following extension opcodes
+//! (`contracts/syscalls.md §3`): `IPC_SOCKET`, `IPC_BIND`,
+//! `IPC_LISTEN`, `IPC_CONNECT`, `IPC_ACCEPT`, `IPC_SEND`,
+//! `IPC_RECV`, `IPC_PIPE`, `PROC_SELF`, `PROC_PARENT`,
+//! `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`, `PROC_CAPS_GET`,
+//! `DISPLAY_CONNECT`, `DISPLAY_BIND`, `CAP_CHECK`, `CAP_LIST`,
+//! `CAP_GRANT`, `MOUNT`, `UMOUNT`.
 //!
 //! The remaining extension opcodes fall through the `_ =>` arm
 //! and return `ENOSYS`:
 //!
-//! * `MOUNT` / `UMOUNT` (0x1400/0x1401) — the semantic surface
-//!   exists on `Kernel::vfs.mount` / `umount`, but a fstype →
-//!   `Box<dyn Filesystem>` factory and the privilege / config
-//!   plumbing isn't yet designed. `MOUNT` is now the canonical
-//!   ext-range ENOSYS probe target in
-//!   `known_ext_opcode_without_handler_returns_enosys`; it inherits
-//!   that role from `IPC_RECV`, which now ships a handler.
 //! * `FS_WATCH` (0x1402) — needs an event queue + watch-point
-//!   notification machinery that doesn't exist yet.
+//!   notification machinery that doesn't exist yet. `FS_WATCH`
+//!   is now the canonical ext-range ENOSYS probe target in
+//!   `known_ext_opcode_without_handler_returns_enosys`; it
+//!   inherits that role from `MOUNT`, which now ships a handler.
 //! * `HOST_FILE_RECV` (0x1500) — needs the drag-drop token
 //!   table + driver plumbing described in
 //!   `contracts/syscalls.md §3.6`.
@@ -39,7 +36,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use abi::cap::{Cap, CapSet};
-use abi::errno::{EAGAIN, EBADF, ECHILD, EINVAL, ENOSYS, ESRCH};
+use abi::errno::{EAGAIN, EBADF, EBUSY, ECHILD, EINVAL, ENOSYS, ESRCH};
 use abi::ext::{self as op, Pid};
 use abi::ring::{Request, Response};
 
@@ -80,6 +77,8 @@ pub fn dispatch_ext(
         op::PROC_CAPS_GET => ServiceOutcome::Done(handle_proc_caps_get(kernel, pid, req)),
         op::DISPLAY_CONNECT => ServiceOutcome::Done(handle_display_connect(kernel, pid, req)),
         op::DISPLAY_BIND => ServiceOutcome::Done(handle_display_bind(kernel, pid, req)),
+        op::MOUNT => ServiceOutcome::Done(handle_mount(kernel, pid, req, heap)),
+        op::UMOUNT => ServiceOutcome::Done(handle_umount(kernel, pid, req, heap)),
         _ => ServiceOutcome::Done(Response::err(req.request_id, ENOSYS)),
     }
 }
@@ -1002,6 +1001,143 @@ fn handle_proc_caps_get(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
     let target_pid = i32::from_le_bytes([req.args[0], req.args[1], req.args[2], req.args[3]]);
     match kernel.proc_caps_get(pid, target_pid) {
         Ok(caps) => Response::ok(req.request_id, caps.0 as i64),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- mount ------------------------------------------------------------
+//
+// Layout (per `contracts/syscalls.md §3.5`):
+//   args[0..4]   = path_ptr (u32) — heap offset where the absolute
+//                  mount path bytes live.
+//   args[4..8]   = path_len (u32) — length of the mount path bytes.
+//   args[8..12]  = fstype_ptr (u32) — heap offset where the fstype
+//                  name lives. v1 only accepts `"tmpfs"`.
+//   args[12..16] = fstype_len (u32) — length of the fstype name.
+//   heap input: path bytes at heap[path_ptr..path_ptr+path_len] +
+//                  fstype bytes at heap[fstype_ptr..fstype_ptr+fstype_len].
+//                  The two regions MAY overlap or alias — the handler
+//                  reads each independently and never holds both
+//                  borrows simultaneously past the UTF-8 decode.
+//
+// Response:
+//   value = 0 on success
+//   status = -ENOTCAPABLE if the caller does not hold Cap::Mount.
+//            -EINVAL if either heap range is out of bounds, the path
+//                  is not valid UTF-8, the path is not absolute, the
+//                  path is `/` (root remount is a future slice), the
+//                  fstype is not valid UTF-8, the fstype is anything
+//                  other than `"tmpfs"`, OR the target directory is
+//                  non-empty (a fresh mount over a directory with
+//                  existing entries would shadow them irreversibly
+//                  until umount; v1 rejects outright).
+//            -ENOENT if the target path doesn't resolve.
+//            -ENOTDIR if the target exists but isn't a directory.
+//            -EBUSY if the target is already a mount point.
+//
+// Why the handler maps `KernelError::Fs(FsError::AlreadyExists)`
+// (which the dispatcher's default `kerr_to_errno` would render as
+// EEXIST) to EBUSY: `Vfs::mount` reuses `AlreadyExists` for the
+// duplicate-mountpoint guard because no mount-specific FS error
+// variant exists, but the §3.5 wire surface specifies EBUSY for
+// "target is already a mount point" — same condition, different
+// error vocabulary at the user-facing layer. Translating in the
+// handler keeps `kerr_to_errno` exhaustive (every FsError variant
+// has its own canonical errno) without adding a special-case to
+// the bridge for one syscall.
+//
+// Wire format note — fstype is heap-pointed rather than inline:
+// the inline args window is 16 bytes; v1's only fstype `"tmpfs"`
+// is 5 bytes, but the spec leaves room for `"devfs"` / `"procfs"`
+// / future names that may exceed 16 bytes minus the path-pointer
+// payload. Heap-pointing both strings keeps the wire format
+// stable as the fstype factory grows.
+
+fn handle_mount(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> Response {
+    let path_ptr = args_u32(req, 0) as usize;
+    let path_len = args_u32(req, 4) as usize;
+    let fstype_ptr = args_u32(req, 8) as usize;
+    let fstype_len = args_u32(req, 12) as usize;
+
+    let Some(path_end) = path_ptr.checked_add(path_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Some(fstype_end) = fstype_ptr.checked_add(fstype_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if path_end > heap.len() || fstype_end > heap.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Ok(path) = core::str::from_utf8(&heap[path_ptr..path_end]) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(fstype) = core::str::from_utf8(&heap[fstype_ptr..fstype_end]) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+
+    match kernel.mount(pid, path, fstype) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(crate::sys::KernelError::Fs(crate::vfs::FsError::AlreadyExists)) => {
+            Response::err(req.request_id, EBUSY)
+        }
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- umount -----------------------------------------------------------
+//
+// Layout (per `contracts/syscalls.md §3.5`):
+//   args[0..4] = path_ptr (u32) — heap offset where the absolute
+//                mount path bytes live.
+//   args[4..8] = path_len (u32) — length of the mount path bytes.
+//   heap input: path bytes only (no fstype — umount identifies the
+//                target by mountpoint).
+//
+// Response:
+//   value = 0 on success
+//   status = -ENOTCAPABLE if the caller does not hold Cap::Mount.
+//            -EINVAL if the heap range is out of bounds, the path is
+//                  not valid UTF-8, the path is not absolute, OR the
+//                  path is not currently a mount point.
+//            -EBUSY if any process holds an open Vnode fd whose
+//                  mount_id matches the target mount (busy-mount
+//                  guard; mirror of POSIX umount(2) EBUSY).
+//
+// Why the handler maps `KernelError::WouldBlock` (which the
+// dispatcher's default `kerr_to_errno` would render as EAGAIN) to
+// EBUSY: `Kernel::umount` reuses `WouldBlock` for the busy-fd
+// guard because no umount-specific kernel error variant exists,
+// but the §3.5 wire surface specifies EBUSY for "mount is busy".
+// Same translation rationale as the mount handler's
+// `AlreadyExists → EBUSY` map.
+
+fn handle_umount(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> Response {
+    let path_ptr = args_u32(req, 0) as usize;
+    let path_len = args_u32(req, 4) as usize;
+
+    let Some(path_end) = path_ptr.checked_add(path_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if path_end > heap.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Ok(path) = core::str::from_utf8(&heap[path_ptr..path_end]) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+
+    match kernel.umount(pid, path) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(crate::sys::KernelError::WouldBlock) => Response::err(req.request_id, EBUSY),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }

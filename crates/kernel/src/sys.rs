@@ -2370,6 +2370,152 @@ impl Kernel {
         Ok(inbox.len())
     }
 
+    // --- Mount management -----------------------------------------
+    //
+    // `mount`/`umount` are a thin privileged wrapper over the VFS
+    // layer's `Vfs::mount` / `Vfs::umount`. The substrate
+    // (mount-table + longest-prefix path resolver) already exists
+    // in `crates/kernel/src/vfs/{mod,mount,path}.rs` (T056); this
+    // surface adds (a) a `Cap::Mount` check, (b) v1's tmpfs-only
+    // fstype factory, (c) the path-validity invariants
+    // (`contracts/syscalls.md §3.5`: absolute, non-root, exists,
+    // empty dir, not already a mount point), and (d) the umount
+    // busy-fd guard (any open `FdObject::Vnode` whose `mount_id`
+    // matches the target mount → -EBUSY, mirror of POSIX umount(2)).
+    //
+    // The fstype-factory is hard-coded to `"tmpfs"` in v1. Other
+    // fstypes (`devfs`, `procfs`, `opfs`) are mounted at boot by
+    // the kernel itself (see `make_kernel` in tests + the JS
+    // bootstrap's kernel-init slice) and are explicitly NOT
+    // userland-mountable in v1 — they own kernel-singleton state
+    // (the `DeviceDispatcher`, the `ProcessTable`, the OPFS block
+    // driver) that doesn't have a fresh-instance constructor on a
+    // userland-arbitrary path. A future slice could grow the
+    // factory into a registry once a real use case (e.g. multiple
+    // tmpfs instances at different paths, or a fuse-style
+    // filesystem) lands.
+
+    /// `mount(target, fstype)`: install a fresh filesystem of kind
+    /// `fstype` at the absolute path `target`. v1 only accepts
+    /// `fstype == "tmpfs"`. The semantic primitive lives on
+    /// `Vfs::mount`; this method adds the privilege check and the
+    /// path-validity invariants documented in
+    /// `contracts/syscalls.md §3.5`.
+    ///
+    /// Errors:
+    /// * [`KernelError::NotCapable`] — caller does not hold
+    ///   [`Cap::Mount`].
+    /// * [`KernelError::InvalidArgument`] — path is not absolute, is
+    ///   the root `/`, fstype is anything other than `"tmpfs"`, OR
+    ///   the target directory is non-empty (a fresh mount over a
+    ///   directory with existing entries would shadow them
+    ///   irreversibly until umount; v1 rejects it outright).
+    /// * [`KernelError::Fs(FsError::NotFound)`] (→ ENOENT) — target
+    ///   path doesn't resolve.
+    /// * [`KernelError::Fs(FsError::NotADirectory)`] (→ ENOTDIR) —
+    ///   target exists but isn't a directory.
+    /// * [`KernelError::Fs(FsError::AlreadyExists)`] (→ EBUSY at the
+    ///   syscall layer) — target is already a mount point. The FS
+    ///   variant pre-exists for `MountTable::insert`'s duplicate-path
+    ///   guard; we re-purpose it because remounting on top of an
+    ///   existing mount IS a "this thing is already there" condition.
+    ///   The dispatcher maps `AlreadyExists` to EEXIST by default,
+    ///   which is wrong for mount semantics — the syscall handler
+    ///   in `ext.rs` translates it to EBUSY explicitly.
+    pub fn mount(&mut self, pid: Pid, target: &str, fstype: &str) -> Result<(), KernelError> {
+        if !self.caps.check(pid, Cap::Mount)? {
+            return Err(KernelError::NotCapable);
+        }
+        if !target.starts_with('/') {
+            return Err(KernelError::InvalidArgument);
+        }
+        let normalised = crate::vfs::path::normalize(target);
+        if normalised == "/" {
+            return Err(KernelError::InvalidArgument);
+        }
+        // Already-a-mount detection runs FIRST: if `normalised`
+        // already exists in the mount table, `Vfs::open(normalised)`
+        // would route into the mounted fs's root (a freshly-empty
+        // tmpfs) and the readdir-empty check below would silently
+        // pass — the busy-mount EBUSY would then become a confusing
+        // "you mounted a tmpfs over your existing tmpfs" success.
+        // Walk mountpoints first to short-circuit with EBUSY.
+        for (_id, mp) in self.vfs.mountpoints() {
+            if mp == normalised {
+                return Err(KernelError::Fs(FsError::AlreadyExists));
+            }
+        }
+        // Confirm the target directory exists, is a directory, and
+        // is empty BEFORE constructing the new filesystem instance.
+        let (mount_id, ino, ty) = self.vfs.open(&normalised)?;
+        if !ty.is_dir() {
+            return Err(KernelError::Fs(FsError::NotADirectory));
+        }
+        let entries = self.vfs.readdir_ino(mount_id, ino)?;
+        if !entries.is_empty() {
+            return Err(KernelError::InvalidArgument);
+        }
+        // Fstype factory: v1 only knows "tmpfs". Other fstypes are
+        // either kernel-singleton (devfs/procfs) or boot-only
+        // (opfs); see the §3.5 method-doc above.
+        let fs: alloc::boxed::Box<dyn crate::vfs::Filesystem> = match fstype {
+            "tmpfs" => alloc::boxed::Box::new(crate::fs::tmpfs::TmpFs::new()),
+            _ => return Err(KernelError::InvalidArgument),
+        };
+        self.vfs.mount(&normalised, fs).map(|_| ()).map_err(KernelError::from)
+    }
+
+    /// `umount(target)`: remove the mount installed at `target`. The
+    /// semantic primitive lives on `Vfs::umount`; this method adds
+    /// the privilege check + path-validity invariants + the busy-fd
+    /// guard.
+    ///
+    /// Errors:
+    /// * [`KernelError::NotCapable`] — caller does not hold
+    ///   [`Cap::Mount`].
+    /// * [`KernelError::InvalidArgument`] — path is not absolute, OR
+    ///   the path is not currently a mount point.
+    /// * [`KernelError::WouldBlock`] (→ EBUSY at the syscall layer) —
+    ///   any process holds an open `FdObject::Vnode` whose
+    ///   `mount_id` matches the target mount. The dispatcher maps
+    ///   `WouldBlock` to EAGAIN by default; the syscall handler in
+    ///   `ext.rs` translates it to EBUSY for the umount semantic.
+    pub fn umount(&mut self, pid: Pid, target: &str) -> Result<(), KernelError> {
+        if !self.caps.check(pid, Cap::Mount)? {
+            return Err(KernelError::NotCapable);
+        }
+        if !target.starts_with('/') {
+            return Err(KernelError::InvalidArgument);
+        }
+        let normalised = crate::vfs::path::normalize(target);
+        // Locate the mount id whose mountpoint EXACTLY matches; a
+        // longest-prefix lookup would also match descendant paths
+        // ("/dev/null" with /dev mounted would resolve to /dev),
+        // which is wrong for umount.
+        let mount_id = self
+            .vfs
+            .mountpoints()
+            .into_iter()
+            .find(|(_id, mp)| mp == &normalised)
+            .map(|(id, _)| id)
+            .ok_or(KernelError::InvalidArgument)?;
+        // Busy-fd guard: any open Vnode fd rooted at this mount
+        // pins it. We could also catch open SignalChannel / Socket
+        // / CharDevice / Pipe fds — none of those carry a mount
+        // id, so they don't pin a mount, and POSIX umount(2)
+        // doesn't refuse on non-Vnode handles either.
+        for table in self.fds.values() {
+            for (_fd, entry) in table.iter() {
+                if let FdObject::Vnode { mount_id: m, .. } = entry.object {
+                    if m == mount_id {
+                        return Err(KernelError::WouldBlock);
+                    }
+                }
+            }
+        }
+        self.vfs.umount(&normalised).map(|_| ()).map_err(KernelError::from)
+    }
+
     /// Bump the kernel-side refcount on a pipe-ended fd object.
     /// Called when we're about to install the same object into a
     /// second fd (proc_spawn inheritance, `dup` inside a

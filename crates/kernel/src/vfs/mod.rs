@@ -351,6 +351,19 @@ impl Vfs {
         self.mounts.len()
     }
 
+    /// Snapshot every installed mount's `(id, mountpoint)`. Returned
+    /// as owned `String`s so the caller doesn't need to keep an
+    /// immutable borrow of `Vfs` alive while iterating — useful from
+    /// `Kernel::mount` / `Kernel::umount`, both of which need
+    /// further `&mut self.vfs` calls (e.g. `vfs.mount(..)`,
+    /// `vfs.readdir_ino(..)`) after the mount-table walk.
+    pub fn mountpoints(&self) -> Vec<(MountId, String)> {
+        self.mounts
+            .iter()
+            .map(|(id, mp)| (id, String::from(mp)))
+            .collect()
+    }
+
     /// Maximum number of symlink dereferences on a single resolve
     /// before `FsError::SymLoop` is returned. POSIX requires at
     /// least SYMLOOP_MAX=8; v1 uses 40 to match Linux's
