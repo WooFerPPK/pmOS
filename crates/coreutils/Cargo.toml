@@ -60,3 +60,7 @@ path = "src/bin/sort.rs"
 [[bin]]
 name = "uniq"
 path = "src/bin/uniq.rs"
+
+[[bin]]
+name = "tr"
+path = "src/bin/tr.rs"
