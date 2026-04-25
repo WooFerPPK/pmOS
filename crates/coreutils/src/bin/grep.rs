@@ -11,16 +11,18 @@
 //! Flag parsing mirrors `cp -r` (commit `b2623ff`): single-pass
 //! arg split; `-i` toggles case-insensitive matching; `-n` prefixes
 //! each match with its 1-indexed line number; `-v` inverts the
-//! match (emit lines that do NOT contain the pattern); short flags
-//! may be clustered POSIX-style (`grep -inv FOO` = `-i -n -v`);
-//! everything after `--` is forced into pattern/file args regardless
-//! of leading `-`. Unknown flags write `grep: unknown flag: <flag>`
-//! to stderr and exit 2.
+//! match (emit lines that do NOT contain the pattern); `-c`
+//! suppresses per-line output and emits only the count of matches
+//! per file (with multi-file invocations the path prefix still
+//! applies); short flags may be clustered POSIX-style (`grep -inv
+//! FOO` = `-i -n -v`); everything after `--` is forced into
+//! pattern/file args regardless of leading `-`. Unknown flags
+//! write `grep: unknown flag: <flag>` to stderr and exit 2.
 //!
 //! Explicitly deferred flag follow-ups: `-E` (POSIX-ERE regex),
-//! `-F` (fixed-string is already the default), `-c` (count only),
-//! `-l` (filenames only), Unicode-aware case-folding (current `-i`
-//! is ASCII-via-`to_lowercase`).
+//! `-F` (fixed-string is already the default), `-l` (filenames
+//! only), Unicode-aware case-folding (current `-i` is
+//! ASCII-via-`to_lowercase`).
 
 use std::env;
 use std::fs::File;
@@ -32,6 +34,7 @@ fn main() -> ExitCode {
     let mut case_insensitive = false;
     let mut with_line_numbers = false;
     let mut invert = false;
+    let mut count_only = false;
     let mut rest: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -45,6 +48,7 @@ fn main() -> ExitCode {
                     'i' => case_insensitive = true,
                     'n' => with_line_numbers = true,
                     'v' => invert = true,
+                    'c' => count_only = true,
                     _ => {
                         let _ = writeln!(io::stderr(), "grep: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -57,7 +61,7 @@ fn main() -> ExitCode {
     }
 
     let Some((pattern, files)) = rest.split_first() else {
-        let _ = writeln!(io::stderr(), "usage: grep [-i] [-n] [-v] <pattern> [file ...]");
+        let _ = writeln!(io::stderr(), "usage: grep [-i] [-n] [-v] [-c] <pattern> [file ...]");
         return ExitCode::from(2);
     };
     let stdout = io::stdout();
@@ -69,13 +73,13 @@ fn main() -> ExitCode {
 
     if files.is_empty() {
         let stdin = io::stdin();
-        matched |= scan(stdin.lock(), &needle, case_insensitive, None, with_line_numbers, invert, &mut out);
+        matched |= scan(stdin.lock(), &needle, case_insensitive, None, with_line_numbers, invert, count_only, &mut out);
     } else {
         for path in files {
             match File::open(path) {
                 Ok(f) => {
                     let prefix = if multi { Some(path.as_str()) } else { None };
-                    matched |= scan(BufReader::new(f), &needle, case_insensitive, prefix, with_line_numbers, invert, &mut out);
+                    matched |= scan(BufReader::new(f), &needle, case_insensitive, prefix, with_line_numbers, invert, count_only, &mut out);
                 }
                 Err(e) => {
                     let _ = writeln!(io::stderr(), "grep: {path}: {e}");
@@ -101,15 +105,20 @@ fn scan<R: BufRead, W: Write>(
     prefix: Option<&str>,
     with_line_numbers: bool,
     invert: bool,
+    count_only: bool,
     out: &mut W,
 ) -> bool {
     let mut any = false;
+    let mut count: u64 = 0;
     let label = prefix.unwrap_or("-");
     for (n, line) in r.split(b'\n').enumerate() {
         let bytes = match line {
             Ok(b) => b,
             Err(e) => {
                 let _ = writeln!(io::stderr(), "grep: {label}: {e}");
+                if count_only {
+                    emit_count(out, prefix, count);
+                }
                 return any;
             }
         };
@@ -122,19 +131,23 @@ fn scan<R: BufRead, W: Write>(
                 };
                 if hit != invert {
                     any = true;
-                    let lineno = n + 1;
-                    match (prefix, with_line_numbers) {
-                        (Some(p), true) => {
-                            let _ = writeln!(out, "{p}:{lineno}:{s}");
-                        }
-                        (Some(p), false) => {
-                            let _ = writeln!(out, "{p}:{s}");
-                        }
-                        (None, true) => {
-                            let _ = writeln!(out, "{lineno}:{s}");
-                        }
-                        (None, false) => {
-                            let _ = writeln!(out, "{s}");
+                    if count_only {
+                        count += 1;
+                    } else {
+                        let lineno = n + 1;
+                        match (prefix, with_line_numbers) {
+                            (Some(p), true) => {
+                                let _ = writeln!(out, "{p}:{lineno}:{s}");
+                            }
+                            (Some(p), false) => {
+                                let _ = writeln!(out, "{p}:{s}");
+                            }
+                            (None, true) => {
+                                let _ = writeln!(out, "{lineno}:{s}");
+                            }
+                            (None, false) => {
+                                let _ = writeln!(out, "{s}");
+                            }
                         }
                     }
                 }
@@ -144,5 +157,19 @@ fn scan<R: BufRead, W: Write>(
             }
         }
     }
+    if count_only {
+        emit_count(out, prefix, count);
+    }
     any
+}
+
+fn emit_count<W: Write>(out: &mut W, prefix: Option<&str>, count: u64) {
+    match prefix {
+        Some(p) => {
+            let _ = writeln!(out, "{p}:{count}");
+        }
+        None => {
+            let _ = writeln!(out, "{count}");
+        }
+    }
 }

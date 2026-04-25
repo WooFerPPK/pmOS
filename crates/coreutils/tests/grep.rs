@@ -413,3 +413,105 @@ fn dash_v_no_lines_pass_exits_one() {
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
     cleanup(&dir);
 }
+
+#[test]
+fn dash_c_emits_match_count_for_single_file() {
+    let dir = scratch_dir("count-single");
+    let path = write_file(&dir, "a.txt", b"foo\nbar\nfoo\n");
+
+    let out = Command::new(GREP)
+        .arg("-c")
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"2\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_emits_zero_for_no_matches() {
+    let dir = scratch_dir("count-zero");
+    let path = write_file(&dir, "a.txt", b"alpha\nbeta\ngamma\n");
+
+    let out = Command::new(GREP)
+        .arg("-c")
+        .arg("xxx")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"0\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_with_multi_file_prefixes_path() {
+    let dir = scratch_dir("count-multi");
+    let a = write_file(&dir, "a.txt", b"foo\nbar\n");
+    let b = write_file(&dir, "b.txt", b"foo\nfoo\nbaz\n");
+
+    let out = Command::new(GREP)
+        .arg("-c")
+        .arg("foo")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected_a = format!("{}:1\n", a.display());
+    let expected_b = format!("{}:2\n", b.display());
+    assert_eq!(stdout, format!("{expected_a}{expected_b}"));
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_combines_with_dash_v_for_non_matching_count() {
+    let dir = scratch_dir("count-invert");
+    let path = write_file(&dir, "a.txt", b"foo\nbar\nfoo\nbaz\n");
+
+    let out = Command::new(GREP)
+        .arg("-cv")
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"2\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_c_in_stdin_mode_emits_count() {
+    let mut child = Command::new(GREP)
+        .arg("-c")
+        .arg("foo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn grep");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"foo\nbar\nfoo\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("wait grep");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"2\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
