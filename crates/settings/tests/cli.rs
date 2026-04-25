@@ -286,6 +286,140 @@ fn about_warns_on_malformed_proc_storage() {
 }
 
 #[test]
+fn about_human_formats_kb_mb_gb() {
+    let dir = env::temp_dir().join(format!(
+        "pmos-settings-about-human-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("mkdir about doc-root");
+    fs::write(dir.join("LICENSE.txt"), b"MIT.\n").expect("write LICENSE fixture");
+    fs::write(dir.join("CREDITS.txt"), b"PMos.\n").expect("write CREDITS fixture");
+
+    // quota = 2 GiB, used = 1.5 MiB, files = 7 — exercises GB + MB thresholds.
+    let storage_path = temp_file("about-storage-human");
+    let quota = 2u64 * 1024 * 1024 * 1024;
+    let used = (1.5_f64 * 1024.0 * 1024.0) as u64;
+    fs::write(&storage_path, format!("{} {} 7\n", quota, used).as_bytes())
+        .expect("write storage fixture");
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&dir)
+        .args(["--proc-storage"])
+        .arg(&storage_path)
+        .arg("--human")
+        .output()
+        .expect("spawn settings about --human");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+
+    assert!(stdout.contains("Storage:"), "stdout = {stdout:?}");
+    assert!(
+        stdout.contains("quota: 2.0 GB"),
+        "stdout should render quota as GB: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("used:  1.5 MB"),
+        "stdout should render used as MB: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("files: 7"),
+        "files count should remain a raw integer: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(&format!("quota: {}", quota)),
+        "raw quota bytes must not appear under --human: {stdout:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&storage_path);
+}
+
+#[test]
+fn about_without_human_still_prints_raw_bytes() {
+    let dir = env::temp_dir().join(format!(
+        "pmos-settings-about-raw-bytes-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("mkdir about doc-root");
+    fs::write(dir.join("LICENSE.txt"), b"MIT.\n").expect("write LICENSE fixture");
+    fs::write(dir.join("CREDITS.txt"), b"PMos.\n").expect("write CREDITS fixture");
+
+    let storage_path = temp_file("about-storage-raw-bytes");
+    fs::write(&storage_path, b"4096 1024 3\n").expect("write storage fixture");
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&dir)
+        .args(["--proc-storage"])
+        .arg(&storage_path)
+        .output()
+        .expect("spawn settings about (no --human)");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+
+    assert!(stdout.contains("quota: 4096"), "stdout = {stdout:?}");
+    assert!(stdout.contains("used:  1024"), "stdout = {stdout:?}");
+    assert!(stdout.contains("files: 3"), "stdout = {stdout:?}");
+    assert!(
+        !stdout.contains("KB") && !stdout.contains("MB") && !stdout.contains("GB"),
+        "raw byte path must not include human-readable suffixes: {stdout:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&storage_path);
+}
+
+#[test]
+fn about_human_with_zero_or_small_values_uses_b() {
+    let dir = env::temp_dir().join(format!(
+        "pmos-settings-about-human-small-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("mkdir about doc-root");
+    fs::write(dir.join("LICENSE.txt"), b"MIT.\n").expect("write LICENSE fixture");
+    fs::write(dir.join("CREDITS.txt"), b"PMos.\n").expect("write CREDITS fixture");
+
+    // Both values below 1 KiB so they fall into the plain `B` branch.
+    let storage_path = temp_file("about-storage-human-small");
+    fs::write(&storage_path, b"512 0 0\n").expect("write storage fixture");
+
+    let out = Command::new(SETTINGS)
+        .args(["about", "--doc-root"])
+        .arg(&dir)
+        .args(["--proc-storage"])
+        .arg(&storage_path)
+        .arg("--human")
+        .output()
+        .expect("spawn settings about --human small");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+
+    assert!(
+        stdout.contains("quota: 512 B"),
+        "sub-KB quota must render as plain B: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("used:  0 B"),
+        "zero used must render as 0 B: {stdout:?}"
+    );
+    assert!(stdout.contains("files: 0"), "files = 0: {stdout:?}");
+    assert!(
+        !stdout.contains("KB") && !stdout.contains("MB") && !stdout.contains("GB"),
+        "small values must not pick up KB/MB/GB suffixes: {stdout:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&storage_path);
+}
+
+#[test]
 fn about_missing_doc_root_exits_one() {
     let missing = env::temp_dir().join(format!(
         "pmos-settings-about-missing-{}-{}",

@@ -16,6 +16,7 @@
 //!   settings about                        # print About (version + ABI + LICENSE + CREDITS + Storage)
 //!   settings about --doc-root <dir>       # About with doc fixtures from <dir> (tests)
 //!   settings about --proc-storage <path>  # About with /proc/storage redirected (tests)
+//!   settings about --human                # Storage byte values formatted as B / KB / MB / GB
 //!   settings set-theme <name>             # write theme.name to /etc/preferences.toml
 //!   settings set-theme <name> --config <path>
 //!                                         # write theme.name to <path> (test hook)
@@ -38,8 +39,9 @@
 //! (many test environments will not mount procfs and the existing
 //! `about_prints_*` tests would otherwise break); a malformed body
 //! warns to stderr and skips the section without failing the
-//! command. Human-readable byte formatting (KB/MB/GB) is a future
-//! flag — values render as raw decimal today.
+//! command. The `--human` flag formats `quota` / `used` as
+//! base-1024 B / KB / MB / GB with one decimal place above 1 KB
+//! (`files` stays as a raw integer count either way).
 //!
 //! Deferred T184 scope: valid-theme allow-list. `set-theme` accepts
 //! any non-empty string; the GUI will enforce the allow-list when it
@@ -121,6 +123,7 @@ fn run_preferences(path: &str) -> ExitCode {
 fn run_about(rest: &[String]) -> ExitCode {
     let mut doc_root: &str = DEFAULT_DOC_ROOT;
     let mut proc_storage: &str = DEFAULT_PROC_STORAGE;
+    let mut human = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -139,6 +142,10 @@ fn run_about(rest: &[String]) -> ExitCode {
                 };
                 proc_storage = next.as_str();
                 i += 2;
+            }
+            "--human" => {
+                human = true;
+                i += 1;
             }
             other => {
                 eprintln!("settings: about: unknown argument {:?}", other);
@@ -189,12 +196,43 @@ fn run_about(rest: &[String]) -> ExitCode {
     if let Some((quota, used, files)) = storage {
         println!();
         println!("Storage:");
-        println!("  quota: {}", quota);
-        println!("  used:  {}", used);
+        if human {
+            println!("  quota: {}", format_bytes_human(quota));
+            println!("  used:  {}", format_bytes_human(used));
+        } else {
+            println!("  quota: {}", quota);
+            println!("  used:  {}", used);
+        }
         println!("  files: {}", files);
     }
 
     ExitCode::from(0)
+}
+
+/// Format a byte count using base-1024 thresholds.
+///
+/// Values >= 1 GiB render as `<x.x> GB`, >= 1 MiB as `<x.x> MB`,
+/// >= 1 KiB as `<x.x> KB`, otherwise `<n> B`. The unit suffixes
+/// keep the familiar KB/MB/GB letters even though the multiplier
+/// is binary — matches the convention the existing `du`/`df`
+/// userland uses for quick human reads. One decimal place is
+/// enough at the About-pane glance fidelity; tests that need
+/// exact byte counts continue to use the default (no `--human`)
+/// path.
+fn format_bytes_human(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+
+    if n >= GIB {
+        format!("{:.1} GB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.1} MB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1} KB", n as f64 / KIB as f64)
+    } else {
+        format!("{} B", n)
+    }
 }
 
 /// Read `/proc/storage` and return parsed `(quota, used, files)`.
