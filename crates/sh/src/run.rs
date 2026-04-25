@@ -119,13 +119,26 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
             continue;
         }
 
-        match dispatch_builtin(&tokens, &mut cwd, env, &mut stdout, &mut stderr) {
+        // Expand `$NAME` / `${NAME}` references against the
+        // env map BEFORE dispatch — see `expand_vars` for the
+        // exact rules. Unset names expand to the empty string
+        // but the token is preserved (matches POSIX `set -u`-
+        // off semantics; we never silently drop an arg).
+        let expanded: Vec<String> = tokens.iter().map(|t| expand_vars(t, env)).collect();
+        let expanded_refs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
+
+        match dispatch_builtin(&expanded_refs, &mut cwd, env, &mut stdout, &mut stderr) {
             BuiltinOutcome::Continue => {}
             BuiltinOutcome::Exit(code) => return ExitStatus::Exit(code),
             BuiltinOutcome::IoError => return ExitStatus::IoError,
             BuiltinOutcome::NotBuiltin => {
                 // Unknown command → stderr, keep the REPL alive.
-                if writeln!(stderr, "sh: command not found: {}", tokens[0]).is_err() {
+                // Use the expanded-token slice so the message
+                // reflects what the user actually invoked
+                // post-expansion (e.g. an unset `$CMD` produces
+                // `sh: command not found: ` with the empty
+                // first token, mirroring bash / dash).
+                if writeln!(stderr, "sh: command not found: {}", expanded_refs[0]).is_err() {
                     return ExitStatus::IoError;
                 }
                 if stderr.flush().is_err() {
@@ -317,6 +330,109 @@ fn builtin_export<W: Write, E: Write>(
     BuiltinOutcome::Continue
 }
 
+/// Expand `$NAME` and `${NAME}` references inside one
+/// whitespace-tokenised word against the caller-provided
+/// env map.
+///
+/// Rules (T142 partial — variable substitution slice):
+///
+/// * `$NAME` where NAME starts with `[A-Za-z_]` and
+///   continues with `[A-Za-z0-9_]*` is a variable
+///   reference. The match is greedy: `$Xb` reads as
+///   `${Xb}`, not `${X}b`. To insert a literal char after
+///   an expansion you must use the braced form: `${X}b`.
+/// * `${NAME}` is the explicit braced form, semantically
+///   identical to the greedy bare form once the name is
+///   isolated by `{` / `}`.
+/// * Unset names expand to the empty string. We do NOT
+///   error and we do NOT remove the token — `echo $UNSET`
+///   tokenises as `["echo", ""]` post-expansion. This
+///   mirrors POSIX `set -u`-off behaviour, which is the
+///   default this slice ships.
+/// * `$$`, `$@`, `$0`, `$1`, etc. are NOT supported in
+///   this slice. A `$` followed by anything other than a
+///   name-start char (`[A-Za-z_]`) or `{` is preserved as
+///   a literal `$` and the scanner advances one byte.
+/// * A trailing `$` at end-of-token is a literal `$`.
+/// * Backslash escapes (`\$X`) are NOT handled here —
+///   those land in the quoting / escaping slice. A `\$X`
+///   in the input becomes literal `\` + the result of
+///   expanding `$X`. The leading `\` is preserved.
+/// * `${NAME` (open brace, no matching close) is treated
+///   as a malformed ref: the literal `${NAME` is
+///   preserved up to end-of-token. POSIX errors here; v1
+///   prefers leniency over surfacing an error mid-line.
+pub(crate) fn expand_vars(token: &str, env: &BTreeMap<String, String>) -> String {
+    let bytes = token.as_bytes();
+    let mut out = String::with_capacity(token.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'$' {
+            // Multi-byte UTF-8 sequences pass through
+            // verbatim — only ASCII `$` introduces an
+            // expansion, and the name-charset is ASCII-only,
+            // so byte-by-byte scanning is safe for any UTF-8
+            // input as long as we copy non-`$` bytes through.
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // Saw `$`. Look at the next byte to decide.
+        let next = bytes.get(i + 1).copied();
+        match next {
+            Some(b'{') => {
+                // Braced form: scan to a matching `}`.
+                let name_start = i + 2;
+                let mut name_end = name_start;
+                while name_end < bytes.len() && bytes[name_end] != b'}' {
+                    name_end += 1;
+                }
+                if name_end >= bytes.len() {
+                    // Unterminated `${...` — preserve literal.
+                    out.push_str(&token[i..]);
+                    return out;
+                }
+                let name = &token[name_start..name_end];
+                if let Some(value) = env.get(name) {
+                    out.push_str(value);
+                }
+                // Else: unset name → empty string (no append).
+                i = name_end + 1;
+            }
+            Some(c) if is_name_start(c) => {
+                // Bare greedy form: scan name chars.
+                let name_start = i + 1;
+                let mut name_end = name_start;
+                while name_end < bytes.len() && is_name_continue(bytes[name_end]) {
+                    name_end += 1;
+                }
+                let name = &token[name_start..name_end];
+                if let Some(value) = env.get(name) {
+                    out.push_str(value);
+                }
+                i = name_end;
+            }
+            _ => {
+                // `$` followed by a non-name-start char (or
+                // end-of-token). Preserve the literal `$`
+                // and advance one byte.
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn is_name_start(b: u8) -> bool {
+    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'_')
+}
+
+fn is_name_continue(b: u8) -> bool {
+    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_')
+}
+
 /// Collapse `.` / `..` / repeated `/` segments in `path`,
 /// producing an absolute-ish normalised path. Anchored at
 /// `/` when the accumulator empties out.
@@ -346,5 +462,122 @@ fn normalise(path: &Path) -> PathBuf {
             out.push(seg);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::expand_vars;
+    use std::collections::BTreeMap;
+
+    fn env_with(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), (*v).to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn unset_var_expands_to_empty() {
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("$UNSET", &env), "");
+    }
+
+    #[test]
+    fn set_var_expands_to_value() {
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(expand_vars("$X", &env), "hello");
+    }
+
+    #[test]
+    fn multiple_vars_in_token_concat() {
+        // `$X$Y` with `X=hello`, `Y=world` → `helloworld`.
+        let env = env_with(&[("X", "hello"), ("Y", "world")]);
+        assert_eq!(expand_vars("$X$Y", &env), "helloworld");
+    }
+
+    #[test]
+    fn braced_form_works() {
+        // `${X}b` with `X=hello` → `hellob`. The bare form
+        // `$Xb` would look up `Xb` (greedy) and return empty,
+        // so this is the only way to insert a literal letter
+        // immediately after an expansion.
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(expand_vars("${X}b", &env), "hellob");
+    }
+
+    #[test]
+    fn partial_match_continues_to_name_end() {
+        // `a$Xb` is `a` + `$Xb` (greedy). `Xb` is unset, so
+        // the whole tail expands to empty: result is `a`.
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(expand_vars("a$Xb", &env), "a");
+    }
+
+    #[test]
+    fn dollar_followed_by_invalid_char_is_literal() {
+        // `$1` → `1` is not a name-start char, so the `$` is
+        // preserved literal and the `1` is preserved literal.
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("$1", &env), "$1");
+    }
+
+    #[test]
+    fn lone_dollar_at_end_is_literal() {
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("foo$", &env), "foo$");
+    }
+
+    #[test]
+    fn var_with_underscore_works() {
+        // Both `_LEAD` and `MID_DLE` and `TRAIL_` should all
+        // be valid identifiers per the `[A-Za-z_][A-Za-z0-9_]*`
+        // rule. Test all three shapes in one go.
+        let env = env_with(&[("_X", "u"), ("FOO_BAR", "fb"), ("Z_", "zt")]);
+        assert_eq!(expand_vars("$_X", &env), "u");
+        assert_eq!(expand_vars("$FOO_BAR", &env), "fb");
+        assert_eq!(expand_vars("$Z_", &env), "zt");
+    }
+
+    #[test]
+    fn no_dollar_passes_through_verbatim() {
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(expand_vars("plain text", &env), "plain text");
+        assert_eq!(expand_vars("", &env), "");
+    }
+
+    #[test]
+    fn braced_form_with_unset_name_is_empty() {
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("${MISSING}", &env), "");
+        // Surrounding text preserved.
+        assert_eq!(expand_vars("a${MISSING}b", &env), "ab");
+    }
+
+    #[test]
+    fn unterminated_brace_preserves_literal() {
+        // `${X` with no closing `}` → preserved as-is.
+        let env = env_with(&[("X", "hello")]);
+        assert_eq!(expand_vars("${X", &env), "${X");
+        assert_eq!(expand_vars("a${X", &env), "a${X");
+    }
+
+    #[test]
+    fn dollar_dollar_is_literal_in_v1() {
+        // `$$` (PID) is NOT supported in this slice — the
+        // second `$` is a non-name-start char so the first
+        // `$` stays literal and the scanner advances. The
+        // second `$` then sees end-of-token, also literal.
+        let env = env_with(&[]);
+        assert_eq!(expand_vars("$$", &env), "$$");
+    }
+
+    #[test]
+    fn backslash_dollar_preserved_unprocessed() {
+        // The escaping slice will handle `\$X`. For now a
+        // literal `\` is preserved, then `$X` expands.
+        let env = env_with(&[("X", "v")]);
+        assert_eq!(expand_vars("\\$X", &env), "\\v");
     }
 }
