@@ -42,3 +42,6 @@ Thumbs.db
 
 # xtask build intermediates
 build/
+
+# Local agent worktrees
+.worktrees/
