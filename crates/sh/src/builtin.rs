@@ -21,11 +21,9 @@ use std::path::{Path, PathBuf};
 
 /// Shell-wide mode flags toggled at runtime by `set`.
 ///
-/// Currently surfaces only the POSIX `errexit` mode (`set
-/// -e` / `set -o errexit`): when true, the REPL terminates
-/// with the failing command's exit status the first time a
-/// command returns non-zero. Future flags (`set -u` for
-/// "error on unset variable", `set -x` for "trace each
+/// Surfaces the POSIX `errexit` (`set -e` / `set -o
+/// errexit`) and `nounset` (`set -u` / `set -o nounset`)
+/// modes. Future flags (`set -x` for "trace each
 /// command", `set -n` for "syntax-check only") slot in as
 /// sibling fields on this struct without changing any
 /// existing call site — `dispatch_builtin` already takes
@@ -37,6 +35,17 @@ pub struct ShellFlags {
     /// the first non-zero status. Off by default — POSIX
     /// shells start with errexit cleared.
     pub errexit: bool,
+    /// `set -u` / `set -o nounset`: treat references to
+    /// unset variables as errors. When true, expanding `$X`
+    /// or `${X}` for an unset name writes `sh: <name>:
+    /// parameter not set\n` to stderr and terminates the
+    /// REPL with status 1. The `${X:-default}` default-value
+    /// form is exempt (POSIX-required — its whole purpose is
+    /// to provide a fallback for unset vars). `$?` is also
+    /// never affected because it has its own resolver and is
+    /// always defined. Off by default — POSIX shells start
+    /// with nounset cleared.
+    pub nounset: bool,
 }
 
 /// Outcome of dispatching one builtin.
@@ -270,10 +279,13 @@ fn builtin_unset<E: Write>(
 
 /// POSIX `set` builtin — mode-flag toggle.
 ///
-/// v1 supports the `errexit` flag in two equivalent shapes:
+/// v1 supports the `errexit` and `nounset` flags in two
+/// equivalent shapes each:
 ///
 /// * `set -e` / `set -o errexit` — turn errexit ON.
 /// * `set +e` / `set +o errexit` — turn errexit OFF.
+/// * `set -u` / `set -o nounset` — turn nounset ON.
+/// * `set +u` / `set +o nounset` — turn nounset OFF.
 ///
 /// `set` with no args is a no-op in v1 (POSIX defines this
 /// as "print every shell variable" but the v1 `env` builtin
@@ -288,7 +300,10 @@ fn builtin_unset<E: Write>(
 /// active errexit flag would terminate the REPL the moment
 /// the user typed `set -e`. The `Continue` arm in the REPL
 /// loop sets `last_status = 0`, so the post-dispatch
-/// errexit check naturally skips `set` invocations.
+/// errexit check naturally skips `set` invocations. The
+/// same property holds for nounset: `set -u` doesn't itself
+/// reference any variable, so the expansion-layer nounset
+/// check can never trigger on the `set` line.
 fn builtin_set<E: Write>(
     args: &[&str],
     flags: &mut ShellFlags,
@@ -312,6 +327,8 @@ fn builtin_set<E: Write>(
         match args[i] {
             "-e" => flags.errexit = true,
             "+e" => flags.errexit = false,
+            "-u" => flags.nounset = true,
+            "+u" => flags.nounset = false,
             "-o" | "+o" => {
                 // `set -o NAME` / `set +o NAME` — the
                 // long-option form. The polarity (`-` vs
@@ -326,6 +343,7 @@ fn builtin_set<E: Write>(
                 };
                 match *name {
                     "errexit" => flags.errexit = on,
+                    "nounset" => flags.nounset = on,
                     other => {
                         let _ = writeln!(
                             stderr,

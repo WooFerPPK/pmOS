@@ -181,15 +181,49 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // Assemble each token by walking its parts: literal
         // parts pass through as-is; unquoted parts run through
         // `expand_vars` so `$NAME` / `${NAME}` references resolve
-        // against the env map. Unset names expand to the empty
-        // string but the token is preserved (matches POSIX
-        // `set -u`-off semantics; we never silently drop an arg).
-        // `last_status` is threaded so `$?` resolves to the
-        // most recent command's exit code as a decimal string.
-        let expanded: Vec<String> = parts
-            .iter()
-            .map(|token| assemble_token(token, env, last_status))
-            .collect();
+        // against the env map. Under `set -u` (nounset) an
+        // unset bare or braced reference returns
+        // `Err(ExpandError::NotSet(name))`; we surface that as
+        // a POSIX-style stderr diagnostic and terminate the
+        // REPL with status 1 — the failing-expansion command
+        // never runs (the dispatch_builtin call below is
+        // skipped). With nounset off (the default), unset
+        // names expand to the empty string and the token is
+        // preserved (`echo $UNSET` tokenises as `["echo", ""]`
+        // post-expansion). `last_status` is threaded so `$?`
+        // resolves to the most recent command's exit code as
+        // a decimal string. `flags` is `&*flags` (re-borrowed
+        // immutable) because `expand_vars` doesn't need mut.
+        let expanded: Vec<String> = {
+            let mut acc = Vec::with_capacity(parts.len());
+            let mut bail: Option<ExpandError> = None;
+            for token in &parts {
+                match assemble_token(token, env, last_status, flags) {
+                    Ok(s) => acc.push(s),
+                    Err(e) => {
+                        bail = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(ExpandError::NotSet(name)) = bail {
+                // POSIX `set -u` diagnostic shape — bash and
+                // dash both write `<shellname>: <name>:
+                // parameter not set\n` and exit 1. Pin the
+                // exit-1 termination so userland can detect
+                // nounset failures distinctly from a generic
+                // command failure (which would surface the
+                // command's own exit status under errexit).
+                if writeln!(stderr, "sh: {name}: parameter not set").is_err() {
+                    return ExitStatus::IoError;
+                }
+                if stderr.flush().is_err() {
+                    return ExitStatus::IoError;
+                }
+                return ExitStatus::Exit(1);
+            }
+            acc
+        };
         let expanded_refs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
 
         // Capture the dispatch outcome and translate to the
@@ -260,10 +294,40 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
     }
 }
 
+/// Why an expansion failed. Surfaced to the dispatch loop
+/// so the REPL can write a POSIX-style diagnostic and
+/// terminate (or, in future variants, recover).
+///
+/// Currently only `NotSet` exists, surfaced when `set -u`
+/// (nounset) is on AND the bare-`$NAME` or braced-`${NAME}`
+/// form references an unset name (the `${NAME:-default}`
+/// form is exempt because the default-value path provides
+/// the fallback; `$?` / `${?}` is exempt because
+/// `last_status` is always defined). Future expansion
+/// errors (`${VAR:?error}` would surface a `Required`
+/// variant; recursive-expansion overflow would surface a
+/// `Depth` variant) slot in as sibling variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpandError {
+    /// A bare or braced reference targeted an unset name
+    /// while `set -u` was on. Carries the offending name so
+    /// the dispatch loop can write `sh: <name>: parameter
+    /// not set\n` to stderr.
+    NotSet(String),
+}
+
 /// Expand `$NAME` and `${NAME}` references inside one
 /// whitespace-tokenised word against the caller-provided
 /// env map. `last_status` is the integer to substitute for
 /// `$?` / `${?}` (POSIX last-exit-status parameter).
+/// `flags` is the shell's mode-flag state — only the
+/// `nounset` field is consulted here.
+///
+/// Returns `Ok(String)` with the expanded bytes on success,
+/// or `Err(ExpandError::NotSet(name))` when `flags.nounset`
+/// is true AND a non-default-form reference targets an unset
+/// name. The dispatch loop translates the error into a
+/// POSIX-style stderr write and a REPL termination.
 ///
 /// Rules (T142 partial — variable substitution slice):
 ///
@@ -276,7 +340,8 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 ///   scanner. As with `$1` / positional args in real
 ///   shells, `?` is the WHOLE expansion (a single byte),
 ///   so `$?bar` expands to `<status>bar` (not
-///   `${?bar}`).
+///   `${?bar}`). `set -u` does NOT affect `$?` because
+///   `last_status` is always defined.
 /// * `$NAME` where NAME starts with `[A-Za-z_]` and
 ///   continues with `[A-Za-z0-9_]*` is a variable
 ///   reference. The match is greedy: `$Xb` reads as
@@ -295,12 +360,16 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 ///   the default are NOT recursively expanded in this
 ///   slice (so `${UNSET:-$X}` produces the literal `$X`,
 ///   not the value of `X`). Recursive expansion is
-///   deferred to a future T142 partial.
-/// * Unset names expand to the empty string. We do NOT
-///   error and we do NOT remove the token — `echo $UNSET`
-///   tokenises as `["echo", ""]` post-expansion. This
-///   mirrors POSIX `set -u`-off behaviour, which is the
-///   default this slice ships.
+///   deferred to a future T142 partial. The `:-` form is
+///   exempt from `set -u` because the whole purpose of
+///   the default-value form is to provide a fallback for
+///   unset vars.
+/// * Unset names expand to the empty string when
+///   `flags.nounset` is false (the default). When
+///   `flags.nounset` is true, an unset name in a bare or
+///   braced (non-`:-`) form returns `Err(NotSet(name))`
+///   instead — the dispatch loop translates this into a
+///   stderr diagnostic and terminates the REPL.
 /// * `$$`, `$@`, `$0`, `$1`, etc. are NOT supported in
 ///   this slice. A `$` followed by anything other than a
 ///   name-start char (`[A-Za-z_]`), `{`, or `?` is
@@ -315,6 +384,9 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 ///   as a malformed ref: the literal `${NAME` is
 ///   preserved up to end-of-token. POSIX errors here; v1
 ///   prefers leniency over surfacing an error mid-line.
+///   `set -u` does NOT trigger on the unterminated case
+///   because the malformed-literal preservation IS the
+///   recovery path — there's no "unset name" to report.
 /// * Other parameter-expansion modifiers are NOT
 ///   implemented in this slice and are deferred to future
 ///   T142 partials: `${VAR-default}` (no colon — only-if-
@@ -328,7 +400,8 @@ pub(crate) fn expand_vars(
     token: &str,
     env: &BTreeMap<String, String>,
     last_status: i32,
-) -> String {
+    flags: &ShellFlags,
+) -> Result<String, ExpandError> {
     let bytes = token.as_bytes();
     let mut out = String::with_capacity(token.len());
     let mut i = 0;
@@ -351,7 +424,11 @@ pub(crate) fn expand_vars(
                 // POSIX `$?` — last-exit-status. Single-char
                 // parameter (like `$1` would be in a shell
                 // with positional args), so any byte after
-                // the `?` resumes literal copying.
+                // the `?` resumes literal copying. `set -u`
+                // is intentionally NOT consulted: $? is
+                // always defined (last_status is an i32 with
+                // a known initial value of 0), so there is
+                // no "unset" state to report.
                 out.push_str(&last_status.to_string());
                 i += 2;
             }
@@ -370,8 +447,13 @@ pub(crate) fn expand_vars(
                 if close >= bytes.len() {
                     // Unterminated `${...` — preserve literal.
                     // Covers both `${X` and `${X:-default`.
+                    // `set -u` does NOT trigger here: the
+                    // malformed-literal preservation IS the
+                    // recovery, and there's no "unset name"
+                    // to report (the parse never resolved a
+                    // name in the first place).
                     out.push_str(&token[i..]);
-                    return out;
+                    return Ok(out);
                 }
                 // Recognise `${?}` as the explicit braced
                 // form of `$?` BEFORE the name / modifier
@@ -380,7 +462,9 @@ pub(crate) fn expand_vars(
                 // defined for it. A `${?:-default}` shape
                 // is not POSIX-defined, so v1 doesn't
                 // bother to support it; only the bare
-                // `${?}` falls into this arm.
+                // `${?}` falls into this arm. `set -u`
+                // skips $? for the same reason as the bare
+                // form: last_status is always defined.
                 let region = &token[name_start..close];
                 if region == "?" {
                     out.push_str(&last_status.to_string());
@@ -400,6 +484,11 @@ pub(crate) fn expand_vars(
                         None => true,
                         Some(v) => v.is_empty(),
                     };
+                    // `:-` form is EXEMPT from `set -u` —
+                    // POSIX-required because the default-value
+                    // form's whole purpose is to provide a
+                    // fallback for unset vars. So no nounset
+                    // check on this branch.
                     if use_default {
                         out.push_str(default);
                     } else {
@@ -408,12 +497,17 @@ pub(crate) fn expand_vars(
                         // empty-value case.
                         out.push_str(env.get(name).expect("checked above"));
                     }
-                } else {
-                    if let Some(value) = env.get(region) {
-                        out.push_str(value);
-                    }
-                    // Else: unset name → empty string (no append).
+                } else if let Some(value) = env.get(region) {
+                    out.push_str(value);
+                } else if flags.nounset {
+                    // Plain `${NAME}` for an unset name +
+                    // nounset on → error. The dispatch loop
+                    // surfaces this as a stderr diagnostic
+                    // and terminates the REPL.
+                    return Err(ExpandError::NotSet(region.to_string()));
                 }
+                // Else: unset name + nounset off → empty
+                // string (no append).
                 i = close + 1;
             }
             Some(c) if is_name_start(c) => {
@@ -426,7 +520,14 @@ pub(crate) fn expand_vars(
                 let name = &token[name_start..name_end];
                 if let Some(value) = env.get(name) {
                     out.push_str(value);
+                } else if flags.nounset {
+                    // Plain `$NAME` for an unset name +
+                    // nounset on → error, mirroring the
+                    // braced-form arm above.
+                    return Err(ExpandError::NotSet(name.to_string()));
                 }
+                // Else: unset name + nounset off → empty
+                // string (no append).
                 i = name_end;
             }
             _ => {
@@ -438,7 +539,7 @@ pub(crate) fn expand_vars(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn is_name_start(b: u8) -> bool {
@@ -641,26 +742,37 @@ pub(crate) fn tokenise_with_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, Qu
 
 /// Assemble one token's parts into a final `String`,
 /// running `expand_vars` over `Unquoted` segments (with
-/// `last_status` threaded for `$?` resolution) and passing
-/// `Literal` segments through verbatim.
+/// `last_status` and `flags` threaded for `$?` and `set -u`
+/// resolution) and passing `Literal` segments through
+/// verbatim.
+///
+/// Returns `Err(ExpandError::NotSet(name))` when any
+/// `Unquoted` segment hits an unset name under `set -u`.
+/// `Literal` segments never trigger the check (they're the
+/// literal-bytes-from-single-quotes path; `expand_vars`
+/// never sees them).
 pub(crate) fn assemble_token(
     parts: &[TokenPart],
     env: &BTreeMap<String, String>,
     last_status: i32,
-) -> String {
+    flags: &ShellFlags,
+) -> Result<String, ExpandError> {
     let mut out = String::new();
     for part in parts {
         match part {
             TokenPart::Literal(s) => out.push_str(s),
-            TokenPart::Unquoted(s) => out.push_str(&expand_vars(s, env, last_status)),
+            TokenPart::Unquoted(s) => {
+                out.push_str(&expand_vars(s, env, last_status, flags)?);
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod expand_tests {
-    use super::expand_vars;
+    use super::{expand_vars, ExpandError};
+    use crate::builtin::ShellFlags;
     use std::collections::BTreeMap;
 
     fn env_with(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -671,23 +783,36 @@ mod expand_tests {
         m
     }
 
+    /// Thin wrapper around `expand_vars` that constructs a
+    /// fresh default `ShellFlags` (errexit / nounset both
+    /// off) and unwraps the `Ok` arm. The tests in this
+    /// module that pre-date `set -u` exercise the
+    /// nounset-off path; the tests added in the `set -u`
+    /// slice (in `tests/set_u.rs`) drive the nounset-on
+    /// path through `run_with_env` so the dispatch loop's
+    /// stderr / status response is also covered.
+    fn ev(token: &str, env: &BTreeMap<String, String>, last_status: i32) -> String {
+        expand_vars(token, env, last_status, &ShellFlags::default())
+            .expect("expand_vars must not error with nounset off")
+    }
+
     #[test]
     fn unset_var_expands_to_empty() {
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$UNSET", &env, 0), "");
+        assert_eq!(ev("$UNSET", &env, 0), "");
     }
 
     #[test]
     fn set_var_expands_to_value() {
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("$X", &env, 0), "hello");
+        assert_eq!(ev("$X", &env, 0), "hello");
     }
 
     #[test]
     fn multiple_vars_in_token_concat() {
         // `$X$Y` with `X=hello`, `Y=world` → `helloworld`.
         let env = env_with(&[("X", "hello"), ("Y", "world")]);
-        assert_eq!(expand_vars("$X$Y", &env, 0), "helloworld");
+        assert_eq!(ev("$X$Y", &env, 0), "helloworld");
     }
 
     #[test]
@@ -697,7 +822,7 @@ mod expand_tests {
         // so this is the only way to insert a literal letter
         // immediately after an expansion.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${X}b", &env, 0), "hellob");
+        assert_eq!(ev("${X}b", &env, 0), "hellob");
     }
 
     #[test]
@@ -705,7 +830,7 @@ mod expand_tests {
         // `a$Xb` is `a` + `$Xb` (greedy). `Xb` is unset, so
         // the whole tail expands to empty: result is `a`.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("a$Xb", &env, 0), "a");
+        assert_eq!(ev("a$Xb", &env, 0), "a");
     }
 
     #[test]
@@ -713,13 +838,13 @@ mod expand_tests {
         // `$1` → `1` is not a name-start char, so the `$` is
         // preserved literal and the `1` is preserved literal.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$1", &env, 0), "$1");
+        assert_eq!(ev("$1", &env, 0), "$1");
     }
 
     #[test]
     fn lone_dollar_at_end_is_literal() {
         let env = env_with(&[]);
-        assert_eq!(expand_vars("foo$", &env, 0), "foo$");
+        assert_eq!(ev("foo$", &env, 0), "foo$");
     }
 
     #[test]
@@ -728,32 +853,32 @@ mod expand_tests {
         // be valid identifiers per the `[A-Za-z_][A-Za-z0-9_]*`
         // rule. Test all three shapes in one go.
         let env = env_with(&[("_X", "u"), ("FOO_BAR", "fb"), ("Z_", "zt")]);
-        assert_eq!(expand_vars("$_X", &env, 0), "u");
-        assert_eq!(expand_vars("$FOO_BAR", &env, 0), "fb");
-        assert_eq!(expand_vars("$Z_", &env, 0), "zt");
+        assert_eq!(ev("$_X", &env, 0), "u");
+        assert_eq!(ev("$FOO_BAR", &env, 0), "fb");
+        assert_eq!(ev("$Z_", &env, 0), "zt");
     }
 
     #[test]
     fn no_dollar_passes_through_verbatim() {
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("plain text", &env, 0), "plain text");
-        assert_eq!(expand_vars("", &env, 0), "");
+        assert_eq!(ev("plain text", &env, 0), "plain text");
+        assert_eq!(ev("", &env, 0), "");
     }
 
     #[test]
     fn braced_form_with_unset_name_is_empty() {
         let env = env_with(&[]);
-        assert_eq!(expand_vars("${MISSING}", &env, 0), "");
+        assert_eq!(ev("${MISSING}", &env, 0), "");
         // Surrounding text preserved.
-        assert_eq!(expand_vars("a${MISSING}b", &env, 0), "ab");
+        assert_eq!(ev("a${MISSING}b", &env, 0), "ab");
     }
 
     #[test]
     fn unterminated_brace_preserves_literal() {
         // `${X` with no closing `}` → preserved as-is.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${X", &env, 0), "${X");
-        assert_eq!(expand_vars("a${X", &env, 0), "a${X");
+        assert_eq!(ev("${X", &env, 0), "${X");
+        assert_eq!(ev("a${X", &env, 0), "a${X");
     }
 
     #[test]
@@ -763,7 +888,7 @@ mod expand_tests {
         // `$` stays literal and the scanner advances. The
         // second `$` then sees end-of-token, also literal.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$$", &env, 0), "$$");
+        assert_eq!(ev("$$", &env, 0), "$$");
     }
 
     #[test]
@@ -771,7 +896,7 @@ mod expand_tests {
         // The escaping slice will handle `\$X`. For now a
         // literal `\` is preserved, then `$X` expands.
         let env = env_with(&[("X", "v")]);
-        assert_eq!(expand_vars("\\$X", &env, 0), "\\v");
+        assert_eq!(ev("\\$X", &env, 0), "\\v");
     }
 
     #[test]
@@ -780,7 +905,7 @@ mod expand_tests {
         // This is the canonical use-case for `:-`: a guard
         // against missing env vars.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("${UNSET:-fallback}", &env, 0), "fallback");
+        assert_eq!(ev("${UNSET:-fallback}", &env, 0), "fallback");
     }
 
     #[test]
@@ -791,7 +916,7 @@ mod expand_tests {
         // implemented this slice) would treat empty-string as
         // "set" and skip the default.
         let env = env_with(&[("X", "")]);
-        assert_eq!(expand_vars("${X:-fallback}", &env, 0), "fallback");
+        assert_eq!(ev("${X:-fallback}", &env, 0), "fallback");
     }
 
     #[test]
@@ -800,7 +925,7 @@ mod expand_tests {
         // default is discarded — only consulted when the var
         // is unset or empty.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${X:-fallback}", &env, 0), "hello");
+        assert_eq!(ev("${X:-fallback}", &env, 0), "hello");
     }
 
     #[test]
@@ -811,7 +936,7 @@ mod expand_tests {
         // guard against the parser rejecting an empty default
         // (it should accept the zero-byte tail after `:-`).
         let env = env_with(&[]);
-        assert_eq!(expand_vars("${UNSET:-}", &env, 0), "");
+        assert_eq!(ev("${UNSET:-}", &env, 0), "");
     }
 
     #[test]
@@ -828,7 +953,7 @@ mod expand_tests {
         // quotes, which the existing T142 partial supports.
         let env = env_with(&[]);
         assert_eq!(
-            expand_vars("${UNSET:-some default}", &env, 0),
+            ev("${UNSET:-some default}", &env, 0),
             "some default"
         );
     }
@@ -842,7 +967,7 @@ mod expand_tests {
         // (one-pass, no recursion) and matches the slice-scope
         // boundary documented in the doc-comment.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(expand_vars("${UNSET:-$X}", &env, 0), "$X");
+        assert_eq!(ev("${UNSET:-$X}", &env, 0), "$X");
     }
 
     #[test]
@@ -853,7 +978,7 @@ mod expand_tests {
         // over surfacing a mid-line error.
         let env = env_with(&[("X", "hello")]);
         assert_eq!(
-            expand_vars("${X:-no_close", &env, 0),
+            ev("${X:-no_close", &env, 0),
             "${X:-no_close"
         );
     }
@@ -865,7 +990,7 @@ mod expand_tests {
         // appear in the output when the var is set.
         let env = env_with(&[("X", "actual")]);
         assert_eq!(
-            expand_vars("${X:-this is junk}", &env, 0),
+            ev("${X:-this is junk}", &env, 0),
             "actual"
         );
     }
@@ -877,7 +1002,7 @@ mod expand_tests {
         // `}` and resumes literal copying.
         let env = env_with(&[]);
         assert_eq!(
-            expand_vars("a${UNSET:-mid}b", &env, 0),
+            ev("a${UNSET:-mid}b", &env, 0),
             "amidb"
         );
     }
@@ -888,7 +1013,7 @@ mod expand_tests {
         // run yet) → `"0"`. Pin against the initial-state
         // expectation that `run_with_env` seeds the same way.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$?", &env, 0), "0");
+        assert_eq!(ev("$?", &env, 0), "0");
     }
 
     #[test]
@@ -898,10 +1023,10 @@ mod expand_tests {
         // multi-digit codes — the most common shape after a
         // `Status(N)` builtin or a `command not found` (127).
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$?", &env, 1), "1");
-        assert_eq!(expand_vars("$?", &env, 2), "2");
-        assert_eq!(expand_vars("$?", &env, 42), "42");
-        assert_eq!(expand_vars("$?", &env, 127), "127");
+        assert_eq!(ev("$?", &env, 1), "1");
+        assert_eq!(ev("$?", &env, 2), "2");
+        assert_eq!(ev("$?", &env, 42), "42");
+        assert_eq!(ev("$?", &env, 127), "127");
     }
 
     #[test]
@@ -912,8 +1037,8 @@ mod expand_tests {
         // POSIX-undefined `${?:-default}` shape is not
         // accidentally accepted via the existing `:-` path.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("${?}", &env, 0), "0");
-        assert_eq!(expand_vars("${?}", &env, 7), "7");
+        assert_eq!(ev("${?}", &env, 0), "0");
+        assert_eq!(ev("${?}", &env, 7), "7");
     }
 
     #[test]
@@ -925,8 +1050,8 @@ mod expand_tests {
         // after `$?`. This mirrors how `$1` works in real
         // shells with positional args.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("$?bar", &env, 0), "0bar");
-        assert_eq!(expand_vars("$?bar", &env, 1), "1bar");
+        assert_eq!(ev("$?bar", &env, 0), "0bar");
+        assert_eq!(ev("$?bar", &env, 1), "1bar");
     }
 
     #[test]
@@ -935,7 +1060,7 @@ mod expand_tests {
         // preserved — the scanner emits the literal prefix,
         // then the status digits, then the literal suffix.
         let env = env_with(&[]);
-        assert_eq!(expand_vars("[$?]", &env, 42), "[42]");
+        assert_eq!(ev("[$?]", &env, 42), "[42]");
     }
 
     #[test]
@@ -947,7 +1072,109 @@ mod expand_tests {
         // consults for `?` / `${?}`. The env map is never
         // checked for the `?` name.
         let env = env_with(&[("?", "foo")]);
-        assert_eq!(expand_vars("$?", &env, 5), "5");
-        assert_eq!(expand_vars("${?}", &env, 5), "5");
+        assert_eq!(ev("$?", &env, 5), "5");
+        assert_eq!(ev("${?}", &env, 5), "5");
+    }
+
+    // --- set -u nounset unit tests (function-level, not
+    // dispatch-loop-level — those live in tests/set_u.rs).
+
+    #[test]
+    fn nounset_off_unset_var_returns_ok_empty() {
+        // Sanity: with the default flags, `$UNSET` returns
+        // Ok("") — no error path is taken when nounset is
+        // off, even for unset names. Guards against an
+        // accidental "always error" regression that would
+        // break the seven test files relying on the default
+        // empty-string expansion.
+        let env = env_with(&[]);
+        let flags = ShellFlags::default();
+        assert_eq!(expand_vars("$UNSET", &env, 0, &flags).unwrap(), "");
+    }
+
+    #[test]
+    fn nounset_on_bare_unset_var_returns_not_set_error() {
+        // The canonical `set -u` failure: a bare `$NAME` for
+        // an unset name returns `Err(NotSet("NAME"))`. The
+        // dispatch loop translates this into the stderr
+        // diagnostic and the Exit(1) termination.
+        let env = env_with(&[]);
+        let flags = ShellFlags { errexit: false, nounset: true };
+        let err = expand_vars("$UNSET", &env, 0, &flags).unwrap_err();
+        assert_eq!(err, ExpandError::NotSet("UNSET".to_string()));
+    }
+
+    #[test]
+    fn nounset_on_braced_unset_var_returns_not_set_error() {
+        // The braced form `${NAME}` mirrors the bare form's
+        // nounset behavior — no `:-` modifier means the
+        // braced arm goes through the same error path.
+        let env = env_with(&[]);
+        let flags = ShellFlags { errexit: false, nounset: true };
+        let err = expand_vars("${UNSET}", &env, 0, &flags).unwrap_err();
+        assert_eq!(err, ExpandError::NotSet("UNSET".to_string()));
+    }
+
+    #[test]
+    fn nounset_on_default_value_form_does_not_error_when_var_unset() {
+        // POSIX-required exemption: `${X:-default}` is the
+        // fallback-for-unset-vars form, so it MUST NOT trip
+        // nounset even when X is unset. Pin this directly
+        // because it's the load-bearing semantic that lets
+        // the `:-` form remain useful under `set -u`.
+        let env = env_with(&[]);
+        let flags = ShellFlags { errexit: false, nounset: true };
+        assert_eq!(
+            expand_vars("${UNSET:-fallback}", &env, 0, &flags).unwrap(),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn nounset_on_default_value_form_uses_value_when_var_set() {
+        // `${X:-fallback}` with X=hello, nounset on → "hello".
+        // The set-var branch wins; the default is discarded.
+        // Same shape as the nounset-off path, just confirming
+        // nounset doesn't accidentally interfere when the var
+        // IS set.
+        let env = env_with(&[("X", "hello")]);
+        let flags = ShellFlags { errexit: false, nounset: true };
+        assert_eq!(
+            expand_vars("${X:-fallback}", &env, 0, &flags).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn nounset_on_dollar_question_does_not_error() {
+        // `$?` is always defined (last_status is an i32 with
+        // a known initial value of 0) — `set -u` MUST NOT
+        // fire on it. Same for the braced form `${?}`.
+        let env = env_with(&[]);
+        let flags = ShellFlags { errexit: false, nounset: true };
+        assert_eq!(expand_vars("$?", &env, 0, &flags).unwrap(), "0");
+        assert_eq!(expand_vars("${?}", &env, 7, &flags).unwrap(), "7");
+    }
+
+    #[test]
+    fn nounset_on_set_var_returns_value_via_ok() {
+        // Sanity: with nounset on, a SET var still resolves
+        // normally — no false-positive error. Pin both the
+        // bare and braced forms.
+        let env = env_with(&[("X", "hello")]);
+        let flags = ShellFlags { errexit: false, nounset: true };
+        assert_eq!(expand_vars("$X", &env, 0, &flags).unwrap(), "hello");
+        assert_eq!(expand_vars("${X}", &env, 0, &flags).unwrap(), "hello");
+    }
+
+    #[test]
+    fn nounset_on_unterminated_brace_does_not_error() {
+        // `${X` with no closing `}` is the lenient-literal
+        // recovery path — there's no resolved name to report
+        // as "unset", so nounset MUST NOT trip. The literal
+        // `${X` is returned as-is.
+        let env = env_with(&[]);
+        let flags = ShellFlags { errexit: false, nounset: true };
+        assert_eq!(expand_vars("${X", &env, 0, &flags).unwrap(), "${X");
     }
 }
