@@ -163,3 +163,99 @@ fn continues_after_missing_path_but_exits_one() {
     );
     cleanup(&dir);
 }
+
+#[test]
+fn dash_l_emits_type_size_name_columns_for_files() {
+    let dir = scratch_dir("dash-l-files");
+    write_file(&dir, "alpha", b"aa");
+    write_file(&dir, "bravo", b"bbbb");
+    write_file(&dir, "charlie", b"cccccc");
+
+    let out = Command::new(LS)
+        .arg("-l")
+        .arg(&dir)
+        .output()
+        .expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout = {stdout:?}");
+    let expected = ["- 2 alpha", "- 4 bravo", "- 6 charlie"];
+    for (got, want) in lines.iter().zip(expected.iter()) {
+        assert_eq!(got, want, "row mismatch: stdout = {stdout:?}");
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_l_marks_directories_with_d_letter() {
+    let dir = scratch_dir("dash-l-dir");
+    let sub = dir.join("subdir");
+    fs::create_dir(&sub).expect("mkdir subdir");
+    write_file(&sub, "ignored", b"x");
+
+    let out = Command::new(LS)
+        .arg("-l")
+        .arg(&dir)
+        .output()
+        .expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(out.stdout, b"d 0 subdir\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_l_handles_file_arg_directly() {
+    let dir = scratch_dir("dash-l-file-arg");
+    let path = write_file(&dir, "only.txt", b"hello");
+
+    let out = Command::new(LS)
+        .arg("-l")
+        .arg(&path)
+        .output()
+        .expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(out.stdout, b"- 5 only.txt\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_l_with_no_args_lists_cwd_long_format() {
+    let dir = scratch_dir("dash-l-cwd");
+    write_file(&dir, "marker", b"mm");
+
+    let out = Command::new(LS)
+        .arg("-l")
+        .current_dir(&dir)
+        .output()
+        .expect("spawn ls");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert_eq!(out.stdout, b"- 2 marker\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn unknown_flag_exits_two_with_stderr() {
+    let dir = scratch_dir("unknown-flag");
+
+    let out = Command::new(LS)
+        .arg("-a")
+        .arg(&dir)
+        .output()
+        .expect("spawn ls");
+
+    assert_eq!(out.status.code(), Some(2), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag"), "stderr = {stderr:?}");
+    assert!(stderr.contains("-a"), "stderr = {stderr:?}");
+    cleanup(&dir);
+}
