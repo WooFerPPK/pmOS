@@ -141,21 +141,27 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `CAP_GRANT` is in the extension range (0x1302) but still has
-    // no handler. Same shape as the WASI case above: decoded as a
-    // known extension opcode, routed to `dispatch_ext`'s `_ =>`
-    // arm, ENOSYS echoed back with the request_id intact.
+    // `IPC_SEND` is in the extension range (0x1005) but still has
+    // no handler — fd-passing primitives are deferred until the
+    // IpcTable grows per-send fd queues; `FD_READ` / `FD_WRITE`
+    // already cover the send/recv-without-fd-passing case via the
+    // `FdObject::Socket` arm, so the dedicated send/recv opcodes
+    // are the fd-passing-only path. Same shape as the WASI case
+    // above: decoded as a known extension opcode, routed to
+    // `dispatch_ext`'s `_ =>` arm, ENOSYS echoed back with the
+    // request_id intact.
     //
     // (This probe was `PROC_SPAWN` before that handler landed, then
-    // `PROC_WAIT`, then `PROC_KILL`, then `PROC_CAPS_GET`. CAP_GRANT
-    // is a v2-era concern — delegating cap edits to userland is out
-    // of scope for v1 — so it's a stable long-term probe target.)
+    // `PROC_WAIT`, then `PROC_KILL`, then `PROC_CAPS_GET`, then
+    // `CAP_GRANT`. Each rotation tightens the unimplemented-opcode
+    // surface; `IPC_SEND` is the next stable target until the
+    // fd-passing slice arrives.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::CAP_GRANT,
+        opcode: op_ext::IPC_SEND,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -690,6 +696,296 @@ fn cap_list_returns_full_cap_bitset() {
 
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, expected_bits);
+}
+
+// ---- cap_grant --------------------------------------------------------
+//
+// Wire layout per `contracts/syscalls.md §3.5`:
+//   args[0..4]  = target_pid (u32 LE)
+//   args[4..12] = caps_to_grant (u64 LE bitset)
+// Response: value = 0 on success; status = -errno on failure.
+//
+// The semantic surface lives on `CapTable::grant`; these tests
+// exercise the dispatcher adapter end-to-end and pin the
+// constitution-mandated invariants:
+//   * caller-needs-CAP_GRANT (NotPermitted → ENOTCAPABLE)
+//   * no-widening subset check (NotASubset → ENOTCAPABLE,
+//     applied atomically — partial subset matches reject the
+//     whole grant)
+//   * union semantics (target gets `target.caps | caps_to_grant`,
+//     never replacement)
+//   * missing target (NoSuchPid → ESRCH)
+
+/// Pack `target_pid: u32` + `caps: u64` into the 16-byte inline-args
+/// window the cap_grant opcode uses.
+fn cap_grant_args(target: abi::ext::Pid, caps: abi::cap::CapSet) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&(target as u32).to_le_bytes());
+    args[4..12].copy_from_slice(&caps.0.to_le_bytes());
+    args
+}
+
+#[test]
+fn cap_grant_happy_path_grants_cap_to_target() {
+    // Caller holds CAP_GRANT + DISPLAY_CLIENT (a subset of init's
+    // ALL); target starts with nothing. After cap_grant the target
+    // owns exactly DISPLAY_CLIENT.
+    let mut k = make_kernel();
+    let granter = k
+        .register_process(RegisterArgs {
+            name: "granter",
+            ppid: 0,
+            caps: abi::cap::CapSet::from_caps(&[Cap::CapGrant, Cap::DisplayClient]),
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(granter).unwrap();
+    k.procs.transition(granter, ProcState::Running).unwrap();
+
+    let target = k
+        .register_process(RegisterArgs {
+            name: "target",
+            ppid: granter,
+            caps: abi::cap::CapSet::EMPTY,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(target).unwrap();
+    k.procs.transition(target, ProcState::Running).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_ext::CAP_GRANT,
+        flags: 0,
+        request_id: 70,
+        args: cap_grant_args(target, abi::cap::CapSet::from_caps(&[Cap::DisplayClient])),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, granter, &req, &mut heap);
+
+    assert_eq!(resp.request_id, 70);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    let target_caps = k.caps.list(target).expect("target still in table");
+    assert!(target_caps.contains(Cap::DisplayClient));
+}
+
+#[test]
+fn cap_grant_widens_existing_caps_via_union() {
+    // Target already holds DISPLAY_CLIENT; granting NET on top
+    // should leave DISPLAY_CLIENT intact (union, not replacement).
+    let mut k = make_kernel();
+    let granter = make_running_proc(&mut k, "init-like", 0);
+
+    let target = k
+        .register_process(RegisterArgs {
+            name: "target",
+            ppid: granter,
+            caps: abi::cap::CapSet::from_caps(&[Cap::DisplayClient]),
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(target).unwrap();
+    k.procs.transition(target, ProcState::Running).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_ext::CAP_GRANT,
+        flags: 0,
+        request_id: 71,
+        args: cap_grant_args(target, abi::cap::CapSet::from_caps(&[Cap::Net])),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, granter, &req, &mut heap);
+
+    assert_eq!(resp.status, 0);
+    let target_caps = k.caps.list(target).unwrap();
+    assert!(target_caps.contains(Cap::DisplayClient), "pre-existing cap preserved");
+    assert!(target_caps.contains(Cap::Net), "newly granted cap added");
+}
+
+#[test]
+fn cap_grant_caller_lacks_cap_grant_returns_enotcapable() {
+    // Caller holds DISPLAY_CLIENT but NOT CAP_GRANT — must fail
+    // with ENOTCAPABLE before any mutation, and the target's caps
+    // must be unchanged after the call.
+    let mut k = make_kernel();
+    let granter = k
+        .register_process(RegisterArgs {
+            name: "no-grant",
+            ppid: 0,
+            caps: abi::cap::CapSet::from_caps(&[Cap::DisplayClient]),
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(granter).unwrap();
+    k.procs.transition(granter, ProcState::Running).unwrap();
+
+    let target = k
+        .register_process(RegisterArgs {
+            name: "target",
+            ppid: granter,
+            caps: abi::cap::CapSet::EMPTY,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(target).unwrap();
+    k.procs.transition(target, ProcState::Running).unwrap();
+
+    let target_caps_before = k.caps.list(target).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_ext::CAP_GRANT,
+        flags: 0,
+        request_id: 72,
+        args: cap_grant_args(target, abi::cap::CapSet::from_caps(&[Cap::DisplayClient])),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, granter, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+    let target_caps_after = k.caps.list(target).unwrap();
+    assert_eq!(
+        target_caps_before, target_caps_after,
+        "target's caps unchanged on permission failure"
+    );
+}
+
+#[test]
+fn cap_grant_caller_does_not_hold_requested_cap_returns_enotcapable() {
+    // Caller has CAP_GRANT but NOT DISPLAY_CLIENT — attempting to
+    // grant DISPLAY_CLIENT is the no-widening violation. Must
+    // return ENOTCAPABLE and leave the target's caps untouched.
+    let mut k = make_kernel();
+    let granter = k
+        .register_process(RegisterArgs {
+            name: "grant-only",
+            ppid: 0,
+            caps: abi::cap::CapSet::from_caps(&[Cap::CapGrant]),
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(granter).unwrap();
+    k.procs.transition(granter, ProcState::Running).unwrap();
+
+    let target = k
+        .register_process(RegisterArgs {
+            name: "target",
+            ppid: granter,
+            caps: abi::cap::CapSet::EMPTY,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(target).unwrap();
+    k.procs.transition(target, ProcState::Running).unwrap();
+
+    let target_caps_before = k.caps.list(target).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_ext::CAP_GRANT,
+        flags: 0,
+        request_id: 73,
+        args: cap_grant_args(target, abi::cap::CapSet::from_caps(&[Cap::DisplayClient])),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, granter, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+    let target_caps_after = k.caps.list(target).unwrap();
+    assert_eq!(
+        target_caps_before, target_caps_after,
+        "target's caps unchanged on subset violation"
+    );
+}
+
+#[test]
+fn cap_grant_target_does_not_exist_returns_esrch() {
+    // Caller is fully privileged; target pid was never registered.
+    // The CapTable lookup in the target arm must surface as ESRCH.
+    let mut k = make_kernel();
+    let granter = make_running_proc(&mut k, "init-like", 0);
+    let phantom_target: abi::ext::Pid = 9999;
+
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_ext::CAP_GRANT,
+        flags: 0,
+        request_id: 74,
+        args: cap_grant_args(
+            phantom_target,
+            abi::cap::CapSet::from_caps(&[Cap::DisplayClient]),
+        ),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, granter, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ESRCH);
+}
+
+#[test]
+fn cap_grant_partial_subset_violation_rejects_whole_grant() {
+    // Caller holds {CAP_GRANT, DISPLAY_CLIENT}; attempting to
+    // grant {DISPLAY_CLIENT, NET} fails because NET is missing
+    // from the caller. The grant is atomic — DISPLAY_CLIENT
+    // (which the caller DID hold) must NOT land on the target;
+    // partial application would let userland incrementally widen
+    // a child's caps by repeatedly trying overlapping subsets.
+    let mut k = make_kernel();
+    let granter = k
+        .register_process(RegisterArgs {
+            name: "granter",
+            ppid: 0,
+            caps: abi::cap::CapSet::from_caps(&[Cap::CapGrant, Cap::DisplayClient]),
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(granter).unwrap();
+    k.procs.transition(granter, ProcState::Running).unwrap();
+
+    let target = k
+        .register_process(RegisterArgs {
+            name: "target",
+            ppid: granter,
+            caps: abi::cap::CapSet::EMPTY,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(target).unwrap();
+    k.procs.transition(target, ProcState::Running).unwrap();
+
+    let target_caps_before = k.caps.list(target).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_ext::CAP_GRANT,
+        flags: 0,
+        request_id: 75,
+        args: cap_grant_args(
+            target,
+            abi::cap::CapSet::from_caps(&[Cap::DisplayClient, Cap::Net]),
+        ),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, granter, &req, &mut heap);
+
+    assert_eq!(resp.status, -errno::ENOTCAPABLE);
+    let target_caps_after = k.caps.list(target).unwrap();
+    assert_eq!(
+        target_caps_before, target_caps_after,
+        "target's caps unchanged on partial subset violation (atomic reject)"
+    );
+    assert!(
+        !target_caps_after.contains(Cap::DisplayClient),
+        "no partial application — DISPLAY_CLIENT must not land"
+    );
 }
 
 // ---- clock_time_get --------------------------------------------------

@@ -9,12 +9,13 @@
 //!
 //! ## Coverage
 //!
-//! As of the SIGCHLD delivery batch, the dispatcher routes the
-//! following extension opcodes (`contracts/syscalls.md §3`):
+//! As of the CAP_GRANT delegation slice, the dispatcher routes
+//! the following extension opcodes (`contracts/syscalls.md §3`):
 //! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
 //! `IPC_ACCEPT`, `IPC_PIPE`, `PROC_SELF`, `PROC_PARENT`,
 //! `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`, `PROC_CAPS_GET`,
-//! `DISPLAY_CONNECT`, `DISPLAY_BIND`, `CAP_CHECK`, `CAP_LIST`.
+//! `DISPLAY_CONNECT`, `DISPLAY_BIND`, `CAP_CHECK`, `CAP_LIST`,
+//! `CAP_GRANT`.
 //!
 //! The remaining extension opcodes fall through the `_ =>` arm
 //! and return `ENOSYS`:
@@ -24,10 +25,10 @@
 //!   queues. `FD_READ` / `FD_WRITE` already cover the
 //!   send/recv-without-fd-passing case via the `FdObject::Socket`
 //!   arm, so the send/recv opcodes are the fd-passing-only path.
-//! * `CAP_GRANT` (0x1302) — intentionally deferred to v2 per the
-//!   `known_ext_opcode_without_handler_returns_enosys` probe
-//!   comment in `crates/kernel/tests/syscall.rs`; delegating
-//!   cap edits to userland is out of scope for v1.
+//!   `IPC_SEND` is the canonical ext-range ENOSYS probe target
+//!   in `known_ext_opcode_without_handler_returns_enosys`; it
+//!   inherits that role from `CAP_GRANT`, which now ships a
+//!   handler.
 //! * `MOUNT` / `UMOUNT` (0x1400/0x1401) — the semantic surface
 //!   exists on `Kernel::vfs.mount` / `umount`, but a fstype →
 //!   `Box<dyn Filesystem>` factory and the privilege / config
@@ -37,10 +38,6 @@
 //! * `HOST_FILE_RECV` (0x1500) — needs the drag-drop token
 //!   table + driver plumbing described in
 //!   `contracts/syscalls.md §3.6`.
-//!
-//! `CAP_GRANT` is also the canonical ext-range ENOSYS probe
-//! target — see `known_ext_opcode_without_handler_returns_enosys`
-//! in the syscall isolation suite.
 
 extern crate alloc;
 
@@ -80,6 +77,7 @@ pub fn dispatch_ext(
         op::PROC_PARENT => ServiceOutcome::Done(handle_proc_parent(kernel, pid, req)),
         op::CAP_CHECK => ServiceOutcome::Done(handle_cap_check(kernel, pid, req)),
         op::CAP_LIST => ServiceOutcome::Done(handle_cap_list(kernel, pid, req)),
+        op::CAP_GRANT => ServiceOutcome::Done(handle_cap_grant(kernel, pid, req)),
         op::PROC_SPAWN => ServiceOutcome::Done(handle_proc_spawn(kernel, pid, req, heap)),
         op::PROC_WAIT => handle_proc_wait(kernel, pid, req, heap),
         op::PROC_KILL => ServiceOutcome::Done(handle_proc_kill(kernel, pid, req)),
@@ -158,6 +156,58 @@ fn handle_cap_list(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
     match kernel.caps.list(pid) {
         Ok(set) => Response::ok(req.request_id, set.0 as i64),
         Err(_) => Response::err(req.request_id, ESRCH),
+    }
+}
+
+// ---- cap_grant ---------------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = target_pid (u32)
+//   args[4..12] = caps_to_grant (u64 LE bitset)
+// Response:
+//   value       = 0 on success
+//   status      = -ENOTCAPABLE if the caller does not hold CAP_GRANT
+//                 or if `caps_to_grant` is not a subset of the caller's
+//                 own cap set (the no-privilege-escalation guard);
+//                 -ESRCH if the target pid is absent from the
+//                 process table.
+//
+// Semantics live in `CapTable::grant` (`crates/kernel/src/cap/mod.rs`)
+// and match `contracts/syscalls.md §3.5` + `data-model.md §5`:
+//
+//   1. Caller must hold `Cap::CapGrant` — otherwise NotPermitted →
+//      ENOTCAPABLE. In v1 only init holds CAP_GRANT by default, so
+//      every other process sees ENOTCAPABLE here unless init has
+//      already delegated CAP_GRANT down via this same opcode.
+//   2. `caps_to_grant` must be a subset of the caller's own cap
+//      set — otherwise NotASubset → ENOTCAPABLE. This is the
+//      no-widening rule: a process cannot grant a cap it does
+//      not itself possess. The check is atomic — partial subset
+//      violations reject the entire grant; the target's caps are
+//      never mutated when any bit of `caps_to_grant` is missing
+//      from the caller.
+//   3. Target pid must exist — otherwise NoSuchPid → ESRCH.
+//
+// On success the target's cap set becomes
+// `target.caps ∪ caps_to_grant` (union — never strips caps from
+// the target; cap removal is `CapTable::drop_caps`'s job, exposed
+// to userland via a separate future opcode).
+//
+// The `From<CapError> for KernelError` impl in `sys.rs` collapses
+// NotPermitted and NotASubset into the same `NotCapable` variant
+// since both surface to userland as ENOTCAPABLE — userland gets
+// the same errno regardless of whether the caller lacked the
+// capability cap entirely or tried to grant a cap they didn't
+// hold. Distinguishing the two would invite probe-driven
+// permission-set inference, which the cap model is built to
+// frustrate.
+
+fn handle_cap_grant(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let target = args_u32(req, 0) as Pid;
+    let caps = CapSet(args_u64(req, 4));
+    match kernel.caps.grant(pid, target, caps) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e.into())),
     }
 }
 
