@@ -531,3 +531,193 @@ fn set_wallpaper_rejects_value_with_quote() {
         "stderr should explain illegal char: {stderr:?}"
     );
 }
+
+#[test]
+fn set_keyboard_writes_new_value_to_fresh_config() {
+    let path = temp_file("set-keyboard-fresh");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-keyboard", "us-qwerty", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-keyboard");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    assert!(
+        written.contains("[keyboard]"),
+        "written config should contain [keyboard] section: {written:?}"
+    );
+    assert!(
+        written.contains("layout = \"us-qwerty\""),
+        "written config should contain keyboard.layout = us-qwerty: {written:?}"
+    );
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_keyboard_preserves_other_fields() {
+    let original = b"[theme]\n\
+        name = \"light\"\n\
+        fit  = \"stretch\"\n\
+        \n\
+        [wallpaper]\n\
+        name = \"mountains.png\"\n\
+        \n\
+        [keyboard]\n\
+        layout = \"de-qwertz\"\n\
+        \n\
+        [timezone]\n\
+        iana = \"America/New_York\"\n\
+        \n\
+        [terminal]\n\
+        font = \"unifont-mono-14.pbm\"\n";
+    let path = write_temp("set-keyboard-preserve", original);
+
+    let out = Command::new(SETTINGS)
+        .args(["set-keyboard", "us-qwerty", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-keyboard");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read(&path).expect("read written config");
+    let prefs = preferences::Preferences::parse(&written)
+        .expect("written config must round-trip through parse");
+
+    assert_eq!(prefs.theme_name.as_deref(), Some("light"));
+    assert_eq!(prefs.theme_fit.as_deref(), Some("stretch"));
+    assert_eq!(prefs.wallpaper_name.as_deref(), Some("mountains.png"));
+    assert_eq!(prefs.keyboard_layout.as_deref(), Some("us-qwerty"));
+    assert_eq!(prefs.timezone_iana.as_deref(), Some("America/New_York"));
+    assert_eq!(prefs.terminal_font.as_deref(), Some("unifont-mono-14.pbm"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_keyboard_overwrites_existing_value() {
+    let path = write_temp(
+        "set-keyboard-overwrite",
+        b"[keyboard]\nlayout = \"de-qwertz\"\n",
+    );
+
+    let out = Command::new(SETTINGS)
+        .args(["set-keyboard", "us-qwerty", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-keyboard");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    let new_occurrences = written.matches("\"us-qwerty\"").count();
+    let old_occurrences = written.matches("\"de-qwertz\"").count();
+    let section_occurrences = written.matches("[keyboard]").count();
+    assert_eq!(
+        new_occurrences, 1,
+        "keyboard.layout = us-qwerty should appear exactly once: {written:?}"
+    );
+    assert_eq!(
+        old_occurrences, 0,
+        "old keyboard.layout = de-qwertz should be gone: {written:?}"
+    );
+    assert_eq!(
+        section_occurrences, 1,
+        "[keyboard] section should appear exactly once: {written:?}"
+    );
+
+    let prefs = preferences::Preferences::parse(written.as_bytes())
+        .expect("written config round-trips");
+    assert_eq!(prefs.keyboard_layout.as_deref(), Some("us-qwerty"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_keyboard_missing_layout_arg_exits_one_with_usage() {
+    let path = temp_file("set-keyboard-missing");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-keyboard", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-keyboard missing");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("usage:"),
+        "stderr should contain 'usage:': {stderr:?}"
+    );
+    assert!(
+        stderr.contains("set-keyboard"),
+        "stderr should mention set-keyboard: {stderr:?}"
+    );
+}
+
+#[test]
+fn set_keyboard_rejects_empty_or_illegal_value() {
+    let path_empty = temp_file("set-keyboard-empty");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-keyboard", "", "--config"])
+        .arg(&path_empty)
+        .output()
+        .expect("spawn settings set-keyboard empty");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "empty layout should exit 1: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("set-keyboard"),
+        "stderr should mention set-keyboard: {stderr:?}"
+    );
+
+    let path_quote = temp_file("set-keyboard-quote");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-keyboard", "bad\"layout", "--config"])
+        .arg(&path_quote)
+        .output()
+        .expect("spawn settings set-keyboard quote");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "layout with quote should exit 1: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("quotes") || stderr.contains("newlines"),
+        "stderr should explain illegal char: {stderr:?}"
+    );
+
+    let path_newline = temp_file("set-keyboard-newline");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-keyboard", "bad\nlayout", "--config"])
+        .arg(&path_newline)
+        .output()
+        .expect("spawn settings set-keyboard newline");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "layout with newline should exit 1: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("quotes") || stderr.contains("newlines"),
+        "stderr should explain illegal char: {stderr:?}"
+    );
+}

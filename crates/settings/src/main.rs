@@ -21,6 +21,9 @@
 //!   settings set-wallpaper <value>        # write wallpaper.name to /etc/preferences.toml
 //!   settings set-wallpaper <value> --config <path>
 //!                                         # write wallpaper.name to <path> (test hook)
+//!   settings set-keyboard <layout>        # write keyboard.layout to /etc/preferences.toml
+//!   settings set-keyboard <layout> --config <path>
+//!                                         # write keyboard.layout to <path> (test hook)
 //!
 //! Deferred T192 scope: `/proc/version` (procfs emits a placeholder
 //! line today and is not yet a stable source) and `/proc/storage`
@@ -33,7 +36,10 @@
 //! `wallpaper.name` field — the only field on the `[wallpaper]`
 //! section in the v1 schema (see `crates/preferences/src/lib.rs`
 //! T183 schema). A future `set-wallpaper-color` slice can land if
-//! the schema gains a colour field.
+//! the schema gains a colour field. `set-keyboard` writes the
+//! `keyboard.layout` field — the only field on the `[keyboard]`
+//! section in the v1 schema. Valid-layout allow-list deferred to
+//! the GUI for the same reason as `set-theme`.
 
 use std::process::ExitCode;
 
@@ -58,6 +64,7 @@ fn main() -> ExitCode {
         Some("about") => run_about(&args[1..]),
         Some("set-theme") => run_set_theme(&args[1..]),
         Some("set-wallpaper") => run_set_wallpaper(&args[1..]),
+        Some("set-keyboard") => run_set_keyboard(&args[1..]),
         _ => run_preferences(args.first().map(String::as_str).unwrap_or(DEFAULT_CONFIG)),
     }
 }
@@ -330,6 +337,98 @@ fn run_set_wallpaper(rest: &[String]) -> ExitCode {
     if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
         eprintln!(
             "settings: set-wallpaper: failed to write {}: {}",
+            config_path, e
+        );
+        return ExitCode::from(1);
+    }
+
+    ExitCode::from(0)
+}
+
+/// `set-keyboard <layout> [--config <path>]` — read-modify-write
+/// `keyboard.layout` on the preferences file, preserving every other
+/// field.
+///
+/// `keyboard.layout` is the only field on the `[keyboard]` section
+/// in the v1 schema (see `crates/preferences/src/lib.rs`), so
+/// `set-keyboard <layout>` writes that field directly — no
+/// disambiguation needed today. Mirrors `set-wallpaper` /
+/// `set-theme` byte-for-byte: same `--config` test hook, same
+/// validation (non-empty, no embedded `"` or `\n`), same exit
+/// codes, same stderr shape.
+fn run_set_keyboard(rest: &[String]) -> ExitCode {
+    let mut layout: Option<&str> = None;
+    let mut config_path: &str = DEFAULT_CONFIG;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--config" => {
+                let Some(next) = rest.get(i + 1) else {
+                    eprintln!("settings: set-keyboard: --config requires a path argument");
+                    return ExitCode::from(1);
+                };
+                config_path = next.as_str();
+                i += 2;
+            }
+            other => {
+                if layout.is_none() {
+                    layout = Some(other);
+                    i += 1;
+                } else {
+                    eprintln!("settings: set-keyboard: unexpected argument {:?}", other);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    }
+
+    let Some(layout) = layout else {
+        eprintln!("settings: set-keyboard: usage: set-keyboard <layout>");
+        return ExitCode::from(1);
+    };
+
+    if layout.is_empty() {
+        eprintln!("settings: set-keyboard: keyboard layout must be non-empty");
+        return ExitCode::from(1);
+    }
+
+    if layout.contains('"') || layout.contains('\n') {
+        eprintln!(
+            "settings: set-keyboard: keyboard layout must not contain quotes or newlines"
+        );
+        return ExitCode::from(1);
+    }
+
+    let mut prefs = match std::fs::read(config_path) {
+        Ok(bytes) => match preferences::Preferences::parse(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "settings: set-keyboard: failed to parse {}: {:?}",
+                    config_path, e
+                );
+                return ExitCode::from(1);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            preferences::Preferences::empty()
+        }
+        Err(e) => {
+            eprintln!(
+                "settings: set-keyboard: failed to open {}: {}",
+                config_path, e
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    prefs.keyboard_layout = Some(layout.to_string());
+
+    let serialised = serialise_preferences(&prefs);
+
+    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+        eprintln!(
+            "settings: set-keyboard: failed to write {}: {}",
             config_path, e
         );
         return ExitCode::from(1);
