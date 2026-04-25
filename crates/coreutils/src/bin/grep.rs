@@ -10,15 +10,17 @@
 //!
 //! Flag parsing mirrors `cp -r` (commit `b2623ff`): single-pass
 //! arg split; `-i` toggles case-insensitive matching; `-n` prefixes
-//! each match with its 1-indexed line number; everything after `--`
-//! is forced into pattern/file args regardless of leading `-`.
-//! Unknown flags write `grep: unknown flag: <flag>` to stderr and
-//! exit 2.
+//! each match with its 1-indexed line number; `-v` inverts the
+//! match (emit lines that do NOT contain the pattern); short flags
+//! may be clustered POSIX-style (`grep -inv FOO` = `-i -n -v`);
+//! everything after `--` is forced into pattern/file args regardless
+//! of leading `-`. Unknown flags write `grep: unknown flag: <flag>`
+//! to stderr and exit 2.
 //!
 //! Explicitly deferred flag follow-ups: `-E` (POSIX-ERE regex),
-//! `-F` (fixed-string is already the default), `-v` (invert match),
-//! `-c` (count only), `-l` (filenames only), Unicode-aware
-//! case-folding (current `-i` is ASCII-via-`to_lowercase`).
+//! `-F` (fixed-string is already the default), `-c` (count only),
+//! `-l` (filenames only), Unicode-aware case-folding (current `-i`
+//! is ASCII-via-`to_lowercase`).
 
 use std::env;
 use std::fs::File;
@@ -29,6 +31,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut case_insensitive = false;
     let mut with_line_numbers = false;
+    let mut invert = false;
     let mut rest: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -37,13 +40,16 @@ fn main() -> ExitCode {
             continue;
         }
         if !sep_seen && arg.starts_with('-') && arg != "-" {
-            if arg == "-i" {
-                case_insensitive = true;
-            } else if arg == "-n" {
-                with_line_numbers = true;
-            } else {
-                let _ = writeln!(io::stderr(), "grep: unknown flag: {arg}");
-                return ExitCode::from(2);
+            for ch in arg[1..].chars() {
+                match ch {
+                    'i' => case_insensitive = true,
+                    'n' => with_line_numbers = true,
+                    'v' => invert = true,
+                    _ => {
+                        let _ = writeln!(io::stderr(), "grep: unknown flag: {arg}");
+                        return ExitCode::from(2);
+                    }
+                }
             }
         } else {
             rest.push(arg);
@@ -51,7 +57,7 @@ fn main() -> ExitCode {
     }
 
     let Some((pattern, files)) = rest.split_first() else {
-        let _ = writeln!(io::stderr(), "usage: grep [-i] [-n] <pattern> [file ...]");
+        let _ = writeln!(io::stderr(), "usage: grep [-i] [-n] [-v] <pattern> [file ...]");
         return ExitCode::from(2);
     };
     let stdout = io::stdout();
@@ -63,13 +69,13 @@ fn main() -> ExitCode {
 
     if files.is_empty() {
         let stdin = io::stdin();
-        matched |= scan(stdin.lock(), &needle, case_insensitive, None, with_line_numbers, &mut out);
+        matched |= scan(stdin.lock(), &needle, case_insensitive, None, with_line_numbers, invert, &mut out);
     } else {
         for path in files {
             match File::open(path) {
                 Ok(f) => {
                     let prefix = if multi { Some(path.as_str()) } else { None };
-                    matched |= scan(BufReader::new(f), &needle, case_insensitive, prefix, with_line_numbers, &mut out);
+                    matched |= scan(BufReader::new(f), &needle, case_insensitive, prefix, with_line_numbers, invert, &mut out);
                 }
                 Err(e) => {
                     let _ = writeln!(io::stderr(), "grep: {path}: {e}");
@@ -94,6 +100,7 @@ fn scan<R: BufRead, W: Write>(
     case_insensitive: bool,
     prefix: Option<&str>,
     with_line_numbers: bool,
+    invert: bool,
     out: &mut W,
 ) -> bool {
     let mut any = false;
@@ -113,7 +120,7 @@ fn scan<R: BufRead, W: Write>(
                 } else {
                     s.contains(needle)
                 };
-                if hit {
+                if hit != invert {
                     any = true;
                     let lineno = n + 1;
                     match (prefix, with_line_numbers) {

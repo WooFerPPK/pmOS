@@ -323,3 +323,93 @@ fn dash_n_in_stdin_mode_counts_from_one() {
     assert_eq!(out.stdout, b"1:alpha\n");
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
 }
+
+#[test]
+fn dash_v_emits_non_matching_lines() {
+    let dir = scratch_dir("inv-basic");
+    let path = write_file(&dir, "a.txt", b"foo\nbar\nfoo\n");
+
+    let out = Command::new(GREP)
+        .arg("-v")
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"bar\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_v_no_match_means_all_lines_pass() {
+    let dir = scratch_dir("inv-allpass");
+    let path = write_file(&dir, "a.txt", b"aaa\nbbb\n");
+
+    let out = Command::new(GREP)
+        .arg("-v")
+        .arg("zzz")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"aaa\nbbb\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_v_with_dash_i_inverts_case_insensitive() {
+    let dir = scratch_dir("inv-ci");
+    let path = write_file(&dir, "a.txt", b"FOO\nbar\nfoo\nbaz\nFoo\n");
+
+    let out = Command::new(GREP)
+        .arg("-iv")
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"bar\nbaz\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_v_combines_with_dash_n() {
+    let dir = scratch_dir("inv-ln");
+    let path = write_file(&dir, "a.txt", b"foo\nbar\nfoo\n");
+
+    let out = Command::new(GREP)
+        .arg("-nv")
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"2:bar\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_v_no_lines_pass_exits_one() {
+    let dir = scratch_dir("inv-empty");
+    let path = write_file(&dir, "a.txt", b"always\nalways\nalways\n");
+
+    let out = Command::new(GREP)
+        .arg("-v")
+        .arg("always")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
