@@ -159,3 +159,79 @@ fn zero_args_exits_one_with_usage_line() {
     assert!(stderr.contains("usage:"), "stderr = {stderr:?}");
     assert!(stderr.contains("mkdir"), "stderr = {stderr:?}");
 }
+
+#[test]
+fn dash_p_creates_intermediate_parents() {
+    let dir = scratch_dir("dash-p-parents");
+    let target = dir.join("a").join("b").join("c");
+
+    let out = Command::new(MKDIR)
+        .arg("-p")
+        .arg(&target)
+        .output()
+        .expect("spawn mkdir");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert!(dir.join("a").is_dir(), "a should exist");
+    assert!(dir.join("a").join("b").is_dir(), "a/b should exist");
+    assert!(target.is_dir(), "{} should exist", target.display());
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_p_is_idempotent_on_existing_dir() {
+    let dir = scratch_dir("dash-p-idempotent");
+    let target = dir.join("already").join("there");
+    fs::create_dir_all(&target).expect("pre-create target");
+
+    let out = Command::new(MKDIR)
+        .arg("-p")
+        .arg(&target)
+        .output()
+        .expect("spawn mkdir");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert!(target.is_dir(), "{} should still exist", target.display());
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_p_with_multiple_paths() {
+    let dir = scratch_dir("dash-p-multi");
+    let first = dir.join("a").join("b");
+    let second = dir.join("c").join("d");
+
+    let out = Command::new(MKDIR)
+        .arg("-p")
+        .arg(&first)
+        .arg(&second)
+        .output()
+        .expect("spawn mkdir");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    assert!(dir.join("a").is_dir(), "a should exist");
+    assert!(first.is_dir(), "{} should exist", first.display());
+    assert!(dir.join("c").is_dir(), "c should exist");
+    assert!(second.is_dir(), "{} should exist", second.display());
+    cleanup(&dir);
+}
+
+#[test]
+fn unknown_flag_exits_two() {
+    let out = Command::new(MKDIR)
+        .arg("-x")
+        .arg("foo")
+        .output()
+        .expect("spawn mkdir");
+
+    assert_eq!(out.status.code(), Some(2), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag"), "stderr = {stderr:?}");
+    assert!(stderr.contains("-x"), "stderr = {stderr:?}");
+}
