@@ -18,6 +18,9 @@
 //!   settings set-theme <name>             # write theme.name to /etc/preferences.toml
 //!   settings set-theme <name> --config <path>
 //!                                         # write theme.name to <path> (test hook)
+//!   settings set-wallpaper <value>        # write wallpaper.name to /etc/preferences.toml
+//!   settings set-wallpaper <value> --config <path>
+//!                                         # write wallpaper.name to <path> (test hook)
 //!
 //! Deferred T192 scope: `/proc/version` (procfs emits a placeholder
 //! line today and is not yet a stable source) and `/proc/storage`
@@ -26,7 +29,11 @@
 //! Deferred T184 scope: valid-theme allow-list. `set-theme` accepts
 //! any non-empty string; the GUI will enforce the allow-list when it
 //! ships. Empty strings are rejected so the TOML round-trip cannot
-//! silently erase the field.
+//! silently erase the field. `set-wallpaper` writes the
+//! `wallpaper.name` field — the only field on the `[wallpaper]`
+//! section in the v1 schema (see `crates/preferences/src/lib.rs`
+//! T183 schema). A future `set-wallpaper-color` slice can land if
+//! the schema gains a colour field.
 
 use std::process::ExitCode;
 
@@ -50,6 +57,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("about") => run_about(&args[1..]),
         Some("set-theme") => run_set_theme(&args[1..]),
+        Some("set-wallpaper") => run_set_wallpaper(&args[1..]),
         _ => run_preferences(args.first().map(String::as_str).unwrap_or(DEFAULT_CONFIG)),
     }
 }
@@ -235,6 +243,97 @@ fn run_set_theme(rest: &[String]) -> ExitCode {
     // Mode 0o644 is left to the kernel VFS default; std::fs on the
     // host cannot set Unix permissions portably and the kernel
     // ignores host permission bits.
+
+    ExitCode::from(0)
+}
+
+/// `set-wallpaper <value> [--config <path>]` — read-modify-write
+/// `wallpaper.name` on the preferences file, preserving every other
+/// field.
+///
+/// `wallpaper.name` is the only field on the `[wallpaper]` section
+/// in the v1 schema (see `crates/preferences/src/lib.rs`), so
+/// `set-wallpaper <value>` writes that field directly — no
+/// disambiguation needed today. If the schema later grows a
+/// `wallpaper.color`, that will land as a separate
+/// `set-wallpaper-color` subcommand to keep argv parsing flat.
+fn run_set_wallpaper(rest: &[String]) -> ExitCode {
+    let mut value: Option<&str> = None;
+    let mut config_path: &str = DEFAULT_CONFIG;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--config" => {
+                let Some(next) = rest.get(i + 1) else {
+                    eprintln!("settings: set-wallpaper: --config requires a path argument");
+                    return ExitCode::from(1);
+                };
+                config_path = next.as_str();
+                i += 2;
+            }
+            other => {
+                if value.is_none() {
+                    value = Some(other);
+                    i += 1;
+                } else {
+                    eprintln!("settings: set-wallpaper: unexpected argument {:?}", other);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    }
+
+    let Some(value) = value else {
+        eprintln!("settings: set-wallpaper: usage: set-wallpaper <value>");
+        return ExitCode::from(1);
+    };
+
+    if value.is_empty() {
+        eprintln!("settings: set-wallpaper: wallpaper value must be non-empty");
+        return ExitCode::from(1);
+    }
+
+    if value.contains('"') || value.contains('\n') {
+        eprintln!(
+            "settings: set-wallpaper: wallpaper value must not contain quotes or newlines"
+        );
+        return ExitCode::from(1);
+    }
+
+    let mut prefs = match std::fs::read(config_path) {
+        Ok(bytes) => match preferences::Preferences::parse(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "settings: set-wallpaper: failed to parse {}: {:?}",
+                    config_path, e
+                );
+                return ExitCode::from(1);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            preferences::Preferences::empty()
+        }
+        Err(e) => {
+            eprintln!(
+                "settings: set-wallpaper: failed to open {}: {}",
+                config_path, e
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    prefs.wallpaper_name = Some(value.to_string());
+
+    let serialised = serialise_preferences(&prefs);
+
+    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+        eprintln!(
+            "settings: set-wallpaper: failed to write {}: {}",
+            config_path, e
+        );
+        return ExitCode::from(1);
+    }
 
     ExitCode::from(0)
 }

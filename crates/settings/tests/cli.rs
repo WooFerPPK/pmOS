@@ -368,3 +368,166 @@ fn set_theme_invalid_toml_exits_one() {
         "stderr should explain failure: {stderr:?}"
     );
 }
+
+#[test]
+fn set_wallpaper_writes_new_value_to_fresh_config() {
+    let path = temp_file("set-wallpaper-fresh");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-wallpaper", "mountains.png", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-wallpaper");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    assert!(
+        written.contains("[wallpaper]"),
+        "written config should contain [wallpaper] section: {written:?}"
+    );
+    assert!(
+        written.contains("name = \"mountains.png\""),
+        "written config should contain wallpaper name = mountains.png: {written:?}"
+    );
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_wallpaper_preserves_other_fields() {
+    let original = b"[theme]\n\
+        name = \"light\"\n\
+        fit  = \"stretch\"\n\
+        \n\
+        [wallpaper]\n\
+        name = \"sunset.png\"\n\
+        \n\
+        [keyboard]\n\
+        layout = \"us-qwerty\"\n\
+        \n\
+        [timezone]\n\
+        iana = \"America/New_York\"\n\
+        \n\
+        [terminal]\n\
+        font = \"unifont-mono-14.pbm\"\n";
+    let path = write_temp("set-wallpaper-preserve", original);
+
+    let out = Command::new(SETTINGS)
+        .args(["set-wallpaper", "mountains.png", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-wallpaper");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read(&path).expect("read written config");
+    let prefs = preferences::Preferences::parse(&written)
+        .expect("written config must round-trip through parse");
+
+    assert_eq!(prefs.theme_name.as_deref(), Some("light"));
+    assert_eq!(prefs.theme_fit.as_deref(), Some("stretch"));
+    assert_eq!(prefs.wallpaper_name.as_deref(), Some("mountains.png"));
+    assert_eq!(prefs.keyboard_layout.as_deref(), Some("us-qwerty"));
+    assert_eq!(prefs.timezone_iana.as_deref(), Some("America/New_York"));
+    assert_eq!(prefs.terminal_font.as_deref(), Some("unifont-mono-14.pbm"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_wallpaper_overwrites_existing_value() {
+    let path = write_temp(
+        "set-wallpaper-overwrite",
+        b"[wallpaper]\nname = \"sunset.png\"\n",
+    );
+
+    let out = Command::new(SETTINGS)
+        .args(["set-wallpaper", "mountains.png", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-wallpaper");
+
+    assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
+
+    let written = fs::read_to_string(&path).expect("read written config");
+    let new_occurrences = written.matches("\"mountains.png\"").count();
+    let old_occurrences = written.matches("\"sunset.png\"").count();
+    let section_occurrences = written.matches("[wallpaper]").count();
+    assert_eq!(
+        new_occurrences, 1,
+        "wallpaper.name = mountains.png should appear exactly once: {written:?}"
+    );
+    assert_eq!(
+        old_occurrences, 0,
+        "old wallpaper.name = sunset.png should be gone: {written:?}"
+    );
+    assert_eq!(
+        section_occurrences, 1,
+        "[wallpaper] section should appear exactly once: {written:?}"
+    );
+
+    let prefs = preferences::Preferences::parse(written.as_bytes())
+        .expect("written config round-trips");
+    assert_eq!(prefs.wallpaper_name.as_deref(), Some("mountains.png"));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn set_wallpaper_missing_value_arg_exits_one_with_usage() {
+    let path = temp_file("set-wallpaper-missing");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-wallpaper", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-wallpaper missing");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("usage:"),
+        "stderr should contain 'usage:': {stderr:?}"
+    );
+    assert!(
+        stderr.contains("set-wallpaper"),
+        "stderr should mention set-wallpaper: {stderr:?}"
+    );
+}
+
+#[test]
+fn set_wallpaper_empty_value_exits_one() {
+    let path = temp_file("set-wallpaper-empty");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-wallpaper", "", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-wallpaper empty");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("set-wallpaper"),
+        "stderr should mention set-wallpaper: {stderr:?}"
+    );
+}
+
+#[test]
+fn set_wallpaper_rejects_value_with_quote() {
+    let path = temp_file("set-wallpaper-quote");
+
+    let out = Command::new(SETTINGS)
+        .args(["set-wallpaper", "bad\"name.png", "--config"])
+        .arg(&path)
+        .output()
+        .expect("spawn settings set-wallpaper quote");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("quotes") || stderr.contains("newlines"),
+        "stderr should explain illegal char: {stderr:?}"
+    );
+}
