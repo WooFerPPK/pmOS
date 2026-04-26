@@ -11,8 +11,10 @@ import {
   packKbdEvent,
   packMouseButton,
   packMouseMotion,
+  packMouseWheel,
   unpackKbdEvent,
   unpackMouseEvent,
+  unpackMouseWheel,
 } from "../../src/shared/input-proto";
 
 describe("mouse event packing", () => {
@@ -119,5 +121,46 @@ describe("keyboard event packing", () => {
     const view = new DataView(bytes.buffer);
     view.setUint32(4, 99, true);
     expect(unpackKbdEvent(bytes)).toBeNull();
+  });
+});
+
+// ---- mouse wheel events ---------------------------------------------
+
+describe("mouse wheel event packing (T082)", () => {
+  it("packs a wheel event at exactly MOUSE_EVENT_SIZE bytes", () => {
+    const bytes = packMouseWheel(100, 50, 0, -3);
+    expect(bytes.byteLength).toBe(MOUSE_EVENT_SIZE);
+  });
+
+  it("round-trips position + deltas through pack + unpackMouseWheel", () => {
+    const bytes = packMouseWheel(42, -7, 1, -10);
+    const decoded = unpackMouseWheel(bytes);
+    expect(decoded).not.toBeNull();
+    if (!decoded) return;
+    expect(decoded.kind).toBe(MouseEventKind.Wheel);
+    expect(decoded.x).toBe(42);
+    expect(decoded.y).toBe(-7);
+    expect(decoded.deltaX).toBe(1);
+    expect(decoded.deltaY).toBe(-10);
+  });
+
+  it("returns null when the bytes carry a non-wheel discriminant", () => {
+    const bytes = packMouseMotion(0, 0);
+    expect(unpackMouseWheel(bytes)).toBeNull();
+  });
+
+  it("returns null for a truncated payload", () => {
+    const bytes = packMouseWheel(0, 0, 0, 0);
+    expect(unpackMouseWheel(bytes.subarray(0, 12))).toBeNull();
+  });
+
+  it("unpackMouseEvent recognises the wheel discriminant", () => {
+    const bytes = packMouseWheel(10, 20, 0, 5);
+    const decoded = unpackMouseEvent(bytes);
+    expect(decoded).not.toBeNull();
+    if (!decoded) return;
+    expect(decoded.kind).toBe(MouseEventKind.Wheel);
+    expect(decoded.x).toBe(10);
+    expect(decoded.y).toBe(20);
   });
 });

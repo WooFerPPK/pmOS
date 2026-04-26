@@ -26,6 +26,12 @@ export const MouseEventKind = {
   Motion: 0,
   /** A mouse button was pressed or released at (x, y). */
   Button: 1,
+  /** Wheel scrolled by `(button, state)` reinterpreted as
+   *  `(deltaX, deltaY)` — see `packMouseWheel`. v1 reserves
+   *  this discriminant for the wheel-scroll path the
+   *  display server's window manager will route to focus
+   *  windows. */
+  Wheel: 2,
 } as const;
 
 export type MouseEventKindValue =
@@ -74,6 +80,59 @@ export function packMouseButton(
   return packMouseEvent(MouseEventKind.Button, x, y, button, state);
 }
 
+/**
+ * Pack a wheel-scroll event as `MOUSE_EVENT_SIZE` bytes.
+ *
+ * The wire reuses the existing five-field shape rather than
+ * widening the struct: `button` carries `deltaX` (signed) and
+ * `state` carries `deltaY` (signed) reinterpreted through their
+ * u32 binary form. Unpacking via `unpackMouseEvent` uses
+ * [`MouseEventKind.Wheel`] as the discriminant; the wheel-aware
+ * decoder is `unpackMouseWheel` below.
+ */
+export function packMouseWheel(
+  x: number,
+  y: number,
+  deltaX: number,
+  deltaY: number,
+): Uint8Array {
+  const out = new Uint8Array(MOUSE_EVENT_SIZE);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, MouseEventKind.Wheel, true);
+  view.setInt32(4, x, true);
+  view.setInt32(8, y, true);
+  view.setInt32(12, deltaX, true);
+  view.setInt32(16, deltaY, true);
+  return out;
+}
+
+/** Decoded wheel event with deltas instead of button/state. */
+export interface WheelEvent {
+  readonly kind: typeof MouseEventKind.Wheel;
+  readonly x: number;
+  readonly y: number;
+  readonly deltaX: number;
+  readonly deltaY: number;
+}
+
+/**
+ * Decode a wheel event. Returns null if the bytes don't carry
+ * a wheel discriminant or the buffer is too short.
+ */
+export function unpackMouseWheel(bytes: Uint8Array): WheelEvent | null {
+  if (bytes.byteLength < MOUSE_EVENT_SIZE) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const kind = view.getUint32(0, true);
+  if (kind !== MouseEventKind.Wheel) return null;
+  return {
+    kind: MouseEventKind.Wheel,
+    x: view.getInt32(4, true),
+    y: view.getInt32(8, true),
+    deltaX: view.getInt32(12, true),
+    deltaY: view.getInt32(16, true),
+  };
+}
+
 function packMouseEvent(
   kind: MouseEventKindValue,
   x: number,
@@ -102,8 +161,30 @@ export function unpackMouseEvent(bytes: Uint8Array): MouseEvent | null {
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const kind = view.getUint32(0, true);
-  if (kind !== MouseEventKind.Motion && kind !== MouseEventKind.Button) {
+  if (
+    kind !== MouseEventKind.Motion &&
+    kind !== MouseEventKind.Button &&
+    kind !== MouseEventKind.Wheel
+  ) {
     return null;
+  }
+  // Wheel events carry signed deltas in the button/state slots,
+  // not button-press semantics; callers that need deltas should
+  // use `unpackMouseWheel` instead. Returning the wheel
+  // discriminant via `unpackMouseEvent` is harmless for
+  // motion/button-only consumers since they branch on `kind`.
+  if (kind === MouseEventKind.Wheel) {
+    return {
+      kind: kind as MouseEventKindValue,
+      x: view.getInt32(4, true),
+      y: view.getInt32(8, true),
+      // `button` reinterprets `deltaX` u32-bits as a u32; tests
+      // that use unpackMouseEvent on a wheel will see the raw
+      // bits, which is fine because they're expected to use
+      // unpackMouseWheel anyway.
+      button: view.getUint32(12, true),
+      state: MouseButtonState.Released,
+    };
   }
   const x = view.getInt32(4, true);
   const y = view.getInt32(8, true);
