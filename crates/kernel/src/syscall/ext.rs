@@ -967,14 +967,22 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     };
     match kernel.proc_kill(pid, target_pid, signal) {
         Ok(()) => {
-            // Slice 2b: SIGTERM additionally interrupts any parked
-            // ipc_accept on the target with -EINTR. Runs AFTER the
-            // signal-inbox delivery inside `Kernel::proc_kill` so
-            // userland draining fd 3 on the EINTR wake finds Term
-            // queued. Other catchable signals (Interrupt, Pipe,
-            // Child) don't interrupt parks in v1 — deferred until
-            // a caller needs them (design §2 non-goal).
-            if signal == Signal::Term {
+            // SIGTERM and SIGINT additionally interrupt any parked
+            // accept / wait / recv on the target with -EINTR. Runs
+            // AFTER the signal-inbox delivery inside
+            // `Kernel::proc_kill` so userland draining fd 3 on the
+            // EINTR wake finds the signal queued. Both signals are
+            // POSIX-canonical interrupters of blocking syscalls
+            // (SIGTERM = "please shut down", SIGINT = ctrl-c). The
+            // other catchable signals (Pipe, Child) don't interrupt
+            // parks: Pipe is a write-side notification with no
+            // analogue in POSIX read-blocked-syscall interruption
+            // semantics, and Child is a child-exit notification
+            // delivered TO the parent — interrupting a parent's
+            // unrelated park on Child arrival would be surprising
+            // (POSIX leaves SIGCHLD's blocking-syscall interruption
+            // gated by SA_RESTART, which v1 doesn't model).
+            if signal == Signal::Term || signal == Signal::Interrupt {
                 let _ = kernel.interrupt_parked_accept(target_pid);
                 let _ = kernel.interrupt_parked_wait(target_pid);
                 let _ = kernel.interrupt_parked_recv(target_pid);
