@@ -1735,3 +1735,285 @@ fn dash_kd_combines_field_and_dictionary() {
     );
     cleanup(&dir);
 }
+
+// ---------- -V version sort ----------
+
+#[test]
+fn dash_V_sorts_versions_naturally() {
+    let dir = scratch_dir("V_basic");
+    let path = write_file(&dir, "in.txt", b"file1\nfile10\nfile2\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"file1\nfile2\nfile10\n",
+        "version sort: file2 < file10 (numeric digit-run compare)"
+    );
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_handles_multi_segment_versions() {
+    let dir = scratch_dir("V_multi");
+    let path = write_file(&dir, "in.txt", b"1.0.10\n1.0.2\n1.0.1\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"1.0.1\n1.0.2\n1.0.10\n",
+        "semver-style: each digit run compared numerically"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_compares_digit_runs_numerically() {
+    let dir = scratch_dir("V_digits");
+    let path = write_file(&dir, "in.txt", b"v1.2\nv1.10\nv1.1\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"v1.1\nv1.2\nv1.10\n",
+        "digit runs compare as integers, not bytes"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_leading_zero_tiebreak() {
+    let dir = scratch_dir("V_zeros");
+    let path = write_file(&dir, "in.txt", b"01\n1\n001\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"1\n01\n001\n",
+        "tiebreak rule: equal-value digit runs sort by SHORTER REPRESENTATION FIRST (fewer leading zeros first)"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_pure_text_falls_back_to_lex() {
+    let dir = scratch_dir("V_text");
+    let path = write_file(&dir, "in.txt", b"banana\napple\ncherry\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"apple\nbanana\ncherry\n",
+        "no digit runs: every position is non-digit, so byte-order lex sort"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_pure_digits_compares_numerically() {
+    let dir = scratch_dir("V_pure_digits");
+    let path = write_file(&dir, "in.txt", b"100\n2\n10\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"2\n10\n100\n",
+        "single digit-run per line: numeric compare (2 < 10 < 100)"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_combines_with_reverse() {
+    let dir = scratch_dir("Vr");
+    let path = write_file(&dir, "in.txt", b"file1\nfile10\nfile2\n");
+
+    let out = Command::new(SORT)
+        .arg("-Vr")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"file10\nfile2\nfile1\n",
+        "version sort then reverse: file10 > file2 > file1"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_combines_with_unique() {
+    let dir = scratch_dir("Vu");
+    let path = write_file(&dir, "in.txt", b"file1\nfile1\nfile2\nfile10\n");
+
+    let out = Command::new(SORT)
+        .arg("-Vu")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"file1\nfile2\nfile10\n",
+        "duplicate file1 collapses; version order preserved"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_combines_with_check() {
+    let v_sorted_input: &[u8] = b"file1\nfile2\nfile10\n";
+    let vc = run_check(&["-Vc"], v_sorted_input);
+    assert!(
+        vc.status.success(),
+        "exit status: {:?}, stderr: {:?}",
+        vc.status,
+        String::from_utf8_lossy(&vc.stderr)
+    );
+    assert!(vc.stderr.is_empty());
+
+    let plain_c = run_check(&["-c"], v_sorted_input);
+    assert_eq!(
+        plain_c.status.code(),
+        Some(1),
+        "plain -c on version-sorted (but lex-disordered) input must FAIL: file2 > file10 lexically"
+    );
+    let stderr = String::from_utf8_lossy(&plain_c.stderr);
+    assert!(stderr.contains("disorder"), "stderr = {stderr:?}");
+}
+
+#[test]
+fn dash_V_with_field_key() {
+    let dir = scratch_dir("V_field");
+    let path = write_file(&dir, "in.txt", b"alpha file10\nbravo file2\ncharlie file1\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg("-k")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"charlie file1\nbravo file2\nalpha file10\n",
+        "version compare on field 2: file1 < file2 < file10"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_Vn_numeric_dominates() {
+    let dir = scratch_dir("Vn_dominates");
+    let path = write_file(&dir, "in.txt", b"file10\nfile2\nfile1\n");
+
+    let vn = Command::new(SORT)
+        .arg("-Vn")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    let n_only = Command::new(SORT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(vn.status.success(), "exit status: {:?}", vn.status);
+    assert!(n_only.status.success(), "exit status: {:?}", n_only.status);
+    assert_eq!(
+        vn.stdout, n_only.stdout,
+        "-Vn must equal -n alone: numeric flag dominates over version sort (key_for checks numeric first)"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_overflow_falls_back_to_lex() {
+    let dir = scratch_dir("V_overflow");
+    let huge_a = "9".repeat(25);
+    let huge_b = "1".repeat(25);
+    let input = format!("{huge_a}\n{huge_b}\n");
+    let path = write_file(&dir, "in.txt", input.as_bytes());
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(
+        out.status.success(),
+        "exit status: {:?}, stderr: {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = format!("{huge_b}\n{huge_a}\n");
+    assert_eq!(
+        out.stdout,
+        expected.as_bytes(),
+        "digit runs > 20 chars overflow u64; fall back to byte-order lex compare ('1...' < '9...')"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_V_combines_with_fold() {
+    let dir = scratch_dir("Vf");
+    let path = write_file(&dir, "in.txt", b"FILE2\nfile10\nFile1\n");
+
+    let out = Command::new(SORT)
+        .arg("-V")
+        .arg("-f")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"File1\nFILE2\nfile10\n",
+        "case-fold then version compare: File1 < FILE2 < file10 case-insensitively"
+    );
+    cleanup(&dir);
+}

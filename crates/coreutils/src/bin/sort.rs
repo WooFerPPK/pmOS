@@ -139,6 +139,50 @@
 //! sort options like `-k 2n,3` (per-key flag overrides); `-t SEP` custom
 //! field separator (currently hardcoded to whitespace); `--key=` long
 //! form alias.
+//! `-V` version sort (POSIX `--version-sort` long form deferred): walks
+//! both compared strings simultaneously, classifying each position as a
+//! digit run (consecutive `[0-9]`) or a non-digit run (everything else),
+//! and compares run-by-run. Digit runs parse to `u64` and compare
+//! numerically so `file2` < `file10` < `file100` (the canonical use case
+//! that lex sort gets wrong: lex puts `file10` < `file2` because the byte
+//! `1` precedes byte `2`). Non-digit runs compare lex (byte-order ASCII).
+//! Equal-value digit-run tiebreak: the run with FEWER characters
+//! (i.e. fewer leading zeros) sorts FIRST — `001` < `01` < `1` since they
+//! all parse to value 1 but the shorter representation wins; this matches
+//! the GNU convention. When the two cursors land on different run TYPES
+//! (one digit, one non-digit), the v1 simplification compares byte-order
+//! on the first differing byte (matches GNU output for plain ASCII inputs
+//! without needing the full GNU algorithm). Equal common prefix: the
+//! shorter string sorts first. `version_compare` is the dedicated helper;
+//! a third `Key::Version(String)` variant carries the raw string and
+//! delegates `cmp` to `version_compare` (the `Ord` derive walks variant
+//! tags first then payloads, so `Numeric` < `Bytes` < `Version` for
+//! cross-variant comparisons — never expected to occur because a single
+//! sort run picks ONE key kind for every line). Numeric overflow: if a
+//! digit run is longer than 20 chars (u64 max is 20 digits) the parse
+//! falls back to lex compare for THAT run pair (no panic, safe semantic
+//! for pathological inputs — pinned by `dash_V_overflow_falls_back_to_lex`).
+//! Composition: `-V` dispatches AFTER `-n` (numeric dominates — `-Vn`
+//! and `-nV` both produce numeric sort, pinned by
+//! `dash_Vn_numeric_dominates`) but BEFORE the filter / fold / blanks
+//! paths (since version_compare consumes the raw string as one indivisible
+//! unit — running the dictionary or printable filter on it first would
+//! drop the very dots/dashes that delimit version segments). `-Vr`
+//! reverses the version-sorted order; `-Vu` dedupes by version-key
+//! (two strings that compare equal under version sort collapse); `-Vc` /
+//! `-VC` checks the input is in version order; `-V -k N` sorts by the
+//! version comparator on the Nth field; `-V -f` is allowed and case-folds
+//! the raw string before version_compare runs (digit runs are unaffected
+//! by case-fold so the numeric compare path is identical; only the
+//! non-digit runs see the fold). Explicitly deferred (out of slice scope,
+//! future `-V` follow-ups): the full GNU file-extension special case
+//! (e.g. `foo.tar.gz` vs `foo.tar.bz2` where GNU treats `.gz` and `.bz2`
+//! as suffix metadata sorted last); locale-aware non-digit compare (v1
+//! stays C / POSIX locale = byte-order); the `--version-sort` long-form
+//! alias; the `~` (tilde) Debian-version special case where `~` sorts
+//! BEFORE everything (so `0.9~rc1` < `0.9` < `1.0`); BigInt /
+//! arbitrary-precision digit-run support (overflow falls back to lex per
+//! spec above, no extension to u128 in v1).
 //! Unknown flags write `sort: unknown flag: <flag>` to stderr and
 //! exit 2 (matching grep's open-error/usage exit code).
 //!
@@ -160,6 +204,7 @@ fn main() -> ExitCode {
     let mut ignore_blanks = false;
     let mut ignore_nonprinting = false;
     let mut dictionary_order = false;
+    let mut version_sort = false;
     let mut output: Option<String> = None;
     let mut key_field: Option<usize> = None;
     let mut paths: Vec<String> = Vec::new();
@@ -188,6 +233,7 @@ fn main() -> ExitCode {
                     'b' => ignore_blanks = true,
                     'i' => ignore_nonprinting = true,
                     'd' => dictionary_order = true,
+                    'V' => version_sort = true,
                     'o' => {
                         let value = if ci < cluster.len() {
                             let rest: String = cluster[ci..].iter().collect();
@@ -283,6 +329,7 @@ fn main() -> ExitCode {
             ignore_nonprinting,
             dictionary_order,
             key_field,
+            version_sort,
             reverse,
             unique,
             silent_check,
@@ -299,10 +346,13 @@ fn main() -> ExitCode {
                 ignore_nonprinting,
                 dictionary_order,
                 key_field,
+                version_sort,
             )
         });
     } else if numeric {
         lines.sort_by_key(|line| parse_leading_int(line));
+    } else if version_sort {
+        lines.sort_by_key(|line| Key::Version(maybe_fold_for_version(line, fold)));
     } else if dictionary_order {
         lines.sort_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
     } else if ignore_nonprinting {
@@ -328,10 +378,13 @@ fn main() -> ExitCode {
                     ignore_nonprinting,
                     dictionary_order,
                     key_field,
+                    version_sort,
                 )
             });
         } else if numeric {
             lines.dedup();
+        } else if version_sort {
+            lines.dedup_by_key(|line| Key::Version(maybe_fold_for_version(line, fold)));
         } else if dictionary_order {
             lines.dedup_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
         } else if ignore_nonprinting {
@@ -374,10 +427,31 @@ fn main() -> ExitCode {
     if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq)]
 enum Key {
     Numeric(i64),
     Bytes(Vec<u8>),
+    Version(String),
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Key::Numeric(a), Key::Numeric(b)) => a.cmp(b),
+            (Key::Bytes(a), Key::Bytes(b)) => a.cmp(b),
+            (Key::Version(a), Key::Version(b)) => version_compare(a, b),
+            (Key::Numeric(_), _) => std::cmp::Ordering::Less,
+            (_, Key::Numeric(_)) => std::cmp::Ordering::Greater,
+            (Key::Bytes(_), _) => std::cmp::Ordering::Less,
+            (_, Key::Bytes(_)) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 fn key_for(
@@ -388,6 +462,7 @@ fn key_for(
     ignore_nonprinting: bool,
     dictionary_order: bool,
     key_field: Option<usize>,
+    version_sort: bool,
 ) -> Key {
     let base: &str = match key_field {
         Some(n) => select_field(line, n),
@@ -395,6 +470,8 @@ fn key_for(
     };
     if numeric {
         Key::Numeric(parse_leading_int(base))
+    } else if version_sort {
+        Key::Version(maybe_fold_for_version(base, fold))
     } else if dictionary_order {
         Key::Bytes(filter_dictionary_then_maybe_fold(base, ignore_blanks, fold))
     } else if ignore_nonprinting {
@@ -421,6 +498,7 @@ fn check_sorted(
     ignore_nonprinting: bool,
     dictionary_order: bool,
     key_field: Option<usize>,
+    version_sort: bool,
     reverse: bool,
     unique: bool,
     silent: bool,
@@ -435,6 +513,7 @@ fn check_sorted(
             ignore_nonprinting,
             dictionary_order,
             key_field,
+            version_sort,
         );
         let curr = key_for(
             &lines[i],
@@ -444,6 +523,7 @@ fn check_sorted(
             ignore_nonprinting,
             dictionary_order,
             key_field,
+            version_sort,
         );
         let ord = prev.cmp(&curr);
         let violation = match (reverse, unique) {
@@ -533,6 +613,85 @@ fn filter_dictionary_then_maybe_fold(line: &str, ignore_blanks: bool, fold: bool
     } else {
         filtered
     }
+}
+
+fn maybe_fold_for_version(line: &str, fold: bool) -> String {
+    if fold {
+        line.bytes()
+            .map(|b| if b.is_ascii_lowercase() { b - 32 } else { b })
+            .map(char::from)
+            .collect()
+    } else {
+        line.to_string()
+    }
+}
+
+fn version_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < ab.len() && j < bb.len() {
+        let a_is_digit = ab[i].is_ascii_digit();
+        let b_is_digit = bb[j].is_ascii_digit();
+        if a_is_digit && b_is_digit {
+            let a_end = digit_run_end(ab, i);
+            let b_end = digit_run_end(bb, j);
+            let a_run = &ab[i..a_end];
+            let b_run = &bb[j..b_end];
+            let av = parse_u64_run(a_run);
+            let bv = parse_u64_run(b_run);
+            match (av, bv) {
+                (Some(av), Some(bv)) => {
+                    let value_ord = av.cmp(&bv);
+                    if value_ord != Ordering::Equal {
+                        return value_ord;
+                    }
+                    let len_ord = a_run.len().cmp(&b_run.len());
+                    if len_ord != Ordering::Equal {
+                        return len_ord;
+                    }
+                }
+                _ => {
+                    let lex_ord = a_run.cmp(b_run);
+                    if lex_ord != Ordering::Equal {
+                        return lex_ord;
+                    }
+                }
+            }
+            i = a_end;
+            j = b_end;
+        } else {
+            let byte_ord = ab[i].cmp(&bb[j]);
+            if byte_ord != Ordering::Equal {
+                return byte_ord;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    ab.len().cmp(&bb.len())
+}
+
+fn digit_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut k = start;
+    while k < bytes.len() && bytes[k].is_ascii_digit() {
+        k += 1;
+    }
+    k
+}
+
+fn parse_u64_run(run: &[u8]) -> Option<u64> {
+    if run.len() > 20 {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &b in run {
+        let digit = u64::from(b - b'0');
+        value = value.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(value)
 }
 
 fn parse_leading_int(s: &str) -> i64 {
