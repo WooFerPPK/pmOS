@@ -561,6 +561,8 @@ fn handle_proc_raise(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let signal = match signum {
         2 => Signal::Interrupt,
         9 => Signal::Kill,
+        10 => Signal::User1,
+        12 => Signal::User2,
         13 => Signal::Pipe,
         15 => Signal::Term,
         17 => Signal::Child,

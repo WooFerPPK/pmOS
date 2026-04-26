@@ -2597,6 +2597,418 @@ fn sigchld_does_not_interrupt_parked_recv() {
     assert_eq!(drained, alloc::vec![Signal::Child]);
 }
 
+// ---------- SIGUSR1/SIGUSR2 ----------
+//
+// User-defined signals: POSIX reserves SIGUSR1 (signum 10) and
+// SIGUSR2 (signum 12) for application-specific meanings. v1
+// routes both through the same inbox-delivery path as SIGTERM/
+// SIGINT/SIGPIPE/SIGCHLD: `Kernel::proc_kill` posts the variant
+// to the target's `SignalInbox`, and the dispatcher's catchable-
+// signal arm leaves them OUT of the {Term, Interrupt} interrupt
+// set (POSIX gates user-signal interruption of blocking syscalls
+// behind SA_RESTART, which v1 doesn't model — the safe default
+// is "deliver to inbox, don't disturb the parked syscall"). These
+// tests pin both halves of that contract.
+
+#[test]
+fn sigusr1_lands_on_inbox_via_proc_kill() {
+    // PROC_KILL(child, 10) → SIGUSR1 on the target's inbox; the
+    // target stays Ready (User1 is catchable, no zombify).
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "usr1-target");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 0xe200,
+        args: proc_kill_args(child, 10),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+    assert_eq!(
+        k.procs.get(child).unwrap().state,
+        kernel::proc::ProcState::Ready,
+    );
+    let drained = k.drain_signals(child).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::User1]);
+}
+
+#[test]
+fn sigusr2_lands_on_inbox_via_proc_kill() {
+    // PROC_KILL(child, 12) → SIGUSR2 on the target's inbox.
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "usr2-target");
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 0xe201,
+        args: proc_kill_args(child, 12),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(k.pending_signals(child).unwrap(), 1);
+    assert_eq!(
+        k.procs.get(child).unwrap().state,
+        kernel::proc::ProcState::Ready,
+    );
+    let drained = k.drain_signals(child).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::User2]);
+}
+
+#[test]
+fn sigusr1_does_not_interrupt_parked_recv() {
+    // SIGUSR1 (10) is a user-defined signal — POSIX gates user-
+    // signal interruption of blocking syscalls behind SA_RESTART
+    // (or its inverse), which v1 doesn't model. Dispatcher's
+    // catchable-signal arm leaves User1 out of the {Term,
+    // Interrupt} interrupt set: the parker stays asleep while
+    // the inbox observes the signal.
+    use abi::cap::{initial, Cap, CapSet};
+    let mut k = make_kernel();
+
+    let init = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs.transition(init, ProcState::Running).unwrap();
+
+    let a_caps = CapSet::from_caps(&[Cap::DisplayClient]);
+    let a = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "server",
+            ppid: init,
+            caps: a_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(a).unwrap();
+    k.procs.transition(a, ProcState::Running).unwrap();
+
+    let b = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "client",
+            ppid: init,
+            caps: a_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(b).unwrap();
+    k.procs.transition(b, ProcState::Running).unwrap();
+
+    let (_b_fd, a_conn) =
+        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-usr1", 870);
+
+    let req_id = 0xe1d0u32;
+    let mut heap = vec![0u8; 64];
+    let outcome = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        a,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: req_id,
+            args: ipc_recv_args(a_conn, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(
+        outcome,
+        kernel::syscall::ServiceOutcome::Parked
+    ));
+
+    // init delivers SIGUSR1 (signum 10).
+    let mut kill_args = [0u8; 16];
+    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[4..6].copy_from_slice(&10u16.to_le_bytes());
+    let kill_resp = dispatch(
+        &mut k,
+        init,
+        &Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 871,
+            args: kill_args,
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(kill_resp.status, 0);
+
+    // Parker slot still populated, A still BlockedOnIpc — SIGUSR1
+    // is signalled but does NOT interrupt the park.
+    assert!(k.parked_recvers_contains(a));
+    assert_eq!(
+        k.procs.get(a).unwrap().state,
+        ProcState::BlockedOnIpc,
+    );
+
+    // No EINTR wake on A's request_id.
+    let wakes = k.pending_wakes_snapshot();
+    assert!(
+        !wakes.iter().any(|(pid, resp, _)| *pid == a
+            && resp.request_id == req_id),
+        "SIGUSR1 must not wake the parked recv",
+    );
+
+    // SIGUSR1 queued on A's inbox.
+    let drained = k.drain_signals(a).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::User1]);
+}
+
+#[test]
+fn sigusr2_does_not_interrupt_parked_recv() {
+    // SIGUSR2 (12) — same conservative inbox-only delivery as
+    // SIGUSR1; the parker stays asleep.
+    use abi::cap::{initial, Cap, CapSet};
+    let mut k = make_kernel();
+
+    let init = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    k.procs.transition(init, ProcState::Running).unwrap();
+
+    let a_caps = CapSet::from_caps(&[Cap::DisplayClient]);
+    let a = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "server",
+            ppid: init,
+            caps: a_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(a).unwrap();
+    k.procs.transition(a, ProcState::Running).unwrap();
+
+    let b = k
+        .register_process(kernel::sys::RegisterArgs {
+            name: "client",
+            ppid: init,
+            caps: a_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(b).unwrap();
+    k.procs.transition(b, ProcState::Running).unwrap();
+
+    let (_b_fd, a_conn) =
+        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-usr2", 880);
+
+    let req_id = 0xe1d1u32;
+    let mut heap = vec![0u8; 64];
+    let outcome = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        a,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: req_id,
+            args: ipc_recv_args(a_conn, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(
+        outcome,
+        kernel::syscall::ServiceOutcome::Parked
+    ));
+
+    let mut kill_args = [0u8; 16];
+    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[4..6].copy_from_slice(&12u16.to_le_bytes());
+    let kill_resp = dispatch(
+        &mut k,
+        init,
+        &Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 881,
+            args: kill_args,
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(kill_resp.status, 0);
+
+    assert!(k.parked_recvers_contains(a));
+    assert_eq!(
+        k.procs.get(a).unwrap().state,
+        ProcState::BlockedOnIpc,
+    );
+
+    let wakes = k.pending_wakes_snapshot();
+    assert!(
+        !wakes.iter().any(|(pid, resp, _)| *pid == a
+            && resp.request_id == req_id),
+        "SIGUSR2 must not wake the parked recv",
+    );
+
+    let drained = k.drain_signals(a).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::User2]);
+}
+
+#[test]
+fn sigusr1_to_unknown_pid_returns_esrch() {
+    // PROC_KILL(9999, 10) — no such pid → -ESRCH (mirror of the
+    // existing SIGTERM-on-unknown-pid contract; the signum
+    // doesn't change which errno arm fires).
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+
+    let req = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 0xe1d2,
+        args: proc_kill_args(9999, 10),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let mut heap = vec![0u8; 16];
+    let resp = dispatch(&mut k, init, &req, &mut heap);
+    assert_eq!(resp.status, -errno::ESRCH);
+}
+
+#[test]
+fn sigusr1_does_not_interrupt_parked_accept() {
+    // Display server parks on ipc_accept; SIGUSR1 delivered to
+    // it; listener stays parked, only the inbox observes the
+    // signal. Mirror of `sigpipe_does_not_interrupt_parked_recv`
+    // shape against the accept primitive — User1 falls into the
+    // same {Pipe, Child, User1, User2} non-interrupter set.
+    let mut k = make_kernel();
+    let ds = k
+        .register_process(RegisterArgs {
+            name: "display-server",
+            ppid: 0,
+            caps: abi::cap::initial::DISPLAY_SERVER,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(ds).unwrap();
+    k.procs.transition(ds, ProcState::Running).unwrap();
+    let listener_fd = k.display_bind(ds).unwrap();
+
+    let req_id = 0xe1d3u32;
+    k.park_on_accept(ds, listener_fd, req_id).unwrap();
+    assert_eq!(
+        k.procs.get(ds).unwrap().state,
+        ProcState::BlockedOnIpc,
+    );
+
+    // Self-deliver SIGUSR1 (sender == target — self-signal is
+    // POSIX-allowed without any cap).
+    let mut kill_args = [0u8; 16];
+    kill_args[0..4].copy_from_slice(&(ds as i32).to_le_bytes());
+    kill_args[4..6].copy_from_slice(&10u16.to_le_bytes());
+    let mut heap = vec![0u8; 16];
+    let kill_resp = dispatch(
+        &mut k,
+        ds,
+        &Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 890,
+            args: kill_args,
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(kill_resp.status, 0);
+
+    // Listener's parked_acceptor slot is still populated; ds is
+    // still BlockedOnIpc.
+    let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
+    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
+    assert!(listener.parked_acceptor.is_some());
+    assert_eq!(
+        k.procs.get(ds).unwrap().state,
+        ProcState::BlockedOnIpc,
+    );
+
+    // No EINTR wake on the parked-accept req_id.
+    let wakes = k.pending_wakes_snapshot();
+    assert!(
+        !wakes.iter().any(|(pid, resp, _)| *pid == ds
+            && resp.request_id == req_id),
+        "SIGUSR1 must not wake the parked accept",
+    );
+
+    // SIGUSR1 queued on ds's signal inbox.
+    let drained = k.drain_signals(ds).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::User1]);
+}
+
+#[test]
+fn sigusr1_and_sigusr2_are_distinct_in_inbox() {
+    // Deliver one of each to the same target; inbox observes
+    // both as distinct entries (SignalInbox coalesces the SAME
+    // variant, never different variants — User1 and User2 are
+    // separate enum variants with separate inbox slots).
+    let mut k = make_kernel();
+    let init = make_running_proc(&mut k, "init", 0);
+    let child = register_child(&mut k, init, "multi-usr");
+
+    let mut heap = vec![0u8; 16];
+    let r1 = dispatch(
+        &mut k,
+        init,
+        &Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 0xe1d4,
+            args: proc_kill_args(child, 10),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(r1.status, 0);
+    let r2 = dispatch(
+        &mut k,
+        init,
+        &Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 0xe1d5,
+            args: proc_kill_args(child, 12),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(r2.status, 0);
+
+    assert_eq!(k.pending_signals(child).unwrap(), 2);
+    let drained = k.drain_signals(child).unwrap();
+    assert_eq!(drained, alloc::vec![Signal::User1, Signal::User2]);
+}
+
 // ---- clock_time_get --------------------------------------------------
 
 #[test]

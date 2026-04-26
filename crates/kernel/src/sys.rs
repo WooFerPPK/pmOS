@@ -2285,7 +2285,12 @@ impl Kernel {
                     ExitStatus::Signaled(signal.number()),
                 );
             }
-            Signal::Term | Signal::Interrupt | Signal::Pipe | Signal::Child => {
+            Signal::Term
+            | Signal::Interrupt
+            | Signal::Pipe
+            | Signal::Child
+            | Signal::User1
+            | Signal::User2 => {
                 if let Some(inbox) = self.signal_inboxes.get_mut(&target_pid) {
                     inbox.post(signal);
                 }

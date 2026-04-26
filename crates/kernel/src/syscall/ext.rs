@@ -960,6 +960,8 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let signal = match signum {
         2 => Signal::Interrupt,
         9 => Signal::Kill,
+        10 => Signal::User1,
+        12 => Signal::User2,
         13 => Signal::Pipe,
         15 => Signal::Term,
         17 => Signal::Child,
@@ -967,21 +969,33 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     };
     match kernel.proc_kill(pid, target_pid, signal) {
         Ok(()) => {
-            // SIGTERM and SIGINT additionally interrupt any parked
-            // accept / wait / recv on the target with -EINTR. Runs
-            // AFTER the signal-inbox delivery inside
-            // `Kernel::proc_kill` so userland draining fd 3 on the
-            // EINTR wake finds the signal queued. Both signals are
-            // POSIX-canonical interrupters of blocking syscalls
-            // (SIGTERM = "please shut down", SIGINT = ctrl-c). The
-            // other catchable signals (Pipe, Child) don't interrupt
-            // parks: Pipe is a write-side notification with no
-            // analogue in POSIX read-blocked-syscall interruption
-            // semantics, and Child is a child-exit notification
-            // delivered TO the parent — interrupting a parent's
-            // unrelated park on Child arrival would be surprising
-            // (POSIX leaves SIGCHLD's blocking-syscall interruption
-            // gated by SA_RESTART, which v1 doesn't model).
+            // The catchable-signal interrupt set is {Term, Interrupt}.
+            // Both are POSIX-canonical interrupters of blocking syscalls
+            // (SIGTERM = "please shut down", SIGINT = ctrl-c) — they
+            // additionally fire `interrupt_parked_accept` /
+            // `interrupt_parked_wait` / `interrupt_parked_recv` on the
+            // target with -EINTR after the signal-inbox delivery inside
+            // `Kernel::proc_kill`, so userland draining fd 3 on the
+            // EINTR wake finds the signal queued.
+            //
+            // The non-interrupter set is {Pipe, Child, User1, User2} —
+            // these are inbox-only and leave any parked syscall asleep:
+            //
+            //   * Pipe is a write-side notification with no POSIX
+            //     analogue for interrupting blocking read syscalls.
+            //   * Child is a child-exit notification delivered TO the
+            //     parent — interrupting a parent's unrelated park on
+            //     Child arrival would be surprising (POSIX leaves
+            //     SIGCHLD's blocking-syscall interruption gated by
+            //     SA_RESTART, which v1 doesn't model).
+            //   * User1 / User2 are user-defined signals; POSIX gates
+            //     their interruption of blocking syscalls behind the
+            //     same SA_RESTART knob (or its inverse) which v1
+            //     doesn't model, so the safe default is "deliver to
+            //     inbox, don't disturb the parked syscall." A future
+            //     slice can flip this conditionally once a use case
+            //     appears (e.g. a daemon that wants SIGUSR1 to
+            //     trigger a config reload mid-blocking-recv).
             if signal == Signal::Term || signal == Signal::Interrupt {
                 let _ = kernel.interrupt_parked_accept(target_pid);
                 let _ = kernel.interrupt_parked_wait(target_pid);

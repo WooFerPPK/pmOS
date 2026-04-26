@@ -10,7 +10,8 @@
 //!   for userland to catch.
 //!
 //! * [`Signal::Term`] (15), [`Signal::Interrupt`] (2),
-//!   [`Signal::Pipe`] (13), and [`Signal::Child`] (17) are
+//!   [`Signal::Pipe`] (13), [`Signal::Child`] (17),
+//!   [`Signal::User1`] (10), and [`Signal::User2`] (12) are
 //!   "catchable": `proc_kill` buffers them in the target's
 //!   [`SignalInbox`]. With the `FdObject::SignalChannel` fd
 //!   variant auto-installed at fd 3 on every proc_spawn'd
@@ -23,7 +24,11 @@
 //!   delivery on child exit, including the SIGKILL-triggered
 //!   path). Neither requires an explicit `proc_kill` call from
 //!   userland — a parent that polls fd 3 observes every child
-//!   exit automatically.
+//!   exit automatically. SIGUSR1 / SIGUSR2 are reserved for
+//!   userland-defined application meanings (config reload,
+//!   diagnostic toggle, etc.); the kernel never generates them
+//!   on its own — they only ever arrive via an explicit
+//!   `proc_kill` from another process.
 //!
 //! The inbox is a bounded FIFO: repeated deliveries of the
 //! same signal are coalesced (classical POSIX behaviour for
@@ -36,8 +41,9 @@ use alloc::collections::VecDeque;
 /// Signals the v1 kernel understands.
 ///
 /// The numeric repr matches POSIX `SIGKILL`, `SIGTERM`, `SIGINT`,
-/// `SIGPIPE`, and `SIGCHLD` so userland code that hard-codes
-/// these values keeps working without a translation table.
+/// `SIGPIPE`, `SIGCHLD`, `SIGUSR1`, and `SIGUSR2` so userland
+/// code that hard-codes these values keeps working without a
+/// translation table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Signal {
@@ -54,6 +60,18 @@ pub enum Signal {
     /// Zombie. Delivered to the parent's signal inbox so a
     /// supervisor can observe child exit by polling fd 3.
     Child = 17,
+    /// User-defined signal #1. v1 reserves the slot and routes
+    /// it through the same inbox-delivery path as Term/Interrupt
+    /// /Pipe/Child; the meaning is whatever userland says it is
+    /// (canonical POSIX use: "reload your config" for a daemon,
+    /// "toggle verbose logging" for a CLI tool, etc.). The
+    /// kernel never generates this on its own.
+    User1 = 10,
+    /// User-defined signal #2. Sibling to [`Signal::User1`] —
+    /// reserved for a second userland-defined meaning so an
+    /// application can multiplex two distinct user signals
+    /// without colliding with kernel-generated SIGPIPE/SIGCHLD.
+    User2 = 12,
 }
 
 impl Signal {
@@ -154,6 +172,8 @@ mod tests {
         assert!(Signal::Interrupt.is_catchable());
         assert!(Signal::Pipe.is_catchable());
         assert!(Signal::Child.is_catchable());
+        assert!(Signal::User1.is_catchable());
+        assert!(Signal::User2.is_catchable());
     }
 
     #[test]
@@ -163,6 +183,8 @@ mod tests {
         assert_eq!(Signal::Interrupt.number(), 2);
         assert_eq!(Signal::Pipe.number(), 13);
         assert_eq!(Signal::Child.number(), 17);
+        assert_eq!(Signal::User1.number(), 10);
+        assert_eq!(Signal::User2.number(), 12);
     }
 
     #[test]
