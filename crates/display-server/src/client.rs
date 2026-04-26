@@ -185,6 +185,24 @@ pub struct Toplevel {
     /// auto-layout counter.
     pub x: i32,
     pub y: i32,
+    /// `true` after the shell has called
+    /// `pmd_shell_manager.minimize_window(this.id)` (T131).
+    /// While minimized, the compositor must skip this
+    /// toplevel's surface in its blit pass — the surface is
+    /// "unmapped" but NOT destroyed; a subsequent restore
+    /// (today: re-emit a configure / focus event from the
+    /// shell) clears the flag and the surface re-enters the
+    /// blit pass with its existing state intact.
+    pub minimized: bool,
+    /// Most-recent maximize state — set by
+    /// `pmd_xdg_toplevel.set_maximized()` and cleared by
+    /// `unset_maximized()` (T132). The actual configure
+    /// emission with the MAXIMIZED state bit + work-area-
+    /// sized geometry is the shell's responsibility (the
+    /// server doesn't track a work area today); v1 stores
+    /// the flag and the apply_toplevel_state arm pins
+    /// the state transition.
+    pub maximized: bool,
 }
 
 impl Toplevel {
@@ -196,6 +214,8 @@ impl Toplevel {
             app_id: String::new(),
             x,
             y,
+            minimized: false,
+            maximized: false,
         }
     }
 }
@@ -670,6 +690,22 @@ impl Client {
                     .get_mut(&toplevel_id)
                     .ok_or(ClientError::UnknownToplevel { toplevel_id })?;
                 toplevel.app_id = req.app_id;
+                Ok(())
+            }
+            5 /* set_maximized */ => {
+                let toplevel = self
+                    .toplevels
+                    .get_mut(&toplevel_id)
+                    .ok_or(ClientError::UnknownToplevel { toplevel_id })?;
+                toplevel.maximized = true;
+                Ok(())
+            }
+            6 /* unset_maximized */ => {
+                let toplevel = self
+                    .toplevels
+                    .get_mut(&toplevel_id)
+                    .ok_or(ClientError::UnknownToplevel { toplevel_id })?;
+                toplevel.maximized = false;
                 Ok(())
             }
             _ => Ok(()),

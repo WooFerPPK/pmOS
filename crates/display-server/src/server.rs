@@ -375,7 +375,55 @@ impl Server {
             self.composite_surface_commit(client_id, header.object_id);
         }
 
+        // T131: cross-client shell_manager.minimize_window
+        // takes effect server-wide. The payload is a window_id
+        // owned by some OTHER client; we walk every client's
+        // toplevel table to find the match and flip the flag.
+        if pre_interface == Some(Interface::ShellManager)
+            && header.opcode == 4 /* minimize_window */
+        {
+            if let Ok(req) = display_proto::requests::ShellManagerMinimizeWindow::decode(payload) {
+                let target = display_proto::ids::ObjectId::new(req.window_id);
+                self.set_toplevel_minimized_across_clients(target, true);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Walk every client's toplevel table and flip the
+    /// `minimized` flag on whichever toplevel matches
+    /// `target_id` (if any). Used by T131's cross-client
+    /// `pmd_shell_manager.minimize_window` dispatch and by
+    /// the server-driven restore path. No-op if no toplevel
+    /// matches; in v1 toplevel ids are unique across clients.
+    pub fn set_toplevel_minimized_across_clients(
+        &mut self,
+        target_id: display_proto::ids::ObjectId,
+        minimized: bool,
+    ) -> bool {
+        for client in self.clients.values_mut() {
+            if let Some(toplevel) = client.toplevels.get_mut(&target_id) {
+                toplevel.minimized = minimized;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Server-driven restore for a previously-minimized
+    /// toplevel. Counterpart to the cross-client minimize
+    /// path — there's no `pmd_shell_manager.restore_window`
+    /// request today (the spec lets the shell drive restore
+    /// via `focus_window`, which in v1 is a separate slice),
+    /// so this method exists for callers wiring restore
+    /// through other channels (test harnesses, future
+    /// taskbar click routing).
+    pub fn restore_toplevel(
+        &mut self,
+        target_id: display_proto::ids::ObjectId,
+    ) -> bool {
+        self.set_toplevel_minimized_across_clients(target_id, false)
     }
 
     /// Blit a surface's current buffer into the server's
@@ -428,6 +476,13 @@ impl Server {
         };
         let (origin_x, origin_y) =
             if let Some(toplevel) = client.toplevel_for_surface(surface_id) {
+                // T131: minimized toplevels are unmapped —
+                // skip the blit but keep the surface state
+                // intact so a restore can re-map without a
+                // round-trip back through the client.
+                if toplevel.minimized {
+                    return;
+                }
                 (
                     toplevel.x.saturating_add(attachment.x),
                     toplevel.y.saturating_add(attachment.y),

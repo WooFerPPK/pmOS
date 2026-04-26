@@ -1546,3 +1546,52 @@ fn xdg_toplevel_set_title_without_install_returns_unknown_toplevel() {
         other => panic!("expected UnknownToplevel, got {other:?}"),
     }
 }
+
+#[test]
+fn xdg_set_maximized_flips_toplevel_maximized_flag() {
+    let (mut c, surface_id, xdg_shell_id) = boot_client_with_xdg_shell();
+    let top = ObjectId::new(11);
+    let payload = xdg_get_toplevel_payload(top, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+    assert!(!c.toplevel(top).unwrap().maximized);
+
+    // set_maximized has an empty payload.
+    let h = MessageHeader::try_new(top, 5 /* set_maximized */, 0, 0).unwrap();
+    c.dispatch_request(h, &[]).unwrap();
+    assert!(c.toplevel(top).unwrap().maximized);
+
+    // unset_maximized clears it.
+    let h = MessageHeader::try_new(top, 6 /* unset_maximized */, 0, 0).unwrap();
+    c.dispatch_request(h, &[]).unwrap();
+    assert!(!c.toplevel(top).unwrap().maximized);
+}
+
+#[test]
+fn xdg_set_maximized_without_install_returns_unknown_toplevel() {
+    let mut c = Client::new(ClientId(1));
+    // Hand-install xdg_toplevel WITHOUT going through
+    // get_toplevel, so toplevels is empty but the object
+    // table has it. set_maximized should fail.
+    c.install_client_object(ObjectId::new(5), Interface::XdgToplevel)
+        .unwrap();
+    let h = MessageHeader::try_new(ObjectId::new(5), 5, 0, 0).unwrap();
+    let err = c.dispatch_request(h, &[]).unwrap_err();
+    match err {
+        ClientError::UnknownToplevel { toplevel_id } => {
+            assert_eq!(toplevel_id, ObjectId::new(5));
+        }
+        other => panic!("expected UnknownToplevel, got {other:?}"),
+    }
+}
+
+#[test]
+fn toplevel_default_minimized_is_false() {
+    let (mut c, surface_id, xdg_shell_id) = boot_client_with_xdg_shell();
+    let top = ObjectId::new(11);
+    let payload = xdg_get_toplevel_payload(top, surface_id);
+    let h = MessageHeader::try_new(xdg_shell_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(h, &payload).unwrap();
+    assert!(!c.toplevel(top).unwrap().minimized);
+    assert!(!c.toplevel(top).unwrap().maximized);
+}

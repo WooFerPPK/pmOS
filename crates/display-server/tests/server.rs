@@ -1063,3 +1063,230 @@ fn multiple_clients_have_independent_object_tables() {
     assert_eq!(s.client(a).unwrap().object_count(), 3);
     assert_eq!(s.client(b).unwrap().object_count(), 1);
 }
+
+#[test]
+fn shell_manager_minimize_window_flips_target_clients_toplevel_minimized_flag() {
+    // T131: a shell client (Cap::Shell) sends
+    // pmd_shell_manager.minimize_window(target_id) where
+    // target_id is a toplevel owned by a different client.
+    // The server must locate the target across clients and
+    // flip the minimized flag.
+    use abi::cap::{Cap, CapSet};
+
+    use display_server::ids::ObjectId;
+
+    let mut s = Server::new();
+    let app = s.accept(); // ordinary client
+    let shell = s.accept_with_caps(CapSet::from_caps(&[Cap::Shell]));
+
+    // App client: bind compositor + xdg_shell, create
+    // surface + toplevel.
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let xdg_shell_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+    let toplevel_id = ObjectId::new(11);
+    s.dispatch_request(
+        app,
+        &encode_request_bytes(
+            ObjectId::DISPLAY,
+            2,
+            &registry_id.raw().to_le_bytes(),
+        ),
+    )
+    .unwrap();
+    for (name, iface, bound) in [
+        (1u32, "pmd_compositor", compositor_id),
+        (2, "pmd_xdg_shell", xdg_shell_id),
+    ] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(app, &encode_request_bytes(registry_id, 1, &payload))
+            .unwrap();
+    }
+    s.dispatch_request(
+        app,
+        &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes()),
+    )
+    .unwrap();
+    s.dispatch_request(
+        app,
+        &encode_request_bytes(
+            xdg_shell_id,
+            1,
+            &xdg_get_toplevel_payload(toplevel_id, surface_id),
+        ),
+    )
+    .unwrap();
+    assert!(!s.client(app).unwrap().toplevel(toplevel_id).unwrap().minimized);
+
+    // Shell client: bind shell_manager (only privileged
+    // clients can). The shell's registry id can reuse 3 —
+    // every client has its own table.
+    let shell_registry_id = ObjectId::new(3);
+    let shell_manager_id = ObjectId::new(5);
+    s.dispatch_request(
+        shell,
+        &encode_request_bytes(
+            ObjectId::DISPLAY,
+            2,
+            &shell_registry_id.raw().to_le_bytes(),
+        ),
+    )
+    .unwrap();
+    let payload = registry_bind_payload(1, "pmd_shell_manager", 1, shell_manager_id);
+    s.dispatch_request(
+        shell,
+        &encode_request_bytes(shell_registry_id, 1, &payload),
+    )
+    .unwrap();
+
+    // Shell sends minimize_window(toplevel_id) targeting
+    // the app client's toplevel. The payload is u32 raw id.
+    let mut min_payload = Vec::new();
+    min_payload.extend_from_slice(&toplevel_id.raw().to_le_bytes());
+    s.dispatch_request(
+        shell,
+        &encode_request_bytes(shell_manager_id, 4 /* minimize_window */, &min_payload),
+    )
+    .unwrap();
+
+    // The app client's toplevel is now minimized.
+    assert!(
+        s.client(app)
+            .unwrap()
+            .toplevel(toplevel_id)
+            .unwrap()
+            .minimized,
+        "minimize_window must flip the target client's toplevel.minimized"
+    );
+
+    // Server::restore_toplevel clears the flag.
+    assert!(s.restore_toplevel(toplevel_id));
+    assert!(
+        !s.client(app)
+            .unwrap()
+            .toplevel(toplevel_id)
+            .unwrap()
+            .minimized
+    );
+}
+
+#[test]
+fn restore_toplevel_returns_false_for_unknown_id() {
+    use display_server::ids::ObjectId;
+    let mut s = Server::new();
+    let _c = s.accept();
+    assert!(!s.restore_toplevel(ObjectId::new(0xdead_beef)));
+}
+
+#[test]
+fn minimized_toplevel_skips_the_composite_blit() {
+    // Paint a 2x2 red buffer + commit, observe the framebuffer
+    // pixel-by-pixel. Then minimize the toplevel via the
+    // direct setter (skipping the cross-client request to
+    // keep the test self-contained), commit again, and
+    // observe that the framebuffer pixels DON'T change.
+    use display_server::ids::ObjectId;
+    let mut s = Server::with_framebuffer_size(16, 16);
+    let c = s.accept();
+
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let xdg_shell_id = ObjectId::new(9);
+    let surface_id = ObjectId::new(11);
+    let pool_id = ObjectId::new(13);
+    let buffer_id = ObjectId::new(15);
+    let toplevel_id = ObjectId::new(17);
+
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            ObjectId::DISPLAY,
+            2,
+            &registry_id.raw().to_le_bytes(),
+        ),
+    )
+    .unwrap();
+    for (name, iface, bound) in [
+        (1u32, "pmd_compositor", compositor_id),
+        (2, "pmd_shm", shm_id),
+        (3, "pmd_xdg_shell", xdg_shell_id),
+    ] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload))
+            .unwrap();
+    }
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes()),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(shm_id, 1, &shm_create_pool_payload(pool_id, 16)),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            pool_id,
+            1,
+            &shm_pool_create_buffer_payload(buffer_id, 0, 2, 2, 8, 0),
+        ),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            xdg_shell_id,
+            1,
+            &xdg_get_toplevel_payload(toplevel_id, surface_id),
+        ),
+    )
+    .unwrap();
+
+    // Paint pool red, attach + damage + commit.
+    for px in s.client_mut(c).unwrap().pool_bytes_mut(pool_id).unwrap().chunks_exact_mut(4) {
+        px[0] = 0x00;
+        px[1] = 0x00;
+        px[2] = 0xff;
+        px[3] = 0xff;
+    }
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface_id, 2, &surface_attach_payload(buffer_id, 0, 0)),
+    )
+    .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 3, &[0u8; 16]))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 7, &[]))
+        .unwrap();
+    assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &[0x00, 0x00, 0xff, 0xff]);
+
+    // Reset framebuffer to a known sentinel + minimize.
+    let fb = s.framebuffer_mut();
+    for px in fb.pixels_mut().chunks_exact_mut(4) {
+        px[0] = 0xab;
+        px[1] = 0xcd;
+        px[2] = 0xef;
+        px[3] = 0xff;
+    }
+    assert!(s.set_toplevel_minimized_across_clients(toplevel_id, true));
+
+    // Re-commit. The blit should be skipped — sentinel
+    // bytes remain at (0, 0).
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 7, &[]))
+        .unwrap();
+    assert_eq!(
+        s.framebuffer().pixel(0, 0).unwrap(),
+        &[0xab, 0xcd, 0xef, 0xff],
+        "minimized toplevel must not blit"
+    );
+
+    // Restore + re-commit; the red pixels return.
+    assert!(s.restore_toplevel(toplevel_id));
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 7, &[]))
+        .unwrap();
+    assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &[0x00, 0x00, 0xff, 0xff]);
+}
