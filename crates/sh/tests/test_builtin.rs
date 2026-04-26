@@ -1609,3 +1609,239 @@ fn read_r_preserves_backslash_in_middle_of_line() {
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("foo\\bar"));
 }
+
+// ---------- read -p flag ----------
+//
+// `read -p PROMPT VAR` writes PROMPT to STDERR (NOT stdout —
+// POSIX-aligned, since stdout is reserved for the script's
+// own output) WITHOUT a trailing newline, BEFORE blocking on
+// the read. The prompt is a literal string (no expansion at
+// the builtin layer; the upstream dispatcher already expanded
+// any `$VAR` references before calling `builtin_read`). Both
+// the space-separated form (`-p PROMPT`, two argv slots) and
+// the glued no-space form (`-pPROMPT`, one argv slot) are
+// accepted, mirroring the `sort -o FILE` / `sort -oFILE`
+// pattern. The flag composes with `-r` in either order.
+//
+// v1 simplification: the prompt is written EXACTLY ONCE per
+// `read -p` invocation; default-mode trailing-backslash
+// continuation does NOT re-prompt (bash optionally uses PS2
+// for that, but v1 doesn't model PS2 yet — the user just
+// types the second line with no further visible cue).
+//
+// Edge case: `read -p -r VAR` (where `-r` LOOKS like a flag
+// but appears in the prompt-value slot) is LITERALLY accepted
+// — `-p` consumes the very next token as the prompt value
+// regardless of content, so the prompt is the literal string
+// `-r` and `VAR` is read in NON-raw mode. Matches bash.
+
+#[test]
+fn read_p_writes_prompt_to_stderr_before_blocking() {
+    // Canonical happy path. `read -p "Enter: " X` against the
+    // input line `hello\n` writes `Enter: ` to stderr (NO
+    // trailing newline — the cursor sits on the same line,
+    // ready for input) and assigns `X=hello`. The prompt
+    // appears EXACTLY as written (no expansion, no escape
+    // interpretation, no trim).
+    let (status, _stdout, stderr, env) =
+        drive("read -p \"Enter: \" X\nhello\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("X").map(String::as_str), Some("hello"));
+    assert!(
+        stderr.contains("Enter: "),
+        "stderr missing prompt: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Enter: \n"),
+        "stderr prompt has unwanted trailing newline: {stderr:?}"
+    );
+}
+
+#[test]
+fn read_p_glued_form_works() {
+    // `-pEnter:` (no space) is the glued one-slot form. The
+    // prompt value is the suffix after `-p` and must reach
+    // stderr identically to the space-separated form. Quote
+    // the whole arg so the tokenizer keeps `-pEnter:` as a
+    // single token. Pin the same `X=hello` outcome.
+    let (status, _stdout, stderr, env) =
+        drive("read \"-pEnter: \" X\nhello\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("X").map(String::as_str), Some("hello"));
+    assert!(
+        stderr.contains("Enter: "),
+        "stderr missing glued prompt: {stderr:?}"
+    );
+}
+
+#[test]
+fn read_p_with_no_value_is_usage_error() {
+    // Bare `read -p` at end-of-args → no prompt value
+    // available; must short-circuit with a usage diagnostic
+    // and Status(2). Critically, the read must NOT proceed —
+    // a fall-through that consumed the next stdin line as if
+    // `-p` weren't there would silently hide the user's
+    // typo. The next line in stdin (`exit`) must reach the
+    // REPL untouched, so the script terminates via the
+    // `exit` command rather than via EOF or via a
+    // misinterpreted read.
+    let (status, _stdout, stderr, env) =
+        drive("read -p\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stderr.contains("sh: read: -p: missing prompt"),
+        "stderr missing missing-prompt diagnostic: {stderr:?}"
+    );
+    assert!(env.is_empty(), "unexpected env mutation: {env:?}");
+}
+
+#[test]
+fn read_p_compose_with_r_flag_either_order() {
+    // Both `-r -p PROMPT VAR` and `-p PROMPT -r VAR` must
+    // work identically: a single prompt write to stderr,
+    // raw mode active (so a trailing backslash is LITERAL,
+    // no continuation), value `foo\\` (Rust escape: one
+    // backslash) preserved verbatim from `foo\\\n` input.
+    let (status_a, _stdout_a, stderr_a, env_a) = drive(
+        "read -r -p \"Hi: \" X\nfoo\\\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status_a, ExitStatus::Exit(0));
+    assert_eq!(env_a.get("X").map(String::as_str), Some("foo\\"));
+    assert!(stderr_a.contains("Hi: "), "order A stderr: {stderr_a:?}");
+
+    let (status_b, _stdout_b, stderr_b, env_b) = drive(
+        "read -p \"Hi: \" -r X\nfoo\\\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status_b, ExitStatus::Exit(0));
+    assert_eq!(env_b.get("X").map(String::as_str), Some("foo\\"));
+    assert!(stderr_b.contains("Hi: "), "order B stderr: {stderr_b:?}");
+    // Both orders produce IDENTICAL stderr — exactly one
+    // prompt write per `read -p`, no duplication.
+    assert_eq!(stderr_a.matches("Hi: ").count(), 1);
+    assert_eq!(stderr_b.matches("Hi: ").count(), 1);
+}
+
+#[test]
+fn read_p_does_not_rewrite_prompt_on_continuation() {
+    // Default mode (no `-r`) treats trailing backslash as
+    // continuation. `read -p "Q: " X` against `"a\\\nb\n"`
+    // (two input lines, the first continues into the
+    // second) reads BOTH lines and assigns `X=ab`. The
+    // prompt is written EXACTLY ONCE — the continuation
+    // iteration does NOT re-prompt (v1 has no PS2 yet, so
+    // there's no continuation prompt to write).
+    let (status, _stdout, stderr, env) = drive(
+        "read -p \"Q: \" X\na\\\nb\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("X").map(String::as_str), Some("ab"));
+    assert_eq!(
+        stderr.matches("Q: ").count(),
+        1,
+        "expected exactly one prompt write, got: {stderr:?}"
+    );
+}
+
+#[test]
+fn read_p_empty_prompt_writes_nothing_visible() {
+    // `read -p "" X` with an empty prompt is valid — no
+    // diagnostic, the empty `write!` produces zero bytes,
+    // and the read proceeds normally. Pin that the empty
+    // prompt does not accidentally leak into stderr or
+    // alter the env mutation.
+    let (status, _stdout, stderr, env) =
+        drive("read -p \"\" X\nhello\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("X").map(String::as_str), Some("hello"));
+    assert!(stderr.is_empty(), "stderr should be empty: {stderr:?}");
+}
+
+#[test]
+fn read_p_with_quirky_value_dash_r() {
+    // `read -p -r X` — the `-p` flag consumes the very next
+    // argv slot as its prompt value REGARDLESS of content.
+    // So the prompt is the literal string `-r` (NOT
+    // interpreted as the raw-mode flag) and the read
+    // proceeds in NON-raw mode against `X`. This matches
+    // bash's behaviour and pins the v1 "consume next slot
+    // verbatim" rule.
+    let (status, _stdout, stderr, env) =
+        drive("read -p -r X\nfoo\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("X").map(String::as_str), Some("foo"));
+    assert!(
+        stderr.contains("-r"),
+        "stderr should contain literal -r prompt: {stderr:?}"
+    );
+}
+
+#[test]
+fn read_p_does_not_pollute_stdout() {
+    // POSIX-critical invariant: the prompt MUST go to
+    // stderr, NOT stdout. Stdout is reserved for the
+    // script's data output (so `script.sh | grep foo`
+    // still works while the script prints prompts to the
+    // user). Pin that no part of the prompt leaks into
+    // stdout — the script does no `echo`, so stdout should
+    // be empty (the REPL's per-line `$ ` prompt is not
+    // emitted in the run_with_env shape; see existing
+    // tests).
+    let (status, stdout, _stderr, env) =
+        drive("read -p \"Q: \" X\nhello\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("X").map(String::as_str), Some("hello"));
+    assert!(
+        !stdout.contains("Q:"),
+        "stdout must not contain prompt: {stdout:?}"
+    );
+}
+
+#[test]
+fn read_p_ascii_prompt_with_punctuation() {
+    // The builtin layer passes the prompt verbatim via
+    // `write!(stderr, "{p}")` — any byte sequence is
+    // forwarded as-is. Multi-byte utf-8 round-tripping
+    // through the v1 shell tokeniser is currently affected
+    // by a pre-existing double-encoding limitation in the
+    // upstream `tokenise_with_quotes` / expansion layer
+    // (non-ASCII bytes inside `"..."` get re-interpreted as
+    // latin-1 and re-encoded as utf-8), so this slice
+    // documents that limitation without stretching test
+    // coverage into the upstream layer's bug. This test
+    // pins the ASCII-punctuation case (`?`, `!`, colon,
+    // brackets) which IS preserved cleanly through the
+    // tokeniser today, demonstrating the builtin's
+    // pass-through behaviour for the prompt arg.
+    let (status, _stdout, stderr, env) =
+        drive("read -p \"What's your name? \" NAME\nalice\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("NAME").map(String::as_str), Some("alice"));
+    assert!(
+        stderr.contains("What's your name? "),
+        "stderr missing punctuation prompt: {stderr:?}"
+    );
+}
+
+#[test]
+fn read_p_prompt_with_multiple_words() {
+    // Quoted multi-word prompts must reach the builtin as a
+    // SINGLE argv slot (the v1 tokenizer is quote-aware —
+    // see `tokenise_with_quotes` in run.rs — so
+    // `"Enter your name now: "` survives whitespace-split
+    // suppression). Pins that the prompt tokenizer behaves
+    // correctly under multi-word quoted prompts (the
+    // typical use case for `read -p`).
+    let (status, _stdout, stderr, env) = drive(
+        "read -p \"Enter your name now: \" NAME\nalice\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert_eq!(env.get("NAME").map(String::as_str), Some("alice"));
+    assert!(
+        stderr.contains("Enter your name now: "),
+        "stderr missing multi-word prompt: {stderr:?}"
+    );
+}

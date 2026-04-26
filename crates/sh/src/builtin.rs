@@ -402,6 +402,30 @@ fn builtin_unset<E: Write>(
 /// — no continuation, no escape interpretation, just strip
 /// `\n` / `\r` and assign verbatim.
 ///
+/// `-p PROMPT` flag: writes PROMPT to STDERR (POSIX-aligned
+/// — stdout is reserved for script output) WITHOUT a trailing
+/// newline, then flushes, BEFORE the blocking `read_line` call.
+/// The prompt is written EXACTLY ONCE per `read -p` invocation;
+/// continuation iterations (default mode, trailing-backslash
+/// line continuation) do NOT re-write the prompt — bash uses
+/// PS2 (`> ` by default) for continuations but v1 doesn't model
+/// PS2 yet, so the user just types the second line with no
+/// further visible cue. Both the space-separated form
+/// (`-p PROMPT`, two argv slots) and the glued no-space form
+/// (`-pPROMPT`, one argv slot) are accepted, mirroring the
+/// pattern established by `sort -o FILE` / `-oFILE`. The flag
+/// composes with `-r` in EITHER order: both `-r -p "Hi: " VAR`
+/// and `-p "Hi: " -r VAR` work identically, parsed by a small
+/// flag-walk loop at the front of the args. The v1
+/// simplification: each flag must be a STANDALONE token; no
+/// `-rp PROMPT` clustering. `-p` consumes the literal NEXT
+/// argv slot regardless of content, so `read -p -r VAR` (a
+/// quirky-but-valid invocation) yields a prompt of the literal
+/// string `-r` then a single read into VAR with NO raw mode —
+/// matches bash's behaviour. Empty prompt (`read -p "" VAR`)
+/// is valid and writes nothing visible to stderr (the empty
+/// `write!` produces no bytes; the flush is a no-op).
+///
 /// Deferred (out of v1 scope):
 /// * The `--` end-of-flags separator (POSIX `read -- VAR`
 ///   to read into a var literally named `-r`) — would need
@@ -409,19 +433,33 @@ fn builtin_unset<E: Write>(
 /// * Combined / clustered short flags like `-rs` or `-rt 5`
 ///   (the v1 path stays single-flag-at-a-time; `-rX` is
 ///   treated as a regular var name, NOT a `-r` flag with a
-///   `-X` cluster).
+///   `-X` cluster). The `-pPROMPT` glued form is the SOLE
+///   exception, scoped to `-p` because consuming the next
+///   argv as a parameter is the established POSIX shape for
+///   prompt-style flags.
 /// * The remaining `read` flags: `-n N` (read N chars),
 ///   `-N N` (read EXACTLY N chars), `-t SEC` (timeout),
-///   `-p PROMPT` (prompt before reading), `-s` (silent /
-///   no echo), `-d DELIM` (custom line delimiter),
-///   `-a ARRAY` (read into an array). Each ships
-///   independently when the need arises.
+///   `-s` (silent / no echo — needs terminal-mode toggling),
+///   `-d DELIM` (custom line delimiter), `-a ARRAY` (read
+///   into an array). Each ships independently when the need
+///   arises.
+/// * `--prompt=` long-form alias for `-p`.
+/// * PS2 (continuation prompt) — `-p` writes the prompt
+///   exactly once; bash optionally re-prompts each
+///   continuation iteration with `PS2`, but v1 has no PS2
+///   yet.
+/// * Tab-completion / readline integration with the prompt
+///   (waits on terminal-control infrastructure).
+/// * Color-code / formatting awareness in the prompt — passed
+///   through verbatim; a future `is_terminal()` check could
+///   strip escape sequences for non-tty stderr.
+/// * Interaction with `-s` (silent mode) — `-s` blocks on
+///   terminal-mode toggling.
 /// * IFS-based field splitting for multi-VAR reads.
 /// * POSIX identifier-charset validation (matches the
 ///   existing `export` behavior — empty-name is the only
 ///   rejected shape).
 /// * Backslash-as-IFS-delimiter-escape (waits on IFS slice).
-/// * Backslash-as-prompt-escape with `-p` (waits on -p slice).
 /// * Heredoc / herestring interaction (those are
 ///   tokenizer-level concerns, not builtin-level).
 fn builtin_read<R: BufRead, E: Write>(
@@ -430,14 +468,42 @@ fn builtin_read<R: BufRead, E: Write>(
     stdin: &mut R,
     stderr: &mut E,
 ) -> BuiltinOutcome {
-    // v1 single-flag parse: only the standalone `-r` form
-    // is recognised. Combined short flags (`-rs`, `-rX`)
-    // and the `--` end-of-flags separator are deferred.
-    let (raw, names) = if !args.is_empty() && args[0] == "-r" {
-        (true, &args[1..])
-    } else {
-        (false, args)
-    };
+    // Flag-walk loop. Each iteration peels one recognised
+    // flag off the front of `args` and updates the local
+    // state; any unrecognised token (including bare var
+    // names) breaks the loop, leaving the remainder as the
+    // names slice. Both `-r` and `-p` may appear in any
+    // order; `-p` may be standalone (`-p PROMPT`, consuming
+    // the very next arg as the prompt value regardless of
+    // its content) or glued (`-pPROMPT`, all in one arg).
+    // The v1 simplification stays: each flag is a STANDALONE
+    // token — no `-rp PROMPT` clustering.
+    let mut raw = false;
+    let mut prompt: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-r" => {
+                raw = true;
+                i += 1;
+            }
+            "-p" => {
+                if i + 1 >= args.len() {
+                    let _ = write!(stderr, "sh: read: -p: missing prompt\n");
+                    let _ = stderr.flush();
+                    return BuiltinOutcome::Status(2);
+                }
+                prompt = Some(args[i + 1]);
+                i += 2;
+            }
+            glued if glued.starts_with("-p") && glued.len() > 2 => {
+                prompt = Some(&glued[2..]);
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let names = &args[i..];
     if names.is_empty() {
         let _ = write!(stderr, "sh: read: missing variable name\n");
         let _ = stderr.flush();
@@ -447,6 +513,10 @@ fn builtin_read<R: BufRead, E: Write>(
         let _ = write!(stderr, "sh: read: : not a valid identifier\n");
         let _ = stderr.flush();
         return BuiltinOutcome::Status(2);
+    }
+    if let Some(p) = prompt {
+        let _ = write!(stderr, "{p}");
+        let _ = stderr.flush();
     }
     let mut accumulated = String::new();
     let mut any_line_read = false;
