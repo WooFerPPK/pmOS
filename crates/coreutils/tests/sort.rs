@@ -677,3 +677,173 @@ fn dash_cb_checks_with_trimmed_keys() {
         "stderr = {plain_stderr:?}"
     );
 }
+
+#[test]
+fn dash_i_filters_non_printable_bytes_for_sort() {
+    let dir = scratch_dir("i_basic");
+    let path = write_file(&dir, "in.txt", b"\x07banana\napple\x08\n");
+
+    let out = Command::new(SORT)
+        .arg("-i")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"apple\x08\n\x07banana\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_i_preserves_original_bytes_in_output() {
+    let dir = scratch_dir("i_preserve");
+    let path = write_file(&dir, "in.txt", b"a\x01b\x02c\nzebra\n");
+
+    let out = Command::new(SORT)
+        .arg("-i")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"a\x01b\x02c\nzebra\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_if_combines_filter_then_fold() {
+    let dir = scratch_dir("if");
+    let path = write_file(&dir, "in.txt", b"Apple\x07\napple\x08\nbanana\n");
+
+    let out = Command::new(SORT)
+        .arg("-if")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"Apple\x07\napple\x08\nbanana\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_iu_dedupes_after_filter() {
+    let dir = scratch_dir("iu");
+    let path = write_file(&dir, "in.txt", b"apple\x07\napple\x08\napple\n");
+
+    let out = Command::new(SORT)
+        .arg("-iu")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"apple\x07\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_ib_combines_filter_and_trim() {
+    let dir = scratch_dir("ib");
+    let path = write_file(&dir, "in.txt", b"   apple\n\x07apple\n");
+
+    let out = Command::new(SORT)
+        .arg("-ibu")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"   apple\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_in_no_op_for_numeric() {
+    let dir = scratch_dir("in_numeric");
+    let path = write_file(&dir, "in.txt", b"   42\nfoo\x07\n2\n");
+
+    let with_i = Command::new(SORT)
+        .arg("-in")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    let without_i = Command::new(SORT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(with_i.status.success(), "exit status: {:?}", with_i.status);
+    assert!(
+        without_i.status.success(),
+        "exit status: {:?}",
+        without_i.status
+    );
+    assert_eq!(with_i.stdout, without_i.stdout);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_ic_checks_with_filtered_keys() {
+    let out = run_check(&["-ic"], b"apple\x08\n\x07banana\ncherry\n");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+
+    let plain_check = run_check(&["-c"], b"apple\x08\n\x07banana\ncherry\n");
+    assert_eq!(
+        plain_check.status.code(),
+        Some(1),
+        "plain check should fail: apple\\x08 (a=97) > \\x07banana (\\x07=7) under raw lex"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain_check.stderr);
+    assert!(
+        plain_stderr.contains("disorder"),
+        "stderr = {plain_stderr:?}"
+    );
+}
+
+#[test]
+fn dash_i_alone_with_no_input_is_empty_output() {
+    let out = run_check(&["-i"], b"");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn dash_i_handles_high_bit_bytes_as_nonprinting() {
+    let dir = scratch_dir("i_highbit");
+    let path = write_file(
+        &dir,
+        "in.txt",
+        "\u{00e9}apple\nbanana\n".as_bytes(),
+    );
+
+    let with_i = Command::new(SORT)
+        .arg("-i")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    assert!(with_i.status.success(), "exit status: {:?}", with_i.status);
+    assert_eq!(with_i.stdout, "\u{00e9}apple\nbanana\n".as_bytes());
+    assert!(with_i.stderr.is_empty(), "stderr = {:?}", with_i.stderr);
+
+    let without_i = Command::new(SORT)
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    assert!(
+        without_i.status.success(),
+        "exit status: {:?}",
+        without_i.status
+    );
+    assert_eq!(without_i.stdout, "banana\n\u{00e9}apple\n".as_bytes());
+    cleanup(&dir);
+}
