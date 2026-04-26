@@ -294,6 +294,65 @@ describe("process lifecycle", () => {
     expect(text).toContain("VmPeak:\t0 kB\n");
   });
 
+  it("/proc/<pid>/fd lists installed file descriptors via the live procfs source", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const path = `/proc/${pid}/fd`;
+    const pathBytes = new TextEncoder().encode(path);
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4201,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const args = new Uint8Array(16);
+    new DataView(args.buffer).setUint32(0, fd, true);
+    const readdir = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READDIR,
+      requestId: 4202,
+      args,
+      heapPtr: 0,
+      heapLen: 1024,
+    });
+    expect(readdir.response!.status).toBe(0);
+    const total = Number(readdir.response!.value);
+    expect(total).toBeGreaterThan(0);
+
+    // Walk the dirent stream and collect names. Header is
+    // POLL_DIRENT_HEADER_SIZE bytes; each entry is followed by
+    // its name inline; entries pack tightly with no padding.
+    const buf = readdir.heapOut!.subarray(0, total);
+    const names: string[] = [];
+    let off = 0;
+    while (off + POLL_DIRENT_HEADER_SIZE <= buf.length) {
+      const v = new DataView(buf.buffer, buf.byteOffset + off, POLL_DIRENT_HEADER_SIZE);
+      const namlen = v.getUint32(DIRENT_OFF.D_NAMLEN, true);
+      if (namlen === 0) break;
+      const nameBytes = buf.subarray(
+        off + POLL_DIRENT_HEADER_SIZE,
+        off + POLL_DIRENT_HEADER_SIZE + namlen,
+      );
+      names.push(new TextDecoder().decode(nameBytes));
+      off += POLL_DIRENT_HEADER_SIZE + namlen;
+    }
+    // The live source surfaces every installed fd; "1" is the
+    // console fd we installed. Other fds may be present (depends
+    // on what kernel_register_process pre-installs); the test
+    // pins the inclusion of "1", not exclusivity.
+    expect(names).toContain("1");
+  });
+
   it("markRunning on a nonexistent pid throws", async () => {
     const { host } = await freshHost();
     expect(() => host.markRunning(9999)).toThrow(/markRunning/);

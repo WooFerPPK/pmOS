@@ -244,14 +244,52 @@ impl ProcFsSource for LiveProcFsSource {
         })
     }
 
-    fn pid_fds(&self, _pid: Pid) -> Vec<ProcFdSnapshot> {
-        // pid_fds projection from the live FdTable through to
-        // `/proc/<pid>/fd/<n>` symlinks is the next slice on top
-        // of this one — needs the FdObject → path mapping that
-        // KernelProcFsSource owns in tests but doesn't yet
-        // export through the live source. The default empty Vec
-        // matches the codex T168 first-landing slice (876d855).
-        Vec::new()
+    fn pid_fds(&self, pid: Pid) -> Vec<ProcFdSnapshot> {
+        Self::with_kernel(|k| {
+            let Ok(table) = k.fds(pid) else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            for (fd, entry) in table.iter() {
+                let target = match entry.object {
+                    FdObject::Vnode { mount_id, ino } => {
+                        let mp = k.vfs.mountpoint_of(mount_id).unwrap_or("?");
+                        format!("{}#{}", mp, ino)
+                    }
+                    FdObject::CharDevice(devnum) => devnum_to_path(devnum),
+                    FdObject::PipeRead(id) => format!("pipe:[{}r]", id),
+                    FdObject::PipeWrite(id) => format!("pipe:[{}w]", id),
+                    FdObject::Socket(id) => format!("socket:[{}]", id),
+                    FdObject::DisplayConn(id) => format!("display:[{}]", id),
+                    FdObject::SignalChannel => String::from("signal:"),
+                    FdObject::Watch { watch_id } => format!("watch:[{}]", watch_id.0),
+                    FdObject::HostFile { token } => format!("host_file:[{}]", token),
+                };
+                out.push(ProcFdSnapshot { fd, target });
+            }
+            out
+        })
+    }
+}
+
+/// Map a device number to its canonical path for `/proc/<pid>/fd/<n>`
+/// symlink targets. Mirrors the names in the devfs init layout
+/// (`crates/kernel/src/fs/devfs.rs`); unknown devnums fall back to
+/// `dev:[<n>]` so an unrecognised device doesn't crash the
+/// projection.
+fn devnum_to_path(devnum: u32) -> String {
+    use crate::fs::devfs::{
+        DEV_CONSOLE, DEV_FB0, DEV_INPUT_KBD, DEV_INPUT_MOUSE, DEV_NULL, DEV_RANDOM, DEV_ZERO,
+    };
+    match devnum {
+        DEV_NULL => String::from("/dev/null"),
+        DEV_ZERO => String::from("/dev/zero"),
+        DEV_RANDOM => String::from("/dev/random"),
+        DEV_CONSOLE => String::from("/dev/console"),
+        DEV_FB0 => String::from("/dev/fb0"),
+        DEV_INPUT_KBD => String::from("/dev/input_kbd"),
+        DEV_INPUT_MOUSE => String::from("/dev/input_mouse"),
+        n => format!("dev:[{}]", n),
     }
 }
 

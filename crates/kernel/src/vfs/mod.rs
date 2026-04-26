@@ -489,6 +489,15 @@ impl Vfs {
             .collect()
     }
 
+    /// Look up the normalised mountpoint path for a mount id, or
+    /// `None` if no such mount is installed. Thin pass-through to
+    /// [`MountTable::mountpoint_of`] — used by procfs's live
+    /// `/proc/<pid>/fd/<n>` symlink projection to render a
+    /// `Vnode { mount_id, ino }` as a `<mountpoint>#<ino>` target.
+    pub fn mountpoint_of(&self, id: MountId) -> Option<&str> {
+        self.mounts.mountpoint_of(id)
+    }
+
     /// Maximum number of symlink dereferences on a single resolve
     /// before `FsError::SymLoop` is returned. POSIX requires at
     /// least SYMLOOP_MAX=8; v1 uses 40 to match Linux's
