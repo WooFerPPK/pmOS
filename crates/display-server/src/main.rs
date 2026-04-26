@@ -141,28 +141,66 @@ unsafe fn poll_sigterm() -> bool {
 // tests can verify it; main.rs imports it as
 // `display_server::detect_protocol_message`.
 
-/// True iff `chunk` decodes as a `pmd_surface.commit`
-/// request (interface = Surface, opcode = 7). Used by the
-/// main loop to decide whether to present the framebuffer
-/// after dispatch — only commits change pixels, so other
-/// requests skip the (expensive, chunked) present path.
+/// True iff any framed message in `chunk` is a
+/// `pmd_surface.commit` request (interface = Surface,
+/// opcode = 7). Used by the main loop to decide whether
+/// to present the framebuffer after dispatching a chunk —
+/// only commits change pixels, so other requests skip the
+/// (expensive, chunked) present path. Walks the chunk
+/// header-by-header so a multi-message batch with a commit
+/// at the end still triggers a present.
 #[cfg(target_arch = "wasm32")]
-fn chunk_is_surface_commit(chunk: &[u8]) -> bool {
-    let Ok(header) = display_server::MessageHeader::decode(chunk) else {
-        return false;
-    };
-    if header.opcode != 7 {
-        return false;
+fn chunk_contains_commit(chunk: &[u8]) -> bool {
+    use display_server::HEADER_SIZE;
+    let mut offset = 0usize;
+    while offset + HEADER_SIZE <= chunk.len() {
+        let Ok(header) = display_server::MessageHeader::decode(&chunk[offset..]) else {
+            return false;
+        };
+        let msg_len = header.length as usize;
+        if msg_len < HEADER_SIZE || offset + msg_len > chunk.len() {
+            return false;
+        }
+        if header.opcode == 7 {
+            return true;
+        }
+        offset += msg_len;
     }
-    // The header's object id is a per-client `surface_id`;
-    // we can't look it up from inside this helper without
-    // a Server reference, so we just match on opcode 7
-    // which is `pmd_surface.commit` per the Surface opcode
-    // table. Other interfaces use opcode 7 for unrelated
-    // ops (none in v1 — the only opcode 7 is commit), so
-    // false positives aren't a hazard at this layer.
-    let _ = header.object_id;
-    true
+    false
+}
+
+/// Dispatch every framed message in `chunk` against
+/// `server` for the given client. The toolkit's send-side
+/// stream batches consecutive requests into a single fd_write,
+/// and the kernel coalesces them into one rx_buf, so by the
+/// time `fd_read` returns a chunk it usually contains 1-N
+/// complete protocol messages. Walks the chunk header-by-
+/// header until either the buffer is consumed or a malformed
+/// header surfaces. Each message's request is fed through
+/// `Server::dispatch_request`; the binary's auto-advertise
+/// hook fires per-message so multi-batch chunks containing a
+/// `display.get_registry` still produce the globals catalog.
+#[cfg(target_arch = "wasm32")]
+fn dispatch_all_messages(
+    server: &mut display_server::Server,
+    client_id: display_server::ClientId,
+    chunk: &[u8],
+) {
+    use display_server::HEADER_SIZE;
+    let mut offset = 0usize;
+    while offset + HEADER_SIZE <= chunk.len() {
+        let Ok(header) = display_server::MessageHeader::decode(&chunk[offset..]) else {
+            return;
+        };
+        let msg_len = header.length as usize;
+        if msg_len < HEADER_SIZE || offset + msg_len > chunk.len() {
+            return;
+        }
+        let msg = &chunk[offset..offset + msg_len];
+        let _ = server.dispatch_request(client_id, msg);
+        advertise_globals_for_get_registry(server, client_id, msg);
+        offset += msg_len;
+    }
 }
 
 /// If `chunk` is a `pmd_display.get_registry` request, push
@@ -475,8 +513,7 @@ fn main() {
             // subsequent batch on the same fd until either the
             // client disconnects, SIGTERM lands, or fd_read
             // returns a real error.
-            let _ = server.dispatch_request(client_id, first_chunk);
-            advertise_globals_for_get_registry(&mut server, client_id, first_chunk);
+            dispatch_all_messages(&mut server, client_id, first_chunk);
             if let Some(events) = server.drain_client_events(client_id) {
                 if !events.is_empty() {
                     let ev_iov = Ciovec {
@@ -487,10 +524,10 @@ fn main() {
                     let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
                 }
             }
-            // Only present if the first batch was a surface.commit
-            // — get_registry / bind / create_surface paths don't
-            // change pixels.
-            if chunk_is_surface_commit(first_chunk) {
+            // Only present if the first batch contained a
+            // surface.commit — get_registry / bind /
+            // create_surface paths don't change pixels.
+            if chunk_contains_commit(first_chunk) {
                 if !present_framebuffer(&server, fb_fd as i32) {
                     std::process::exit(16);
                 }
@@ -519,8 +556,7 @@ fn main() {
                 if rc == 0 && nread > 0 {
                     let chunk = &recv_buf[..nread as usize];
                     if display_server::detect_protocol_message(chunk).is_some() {
-                        let _ = server.dispatch_request(client_id, chunk);
-                        advertise_globals_for_get_registry(&mut server, client_id, chunk);
+                        dispatch_all_messages(&mut server, client_id, chunk);
                         if let Some(events) = server.drain_client_events(client_id) {
                             if !events.is_empty() {
                                 let ev_iov = Ciovec {
@@ -531,7 +567,7 @@ fn main() {
                                 let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
                             }
                         }
-                        if chunk_is_surface_commit(chunk) {
+                        if chunk_contains_commit(chunk) {
                             if !present_framebuffer(&server, fb_fd as i32) {
                                 std::process::exit(16);
                             }

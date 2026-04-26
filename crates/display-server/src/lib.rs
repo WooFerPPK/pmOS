@@ -60,10 +60,31 @@ pub fn detect_protocol_message(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < HEADER_SIZE {
         return None;
     }
-    let header = MessageHeader::decode(bytes).ok()?;
-    let total = header.length as usize;
-    if total == bytes.len() {
-        Some(total)
+    // Walk the buffer header-by-header. The toolkit's send-
+    // side batches consecutive requests into a single
+    // fd_write, and the kernel coalesces them into one
+    // rx_buf, so by the time `fd_read` returns a chunk it
+    // may contain 1-N complete protocol messages. We accept
+    // ANY chunk that walks cleanly to the end as protocol-
+    // shaped. The legacy 16-byte raw-RGBA payload from
+    // `display-client-demo` falls out of this walk on the
+    // first header decode (its length field doesn't match
+    // any boundary we can recover), routing the chunk to
+    // the binary's raw-blit fallback.
+    let mut offset = 0usize;
+    while offset + HEADER_SIZE <= bytes.len() {
+        let header = MessageHeader::decode(&bytes[offset..]).ok()?;
+        let msg_len = header.length as usize;
+        if msg_len < HEADER_SIZE {
+            return None;
+        }
+        if offset + msg_len > bytes.len() {
+            return None;
+        }
+        offset += msg_len;
+    }
+    if offset == bytes.len() {
+        Some(offset)
     } else {
         None
     }
