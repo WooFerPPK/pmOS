@@ -1197,6 +1197,13 @@ export interface SpawnRouter {
 export function createSpawnRouter(deps: SpawnRouterDeps): SpawnRouter {
   const live = new Map<number, SpawnedEntry>();
 
+  function recordMemory(pid: number, bytes: number): void {
+    if (!live.has(pid)) {
+      return;
+    }
+    deps.kernelWorker.postMessage({ kind: "proc:memory", pid, bytes });
+  }
+
   function reap(pid: number, code: number, trap: string | undefined): void {
     const entry = live.get(pid);
     if (!entry) {
@@ -1225,7 +1232,17 @@ export function createSpawnRouter(deps: SpawnRouterDeps): SpawnRouter {
       live.set(msg.pid, { worker, sab });
       worker.addEventListener("message", (ev) => {
         const m = ev.data;
-        if (m.kind === "exited" && m.pid === msg.pid) {
+        if (m.pid !== msg.pid) {
+          return;
+        }
+        if (m.kind === "memory") {
+          recordMemory(msg.pid, m.bytes);
+          return;
+        }
+        if (m.memoryBytes !== undefined) {
+          recordMemory(msg.pid, m.memoryBytes);
+        }
+        if (m.kind === "exited") {
           reap(msg.pid, m.code, m.trap);
         }
       });

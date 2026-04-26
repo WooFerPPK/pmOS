@@ -180,6 +180,15 @@ describe("process lifecycle", () => {
     expect(() => host.markRunning(pid)).not.toThrow();
   });
 
+  it("recordProcessMemory accepts known pids and rejects unknown pids", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    expect(() => host.recordProcessMemory(pid, 128 * 1024)).not.toThrow();
+    expect(() => host.recordProcessMemory(999_999, 128 * 1024)).toThrow(
+      /recordProcessMemory/,
+    );
+  });
+
   it("markRunning on a nonexistent pid throws", async () => {
     const { host } = await freshHost();
     expect(() => host.markRunning(9999)).toThrow(/markRunning/);
@@ -768,23 +777,16 @@ describe("dispatch: ENOSYS", () => {
     expect(response!.requestId).toBe(40);
   });
 
-  it("returns -ENOSYS for a known WASI opcode without a handler", async () => {
+  it("returns -ENOTSUP for FD_FDSTAT_SET_RIGHTS", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // `FD_FDSTAT_SET_RIGHTS` is in the WASI range (0x0026) but still
-    // has no handler and isn't planned for v1 (WASI's rights system
-    // is un-v1-relevant). Was `FD_PRESTAT_DIR_NAME` before that
-    // handler landed, then `PATH_READLINK`, `PATH_SYMLINK`,
-    // `PATH_LINK`, `SOCK_SHUTDOWN`, `FD_PREAD`, `FD_READDIR`. Swap
-    // this probe to whatever's still unhandled as the implementation
-    // catches up.
     const { response } = host.dispatch(pid, {
       opcode: OP_WASI.FD_FDSTAT_SET_RIGHTS,
       requestId: 41,
     });
-    expect(response!.status).toBe(-ERRNO.ENOSYS);
+    expect(response!.status).toBe(-ERRNO.ENOTSUP);
   });
 });
 

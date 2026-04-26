@@ -181,6 +181,37 @@ describe("createSpawnRouter", () => {
     ]);
   });
 
+  it("on user-worker memory message, forwards proc:memory to the kernel while the worker remains live", () => {
+    const h = makeHarness();
+    h.router.handleKernelMessage(sampleSpawn(12));
+    const w = h.workers[0]!;
+    h.kernel.posted.length = 0;
+
+    w.injectMessage({ kind: "memory", pid: 12, bytes: 131_072 });
+
+    expect(w.terminated).toBe(false);
+    expect(h.router.liveWorkers.has(12)).toBe(true);
+    expect(h.kernel.posted).toEqual([
+      { kind: "proc:memory", pid: 12, bytes: 131_072 },
+    ]);
+  });
+
+  it("on exited(memoryBytes), records memory before proc:exited", () => {
+    const h = makeHarness();
+    h.router.handleKernelMessage(sampleSpawn(14));
+    const w = h.workers[0]!;
+    h.kernel.posted.length = 0;
+
+    w.injectMessage({ kind: "exited", pid: 14, code: 0, memoryBytes: 262_144 });
+
+    expect(w.terminated).toBe(true);
+    expect(h.router.liveWorkers.has(14)).toBe(false);
+    expect(h.kernel.posted).toEqual([
+      { kind: "proc:memory", pid: 14, bytes: 262_144 },
+      { kind: "proc:exited", pid: 14, code: 0 },
+    ]);
+  });
+
   it("on user-worker error event, posts proc:exited(code=-1, trap) to the kernel and terminates the worker", () => {
     const h = makeHarness();
     h.router.handleKernelMessage(sampleSpawn(13));

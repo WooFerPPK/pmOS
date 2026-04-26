@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use abi::ext::Pid;
 
-use super::{BlockReason, Process, ProcState};
+use super::{BlockReason, ProcState, Process};
 
 /// Monotonic PID allocator.
 ///
@@ -163,11 +163,7 @@ impl ProcessTable {
     /// Find any zombie child of `parent_pid`, optionally filtered
     /// by a specific child pid (`any = false`) or "any child"
     /// (`any = true`).
-    pub fn find_zombie_child(
-        &self,
-        parent_pid: Pid,
-        target: ZombieTarget,
-    ) -> Option<Pid> {
+    pub fn find_zombie_child(&self, parent_pid: Pid, target: ZombieTarget) -> Option<Pid> {
         for (pid, proc) in &self.procs {
             if proc.state != ProcState::Zombie {
                 continue;
@@ -192,6 +188,19 @@ impl ProcessTable {
             .count()
     }
 
+    /// Record the current virtual memory size for `pid`.
+    ///
+    /// Returns `false` if the pid is missing. The process itself
+    /// owns the high-water mark update so all callers share the
+    /// same VmSize / VmPeak semantics.
+    pub fn record_memory_size(&mut self, pid: Pid, bytes: u64) -> bool {
+        let Some(proc) = self.procs.get_mut(&pid) else {
+            return false;
+        };
+        proc.record_memory_size(bytes);
+        true
+    }
+
     /// Mark a process as blocked on some event. Convenience wrapper
     /// that transitions the state and records the block reason in
     /// one atomic operation.
@@ -203,7 +212,8 @@ impl ProcessTable {
     ) -> Result<(), TransitionError> {
         assert!(state.is_blocked(), "block() requires a blocked ProcState");
         let proc = self.procs.get_mut(&pid).ok_or(TransitionError::NoSuchPid)?;
-        proc.transition(state).map_err(|_| TransitionError::Illegal)?;
+        proc.transition(state)
+            .map_err(|_| TransitionError::Illegal)?;
         proc.block_reason = Some(reason);
         Ok(())
     }

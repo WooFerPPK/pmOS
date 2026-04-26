@@ -133,6 +133,8 @@ pub struct Process {
     pub sab_handle: u64,
     pub spawn_time_ns: u64,
     pub cpu_time_ns: u64,
+    pub vm_size_bytes: u64,
+    pub vm_peak_bytes: u64,
     pub mem_limit: Option<usize>,
 }
 
@@ -167,7 +169,20 @@ impl Process {
             sab_handle,
             spawn_time_ns,
             cpu_time_ns: 0,
+            vm_size_bytes: 0,
+            vm_peak_bytes: 0,
             mem_limit: None,
+        }
+    }
+
+    /// Record the current virtual memory size reported for this
+    /// process. The high-water mark is monotonic for the lifetime
+    /// of the process, matching `/proc/<pid>/status`'s VmPeak
+    /// convention.
+    pub fn record_memory_size(&mut self, bytes: u64) {
+        self.vm_size_bytes = bytes;
+        if bytes > self.vm_peak_bytes {
+            self.vm_peak_bytes = bytes;
         }
     }
 
@@ -204,27 +219,27 @@ fn is_legal_transition(from: ProcState, to: ProcState) -> bool {
     use ProcState::*;
     match (from, to) {
         // Starting: can become Ready (boot completed) or Zombie (crashed before run).
-        (Starting, Ready)  => true,
+        (Starting, Ready) => true,
         (Starting, Zombie) => true,
 
         // Ready: scheduler dispatches, or a SIGKILL arrives before we run.
         (Ready, Running) => true,
-        (Ready, Zombie)  => true,
+        (Ready, Zombie) => true,
 
         // Running: can block on any blocking condition, exit, or be killed.
         (Running, BlockedOnSyscall) => true,
-        (Running, BlockedOnIpc)     => true,
-        (Running, BlockedOnWait)    => true,
-        (Running, Ready)            => true, // yield
-        (Running, Zombie)           => true,
+        (Running, BlockedOnIpc) => true,
+        (Running, BlockedOnWait) => true,
+        (Running, Ready) => true, // yield
+        (Running, Zombie) => true,
 
         // Blocked: becomes ready when its event fires, or is killed.
-        (BlockedOnSyscall, Ready)  => true,
+        (BlockedOnSyscall, Ready) => true,
         (BlockedOnSyscall, Zombie) => true,
-        (BlockedOnIpc,     Ready)  => true,
-        (BlockedOnIpc,     Zombie) => true,
-        (BlockedOnWait,    Ready)  => true,
-        (BlockedOnWait,    Zombie) => true,
+        (BlockedOnIpc, Ready) => true,
+        (BlockedOnIpc, Zombie) => true,
+        (BlockedOnWait, Ready) => true,
+        (BlockedOnWait, Zombie) => true,
 
         // Zombie: only `proc_wait` reaps it to Dead.
         (Zombie, Dead) => true,
@@ -344,5 +359,24 @@ mod tests {
         assert_eq!(p.worker_handle, 0xDEAD_BEEF);
         assert_eq!(p.sab_handle, 0xCAFE_F00D);
         assert_eq!(p.spawn_time_ns, 123_456_789);
+        assert_eq!(p.vm_size_bytes, 0);
+        assert_eq!(p.vm_peak_bytes, 0);
+    }
+
+    #[test]
+    fn process_memory_accounting_tracks_current_and_peak() {
+        let mut p = sample_proc(7);
+
+        p.record_memory_size(8 * 1024);
+        assert_eq!(p.vm_size_bytes, 8 * 1024);
+        assert_eq!(p.vm_peak_bytes, 8 * 1024);
+
+        p.record_memory_size(4 * 1024);
+        assert_eq!(p.vm_size_bytes, 4 * 1024);
+        assert_eq!(p.vm_peak_bytes, 8 * 1024);
+
+        p.record_memory_size(16 * 1024);
+        assert_eq!(p.vm_size_bytes, 16 * 1024);
+        assert_eq!(p.vm_peak_bytes, 16 * 1024);
     }
 }

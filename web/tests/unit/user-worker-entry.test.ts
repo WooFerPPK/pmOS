@@ -117,13 +117,22 @@ describe("installUserWorkerEntry", () => {
     });
     await entry.whenExited;
 
-    expect(msg.posted).toHaveLength(1);
-    const exited = msg.posted[0];
+    const memoryReports = msg.posted.filter((m) => m.kind === "memory");
+    expect(memoryReports.length).toBeGreaterThan(0);
+    for (const report of memoryReports) {
+      if (report.kind === "memory") {
+        expect(report.pid).toBe(pid);
+        expect(report.bytes).toBeGreaterThan(0);
+      }
+    }
+    const exited = msg.posted.find((m) => m.kind === "exited");
+    expect(exited).toBeDefined();
     expect(exited?.kind).toBe("exited");
     if (exited?.kind === "exited") {
       expect(exited.pid).toBe(pid);
       expect(exited.code).toBe(0);
       expect(exited.trap).toBeUndefined();
+      expect(exited.memoryBytes).toBeGreaterThan(0);
     }
 
     const concatenated = consoleWrites
@@ -192,13 +201,14 @@ describe("installUserWorkerEntry", () => {
     // available without a serviceHook + no real Atomics.wait on a
     // plain ArrayBuffer). The crash is the expected outcome here —
     // we only care that the wake-slot path was exercised.
-    expect(msg.posted).toHaveLength(1);
-    const exited = msg.posted[0];
+    const exited = msg.posted.find((m) => m.kind === "exited");
+    expect(exited).toBeDefined();
     expect(exited?.kind).toBe("exited");
     if (exited?.kind === "exited") {
       expect(exited.pid).toBe(pid);
       expect(exited.code).toBe(-1);
       expect(exited.trap).toBeDefined();
+      expect(exited.memoryBytes).toBeGreaterThan(0);
     }
     // The key assertion: SabBackend bumped the wake slot at least once
     // before the dispatch crashed — proving the `kernelWakeSlot` from

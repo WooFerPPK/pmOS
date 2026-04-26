@@ -140,13 +140,27 @@ async function runOnce(
     ...(options.serviceHook ? { serviceHook: options.serviceHook } : {}),
     ...(kernelWakeSlot !== undefined ? { kernelWakeSlot } : {}),
   });
-  const runtime = new UserWasmRuntime(boot.wasmBytes, backend);
+  const runtime = new UserWasmRuntime(boot.wasmBytes, backend, {
+    onMemorySizeBytes: (bytes) => {
+      messaging.postMessage({ kind: "memory", pid: boot.pid, bytes });
+    },
+  });
   try {
     const code = await runtime.run();
-    messaging.postMessage({ kind: "exited", pid: boot.pid, code });
+    const memoryBytes = runtime.memorySizeBytes();
+    messaging.postMessage(
+      memoryBytes !== undefined
+        ? { kind: "exited", pid: boot.pid, code, memoryBytes }
+        : { kind: "exited", pid: boot.pid, code },
+    );
   } catch (err) {
     const trap = err instanceof Error ? err.message : String(err);
-    messaging.postMessage({ kind: "exited", pid: boot.pid, code: -1, trap });
+    const memoryBytes = runtime.memorySizeBytes();
+    messaging.postMessage(
+      memoryBytes !== undefined
+        ? { kind: "exited", pid: boot.pid, code: -1, trap, memoryBytes }
+        : { kind: "exited", pid: boot.pid, code: -1, trap },
+    );
   }
 }
 

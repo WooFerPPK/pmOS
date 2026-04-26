@@ -158,7 +158,10 @@ pub extern "C" fn kernel_init() -> i32 {
         if k.vfs.mount("/dev", Box::new(DevFs::new())).is_err() {
             return -1;
         }
-        if k.vfs.mount("/proc", Box::new(ProcFs::with_static())).is_err() {
+        if k.vfs
+            .mount("/proc", Box::new(ProcFs::with_static()))
+            .is_err()
+        {
             return -1;
         }
         KERNEL = Some(k);
@@ -334,6 +337,26 @@ pub extern "C" fn kernel_mark_running(pid: Pid) -> i32 {
         return -1;
     }
     0
+}
+
+/// Record the current wasm linear-memory size for `pid`.
+///
+/// The browser-side user Worker owns the process's isolated
+/// [`WebAssembly.Memory`], so it reports byte counts through the
+/// kernel Worker rather than through a syscall. `bytes_lo` /
+/// `bytes_hi` form a little-endian u64 to keep the export ABI stable
+/// if a future memory64-capable runtime reports more than 4 GiB.
+///
+/// Returns `0` on success, `-1` for an unknown pid.
+#[no_mangle]
+pub extern "C" fn kernel_record_process_memory(pid: Pid, bytes_lo: u32, bytes_hi: u32) -> i32 {
+    let bytes = ((bytes_hi as u64) << 32) | (bytes_lo as u64);
+    let kernel = kernel_mut();
+    if kernel.procs.record_memory_size(pid, bytes) {
+        0
+    } else {
+        -1
+    }
 }
 
 // ---- dispatch ----------------------------------------------------------

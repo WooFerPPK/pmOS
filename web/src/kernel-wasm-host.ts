@@ -101,6 +101,11 @@ interface KernelExports {
   readonly kernel_install_console_fd: (pid: number, fd: number) => number;
   readonly kernel_install_signal_channel_fd: (pid: number, fd: number) => number;
   readonly kernel_mark_running: (pid: number) => number;
+  readonly kernel_record_process_memory: (
+    pid: number,
+    bytesLo: number,
+    bytesHi: number,
+  ) => number;
   readonly kernel_dispatch: (pid: number) => number;
   readonly kernel_take_next_wake_for_pid: (pid: number) => number;
   readonly kernel_resp_heap_ptr: () => number;
@@ -603,6 +608,20 @@ export class KernelWasmHost implements Kernel {
     const rc = this.exports.kernel_mark_running(pid);
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.markRunning(${pid}): rc=${rc}`);
+    }
+  }
+
+  recordProcessMemory(pid: number, bytes: number): void {
+    if (!Number.isFinite(bytes) || bytes < 0 || !Number.isSafeInteger(bytes)) {
+      throw new Error(`KernelWasmHost.recordProcessMemory: invalid byte count ${bytes}`);
+    }
+    const bytesLo = bytes >>> 0;
+    const bytesHi = Math.floor(bytes / 0x1_0000_0000) >>> 0;
+    const rc = this.exports.kernel_record_process_memory(pid, bytesLo, bytesHi);
+    if (rc !== 0) {
+      throw new Error(
+        `KernelWasmHost.recordProcessMemory(${pid}, ${bytes}): rc=${rc}`,
+      );
     }
   }
 

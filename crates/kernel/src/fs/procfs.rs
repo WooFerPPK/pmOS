@@ -4,13 +4,11 @@
 //! `/proc/meminfo`, `/proc/loadavg`, `/proc/storage` — plus a
 //! per-pid subtree under `/proc/<pid>/` that surfaces live
 //! process-table fields. Populated in this slice:
-//! `/proc/<pid>/status` (Name / State / Pid / PPid),
+//! `/proc/<pid>/status` (Name / State / Pid / PPid / VmSize / VmPeak),
 //! `/proc/<pid>/fd/<n>` symlinks describing each open file
 //! descriptor, and `/proc/<pid>/cmdline` with the process's
 //! NUL-separated argv. Follow-up slices add `stat`, `maps`,
-//! `environ`, etc. alongside the memory-tracking fields
-//! (`VmSize`, `VmPeak`) once the process table owns that
-//! accounting.
+//! `environ`, etc.
 //!
 //! Data sources are injected through the [`ProcFsSource`] trait.
 //! The v1 slice provides a [`StaticProcFsSource`] that returns
@@ -266,7 +264,8 @@ impl ProcFsSource for StaticProcFsSource {
 /// * `pid_status`, `live_pids` — implemented against the borrowed
 ///   [`ProcessTable`]. `/proc/<pid>/status` now shows whatever the
 ///   kernel actually holds for that pid, including live state
-///   transitions (Running → Zombie, etc.).
+///   transitions (Running → Zombie, etc.) and process memory
+///   counters (VmSize / VmPeak).
 /// * `pid_cmdline` — projects [`Process::argv`](crate::proc::Process)
 ///   through [`format_argv_cmdline`]. Returns `None` for a dead or
 ///   never-spawned pid; returns `Some(vec![])` for a live pid whose
@@ -275,7 +274,8 @@ impl ProcFsSource for StaticProcFsSource {
 ///   until a build-time banner is plumbed through.
 /// * `uptime`, `meminfo`, `loadavg` — placeholders (`"0 0\n"`,
 ///   `"0 0 0\n"`, `"0.00 0.00 0.00 0/0 0\n"`). Real values need a
-///   clock source + memory accounting, both of which are follow-ups.
+///   clock source + system-wide memory accounting, both of which
+///   are follow-ups.
 /// * `storage_info` — returns `None`; the block-driver counter
 ///   wiring is a separate follow-up slice, and the default
 ///   `storage()` impl falls back to the `"0 0 0\n"` placeholder.
@@ -349,6 +349,8 @@ impl<'a> ProcFsSource for KernelProcFsSource<'a> {
             ppid: proc.ppid,
             name: proc.name.clone(),
             state: proc_state_to_status(proc.state),
+            vm_size_bytes: proc.vm_size_bytes,
+            vm_peak_bytes: proc.vm_peak_bytes,
         })
     }
 
@@ -422,6 +424,8 @@ pub struct ProcStatusSnapshot {
     pub ppid: Pid,
     pub name: String,
     pub state: ProcStatusState,
+    pub vm_size_bytes: u64,
+    pub vm_peak_bytes: u64,
 }
 
 /// A snapshot of one open file descriptor in a process, as
@@ -444,9 +448,9 @@ pub struct ProcFdSnapshot {
 
 // Inode layout — ino 1 is the root directory; each top-level file
 // has a fixed ino so tests can assert on them.
-const INO_ROOT:    Ino = 1;
+const INO_ROOT: Ino = 1;
 const INO_VERSION: Ino = 2;
-const INO_UPTIME:  Ino = 3;
+const INO_UPTIME: Ino = 3;
 const INO_MEMINFO: Ino = 4;
 const INO_LOADAVG: Ino = 5;
 const INO_STORAGE: Ino = 6;
@@ -551,14 +555,25 @@ fn decode_pid_ino(ino: Ino) -> Option<(Pid, Ino)> {
 /// the one `format!` that backs it).
 fn format_pid_status(snap: &ProcStatusSnapshot) -> Vec<u8> {
     let text = format!(
-        "Name:\t{}\nState:\t{} ({})\nPid:\t{}\nPPid:\t{}\n",
+        "Name:\t{}\nState:\t{} ({})\nPid:\t{}\nPPid:\t{}\nVmSize:\t{} kB\nVmPeak:\t{} kB\n",
         snap.name,
         snap.state.letter(),
         snap.state.name(),
         snap.pid,
         snap.ppid,
+        bytes_to_status_kib(snap.vm_size_bytes),
+        bytes_to_status_kib(snap.vm_peak_bytes),
     );
     text.into_bytes()
+}
+
+#[inline]
+fn bytes_to_status_kib(bytes: u64) -> u64 {
+    if bytes == 0 {
+        0
+    } else {
+        ((bytes - 1) / 1024) + 1
+    }
 }
 
 /// Serialise an `argv` slice into the exact byte layout

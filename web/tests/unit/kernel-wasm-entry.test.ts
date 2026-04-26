@@ -59,6 +59,7 @@ const DEV_CONSOLE = 5;
 const EBADF = 8;
 const ENOENT = 44;
 const ENOSYS = 52;
+const ENOTSUP = 58;
 
 // ---- kernel.wasm export surface ---------------------------------------
 
@@ -68,6 +69,11 @@ interface KernelExports {
   kernel_register_process: (caps: bigint) => number;
   kernel_install_console_fd: (pid: number, fd: number) => number;
   kernel_mark_running: (pid: number) => number;
+  kernel_record_process_memory: (
+    pid: number,
+    bytesLo: number,
+    bytesHi: number,
+  ) => number;
   kernel_dispatch: (pid: number) => number;
   kernel_req_ptr: () => number;
   kernel_resp_ptr: () => number;
@@ -280,6 +286,12 @@ describe("kernel.wasm extern C entry points", () => {
   it("mark_running transitions a registered process", () => {
     const pid = kernel.kernel_register_process(CAPSET_ALL);
     expect(kernel.kernel_mark_running(pid)).toBe(0);
+  });
+
+  it("record_process_memory accepts known pids and rejects unknown pids", () => {
+    const pid = kernel.kernel_register_process(CAPSET_ALL);
+    expect(kernel.kernel_record_process_memory(pid, 0x0002_0000, 0)).toBe(0);
+    expect(kernel.kernel_record_process_memory(999_999, 0x0002_0000, 0)).toBe(-1);
   });
 
   // ---- PROC_SELF + PROC_PARENT ------------------------------------
@@ -530,19 +542,19 @@ describe("kernel.wasm extern C entry points", () => {
     expect(resp.status).toBe(-ENOSYS);
   });
 
-  it("known WASI opcode with no handler returns -ENOSYS (FD_FDSTAT_SET_RIGHTS)", () => {
+  it("FD_FDSTAT_SET_RIGHTS is explicitly unsupported in v1", () => {
     const pid = kernel.kernel_register_process(CAPSET_ALL);
     expect(kernel.kernel_mark_running(pid)).toBe(0);
 
     writeRequest(kernel, {
-      opcode: 0x0026, // FD_FDSTAT_SET_RIGHTS — WASI range but not implemented
+      opcode: 0x0026, // FD_FDSTAT_SET_RIGHTS
       requestId: 601,
       arg0: 0,
       heapPtr: 0,
       heapLen: 0,
     });
     expect(kernel.kernel_dispatch(pid)).toBe(0);
-    expect(readResponse(kernel).status).toBe(-ENOSYS);
+    expect(readResponse(kernel).status).toBe(-ENOTSUP);
   });
 
   // ---- request_id echo + no panics --------------------------------

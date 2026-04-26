@@ -148,6 +148,10 @@ interface UserExports {
   readonly _start: () => void;
 }
 
+export interface UserWasmRuntimeOptions {
+  readonly onMemorySizeBytes?: (bytes: number) => void;
+}
+
 /**
  * Handles one wasm32-wasip1 binary + one kernel backend + one
  * run of `_start`. Single-use: construct, call `run()`, read the
@@ -160,7 +164,19 @@ export class UserWasmRuntime {
   constructor(
     private readonly wasmBytes: BufferSource,
     private readonly backend: KernelBackend,
+    private readonly options: UserWasmRuntimeOptions = {},
   ) {}
+
+  memorySizeBytes(): number | undefined {
+    return this.memory?.buffer.byteLength;
+  }
+
+  private reportMemorySize(): void {
+    const bytes = this.memorySizeBytes();
+    if (bytes !== undefined) {
+      this.options.onMemorySizeBytes?.(bytes);
+    }
+  }
 
   /**
    * Instantiate the user wasm, satisfy its WASI imports with the
@@ -187,6 +203,7 @@ export class UserWasmRuntime {
       throw new Error("UserWasmRuntime: user wasm does not export `memory`");
     }
     this.memory = exports.memory;
+    this.reportMemorySize();
 
     try {
       exports._start();
@@ -210,11 +227,14 @@ export class UserWasmRuntime {
         // reaped us via a parallel SIGKILL path), the Worker is
         // about to be terminated anyway.
       }
+      this.reportMemorySize();
       return 0;
     } catch (err) {
       if (err instanceof UserProcessExited) {
+        this.reportMemorySize();
         return err.exitCode;
       }
+      this.reportMemorySize();
       throw err;
     }
   }

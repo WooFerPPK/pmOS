@@ -187,7 +187,25 @@ export function installWorkerEntry(
       }
       return;
     }
+    if (msg.kind === "proc:memory") {
+      if (realKernel !== undefined) {
+        try {
+          realKernel.recordProcessMemory(msg.pid, msg.bytes);
+        } catch {
+          // Unknown pid or stale lifecycle message; the process table
+          // remains the source of truth.
+        }
+      }
+      return;
+    }
     if (msg.kind === "proc:exited") {
+      if (msg.memoryBytes !== undefined && realKernel !== undefined) {
+        try {
+          realKernel.recordProcessMemory(msg.pid, msg.memoryBytes);
+        } catch {
+          // Stale exit for a pid the kernel no longer knows about.
+        }
+      }
       pidMap.delete(msg.pid);
       return;
     }

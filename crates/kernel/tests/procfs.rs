@@ -24,13 +24,10 @@ use abi::ext::Pid;
 
 use kernel::fs::procfs::{
     fd_symlink_ino, format_argv_cmdline, pid_cmdline_ino, pid_fd_dir_ino, pid_status_ino,
-    pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs, ProcFsSource,
-    ProcStatusSnapshot, ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
+    pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs, ProcFsSource, ProcStatusSnapshot,
+    ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
 };
-use kernel::proc::{
-    table::ProcessTable,
-    ExitStatus, Process, ProcState,
-};
+use kernel::proc::{table::ProcessTable, ExitStatus, ProcState, Process};
 use kernel::vfs::{FsError, NodeType, Vfs};
 
 // ---- Helpers --------------------------------------------------------
@@ -78,6 +75,8 @@ fn snapshots_from(table: &ProcessTable) -> Vec<ProcStatusSnapshot> {
                 ppid: p.ppid,
                 name: p.name.clone(),
                 state: project_state(p.state),
+                vm_size_bytes: p.vm_size_bytes,
+                vm_peak_bytes: p.vm_peak_bytes,
             })
         })
         .collect()
@@ -184,6 +183,30 @@ fn status_reports_pid_and_ppid_correctly() {
 }
 
 #[test]
+fn status_reports_vm_size_and_peak_in_kib() {
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    table.insert(make_process(pid, 1, "mem")).unwrap();
+    assert!(table.record_memory_size(pid, 8 * 1024));
+    assert!(table.record_memory_size(pid, 6 * 1024 + 1));
+
+    let mut vfs = vfs_with_snapshots(snapshots_from(&table));
+    let bytes = read_status(&mut vfs, pid).unwrap();
+    let text = core::str::from_utf8(&bytes).unwrap();
+
+    assert!(
+        text.contains("VmSize:\t7 kB\n"),
+        "missing VmSize line, text was: {:?}",
+        text,
+    );
+    assert!(
+        text.contains("VmPeak:\t8 kB\n"),
+        "missing VmPeak line, text was: {:?}",
+        text,
+    );
+}
+
+#[test]
 fn status_reports_state_zombie_after_proc_exit() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
@@ -206,8 +229,8 @@ fn status_reports_state_zombie_after_proc_exit() {
 // ---- Additional shape / layout assertions --------------------------
 
 #[test]
-fn status_ends_with_trailing_newline_and_four_fields() {
-    // Four `Key: Value\n` lines, in the documented order. The
+fn status_ends_with_trailing_newline_and_six_fields() {
+    // Six `Key: Value\n` lines, in the documented order. The
     // buffer ends on `\n` — no trailing whitespace.
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
@@ -220,11 +243,13 @@ fn status_ends_with_trailing_newline_and_four_fields() {
 
     assert!(text.ends_with('\n'));
     let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
-    assert_eq!(lines.len(), 4, "expected 4 lines, got {:?}", lines);
+    assert_eq!(lines.len(), 6, "expected 6 lines, got {:?}", lines);
     assert!(lines[0].starts_with("Name:\t"), "line 0: {:?}", lines[0]);
     assert!(lines[1].starts_with("State:\t"), "line 1: {:?}", lines[1]);
     assert!(lines[2].starts_with("Pid:\t"), "line 2: {:?}", lines[2]);
     assert!(lines[3].starts_with("PPid:\t"), "line 3: {:?}", lines[3]);
+    assert!(lines[4].starts_with("VmSize:\t"), "line 4: {:?}", lines[4]);
+    assert!(lines[5].starts_with("VmPeak:\t"), "line 5: {:?}", lines[5]);
 }
 
 #[test]
@@ -291,38 +316,14 @@ fn state_letter_mapping_covers_all_procstate_variants() {
     // variant addition fails here rather than silently serving
     // the wrong letter. The projection mirrors the live code
     // path's `project_state`.
-    assert_eq!(
-        project_state(ProcState::Running).letter(),
-        'R',
-    );
-    assert_eq!(
-        project_state(ProcState::Ready).letter(),
-        'S',
-    );
-    assert_eq!(
-        project_state(ProcState::Starting).letter(),
-        'S',
-    );
-    assert_eq!(
-        project_state(ProcState::BlockedOnSyscall).letter(),
-        'S',
-    );
-    assert_eq!(
-        project_state(ProcState::BlockedOnIpc).letter(),
-        'S',
-    );
-    assert_eq!(
-        project_state(ProcState::BlockedOnWait).letter(),
-        'S',
-    );
-    assert_eq!(
-        project_state(ProcState::Zombie).letter(),
-        'Z',
-    );
-    assert_eq!(
-        project_state(ProcState::Dead).letter(),
-        'Z',
-    );
+    assert_eq!(project_state(ProcState::Running).letter(), 'R',);
+    assert_eq!(project_state(ProcState::Ready).letter(), 'S',);
+    assert_eq!(project_state(ProcState::Starting).letter(), 'S',);
+    assert_eq!(project_state(ProcState::BlockedOnSyscall).letter(), 'S',);
+    assert_eq!(project_state(ProcState::BlockedOnIpc).letter(), 'S',);
+    assert_eq!(project_state(ProcState::BlockedOnWait).letter(), 'S',);
+    assert_eq!(project_state(ProcState::Zombie).letter(), 'Z',);
+    assert_eq!(project_state(ProcState::Dead).letter(), 'Z',);
 }
 
 #[test]
@@ -455,10 +456,7 @@ fn custom_source_with_only_storage_info_returns_formatted_storage_line() {
 /// populated from both a status snapshot list *and* a per-pid fd
 /// map. The canned `status` snapshot makes the pid directory live;
 /// `pid_fds` then populates the `fd/` subtree.
-fn vfs_with_fds(
-    statuses: Vec<ProcStatusSnapshot>,
-    fds: Vec<(Pid, Vec<ProcFdSnapshot>)>,
-) -> Vfs {
+fn vfs_with_fds(statuses: Vec<ProcStatusSnapshot>, fds: Vec<(Pid, Vec<ProcFdSnapshot>)>) -> Vfs {
     let mut source = StaticProcFsSource::default();
     for snap in statuses {
         source.set_pid_status(snap);
@@ -481,6 +479,8 @@ fn stub_status(pid: Pid, ppid: Pid, name: &str) -> ProcStatusSnapshot {
         ppid,
         name: name.into(),
         state: ProcStatusState::Sleeping,
+        vm_size_bytes: 0,
+        vm_peak_bytes: 0,
     }
 }
 
@@ -491,15 +491,24 @@ fn fd_dir_readdir_lists_open_fds() {
     // yield exactly those four entries, all of type SymLink.
     let pid: Pid = 42;
     let fds = vec![
-        ProcFdSnapshot { fd: 0, target: String::from("/dev/console") },
-        ProcFdSnapshot { fd: 1, target: String::from("/dev/console") },
-        ProcFdSnapshot { fd: 2, target: String::from("/dev/console") },
-        ProcFdSnapshot { fd: 3, target: String::from("/etc/preferences.toml") },
+        ProcFdSnapshot {
+            fd: 0,
+            target: String::from("/dev/console"),
+        },
+        ProcFdSnapshot {
+            fd: 1,
+            target: String::from("/dev/console"),
+        },
+        ProcFdSnapshot {
+            fd: 2,
+            target: String::from("/dev/console"),
+        },
+        ProcFdSnapshot {
+            fd: 3,
+            target: String::from("/etc/preferences.toml"),
+        },
     ];
-    let mut vfs = vfs_with_fds(
-        vec![stub_status(pid, 1, "sh")],
-        vec![(pid, fds)],
-    );
+    let mut vfs = vfs_with_fds(vec![stub_status(pid, 1, "sh")], vec![(pid, fds)]);
 
     let entries = vfs.readdir(&format!("/proc/{pid}/fd")).unwrap();
     assert_eq!(entries.len(), 4, "unexpected fd dir entries: {:?}", entries);
@@ -518,9 +527,10 @@ fn fd_symlink_read_returns_target_path() {
     // the byte-read path so a userland caller that doesn't
     // implement readlink can still surface the target.
     let pid: Pid = 42;
-    let fds = vec![
-        ProcFdSnapshot { fd: 3, target: String::from("/etc/preferences.toml") },
-    ];
+    let fds = vec![ProcFdSnapshot {
+        fd: 3,
+        target: String::from("/etc/preferences.toml"),
+    }];
     let mut source = StaticProcFsSource::default();
     source.set_pid_status(stub_status(pid, 1, "sh"));
     source.set_pid_fds(pid, fds);
@@ -548,11 +558,11 @@ fn fd_symlink_stat_reports_symlink_node_type() {
     // metadata rather than dereferencing to the target.
     let pid: Pid = 42;
     let target = String::from("/etc/preferences.toml");
-    let fds = vec![ProcFdSnapshot { fd: 3, target: target.clone() }];
-    let mut vfs = vfs_with_fds(
-        vec![stub_status(pid, 1, "sh")],
-        vec![(pid, fds)],
-    );
+    let fds = vec![ProcFdSnapshot {
+        fd: 3,
+        target: target.clone(),
+    }];
+    let mut vfs = vfs_with_fds(vec![stub_status(pid, 1, "sh")], vec![(pid, fds)]);
 
     let st = vfs.stat(&format!("/proc/{pid}/fd/3")).unwrap();
     assert_eq!(st.ty, NodeType::SymLink);
@@ -566,13 +576,14 @@ fn fd_dir_empty_for_pid_with_no_fds() {
     // registered. readdir on `/proc/1/fd` must succeed and return
     // an empty list — not NotADirectory, not NotFound.
     let pid: Pid = 1;
-    let mut vfs = vfs_with_fds(
-        vec![stub_status(pid, 0, "init")],
-        vec![],
-    );
+    let mut vfs = vfs_with_fds(vec![stub_status(pid, 0, "init")], vec![]);
 
     let entries = vfs.readdir(&format!("/proc/{pid}/fd")).unwrap();
-    assert!(entries.is_empty(), "expected empty fd dir, got: {:?}", entries);
+    assert!(
+        entries.is_empty(),
+        "expected empty fd dir, got: {:?}",
+        entries
+    );
 }
 
 #[test]
@@ -582,13 +593,11 @@ fn fd_dir_lookup_rejects_nonexistent_fd_number() {
     // would otherwise be happy to hand out a number; the
     // snapshot-set check is what gates the response.
     let pid: Pid = 42;
-    let fds = vec![
-        ProcFdSnapshot { fd: 3, target: String::from("/etc/preferences.toml") },
-    ];
-    let mut vfs = vfs_with_fds(
-        vec![stub_status(pid, 1, "sh")],
-        vec![(pid, fds)],
-    );
+    let fds = vec![ProcFdSnapshot {
+        fd: 3,
+        target: String::from("/etc/preferences.toml"),
+    }];
+    let mut vfs = vfs_with_fds(vec![stub_status(pid, 1, "sh")], vec![(pid, fds)]);
 
     let err = vfs.stat(&format!("/proc/{pid}/fd/99")).unwrap_err();
     assert_eq!(err, FsError::NotFound);
@@ -620,13 +629,11 @@ fn fd_dir_listed_in_pid_subtree_readdir() {
     // readdir on `/proc/42` must include both `status` and `fd`
     // entries; `status` stays a regular file, `fd` is a directory.
     let pid: Pid = 42;
-    let fds = vec![
-        ProcFdSnapshot { fd: 0, target: String::from("/dev/console") },
-    ];
-    let mut vfs = vfs_with_fds(
-        vec![stub_status(pid, 1, "sh")],
-        vec![(pid, fds)],
-    );
+    let fds = vec![ProcFdSnapshot {
+        fd: 0,
+        target: String::from("/dev/console"),
+    }];
+    let mut vfs = vfs_with_fds(vec![stub_status(pid, 1, "sh")], vec![(pid, fds)]);
 
     let entries = vfs.readdir(&format!("/proc/{pid}")).unwrap();
 
@@ -672,8 +679,26 @@ fn kernel_procfs_source_pid_status_returns_spawned_process() {
             ppid: 1,
             name: "edit".into(),
             state: ProcStatusState::Sleeping,
+            vm_size_bytes: 0,
+            vm_peak_bytes: 0,
         },
     );
+}
+
+#[test]
+fn kernel_procfs_source_pid_status_projects_memory_counters() {
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    table.insert(make_process(pid, 1, "worker")).unwrap();
+    assert!(table.record_memory_size(pid, 4 * 1024));
+    assert!(table.record_memory_size(pid, 9 * 1024));
+    assert!(table.record_memory_size(pid, 5 * 1024));
+
+    let snap = KernelProcFsSource::new(&table)
+        .pid_status(pid)
+        .expect("pid live");
+    assert_eq!(snap.vm_size_bytes, 5 * 1024);
+    assert_eq!(snap.vm_peak_bytes, 9 * 1024);
 }
 
 #[test]
@@ -760,10 +785,7 @@ fn kernel_procfs_source_version_uptime_meminfo_loadavg_are_placeholders() {
 /// populated with both a status snapshot and a cmdline byte
 /// sequence. The canned `status` snapshot makes the pid directory
 /// live; `pid_cmdline` then populates the `cmdline` file.
-fn vfs_with_cmdline(
-    statuses: Vec<ProcStatusSnapshot>,
-    cmdlines: Vec<(Pid, Vec<u8>)>,
-) -> Vfs {
+fn vfs_with_cmdline(statuses: Vec<ProcStatusSnapshot>, cmdlines: Vec<(Pid, Vec<u8>)>) -> Vfs {
     let mut source = StaticProcFsSource::default();
     for snap in statuses {
         source.set_pid_status(snap);
@@ -783,10 +805,7 @@ fn vfs_with_cmdline(
 fn cmdline_lookup_returns_regular_file_for_pid_with_cmdline() {
     let pid: Pid = 42;
     let cmdline: Vec<u8> = b"/usr/bin/edit\0file.txt\0".to_vec();
-    let mut vfs = vfs_with_cmdline(
-        vec![stub_status(pid, 1, "edit")],
-        vec![(pid, cmdline)],
-    );
+    let mut vfs = vfs_with_cmdline(vec![stub_status(pid, 1, "edit")], vec![(pid, cmdline)]);
 
     let st = vfs.stat(&format!("/proc/{pid}/cmdline")).unwrap();
     assert_eq!(st.ty, NodeType::RegularFile);
@@ -821,10 +840,7 @@ fn cmdline_stat_reports_mode_0o444_and_correct_size() {
     let pid: Pid = 42;
     let cmdline: Vec<u8> = b"/usr/bin/edit\0file.txt\0".to_vec();
     let expected_size = cmdline.len() as u64;
-    let mut vfs = vfs_with_cmdline(
-        vec![stub_status(pid, 1, "edit")],
-        vec![(pid, cmdline)],
-    );
+    let mut vfs = vfs_with_cmdline(vec![stub_status(pid, 1, "edit")], vec![(pid, cmdline)]);
 
     let st = vfs.stat(&format!("/proc/{pid}/cmdline")).unwrap();
     assert_eq!(st.mode, 0o444);
@@ -837,10 +853,7 @@ fn cmdline_lookup_rejects_pid_without_cmdline() {
     // `/proc/99/cmdline` must report NotFound, not serve an empty
     // regular file.
     let pid: Pid = 99;
-    let mut vfs = vfs_with_cmdline(
-        vec![stub_status(pid, 1, "sh")],
-        vec![],
-    );
+    let mut vfs = vfs_with_cmdline(vec![stub_status(pid, 1, "sh")], vec![]);
 
     let err = vfs.stat(&format!("/proc/{pid}/cmdline")).unwrap_err();
     assert_eq!(err, FsError::NotFound);
@@ -904,7 +917,9 @@ fn cmdline_empty_argv_yields_empty_bytes() {
     assert_eq!(st.size, 0);
 
     let mut buf = [0u8; 16];
-    let n = vfs.read(&format!("/proc/{pid}/cmdline"), 0, &mut buf).unwrap();
+    let n = vfs
+        .read(&format!("/proc/{pid}/cmdline"), 0, &mut buf)
+        .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -913,10 +928,7 @@ fn format_argv_cmdline_joins_with_nul_and_trailing_nul() {
     // Pin the byte layout the bridge relies on: each argv entry
     // followed by a single NUL, including the last, so readers can
     // split on 0x00 without special-casing the terminator.
-    let argv = vec![
-        "/usr/bin/edit".to_string(),
-        "file.txt".to_string(),
-    ];
+    let argv = vec!["/usr/bin/edit".to_string(), "file.txt".to_string()];
     let bytes = format_argv_cmdline(&argv);
     assert_eq!(bytes, b"/usr/bin/edit\0file.txt\0".to_vec());
 

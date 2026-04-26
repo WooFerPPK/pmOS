@@ -84,6 +84,16 @@ export type MainToKernel =
       readonly pid: number;
       readonly code: number;
       readonly trap?: string;
+      readonly memoryBytes?: number;
+    }
+  | {
+      // Main observed a user Worker's current wasm linear-memory
+      // size. The kernel records this as process VM accounting; the
+      // user Worker remains the authority because each process owns a
+      // separate wasm memory object.
+      readonly kind: "proc:memory";
+      readonly pid: number;
+      readonly bytes: number;
     };
 
 /** Kernel-worker → main-thread. */
@@ -145,14 +155,22 @@ export type MainToUser = {
 };
 
 /**
- * Dedicated user Worker → main-thread. The Worker posts exactly one
- * `exited` message before closing. `trap` is present when the user
- * wasm trapped or the WASI shim threw a non-`UserProcessExited` error;
- * for clean `proc_exit(code)` paths only `code` is set.
+ * Dedicated user Worker → main-thread. The Worker may post memory
+ * samples as its wasm memory becomes observable, then posts exactly
+ * one `exited` message before closing. `trap` is present when the
+ * user wasm trapped or the WASI shim threw a non-`UserProcessExited`
+ * error; for clean `proc_exit(code)` paths only `code` is set.
  */
-export type UserToMain = {
-  readonly kind: "exited";
-  readonly pid: number;
-  readonly code: number;
-  readonly trap?: string;
-};
+export type UserToMain =
+  | {
+      readonly kind: "memory";
+      readonly pid: number;
+      readonly bytes: number;
+    }
+  | {
+      readonly kind: "exited";
+      readonly pid: number;
+      readonly code: number;
+      readonly trap?: string;
+      readonly memoryBytes?: number;
+    };

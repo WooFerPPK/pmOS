@@ -15,7 +15,7 @@ use abi::ext::Pid;
 
 use kernel::proc::{
     table::{ExitError, InsertError, ProcessTable, TransitionError, ZombieTarget},
-    BlockReason, ExitStatus, Process, ProcState, Scheduler,
+    BlockReason, ExitStatus, ProcState, Process, Scheduler,
 };
 
 fn make_process(pid: Pid, ppid: Pid, name: &str, caps: CapSet) -> Process {
@@ -50,7 +50,9 @@ fn pid_allocator_never_reuses_within_a_boot() {
     let mut table = ProcessTable::new();
 
     let pid_a = table.allocate_pid();
-    table.insert(make_process(pid_a, 1, "a", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(pid_a, 1, "a", CapSet::EMPTY))
+        .unwrap();
     table.transition(pid_a, ProcState::Ready).unwrap();
     table.transition(pid_a, ProcState::Running).unwrap();
     table.exit(pid_a, ExitStatus::Exited(0)).unwrap();
@@ -68,7 +70,12 @@ fn insert_and_lookup_round_trip() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
     table
-        .insert(make_process(pid, 1, "sh", CapSet::from_caps(&[Cap::DisplayClient])))
+        .insert(make_process(
+            pid,
+            1,
+            "sh",
+            CapSet::from_caps(&[Cap::DisplayClient]),
+        ))
         .unwrap();
 
     let proc = table.get(pid).expect("process exists");
@@ -82,8 +89,12 @@ fn insert_and_lookup_round_trip() {
 fn insert_duplicate_pid_fails() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
-    table.insert(make_process(pid, 1, "a", CapSet::EMPTY)).unwrap();
-    let err = table.insert(make_process(pid, 1, "b", CapSet::EMPTY)).unwrap_err();
+    table
+        .insert(make_process(pid, 1, "a", CapSet::EMPTY))
+        .unwrap();
+    let err = table
+        .insert(make_process(pid, 1, "b", CapSet::EMPTY))
+        .unwrap_err();
     assert_eq!(err, InsertError::PidInUse);
 }
 
@@ -100,7 +111,9 @@ fn lookup_missing_pid_returns_none() {
 fn exit_sets_zombie_and_retains_status() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
-    table.insert(make_process(pid, 1, "child", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(pid, 1, "child", CapSet::EMPTY))
+        .unwrap();
     table.transition(pid, ProcState::Ready).unwrap();
     table.transition(pid, ProcState::Running).unwrap();
     table.exit(pid, ExitStatus::Exited(7)).unwrap();
@@ -115,7 +128,9 @@ fn exit_sets_zombie_and_retains_status() {
 fn reap_removes_zombie_and_returns_status() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
-    table.insert(make_process(pid, 1, "child", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(pid, 1, "child", CapSet::EMPTY))
+        .unwrap();
     table.transition(pid, ProcState::Ready).unwrap();
     table.transition(pid, ProcState::Running).unwrap();
     table.exit(pid, ExitStatus::Signaled(9)).unwrap();
@@ -130,7 +145,9 @@ fn reap_removes_zombie_and_returns_status() {
 fn reap_non_zombie_returns_none() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
-    table.insert(make_process(pid, 1, "running", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(pid, 1, "running", CapSet::EMPTY))
+        .unwrap();
     table.transition(pid, ProcState::Ready).unwrap();
     // Reaping a Ready process is a no-op.
     assert_eq!(table.reap(pid), None);
@@ -141,7 +158,9 @@ fn reap_non_zombie_returns_none() {
 fn exit_dead_process_fails() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
-    table.insert(make_process(pid, 1, "zombie", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(pid, 1, "zombie", CapSet::EMPTY))
+        .unwrap();
     table.transition(pid, ProcState::Ready).unwrap();
     table.transition(pid, ProcState::Running).unwrap();
     table.exit(pid, ExitStatus::Exited(0)).unwrap();
@@ -157,7 +176,9 @@ fn exit_dead_process_fails() {
 fn illegal_transitions_are_errors_from_the_table() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
-    table.insert(make_process(pid, 1, "x", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(pid, 1, "x", CapSet::EMPTY))
+        .unwrap();
     // Starting -> Running is illegal (must pass through Ready).
     assert_eq!(
         table.transition(pid, ProcState::Running).unwrap_err(),
@@ -181,12 +202,18 @@ fn find_zombie_child_any_target() {
     let mut table = ProcessTable::new();
 
     let parent = table.allocate_pid();
-    table.insert(make_process(parent, 0, "init", CapSet::ALL)).unwrap();
+    table
+        .insert(make_process(parent, 0, "init", CapSet::ALL))
+        .unwrap();
 
     let child_a = table.allocate_pid();
-    table.insert(make_process(child_a, parent, "a", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(child_a, parent, "a", CapSet::EMPTY))
+        .unwrap();
     let child_b = table.allocate_pid();
-    table.insert(make_process(child_b, parent, "b", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(child_b, parent, "b", CapSet::EMPTY))
+        .unwrap();
 
     // Neither is a zombie yet.
     assert!(table.find_zombie_child(parent, ZombieTarget::Any).is_none());
@@ -218,11 +245,15 @@ fn child_count_excludes_dead_processes() {
     let mut table = ProcessTable::new();
 
     let parent = table.allocate_pid();
-    table.insert(make_process(parent, 0, "init", CapSet::ALL)).unwrap();
+    table
+        .insert(make_process(parent, 0, "init", CapSet::ALL))
+        .unwrap();
 
     for _ in 0..3 {
         let pid = table.allocate_pid();
-        table.insert(make_process(pid, parent, "c", CapSet::EMPTY)).unwrap();
+        table
+            .insert(make_process(pid, parent, "c", CapSet::EMPTY))
+            .unwrap();
     }
     assert_eq!(table.child_count(parent), 3);
 
@@ -236,13 +267,32 @@ fn child_count_excludes_dead_processes() {
     assert_eq!(table.child_count(parent), 2);
 }
 
+#[test]
+fn process_table_records_memory_size_and_peak() {
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    table
+        .insert(make_process(pid, 1, "mem", CapSet::EMPTY))
+        .unwrap();
+
+    assert!(table.record_memory_size(pid, 12 * 1024));
+    assert!(table.record_memory_size(pid, 5 * 1024));
+    let proc = table.get(pid).unwrap();
+    assert_eq!(proc.vm_size_bytes, 5 * 1024);
+    assert_eq!(proc.vm_peak_bytes, 12 * 1024);
+
+    assert!(!table.record_memory_size(999, 1));
+}
+
 // ---- Block + wake ---------------------------------------------------
 
 #[test]
 fn block_on_syscall_then_wake_round_trip() {
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
-    table.insert(make_process(pid, 1, "x", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(pid, 1, "x", CapSet::EMPTY))
+        .unwrap();
     table.transition(pid, ProcState::Ready).unwrap();
     table.transition(pid, ProcState::Running).unwrap();
 
@@ -276,7 +326,9 @@ fn scheduler_picks_ready_in_fifo_order() {
     let b = table.allocate_pid();
     let c = table.allocate_pid();
     for (pid, name) in [(a, "a"), (b, "b"), (c, "c")] {
-        table.insert(make_process(pid, 1, name, CapSet::EMPTY)).unwrap();
+        table
+            .insert(make_process(pid, 1, name, CapSet::EMPTY))
+            .unwrap();
         table.transition(pid, ProcState::Ready).unwrap();
         sched.enqueue(pid);
     }
@@ -299,8 +351,12 @@ fn scheduler_skips_stale_entries_for_killed_processes() {
 
     let a = table.allocate_pid();
     let b = table.allocate_pid();
-    table.insert(make_process(a, 1, "a", CapSet::EMPTY)).unwrap();
-    table.insert(make_process(b, 1, "b", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(a, 1, "a", CapSet::EMPTY))
+        .unwrap();
+    table
+        .insert(make_process(b, 1, "b", CapSet::EMPTY))
+        .unwrap();
     table.transition(a, ProcState::Ready).unwrap();
     table.transition(b, ProcState::Ready).unwrap();
     sched.enqueue(a);
@@ -320,7 +376,9 @@ fn scheduler_returns_none_when_no_process_is_ready() {
     let mut sched = Scheduler::new();
 
     let a = table.allocate_pid();
-    table.insert(make_process(a, 1, "a", CapSet::EMPTY)).unwrap();
+    table
+        .insert(make_process(a, 1, "a", CapSet::EMPTY))
+        .unwrap();
     // Still in Starting — not Ready.
     sched.enqueue(a);
     assert_eq!(sched.pick_next(&mut table), None);
@@ -343,7 +401,9 @@ fn scheduler_remove_clears_from_queue_and_current() {
     let a = table.allocate_pid();
     let b = table.allocate_pid();
     for (pid, name) in [(a, "a"), (b, "b")] {
-        table.insert(make_process(pid, 1, name, CapSet::EMPTY)).unwrap();
+        table
+            .insert(make_process(pid, 1, name, CapSet::EMPTY))
+            .unwrap();
         table.transition(pid, ProcState::Ready).unwrap();
         sched.enqueue(pid);
     }
@@ -369,7 +429,9 @@ fn live_count_and_live_pids_exclude_dead() {
     for i in 1..=3 {
         let pid = table.allocate_pid();
         assert_eq!(pid, i);
-        table.insert(make_process(pid, 0, "p", CapSet::EMPTY)).unwrap();
+        table
+            .insert(make_process(pid, 0, "p", CapSet::EMPTY))
+            .unwrap();
     }
     assert_eq!(table.live_count(), 3);
     assert_eq!(table.live_pids(), vec![1, 2, 3]);
