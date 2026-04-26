@@ -43,12 +43,7 @@ const LOOKUP_SYMLINK_FOLLOW: u32 = 0x1;
 
 /// Dispatch a request whose opcode is in the WASI preview 1 range.
 /// The caller has already guarded with [`abi::wasi::is_wasi`].
-pub fn dispatch_wasi(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+pub fn dispatch_wasi(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     match req.opcode {
         op::FD_WRITE => handle_fd_write(kernel, pid, req, heap),
         op::FD_READ => handle_fd_read(kernel, pid, req, heap),
@@ -139,12 +134,7 @@ fn handle_fd_write(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) ->
 //                 of the heap window was populated without
 //                 looking at `value` first
 
-fn handle_fd_read(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_fd_read(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let fd = args_u32(req, 0);
     let max_len = req.heap_len as usize;
     let Some(buf) = heap_out_mut(req, heap, max_len) else {
@@ -227,21 +217,14 @@ fn handle_fd_seek(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
             }
             offset as u64
         }
-        x if x == abi::wasi::Whence::Cur as u8 => {
-            match entry.offset.checked_add_signed(offset) {
-                Some(n) => n,
-                None => return Response::err(req.request_id, EINVAL),
-            }
-        }
+        x if x == abi::wasi::Whence::Cur as u8 => match entry.offset.checked_add_signed(offset) {
+            Some(n) => n,
+            None => return Response::err(req.request_id, EINVAL),
+        },
         x if x == abi::wasi::Whence::End as u8 => {
             let st = match kernel.vfs.stat_ino(mount_id, ino) {
                 Ok(s) => s,
-                Err(e) => {
-                    return Response::err(
-                        req.request_id,
-                        kerr_to_errno(KernelError::Fs(e)),
-                    )
-                }
+                Err(e) => return Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
             };
             match st.size.checked_add_signed(offset) {
                 Some(n) => n,
@@ -303,17 +286,17 @@ fn handle_fd_tell(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 
 // ---- fd-state opcodes (fd_advise / fd_allocate / fd_sync / fd_datasync) ----
 //
-// Four "fd-state" opcodes that collapse to trivial semantics in v1's
-// tmpfs-backed VFS. All four share the same guards — EBADF on an
-// unopened fd; EINVAL on every non-Vnode FdObject (the state these
-// opcodes touch only has meaning for seekable regular files).
+// Four "fd-state" opcodes over Vnode fds. All four share the
+// same guards — EBADF on an unopened fd; EINVAL on every non-Vnode
+// FdObject (the state these opcodes touch only has meaning for
+// seekable regular files).
 //
 //   fd_advise   = no-op success (the advice is taken, then discarded;
 //                 POSIX and WASI both permit this, the opcode is a
 //                 hint with no reserved behaviour).
-//   fd_sync     = no-op success (nothing to flush; v1 writes are
-//                 synchronous into the vfs state).
-//   fd_datasync = no-op success (same reason).
+//   fd_sync     = forward to the mounted filesystem's sync hook.
+//   fd_datasync = same as fd_sync in v1 (metadata/data split is
+//                 not modelled below Filesystem::sync).
 //   fd_allocate = ENOTSUP (v1 tmpfs has no preallocation primitive;
 //                 a success response would lie about reserved space,
 //                 ENOTSUP is the honest answer).
@@ -363,7 +346,10 @@ fn handle_fd_sync(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
         Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
     match entry.object {
-        FdObject::Vnode { .. } => Response::ok(req.request_id, 0),
+        FdObject::Vnode { mount_id, .. } => match kernel.vfs.sync_mount(mount_id) {
+            Ok(()) => Response::ok(req.request_id, 0),
+            Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
+        },
         _ => Response::err(req.request_id, EINVAL),
     }
 }
@@ -378,7 +364,10 @@ fn handle_fd_datasync(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response 
         Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
     match entry.object {
-        FdObject::Vnode { .. } => Response::ok(req.request_id, 0),
+        FdObject::Vnode { mount_id, .. } => match kernel.vfs.sync_mount(mount_id) {
+            Ok(()) => Response::ok(req.request_id, 0),
+            Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
+        },
         _ => Response::err(req.request_id, EINVAL),
     }
 }
@@ -411,11 +400,7 @@ fn handle_fd_datasync(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response 
 // than calling FdTable::renumber directly from the handler) is the
 // release_object path for the prior `to` entry.
 
-fn handle_fd_renumber(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-) -> Response {
+fn handle_fd_renumber(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let from = args_u32(req, 0);
     let to = args_u32(req, 4);
     match kernel.fd_renumber(pid, from, to) {
@@ -475,12 +460,7 @@ fn handle_fd_close(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 // directory). EXCL without CREAT is ignored per POSIX. TRUNC on a
 // directory → EISDIR; TRUNC on a read-only fs → EROFS.
 
-fn handle_path_open(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_path_open(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let wasi_bits = args_u32(req, 0);
     let flags = FdFlags::from_wasi_bits(wasi_bits);
     let oflags = {
@@ -824,22 +804,17 @@ fn filetype_for(object: FdObject) -> u8 {
 
 fn filetype_from_nodetype(ty: NodeType) -> u8 {
     match ty {
-        NodeType::RegularFile     => ft::REGULAR_FILE,
-        NodeType::Directory       => ft::DIRECTORY,
-        NodeType::CharDevice(_)   => ft::CHARACTER_DEVICE,
-        NodeType::Socket          => ft::SOCKET_STREAM,
-        NodeType::SymLink         => ft::SYMBOLIC_LINK,
+        NodeType::RegularFile => ft::REGULAR_FILE,
+        NodeType::Directory => ft::DIRECTORY,
+        NodeType::CharDevice(_) => ft::CHARACTER_DEVICE,
+        NodeType::Socket => ft::SOCKET_STREAM,
+        NodeType::SymLink => ft::SYMBOLIC_LINK,
         // WASI has no FIFO filetype; UNKNOWN is the honest answer.
-        NodeType::Fifo            => ft::UNKNOWN,
+        NodeType::Fifo => ft::UNKNOWN,
     }
 }
 
-fn handle_fd_fdstat_get(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_fd_fdstat_get(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let fd = args_u32(req, 0);
     let table = match kernel.fds(pid) {
         Ok(t) => t,
@@ -923,12 +898,7 @@ fn handle_fd_filestat_get(
         FdObject::Vnode { mount_id, ino } => {
             let st = match kernel.vfs.stat_ino(mount_id, ino) {
                 Ok(s) => s,
-                Err(e) => {
-                    return Response::err(
-                        req.request_id,
-                        kerr_to_errno(KernelError::Fs(e)),
-                    )
-                }
+                Err(e) => return Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
             };
             (
                 filetype_from_nodetype(st.ty),
@@ -941,9 +911,7 @@ fn handle_fd_filestat_get(
                 st.ctime_ns,
             )
         }
-        FdObject::CharDevice(devnum) => {
-            (ft::CHARACTER_DEVICE, 0, devnum as u64, 0, 1, 0, 0, 0)
-        }
+        FdObject::CharDevice(devnum) => (ft::CHARACTER_DEVICE, 0, devnum as u64, 0, 1, 0, 0, 0),
         FdObject::Socket(id) | FdObject::DisplayConn(id) => {
             (ft::SOCKET_STREAM, 0, id as u64, 0, 1, 0, 0, 0)
         }
@@ -951,9 +919,7 @@ fn handle_fd_filestat_get(
             (ft::UNKNOWN, 0, id as u64, 0, 1, 0, 0, 0)
         }
         FdObject::SignalChannel => (ft::UNKNOWN, 0, 0, 0, 1, 0, 0, 0),
-        FdObject::Watch { watch_id } => {
-            (ft::UNKNOWN, 0, watch_id.0 as u64, 0, 1, 0, 0, 0)
-        }
+        FdObject::Watch { watch_id } => (ft::UNKNOWN, 0, watch_id.0 as u64, 0, 1, 0, 0, 0),
         FdObject::HostFile { token } => {
             // Per `contracts/syscalls.md §3.6`: returns the host
             // file's size in `st_size` and zero for all timestamps.
@@ -1058,35 +1024,23 @@ fn handle_path_filestat_get(
     };
     let (mount_id, ino) = match resolved {
         Ok(p) => p,
-        Err(e) => {
-            return Response::err(
-                req.request_id,
-                kerr_to_errno(KernelError::Fs(e)),
-            )
-        }
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     };
     let st = match kernel.vfs.stat_ino(mount_id, ino) {
         Ok(s) => s,
-        Err(e) => {
-            return Response::err(
-                req.request_id,
-                kerr_to_errno(KernelError::Fs(e)),
-            )
-        }
+        Err(e) => return Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     };
 
     let Some(buf) = heap_out_mut(req, heap, fs_off::SIZE) else {
         return Response::err(req.request_id, EINVAL);
     };
     buf[..fs_off::SIZE].copy_from_slice(&[0u8; fs_off::SIZE]);
-    buf[fs_off::OFF_DEV..fs_off::OFF_DEV + 8]
-        .copy_from_slice(&(mount_id.0 as u64).to_le_bytes());
+    buf[fs_off::OFF_DEV..fs_off::OFF_DEV + 8].copy_from_slice(&(mount_id.0 as u64).to_le_bytes());
     buf[fs_off::OFF_INO..fs_off::OFF_INO + 8].copy_from_slice(&st.ino.to_le_bytes());
     buf[fs_off::OFF_FILETYPE] = filetype_from_nodetype(st.ty);
     // bytes fs_off::OFF_FILETYPE+1 .. fs_off::OFF_NLINK stay zero
     // (struct-alignment padding before the next u64 field).
-    buf[fs_off::OFF_NLINK..fs_off::OFF_NLINK + 8]
-        .copy_from_slice(&(st.nlink as u64).to_le_bytes());
+    buf[fs_off::OFF_NLINK..fs_off::OFF_NLINK + 8].copy_from_slice(&(st.nlink as u64).to_le_bytes());
     buf[fs_off::OFF_SIZE..fs_off::OFF_SIZE + 8].copy_from_slice(&st.size.to_le_bytes());
     buf[fs_off::OFF_ATIM..fs_off::OFF_ATIM + 8].copy_from_slice(&st.atime_ns.to_le_bytes());
     buf[fs_off::OFF_MTIM..fs_off::OFF_MTIM + 8].copy_from_slice(&st.mtime_ns.to_le_bytes());
@@ -1234,10 +1188,7 @@ fn handle_fd_filestat_set_times(
 
     match kernel.vfs.set_times_ino(mount_id, ino, atim_opt, mtim_opt) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1300,10 +1251,7 @@ fn handle_path_filestat_set_times(
 
     match kernel.vfs.set_times(path, atim_opt, mtim_opt) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1388,12 +1336,7 @@ fn handle_fd_prestat_dir_name(req: &Request) -> Response {
 
 use abi::wasi::dirent as de;
 
-fn handle_fd_readdir(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_fd_readdir(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let fd = args_u32(req, 0);
     let cookie = args_u64(req, 4);
     let buf_len = req.heap_len as usize;
@@ -1423,10 +1366,8 @@ fn handle_fd_readdir(
         let remaining = buf_len - written;
         let header_end = core::cmp::min(de::HEADER_SIZE, remaining);
         let mut header = [0u8; de::HEADER_SIZE];
-        header[de::OFF_D_NEXT..de::OFF_D_NEXT + 8]
-            .copy_from_slice(&d_next.to_le_bytes());
-        header[de::OFF_D_INO..de::OFF_D_INO + 8]
-            .copy_from_slice(&ent.ino.to_le_bytes());
+        header[de::OFF_D_NEXT..de::OFF_D_NEXT + 8].copy_from_slice(&d_next.to_le_bytes());
+        header[de::OFF_D_INO..de::OFF_D_INO + 8].copy_from_slice(&ent.ino.to_le_bytes());
         header[de::OFF_D_NAMLEN..de::OFF_D_NAMLEN + 4]
             .copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
         header[de::OFF_D_TYPE] = d_type;
@@ -1490,10 +1431,7 @@ fn handle_path_unlink_file(
     };
     match kernel.vfs_unlink(path) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1529,12 +1467,7 @@ fn handle_path_unlink_file(
 // other in-tree filesystems inherit the trait default (ReadOnly /
 // NotSupported depending on the impl).
 
-fn handle_path_rename(
-    kernel: &mut Kernel,
-    _pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_path_rename(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let _from_dir_fd = args_u32(req, 0);
     let _to_dir_fd = args_u32(req, 4);
     let old_len = args_u32(req, 8) as usize;
@@ -1554,10 +1487,7 @@ fn handle_path_rename(
     };
     match kernel.vfs.rename(old_path, new_path) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1595,12 +1525,7 @@ fn handle_path_rename(
 // ENOTSUP — a hardlink can't span filesystems because inode numbers
 // are per-mount.
 
-fn handle_path_link(
-    kernel: &mut Kernel,
-    _pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_path_link(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let _old_fd = args_u32(req, 0);
     let _old_flags = args_u32(req, 4);
     let _new_fd = args_u32(req, 8);
@@ -1621,10 +1546,7 @@ fn handle_path_link(
     };
     match kernel.vfs.link(old_path, new_path) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1665,12 +1587,7 @@ fn handle_path_link(
 // permission — devfs / procfs never gain symlinks in any v1-era
 // future slice.
 
-fn handle_path_symlink(
-    kernel: &mut Kernel,
-    _pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_path_symlink(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let old_len = args_u32(req, 0) as usize;
 
     let Some(heap_bytes) = heap_in(req, heap) else {
@@ -1688,10 +1605,7 @@ fn handle_path_symlink(
     };
     match kernel.vfs.symlink(target, new_path) {
         Ok(_ino) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1753,10 +1667,7 @@ fn handle_path_readlink(
             extra_len: n as u32,
             _pad: [0u8; 12],
         },
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1796,10 +1707,7 @@ fn handle_path_create_directory(
     };
     match kernel.vfs_mkdir(path, 0o755) {
         Ok(_) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1818,10 +1726,7 @@ fn handle_path_remove_directory(
     };
     match kernel.vfs_rmdir(path) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1931,11 +1836,7 @@ fn handle_fd_fdstat_set_rights(req: &Request) -> Response {
 // NotSupported → ENOTSUP (but devfs has no regular-file vnodes in
 // v1, so that branch is unreachable from the WASI surface).
 
-fn handle_fd_filestat_set_size(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-) -> Response {
+fn handle_fd_filestat_set_size(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let fd = args_u32(req, 0);
     let new_size = args_u64(req, 4);
 
@@ -1952,10 +1853,7 @@ fn handle_fd_filestat_set_size(
     };
     match kernel.vfs.truncate_ino(mount_id, ino, new_size) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -1989,12 +1887,7 @@ fn handle_fd_filestat_set_size(
 // stream isn't seekable, a char device's bytes are produced on
 // demand, etc.
 
-fn handle_fd_pread(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_fd_pread(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let fd = args_u32(req, 0);
     let offset = args_u64(req, 4);
 
@@ -2021,19 +1914,11 @@ fn handle_fd_pread(
             extra_len: n as u32,
             _pad: [0u8; 12],
         },
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
-fn handle_fd_pwrite(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_fd_pwrite(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let fd = args_u32(req, 0);
     let offset = args_u64(req, 4);
 
@@ -2053,10 +1938,7 @@ fn handle_fd_pwrite(
     };
     match kernel.vfs.write_ino(mount_id, ino, offset, bytes) {
         Ok(n) => Response::ok(req.request_id, n as i64),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::Fs(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
 }
 
@@ -2089,12 +1971,7 @@ fn handle_fd_pwrite(
 // discards them — a userland caller that asks for SO_OOB gets a
 // plain in-band send, no error.
 
-fn handle_sock_send(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_sock_send(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let fd = args_u32(req, 0);
     let _si_flags = args_u32(req, 4) & 0xFFFF;
 
@@ -2112,10 +1989,11 @@ fn handle_sock_send(
     let Some(bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel
-        .ipc
-        .send_on_socket(crate::ipc::SocketId(socket_id), bytes, alloc::vec::Vec::new())
-    {
+    match kernel.ipc.send_on_socket(
+        crate::ipc::SocketId(socket_id),
+        bytes,
+        alloc::vec::Vec::new(),
+    ) {
         Ok(n) => Response::ok(req.request_id, n as i64),
         Err(e) => {
             let kerr = KernelError::from(e);
@@ -2205,10 +2083,7 @@ fn handle_sock_shutdown(kernel: &mut Kernel, pid: Pid, req: &Request) -> Respons
         .shutdown_socket(crate::ipc::SocketId(socket_id), read, write)
     {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::from(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::from(e))),
     }
 }
 
@@ -2235,12 +2110,7 @@ fn handle_sock_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response 
     Response::ok(req.request_id, new_fd as i64)
 }
 
-fn handle_sock_recv(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_sock_recv(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let fd = args_u32(req, 0);
     let _ri_flags = args_u32(req, 4) & 0xFFFF;
 
@@ -2270,10 +2140,7 @@ fn handle_sock_recv(
             extra_len: n as u32,
             _pad: [0u8; 12],
         },
-        Err(e) => Response::err(
-            req.request_id,
-            kerr_to_errno(KernelError::from(e)),
-        ),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::from(e))),
     }
 }
 
@@ -2349,15 +2216,11 @@ use alloc::vec::Vec;
 /// Build one 32-byte event slot from its logical fields.
 fn build_event(userdata: u64, error: u16, ty: u8, nbytes: u64, flags: u16) -> [u8; pl::EVENT_SIZE] {
     let mut e = [0u8; pl::EVENT_SIZE];
-    e[pl::EVENT_OFF_USERDATA..pl::EVENT_OFF_USERDATA + 8]
-        .copy_from_slice(&userdata.to_le_bytes());
-    e[pl::EVENT_OFF_ERROR..pl::EVENT_OFF_ERROR + 2]
-        .copy_from_slice(&error.to_le_bytes());
+    e[pl::EVENT_OFF_USERDATA..pl::EVENT_OFF_USERDATA + 8].copy_from_slice(&userdata.to_le_bytes());
+    e[pl::EVENT_OFF_ERROR..pl::EVENT_OFF_ERROR + 2].copy_from_slice(&error.to_le_bytes());
     e[pl::EVENT_OFF_TYPE] = ty;
-    e[pl::EVENT_OFF_RW_NBYTES..pl::EVENT_OFF_RW_NBYTES + 8]
-        .copy_from_slice(&nbytes.to_le_bytes());
-    e[pl::EVENT_OFF_RW_FLAGS..pl::EVENT_OFF_RW_FLAGS + 2]
-        .copy_from_slice(&flags.to_le_bytes());
+    e[pl::EVENT_OFF_RW_NBYTES..pl::EVENT_OFF_RW_NBYTES + 8].copy_from_slice(&nbytes.to_le_bytes());
+    e[pl::EVENT_OFF_RW_FLAGS..pl::EVENT_OFF_RW_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
     e
 }
 
@@ -2441,9 +2304,7 @@ fn fd_readiness(
                 (true, total - state.offset, 0, None)
             }
         }
-        FdObject::PipeRead(_)
-        | FdObject::PipeWrite(_)
-        | FdObject::DisplayConn(_) => {
+        FdObject::PipeRead(_) | FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => {
             // v1 doesn't wire these through fd_read / fd_write; poll
             // on them is meaningless → per-subscription EINVAL.
             (false, 0, 0, Some(EINVAL))
@@ -2505,9 +2366,7 @@ fn char_device_readiness(
         match devnum {
             // null / zero / console / fb0 all accept writes without blocking.
             DEV_NULL | DEV_ZERO | DEV_CONSOLE | DEV_FB0 => (true, 0, 0, None),
-            DEV_RANDOM | DEV_INPUT_KBD | DEV_INPUT_MOUSE => {
-                (false, 0, 0, Some(EINVAL))
-            }
+            DEV_RANDOM | DEV_INPUT_KBD | DEV_INPUT_MOUSE => (false, 0, 0, Some(EINVAL)),
             _ => (false, 0, 0, Some(EINVAL)),
         }
     }
@@ -2554,12 +2413,7 @@ fn socket_readiness(
     }
 }
 
-fn handle_poll_oneoff(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_poll_oneoff(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let n_subs = args_u32(req, 0);
     let n_events_cap = args_u32(req, 4);
     if n_subs == 0 {
@@ -2631,9 +2485,8 @@ fn handle_poll_oneoff(
                 );
                 let timeout = u64::from_le_bytes(to_bytes);
                 let mut fl_bytes = [0u8; 2];
-                fl_bytes.copy_from_slice(
-                    &sub[pl::SUB_CLOCK_OFF_FLAGS..pl::SUB_CLOCK_OFF_FLAGS + 2],
-                );
+                fl_bytes
+                    .copy_from_slice(&sub[pl::SUB_CLOCK_OFF_FLAGS..pl::SUB_CLOCK_OFF_FLAGS + 2]);
                 let flags = u16::from_le_bytes(fl_bytes);
                 let now_opt = match clock_id {
                     abi::wasi::CLOCKID_MONOTONIC => Some(platform::current().now_ns()),

@@ -135,7 +135,8 @@ fn reap_drops_fd_table_and_removes_from_procs() {
     k.procs
         .transition(pid, kernel::proc::ProcState::Running)
         .unwrap();
-    k.proc_exit(pid, kernel::proc::ExitStatus::Exited(0)).unwrap();
+    k.proc_exit(pid, kernel::proc::ExitStatus::Exited(0))
+        .unwrap();
 
     let status = k.reap(pid).unwrap();
     assert_eq!(status, kernel::proc::ExitStatus::Exited(0));
@@ -158,7 +159,9 @@ fn path_open_on_regular_file_installs_vnode_fd() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/greeting", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/greeting", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     let table = k.fds(pid).unwrap();
     let entry = table.get(fd).unwrap();
     assert!(matches!(entry.object, FdObject::Vnode { .. }));
@@ -199,12 +202,16 @@ fn fd_write_then_read_round_trips_through_tmpfs() {
     // Open once for writing, close, reopen for reading: this
     // matches the shape a real shell uses when redirecting
     // `>/notes.txt` then `cat /notes.txt`.
-    let wfd = k.path_open(pid, "/notes.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let wfd = k
+        .path_open(pid, "/notes.txt", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     let n = k.fd_write(pid, wfd, b"hello\n").unwrap();
     assert_eq!(n, 6);
     k.fd_close(pid, wfd).unwrap();
 
-    let rfd = k.path_open(pid, "/notes.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let rfd = k
+        .path_open(pid, "/notes.txt", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     let mut buf = [0u8; 16];
     let n = k.fd_read(pid, rfd, &mut buf).unwrap();
     assert_eq!(n, 6);
@@ -224,11 +231,15 @@ fn fd_read_advances_offset_across_multiple_calls() {
             cwd: "/",
         })
         .unwrap();
-    let wfd = k.path_open(pid, "/split.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let wfd = k
+        .path_open(pid, "/split.txt", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     k.fd_write(pid, wfd, b"abcdefghij").unwrap();
     k.fd_close(pid, wfd).unwrap();
 
-    let rfd = k.path_open(pid, "/split.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let rfd = k
+        .path_open(pid, "/split.txt", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     let mut buf = [0u8; 4];
     // Three consecutive partial reads consume the file in 4 /
     // 4 / 2 byte chunks, demonstrating that the fd's offset is
@@ -256,7 +267,9 @@ fn path_open_console_installs_chardevice_fd() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     let entry = k.fds(pid).unwrap().get(fd).unwrap();
     assert_eq!(entry.object, FdObject::CharDevice(DEV_CONSOLE));
 }
@@ -290,7 +303,9 @@ fn path_open_fb0_allowed_with_display_server_cap() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/fb0", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/dev/fb0", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     // It IS a chardev fd once opened; writes go through
     // DeviceDispatcher → Platform::driver_call which in the
     // native-platform test build is a no-op-Ok.
@@ -311,7 +326,9 @@ fn fd_read_chardevice_console_drains_injected_input() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
 
     k.devs.inject_console_input(b"ls\n");
     let mut buf = [0u8; 8];
@@ -331,7 +348,9 @@ fn fd_read_chardevice_console_empty_is_would_block() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     let mut buf = [0u8; 4];
     let err = k.fd_read(pid, fd, &mut buf).unwrap_err();
     assert_eq!(err, KernelError::Dev(DevError::WouldBlock));
@@ -348,7 +367,9 @@ fn fd_write_chardevice_console_flushes_complete_lines() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     k.fd_write(pid, fd, b"hello\n").unwrap();
     // Whole-line writes flush to the platform driver; the
     // in-kernel pending-line sink is empty.
@@ -372,7 +393,9 @@ fn fd_close_frees_the_slot() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/tmp.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/tmp.txt", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     assert!(k.fds(pid).unwrap().is_open(fd));
     k.fd_close(pid, fd).unwrap();
     assert!(!k.fds(pid).unwrap().is_open(fd));
@@ -407,8 +430,7 @@ fn fd_readdir_returns_directory_entries_by_name() {
         .path_open(pid, "/", 0, abi::wasi::oflags::DIRECTORY, 0, FdFlags::EMPTY)
         .unwrap();
     let entries = k.fd_readdir(pid, dir_fd).unwrap();
-    let names: alloc::vec::Vec<&str> =
-        entries.iter().map(|e| e.name.as_str()).collect();
+    let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"etc"));
     assert!(names.contains(&"usr"));
     assert!(names.contains(&"hello.txt"));
@@ -426,7 +448,9 @@ fn fd_readdir_on_regular_file_vnode_returns_not_a_directory() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/note.txt", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/note.txt", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     // The fd IS a Vnode — so the kernel must forward to the fs
     // readdir, which reports NotADirectory. The errno layer
     // translates this to ENOTDIR; here we verify the typed
@@ -449,7 +473,9 @@ fn fd_readdir_on_char_device_fd_is_not_supported_on_fd() {
             cwd: "/",
         })
         .unwrap();
-    let fd = k.path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let fd = k
+        .path_open(pid, "/dev/console", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     // CharDevice fds have no directory listing; the semantic
     // layer reports NotSupportedOnFd (dispatcher → EINVAL), NOT
     // Fs(NotADirectory) — those are distinct: "this fd is not a
@@ -471,10 +497,7 @@ fn fd_readdir_on_bad_fd_returns_bad_fd() {
             cwd: "/",
         })
         .unwrap();
-    assert_eq!(
-        k.fd_readdir(pid, 9999).unwrap_err(),
-        KernelError::BadFd,
-    );
+    assert_eq!(k.fd_readdir(pid, 9999).unwrap_err(), KernelError::BadFd,);
 }
 
 // ---- install_fd: used by proc_spawn to seed stdin/stdout/stderr ---
@@ -561,8 +584,7 @@ fn shell_step(
         out.push(b'\n');
         k.fd_write(pid, stdout, &out).expect("fd_write stdout");
     } else {
-        k.fd_write(pid, stderr, b"err\n")
-            .expect("fd_write stderr");
+        k.fd_write(pid, stderr, b"err\n").expect("fd_write stderr");
     }
     None
 }
@@ -633,7 +655,8 @@ fn principle_viii_headless_shell_gate() {
     k.procs
         .transition(sh, kernel::proc::ProcState::Running)
         .ok();
-    k.proc_exit(sh, kernel::proc::ExitStatus::Exited(0)).unwrap();
+    k.proc_exit(sh, kernel::proc::ExitStatus::Exited(0))
+        .unwrap();
     let status = k.reap(sh).unwrap();
     assert_eq!(status, kernel::proc::ExitStatus::Exited(0));
     // After reap, the shell is gone and its fd table is freed.
@@ -643,11 +666,7 @@ fn principle_viii_headless_shell_gate() {
 
 // ---- proc_spawn / proc_wait / proc_kill (T074-T076) ---------------
 
-fn spawn_ordinary_app<'a>(
-    k: &mut Kernel,
-    parent: abi::ext::Pid,
-    name: &'a str,
-) -> abi::ext::Pid {
+fn spawn_ordinary_app<'a>(k: &mut Kernel, parent: abi::ext::Pid, name: &'a str) -> abi::ext::Pid {
     k.proc_spawn(
         parent,
         SpawnArgs {
@@ -701,10 +720,7 @@ fn proc_spawn_creates_child_with_stdio_and_marks_ready() {
     // Signal channel auto-installed at fd 3 (POSIX signalfd
     // analogue — every proc_spawn'd child can observe its own
     // signal stream without an explicit install step).
-    assert_eq!(
-        table.get(3).unwrap().object,
-        FdObject::SignalChannel,
-    );
+    assert_eq!(table.get(3).unwrap().object, FdObject::SignalChannel,);
     // Child is on the scheduler's ready queue.
     assert!(k.sched.ready_len() >= 1);
 }
@@ -741,10 +757,7 @@ fn proc_spawn_signal_channel_fd_reads_signals_posted_by_parent() {
     let mut buf = [0u8; 4];
     let n = k.fd_read(child, 3, &mut buf).unwrap();
     assert_eq!(n, 2);
-    assert_eq!(
-        u16::from_le_bytes([buf[0], buf[1]]),
-        Signal::Term.number(),
-    );
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), Signal::Term.number(),);
     assert_eq!(k.pending_signals(child).unwrap(), 0);
 }
 
@@ -846,7 +859,10 @@ fn proc_spawn_bumps_pipe_refcount_so_parent_and_child_share_writer() {
         )
         .unwrap();
     let after = k.ipc.pipe_mut(pid).unwrap().writer_count();
-    assert_eq!(after, 2, "pipe writer refcount should bump on spawn inherit");
+    assert_eq!(
+        after, 2,
+        "pipe writer refcount should bump on spawn inherit"
+    );
 }
 
 #[test]
@@ -1098,14 +1114,8 @@ fn proc_kill_sigkill_does_not_queue_in_inbox() {
 #[test]
 fn drain_signals_on_unknown_pid_is_no_such_pid() {
     let mut k = make_kernel();
-    assert_eq!(
-        k.drain_signals(999).unwrap_err(),
-        KernelError::NoSuchPid
-    );
-    assert_eq!(
-        k.pending_signals(999).unwrap_err(),
-        KernelError::NoSuchPid
-    );
+    assert_eq!(k.drain_signals(999).unwrap_err(), KernelError::NoSuchPid);
+    assert_eq!(k.pending_signals(999).unwrap_err(), KernelError::NoSuchPid);
 }
 
 #[test]
@@ -1247,7 +1257,9 @@ fn principle_viii_shell_can_source_a_script_file() {
             cwd: "/",
         })
         .unwrap();
-    let wfd = k.path_open(init, "/script.sh", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let wfd = k
+        .path_open(init, "/script.sh", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     k.fd_write(init, wfd, b"echo first\necho second\nexit\n")
         .unwrap();
     k.fd_close(init, wfd).unwrap();
@@ -1262,7 +1274,9 @@ fn principle_viii_shell_can_source_a_script_file() {
             cwd: "/",
         })
         .unwrap();
-    let script_fd = k.path_open(sh, "/script.sh", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    let script_fd = k
+        .path_open(sh, "/script.sh", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
     k.install_fd(sh, 1, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
         .unwrap();
     k.install_fd(sh, 2, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
@@ -1287,11 +1301,7 @@ fn principle_viii_shell_can_source_a_script_file() {
 /// yet in v1 so we synthesise the cap set directly for
 /// tests.
 fn register_display_server(k: &mut Kernel) -> abi::ext::Pid {
-    let caps = CapSet::from_caps(&[
-        Cap::DisplayServer,
-        Cap::DisplayClient,
-        Cap::DevBlock,
-    ]);
+    let caps = CapSet::from_caps(&[Cap::DisplayServer, Cap::DisplayClient, Cap::DevBlock]);
     let pid = k
         .register_process(RegisterArgs {
             name: "display-server",
@@ -1660,11 +1670,7 @@ fn sigterm_interrupts_parked_accept_with_eintr() {
         .unwrap();
 
     // Display-server with init as parent.
-    let ds_caps = CapSet::from_caps(&[
-        Cap::DisplayServer,
-        Cap::DisplayClient,
-        Cap::DevBlock,
-    ]);
+    let ds_caps = CapSet::from_caps(&[Cap::DisplayServer, Cap::DisplayClient, Cap::DevBlock]);
     let ds = k
         .register_process(RegisterArgs {
             name: "display-server",
@@ -1744,11 +1750,7 @@ fn signum_zero_probe_does_not_wake_parked_accept() {
         .unwrap();
     k.mark_ready(init).unwrap();
 
-    let ds_caps = CapSet::from_caps(&[
-        Cap::DisplayServer,
-        Cap::DisplayClient,
-        Cap::DevBlock,
-    ]);
+    let ds_caps = CapSet::from_caps(&[Cap::DisplayServer, Cap::DisplayClient, Cap::DevBlock]);
     let ds = k
         .register_process(RegisterArgs {
             name: "display-server",
@@ -1818,11 +1820,7 @@ fn sigkill_on_parked_accept_exits_without_eintr_wake() {
         .unwrap();
     k.mark_ready(init).unwrap();
 
-    let ds_caps = CapSet::from_caps(&[
-        Cap::DisplayServer,
-        Cap::DisplayClient,
-        Cap::DevBlock,
-    ]);
+    let ds_caps = CapSet::from_caps(&[Cap::DisplayServer, Cap::DisplayClient, Cap::DevBlock]);
     let ds = k
         .register_process(RegisterArgs {
             name: "display-server",
@@ -1896,14 +1894,8 @@ fn proc_wait_options_zero_parks_parent_when_no_zombie() {
     // preconditions the handler layer runs (target is a live
     // child + not already parked).
     let req_id = 0xc0deu32;
-    k.park_on_wait(
-        parent,
-        req_id,
-        kernel::sys::WaitTarget::Any,
-        0,
-        0,
-    )
-    .unwrap();
+    k.park_on_wait(parent, req_id, kernel::sys::WaitTarget::Any, 0, 0)
+        .unwrap();
 
     // State transitioned to BlockedOnWait.
     let proc = k.procs.get(parent).unwrap();
@@ -1948,14 +1940,8 @@ fn child_exit_wakes_parked_parent() {
 
     // Park on `Any` with heap_len = 4 so the wake carries the pid.
     let req_id = 0xfeedu32;
-    k.park_on_wait(
-        parent,
-        req_id,
-        kernel::sys::WaitTarget::Any,
-        0,
-        4,
-    )
-    .unwrap();
+    k.park_on_wait(parent, req_id, kernel::sys::WaitTarget::Any, 0, 4)
+        .unwrap();
 
     // Child exits voluntarily.
     k.proc_exit(child, kernel::proc::ExitStatus::Exited(42))
@@ -1985,9 +1971,7 @@ fn child_exit_wakes_parked_parent() {
     let expected_value = {
         let tmp = Response::ok(
             0,
-            kernel::sys::pack_exit_status_public(
-                kernel::proc::ExitStatus::Exited(42),
-            ),
+            kernel::sys::pack_exit_status_public(kernel::proc::ExitStatus::Exited(42)),
         );
         tmp.value
     };
@@ -1996,12 +1980,7 @@ fn child_exit_wakes_parked_parent() {
     let heap = wake_heap.as_ref().expect("wake has heap payload");
     assert_eq!(heap.heap_ptr, 0);
     assert_eq!(heap.bytes.len(), 4);
-    let decoded = u32::from_le_bytes([
-        heap.bytes[0],
-        heap.bytes[1],
-        heap.bytes[2],
-        heap.bytes[3],
-    ]);
+    let decoded = u32::from_le_bytes([heap.bytes[0], heap.bytes[1], heap.bytes[2], heap.bytes[3]]);
     assert_eq!(decoded, child as u32);
 }
 
@@ -2065,14 +2044,8 @@ fn second_wait_on_parked_parent_returns_eagain() {
     let _child = spawn_ordinary_app(&mut k, parent, "child");
 
     // First park lands.
-    k.park_on_wait(
-        parent,
-        1,
-        kernel::sys::WaitTarget::Any,
-        0,
-        0,
-    )
-    .unwrap();
+    k.park_on_wait(parent, 1, kernel::sys::WaitTarget::Any, 0, 0)
+        .unwrap();
 
     // Second park against the same parent must fail with
     // WouldBlock. Original parker's req_id is preserved.
@@ -2128,14 +2101,8 @@ fn sigterm_interrupts_parked_wait_with_eintr() {
 
     // Parent parks on wait.
     let req_id = 0xe171u32;
-    k.park_on_wait(
-        parent,
-        req_id,
-        kernel::sys::WaitTarget::Any,
-        0,
-        0,
-    )
-    .unwrap();
+    k.park_on_wait(parent, req_id, kernel::sys::WaitTarget::Any, 0, 0)
+        .unwrap();
     assert_eq!(
         k.procs.get(parent).unwrap().state,
         kernel::proc::ProcState::BlockedOnWait,
@@ -2206,14 +2173,8 @@ fn sigkill_on_parked_wait_exits_without_eintr_wake() {
 
     // Parent parks on wait.
     let req_id = 0x9c1du32;
-    k.park_on_wait(
-        parent,
-        req_id,
-        kernel::sys::WaitTarget::Any,
-        0,
-        0,
-    )
-    .unwrap();
+    k.park_on_wait(parent, req_id, kernel::sys::WaitTarget::Any, 0, 0)
+        .unwrap();
 
     // Grandparent SIGKILLs parent.
     k.proc_kill(grandparent, parent, kernel::proc::Signal::Kill)
@@ -2318,12 +2279,7 @@ fn specific_target_wake_only_matches_specific_child() {
     assert_eq!(wake_resp.status, 0);
     assert_eq!(wake_resp.extra_len, 4);
     let heap = wake_heap.as_ref().expect("wake has heap payload");
-    let decoded = u32::from_le_bytes([
-        heap.bytes[0],
-        heap.bytes[1],
-        heap.bytes[2],
-        heap.bytes[3],
-    ]);
+    let decoded = u32::from_le_bytes([heap.bytes[0], heap.bytes[1], heap.bytes[2], heap.bytes[3]]);
     assert_eq!(decoded, child_b as u32);
 
     // A is still a zombie — a later non-blocking PROC_WAIT(WNOHANG)
@@ -2363,14 +2319,8 @@ fn parent_exit_clears_parked_waiter_slot() {
     let _child = spawn_ordinary_app(&mut k, parent, "child");
 
     // Parent parks.
-    k.park_on_wait(
-        parent,
-        0xdeadu32,
-        kernel::sys::WaitTarget::Any,
-        0,
-        0,
-    )
-    .unwrap();
+    k.park_on_wait(parent, 0xdeadu32, kernel::sys::WaitTarget::Any, 0, 0)
+        .unwrap();
     assert!(k.parked_waiters_get_public(parent).is_some());
 
     // Parent exits directly with Crashed (simulates host-side
@@ -2459,6 +2409,25 @@ fn proc_exit_allows_another_process_to_rebind_the_freed_path() {
 }
 
 #[test]
+fn proc_exit_flushes_dirty_vfs_mounts() {
+    let mut k = make_kernel();
+    k.vfs.create("/dirty.txt", 0o644).unwrap();
+    assert_eq!(k.vfs.dirty_mount_count(), 1);
+
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "writer",
+            ppid: 0,
+            caps: CapSet::EMPTY,
+            cwd: "/",
+        })
+        .unwrap();
+    k.proc_exit(pid, ExitStatus::Exited(0)).unwrap();
+
+    assert_eq!(k.vfs.dirty_mount_count(), 0);
+}
+
+#[test]
 fn proc_exit_releases_generic_ipc_bindings_too() {
     // `display_bind` is a capability-gated alias for
     // `ipc_bind(path = "/run/display")`; the same cleanup must
@@ -2476,9 +2445,7 @@ fn proc_exit_releases_generic_ipc_bindings_too() {
     k.procs
         .transition(pid, kernel::proc::ProcState::Running)
         .unwrap();
-    let sock_fd = k
-        .ipc_socket(pid, kernel::ipc::SocketType::Stream)
-        .unwrap();
+    let sock_fd = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
     k.ipc_bind(pid, sock_fd, "/run/greeter").unwrap();
     assert!(k.ipc.lookup_binding("/run/greeter").is_some());
 
@@ -2733,10 +2700,7 @@ fn parent_fd_read_fd3_observes_sigchld_after_child_exit() {
     let mut buf = [0u8; 4];
     let n = k.fd_read(parent, 3, &mut buf).unwrap();
     assert_eq!(n, 2);
-    assert_eq!(
-        u16::from_le_bytes([buf[0], buf[1]]),
-        Signal::Child.number(),
-    );
+    assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), Signal::Child.number(),);
 }
 
 #[test]
@@ -2836,10 +2800,20 @@ fn path_open_creat_creates_new_file_and_returns_fd() {
     let pid = path_open_proc(&mut k, "creater");
 
     let fd = k
-        .path_open(pid, "/new.txt", 0, abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
+        .path_open(
+            pid,
+            "/new.txt",
+            0,
+            abi::wasi::oflags::CREAT,
+            0,
+            FdFlags::EMPTY,
+        )
         .unwrap();
     let table = k.fds(pid).unwrap();
-    assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
+    assert!(matches!(
+        table.get(fd).unwrap().object,
+        FdObject::Vnode { .. }
+    ));
     // And the file shows up on stat.
     let st = k.vfs.stat("/new.txt").unwrap();
     assert!(st.ty.is_regular());
@@ -2856,7 +2830,14 @@ fn path_open_creat_on_existing_file_opens_without_truncating() {
     let pid = path_open_proc(&mut k, "creater2");
 
     let fd = k
-        .path_open(pid, "/exists.txt", 0, abi::wasi::oflags::CREAT, 0, FdFlags::EMPTY)
+        .path_open(
+            pid,
+            "/exists.txt",
+            0,
+            abi::wasi::oflags::CREAT,
+            0,
+            FdFlags::EMPTY,
+        )
         .unwrap();
     let mut buf = [0u8; 8];
     let n = k.fd_read(pid, fd, &mut buf).unwrap();
@@ -2893,10 +2874,20 @@ fn path_open_excl_without_creat_is_ignored_on_existing() {
     let pid = path_open_proc(&mut k, "openerX");
 
     let fd = k
-        .path_open(pid, "/plain.txt", 0, abi::wasi::oflags::EXCL, 0, FdFlags::EMPTY)
+        .path_open(
+            pid,
+            "/plain.txt",
+            0,
+            abi::wasi::oflags::EXCL,
+            0,
+            FdFlags::EMPTY,
+        )
         .unwrap();
     let table = k.fds(pid).unwrap();
-    assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
+    assert!(matches!(
+        table.get(fd).unwrap().object,
+        FdObject::Vnode { .. }
+    ));
 }
 
 #[test]
@@ -2911,7 +2902,14 @@ fn path_open_trunc_shrinks_existing_regular_file_to_zero() {
     let pid = path_open_proc(&mut k, "truncater");
 
     let fd = k
-        .path_open(pid, "/data.bin", 0, abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
+        .path_open(
+            pid,
+            "/data.bin",
+            0,
+            abi::wasi::oflags::TRUNC,
+            0,
+            FdFlags::EMPTY,
+        )
         .unwrap();
     // Stat now reports 0.
     assert_eq!(k.vfs.stat("/data.bin").unwrap().size, 0);
@@ -2972,7 +2970,10 @@ fn path_open_directory_flag_on_directory_opens_normally() {
         )
         .unwrap();
     let table = k.fds(pid).unwrap();
-    assert!(matches!(table.get(fd).unwrap().object, FdObject::Vnode { .. }));
+    assert!(matches!(
+        table.get(fd).unwrap().object,
+        FdObject::Vnode { .. }
+    ));
 }
 
 #[test]
@@ -3093,9 +3094,7 @@ fn path_open_without_symlink_follow_opens_symlink_itself() {
     let link_ino = k.vfs.resolve_nofollow("/link").unwrap().1;
     let pid = path_open_proc(&mut k, "nofollow");
 
-    let fd = k
-        .path_open(pid, "/link", 0, 0, 0, FdFlags::EMPTY)
-        .unwrap();
+    let fd = k.path_open(pid, "/link", 0, 0, 0, FdFlags::EMPTY).unwrap();
     let entry = k.fds(pid).unwrap().get(fd).unwrap();
     match entry.object {
         FdObject::Vnode { ino, .. } => assert_eq!(ino, link_ino),

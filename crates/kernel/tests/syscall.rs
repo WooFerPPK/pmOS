@@ -48,8 +48,12 @@ use ring::Sab;
 /// other file's assumptions.
 fn make_kernel() -> Kernel {
     let mut k = Kernel::new();
-    k.vfs.mount("/", Box::new(TmpFs::new())).expect("root mount");
-    k.vfs.mount("/dev", Box::new(DevFs::new())).expect("devfs mount");
+    k.vfs
+        .mount("/", Box::new(TmpFs::new()))
+        .expect("root mount");
+    k.vfs
+        .mount("/dev", Box::new(DevFs::new()))
+        .expect("devfs mount");
     k.vfs
         .mount("/proc", Box::new(ProcFs::with_static()))
         .expect("procfs mount");
@@ -443,9 +447,15 @@ fn path_open_with_wasi_append_sets_pmos_append() {
     assert_eq!(resp.status, 0);
     let fd = resp.value as u32;
     let e = k.fds(pid).unwrap().get(fd).unwrap();
-    assert!(e.flags.contains(FdFlags::APPEND), "WASI APPEND → PMos APPEND");
+    assert!(
+        e.flags.contains(FdFlags::APPEND),
+        "WASI APPEND → PMos APPEND"
+    );
     assert!(!e.flags.contains(FdFlags::CLOEXEC), "must not set CLOEXEC");
-    assert!(!e.flags.contains(FdFlags::NONBLOCK), "must not set NONBLOCK");
+    assert!(
+        !e.flags.contains(FdFlags::NONBLOCK),
+        "must not set NONBLOCK"
+    );
 }
 
 #[test]
@@ -469,7 +479,10 @@ fn path_open_with_wasi_nonblock_sets_pmos_nonblock() {
     assert_eq!(resp.status, 0);
     let fd = resp.value as u32;
     let e = k.fds(pid).unwrap().get(fd).unwrap();
-    assert!(e.flags.contains(FdFlags::NONBLOCK), "WASI NONBLOCK → PMos NONBLOCK");
+    assert!(
+        e.flags.contains(FdFlags::NONBLOCK),
+        "WASI NONBLOCK → PMos NONBLOCK"
+    );
     assert!(!e.flags.contains(FdFlags::APPEND), "must not set APPEND");
     assert!(!e.flags.contains(FdFlags::CLOEXEC), "must not set CLOEXEC");
 }
@@ -487,9 +500,8 @@ fn path_open_with_wasi_sync_bits_sets_no_pmos_bits() {
     let mut heap = vec![0u8; 64];
     heap[..path.len()].copy_from_slice(path);
 
-    let combined = (abi::wasi::fdflags::DSYNC
-        | abi::wasi::fdflags::RSYNC
-        | abi::wasi::fdflags::SYNC) as u32;
+    let combined =
+        (abi::wasi::fdflags::DSYNC | abi::wasi::fdflags::RSYNC | abi::wasi::fdflags::SYNC) as u32;
     let req = Request {
         opcode: op_wasi::PATH_OPEN,
         flags: 0,
@@ -514,8 +526,7 @@ fn path_open_with_wasi_append_and_nonblock_sets_both_pmos_bits() {
     let mut heap = vec![0u8; 64];
     heap[..path.len()].copy_from_slice(path);
 
-    let combined =
-        (abi::wasi::fdflags::APPEND | abi::wasi::fdflags::NONBLOCK) as u32;
+    let combined = (abi::wasi::fdflags::APPEND | abi::wasi::fdflags::NONBLOCK) as u32;
     let req = Request {
         opcode: op_wasi::PATH_OPEN,
         flags: 0,
@@ -816,7 +827,10 @@ fn cap_grant_widens_existing_caps_via_union() {
 
     assert_eq!(resp.status, 0);
     let target_caps = k.caps.list(target).unwrap();
-    assert!(target_caps.contains(Cap::DisplayClient), "pre-existing cap preserved");
+    assert!(
+        target_caps.contains(Cap::DisplayClient),
+        "pre-existing cap preserved"
+    );
     assert!(target_caps.contains(Cap::Net), "newly granted cap added");
 }
 
@@ -1213,8 +1227,7 @@ fn ipc_send_with_fd_to_pass_round_trips_to_receiver() {
     let mut k = make_kernel();
     let server = make_running_proc(&mut k, "srv", 0);
     let client = make_running_proc(&mut k, "cli", 0);
-    let (cli_fd, srv_conn) =
-        ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-fd", 420);
+    let (cli_fd, srv_conn) = ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-fd", 420);
 
     // The ancillary fd: open /dev/console on the client side. The
     // value gets queued as-is on the server's rx_fds; receiver-side
@@ -1485,8 +1498,7 @@ fn ipc_recv_with_fd_pass_installs_fd_in_receiver_table() {
     let mut k = make_kernel();
     let server = make_running_proc(&mut k, "srv", 0);
     let client = make_running_proc(&mut k, "cli", 0);
-    let (cli_fd, srv_conn) =
-        ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-fd", 520);
+    let (cli_fd, srv_conn) = ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-fd", 520);
 
     k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
         .unwrap();
@@ -1580,10 +1592,7 @@ fn ipc_recv_with_flags_one_is_nonblocking_returns_eagain() {
     // Caller must NOT have parked: the non-blocking path bypasses
     // park_on_recv entirely. Verify the parker slot is still empty.
     assert!(!k.parked_recvers_contains(server));
-    assert_eq!(
-        k.procs.get(server).unwrap().state,
-        ProcState::Running
-    );
+    assert_eq!(k.procs.get(server).unwrap().state, ProcState::Running);
 }
 
 #[test]
@@ -1776,10 +1785,7 @@ fn ipc_recv_on_empty_socket_blocking_parks_caller() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     // Parker slot is populated with the in-flight recv params.
     let parker = k
@@ -1816,8 +1822,7 @@ fn ipc_send_wakes_parked_recver_with_bytes() {
     let mut k = make_kernel();
     let server = make_running_proc(&mut k, "srv", 0);
     let client = make_running_proc(&mut k, "cli", 0);
-    let (cli_fd, srv_conn) =
-        ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-wake", 710);
+    let (cli_fd, srv_conn) = ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-wake", 710);
 
     let req_id = 0x7200u32;
     let mut heap = vec![0u8; 64];
@@ -1834,10 +1839,7 @@ fn ipc_send_wakes_parked_recver_with_bytes() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     // Client sends bytes — this must wake the parker inline.
     let payload = b"hello";
@@ -1919,10 +1921,7 @@ fn ipc_send_wakes_parked_recver_with_fd() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     let payload = b"xyz";
     heap[..payload.len()].copy_from_slice(payload);
@@ -2004,10 +2003,7 @@ fn ipc_recv_blocking_second_call_from_parked_pid_returns_eagain() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome1,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome1, kernel::syscall::ServiceOutcome::Parked));
     assert!(k.parked_recvers_contains(server));
 
     // Second blocking recv from the same pid hits the one-parker
@@ -2072,8 +2068,7 @@ fn sigterm_interrupts_parked_recv_with_eintr() {
     k.mark_ready(b).unwrap();
     k.procs.transition(b, ProcState::Running).unwrap();
 
-    let (_b_fd, a_conn) =
-        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-eintr", 800);
+    let (_b_fd, a_conn) = ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-eintr", 800);
 
     // A parks on the recv.
     let req_id = 0xe17fu32;
@@ -2091,14 +2086,8 @@ fn sigterm_interrupts_parked_recv_with_eintr() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
-    assert_eq!(
-        k.procs.get(a).unwrap().state,
-        ProcState::BlockedOnIpc
-    );
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
+    assert_eq!(k.procs.get(a).unwrap().state, ProcState::BlockedOnIpc);
 
     // init delivers SIGTERM via PROC_KILL. The handler's Term arm
     // composes interrupt_parked_accept + interrupt_parked_wait +
@@ -2187,8 +2176,7 @@ fn sigint_interrupts_parked_recv_with_eintr() {
     k.mark_ready(b).unwrap();
     k.procs.transition(b, ProcState::Running).unwrap();
 
-    let (_b_fd, a_conn) =
-        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-eintr-int", 820);
+    let (_b_fd, a_conn) = ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-eintr-int", 820);
 
     // A parks on the recv.
     let req_id = 0xe17eu32;
@@ -2206,10 +2194,7 @@ fn sigint_interrupts_parked_recv_with_eintr() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     // init delivers SIGINT (signum 2) via PROC_KILL.
     let mut kill_args = [0u8; 16];
@@ -2271,10 +2256,7 @@ fn sigint_interrupts_parked_accept_with_eintr() {
 
     let req_id = 0xe18cu32;
     k.park_on_accept(ds, listener_fd, req_id).unwrap();
-    assert_eq!(
-        k.procs.get(ds).unwrap().state,
-        ProcState::BlockedOnIpc
-    );
+    assert_eq!(k.procs.get(ds).unwrap().state, ProcState::BlockedOnIpc);
 
     // Self-deliver SIGINT (sender == target — self-signal is
     // POSIX-allowed without any cap).
@@ -2341,18 +2323,9 @@ fn sigint_interrupts_parked_wait_with_eintr() {
     let _child = register_child(&mut k, parent, "child");
 
     let req_id = 0xe19du32;
-    k.park_on_wait(
-        parent,
-        req_id,
-        kernel::sys::WaitTarget::Any,
-        0,
-        0,
-    )
-    .unwrap();
-    assert_eq!(
-        k.procs.get(parent).unwrap().state,
-        ProcState::BlockedOnWait,
-    );
+    k.park_on_wait(parent, req_id, kernel::sys::WaitTarget::Any, 0, 0)
+        .unwrap();
+    assert_eq!(k.procs.get(parent).unwrap().state, ProcState::BlockedOnWait,);
 
     // init sends SIGINT to parent. Dispatcher's SIGINT arm runs
     // interrupt_parked_wait → EINTR wake.
@@ -2439,8 +2412,7 @@ fn sigpipe_does_not_interrupt_parked_recv() {
     k.mark_ready(b).unwrap();
     k.procs.transition(b, ProcState::Running).unwrap();
 
-    let (_b_fd, a_conn) =
-        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-pipe", 850);
+    let (_b_fd, a_conn) = ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-pipe", 850);
 
     let req_id = 0xe1afu32;
     let mut heap = vec![0u8; 64];
@@ -2457,10 +2429,7 @@ fn sigpipe_does_not_interrupt_parked_recv() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     // init delivers SIGPIPE (signum 13). Should queue on inbox
     // but NOT wake the parker.
@@ -2485,16 +2454,14 @@ fn sigpipe_does_not_interrupt_parked_recv() {
     // Parker slot still populated, A still BlockedOnIpc — SIGPIPE
     // is signalled but does NOT interrupt the park.
     assert!(k.parked_recvers_contains(a));
-    assert_eq!(
-        k.procs.get(a).unwrap().state,
-        ProcState::BlockedOnIpc,
-    );
+    assert_eq!(k.procs.get(a).unwrap().state, ProcState::BlockedOnIpc,);
 
     // No EINTR wake on A's request_id.
     let wakes = k.pending_wakes_snapshot();
     assert!(
-        !wakes.iter().any(|(pid, resp, _)| *pid == a
-            && resp.request_id == req_id),
+        !wakes
+            .iter()
+            .any(|(pid, resp, _)| *pid == a && resp.request_id == req_id),
         "SIGPIPE must not wake the parked recv",
     );
 
@@ -2548,8 +2515,7 @@ fn sigchld_does_not_interrupt_parked_recv() {
     k.mark_ready(b).unwrap();
     k.procs.transition(b, ProcState::Running).unwrap();
 
-    let (_b_fd, a_conn) =
-        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-chld", 860);
+    let (_b_fd, a_conn) = ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-chld", 860);
 
     let req_id = 0xe1c1u32;
     let mut heap = vec![0u8; 64];
@@ -2566,10 +2532,7 @@ fn sigchld_does_not_interrupt_parked_recv() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     // init delivers SIGCHLD (signum 17).
     let mut kill_args = [0u8; 16];
@@ -2592,16 +2555,14 @@ fn sigchld_does_not_interrupt_parked_recv() {
 
     // Parker slot still populated, A still BlockedOnIpc.
     assert!(k.parked_recvers_contains(a));
-    assert_eq!(
-        k.procs.get(a).unwrap().state,
-        ProcState::BlockedOnIpc,
-    );
+    assert_eq!(k.procs.get(a).unwrap().state, ProcState::BlockedOnIpc,);
 
     // No EINTR wake on A's request_id.
     let wakes = k.pending_wakes_snapshot();
     assert!(
-        !wakes.iter().any(|(pid, resp, _)| *pid == a
-            && resp.request_id == req_id),
+        !wakes
+            .iter()
+            .any(|(pid, resp, _)| *pid == a && resp.request_id == req_id),
         "SIGCHLD must not wake the parked recv",
     );
 
@@ -2723,8 +2684,7 @@ fn sigusr1_does_not_interrupt_parked_recv() {
     k.mark_ready(b).unwrap();
     k.procs.transition(b, ProcState::Running).unwrap();
 
-    let (_b_fd, a_conn) =
-        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-usr1", 870);
+    let (_b_fd, a_conn) = ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-usr1", 870);
 
     let req_id = 0xe1d0u32;
     let mut heap = vec![0u8; 64];
@@ -2741,10 +2701,7 @@ fn sigusr1_does_not_interrupt_parked_recv() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     // init delivers SIGUSR1 (signum 10).
     let mut kill_args = [0u8; 16];
@@ -2768,16 +2725,14 @@ fn sigusr1_does_not_interrupt_parked_recv() {
     // Parker slot still populated, A still BlockedOnIpc — SIGUSR1
     // is signalled but does NOT interrupt the park.
     assert!(k.parked_recvers_contains(a));
-    assert_eq!(
-        k.procs.get(a).unwrap().state,
-        ProcState::BlockedOnIpc,
-    );
+    assert_eq!(k.procs.get(a).unwrap().state, ProcState::BlockedOnIpc,);
 
     // No EINTR wake on A's request_id.
     let wakes = k.pending_wakes_snapshot();
     assert!(
-        !wakes.iter().any(|(pid, resp, _)| *pid == a
-            && resp.request_id == req_id),
+        !wakes
+            .iter()
+            .any(|(pid, resp, _)| *pid == a && resp.request_id == req_id),
         "SIGUSR1 must not wake the parked recv",
     );
 
@@ -2827,8 +2782,7 @@ fn sigusr2_does_not_interrupt_parked_recv() {
     k.mark_ready(b).unwrap();
     k.procs.transition(b, ProcState::Running).unwrap();
 
-    let (_b_fd, a_conn) =
-        ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-usr2", 880);
+    let (_b_fd, a_conn) = ipc_send_connected_pair(&mut k, b, a, b"/tmp/rcv-usr2", 880);
 
     let req_id = 0xe1d1u32;
     let mut heap = vec![0u8; 64];
@@ -2845,10 +2799,7 @@ fn sigusr2_does_not_interrupt_parked_recv() {
         },
         &mut heap,
     );
-    assert!(matches!(
-        outcome,
-        kernel::syscall::ServiceOutcome::Parked
-    ));
+    assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     let mut kill_args = [0u8; 16];
     kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
@@ -2869,15 +2820,13 @@ fn sigusr2_does_not_interrupt_parked_recv() {
     assert_eq!(kill_resp.status, 0);
 
     assert!(k.parked_recvers_contains(a));
-    assert_eq!(
-        k.procs.get(a).unwrap().state,
-        ProcState::BlockedOnIpc,
-    );
+    assert_eq!(k.procs.get(a).unwrap().state, ProcState::BlockedOnIpc,);
 
     let wakes = k.pending_wakes_snapshot();
     assert!(
-        !wakes.iter().any(|(pid, resp, _)| *pid == a
-            && resp.request_id == req_id),
+        !wakes
+            .iter()
+            .any(|(pid, resp, _)| *pid == a && resp.request_id == req_id),
         "SIGUSR2 must not wake the parked recv",
     );
 
@@ -2928,10 +2877,7 @@ fn sigusr1_does_not_interrupt_parked_accept() {
 
     let req_id = 0xe1d3u32;
     k.park_on_accept(ds, listener_fd, req_id).unwrap();
-    assert_eq!(
-        k.procs.get(ds).unwrap().state,
-        ProcState::BlockedOnIpc,
-    );
+    assert_eq!(k.procs.get(ds).unwrap().state, ProcState::BlockedOnIpc,);
 
     // Self-deliver SIGUSR1 (sender == target — self-signal is
     // POSIX-allowed without any cap).
@@ -2959,16 +2905,14 @@ fn sigusr1_does_not_interrupt_parked_accept() {
     let listener_socket_id = k.socket_id_from_fd_public(ds, listener_fd).unwrap();
     let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
     assert!(listener.parked_acceptor.is_some());
-    assert_eq!(
-        k.procs.get(ds).unwrap().state,
-        ProcState::BlockedOnIpc,
-    );
+    assert_eq!(k.procs.get(ds).unwrap().state, ProcState::BlockedOnIpc,);
 
     // No EINTR wake on the parked-accept req_id.
     let wakes = k.pending_wakes_snapshot();
     assert!(
-        !wakes.iter().any(|(pid, resp, _)| *pid == ds
-            && resp.request_id == req_id),
+        !wakes
+            .iter()
+            .any(|(pid, resp, _)| *pid == ds && resp.request_id == req_id),
         "SIGUSR1 must not wake the parked accept",
     );
 
@@ -3617,13 +3561,8 @@ fn fd_filestat_get_on_regular_file_vnode_returns_filetype_and_size() {
     let wrote = k.vfs.write("/probe.txt", 0, bytes).expect("write");
     assert_eq!(wrote, bytes.len());
     let (mount_id, ino) = k.vfs.resolve("/probe.txt").expect("resolve");
-    k.install_fd(
-        pid,
-        10,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .unwrap();
+    k.install_fd(pid, 10, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 128];
 
     let req = Request {
@@ -3653,13 +3592,8 @@ fn fd_filestat_get_on_directory_vnode_returns_filetype_directory() {
     // pair the Vnode fd needs.
     k.vfs.mkdir("/adir", 0o755).expect("mkdir");
     let (mount_id, ino) = k.vfs.resolve("/adir").expect("resolve");
-    k.install_fd(
-        pid,
-        11,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .unwrap();
+    k.install_fd(pid, 11, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 128];
 
     let req = Request {
@@ -3913,7 +3847,11 @@ fn path_filestat_get_on_root_returns_filetype_directory_and_root_mount_id() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
-    assert_eq!(filestat_u64(&heap, 0, 0), mount_id.0 as u64, "dev = root mount id");
+    assert_eq!(
+        filestat_u64(&heap, 0, 0),
+        mount_id.0 as u64,
+        "dev = root mount id"
+    );
     assert_eq!(filestat_u64(&heap, 0, 8), ino, "ino = root ino");
     assert_eq!(heap[16], 3, "filetype = directory");
 }
@@ -4137,11 +4075,7 @@ fn path_filestat_set_times_set_atim_now_stamps_current_wall_clock() {
         opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
         flags: 0,
         request_id: 801,
-        args: path_filestat_set_times_args(
-            0,
-            0,
-            abi::wasi::fstflags::SET_ATIM_NOW as u32,
-        ),
+        args: path_filestat_set_times_args(0, 0, abi::wasi::fstflags::SET_ATIM_NOW as u32),
         heap_ptr: 0,
         heap_len: buf.len() as u32,
     };
@@ -4187,7 +4121,10 @@ fn path_filestat_set_times_with_zero_flags_is_noop_success() {
     let after = k.vfs.stat("/p.txt").unwrap();
     assert_eq!(after.atime_ns, before.atime_ns, "atim untouched");
     assert_eq!(after.mtime_ns, before.mtime_ns, "mtim untouched");
-    assert_eq!(after.ctime_ns, before.ctime_ns, "ctime untouched (zero-flags is not a metadata change)");
+    assert_eq!(
+        after.ctime_ns, before.ctime_ns,
+        "ctime untouched (zero-flags is not a metadata change)"
+    );
 }
 
 #[test]
@@ -4312,11 +4249,7 @@ fn path_filestat_set_times_with_short_heap_returns_einval() {
         opcode: op_wasi::PATH_FILESTAT_SET_TIMES,
         flags: 0,
         request_id: 807,
-        args: path_filestat_set_times_args(
-            0,
-            0,
-            abi::wasi::fstflags::SET_ATIM as u32,
-        ),
+        args: path_filestat_set_times_args(0, 0, abi::wasi::fstflags::SET_ATIM as u32),
         heap_ptr: 0,
         heap_len: 8, // only one u64 fits, no room for both times + path
     };
@@ -4397,7 +4330,9 @@ fn decode_event(heap: &[u8], offset: usize) -> (u64, u16, u8, u64, u16) {
     let error = u16::from_le_bytes(e);
     let ty = heap[offset + pl::EVENT_OFF_TYPE];
     let mut n = [0u8; 8];
-    n.copy_from_slice(&heap[offset + pl::EVENT_OFF_RW_NBYTES..offset + pl::EVENT_OFF_RW_NBYTES + 8]);
+    n.copy_from_slice(
+        &heap[offset + pl::EVENT_OFF_RW_NBYTES..offset + pl::EVENT_OFF_RW_NBYTES + 8],
+    );
     let nbytes = u64::from_le_bytes(n);
     let mut f = [0u8; 2];
     f.copy_from_slice(&heap[offset + pl::EVENT_OFF_RW_FLAGS..offset + pl::EVENT_OFF_RW_FLAGS + 2]);
@@ -4886,7 +4821,8 @@ fn poll_oneoff_fd_read_socket_empty_connected_not_ready() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
 
     let mut heap = vec![0u8; 128];
     let s = sub_fd_rw(6, abi::wasi::eventtype::FD_READ, 10);
@@ -4924,7 +4860,8 @@ fn poll_oneoff_fd_read_socket_with_data_ready() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
 
     let mut heap = vec![0u8; 128];
     let s = sub_fd_rw(7, abi::wasi::eventtype::FD_READ, 10);
@@ -4968,7 +4905,8 @@ fn poll_oneoff_fd_read_socket_peer_closed_hangup_ready() {
         sb.peer = Some(a);
         sb.closed = true;
     }
-    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
 
     let mut heap = vec![0u8; 128];
     let s = sub_fd_rw(8, abi::wasi::eventtype::FD_READ, 10);
@@ -5009,7 +4947,8 @@ fn poll_oneoff_fd_write_socket_with_peer_capacity_ready() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
 
     let mut heap = vec![0u8; 128];
     let s = sub_fd_rw(11, abi::wasi::eventtype::FD_WRITE, 10);
@@ -5039,7 +4978,8 @@ fn poll_oneoff_fd_read_on_empty_signal_channel_not_ready() {
     // burning CPU on a meaningless error.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sigrd", 0);
-    k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 128];
     let s = sub_fd_rw(13, abi::wasi::eventtype::FD_READ, 5);
     heap[..48].copy_from_slice(&s);
@@ -5067,7 +5007,8 @@ fn poll_oneoff_fd_read_on_signal_channel_with_pending_signals_ready() {
     // Self-signal SIGTERM + SIGPIPE to fill two inbox slots.
     k.proc_kill(init, init, Signal::Term).unwrap();
     k.proc_kill(init, init, Signal::Pipe).unwrap();
-    k.install_fd(init, 5, FdObject::SignalChannel, FdFlags::EMPTY).unwrap();
+    k.install_fd(init, 5, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 128];
     let s = sub_fd_rw(17, abi::wasi::eventtype::FD_READ, 5);
     heap[..48].copy_from_slice(&s);
@@ -5097,7 +5038,8 @@ fn poll_oneoff_fd_write_on_signal_channel_emits_einval() {
     // SignalChannel is read-only. FD_WRITE on it is ill-posed.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sigwr", 0);
-    k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 128];
     let s = sub_fd_rw(19, abi::wasi::eventtype::FD_WRITE, 5);
     heap[..48].copy_from_slice(&s);
@@ -5125,12 +5067,7 @@ fn poll_oneoff_userdata_is_echoed_verbatim() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "udatareal", 0);
     let mut heap = vec![0u8; 128];
-    let s = sub_clock(
-        0xFEDC_BA98_7654_3210,
-        abi::wasi::CLOCKID_MONOTONIC,
-        0,
-        0,
-    );
+    let s = sub_clock(0xFEDC_BA98_7654_3210, abi::wasi::CLOCKID_MONOTONIC, 0, 0);
     heap[..48].copy_from_slice(&s);
 
     let req = Request {
@@ -5307,10 +5244,7 @@ fn fd_filestat_set_times_set_atim_now_stamps_wall_clock_via_platform() {
         opcode: op_wasi::FD_FILESTAT_SET_TIMES,
         flags: 0,
         request_id: 851,
-        args: fd_filestat_set_times_args(
-            fd,
-            abi::wasi::fstflags::SET_ATIM_NOW as u32,
-        ),
+        args: fd_filestat_set_times_args(fd, abi::wasi::fstflags::SET_ATIM_NOW as u32),
         heap_ptr: 0,
         heap_len: 16,
     };
@@ -5446,13 +5380,8 @@ fn fd_filestat_set_times_on_procfs_fd_returns_erofs() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "fd_proc", 0);
     let (mount_id, ino) = k.vfs.resolve("/proc/version").expect("resolve");
-    k.install_fd(
-        pid,
-        4,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .unwrap();
+    k.install_fd(pid, 4, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 64];
     heap[..16].copy_from_slice(&fd_filestat_set_times_heap(111, 222));
 
@@ -5483,10 +5412,7 @@ fn fd_filestat_set_times_with_short_heap_returns_einval() {
         opcode: op_wasi::FD_FILESTAT_SET_TIMES,
         flags: 0,
         request_id: 858,
-        args: fd_filestat_set_times_args(
-            fd,
-            abi::wasi::fstflags::SET_ATIM as u32,
-        ),
+        args: fd_filestat_set_times_args(fd, abi::wasi::fstflags::SET_ATIM as u32),
         heap_ptr: 0,
         heap_len: 8, // only room for atim, no mtim
     };
@@ -5737,28 +5663,18 @@ fn decode_dirent_header(heap: &[u8], offset: usize) -> (u64, u64, u32, u8) {
     d_ino_bytes.copy_from_slice(&heap[offset + de::OFF_D_INO..offset + de::OFF_D_INO + 8]);
     let d_ino = u64::from_le_bytes(d_ino_bytes);
     let mut d_namlen_bytes = [0u8; 4];
-    d_namlen_bytes
-        .copy_from_slice(&heap[offset + de::OFF_D_NAMLEN..offset + de::OFF_D_NAMLEN + 4]);
+    d_namlen_bytes.copy_from_slice(&heap[offset + de::OFF_D_NAMLEN..offset + de::OFF_D_NAMLEN + 4]);
     let d_namlen = u32::from_le_bytes(d_namlen_bytes);
     let d_type = heap[offset + de::OFF_D_TYPE];
     (d_next, d_ino, d_namlen, d_type)
 }
 
-fn make_dir_fd(
-    k: &mut Kernel,
-    name: &str,
-    dir_path: &str,
-) -> (abi::ext::Pid, u32) {
+fn make_dir_fd(k: &mut Kernel, name: &str, dir_path: &str) -> (abi::ext::Pid, u32) {
     let pid = make_running_proc(k, name, 0);
     k.vfs.mkdir(dir_path, 0o755).expect("mkdir");
     let (mount_id, ino) = k.vfs.resolve(dir_path).expect("resolve");
-    k.install_fd(
-        pid,
-        10,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .unwrap();
+    k.install_fd(pid, 10, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .unwrap();
     (pid, 10)
 }
 
@@ -5811,7 +5727,9 @@ fn fd_readdir_lists_all_entries_in_a_populated_directory() {
         let (d_next, _d_ino, d_namlen, d_type) = decode_dirent_header(&heap, off);
         let name_start = off + 24;
         let name_end = name_start + d_namlen as usize;
-        let name = core::str::from_utf8(&heap[name_start..name_end]).unwrap().to_string();
+        let name = core::str::from_utf8(&heap[name_start..name_end])
+            .unwrap()
+            .to_string();
         names.push((name, d_type, d_next));
         off = name_end;
     }
@@ -5822,7 +5740,10 @@ fn fd_readdir_lists_all_entries_in_a_populated_directory() {
     assert_eq!(names[1].2, 2);
     assert_eq!(names[2].2, 3);
     // One of them is the subdirectory, and its type is DIRECTORY.
-    let sub = names.iter().find(|(n, _, _)| n == "sub").expect("sub listed");
+    let sub = names
+        .iter()
+        .find(|(n, _, _)| n == "sub")
+        .expect("sub listed");
     assert_eq!(sub.1, 3, "sub is filetype DIRECTORY (3)");
 }
 
@@ -5853,7 +5774,9 @@ fn fd_readdir_with_cookie_resumes_from_that_position() {
         let (_d_next, _d_ino, d_namlen, _d_type) = decode_dirent_header(&heap, off);
         let name_start = off + 24;
         let name_end = name_start + d_namlen as usize;
-        let name = core::str::from_utf8(&heap[name_start..name_end]).unwrap().to_string();
+        let name = core::str::from_utf8(&heap[name_start..name_end])
+            .unwrap()
+            .to_string();
         names.push(name);
         off = name_end;
     }
@@ -5868,11 +5791,15 @@ fn fd_readdir_truncates_when_buffer_fills_mid_entry() {
     // value == heap_len on re-call.
     let mut k = make_kernel();
     let (pid, fd) = make_dir_fd(&mut k, "trunc", "/t");
-    k.vfs.create("/t/aaaaaaaaaaaaaaa.txt", 0o644).expect("create"); // 19 bytes name
-    k.vfs.create("/t/bbbbbbbbbbbbbbb.txt", 0o644).expect("create"); // 19 bytes name
-    // One entry = 24 bytes header + 19 bytes name = 43 bytes.
-    // Buffer of 50 bytes fits one full entry (43) + 7 bytes of
-    // the next entry's header (partial).
+    k.vfs
+        .create("/t/aaaaaaaaaaaaaaa.txt", 0o644)
+        .expect("create"); // 19 bytes name
+    k.vfs
+        .create("/t/bbbbbbbbbbbbbbb.txt", 0o644)
+        .expect("create"); // 19 bytes name
+                           // One entry = 24 bytes header + 19 bytes name = 43 bytes.
+                           // Buffer of 50 bytes fits one full entry (43) + 7 bytes of
+                           // the next entry's header (partial).
     let mut heap = vec![0u8; 50];
 
     let req = Request {
@@ -6036,7 +5963,10 @@ fn path_unlink_file_removes_regular_file_from_tmpfs() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
-    assert_eq!(k.vfs.stat("/u.txt").unwrap_err(), kernel::vfs::FsError::NotFound);
+    assert_eq!(
+        k.vfs.stat("/u.txt").unwrap_err(),
+        kernel::vfs::FsError::NotFound
+    );
 }
 
 #[test]
@@ -6686,7 +6616,10 @@ fn fd_fdstat_set_flags_preserves_cloexec() {
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
     let e = k.fds(pid).unwrap().get(fd).unwrap();
-    assert!(e.flags.contains(FdFlags::CLOEXEC), "CLOEXEC preserved across set_flags");
+    assert!(
+        e.flags.contains(FdFlags::CLOEXEC),
+        "CLOEXEC preserved across set_flags"
+    );
     assert!(e.flags.contains(FdFlags::NONBLOCK));
 }
 
@@ -7159,13 +7092,8 @@ fn fd_pwrite_to_procfs_vnode_returns_erofs() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "procpwriter", 0);
     let (mount_id, ino) = k.vfs.resolve("/proc/version").expect("resolve");
-    k.install_fd(
-        pid,
-        10,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .unwrap();
+    k.install_fd(pid, 10, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 32];
     heap[..2].copy_from_slice(b"hi");
 
@@ -7189,14 +7117,12 @@ fn fd_filestat_set_size_on_procfs_returns_erofs() {
     // stopping at the non-Vnode EINVAL guard.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "proctruncer", 0);
-    let (mount_id, ino) = k.vfs.resolve("/proc/version").expect("resolve proc version");
-    k.install_fd(
-        pid,
-        10,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .unwrap();
+    let (mount_id, ino) = k
+        .vfs
+        .resolve("/proc/version")
+        .expect("resolve proc version");
+    k.install_fd(pid, 10, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7272,7 +7198,8 @@ fn sock_send_delivers_bytes_to_connected_peer() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
 
     let msg = b"hello";
     let mut heap = vec![0u8; 64];
@@ -7312,7 +7239,8 @@ fn sock_send_ignores_si_flags() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
 
     let mut heap = vec![0u8; 64];
     heap[..2].copy_from_slice(b"hi");
@@ -7390,7 +7318,8 @@ fn sock_recv_reads_bytes_from_peer_send() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
 
     let mut heap = vec![0u8; 32];
 
@@ -7495,7 +7424,8 @@ fn sock_accept_returns_fresh_fd_for_pending_backlog_client() {
         let cs = k.ipc.socket_mut(client).unwrap();
         cs.state = SocketState::Connecting;
     }
-    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7532,7 +7462,8 @@ fn sock_accept_applies_wasi_fdflags_to_the_new_fd() {
         let cs = k.ipc.socket_mut(client).unwrap();
         cs.state = SocketState::Connecting;
     }
-    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7562,7 +7493,8 @@ fn sock_accept_on_empty_backlog_returns_eagain() {
         ls.state = SocketState::Listening;
         // No backlog entries — empty.
     }
-    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7585,7 +7517,8 @@ fn sock_accept_on_non_listening_socket_returns_einval() {
 
     // Fresh socket — state defaults to Unbound, not Listening.
     let s = k.ipc.create_socket(SocketType::Stream);
-    k.install_fd(pid, 3, FdObject::Socket(s.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(s.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7682,7 +7615,8 @@ fn sock_shutdown_rdwr_closes_socket_observable_via_peer_eof() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let how = (abi::wasi::sdflags::RD | abi::wasi::sdflags::WR) as u32;
@@ -7713,7 +7647,8 @@ fn sock_shutdown_rd_alone_marks_read_side_shutdown() {
     let pid = make_running_proc(&mut k, "shutter", 0);
     let a = k.ipc.create_socket(SocketType::Stream);
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7739,7 +7674,8 @@ fn sock_shutdown_wr_alone_marks_write_side_shutdown() {
     let pid = make_running_proc(&mut k, "shutter", 0);
     let a = k.ipc.create_socket(SocketType::Stream);
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7769,7 +7705,8 @@ fn sock_shutdown_rdwr_sets_both_flags_without_closing() {
     let pid = make_running_proc(&mut k, "shutter", 0);
     let a = k.ipc.create_socket(SocketType::Stream);
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let how = (abi::wasi::sdflags::RD | abi::wasi::sdflags::WR) as u32;
@@ -7812,7 +7749,8 @@ fn sock_shutdown_read_makes_recv_return_eof() {
     // Push some bytes into a's rx buffer, then shutdown RD on a.
     k.ipc.send_on_socket(b, b"payload", Vec::new()).unwrap();
     assert_eq!(k.ipc.socket_mut(a).unwrap().rx_len(), 7);
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7925,7 +7863,8 @@ fn sock_shutdown_with_zero_how_returns_einval() {
     let pid = make_running_proc(&mut k, "shutter", 0);
     let a = k.ipc.create_socket(SocketType::Stream);
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -7950,7 +7889,8 @@ fn sock_shutdown_with_reserved_bits_returns_einval() {
     let pid = make_running_proc(&mut k, "shutter", 0);
     let a = k.ipc.create_socket(SocketType::Stream);
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     let mut heap = vec![0u8; 16];
 
     // Bit 0x80 is undefined; RD | WR = 0x3, so 0x83 has the
@@ -9082,7 +9022,8 @@ fn fd_write_on_socket_after_peer_close_returns_epipe() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     // Peer b closes, leaving a.peer pointing at a closed socket.
     k.ipc.close_socket(b).unwrap();
 
@@ -9117,7 +9058,8 @@ fn fd_write_on_write_shutdown_socket_returns_epipe() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     // Half-close the write side.
     k.ipc.shutdown_socket(a, false, true).unwrap();
 
@@ -9152,7 +9094,8 @@ fn sock_send_on_socket_with_peer_read_shutdown_returns_epipe() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     // Peer b shuts down its read side; a's send must EPIPE.
     k.ipc.shutdown_socket(b, true, false).unwrap();
 
@@ -9229,7 +9172,8 @@ fn fd_write_on_broken_socket_posts_sigpipe_alongside_epipe() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     k.ipc.close_socket(b).unwrap();
 
     let mut heap = vec![0u8; 16];
@@ -9265,7 +9209,8 @@ fn sock_send_on_broken_socket_posts_sigpipe_alongside_epipe() {
         sb.state = SocketState::Connected;
         sb.peer = Some(a);
     }
-    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY).unwrap();
+    k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
     // Peer shuts down its read side; a's send must EPIPE + SIGPIPE.
     k.ipc.shutdown_socket(b, true, false).unwrap();
 
@@ -9684,7 +9629,9 @@ fn path_readlink_truncates_when_buffer_is_smaller_than_target() {
     // output buffer capacity.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "reader", 0);
-    k.vfs.symlink("/a/long/target/string", "/lnk").expect("symlink");
+    k.vfs
+        .symlink("/a/long/target/string", "/lnk")
+        .expect("symlink");
 
     let path = b"/lnk";
     // heap_size = path length means the kernel has exactly path.len()
@@ -9905,13 +9852,8 @@ fn make_proc_with_file_fd(
     let wrote = k.vfs.write(path, 0, bytes).expect("write");
     assert_eq!(wrote, bytes.len());
     let (mount_id, ino) = k.vfs.resolve(path).expect("resolve");
-    k.install_fd(
-        pid,
-        10,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .unwrap();
+    k.install_fd(pid, 10, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .unwrap();
     (pid, 10)
 }
 
@@ -10264,16 +10206,15 @@ fn fd_tell_on_invalid_fd_returns_ebadf() {
 
 // ---- fd-state opcodes (fd_advise / fd_allocate / fd_sync / fd_datasync) ----
 //
-// Four related "fd-state" opcodes bundled in one block. In v1's
-// tmpfs-backed VFS there is no advisor, no write-buffer to flush, and
-// no preallocation primitive — the semantics collapse to:
+// Four related "fd-state" opcodes bundled in one block:
 //
 //   fd_advise   = no-op success on a Vnode (the advice is taken, then
 //                 discarded — POSIX and WASI both permit this; the
 //                 opcode is purely a hint).
-//   fd_sync     = no-op success on a Vnode (nothing to flush; v1
-//                 writes are synchronous into the vfs state).
-//   fd_datasync = no-op success on a Vnode (same reason).
+//   fd_sync     = success on a Vnode and forwards to the mounted
+//                 filesystem's sync hook.
+//   fd_datasync = same as fd_sync in v1 (metadata/data split is not
+//                 modelled below Filesystem::sync).
 //   fd_allocate = ENOTSUP on every fd (v1 tmpfs doesn't honour
 //                 preallocation; returning success would lie about
 //                 reserved space, so the honest answer is ENOTSUP).
@@ -10422,6 +10363,7 @@ fn fd_allocate_on_invalid_fd_returns_ebadf() {
 fn fd_sync_on_vnode_fd_returns_success() {
     let mut k = make_kernel();
     let (pid, fd) = make_proc_with_file_fd(&mut k, "syncer", "/s.txt", b"abcdefghij");
+    assert_eq!(k.vfs.dirty_mount_count(), 1);
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -10435,6 +10377,7 @@ fn fd_sync_on_vnode_fd_returns_success() {
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, 0);
+    assert_eq!(k.vfs.dirty_mount_count(), 0);
 }
 
 #[test]
@@ -10479,6 +10422,7 @@ fn fd_sync_on_invalid_fd_returns_ebadf() {
 fn fd_datasync_on_vnode_fd_returns_success() {
     let mut k = make_kernel();
     let (pid, fd) = make_proc_with_file_fd(&mut k, "datasyncer", "/d.txt", b"abc");
+    assert_eq!(k.vfs.dirty_mount_count(), 1);
     let mut heap = vec![0u8; 16];
 
     let req = Request {
@@ -10492,6 +10436,7 @@ fn fd_datasync_on_vnode_fd_returns_success() {
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, 0);
+    assert_eq!(k.vfs.dirty_mount_count(), 0);
 }
 
 #[test]
@@ -11523,7 +11468,10 @@ fn proc_spawn_creates_child_and_records_platform_spawn_call() {
     let resp = dispatch(&mut k, parent, &req, &mut heap);
 
     assert_eq!(resp.status, 0);
-    assert!(resp.value > parent as i64, "new pid must be positive and fresh");
+    assert!(
+        resp.value > parent as i64,
+        "new pid must be positive and fresh"
+    );
     let new_pid = resp.value as i32;
     assert!(k.procs.is_alive(new_pid));
     assert_eq!(k.procs.get(new_pid).unwrap().ppid, parent);
@@ -11533,10 +11481,7 @@ fn proc_spawn_creates_child_and_records_platform_spawn_call() {
     assert!(child_fds.get(1).is_some());
     assert!(child_fds.get(2).is_some());
     // Signal channel auto-installed at fd 3.
-    assert_eq!(
-        child_fds.get(3).unwrap().object,
-        FdObject::SignalChannel,
-    );
+    assert_eq!(child_fds.get(3).unwrap().object, FdObject::SignalChannel,);
 
     // Platform was asked to spawn a Worker for the new pid.
     kernel::platform::native::with_state(|s| {
@@ -11568,9 +11513,7 @@ fn proc_spawn_rolls_back_when_platform_refuses() {
 
     // Remember which pids exist pre-call so we can assert that NO new
     // pid survives the rollback.
-    let before_alive: Vec<_> = (0..20)
-        .filter(|p| k.procs.is_alive(*p as i32))
-        .collect();
+    let before_alive: Vec<_> = (0..20).filter(|p| k.procs.is_alive(*p as i32)).collect();
 
     let req = Request {
         opcode: op_ext::PROC_SPAWN,
@@ -11585,9 +11528,7 @@ fn proc_spawn_rolls_back_when_platform_refuses() {
     assert_eq!(resp.status, -errno::EIO);
     // No new pid in the process table: the set of alive pids is
     // the same as before the call.
-    let after_alive: Vec<_> = (0..20)
-        .filter(|p| k.procs.is_alive(*p as i32))
-        .collect();
+    let after_alive: Vec<_> = (0..20).filter(|p| k.procs.is_alive(*p as i32)).collect();
     assert_eq!(before_alive, after_alive);
     // Platform recorded no successful spawn (the error consumed the
     // `next_spawn_error` slot without appending).
@@ -11650,9 +11591,7 @@ fn proc_spawn_rejects_cap_superset() {
         })
         .unwrap();
     k.mark_ready(parent).unwrap();
-    k.procs
-        .transition(parent, ProcState::Running)
-        .unwrap();
+    k.procs.transition(parent, ProcState::Running).unwrap();
     install_default_stdio(&mut k, parent);
 
     let path = "/usr/bin/escalator";
@@ -12473,10 +12412,7 @@ fn proc_kill_sigpipe_queues_on_child_inbox() {
     let mut heap = vec![0u8; 16];
     let resp = dispatch(&mut k, init, &req, &mut heap);
     assert_eq!(resp.status, 0);
-    assert_eq!(
-        k.drain_signals(child).unwrap(),
-        alloc::vec![Signal::Pipe]
-    );
+    assert_eq!(k.drain_signals(child).unwrap(), alloc::vec![Signal::Pipe]);
 }
 
 #[test]
@@ -12500,10 +12436,7 @@ fn proc_kill_sigchld_queues_on_child_inbox() {
     let mut heap = vec![0u8; 16];
     let resp = dispatch(&mut k, init, &req, &mut heap);
     assert_eq!(resp.status, 0);
-    assert_eq!(
-        k.drain_signals(child).unwrap(),
-        alloc::vec![Signal::Child]
-    );
+    assert_eq!(k.drain_signals(child).unwrap(), alloc::vec![Signal::Child]);
 }
 
 // ---- proc_kill(pid, 0) existence probe ---------------------------
@@ -12718,12 +12651,12 @@ fn proc_kill_and_proc_check_signal_agree_across_cap_matrix() {
         Err(KernelError),
     }
     let cases: &[(i32, i32, Outcome)] = &[
-        (init, child, Outcome::Ok),                           // parent
-        (init, init, Outcome::Ok),                            // self
-        (sib_a, sib_b, Outcome::Err(KernelError::NotCapable)),// cross-sibling, no cap
-        (init, sib_a, Outcome::Ok),                           // parent w/ cap
-        (init, bogus, Outcome::Err(KernelError::NoSuchPid)),  // nonexistent
-        (init, reaped, Outcome::Err(KernelError::NoSuchPid)), // reaped (Dead state)
+        (init, child, Outcome::Ok),                            // parent
+        (init, init, Outcome::Ok),                             // self
+        (sib_a, sib_b, Outcome::Err(KernelError::NotCapable)), // cross-sibling, no cap
+        (init, sib_a, Outcome::Ok),                            // parent w/ cap
+        (init, bogus, Outcome::Err(KernelError::NoSuchPid)),   // nonexistent
+        (init, reaped, Outcome::Err(KernelError::NoSuchPid)),  // reaped (Dead state)
     ];
 
     for (sender, target, expected) in cases {
@@ -13028,11 +12961,7 @@ fn umount_args(path_ptr: u32, path_len: u32) -> [u8; 16] {
 /// a non-INIT cap set so the mount tests can probe the cap-check
 /// arm without the test fixture itself granting Cap::Mount
 /// implicitly via init's `CapSet::ALL`.
-fn make_proc_with_caps(
-    k: &mut Kernel,
-    name: &str,
-    caps: abi::cap::CapSet,
-) -> abi::ext::Pid {
+fn make_proc_with_caps(k: &mut Kernel, name: &str, caps: abi::cap::CapSet) -> abi::ext::Pid {
     let pid = k
         .register_process(RegisterArgs {
             name,
@@ -13474,11 +13403,7 @@ fn umount_caller_lacks_fs_mount_returns_enotcapable() {
     // /mnt is a real mount, but the umount caller has only
     // DisplayClient → -ENOTCAPABLE. The mount stays installed.
     let mut k = make_kernel();
-    let setup = make_proc_with_caps(
-        &mut k,
-        "setup",
-        abi::cap::CapSet::from_caps(&[Cap::Mount]),
-    );
+    let setup = make_proc_with_caps(&mut k, "setup", abi::cap::CapSet::from_caps(&[Cap::Mount]));
     k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
     k.mount(setup, "/mnt", "tmpfs", 0).expect("mount");
     let mount_count_after = k.vfs.mount_count();
@@ -13523,13 +13448,8 @@ fn umount_with_open_fds_returns_ebusy() {
     k.mount(pid, "/mnt", "tmpfs", 0).expect("mount");
     k.vfs.create("/mnt/pin", 0o644).expect("create pin");
     let (mount_id, ino) = k.vfs.resolve("/mnt/pin").expect("resolve pin");
-    k.install_fd(
-        pid,
-        7,
-        FdObject::Vnode { mount_id, ino },
-        FdFlags::EMPTY,
-    )
-    .expect("install pinning fd");
+    k.install_fd(pid, 7, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
+        .expect("install pinning fd");
 
     let mut heap = vec![0u8; 256];
     let path = b"/mnt";
@@ -13544,7 +13464,8 @@ fn umount_with_open_fds_returns_ebusy() {
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(
-        resp.status, -errno::EBUSY,
+        resp.status,
+        -errno::EBUSY,
         "open fd under the mount must pin it busy"
     );
 
@@ -13559,7 +13480,10 @@ fn umount_with_open_fds_returns_ebusy() {
         heap_len: path.len() as u32,
     };
     let resp2 = dispatch(&mut k, pid, &req2, &mut heap);
-    assert_eq!(resp2.status, 0, "umount succeeds after the pinning fd closes");
+    assert_eq!(
+        resp2.status, 0,
+        "umount succeeds after the pinning fd closes"
+    );
 }
 
 // ---------- mount remount ----------
@@ -13607,7 +13531,11 @@ fn mount_remount_changes_flags_in_place() {
         .find(|(_id, mp)| mp == "/a")
         .map(|(id, _)| id)
         .expect("/a in mount table");
-    assert_eq!(k.vfs.mount_flags("/a"), Some(0), "fresh mount starts at flags=0");
+    assert_eq!(
+        k.vfs.mount_flags("/a"),
+        Some(0),
+        "fresh mount starts at flags=0"
+    );
 
     // Pick a flag bit that ISN'T MOUNT_REMOUNT itself — bit 1 is
     // unused so it can't accidentally collide with REMOUNT.
@@ -13620,7 +13548,11 @@ fn mount_remount_changes_flags_in_place() {
     )
     .expect("remount");
 
-    assert_eq!(k.vfs.mount_count(), mount_count_before, "no new mount entry");
+    assert_eq!(
+        k.vfs.mount_count(),
+        mount_count_before,
+        "no new mount entry"
+    );
     assert_eq!(
         k.vfs.mount_flags("/a"),
         Some(PROBE_BIT),
@@ -13710,7 +13642,10 @@ fn mount_remount_ignores_source_parameter() {
     )
     .expect("remount");
 
-    let (_mount_id, _ino) = k.vfs.resolve("/a/before.txt").expect("file survives remount");
+    let (_mount_id, _ino) = k
+        .vfs
+        .resolve("/a/before.txt")
+        .expect("file survives remount");
     assert_eq!(k.vfs.mount_flags("/a"), Some(1 << 2), "flag bit installed");
 }
 
@@ -13750,11 +13685,7 @@ fn mount_remount_requires_cap_mount() {
     // /a is a real mount, the cap check fires first and the flag
     // bitset is unchanged.
     let mut k = make_kernel();
-    let setup = make_proc_with_caps(
-        &mut k,
-        "setup",
-        abi::cap::CapSet::from_caps(&[Cap::Mount]),
-    );
+    let setup = make_proc_with_caps(&mut k, "setup", abi::cap::CapSet::from_caps(&[Cap::Mount]));
     k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
     k.mount(setup, "/a", "tmpfs", 0).expect("first mount");
     assert_eq!(k.vfs.mount_flags("/a"), Some(0));
@@ -13807,7 +13738,8 @@ fn mount_without_remount_creates_new_entry() {
     // A non-zero flag bit on a fresh mount (REMOUNT bit NOT set)
     // is persisted as the entry's starting flag bitset.
     k.vfs.mkdir("/b", 0o755).expect("mkdir /b");
-    k.mount(pid, "/b", "tmpfs", 1 << 2).expect("fresh mount with flags");
+    k.mount(pid, "/b", "tmpfs", 1 << 2)
+        .expect("fresh mount with flags");
     assert_eq!(k.vfs.mount_count(), mount_count_before + 2);
     assert_eq!(k.vfs.mount_flags("/b"), Some(1 << 2));
 }
@@ -13880,7 +13812,8 @@ fn mount_remount_clears_a_set_flag() {
         abi::cap::CapSet::from_caps(&[Cap::Mount]),
     );
     k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
-    k.mount(pid, "/a", "tmpfs", 1 << 2).expect("first mount with flags");
+    k.mount(pid, "/a", "tmpfs", 1 << 2)
+        .expect("first mount with flags");
     assert_eq!(k.vfs.mount_flags("/a"), Some(1 << 2));
 
     // Remount with REMOUNT bit only — persisted bits = 0 after
@@ -13912,7 +13845,11 @@ fn mount_remount_root_is_supported() {
     );
     // make_kernel() installs a tmpfs at "/" already. Confirm the
     // root entry exists with flags=0.
-    assert_eq!(k.vfs.mount_flags("/"), Some(0), "root mount exists at flags=0");
+    assert_eq!(
+        k.vfs.mount_flags("/"),
+        Some(0),
+        "root mount exists at flags=0"
+    );
     let mount_count_before = k.vfs.mount_count();
     let root_id_before = k
         .vfs
@@ -13931,7 +13868,11 @@ fn mount_remount_root_is_supported() {
     )
     .expect("root remount");
 
-    assert_eq!(k.vfs.mount_flags("/"), Some(PROBE_BIT), "root flags updated");
+    assert_eq!(
+        k.vfs.mount_flags("/"),
+        Some(PROBE_BIT),
+        "root flags updated"
+    );
     assert_eq!(k.vfs.mount_count(), mount_count_before, "no new mount");
     let root_id_after = k
         .vfs
@@ -14044,7 +13985,13 @@ fn fs_watch_path_does_not_exist_returns_enoent() {
     let pid = make_running_proc(&mut k, "watcher", 0);
     let mut heap = vec![0u8; 256];
     let resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/no/such/path", abi::ext::WATCH_CREATE, 0, 701,
+        &mut k,
+        pid,
+        &mut heap,
+        b"/no/such/path",
+        abi::ext::WATCH_CREATE,
+        0,
+        701,
     );
     assert_eq!(resp.status, -errno::ENOENT);
 }
@@ -14059,7 +14006,13 @@ fn fs_watch_path_not_absolute_returns_einval() {
     let watch_count_before = k.vfs.watches().len();
     let fd_count_before = k.fds(pid).unwrap().open_count();
     let resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"no-leading-slash", abi::ext::WATCH_CREATE, 0, 702,
+        &mut k,
+        pid,
+        &mut heap,
+        b"no-leading-slash",
+        abi::ext::WATCH_CREATE,
+        0,
+        702,
     );
     assert_eq!(resp.status, -errno::EINVAL);
     assert_eq!(k.vfs.watches().len(), watch_count_before);
@@ -14129,9 +14082,7 @@ fn fs_watch_invalid_flags_atomic_reject() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "watcher", 0);
     let mut heap = vec![0u8; 256];
-    let resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 1, 706,
-    );
+    let resp = dispatch_fs_watch(&mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 1, 706);
     assert_eq!(resp.status, -errno::EINVAL);
     assert_eq!(k.vfs.watches().len(), 0);
 }
@@ -14146,7 +14097,13 @@ fn fs_watch_create_event_is_delivered() {
     let mut heap = vec![0u8; 256];
 
     let reg_resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_CREATE, 0, 710,
+        &mut k,
+        pid,
+        &mut heap,
+        b"/dir",
+        abi::ext::WATCH_CREATE,
+        0,
+        710,
     );
     assert_eq!(reg_resp.status, 0);
     let watch_fd = reg_resp.value as u32;
@@ -14158,7 +14115,9 @@ fn fs_watch_create_event_is_delivered() {
     // Drain the watch fd via the kernel's fd_read seam — bypasses
     // dispatcher serialization but exercises the same code path.
     let mut buf = [0u8; 16];
-    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    let n = k
+        .fd_read(pid, watch_fd, &mut buf)
+        .expect("fd_read on watch");
     assert_eq!(n, 8, "one event = one 8-byte record");
     let mask = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let inode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
@@ -14178,7 +14137,13 @@ fn fs_watch_delete_event_is_delivered() {
     let mut heap = vec![0u8; 256];
 
     let reg_resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_DELETE, 0, 720,
+        &mut k,
+        pid,
+        &mut heap,
+        b"/dir",
+        abi::ext::WATCH_DELETE,
+        0,
+        720,
     );
     assert_eq!(reg_resp.status, 0);
     let watch_fd = reg_resp.value as u32;
@@ -14186,7 +14151,9 @@ fn fs_watch_delete_event_is_delivered() {
     k.vfs_unlink("/dir/file").expect("unlink");
 
     let mut buf = [0u8; 16];
-    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    let n = k
+        .fd_read(pid, watch_fd, &mut buf)
+        .expect("fd_read on watch");
     assert_eq!(n, 8);
     let mask = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let inode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
@@ -14208,7 +14175,13 @@ fn fs_watch_modify_event_is_delivered() {
     let mut heap = vec![0u8; 256];
 
     let reg_resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/file", abi::ext::WATCH_MODIFY, 0, 730,
+        &mut k,
+        pid,
+        &mut heap,
+        b"/file",
+        abi::ext::WATCH_MODIFY,
+        0,
+        730,
     );
     assert_eq!(reg_resp.status, 0);
     let watch_fd = reg_resp.value as u32;
@@ -14216,7 +14189,9 @@ fn fs_watch_modify_event_is_delivered() {
     k.fd_write(pid, writer_fd, b"hi").expect("fd_write");
 
     let mut buf = [0u8; 16];
-    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    let n = k
+        .fd_read(pid, watch_fd, &mut buf)
+        .expect("fd_read on watch");
     assert_eq!(n, 8);
     let mask = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let inode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
@@ -14235,7 +14210,13 @@ fn fs_watch_no_event_when_mask_excludes() {
     let mut heap = vec![0u8; 256];
 
     let reg_resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_DELETE, 0, 740,
+        &mut k,
+        pid,
+        &mut heap,
+        b"/dir",
+        abi::ext::WATCH_DELETE,
+        0,
+        740,
     );
     assert_eq!(reg_resp.status, 0);
     let watch_fd = reg_resp.value as u32;
@@ -14243,7 +14224,9 @@ fn fs_watch_no_event_when_mask_excludes() {
     k.vfs_create("/dir/file", 0o644).expect("create");
 
     let mut buf = [0u8; 16];
-    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    let n = k
+        .fd_read(pid, watch_fd, &mut buf)
+        .expect("fd_read on watch");
     assert_eq!(n, 0, "create event filtered out by DELETE-only mask");
 }
 
@@ -14261,7 +14244,13 @@ fn fs_watch_close_unregisters() {
     let mut heap = vec![0u8; 256];
 
     let reg_resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_CREATE, 0, 750,
+        &mut k,
+        pid,
+        &mut heap,
+        b"/dir",
+        abi::ext::WATCH_CREATE,
+        0,
+        750,
     );
     assert_eq!(reg_resp.status, 0);
     let watch_fd = reg_resp.value as u32;
@@ -14272,7 +14261,8 @@ fn fs_watch_close_unregisters() {
 
     // Subsequent mutations don't queue events anywhere — the watch
     // is gone. Just confirm the create still works without panic.
-    k.vfs_create("/dir/post-close", 0o644).expect("create after close");
+    k.vfs_create("/dir/post-close", 0o644)
+        .expect("create after close");
 }
 
 #[test]
@@ -14304,15 +14294,16 @@ fn fs_watch_emfile_when_fd_table_full_rolls_back_registration() {
     let mut tight = kernel::fd::FdTable::with_limit(16);
     for fd in 0..16u32 {
         tight
-            .install_at(fd, kernel::fd::FdEntry::new(FdObject::CharDevice(DEV_CONSOLE)))
+            .install_at(
+                fd,
+                kernel::fd::FdEntry::new(FdObject::CharDevice(DEV_CONSOLE)),
+            )
             .expect("install at");
     }
     *k.fds_mut(pid).unwrap() = tight;
 
     let mut heap = vec![0u8; 64];
-    let resp = dispatch_fs_watch(
-        &mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 0, 760,
-    );
+    let resp = dispatch_fs_watch(&mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 0, 760);
     assert_eq!(resp.status, -errno::EMFILE);
     assert_eq!(
         k.vfs.watches().len(),
@@ -14564,7 +14555,10 @@ fn host_file_recv_emfile_rolls_back_to_pending() {
     let mut tight = kernel::fd::FdTable::with_limit(8);
     for fd in 0..8u32 {
         tight
-            .install_at(fd, kernel::fd::FdEntry::new(FdObject::CharDevice(DEV_CONSOLE)))
+            .install_at(
+                fd,
+                kernel::fd::FdEntry::new(FdObject::CharDevice(DEV_CONSOLE)),
+            )
             .expect("install at");
     }
     *k.fds_mut(pid).unwrap() = tight;

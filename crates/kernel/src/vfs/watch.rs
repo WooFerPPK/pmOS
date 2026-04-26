@@ -143,12 +143,7 @@ impl WatchTable {
     }
 
     /// Install a fresh watch. Returns the assigned id.
-    pub fn register(
-        &mut self,
-        mount_id: MountId,
-        inode: Ino,
-        mask: u32,
-    ) -> WatchId {
+    pub fn register(&mut self, mount_id: MountId, inode: Ino, mask: u32) -> WatchId {
         let id = WatchId(self.next_id);
         self.next_id = self.next_id.checked_add(1).expect("watch id overflow");
         self.watches.insert(

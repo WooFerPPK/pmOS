@@ -36,11 +36,11 @@ use crate::dev::{DevError, DeviceDispatcher};
 use crate::fd::{FdEntry, FdError, FdFlags, FdObject, FdTable};
 use crate::host_file::{HostFile, HostFileFd};
 use crate::ipc::{IpcError, IpcTable, PipeId, SocketId, SocketType};
+pub use crate::proc::Signal;
 use crate::proc::{
     table::{InsertError, ZombieTarget},
     ExitStatus, ProcState, Process, ProcessTable, Scheduler, SignalInbox,
 };
-pub use crate::proc::Signal;
 use crate::vfs::{DirEntry, FsError, Ino, MountId, NodeType, Vfs, WatchEvent, WatchId};
 
 /// Error returned by the high-level kernel API.
@@ -599,12 +599,7 @@ impl Kernel {
     /// * `PipeRead` / `Socket` → wired in a later slice.
     /// * `PipeWrite` / `DisplayConn` / `SignalChannel` →
     ///   [`KernelError::NotSupportedOnFd`].
-    pub fn fd_read(
-        &mut self,
-        pid: Pid,
-        fd: u32,
-        buf: &mut [u8],
-    ) -> Result<usize, KernelError> {
+    pub fn fd_read(&mut self, pid: Pid, fd: u32, buf: &mut [u8]) -> Result<usize, KernelError> {
         let entry = *self
             .fds
             .get(&pid)
@@ -688,9 +683,7 @@ impl Kernel {
                 };
                 Ok(state.read(buf))
             }
-            FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => {
-                Err(KernelError::NotSupportedOnFd)
-            }
+            FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => Err(KernelError::NotSupportedOnFd),
         }
     }
 
@@ -705,12 +698,7 @@ impl Kernel {
     /// CharDevice, pipe-read, display conn, signal channel) does
     /// not post a signal: those either cannot surface
     /// PipeBroken or have their own error paths.
-    pub fn fd_write(
-        &mut self,
-        pid: Pid,
-        fd: u32,
-        buf: &[u8],
-    ) -> Result<usize, KernelError> {
+    pub fn fd_write(&mut self, pid: Pid, fd: u32, buf: &[u8]) -> Result<usize, KernelError> {
         let entry = *self
             .fds
             .get(&pid)
@@ -742,9 +730,7 @@ impl Kernel {
                     Err(e) => Err(KernelError::Fs(e)),
                 }
             }
-            FdObject::CharDevice(devnum) => {
-                self.devs.write(devnum, buf).map_err(KernelError::from)
-            }
+            FdObject::CharDevice(devnum) => self.devs.write(devnum, buf).map_err(KernelError::from),
             FdObject::Socket(id) => {
                 let r = self
                     .ipc
@@ -755,11 +741,7 @@ impl Kernel {
                     // is parked on a blocking ipc_recv against the
                     // peer socket, wake it now with the freshly-
                     // available bytes.
-                    if let Some(peer_id) = self
-                        .ipc
-                        .sockets_get(SocketId(id))
-                        .and_then(|s| s.peer)
-                    {
+                    if let Some(peer_id) = self.ipc.sockets_get(SocketId(id)).and_then(|s| s.peer) {
                         let _ = self.wake_parked_recver_if_any(peer_id);
                     }
                 }
@@ -808,12 +790,7 @@ impl Kernel {
     /// open and returns success as a no-op. Releases object-side
     /// resources for the prior `to` entry (pipe / socket ref
     /// counts) before returning, same way `fd_close` does.
-    pub fn fd_renumber(
-        &mut self,
-        pid: Pid,
-        from: u32,
-        to: u32,
-    ) -> Result<(), KernelError> {
+    pub fn fd_renumber(&mut self, pid: Pid, from: u32, to: u32) -> Result<(), KernelError> {
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         let prior = table.renumber(from, to)?;
         if let Some(entry) = prior {
@@ -856,11 +833,7 @@ impl Kernel {
     ///   vnode is a regular file / symlink rather than a
     ///   directory; the errno-mapping layer translates this to
     ///   ENOTDIR.
-    pub fn fd_readdir(
-        &mut self,
-        pid: Pid,
-        fd: u32,
-    ) -> Result<Vec<DirEntry>, KernelError> {
+    pub fn fd_readdir(&mut self, pid: Pid, fd: u32) -> Result<Vec<DirEntry>, KernelError> {
         let entry = *self
             .fds
             .get(&pid)
@@ -928,9 +901,7 @@ impl Kernel {
             return Err(KernelError::NotCapable);
         }
         let socket_id = self.ipc.create_socket(SocketType::Stream);
-        let parker = self
-            .ipc
-            .connect_socket(socket_id, DISPLAY_SOCKET_PATH)?;
+        let parker = self.ipc.connect_socket(socket_id, DISPLAY_SOCKET_PATH)?;
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
         self.wake_parked_acceptor_if_any(parker)?;
@@ -946,11 +917,7 @@ impl Kernel {
     /// waiting; `KernelError::BadFd` if the fd isn't a
     /// socket at all; `KernelError::InvalidArgument` if the
     /// socket exists but isn't in `Listening` state.
-    pub fn accept_socket(
-        &mut self,
-        pid: Pid,
-        listener_fd: u32,
-    ) -> Result<u32, KernelError> {
+    pub fn accept_socket(&mut self, pid: Pid, listener_fd: u32) -> Result<u32, KernelError> {
         let entry = *self
             .fds
             .get(&pid)
@@ -962,10 +929,7 @@ impl Kernel {
             _ => return Err(KernelError::NotSupportedOnFd),
         };
         let server_id = self.ipc.accept_socket(listener_id)?;
-        let table = self
-            .fds
-            .get_mut(&pid)
-            .ok_or(KernelError::NoSuchPid)?;
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         let fd = table.alloc(FdEntry::new(FdObject::Socket(server_id.0)))?;
         Ok(fd)
     }
@@ -1003,7 +967,9 @@ impl Kernel {
             .map_err(|_| KernelError::NoSuchPid)?;
         self.procs.set_block_reason(
             pid,
-            crate::proc::BlockReason::Ipc { endpoint_id: listener_id.0 },
+            crate::proc::BlockReason::Ipc {
+                endpoint_id: listener_id.0,
+            },
         );
         Ok(())
     }
@@ -1049,10 +1015,7 @@ impl Kernel {
         };
         let wake_resp = match self.complete_parked_accept(acceptor_pid, listener_id) {
             Ok(fd) => abi::ring::Response::ok(req_id, fd as i64),
-            Err(e) => abi::ring::Response::err(
-                req_id,
-                crate::syscall::dispatch::kerr_to_errno(e),
-            ),
+            Err(e) => abi::ring::Response::err(req_id, crate::syscall::dispatch::kerr_to_errno(e)),
         };
         self.pending_wakes.push((acceptor_pid, wake_resp, None));
         let _ = self.procs.transition(acceptor_pid, ProcState::Ready);
@@ -1133,10 +1096,7 @@ impl Kernel {
         // the non-blocking handler would have surfaced that as
         // `-EINVAL` rather than parking — guard against the harness
         // mistake of parking on a non-Connected socket.
-        let sock = self
-            .ipc
-            .sockets_get(socket_id)
-            .ok_or(KernelError::BadFd)?;
+        let sock = self.ipc.sockets_get(socket_id).ok_or(KernelError::BadFd)?;
         if sock.state != crate::ipc::SocketState::Connected {
             return Err(KernelError::InvalidArgument);
         }
@@ -1162,7 +1122,9 @@ impl Kernel {
             })?;
         self.procs.set_block_reason(
             pid,
-            crate::proc::BlockReason::Ipc { endpoint_id: socket_id.0 },
+            crate::proc::BlockReason::Ipc {
+                endpoint_id: socket_id.0,
+            },
         );
         Ok(())
     }
@@ -1198,16 +1160,13 @@ impl Kernel {
         // by pid for O(log n) cleanup, but the wake path needs a
         // socket-id lookup — a linear walk is fine in v1 (parker
         // count == active blocking recvs, which is small).
-        let parker_pid = self
-            .parked_recvers
-            .iter()
-            .find_map(|(pid, parker)| {
-                if parker.socket_id == socket_id {
-                    Some(*pid)
-                } else {
-                    None
-                }
-            });
+        let parker_pid = self.parked_recvers.iter().find_map(|(pid, parker)| {
+            if parker.socket_id == socket_id {
+                Some(*pid)
+            } else {
+                None
+            }
+        });
         let Some(parker_pid) = parker_pid else {
             return false;
         };
@@ -1225,15 +1184,12 @@ impl Kernel {
         // the window between park and wake; if so, queue an EBADF
         // wake (the parker's fd is gone) instead of a successful
         // wake against a stale socket.
-        let parker_fd = self
-            .fds
-            .get(&parker_pid)
-            .and_then(|table| {
-                table.iter().find_map(|(fd, entry)| match entry.object {
-                    FdObject::Socket(id) if id == parker.socket_id.0 => Some(fd),
-                    _ => None,
-                })
-            });
+        let parker_fd = self.fds.get(&parker_pid).and_then(|table| {
+            table.iter().find_map(|(fd, entry)| match entry.object {
+                FdObject::Socket(id) if id == parker.socket_id.0 => Some(fd),
+                _ => None,
+            })
+        });
         let want_fd = parker.recv_fd_slot >= 0;
         let wake_resp_and_heap = match parker_fd {
             Some(fd) => match self.ipc_recv(parker_pid, fd, parker.max_len as usize, want_fd) {
@@ -1401,12 +1357,7 @@ impl Kernel {
     /// Transition a bound socket fd to listening with a caller-
     /// supplied backlog. Only meaningful for stream sockets; dgram
     /// sockets skip `listen` entirely and go straight to `recv`.
-    pub fn ipc_listen(
-        &mut self,
-        pid: Pid,
-        fd: u32,
-        backlog: usize,
-    ) -> Result<(), KernelError> {
+    pub fn ipc_listen(&mut self, pid: Pid, fd: u32, backlog: usize) -> Result<(), KernelError> {
         let socket_id = self.socket_id_from_fd(pid, fd)?;
         self.ipc.listen_socket(socket_id, backlog)?;
         Ok(())
@@ -1418,12 +1369,7 @@ impl Kernel {
     /// exchange bytes — those already route through the socket via
     /// `FdObject::Socket`, so no separate `ipc_send` / `ipc_recv`
     /// plumbing is needed on the Rust side.
-    pub fn ipc_connect(
-        &mut self,
-        pid: Pid,
-        fd: u32,
-        path: &str,
-    ) -> Result<(), KernelError> {
+    pub fn ipc_connect(&mut self, pid: Pid, fd: u32, path: &str) -> Result<(), KernelError> {
         let socket_id = self.socket_id_from_fd(pid, fd)?;
         let parker = self.ipc.connect_socket(socket_id, path)?;
         self.wake_parked_acceptor_if_any(parker)?;
@@ -1502,11 +1448,7 @@ impl Kernel {
                     // any pid is parked on a blocking ipc_recv
                     // against the peer socket, wake it now with the
                     // freshly-available payload + ancillary fd.
-                    if let Some(peer_id) = self
-                        .ipc
-                        .sockets_get(SocketId(id))
-                        .and_then(|s| s.peer)
-                    {
+                    if let Some(peer_id) = self.ipc.sockets_get(SocketId(id)).and_then(|s| s.peer) {
                         let _ = self.wake_parked_recver_if_any(peer_id);
                     }
                 }
@@ -1635,9 +1577,7 @@ impl Kernel {
         let sender_pid = self.find_pid_owning_socket(peer_id)?;
         let sender_object = self.fds.get(&sender_pid)?.get(sender_fd_num)?.object;
         let table = self.fds.get_mut(&receiver_pid)?;
-        table
-            .alloc(FdEntry::new(sender_object))
-            .ok()
+        table.alloc(FdEntry::new(sender_object)).ok()
     }
 
     /// Linear scan helper: find the pid whose fd table contains an
@@ -1696,9 +1636,7 @@ impl Kernel {
 
     /// Test helper: clone of `pending_wakes` for assertions.
     #[doc(hidden)]
-    pub fn pending_wakes_snapshot(
-        &self,
-    ) -> alloc::vec::Vec<(Pid, abi::ring::Response, WakeHeap)> {
+    pub fn pending_wakes_snapshot(&self) -> alloc::vec::Vec<(Pid, abi::ring::Response, WakeHeap)> {
         self.pending_wakes.clone()
     }
 
@@ -1837,10 +1775,7 @@ impl Kernel {
     fn wake_parked_recvers_on_socket_close(&mut self, socket_id: crate::ipc::SocketId) {
         // Identify the peer (if any) so a close on one end of a
         // connected pair wakes a parker on the other end too.
-        let peer_id = self
-            .ipc
-            .sockets_get(socket_id)
-            .and_then(|s| s.peer);
+        let peer_id = self.ipc.sockets_get(socket_id).and_then(|s| s.peer);
         let to_wake: alloc::vec::Vec<(Pid, u32)> = self
             .parked_recvers
             .iter()
@@ -1912,6 +1847,12 @@ impl Kernel {
         // Same surgical sweep for the blocking ipc_recv parker
         // slot — an exiting pid can't observe a recv wake.
         self.parked_recvers.remove(&pid);
+        // Best-effort persistence barrier: dirty filesystems get
+        // their `sync` hook before the process loses ownership of
+        // its descriptors. Exit must still complete if a flush
+        // fails; recovery/reporting for a failed OPFS flush belongs
+        // to the storage driver follow-up.
+        let _ = self.vfs.sync_dirty();
         self.release_fd_table_resources(pid);
         let ppid = self.procs.get(pid).map(|p| p.ppid).unwrap_or(0);
         self.procs
@@ -1968,11 +1909,7 @@ impl Kernel {
     /// marks the child `Ready`.
     ///
     /// Returns the child pid.
-    pub fn proc_spawn(
-        &mut self,
-        parent_pid: Pid,
-        args: SpawnArgs<'_>,
-    ) -> Result<Pid, KernelError> {
+    pub fn proc_spawn(&mut self, parent_pid: Pid, args: SpawnArgs<'_>) -> Result<Pid, KernelError> {
         // Privilege-escalation guard: the child's cap set must
         // be a subset of the parent's. This is tighter than the
         // `cap_grant` rule (which allows CapGrant holders to
@@ -1987,16 +1924,7 @@ impl Kernel {
         // Allocate + construct the child process.
         let child_pid = self.procs.allocate_pid();
         let proc = Process::new_starting(
-            child_pid,
-            parent_pid,
-            args.name,
-            args.argv,
-            args.envp,
-            args.cwd,
-            args.caps,
-            0,
-            0,
-            0,
+            child_pid, parent_pid, args.name, args.argv, args.envp, args.cwd, args.caps, 0, 0, 0,
         );
         self.procs.insert(proc)?;
         self.caps.install(child_pid, args.caps);
@@ -2072,12 +2000,11 @@ impl Kernel {
         // vs. EAGAIN.
         let has_live_match = match target {
             WaitTarget::Any => self.procs.child_count(parent_pid) > 0,
-            WaitTarget::Specific(pid) => {
-                self.procs
-                    .get(pid)
-                    .map(|p| p.ppid == parent_pid && p.state != ProcState::Dead)
-                    .unwrap_or(false)
-            }
+            WaitTarget::Specific(pid) => self
+                .procs
+                .get(pid)
+                .map(|p| p.ppid == parent_pid && p.state != ProcState::Dead)
+                .unwrap_or(false),
         };
         if has_live_match {
             Ok(WaitOutcome::WouldBlock)
@@ -2120,7 +2047,12 @@ impl Kernel {
         }
         self.parked_waiters.insert(
             parent_pid,
-            WaitParker { req_id, target, heap_ptr, heap_len },
+            WaitParker {
+                req_id,
+                target,
+                heap_ptr,
+                heap_len,
+            },
         );
         self.procs
             .transition(parent_pid, ProcState::BlockedOnWait)
@@ -2135,8 +2067,10 @@ impl Kernel {
             WaitTarget::Any => -1,
             WaitTarget::Specific(p) => p,
         };
-        self.procs
-            .set_block_reason(parent_pid, crate::proc::BlockReason::Wait { pid: reason_pid });
+        self.procs.set_block_reason(
+            parent_pid,
+            crate::proc::BlockReason::Wait { pid: reason_pid },
+        );
         Ok(())
     }
 
@@ -2271,10 +2205,7 @@ impl Kernel {
         let sender_caps = self.caps.list(sender_pid)?;
 
         // Target must exist and must not already be reaped.
-        let target = self
-            .procs
-            .get(target_pid)
-            .ok_or(KernelError::NoSuchPid)?;
+        let target = self.procs.get(target_pid).ok_or(KernelError::NoSuchPid)?;
         let is_parent = target.ppid == sender_pid;
         let is_self = sender_pid == target_pid;
         if target.state == ProcState::Dead {
@@ -2365,16 +2296,9 @@ impl Kernel {
     /// this method — POSIX-style userland calling `kill(pid, 0)`
     /// to check "is this pid alive and could I signal it" gets
     /// a clean yes/no answer via the ext opcode.
-    pub fn proc_check_signal(
-        &self,
-        sender_pid: Pid,
-        target_pid: Pid,
-    ) -> Result<(), KernelError> {
+    pub fn proc_check_signal(&self, sender_pid: Pid, target_pid: Pid) -> Result<(), KernelError> {
         let sender_caps = self.caps.list(sender_pid)?;
-        let target = self
-            .procs
-            .get(target_pid)
-            .ok_or(KernelError::NoSuchPid)?;
+        let target = self.procs.get(target_pid).ok_or(KernelError::NoSuchPid)?;
         if target.state == ProcState::Dead {
             return Err(KernelError::NoSuchPid);
         }
@@ -2398,19 +2322,12 @@ impl Kernel {
     /// not exist (or has been reaped to `Dead`). The sender must
     /// also exist — `CapError::NoSuchPid` on the sender_caps
     /// fetch bubbles through `From<CapError>` to the same variant.
-    pub fn proc_caps_get(
-        &self,
-        sender_pid: Pid,
-        target_pid: Pid,
-    ) -> Result<CapSet, KernelError> {
+    pub fn proc_caps_get(&self, sender_pid: Pid, target_pid: Pid) -> Result<CapSet, KernelError> {
         let sender_caps = self.caps.list(sender_pid)?;
         if sender_pid == target_pid {
             return Ok(sender_caps);
         }
-        let target = self
-            .procs
-            .get(target_pid)
-            .ok_or(KernelError::NoSuchPid)?;
+        let target = self.procs.get(target_pid).ok_or(KernelError::NoSuchPid)?;
         if target.state == ProcState::Dead {
             return Err(KernelError::NoSuchPid);
         }
@@ -2601,10 +2518,9 @@ impl Kernel {
         // route to remount, fail with EINVAL, and never store
         // anything — but the mask is defence-in-depth in case a
         // future caller passes REMOUNT|other_bits.)
-        let _ = self.vfs.set_mount_flags(
-            &normalised,
-            flags & !abi::ext::mount_flags::MOUNT_REMOUNT,
-        );
+        let _ = self
+            .vfs
+            .set_mount_flags(&normalised, flags & !abi::ext::mount_flags::MOUNT_REMOUNT);
         let _ = mount_id;
         Ok(())
     }
@@ -2636,12 +2552,7 @@ impl Kernel {
     /// * [`KernelError::InvalidArgument`] — path is not absolute OR
     ///   the path is not currently a mount point. POSIX says
     ///   "EINVAL — the target is not a mount point" for this case.
-    pub fn remount(
-        &mut self,
-        pid: Pid,
-        target: &str,
-        flags: u32,
-    ) -> Result<(), KernelError> {
+    pub fn remount(&mut self, pid: Pid, target: &str, flags: u32) -> Result<(), KernelError> {
         if !self.caps.check(pid, Cap::Mount)? {
             return Err(KernelError::NotCapable);
         }
@@ -2712,7 +2623,10 @@ impl Kernel {
                 }
             }
         }
-        self.vfs.umount(&normalised).map(|_| ()).map_err(KernelError::from)
+        self.vfs
+            .umount(&normalised)
+            .map(|_| ())
+            .map_err(KernelError::from)
     }
 
     /// `fs_watch(pid, abs_path, mask) -> watch_fd`. Resolves
@@ -2733,12 +2647,7 @@ impl Kernel {
     ///   Surfaces as `-EMFILE`. The watch is rolled back from the
     ///   VFS registry on this path so a failed install doesn't
     ///   leak a watch slot the caller has no fd for.
-    pub fn fs_watch(
-        &mut self,
-        pid: Pid,
-        abs_path: &str,
-        mask: u32,
-    ) -> Result<u32, KernelError> {
+    pub fn fs_watch(&mut self, pid: Pid, abs_path: &str, mask: u32) -> Result<u32, KernelError> {
         let watch_id = self.vfs.register_watch(abs_path, mask)?;
         let table = match self.fds.get_mut(&pid) {
             Some(t) => t,
@@ -2851,14 +2760,10 @@ impl Kernel {
         let Some(file) = self.host_files.remove(&token) else {
             return Err(KernelError::BadFd);
         };
-        let table = self
-            .fds
-            .get_mut(&pid)
-            .ok_or(KernelError::NoSuchPid)?;
+        let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         match table.alloc(FdEntry::new(FdObject::HostFile { token })) {
             Ok(fd) => {
-                self.host_file_fds
-                    .insert(token, HostFileFd::new(file));
+                self.host_file_fds.insert(token, HostFileFd::new(file));
                 Ok(fd)
             }
             Err(e) => {
@@ -2896,7 +2801,10 @@ impl Kernel {
             self.vfs.notify(
                 mount_id,
                 parent_ino,
-                WatchEvent { mask: abi::ext::WATCH_CREATE, inode: new_ino as u32 },
+                WatchEvent {
+                    mask: abi::ext::WATCH_CREATE,
+                    inode: new_ino as u32,
+                },
             );
         }
         Ok(new_ino)
@@ -2911,7 +2819,10 @@ impl Kernel {
             self.vfs.notify(
                 mount_id,
                 parent_ino,
-                WatchEvent { mask: abi::ext::WATCH_CREATE, inode: new_ino as u32 },
+                WatchEvent {
+                    mask: abi::ext::WATCH_CREATE,
+                    inode: new_ino as u32,
+                },
             );
         }
         Ok(new_ino)
@@ -2943,7 +2854,10 @@ impl Kernel {
             self.vfs.notify(
                 mount_id,
                 parent_ino,
-                WatchEvent { mask: abi::ext::WATCH_DELETE, inode: child_ino as u32 },
+                WatchEvent {
+                    mask: abi::ext::WATCH_DELETE,
+                    inode: child_ino as u32,
+                },
             );
         }
         Ok(())
@@ -2966,7 +2880,10 @@ impl Kernel {
             self.vfs.notify(
                 mount_id,
                 parent_ino,
-                WatchEvent { mask: abi::ext::WATCH_DELETE, inode: child_ino as u32 },
+                WatchEvent {
+                    mask: abi::ext::WATCH_DELETE,
+                    inode: child_ino as u32,
+                },
             );
         }
         Ok(())
@@ -2983,7 +2900,10 @@ impl Kernel {
         self.vfs.notify(
             mount_id,
             ino,
-            WatchEvent { mask: abi::ext::WATCH_MODIFY, inode: ino as u32 },
+            WatchEvent {
+                mask: abi::ext::WATCH_MODIFY,
+                inode: ino as u32,
+            },
         );
     }
 

@@ -49,6 +49,28 @@ fn create_write_read_round_trip() {
 }
 
 #[test]
+fn successful_mutations_mark_mount_dirty_until_sync() {
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    assert_eq!(vfs.dirty_mount_count(), 0);
+
+    vfs.create("/dirty.txt", 0o644).unwrap();
+    assert_eq!(vfs.dirty_mount_count(), 1);
+
+    vfs.sync_dirty().unwrap();
+    assert_eq!(vfs.dirty_mount_count(), 0);
+
+    vfs.write("/dirty.txt", 0, b"x").unwrap();
+    assert_eq!(vfs.dirty_mount_count(), 1);
+
+    let mut buf = [0u8; 1];
+    vfs.read("/dirty.txt", 0, &mut buf).unwrap();
+    assert_eq!(vfs.dirty_mount_count(), 1);
+
+    vfs.sync_dirty().unwrap();
+    assert_eq!(vfs.dirty_mount_count(), 0);
+}
+
+#[test]
 fn read_past_end_returns_zero() {
     let mut vfs = fresh_vfs_with_root_tmpfs();
     vfs.create("/a", 0o644).unwrap();
@@ -145,7 +167,10 @@ fn readdir_root_listing_is_deterministic() {
     // tmpfs's children are stored in a BTreeMap, so readdir
     // returns them in ascending name order.
     let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
-    assert_eq!(names, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    assert_eq!(
+        names,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()]
+    );
     for e in &entries {
         assert_eq!(e.ty, NodeType::RegularFile);
     }
@@ -161,7 +186,10 @@ fn rename_within_same_directory() {
     let mut buf = [0u8; 8];
     let n = vfs.read("/bar.txt", 0, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"content");
-    assert_eq!(vfs.read("/foo.txt", 0, &mut buf).unwrap_err(), FsError::NotFound);
+    assert_eq!(
+        vfs.read("/foo.txt", 0, &mut buf).unwrap_err(),
+        FsError::NotFound
+    );
 }
 
 #[test]
@@ -193,7 +221,10 @@ fn rename_replaces_existing_destination() {
     let mut buf = [0u8; 8];
     let n = vfs.read("/dst", 0, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"SRC");
-    assert_eq!(vfs.read("/src", 0, &mut buf).unwrap_err(), FsError::NotFound);
+    assert_eq!(
+        vfs.read("/src", 0, &mut buf).unwrap_err(),
+        FsError::NotFound
+    );
 }
 
 #[test]
@@ -225,7 +256,12 @@ fn redundant_slashes_and_dot_resolve_correctly() {
     vfs.write("/foo/bar.txt", 0, b"ok").unwrap();
 
     let mut buf = [0u8; 4];
-    for path in &["/foo/bar.txt", "//foo//bar.txt", "/./foo/./bar.txt", "/foo/./bar.txt/"] {
+    for path in &[
+        "/foo/bar.txt",
+        "//foo//bar.txt",
+        "/./foo/./bar.txt",
+        "/foo/./bar.txt/",
+    ] {
         let n = vfs.read(path, 0, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"ok", "path: {path}");
     }
@@ -328,7 +364,10 @@ fn devfs_lookup_and_readdir() {
 #[test]
 fn devfs_is_read_only() {
     let mut vfs = fresh_vfs_full();
-    assert_eq!(vfs.create("/dev/foo", 0o644).unwrap_err(), FsError::ReadOnly);
+    assert_eq!(
+        vfs.create("/dev/foo", 0o644).unwrap_err(),
+        FsError::ReadOnly
+    );
     assert_eq!(vfs.mkdir("/dev/d", 0o755).unwrap_err(), FsError::ReadOnly);
     assert_eq!(vfs.unlink("/dev/null").unwrap_err(), FsError::ReadOnly);
 }
@@ -353,7 +392,10 @@ fn procfs_serves_static_content() {
 #[test]
 fn procfs_is_read_only() {
     let mut vfs = fresh_vfs_full();
-    assert_eq!(vfs.create("/proc/new", 0o644).unwrap_err(), FsError::ReadOnly);
+    assert_eq!(
+        vfs.create("/proc/new", 0o644).unwrap_err(),
+        FsError::ReadOnly
+    );
     assert_eq!(vfs.unlink("/proc/version").unwrap_err(), FsError::ReadOnly);
 }
 
@@ -531,8 +573,16 @@ fn readdir_reports_correct_types() {
     let mut saw_file = false;
     for e in entries {
         match e {
-            DirEntry { ref name, ty: NodeType::Directory, .. } if name == "d" => saw_dir = true,
-            DirEntry { ref name, ty: NodeType::RegularFile, .. } if name == "f" => saw_file = true,
+            DirEntry {
+                ref name,
+                ty: NodeType::Directory,
+                ..
+            } if name == "d" => saw_dir = true,
+            DirEntry {
+                ref name,
+                ty: NodeType::RegularFile,
+                ..
+            } if name == "f" => saw_file = true,
             _ => {}
         }
     }
@@ -575,7 +625,10 @@ fn resolve_nofollow_returns_symlink_ino() {
 
     let target_ino = vfs.resolve("/target").unwrap().1;
     let link_ino = vfs.resolve_nofollow("/link").unwrap().1;
-    assert_ne!(link_ino, target_ino, "resolve_nofollow returns symlink's own ino");
+    assert_ne!(
+        link_ino, target_ino,
+        "resolve_nofollow returns symlink's own ino"
+    );
     // And its node type is SymLink.
     let (mid, ino) = vfs.resolve_nofollow("/link").unwrap();
     let st = vfs.stat_ino(mid, ino).unwrap();

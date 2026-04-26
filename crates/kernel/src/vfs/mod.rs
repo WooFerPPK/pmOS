@@ -34,6 +34,7 @@
 //! dependencies.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -282,12 +283,7 @@ pub trait Filesystem: Send {
     /// capability (does this filesystem know what a symlink is?)
     /// rather than a write permission, and devfs / procfs never gain
     /// symlinks in any conceivable future.
-    fn symlink(
-        &mut self,
-        _dir: Ino,
-        _name: &str,
-        _target: &str,
-    ) -> Result<Ino, FsError> {
+    fn symlink(&mut self, _dir: Ino, _name: &str, _target: &str) -> Result<Ino, FsError> {
         Err(FsError::NotSupported)
     }
 
@@ -319,6 +315,7 @@ pub trait Filesystem: Send {
 pub struct Vfs {
     mounts: MountTable,
     watches: WatchTable,
+    dirty_mounts: BTreeSet<MountId>,
 }
 
 impl Vfs {
@@ -326,6 +323,7 @@ impl Vfs {
         Vfs {
             mounts: MountTable::new(),
             watches: WatchTable::new(),
+            dirty_mounts: BTreeSet::new(),
         }
     }
 
@@ -349,11 +347,7 @@ impl Vfs {
     /// non-absolute paths BEFORE calling this method — the VFS
     /// surface is intentionally minimal so the syscall handler owns
     /// the wire-level validation invariants.
-    pub fn register_watch(
-        &mut self,
-        abs_path: &str,
-        mask: u32,
-    ) -> Result<WatchId, FsError> {
+    pub fn register_watch(&mut self, abs_path: &str, mask: u32) -> Result<WatchId, FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
         Ok(self.watches.register(mount_id, ino, mask))
     }
@@ -382,11 +376,7 @@ impl Vfs {
     /// the mounted filesystem. The path is normalised before
     /// insertion — `mount("/dev/", ...)` and `mount("/dev", ...)`
     /// are equivalent.
-    pub fn mount(
-        &mut self,
-        mountpoint: &str,
-        fs: Box<dyn Filesystem>,
-    ) -> Result<MountId, FsError> {
+    pub fn mount(&mut self, mountpoint: &str, fs: Box<dyn Filesystem>) -> Result<MountId, FsError> {
         let normalised = path::normalize(mountpoint);
         self.mounts.insert(normalised, fs)
     }
@@ -395,12 +385,46 @@ impl Vfs {
     /// caller can perform any last sync.
     pub fn umount(&mut self, mountpoint: &str) -> Result<Box<dyn Filesystem>, FsError> {
         let normalised = path::normalize(mountpoint);
-        self.mounts.remove(&normalised)
+        let mount_id = self.mounts.id_of(&normalised).ok_or(FsError::NotFound)?;
+        let fs = self.mounts.remove(&normalised)?;
+        self.dirty_mounts.remove(&mount_id);
+        Ok(fs)
     }
 
     /// Number of currently-installed mounts.
     pub fn mount_count(&self) -> usize {
         self.mounts.len()
+    }
+
+    /// Number of mounts with successful mutations that have not
+    /// yet been flushed through [`Filesystem::sync`]. Exposed for
+    /// diagnostics and native isolation tests.
+    pub fn dirty_mount_count(&self) -> usize {
+        self.dirty_mounts.len()
+    }
+
+    #[inline]
+    fn mark_dirty(&mut self, mount_id: MountId) {
+        self.dirty_mounts.insert(mount_id);
+    }
+
+    /// Flush every dirty mount and clear its dirty bit only after
+    /// that filesystem reports success.
+    pub fn sync_dirty(&mut self) -> Result<(), FsError> {
+        let mounts: Vec<MountId> = self.dirty_mounts.iter().copied().collect();
+        for mount_id in mounts {
+            self.sync_mount(mount_id)?;
+        }
+        Ok(())
+    }
+
+    /// Flush a specific mount, clearing its dirty bit after a
+    /// successful filesystem sync.
+    pub fn sync_mount(&mut self, mount_id: MountId) -> Result<(), FsError> {
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        fs.sync()?;
+        self.dirty_mounts.remove(&mount_id);
+        Ok(())
     }
 
     /// Mutate an existing mount's flag bitset in place. Pass-through
@@ -503,8 +527,8 @@ impl Vfs {
             // silently, so a simple fixed buffer is fine.
             let mut buf = [0u8; 4096];
             let target_len = fs.readlink(ino, &mut buf)?;
-            let target = core::str::from_utf8(&buf[..target_len])
-                .map_err(|_| FsError::InvalidArgument)?;
+            let target =
+                core::str::from_utf8(&buf[..target_len]).map_err(|_| FsError::InvalidArgument)?;
 
             // Rebuild the path to re-resolve. For an absolute
             // target, `new_path = target + remainder`. For a
@@ -624,8 +648,14 @@ impl Vfs {
         offset: u64,
         buf: &[u8],
     ) -> Result<usize, FsError> {
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.write(ino, offset, buf)
+        let n = {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.write(ino, offset, buf)?
+        };
+        if n > 0 {
+            self.mark_dirty(mount_id);
+        }
+        Ok(n)
     }
 
     /// List the entries of the directory at an absolute path.
@@ -641,11 +671,7 @@ impl Vfs {
     /// of [`Vfs::readdir`]. Returns the directory's entries
     /// verbatim (no `.` / `..` injection — WASI doesn't require
     /// them and v1 filesystems don't track parent inodes).
-    pub fn readdir_ino(
-        &mut self,
-        mount_id: MountId,
-        ino: Ino,
-    ) -> Result<Vec<DirEntry>, FsError> {
+    pub fn readdir_ino(&mut self, mount_id: MountId, ino: Ino) -> Result<Vec<DirEntry>, FsError> {
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         let mut out = Vec::new();
         fs.readdir(ino, &mut out)?;
@@ -655,29 +681,45 @@ impl Vfs {
     /// Create a regular file at an absolute path.
     pub fn create(&mut self, abs_path: &str, mode: Mode) -> Result<Ino, FsError> {
         let (mount_id, parent_ino, name) = self.resolve_parent(abs_path)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.create(parent_ino, &name, mode)
+        let ino = {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.create(parent_ino, &name, mode)?
+        };
+        self.mark_dirty(mount_id);
+        Ok(ino)
     }
 
     /// Create a directory at an absolute path.
     pub fn mkdir(&mut self, abs_path: &str, mode: Mode) -> Result<Ino, FsError> {
         let (mount_id, parent_ino, name) = self.resolve_parent(abs_path)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.mkdir(parent_ino, &name, mode)
+        let ino = {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.mkdir(parent_ino, &name, mode)?
+        };
+        self.mark_dirty(mount_id);
+        Ok(ino)
     }
 
     /// Unlink (remove) a regular file at an absolute path.
     pub fn unlink(&mut self, abs_path: &str) -> Result<(), FsError> {
         let (mount_id, parent_ino, name) = self.resolve_parent(abs_path)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.unlink(parent_ino, &name)
+        {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.unlink(parent_ino, &name)?;
+        }
+        self.mark_dirty(mount_id);
+        Ok(())
     }
 
     /// Remove an empty directory at an absolute path.
     pub fn rmdir(&mut self, abs_path: &str) -> Result<(), FsError> {
         let (mount_id, parent_ino, name) = self.resolve_parent(abs_path)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.rmdir(parent_ino, &name)
+        {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.rmdir(parent_ino, &name)?;
+        }
+        self.mark_dirty(mount_id);
+        Ok(())
     }
 
     /// Rename within the same filesystem. Cross-mount renames
@@ -688,8 +730,12 @@ impl Vfs {
         if from_mount != to_mount {
             return Err(FsError::NotSupported);
         }
-        let fs = self.mounts.fs_mut(from_mount).ok_or(FsError::NotFound)?;
-        fs.rename(from_parent, &from_name, to_parent, &to_name)
+        {
+            let fs = self.mounts.fs_mut(from_mount).ok_or(FsError::NotFound)?;
+            fs.rename(from_parent, &from_name, to_parent, &to_name)?;
+        }
+        self.mark_dirty(from_mount);
+        Ok(())
     }
 
     /// Create a hardlink at `to` pointing at the same inode already
@@ -705,8 +751,12 @@ impl Vfs {
         if from_mount != to_mount {
             return Err(FsError::NotSupported);
         }
-        let fs = self.mounts.fs_mut(from_mount).ok_or(FsError::NotFound)?;
-        fs.link(from_parent, &from_name, to_parent, &to_name)
+        {
+            let fs = self.mounts.fs_mut(from_mount).ok_or(FsError::NotFound)?;
+            fs.link(from_parent, &from_name, to_parent, &to_name)?;
+        }
+        self.mark_dirty(from_mount);
+        Ok(())
     }
 
     /// Create a symlink at `link_path` that holds the arbitrary UTF-8
@@ -717,8 +767,12 @@ impl Vfs {
     /// opfs inherit the default (`NotSupported` → ENOTSUP).
     pub fn symlink(&mut self, target: &str, link_path: &str) -> Result<Ino, FsError> {
         let (mount_id, parent_ino, name) = self.resolve_parent(link_path)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.symlink(parent_ino, &name, target)
+        let ino = {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.symlink(parent_ino, &name, target)?
+        };
+        self.mark_dirty(mount_id);
+        Ok(ino)
     }
 
     /// Copy the symlink target at `abs_path` into `out`. Uses
@@ -751,11 +805,7 @@ impl Vfs {
     /// [`Vfs::write_ino`]: the syscall layer already carries the
     /// pair on a `Vnode` fd, so `fd_filestat_get` skips path
     /// resolution by calling this instead of [`Vfs::stat`].
-    pub fn stat_ino(
-        &mut self,
-        mount_id: MountId,
-        ino: Ino,
-    ) -> Result<FileStat, FsError> {
+    pub fn stat_ino(&mut self, mount_id: MountId, ino: Ino) -> Result<FileStat, FsError> {
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         fs.stat(ino)
     }
@@ -763,8 +813,7 @@ impl Vfs {
     /// Truncate a regular file to `new_size` bytes.
     pub fn truncate(&mut self, abs_path: &str, new_size: u64) -> Result<(), FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.truncate(ino, new_size)
+        self.truncate_ino(mount_id, ino, new_size)
     }
 
     /// Truncate `(mount_id, ino)` directly. Mirrors [`Vfs::stat_ino`] /
@@ -777,8 +826,12 @@ impl Vfs {
         ino: Ino,
         new_size: u64,
     ) -> Result<(), FsError> {
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.truncate(ino, new_size)
+        {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.truncate(ino, new_size)?;
+        }
+        self.mark_dirty(mount_id);
+        Ok(())
     }
 
     /// Set atim and/or mtim on the vnode at `abs_path`. `None`
@@ -798,8 +851,7 @@ impl Vfs {
         if atime_ns.is_none() && mtime_ns.is_none() {
             return Ok(());
         }
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.set_times(ino, atime_ns, mtime_ns)
+        self.set_times_ino(mount_id, ino, atime_ns, mtime_ns)
     }
 
     /// Set atim and/or mtim on `(mount_id, ino)` directly. Mirrors
@@ -821,8 +873,12 @@ impl Vfs {
         if atime_ns.is_none() && mtime_ns.is_none() {
             return Ok(());
         }
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-        fs.set_times(ino, atime_ns, mtime_ns)
+        {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.set_times(ino, atime_ns, mtime_ns)?;
+        }
+        self.mark_dirty(mount_id);
+        Ok(())
     }
 }
 

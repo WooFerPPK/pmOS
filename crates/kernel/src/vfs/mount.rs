@@ -108,7 +108,18 @@ impl MountTable {
     /// Returns `None` if no mount matches `mountpoint`. Exact
     /// (non-prefix) match, paired with [`MountTable::set_flags`].
     pub fn flags_of(&self, mountpoint: &str) -> Option<u32> {
-        self.mounts.iter().find(|m| m.mountpoint == mountpoint).map(|m| m.flags)
+        self.mounts
+            .iter()
+            .find(|m| m.mountpoint == mountpoint)
+            .map(|m| m.flags)
+    }
+
+    /// Return the mount id for an exact normalised mountpoint.
+    pub fn id_of(&self, mountpoint: &str) -> Option<MountId> {
+        self.mounts
+            .iter()
+            .find(|m| m.mountpoint == mountpoint)
+            .map(|m| m.id)
     }
 
     /// Remove a mount by normalised path. Returns the freed
@@ -156,7 +167,10 @@ impl MountTable {
     /// Return the normalised mountpoint path for a mount id, or
     /// `None` if no such mount is installed.
     pub fn mountpoint_of(&self, id: MountId) -> Option<&str> {
-        self.mounts.iter().find(|m| m.id == id).map(|m| m.mountpoint.as_str())
+        self.mounts
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.mountpoint.as_str())
     }
 
     /// Iterate mount metadata (id + mountpoint string) in the
