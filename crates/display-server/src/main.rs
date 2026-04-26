@@ -265,7 +265,8 @@ unsafe fn drain_input_events(
 /// caller decides whether to retry or exit.
 ///
 /// Chunked write: the kernel's WASI heap-scratch window is
-/// `HEAP_SCRATCH_BYTES` (32 KiB) per syscall, so the full
+/// 4 KiB per syscall (`HEAP_SCRATCH_SIZE` in
+/// `crates/kernel/src/wasm_entry.rs`), so the full
 /// framebuffer (3 MiB at 1024×768) must be split across many
 /// `fd_write` calls. The framebuffer driver's host side
 /// concatenates the chunks back into a single image at
@@ -276,12 +277,13 @@ unsafe fn present_framebuffer(
     server: &display_server::Server,
     fb_fd: i32,
 ) -> bool {
-    /// 16 KiB per chunk — half of the kernel's
-    /// `HEAP_SCRATCH_BYTES` (32 KiB), leaving headroom for
-    /// the request slot + response shape. Smaller chunks
-    /// trade more syscalls for safety against future heap-
-    /// window changes; 16 KiB is the v1 sweet spot.
-    const CHUNK_BYTES: usize = 16 * 1024;
+    /// 2 KiB per chunk — half of the kernel's
+    /// HEAP_SCRATCH_SIZE (4 KiB), leaving headroom for
+    /// future request-shape additions. Smaller chunks trade
+    /// more syscalls for safety against future heap-window
+    /// changes; 2 KiB is the v1 sweet spot for the kernel's
+    /// 4 KiB heap.
+    const CHUNK_BYTES: usize = 2 * 1024;
     let pixels = server.framebuffer().pixels();
     let mut offset = 0usize;
     while offset < pixels.len() {
