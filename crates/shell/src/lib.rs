@@ -40,6 +40,7 @@
 pub mod launcher;
 pub mod paint;
 pub mod session;
+pub mod taskbar;
 
 pub use launcher::{
     DesktopEntry, DesktopEntryStore, Launcher, LauncherError, MemoryStore,
@@ -47,4 +48,8 @@ pub use launcher::{
 pub use paint::{run_shell, ShellExit, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 pub use session::{
     GlobalEntry, Session, SessionError, SessionStep, INTERESTING_INTERFACES,
+};
+pub use taskbar::{
+    Taskbar, TaskbarClick, TaskbarEntry, TaskbarError, TASKBAR_ENTRY_GAP, TASKBAR_ENTRY_WIDTH,
+    TASKBAR_HEIGHT, TASKBAR_LEFT_MARGIN,
 };
