@@ -162,6 +162,120 @@ impl BlockDevice for MockBlockDevice {
 /// every signature.
 pub type DynBlockDevice = Box<dyn BlockDevice>;
 
+// --- Block driver protocol opcodes ------------------------------------
+//
+// Mirrored TS-side as constants in `web/src/drivers/block.ts`. The
+// kernel issues these via `Platform::driver_call(DevId::Block, op,
+// args)`; the TS block driver dispatches on `op`.
+//
+// READ and WRITE pass a 4104-byte buffer: bytes [0..8] hold the LBA
+// as little-endian u64; bytes [8..4104] hold either the block being
+// written (WRITE) or scratch space the driver fills with the read
+// data (READ). The "TS writes back into a `&[u8]` argument buffer"
+// pattern is consistent with how `pmos_host_driver_call` works for
+// every other driver — `args_ptr` is a real wasm-memory address and
+// the host can poke it.
+
+/// Query the device's total block count. `args` is empty; the
+/// driver returns the count via the `result_ptr` u32. Errors map
+/// to `FsError::Io`.
+pub const OP_BLOCK_COUNT: u32 = 0x01;
+/// Read one block. `args` = [lba: u64 LE | scratch: [u8; 4096]];
+/// the driver fills scratch with the block contents.
+pub const OP_READ: u32 = 0x02;
+/// Write one block. `args` = [lba: u64 LE | data: [u8; 4096]].
+pub const OP_WRITE: u32 = 0x03;
+/// Flush in-flight writes to the persistence backing store.
+pub const OP_FLUSH: u32 = 0x04;
+
+// --- WasmBlockDevice (browser-side OPFS) ------------------------------
+
+#[cfg(target_arch = "wasm32")]
+use crate::platform::{self, DevId, DriverError};
+#[cfg(target_arch = "wasm32")]
+use abi::errno::ENOSPC;
+#[cfg(target_arch = "wasm32")]
+use alloc::vec::Vec;
+
+/// `BlockDevice` implementation that proxies every read/write/flush
+/// through the host platform's `driver_call(DevId::Block, ...)`.
+/// Active in the browser kernel where the TS-side `BlockDriver`
+/// (`web/src/drivers/block.ts`) holds the `FileSystemSyncAccessHandle`
+/// for `pmos.img` in the OPFS root.
+///
+/// `block_count` is captured at `open()` time via `OP_BLOCK_COUNT`
+/// so subsequent reads of `block_count()` don't make a host
+/// round-trip; the count is stable for the lifetime of the device
+/// (the TS driver pre-sizes `pmos.img` to a fixed capacity at
+/// init).
+///
+/// Only present on the `wasm32` target — the protocol shim has
+/// no native correspondent; OPFS coverage on native runs through
+/// `MockBlockDevice` (`crates/kernel/tests/opfs.rs`). Round-trip
+/// verification of the wasm shim happens browser-side via the TS
+/// `BlockDriver` tests (`web/tests/unit/block.test.ts`) against
+/// the Vitest stub `FileSystemSyncAccessHandle`, and end-to-end in
+/// the Playwright file-persistence flow (`real-kernel.spec.ts`).
+#[cfg(target_arch = "wasm32")]
+pub struct WasmBlockDevice {
+    block_count: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WasmBlockDevice {
+    /// Open the block device: query the TS driver for its block
+    /// count and cache it.
+    ///
+    /// Returns `FsError::Io` if the host driver isn't ready, or if
+    /// the reported block count is below the minimum required for a
+    /// formatted OPFS image (the caller will then call `mkfs` only
+    /// if it's at least the minimum, and bail out otherwise).
+    pub fn open() -> Result<Self, FsError> {
+        let count = match platform::current().driver_call(DevId::Block, OP_BLOCK_COUNT, &[]) {
+            Ok(c) => c as u64,
+            Err(_) => return Err(FsError::Io),
+        };
+        Ok(Self { block_count: count })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BlockDevice for WasmBlockDevice {
+    fn read(&mut self, lba: Lba, out: &mut Block) -> Result<(), FsError> {
+        let mut buf: Vec<u8> = alloc::vec![0u8; 8 + BLOCK_SIZE];
+        buf[0..8].copy_from_slice(&lba.to_le_bytes());
+        match platform::current().driver_call(DevId::Block, OP_READ, &buf) {
+            Ok(_) => {
+                out.copy_from_slice(&buf[8..]);
+                Ok(())
+            }
+            Err(_) => Err(FsError::Io),
+        }
+    }
+
+    fn write(&mut self, lba: Lba, data: &Block) -> Result<(), FsError> {
+        let mut buf: Vec<u8> = alloc::vec::Vec::with_capacity(8 + BLOCK_SIZE);
+        buf.extend_from_slice(&lba.to_le_bytes());
+        buf.extend_from_slice(data);
+        match platform::current().driver_call(DevId::Block, OP_WRITE, &buf) {
+            Ok(_) => Ok(()),
+            Err(DriverError::Errno(e)) if e == ENOSPC => Err(FsError::NoSpace),
+            Err(_) => Err(FsError::Io),
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), FsError> {
+        match platform::current().driver_call(DevId::Block, OP_FLUSH, &[]) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(FsError::Io),
+        }
+    }
+
+    fn block_count(&self) -> u64 {
+        self.block_count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -66,6 +66,13 @@ export interface DriverOk {
 export interface DriverErr {
   readonly ok: false;
   readonly error: DriverErrorCode;
+  /**
+   * Specific POSIX errno when `error === DriverErrorCode.Errno`.
+   * The host translates this into the negative `rc` value the
+   * kernel sees from `pmos_host_driver_call`. Optional so callers
+   * that only care about the coarse error class can omit it.
+   */
+  readonly errno?: number;
 }
 
 export type DriverResult = DriverOk | DriverErr;

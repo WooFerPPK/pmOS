@@ -124,6 +124,59 @@ interface FreshHostOptions {
    * verify the handler reads through the new host import.
    */
   readonly nowRealtimeNs?: () => bigint;
+  /**
+   * Optional `BlockDriver` for the OPFS mount. T084 tests pass a
+   * `BlockDriver.withHandle(MemSyncAccessHandle)` so `kernel_init`'s
+   * `/persist` mount path is exercised end-to-end without touching
+   * the real browser OPFS.
+   */
+  readonly blockDriver?: import("../../src/drivers/types").Driver;
+}
+
+/**
+ * In-memory `SyncAccessHandle` stub for T084 integration tests
+ * that wire a `BlockDriver` into `freshHost`. Same shape as the
+ * `MemSyncAccessHandle` in `block.test.ts` but inlined here so
+ * neither test file imports the other.
+ */
+function makeMemSyncAccessHandle(): import(
+  "../../src/drivers/block"
+).SyncAccessHandle & { getSize(): number } {
+  let buf = new Uint8Array(1 << 24);
+  let size = 0;
+  return {
+    read(buffer, options) {
+      const end = Math.min(size, options.at + buffer.length);
+      if (end <= options.at) return 0;
+      const n = end - options.at;
+      buffer.set(buf.subarray(options.at, end), 0);
+      return n;
+    },
+    write(buffer, options) {
+      const need = options.at + buffer.length;
+      if (need > buf.length) {
+        const next = new Uint8Array(Math.max(buf.length * 2, need));
+        next.set(buf);
+        buf = next;
+      }
+      buf.set(buffer, options.at);
+      if (need > size) size = need;
+      return buffer.length;
+    },
+    flush() {},
+    getSize() {
+      return size;
+    },
+    truncate(newSize) {
+      if (newSize > buf.length) {
+        const next = new Uint8Array(Math.max(buf.length * 2, newSize));
+        next.set(buf);
+        buf = next;
+      }
+      size = newSize;
+    },
+    close() {},
+  };
 }
 
 async function freshHost(opts: FreshHostOptions = {}): Promise<TestFixture> {
@@ -146,6 +199,7 @@ async function freshHost(opts: FreshHostOptions = {}): Promise<TestFixture> {
     // Deterministic clock so tests never race with wall-clock changes.
     nowNs: opts.nowNs ?? (() => 0n),
     nowRealtimeNs: opts.nowRealtimeNs ?? (() => 0n),
+    blockDriver: opts.blockDriver,
   });
   return { host, consoleWrites, panics, spawnCalls };
 }
@@ -373,6 +427,144 @@ describe("process lifecycle", () => {
     // kernel synchronously in this test, so seconds may be 0 or
     // very small but the format must be parseable.
     expect(text).toMatch(/^\d+ 0\n$/);
+  });
+
+  it("kernel_init mounts OPFS at /persist when a BlockDriver is wired (T084)", async () => {
+    const { BlockDriver, BLOCK_SIZE } = await import("../../src/drivers/block");
+    const handle = makeMemSyncAccessHandle();
+    const blockDriver = BlockDriver.withHandle(handle, 4096);
+    const { host } = await freshHost({ blockDriver });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // PATH_OPEN /persist as a directory. If mkfs ran successfully
+    // during kernel_init, this resolves to the OPFS root. If the
+    // OPFS mount didn't happen, PATH_OPEN /persist returns ENOENT.
+    const pathBytes = new TextEncoder().encode("/persist");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 5001,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+
+    // The handle must have grown to at least one block (mkfs writes
+    // the superblock + zeros the inode table + journal).
+    expect(handle.getSize()).toBeGreaterThanOrEqual(BLOCK_SIZE);
+  });
+
+  it("file written under /persist persists across kernel re-mount (FR-013a)", async () => {
+    const { BlockDriver } = await import("../../src/drivers/block");
+    const handle = makeMemSyncAccessHandle();
+
+    // Boot 1: mount OPFS, create + write /persist/notes.txt, flush.
+    {
+      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const { host } = await freshHost({ blockDriver });
+      const pid = host.registerProcess(CAPSET_ALL);
+      host.markRunning(pid);
+
+      const pathBytes = new TextEncoder().encode("/persist/notes.txt");
+      const open = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.PATH_OPEN,
+          requestId: 6001,
+          args: encodePathOpenArgs(0, OFLAG_CREAT, 0o644),
+          heapPtr: 0,
+          heapLen: pathBytes.length,
+        },
+        pathBytes,
+      );
+      expect(open.response!.status).toBe(0);
+      const fd = Number(open.response!.value);
+
+      const message = new TextEncoder().encode("hello pmos\n");
+      const write = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.FD_WRITE,
+          requestId: 6002,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: message.length,
+        },
+        message,
+      );
+      expect(write.response!.status).toBe(0);
+
+      // Sync everything dirty (T072 path) — the kernel calls
+      // OpfsFs::sync which writes the journal + superblock through
+      // the BlockDriver into the MemSyncAccessHandle.
+      expect(host.syncAll()).toBe(true);
+    }
+
+    // Boot 2: same handle, fresh kernel + driver. The kernel's
+    // OpfsFs::mount reads back the superblock written by boot 1
+    // (correct magic + checksum) so this time mkfs is NOT called.
+    // Reading back /persist/notes.txt round-trips the bytes.
+    {
+      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const { host } = await freshHost({ blockDriver });
+      const pid = host.registerProcess(CAPSET_ALL);
+      host.markRunning(pid);
+
+      const pathBytes = new TextEncoder().encode("/persist/notes.txt");
+      const open = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.PATH_OPEN,
+          requestId: 6101,
+          arg0: 0,
+          heapPtr: 0,
+          heapLen: pathBytes.length,
+        },
+        pathBytes,
+      );
+      expect(open.response!.status).toBe(0);
+      const fd = Number(open.response!.value);
+
+      const read = host.dispatch(pid, {
+        opcode: OP_WASI.FD_READ,
+        requestId: 6102,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: 64,
+      });
+      expect(read.response!.status).toBe(0);
+      const text = new TextDecoder().decode(
+        read.heapOut!.slice(0, Number(read.response!.value)),
+      );
+      expect(text).toBe("hello pmos\n");
+    }
+  });
+
+  it("kernel_init skips the /persist mount when no BlockDriver is wired (default)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // /persist does NOT exist when the block driver is absent.
+    // PATH_OPEN on /persist returns ENOENT.
+    const pathBytes = new TextEncoder().encode("/persist");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 5002,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(-ERRNO.ENOENT);
   });
 
   it("/proc/<pid>/fd lists installed file descriptors via the live procfs source", async () => {

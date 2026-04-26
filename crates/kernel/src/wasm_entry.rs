@@ -82,6 +82,8 @@ use alloc::vec::Vec;
 
 use crate::fd::{FdFlags, FdObject};
 use crate::fs::devfs::{DevFs, DEV_CONSOLE};
+#[cfg(target_arch = "wasm32")]
+use crate::fs::opfs::{block::WasmBlockDevice, mkfs::mkfs as opfs_mkfs, OpfsFs};
 use crate::fs::procfs::{
     format_argv_cmdline, proc_state_to_status, ProcFdSnapshot, ProcFs, ProcFsSource,
     ProcStatusSnapshot,
@@ -350,6 +352,48 @@ pub extern "C" fn kernel_init() -> i32 {
             .is_err()
         {
             return -1;
+        }
+        // T084: mount the persistent OPFS image at /persist. The
+        // browser-side block driver (web/src/drivers/block.ts)
+        // owns a `FileSystemSyncAccessHandle` over `pmos.img` in
+        // the OPFS root and answers `driver_call(DevId::Block,
+        // ...)` requests.
+        //
+        // Boot policy:
+        //   1. Open the block device. If the host driver isn't
+        //      ready (no FileSystemSyncAccessHandle support, hard
+        //      private-mode block, etc.), skip the OPFS mount and
+        //      let userspace fall back to tmpfs at /. Returning -1
+        //      here would brick the kernel for any environment
+        //      that can't persist; FR-013a's persistence is best-
+        //      effort.
+        //   2. Try `OpfsFs::mount` against the device. On
+        //      `FsError::Io` (bad magic / bad checksum — the
+        //      first-boot or fresh-OPFS case) `mkfs` the device
+        //      and re-mount. Other `FsError`s leak through; the
+        //      mount returns `-1` and the kernel halts.
+        //   3. On the second-mount failure, return `-1` — that
+        //      means mkfs succeeded but the filesystem still
+        //      doesn't read back, which is a kernel bug, not a
+        //      runtime expectation we can recover from.
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(device) = WasmBlockDevice::open() {
+            let opfs = match OpfsFs::mount(alloc::boxed::Box::new(device)) {
+                Ok(fs) => fs,
+                Err(_) => {
+                    let device = match WasmBlockDevice::open() {
+                        Ok(d) => d,
+                        Err(_) => return -1,
+                    };
+                    match opfs_mkfs(alloc::boxed::Box::new(device)) {
+                        Ok(fs) => fs,
+                        Err(_) => return -1,
+                    }
+                }
+            };
+            if k.vfs.mount("/persist", Box::new(opfs)).is_err() {
+                return -1;
+            }
         }
         KERNEL = Some(k);
     }

@@ -293,6 +293,24 @@ export interface KernelWasmHostOptions {
    * `fb:set-mode` or `fb:blit`. No-op when unset.
    */
   readonly onFramebufferMessage?: (msg: unknown) => void;
+  /**
+   * Optional [`Driver`] (a `BlockDriver`) the host calls whenever
+   * a `driver_call(Block, ...)` lands. The call is dispatched in
+   * place: the driver's `call(op, payload)` may read AND write
+   * the payload buffer (the read path fills payload[8..] with
+   * 4096 block bytes), and the result `value` is written into
+   * the kernel's `result_ptr`. Errno errors propagate as a
+   * negative rc; transport errors as a positive one.
+   *
+   * Production wiring: `BlockDriver.openInOpfs()` returns a ready
+   * driver after the `FileSystemSyncAccessHandle` for `pmos.img`
+   * is open. The `kernel_init` Rust path mounts an OPFS at
+   * `/persist` only if `driver_call(Block, OP_BLOCK_COUNT)`
+   * succeeds, so omitting this field cleanly skips the OPFS
+   * mount (handy for tests and for environments where OPFS
+   * isn't available).
+   */
+  readonly blockDriver?: Driver;
 }
 
 // ---- Dispatch result -------------------------------------------------
@@ -437,6 +455,21 @@ export class KernelWasmHost implements Kernel {
       framebufferDriver.init(fbDriverHost);
     }
 
+    // Initialise the block driver (T084). Like the framebuffer
+    // path, the block driver runs synchronously inside
+    // `driver_call`, so we hand it a one-shot DriverHost whose
+    // `postToMain` is a no-op (the block driver doesn't post
+    // events) and `pushInputToKernel` is a no-op (it's
+    // request/response, not event-driven).
+    const blockDriver = options.blockDriver;
+    if (blockDriver !== undefined) {
+      const blockDriverHost: DriverHost = {
+        postToMain: (): void => {},
+        pushInputToKernel: (): void => {},
+      };
+      blockDriver.init(blockDriverHost);
+    }
+
     const imports: WebAssembly.Imports = {
       env: {
         pmos_host_now_ns: (): bigint => nowNs(),
@@ -445,10 +478,10 @@ export class KernelWasmHost implements Kernel {
 
         pmos_host_driver_call: (
           dev: number,
-          _op: number,
+          op: number,
           argsPtr: number,
           argsLen: number,
-          _resultPtr: number,
+          resultPtr: number,
         ): number => {
           if (memory === undefined) return 0;
           // Copy out of kernel memory immediately — the buffer
@@ -474,12 +507,44 @@ export class KernelWasmHost implements Kernel {
             if (framebufferDriver !== undefined && copy.length >= 1) {
               framebufferDriver.call(copy[0]!, copy.subarray(1));
             }
+          } else if (dev === DEV.BLOCK) {
+            if (blockDriver === undefined) {
+              // No block driver attached → signal transport
+              // error so the kernel-side `WasmBlockDevice::open`
+              // sees `Err(NotReady)` and `kernel_init` cleanly
+              // skips the OPFS mount.
+              return 1;
+            }
+            // Block driver: read/write/flush. The driver may
+            // write back into the args buffer (OP_READ fills
+            // bytes 8..4104 with the read block), so we hand it
+            // a *direct* view into kernel memory rather than a
+            // copy. Result `value` goes into `resultPtr` as a
+            // little-endian u32 so the kernel's
+            // `WasmPlatform::driver_call` reads it back.
+            const view = new Uint8Array(memory.buffer, argsPtr, argsLen);
+            const result = blockDriver.call(op, view);
+            if (result.ok) {
+              if (resultPtr !== 0) {
+                new DataView(memory.buffer).setUint32(
+                  resultPtr,
+                  result.value >>> 0,
+                  true,
+                );
+              }
+              return 0;
+            }
+            // Errno → negative rc; transport / not-ready →
+            // positive rc per the WasmPlatform mapping.
+            if (result.error === 3 /* DriverErrorCode.Errno */) {
+              return -(result.errno ?? 5 /* EIO */);
+            }
+            return 1;
           }
-          // Input / block / net: not wired yet. Return 0
-          // ("success") for all devs so the kernel's side of
-          // driver_call doesn't propagate a spurious error back
-          // into the dispatch path for devices we just don't
-          // route to a callback.
+          // Input / net: not wired yet. Return 0 ("success") for
+          // all devs so the kernel's side of driver_call doesn't
+          // propagate a spurious error back into the dispatch
+          // path for devices we just don't route to a callback.
           return 0;
         },
 

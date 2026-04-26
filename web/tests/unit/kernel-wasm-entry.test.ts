@@ -140,6 +140,15 @@ async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }>
           const view = new Uint8Array(memory.buffer, argsPtr, argsLen);
           host.consoleWrites.push(new Uint8Array(view));
         }
+        // T084: when the kernel's `kernel_init` queries the block
+        // driver (DevId::Block = 3), this test file doesn't wire
+        // up an OPFS-backed driver, so signal "transport error"
+        // (positive rc). The kernel-side `WasmBlockDevice::open`
+        // sees `Err(NotReady)` and `kernel_init` cleanly skips
+        // the OPFS mount.
+        if (dev === 3 /* DEV.BLOCK */) {
+          return 1;
+        }
         return 0;
       },
       pmos_host_panic: (_ptr: number, _len: number): void => {

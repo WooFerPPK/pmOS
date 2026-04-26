@@ -311,7 +311,7 @@ describe("installPagehideSync", () => {
     const listeners: Array<() => void> = [];
     return {
       listeners,
-      addEventListener(type, listener) {
+      addEventListener(_type, listener) {
         listeners.push(listener);
       },
     };

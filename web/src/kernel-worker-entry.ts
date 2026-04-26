@@ -121,6 +121,16 @@ export interface WorkerEntryOptions {
    * default kicks in.
    */
   readonly fetcher?: (url: string) => Promise<ArrayBuffer>;
+  /**
+   * Optional pre-built [`BlockDriver`] (T084) for the OPFS mount.
+   * When unset (production), `bootRealKernel` opens its own
+   * `BlockDriver.openInOpfs()` — which falls back to no driver
+   * if `FileSystemSyncAccessHandle` is unavailable (private
+   * mode, older browsers, jsdom). Tests pass a `BlockDriver.
+   * withHandle(MemSyncAccessHandle)` so the OPFS round-trip is
+   * deterministic without touching the real browser surface.
+   */
+  readonly blockDriver?: import("./drivers/types").Driver;
 }
 
 /**
@@ -360,6 +370,26 @@ async function bootRealKernel(
       throw e;
     }
   }
+  // T084: open the OPFS-backed block driver before instantiating
+  // the kernel so `kernel_init` finds it ready when it queries
+  // OP_BLOCK_COUNT to decide whether to mount /persist. If the
+  // browser lacks `FileSystemSyncAccessHandle` (private mode,
+  // older browsers, jsdom), the open() rejects and we let the
+  // kernel skip the /persist mount cleanly — it's best-effort
+  // persistence, not a hard requirement for boot.
+  let blockDriver: import("./drivers/types").Driver | undefined;
+  if (options.blockDriver !== undefined) {
+    blockDriver = options.blockDriver;
+  } else {
+    try {
+      const { BlockDriver } = await import("./drivers/block");
+      blockDriver = await BlockDriver.openInOpfs();
+    } catch {
+      // OPFS unavailable; proceed with no block driver. /persist
+      // simply won't appear in the kernel's mount table.
+      blockDriver = undefined;
+    }
+  }
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -372,6 +402,7 @@ async function bootRealKernel(
       messaging.postMessage({ kind: "panic", message });
     },
     ...(registry !== undefined ? { binaryRegistry: registry } : {}),
+    ...(blockDriver !== undefined ? { blockDriver } : {}),
     kernelWorkerChannel: {
       postMessage: (msg: KernelToMain): void => {
         messaging.postMessage(msg);
