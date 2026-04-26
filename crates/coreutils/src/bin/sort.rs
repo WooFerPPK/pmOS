@@ -39,7 +39,18 @@
 //! numeric ordering, `-cf` checks fold ordering, `-cr` checks
 //! descending order, `-cu` ALSO checks uniqueness (equal adjacent
 //! keys count as a violation, since under `-u` the input would have
-//! been collapsed). `-b` ignores leading blanks (POSIX `[[:blank:]]`
+//! been collapsed). `-C` is the POSIX-2008 silent-check variant
+//! (`--check=quiet` long form): identical check semantics to `-c`
+//! (same composition with `-n` / `-f` / `-b` / `-i` / `-d` / `-r` /
+//! `-u`, same exit code 0/1, same `check_sorted` code path) BUT
+//! suppresses the disorder diagnostic on stderr — designed for
+//! script-friendly conditionals like `if sort -C foo; then ...`
+//! where stderr noise would pollute the calling context. When BOTH
+//! `-c` and `-C` are passed (e.g. `-cC` or `-Cc`), the silent
+//! semantic dominates: silent is the more restrictive output choice
+//! and asking for silence at any point in the cluster is honoured —
+//! pinned by `dash_capital_c_with_lowercase_c_silent_dominates`.
+//! `-b` ignores leading blanks (POSIX `[[:blank:]]`
 //! — space + horizontal tab only) when computing the comparison key
 //! for the lex / fold comparators (the trim is COMPARISON-ONLY:
 //! original line bytes are emitted unchanged on stdout, mirroring
@@ -79,7 +90,8 @@
 //! `-nr` / `-nu` / `-nru` / `-fr` / `-fu` / `-fnu` / `-cn` / `-cf` /
 //! `-cr` / `-cu` / `-b` / `-bf` / `-bu` / `-bfu` / `-cb` / `-i` /
 //! `-if` / `-iu` / `-ib` / `-ic` / `-d` / `-df` / `-du` / `-db` /
-//! `-dc` / `-di` etc. apply the chosen combination.
+//! `-dc` / `-di` / `-C` / `-Cn` / `-Cf` / `-Cr` / `-Cu` / `-Cb` /
+//! `-Ci` / `-Cd` / `-cC` (silent dominates) etc. apply the chosen combination.
 //! Unknown flags write `sort: unknown flag: <flag>` to stderr and
 //! exit 2 (matching grep's open-error/usage exit code).
 //!
@@ -97,6 +109,7 @@ fn main() -> ExitCode {
     let mut numeric = false;
     let mut fold = false;
     let mut check_only = false;
+    let mut silent_check = false;
     let mut ignore_blanks = false;
     let mut ignore_nonprinting = false;
     let mut dictionary_order = false;
@@ -115,6 +128,7 @@ fn main() -> ExitCode {
                     'n' => numeric = true,
                     'f' => fold = true,
                     'c' => check_only = true,
+                    'C' => silent_check = true,
                     'b' => ignore_blanks = true,
                     'i' => ignore_nonprinting = true,
                     'd' => dictionary_order = true,
@@ -153,7 +167,7 @@ fn main() -> ExitCode {
         }
     }
 
-    if check_only {
+    if check_only || silent_check {
         return check_sorted(
             &lines,
             numeric,
@@ -163,6 +177,7 @@ fn main() -> ExitCode {
             dictionary_order,
             reverse,
             unique,
+            silent_check,
         );
     }
 
@@ -249,6 +264,7 @@ fn check_sorted(
     dictionary_order: bool,
     reverse: bool,
     unique: bool,
+    silent: bool,
 ) -> ExitCode {
     use std::cmp::Ordering;
     for i in 1..lines.len() {
@@ -276,12 +292,14 @@ fn check_sorted(
             (true, true) => ord != Ordering::Greater,
         };
         if violation {
-            let _ = writeln!(
-                io::stderr(),
-                "sort: -:{}: disorder: {}",
-                i + 1,
-                lines[i]
-            );
+            if !silent {
+                let _ = writeln!(
+                    io::stderr(),
+                    "sort: -:{}: disorder: {}",
+                    i + 1,
+                    lines[i]
+                );
+            }
             return ExitCode::from(1);
         }
     }

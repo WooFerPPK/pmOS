@@ -1008,3 +1008,164 @@ fn dash_d_alone_with_no_input_is_empty_output() {
     assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
 }
+
+#[test]
+fn dash_capital_c_exits_zero_for_sorted_input() {
+    let out = run_check(&["-C"], b"apple\nbanana\ncherry\n");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn dash_capital_c_exits_one_for_unsorted_input_silently() {
+    let out = run_check(&["-C"], b"banana\napple\ncherry\n");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(
+        out.stderr.is_empty(),
+        "stderr should be empty under -C even on disorder, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn dash_capital_c_combines_with_n_for_numeric_silent_check() {
+    let sorted_numeric = run_check(&["-Cn"], b"1\n2\n10\n");
+    assert!(
+        sorted_numeric.status.success(),
+        "exit status: {:?}",
+        sorted_numeric.status
+    );
+    assert!(sorted_numeric.stdout.is_empty());
+    assert!(sorted_numeric.stderr.is_empty());
+
+    let unsorted_numeric = run_check(&["-Cn"], b"10\n2\n1\n");
+    assert_eq!(
+        unsorted_numeric.status.code(),
+        Some(1),
+        "numeric check should fail on numerically-descending input"
+    );
+    assert!(unsorted_numeric.stdout.is_empty());
+    assert!(
+        unsorted_numeric.stderr.is_empty(),
+        "stderr should be silent under -Cn, got {:?}",
+        String::from_utf8_lossy(&unsorted_numeric.stderr)
+    );
+}
+
+#[test]
+fn dash_capital_c_combines_with_f_for_fold_silent_check() {
+    let sorted_fold = run_check(&["-Cf"], b"Apple\nbanana\nCherry\n");
+    assert!(
+        sorted_fold.status.success(),
+        "exit status: {:?}, stderr: {:?}",
+        sorted_fold.status,
+        String::from_utf8_lossy(&sorted_fold.stderr)
+    );
+    assert!(sorted_fold.stderr.is_empty());
+
+    let unsorted_fold = run_check(&["-Cf"], b"banana\nApple\nCherry\n");
+    assert_eq!(
+        unsorted_fold.status.code(),
+        Some(1),
+        "fold check should fail since BANANA > APPLE"
+    );
+    assert!(
+        unsorted_fold.stderr.is_empty(),
+        "stderr should be silent under -Cf, got {:?}",
+        String::from_utf8_lossy(&unsorted_fold.stderr)
+    );
+}
+
+#[test]
+fn dash_capital_c_combines_with_r_for_reverse_silent_check() {
+    let sorted_rev = run_check(&["-Cr"], b"cherry\nbanana\napple\n");
+    assert!(
+        sorted_rev.status.success(),
+        "exit status: {:?}",
+        sorted_rev.status
+    );
+    assert!(sorted_rev.stderr.is_empty());
+
+    let ascending_under_reverse = run_check(&["-Cr"], b"apple\nbanana\ncherry\n");
+    assert_eq!(
+        ascending_under_reverse.status.code(),
+        Some(1),
+        "reverse check should fail on ascending input"
+    );
+    assert!(
+        ascending_under_reverse.stderr.is_empty(),
+        "stderr should be silent under -Cr, got {:?}",
+        String::from_utf8_lossy(&ascending_under_reverse.stderr)
+    );
+}
+
+#[test]
+fn dash_capital_c_with_lowercase_c_silent_dominates() {
+    let cluster_lower_first = run_check(&["-cC"], b"banana\napple\n");
+    assert_eq!(
+        cluster_lower_first.status.code(),
+        Some(1),
+        "exit status: {:?}",
+        cluster_lower_first.status
+    );
+    assert!(cluster_lower_first.stdout.is_empty());
+    assert!(
+        cluster_lower_first.stderr.is_empty(),
+        "stderr should be silent when -cC is passed (silent dominates), got {:?}",
+        String::from_utf8_lossy(&cluster_lower_first.stderr)
+    );
+
+    let cluster_capital_first = run_check(&["-Cc"], b"banana\napple\n");
+    assert_eq!(
+        cluster_capital_first.status.code(),
+        Some(1),
+        "exit status: {:?}",
+        cluster_capital_first.status
+    );
+    assert!(cluster_capital_first.stdout.is_empty());
+    assert!(
+        cluster_capital_first.stderr.is_empty(),
+        "stderr should be silent when -Cc is passed (silent dominates), got {:?}",
+        String::from_utf8_lossy(&cluster_capital_first.stderr)
+    );
+}
+
+#[test]
+fn dash_capital_c_empty_input_exits_zero() {
+    let out = run_check(&["-C"], b"");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
+
+#[test]
+fn dash_capital_c_used_in_script_friendly_conditional() {
+    let unsorted = run_check(&["-C"], b"banana\napple\ncherry\n");
+    assert!(
+        !unsorted.status.success(),
+        "non-zero exit needed for `if !sort -C` script branch, got {:?}",
+        unsorted.status
+    );
+    assert_eq!(unsorted.status.code(), Some(1));
+    assert!(
+        unsorted.stdout.is_empty(),
+        "stdout must stay empty so callers can pipe to other tools, got {:?}",
+        unsorted.stdout
+    );
+    assert!(
+        unsorted.stderr.is_empty(),
+        "stderr must stay empty so script callers can use `if sort -C f; then ...` without polluting their console, got {:?}",
+        String::from_utf8_lossy(&unsorted.stderr)
+    );
+
+    let sorted = run_check(&["-C"], b"apple\nbanana\ncherry\n");
+    assert!(
+        sorted.status.success(),
+        "zero exit needed for `if sort -C` true branch, got {:?}",
+        sorted.status
+    );
+    assert!(sorted.stdout.is_empty());
+    assert!(sorted.stderr.is_empty());
+}
