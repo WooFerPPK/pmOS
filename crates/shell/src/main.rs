@@ -187,13 +187,47 @@ mod wasm_main {
         }
     }
 
+    /// ECONNREFUSED: the kernel reports it as positive errno 14
+    /// for ext syscalls (negated by the shim → -14 on the wire).
+    /// Returned when the listener at `/run/display` doesn't exist
+    /// yet (display-server hasn't called `display_bind`).
+    const ECONNREFUSED: i32 = 14;
+    /// Bounded retry budget for the connect-poll loop. With each
+    /// iteration calling sched_yield + a short syscall, this gives
+    /// the kernel-worker plenty of room to schedule display-server's
+    /// startup (display_bind + path_open + the loop entry) before
+    /// the shell gives up.
+    const CONNECT_MAX_POLLS: u32 = 50_000;
+
     pub fn run() {
         println!("shell: starting");
-        let fd = unsafe { display_connect() };
+        // Retry on ECONNREFUSED while display-server is starting up
+        // — the shell and display-server are spawned almost
+        // simultaneously by init-desktop, and the shell's
+        // display_connect can race the server's display_bind. Same
+        // retry pattern as crates/display-client-demo/src/main.rs.
+        let mut fd: i32 = -1;
+        for _ in 0..CONNECT_MAX_POLLS {
+            let rc = unsafe { display_connect() };
+            if rc >= 0 {
+                fd = rc;
+                break;
+            }
+            if rc == -ECONNREFUSED {
+                unsafe {
+                    let _ = sched_yield();
+                }
+                continue;
+            }
+            // Other errors are fatal — log via proc_exit's exit
+            // code (the negated errno).
+            unsafe { proc_exit(-rc) };
+        }
         if fd < 0 {
-            // display_connect failed — bail with the negated
-            // errno so the kernel logs the failure cause.
-            unsafe { proc_exit(-fd) };
+            // Connect-poll exhausted without ever seeing the
+            // server bind. Exit with ECONNREFUSED so init-desktop
+            // logs the cause.
+            unsafe { proc_exit(ECONNREFUSED) };
         }
         let conn = FdConnection::new(fd);
         let taskbar = Taskbar::new(0, 0);
