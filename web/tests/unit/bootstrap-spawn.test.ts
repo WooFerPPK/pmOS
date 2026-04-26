@@ -343,3 +343,75 @@ describe("installPagehideSync", () => {
     ]);
   });
 });
+
+describe("installPeriodicSync", () => {
+  function makeFakeScheduler(): {
+    setIntervalCalls: Array<{ handler: () => void; ms: number; handle: number }>;
+    clearIntervalCalls: number[];
+    nextHandle: number;
+    fire(handle: number): void;
+    setInterval(handler: () => void, ms: number): number;
+    clearInterval(handle: number): void;
+  } {
+    const setIntervalCalls: Array<{ handler: () => void; ms: number; handle: number }> = [];
+    const clearIntervalCalls: number[] = [];
+    let nextHandle = 1;
+    return {
+      setIntervalCalls,
+      clearIntervalCalls,
+      get nextHandle() {
+        return nextHandle;
+      },
+      setInterval(handler, ms) {
+        const handle = nextHandle++;
+        setIntervalCalls.push({ handler, ms, handle });
+        return handle;
+      },
+      clearInterval(handle) {
+        clearIntervalCalls.push(handle);
+      },
+      fire(handle) {
+        const entry = setIntervalCalls.find((c) => c.handle === handle);
+        if (entry) entry.handler();
+      },
+    };
+  }
+
+  it("schedules a setInterval at the requested cadence and posts sync:request on each tick", async () => {
+    const { installPeriodicSync } = await import("../../src/bootstrap");
+    const kernel = makeFakeKernel();
+    const sched = makeFakeScheduler();
+    installPeriodicSync(kernel, 60_000, sched);
+    expect(sched.setIntervalCalls).toHaveLength(1);
+    expect(sched.setIntervalCalls[0]!.ms).toBe(60_000);
+    expect(kernel.posted).toEqual([]);
+    sched.fire(sched.setIntervalCalls[0]!.handle);
+    sched.fire(sched.setIntervalCalls[0]!.handle);
+    expect(kernel.posted).toEqual([
+      { kind: "sync:request" },
+      { kind: "sync:request" },
+    ]);
+  });
+
+  it("dispose() calls clearInterval with the registered handle", async () => {
+    const { installPeriodicSync } = await import("../../src/bootstrap");
+    const kernel = makeFakeKernel();
+    const sched = makeFakeScheduler();
+    const dispose = installPeriodicSync(kernel, 30_000, sched);
+    const handle = sched.setIntervalCalls[0]!.handle;
+    expect(sched.clearIntervalCalls).toEqual([]);
+    dispose();
+    expect(sched.clearIntervalCalls).toEqual([handle]);
+  });
+
+  it("rejects non-positive or non-finite intervalMs", async () => {
+    const { installPeriodicSync } = await import("../../src/bootstrap");
+    const kernel = makeFakeKernel();
+    const sched = makeFakeScheduler();
+    expect(() => installPeriodicSync(kernel, 0, sched)).toThrow(/positive finite/);
+    expect(() => installPeriodicSync(kernel, -1, sched)).toThrow(/positive finite/);
+    expect(() => installPeriodicSync(kernel, Number.NaN, sched)).toThrow(/positive finite/);
+    expect(() => installPeriodicSync(kernel, Number.POSITIVE_INFINITY, sched)).toThrow(/positive finite/);
+    expect(sched.setIntervalCalls).toEqual([]);
+  });
+});

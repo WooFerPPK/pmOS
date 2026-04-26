@@ -1018,6 +1018,10 @@ function runRealKernelMode(bootBinary: string): void {
   // the tab while a process is mid-flight" case so OPFS-backed
   // mutations are not lost.
   installPagehideSync(worker);
+  // T137 follow-up: periodic sync for long-running tabs. 60s default
+  // trades I/O frequency against window-of-loss size — a hard browser
+  // crash loses at most one minute of writes.
+  installPeriodicSync(worker);
 }
 
 /**
@@ -1212,6 +1216,53 @@ export function installPagehideSync(
   };
   target.addEventListener("pagehide", listener);
   return listener;
+}
+
+/**
+ * Subset of the host timer surface needed by
+ * [`installPeriodicSync`] — production code passes the global
+ * `setInterval` / `clearInterval`, tests pass a fake-timer harness
+ * that captures the callback + interval and fires it on demand.
+ */
+export interface IntervalScheduler {
+  setInterval(handler: () => void, ms: number): number;
+  clearInterval(handle: number): void;
+}
+
+/**
+ * Periodic companion to [`installPagehideSync`] — fires a
+ * `sync:request` to the kernel Worker every `intervalMs`
+ * milliseconds so a long-running tab doesn't accumulate hours of
+ * un-flushed writes between the user's last interaction and the
+ * eventual pagehide.
+ *
+ * `pagehide` is the right primitive for "tab is going away";
+ * periodic sync is the right primitive for "tab has been open for
+ * hours". They're complementary — both wire to the same
+ * `sync:request` message kind, so the kernel-side handler is
+ * unchanged.
+ *
+ * Returns a `dispose()` function that cancels the interval. The
+ * default interval is 60_000ms (one minute) which trades I/O
+ * frequency against window-of-loss size.
+ */
+export function installPeriodicSync(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  intervalMs: number = 60_000,
+  scheduler: IntervalScheduler = {
+    setInterval: (h, ms) => globalThis.setInterval(h, ms) as unknown as number,
+    clearInterval: (h) => globalThis.clearInterval(h),
+  },
+): () => void {
+  if (intervalMs <= 0 || !Number.isFinite(intervalMs)) {
+    throw new Error(
+      `installPeriodicSync: intervalMs must be a positive finite number, got ${intervalMs}`,
+    );
+  }
+  const handle = scheduler.setInterval(() => {
+    kernelWorker.postMessage({ kind: "sync:request" });
+  }, intervalMs);
+  return () => scheduler.clearInterval(handle);
 }
 
 /** The handle [`createSpawnRouter`] returns. */
