@@ -52,20 +52,69 @@ function hasSharedArrayBuffer(): boolean {
   return typeof SharedArrayBuffer !== "undefined";
 }
 
-function hasAtomicsWait(): boolean {
+/**
+ * Probe for `Atomics.wait`. Required for the SAB-backed syscall
+ * transport; absent in non-cross-origin-isolated contexts.
+ */
+export function hasAtomicsWait(): boolean {
   return typeof Atomics !== "undefined" && typeof Atomics.wait === "function";
 }
 
-function isCrossOriginIsolated(): boolean {
+/**
+ * Probe for the `crossOriginIsolated` global. The deployment must
+ * set COOP/COEP headers; without isolation, `SharedArrayBuffer`
+ * isn't constructible and the SAB transport can't initialize.
+ */
+export function isCrossOriginIsolated(): boolean {
   return typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
 }
 
-function hasOpfs(): boolean {
+/**
+ * Probe for `navigator.storage.getDirectory` — the entry point
+ * the OPFS block driver uses. Absent in private mode and older
+ * browsers.
+ */
+export function hasOpfs(): boolean {
   return (
     typeof navigator !== "undefined" &&
     typeof navigator.storage !== "undefined" &&
     typeof (navigator.storage as unknown as { getDirectory?: unknown }).getDirectory === "function"
   );
+}
+
+/**
+ * Subset of the global `navigator.serviceWorker` API used by
+ * [`registerServiceWorker`]. Tests pass a stub that records
+ * register calls and resolves with a fake registration handle.
+ */
+export interface ServiceWorkerContainerLike {
+  register(
+    scriptURL: string,
+    options?: { scope?: string; type?: "classic" | "module" },
+  ): Promise<unknown>;
+}
+
+/**
+ * Register the bootstrap's service worker. Returns the
+ * `Promise<unknown>` from `register()`, or `Promise.resolve(null)`
+ * if the runtime has no service-worker container (private mode,
+ * older browsers, jsdom). Defaults to the global
+ * `navigator.serviceWorker`.
+ */
+export function registerServiceWorker(
+  scriptURL = "/assets/sw.js",
+  options: { scope?: string; type?: "classic" | "module" } = { type: "module" },
+  container?: ServiceWorkerContainerLike,
+): Promise<unknown> {
+  const target =
+    container ??
+    (typeof navigator !== "undefined"
+      ? (navigator.serviceWorker as ServiceWorkerContainerLike | undefined)
+      : undefined);
+  if (target === undefined) {
+    return Promise.resolve(null);
+  }
+  return target.register(scriptURL, options);
 }
 
 function hasServiceWorker(): boolean {
