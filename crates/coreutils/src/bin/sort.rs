@@ -136,9 +136,21 @@
 //! Explicitly deferred (out of slice scope, future `-k` follow-ups):
 //! `-k N,M` start-end range form; `-k N.C` start-field-plus-character-offset
 //! form; the full `-k F[.C][OPTS][,F[.C][OPTS]]` POSIX notation; per-key
-//! sort options like `-k 2n,3` (per-key flag overrides); `-t SEP` custom
-//! field separator (currently hardcoded to whitespace); `--key=` long
+//! sort options like `-k 2n,3` (per-key flag overrides); `--key=` long
 //! form alias.
+//! `-t SEP` selects a custom single-character field separator for
+//! `-k` field selection. Both `-t SEP` (space-separated) and `-tSEP`
+//! (no space) forms are accepted. With no `-t`, `-k` keeps the prior
+//! whitespace-tokenized behavior (`split_whitespace`, so runs collapse
+//! and leading/trailing blanks are ignored). With `-t`, field splitting
+//! uses exact separator occurrences (`str::split(SEP)`), so repeated
+//! separators produce empty fields and a trailing separator produces an
+//! empty final field. The output remains the full original line. Invalid
+//! separators (empty string or more than one character) write
+//! `sort: invalid field separator: <value>\n` to stderr and exit 1;
+//! `-t` with no following value writes
+//! `sort: option requires an argument: -t\n` and exits 2. `-t`
+//! without `-k` is accepted and has no effect.
 //! `-V` version sort (POSIX `--version-sort` long form deferred): walks
 //! both compared strings simultaneously, classifying each position as a
 //! digit run (consecutive `[0-9]`) or a non-digit run (everything else),
@@ -270,6 +282,28 @@ fn main() -> ExitCode {
                             }
                         }
                     }
+                    't' => {
+                        let value = if ci < cluster.len() {
+                            let rest: String = cluster[ci..].iter().collect();
+                            ci = cluster.len();
+                            rest
+                        } else if idx < args.len() {
+                            let v = args[idx].clone();
+                            idx += 1;
+                            v
+                        } else {
+                            let _ = writeln!(io::stderr(), "sort: option requires an argument: -t");
+                            return ExitCode::from(2);
+                        };
+                        let mut chars = value.chars();
+                        let first = chars.next();
+                        if first.is_none() || chars.next().is_some() {
+                            let _ =
+                                writeln!(io::stderr(), "sort: invalid field separator: {value}");
+                            return ExitCode::from(1);
+                        }
+                        options.field_separator = first;
+                    }
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -358,9 +392,7 @@ fn main() -> ExitCode {
                 filter_printable_then_maybe_fold(line, options.ignore_blanks, options.fold)
             });
         } else if options.fold {
-            lines.dedup_by_key(|line| {
-                fold_to_upper_bytes(maybe_trim(line, options.ignore_blanks))
-            });
+            lines.dedup_by_key(|line| fold_to_upper_bytes(maybe_trim(line, options.ignore_blanks)));
         } else if options.ignore_blanks {
             lines.dedup_by_key(|line| trim_leading_blanks(line).as_bytes().to_vec());
         } else {
@@ -394,7 +426,11 @@ fn main() -> ExitCode {
         }
     }
 
-    if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -405,6 +441,7 @@ struct KeyOptions {
     ignore_nonprinting: bool,
     dictionary_order: bool,
     key_field: Option<usize>,
+    field_separator: Option<char>,
     version_sort: bool,
 }
 
@@ -437,6 +474,11 @@ impl KeyOptions {
 
     fn with_field(mut self, field: usize) -> Self {
         self.key_field = Some(field);
+        self
+    }
+
+    fn with_field_separator(mut self, separator: char) -> Self {
+        self.field_separator = Some(separator);
         self
     }
 
@@ -475,7 +517,7 @@ impl PartialOrd for Key {
 
 fn key_for(line: &str, options: &KeyOptions) -> Key {
     let base: &str = match options.key_field {
-        Some(n) => select_field(line, n),
+        Some(n) => select_field(line, n, options.field_separator),
         None => line,
     };
     if options.numeric {
@@ -504,8 +546,11 @@ fn key_for(line: &str, options: &KeyOptions) -> Key {
     }
 }
 
-fn select_field(line: &str, field: usize) -> &str {
-    line.split_whitespace().nth(field - 1).unwrap_or("")
+fn select_field(line: &str, field: usize, separator: Option<char>) -> &str {
+    match separator {
+        Some(sep) => line.split(sep).nth(field - 1).unwrap_or(""),
+        None => line.split_whitespace().nth(field - 1).unwrap_or(""),
+    }
 }
 
 fn check_sorted(
@@ -528,12 +573,7 @@ fn check_sorted(
         };
         if violation {
             if !silent {
-                let _ = writeln!(
-                    io::stderr(),
-                    "sort: -:{}: disorder: {}",
-                    i + 1,
-                    lines[i]
-                );
+                let _ = writeln!(io::stderr(), "sort: -:{}: disorder: {}", i + 1, lines[i]);
             }
             return ExitCode::from(1);
         }
@@ -562,7 +602,11 @@ fn trim_leading_blanks(s: &str) -> &str {
 }
 
 fn maybe_trim(s: &str, ignore_blanks: bool) -> &str {
-    if ignore_blanks { trim_leading_blanks(s) } else { s }
+    if ignore_blanks {
+        trim_leading_blanks(s)
+    } else {
+        s
+    }
 }
 
 fn filter_printable(s: &str) -> Vec<u8> {
@@ -729,6 +773,7 @@ mod tests {
                 ignore_nonprinting: false,
                 dictionary_order: false,
                 key_field: None,
+                field_separator: None,
                 version_sort: false,
             }
         );
@@ -744,6 +789,7 @@ mod tests {
         assert!(!opts.dictionary_order);
         assert!(!opts.version_sort);
         assert_eq!(opts.key_field, None);
+        assert_eq!(opts.field_separator, None);
     }
 
     #[test]
@@ -751,6 +797,14 @@ mod tests {
         let opts = KeyOptions::default().with_field(2);
         assert_eq!(opts.key_field, Some(2));
         assert!(!opts.numeric);
+        assert_eq!(opts.field_separator, None);
+    }
+
+    #[test]
+    fn with_field_separator_sets_separator() {
+        let opts = KeyOptions::default().with_field_separator(',');
+        assert_eq!(opts.field_separator, Some(','));
+        assert_eq!(opts.key_field, None);
     }
 
     #[test]
@@ -762,6 +816,7 @@ mod tests {
         assert!(opts.numeric);
         assert!(opts.fold);
         assert_eq!(opts.key_field, Some(3));
+        assert_eq!(opts.field_separator, None);
         assert!(!opts.ignore_blanks);
         assert!(!opts.dictionary_order);
         assert!(!opts.version_sort);
@@ -780,6 +835,7 @@ mod tests {
         assert!(!opts.fold);
         assert!(!opts.version_sort);
         assert_eq!(opts.key_field, None);
+        assert_eq!(opts.field_separator, None);
     }
 
     #[test]
@@ -807,5 +863,17 @@ mod tests {
             &KeyOptions::default().with_numeric().with_version_sort(),
         );
         assert!(matches!(k, Key::Numeric(42)));
+    }
+
+    #[test]
+    fn select_field_with_separator_preserves_empty_fields() {
+        assert_eq!(select_field("a,,c,", 2, Some(',')), "");
+        assert_eq!(select_field("a,,c,", 3, Some(',')), "c");
+        assert_eq!(select_field("a,,c,", 4, Some(',')), "");
+    }
+
+    #[test]
+    fn select_field_without_separator_collapses_whitespace() {
+        assert_eq!(select_field("  a   b\tc  ", 2, None), "b");
     }
 }

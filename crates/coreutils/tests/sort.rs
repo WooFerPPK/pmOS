@@ -20,12 +20,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-sort-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-sort-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -456,7 +451,10 @@ fn dash_c_emits_diagnostic_for_first_violation_only() {
     assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let count = stderr.matches("disorder").count();
-    assert_eq!(count, 1, "stderr = {stderr:?} (expected exactly one disorder line)");
+    assert_eq!(
+        count, 1,
+        "stderr = {stderr:?} (expected exactly one disorder line)"
+    );
     assert!(
         stderr.contains("sort: -:3: disorder: b"),
         "stderr = {stderr:?}"
@@ -474,7 +472,11 @@ fn dash_cn_checks_numeric_order() {
     assert!(sorted_numeric.stderr.is_empty());
 
     let lex_only = run_check(&["-c"], b"1\n2\n10\n");
-    assert_eq!(lex_only.status.code(), Some(1), "lex check should fail on numerically-sorted but lex-unsorted input");
+    assert_eq!(
+        lex_only.status.code(),
+        Some(1),
+        "lex check should fail on numerically-sorted but lex-unsorted input"
+    );
     let stderr = String::from_utf8_lossy(&lex_only.stderr);
     assert!(stderr.contains("disorder"), "stderr = {stderr:?}");
 }
@@ -491,7 +493,11 @@ fn dash_cf_checks_case_insensitive_order() {
     assert!(sorted_fold.stderr.is_empty());
 
     let lex_only = run_check(&["-c"], b"Apple\nbanana\nCherry\n");
-    assert_eq!(lex_only.status.code(), Some(1), "lex check should fail since lowercase b > uppercase C");
+    assert_eq!(
+        lex_only.status.code(),
+        Some(1),
+        "lex check should fail since lowercase b > uppercase C"
+    );
 }
 
 #[test]
@@ -820,11 +826,7 @@ fn dash_i_alone_with_no_input_is_empty_output() {
 #[test]
 fn dash_i_handles_high_bit_bytes_as_nonprinting() {
     let dir = scratch_dir("i_highbit");
-    let path = write_file(
-        &dir,
-        "in.txt",
-        "\u{00e9}apple\nbanana\n".as_bytes(),
-    );
+    let path = write_file(&dir, "in.txt", "\u{00e9}apple\nbanana\n".as_bytes());
 
     let with_i = Command::new(SORT)
         .arg("-i")
@@ -835,10 +837,7 @@ fn dash_i_handles_high_bit_bytes_as_nonprinting() {
     assert_eq!(with_i.stdout, "\u{00e9}apple\nbanana\n".as_bytes());
     assert!(with_i.stderr.is_empty(), "stderr = {:?}", with_i.stderr);
 
-    let without_i = Command::new(SORT)
-        .arg(&path)
-        .output()
-        .expect("spawn sort");
+    let without_i = Command::new(SORT).arg(&path).output().expect("spawn sort");
     assert!(
         without_i.status.success(),
         "exit status: {:?}",
@@ -915,7 +914,11 @@ fn dash_di_d_dominates_i() {
         .output()
         .expect("spawn sort");
 
-    assert!(with_di.status.success(), "exit status: {:?}", with_di.status);
+    assert!(
+        with_di.status.success(),
+        "exit status: {:?}",
+        with_di.status
+    );
     assert!(with_d.status.success(), "exit status: {:?}", with_d.status);
     assert_eq!(with_di.stdout, with_d.stdout);
     cleanup(&dir);
@@ -1576,8 +1579,7 @@ fn dash_k_missing_field_uses_empty_key() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"alpha\ncharlie\nbravo 1\n",
+        out.stdout, b"alpha\ncharlie\nbravo 1\n",
         "lines with no field 2 (empty key) sort first stably; bravo 1's field 2 is '1'"
     );
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
@@ -1598,8 +1600,7 @@ fn dash_k_preserves_full_line_in_output() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"keep all this a\nkeep all this z\n",
+        out.stdout, b"keep all this a\nkeep all this z\n",
         "output must be the FULL line, not just the field"
     );
     cleanup(&dir);
@@ -1620,8 +1621,7 @@ fn dash_kn_combines_field_and_numeric() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"y 9\nz 50\nx 100\n",
+        out.stdout, b"y 9\nz 50\nx 100\n",
         "numeric on field 2: 9 < 50 < 100"
     );
     cleanup(&dir);
@@ -1642,8 +1642,7 @@ fn dash_kr_combines_field_and_reverse() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"alpha 3\ncharlie 2\nbravo 1\n",
+        out.stdout, b"alpha 3\ncharlie 2\nbravo 1\n",
         "reverse of field-2 sort: 3 > 2 > 1"
     );
     cleanup(&dir);
@@ -1664,8 +1663,7 @@ fn dash_ku_dedupes_by_field_key() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"red apple\ngreen banana\n",
+        out.stdout, b"red apple\ngreen banana\n",
         "dedupe by field-2 key collapses duplicate 'apple' keys to the first"
     );
     cleanup(&dir);
@@ -1707,8 +1705,7 @@ fn dash_kf_combines_field_and_fold() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"y apple\nx BANANA\nz Cherry\n",
+        out.stdout, b"y apple\nx BANANA\nz Cherry\n",
         "fold of field 2: apple < BANANA < Cherry case-insensitively"
     );
     cleanup(&dir);
@@ -1736,6 +1733,206 @@ fn dash_kd_combines_field_and_dictionary() {
     cleanup(&dir);
 }
 
+// ---------- -t field separator ----------
+
+#[test]
+fn dash_t_comma_sorts_by_custom_separator_field() {
+    let dir = scratch_dir("t_comma");
+    let path = write_file(&dir, "in.txt", b"bravo,2\nalpha,3\ncharlie,1\n");
+
+    let out = Command::new(SORT)
+        .arg("-t")
+        .arg(",")
+        .arg("-k")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"charlie,1\nbravo,2\nalpha,3\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_t_glued_form_works() {
+    let dir = scratch_dir("t_glued");
+    let path = write_file(&dir, "in.txt", b"bravo:2\nalpha:3\ncharlie:1\n");
+
+    let glued = Command::new(SORT)
+        .arg("-t:")
+        .arg("-k2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    let spaced = Command::new(SORT)
+        .arg("-t")
+        .arg(":")
+        .arg("-k")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(glued.status.success(), "exit status: {:?}", glued.status);
+    assert!(spaced.status.success(), "exit status: {:?}", spaced.status);
+    assert_eq!(glued.stdout, spaced.stdout);
+    assert_eq!(glued.stdout, b"charlie:1\nbravo:2\nalpha:3\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_t_preserves_empty_fields_from_repeated_separators() {
+    let dir = scratch_dir("t_empty_fields");
+    let path = write_file(&dir, "in.txt", b"alpha,,z\nbravo,a,z\ncharlie,,a\n");
+
+    let out = Command::new(SORT)
+        .arg("-t,")
+        .arg("-k")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout, b"alpha,,z\ncharlie,,a\nbravo,a,z\n",
+        "repeated separators create empty field-2 keys; empty keys sort first stably"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_t_trailing_separator_produces_empty_final_field() {
+    let dir = scratch_dir("t_trailing");
+    let path = write_file(&dir, "in.txt", b"a,b,z\nc,d,\ne,f,m\n");
+
+    let out = Command::new(SORT)
+        .arg("-t,")
+        .arg("-k")
+        .arg("3")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout, b"c,d,\ne,f,m\na,b,z\n",
+        "the trailing comma creates an empty third field, which sorts before m and z"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_t_combines_with_numeric_field_sort() {
+    let dir = scratch_dir("tn");
+    let path = write_file(&dir, "in.txt", b"x:100\ny:9\nz:50\n");
+
+    let out = Command::new(SORT)
+        .arg("-t:")
+        .arg("-k2")
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"y:9\nz:50\nx:100\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_tc_checks_with_custom_separator_field() {
+    let sorted = run_check(&["-t", ",", "-k", "2", "-c"], b"red,1\nblue,2\ngreen,3\n");
+    assert!(
+        sorted.status.success(),
+        "exit status: {:?}, stderr: {:?}",
+        sorted.status,
+        String::from_utf8_lossy(&sorted.stderr)
+    );
+    assert!(sorted.stderr.is_empty());
+
+    let plain_check = run_check(&["-c"], b"red,1\nblue,2\ngreen,3\n");
+    assert_eq!(
+        plain_check.status.code(),
+        Some(1),
+        "plain -c should fail because red > blue under raw lex"
+    );
+}
+
+#[test]
+fn dash_t_without_k_has_no_effect() {
+    let dir = scratch_dir("t_no_k");
+    let path = write_file(&dir, "in.txt", b"b,1\na,9\n");
+
+    let with_t = Command::new(SORT)
+        .arg("-t,")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    let plain = Command::new(SORT).arg(&path).output().expect("spawn sort");
+
+    assert!(with_t.status.success(), "exit status: {:?}", with_t.status);
+    assert!(plain.status.success(), "exit status: {:?}", plain.status);
+    assert_eq!(with_t.stdout, plain.stdout);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_t_empty_separator_is_invalid() {
+    let out = Command::new(SORT)
+        .arg("-t")
+        .arg("")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: invalid field separator: "),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_t_multi_character_separator_is_invalid() {
+    let out = Command::new(SORT)
+        .arg("-t")
+        .arg("::")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: invalid field separator: ::"),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_t_with_no_value_is_usage_error() {
+    let out = Command::new(SORT)
+        .arg("-t")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+
+    assert_eq!(out.status.code(), Some(2), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: option requires an argument: -t"),
+        "stderr = {stderr:?}"
+    );
+}
+
 // ---------- -V version sort ----------
 
 #[test]
@@ -1751,8 +1948,7 @@ fn dash_V_sorts_versions_naturally() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"file1\nfile2\nfile10\n",
+        out.stdout, b"file1\nfile2\nfile10\n",
         "version sort: file2 < file10 (numeric digit-run compare)"
     );
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
@@ -1772,8 +1968,7 @@ fn dash_V_handles_multi_segment_versions() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"1.0.1\n1.0.2\n1.0.10\n",
+        out.stdout, b"1.0.1\n1.0.2\n1.0.10\n",
         "semver-style: each digit run compared numerically"
     );
     cleanup(&dir);
@@ -1792,8 +1987,7 @@ fn dash_V_compares_digit_runs_numerically() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"v1.1\nv1.2\nv1.10\n",
+        out.stdout, b"v1.1\nv1.2\nv1.10\n",
         "digit runs compare as integers, not bytes"
     );
     cleanup(&dir);
@@ -1832,8 +2026,7 @@ fn dash_V_pure_text_falls_back_to_lex() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"apple\nbanana\ncherry\n",
+        out.stdout, b"apple\nbanana\ncherry\n",
         "no digit runs: every position is non-digit, so byte-order lex sort"
     );
     cleanup(&dir);
@@ -1852,8 +2045,7 @@ fn dash_V_pure_digits_compares_numerically() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"2\n10\n100\n",
+        out.stdout, b"2\n10\n100\n",
         "single digit-run per line: numeric compare (2 < 10 < 100)"
     );
     cleanup(&dir);
@@ -1872,8 +2064,7 @@ fn dash_V_combines_with_reverse() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"file10\nfile2\nfile1\n",
+        out.stdout, b"file10\nfile2\nfile1\n",
         "version sort then reverse: file10 > file2 > file1"
     );
     cleanup(&dir);
@@ -1892,8 +2083,7 @@ fn dash_V_combines_with_unique() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"file1\nfile2\nfile10\n",
+        out.stdout, b"file1\nfile2\nfile10\n",
         "duplicate file1 collapses; version order preserved"
     );
     cleanup(&dir);
@@ -1924,7 +2114,11 @@ fn dash_V_combines_with_check() {
 #[test]
 fn dash_V_with_field_key() {
     let dir = scratch_dir("V_field");
-    let path = write_file(&dir, "in.txt", b"alpha file10\nbravo file2\ncharlie file1\n");
+    let path = write_file(
+        &dir,
+        "in.txt",
+        b"alpha file10\nbravo file2\ncharlie file1\n",
+    );
 
     let out = Command::new(SORT)
         .arg("-V")
@@ -1936,8 +2130,7 @@ fn dash_V_with_field_key() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"charlie file1\nbravo file2\nalpha file10\n",
+        out.stdout, b"charlie file1\nbravo file2\nalpha file10\n",
         "version compare on field 2: file1 < file2 < file10"
     );
     cleanup(&dir);
@@ -2011,8 +2204,7 @@ fn dash_V_combines_with_fold() {
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(
-        out.stdout,
-        b"File1\nFILE2\nfile10\n",
+        out.stdout, b"File1\nFILE2\nfile10\n",
         "case-fold then version compare: File1 < FILE2 < file10 case-insensitively"
     );
     cleanup(&dir);
