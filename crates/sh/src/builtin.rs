@@ -486,23 +486,30 @@ fn builtin_set<E: Write>(
 /// results, not usage errors. Only structural mistakes
 /// (wrong arg count, unknown operator) write to stderr.
 ///
+/// Binary file-test operators (`-nt`, `-ot`, `-ef`) live in
+/// the 3-arg branch alongside the integer ops. Each takes two
+/// paths and queries `std::fs::metadata` for both, then
+/// compares modification time (`-nt`, `-ot`) or device + inode
+/// (`-ef`). Missing-path semantics follow bash: `PATH1 -nt
+/// PATH2` is true if PATH1 is newer (or PATH2 is missing —
+/// "newer than nothing"); false if PATH1 is missing. `-ot` is
+/// the mirror. `-ef` is false if either path is missing.
+///
 /// Deferred (out of v1 scope): symlink-test operators (`-L`,
 /// `-h` — need `lstat` instead of `stat`); FIFO / socket /
 /// device / setuid-setgid-sticky tests (`-p`, `-S`, `-b`,
 /// `-c`, `-g`, `-u`, `-k` — need filesystem features the v1
 /// substrate doesn't model); terminal-test operator (`-t fd`
 /// — needs FD tracking); ownership tests (`-N`, `-O`, `-G` —
-/// need uid/gid surfacing); binary file-test ops (`-nt`,
-/// `-ot`, `-ef` — newer-than / older-than / equal-files);
-/// compound expressions with `-a` / `-o` / `(` / `)`
-/// (POSIX-deprecated, scripts should use `&&` / `||` at the
-/// shell level which v1 also lacks); bash-extended operators
-/// (`==`, `=~`, `<` / `>` for string ordering, the `[[`
-/// double-bracket form). Each unrecognised operator surfaces
-/// as `unknown unary operator: <X>` or `unknown binary
-/// operator: <X>` (NOT a silent failure) so users get a
-/// clear "this slice didn't implement that yet" signal
-/// rather than mysterious wrong answers.
+/// need uid/gid surfacing); compound expressions with `-a` /
+/// `-o` / `(` / `)` (POSIX-deprecated, scripts should use
+/// `&&` / `||` at the shell level which v1 also lacks);
+/// bash-extended operators (`==`, `=~`, `<` / `>` for string
+/// ordering, the `[[` double-bracket form). Each unrecognised
+/// operator surfaces as `unknown unary operator: <X>` or
+/// `unknown binary operator: <X>` (NOT a silent failure) so
+/// users get a clear "this slice didn't implement that yet"
+/// signal rather than mysterious wrong answers.
 fn evaluate_test<E: Write>(
     raw_args: &[&str],
     for_bracket: bool,
@@ -581,7 +588,10 @@ fn evaluate_test_expr<E: Write>(
         3 => {
             // Binary operator. String ops `=` / `!=` first
             // because they take any operands; integer ops
-            // require both args parse as `i64`.
+            // require both args parse as `i64`. Binary
+            // file-test ops (`-nt`, `-ot`, `-ef`) compare two
+            // paths' filesystem metadata via
+            // `evaluate_binary_file_test`.
             let (lhs, op, rhs) = (args[0], args[1], args[2]);
             match op {
                 "=" => bool_to_status(lhs == rhs),
@@ -606,6 +616,7 @@ fn evaluate_test_expr<E: Write>(
                     };
                     bool_to_status(result)
                 }
+                "-nt" | "-ot" | "-ef" => evaluate_binary_file_test(op, lhs, rhs),
                 other => {
                     let _ = writeln!(stderr, "{command}: unknown binary operator: {other}");
                     let _ = stderr.flush();
@@ -697,6 +708,77 @@ fn evaluate_file_test(op: &str, path: &str) -> BuiltinOutcome {
         _ => unreachable!("evaluate_file_test called with non-file-test op {op}"),
     };
     bool_to_status(pass)
+}
+
+/// Evaluate a POSIX binary file-test operator (`-nt`, `-ot`,
+/// `-ef`) against two paths. Each operator queries
+/// `std::fs::metadata` for BOTH paths and compares the
+/// resulting metadata.
+///
+/// `-nt` (newer-than): true if PATH1's mtime > PATH2's mtime.
+/// Missing-path semantics follow bash: false if PATH1 is
+/// missing (a non-existent file is "older than" anything);
+/// true if PATH2 is missing but PATH1 exists ("newer than
+/// nothing"); false if both are missing (no comparison
+/// possible — pin "missing != newer" so a typo'd path doesn't
+/// silently succeed).
+///
+/// `-ot` (older-than): the mirror of `-nt`. True if PATH1's
+/// mtime < PATH2's mtime. False if PATH2 is missing but PATH1
+/// exists (existing files are not "older than nothing"); true
+/// if PATH1 is missing but PATH2 exists; false if both are
+/// missing.
+///
+/// `-ef` (equal-files): true if both paths refer to the same
+/// underlying file (same device + inode). The hard-link /
+/// same-path identity check. False if EITHER path is missing
+/// (including the both-missing case — pin "missing == missing"
+/// doesn't accidentally return true). Uses
+/// `std::os::unix::fs::MetadataExt::dev()` and `ino()` which
+/// are surfaced on both `x86_64-unknown-linux-gnu` (the native
+/// test target) and `wasm32-wasip1` (the wasip1 std shim
+/// emulates the Unix metadata model). No fallback to
+/// path-canonicalisation is needed because the unix metadata
+/// shape is universally available across our supported
+/// targets.
+///
+/// Modification-time comparison uses
+/// `std::fs::Metadata::modified()` which returns
+/// `Result<SystemTime, io::Error>`. `SystemTime` implements
+/// `Ord` on Unix targets so direct `>` / `<` comparison of
+/// the `Result` values via `Option`-coerced `.ok()` produces
+/// the expected ordering — equal mtimes count as
+/// not-newer-and-not-older (POSIX-aligned), so two files
+/// touched at the same instant are neither newer nor older
+/// than each other and `-nt` / `-ot` both return false.
+///
+/// Diagnostic output: NONE. As with the unary file-test ops,
+/// any "missing" / "unreachable" / "permission denied at the
+/// metadata lookup" outcome is a normal `false` result, not a
+/// usage error.
+fn evaluate_binary_file_test(op: &str, path1: &str, path2: &str) -> BuiltinOutcome {
+    let meta1 = std::fs::metadata(path1);
+    let meta2 = std::fs::metadata(path2);
+    match op {
+        "-nt" => match (&meta1, &meta2) {
+            (Ok(m1), Ok(m2)) => bool_to_status(m1.modified().ok() > m2.modified().ok()),
+            (Ok(_), Err(_)) => bool_to_status(true),
+            (Err(_), _) => bool_to_status(false),
+        },
+        "-ot" => match (&meta1, &meta2) {
+            (Ok(m1), Ok(m2)) => bool_to_status(m1.modified().ok() < m2.modified().ok()),
+            (Err(_), Ok(_)) => bool_to_status(true),
+            (_, Err(_)) => bool_to_status(false),
+        },
+        "-ef" => match (&meta1, &meta2) {
+            (Ok(m1), Ok(m2)) => {
+                use std::os::unix::fs::MetadataExt;
+                bool_to_status(m1.dev() == m2.dev() && m1.ino() == m2.ino())
+            }
+            _ => bool_to_status(false),
+        },
+        _ => unreachable!("evaluate_binary_file_test called with non-file-test op {op}"),
+    }
 }
 
 /// Collapse `.` / `..` / repeated `/` segments in `path`,

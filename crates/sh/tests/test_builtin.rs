@@ -858,3 +858,390 @@ fn bracket_dash_l_still_unknown_unary_operator() {
         "stderr missing unknown-unary diagnostic for deferred -L: {stderr:?}"
     );
 }
+
+// ---------- Binary file-test operators ----------
+//
+// These tests cover the POSIX binary file-test operators
+// (`-nt`, `-ot`, `-ef`) added in the T144 follow-up after
+// the unary file-test slice (ed7257f). Unlike the unary
+// file-test ops which live in the 2-arg branch, these live
+// in the 3-arg branch alongside the integer comparison
+// operators — the dispatch is on the MIDDLE arg.
+//
+// Reuses the `scratch_dir` / `write_file` / `cleanup`
+// helpers from the unary file-test block. Tests that compare
+// modification times insert a small `thread::sleep` between
+// two file creations to ensure the mtimes actually differ —
+// 10ms is enough on most systems (the underlying mtime
+// resolution is typically 1ms or better on tmpfs).
+//
+// Missing-path semantics follow bash exactly:
+// * `-nt` is true if PATH2 is missing (PATH1 is "newer than
+//   nothing"); false if PATH1 is missing.
+// * `-ot` is the mirror.
+// * `-ef` is false if EITHER path is missing — including the
+//   both-missing case (we explicitly pin that "missing ==
+//   missing" doesn't accidentally return true).
+
+#[test]
+fn bracket_dash_nt_newer_returns_zero() {
+    // `[ PATH1 -nt PATH2 ]` where PATH1 was created AFTER
+    // PATH2 → Status(0). Sleep between creates so the mtimes
+    // are unambiguously different.
+    let dir = scratch_dir("dash-nt-newer");
+    let older = write_file(&dir, "older", b"a");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let newer = write_file(&dir, "newer", b"b");
+    let script = format!(
+        "[ {} -nt {} ]\necho $?\nexit\n",
+        newer.display(),
+        older.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-nt newer) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_nt_older_returns_one() {
+    // Mirror: `[ PATH1 -nt PATH2 ]` where PATH1 is OLDER
+    // than PATH2 → Status(1).
+    let dir = scratch_dir("dash-nt-older");
+    let older = write_file(&dir, "older", b"a");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let newer = write_file(&dir, "newer", b"b");
+    let script = format!(
+        "[ {} -nt {} ]\necho $?\nexit\n",
+        older.display(),
+        newer.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-nt older) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_nt_same_path_returns_one() {
+    // `[ PATH -nt PATH ]` — comparing a file to itself, the
+    // mtimes are equal so neither side is "newer". POSIX
+    // defines equal mtimes as not-newer (Status(1)). Pins
+    // the strict `>` semantic — "newer" means STRICTLY
+    // newer, not "not older".
+    let dir = scratch_dir("dash-nt-same");
+    let file = write_file(&dir, "same", b"x");
+    let script = format!(
+        "[ {} -nt {} ]\necho $?\nexit\n",
+        file.display(),
+        file.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-nt same) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_nt_path1_missing_returns_one() {
+    // `[ MISSING -nt EXISTING ]` — bash semantic: a missing
+    // file is "older than anything that exists" → Status(1).
+    let dir = scratch_dir("dash-nt-p1-missing");
+    let existing = write_file(&dir, "existing", b"x");
+    let script = format!(
+        "[ /pmos-not-here-nt-1-{} -nt {} ]\necho $?\nexit\n",
+        std::process::id(),
+        existing.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-nt missing-vs-existing) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_nt_path2_missing_returns_zero() {
+    // `[ EXISTING -nt MISSING ]` — bash semantic: an
+    // existing file is "newer than nothing" → Status(0).
+    let dir = scratch_dir("dash-nt-p2-missing");
+    let existing = write_file(&dir, "existing", b"x");
+    let script = format!(
+        "[ {} -nt /pmos-not-here-nt-2-{} ]\necho $?\nexit\n",
+        existing.display(),
+        std::process::id()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-nt existing-vs-missing) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ot_older_returns_zero() {
+    // `[ PATH1 -ot PATH2 ]` where PATH1 is OLDER than PATH2
+    // → Status(0).
+    let dir = scratch_dir("dash-ot-older");
+    let older = write_file(&dir, "older", b"a");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let newer = write_file(&dir, "newer", b"b");
+    let script = format!(
+        "[ {} -ot {} ]\necho $?\nexit\n",
+        older.display(),
+        newer.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-ot older) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ot_newer_returns_one() {
+    // Mirror: `[ PATH1 -ot PATH2 ]` where PATH1 is NEWER
+    // than PATH2 → Status(1).
+    let dir = scratch_dir("dash-ot-newer");
+    let older = write_file(&dir, "older", b"a");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let newer = write_file(&dir, "newer", b"b");
+    let script = format!(
+        "[ {} -ot {} ]\necho $?\nexit\n",
+        newer.display(),
+        older.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-ot newer) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ot_path1_missing_returns_zero() {
+    // `[ MISSING -ot EXISTING ]` — bash semantic: a missing
+    // file is "older than anything that exists" → Status(0).
+    let dir = scratch_dir("dash-ot-p1-missing");
+    let existing = write_file(&dir, "existing", b"x");
+    let script = format!(
+        "[ /pmos-not-here-ot-1-{} -ot {} ]\necho $?\nexit\n",
+        std::process::id(),
+        existing.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-ot missing-vs-existing) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ot_path2_missing_returns_one() {
+    // `[ EXISTING -ot MISSING ]` — bash semantic: an
+    // existing file is NOT "older than nothing" → Status(1).
+    let dir = scratch_dir("dash-ot-p2-missing");
+    let existing = write_file(&dir, "existing", b"x");
+    let script = format!(
+        "[ {} -ot /pmos-not-here-ot-2-{} ]\necho $?\nexit\n",
+        existing.display(),
+        std::process::id()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-ot existing-vs-missing) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ef_same_path_returns_zero() {
+    // `[ PATH -ef PATH ]` — same literal path on both sides
+    // → Status(0). The `stat()` returns the same dev+inode
+    // for both lookups, so the device + inode comparison
+    // succeeds.
+    let dir = scratch_dir("dash-ef-same-path");
+    let file = write_file(&dir, "same", b"x");
+    let script = format!(
+        "[ {} -ef {} ]\necho $?\nexit\n",
+        file.display(),
+        file.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-ef same path) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ef_hard_link_returns_zero() {
+    // `[ ORIG -ef LINK ]` where LINK is a hard link to ORIG
+    // → Status(0). Hard links share dev+inode by definition,
+    // so the comparison succeeds even though the path
+    // strings are different. Pins the "same underlying file"
+    // semantic — `-ef` is NOT a path-equality check, it's a
+    // file-identity check.
+    let dir = scratch_dir("dash-ef-hard-link");
+    let orig = write_file(&dir, "orig", b"shared content");
+    let link = dir.join("link");
+    std::fs::hard_link(&orig, &link).expect("create hard link");
+    let script = format!(
+        "[ {} -ef {} ]\necho $?\nexit\n",
+        orig.display(),
+        link.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-ef hard link) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ef_different_files_returns_one() {
+    // `[ PATH1 -ef PATH2 ]` where PATH1 and PATH2 are
+    // distinct regular files → Status(1). Different inodes,
+    // different files. Pins the "false on different files"
+    // semantic.
+    let dir = scratch_dir("dash-ef-different");
+    let a = write_file(&dir, "a", b"a");
+    let b = write_file(&dir, "b", b"b");
+    let script = format!(
+        "[ {} -ef {} ]\necho $?\nexit\n",
+        a.display(),
+        b.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-ef different files) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ef_path1_missing_returns_one() {
+    // `[ MISSING -ef EXISTING ]` — `-ef` returns Status(1)
+    // when either path fails to stat.
+    let dir = scratch_dir("dash-ef-p1-missing");
+    let existing = write_file(&dir, "existing", b"x");
+    let script = format!(
+        "[ /pmos-not-here-ef-1-{} -ef {} ]\necho $?\nexit\n",
+        std::process::id(),
+        existing.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-ef missing path1) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ef_path2_missing_returns_one() {
+    // `[ EXISTING -ef MISSING ]` — symmetric to the above.
+    let dir = scratch_dir("dash-ef-p2-missing");
+    let existing = write_file(&dir, "existing", b"x");
+    let script = format!(
+        "[ {} -ef /pmos-not-here-ef-2-{} ]\necho $?\nexit\n",
+        existing.display(),
+        std::process::id()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-ef missing path2) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_ef_both_missing_returns_one() {
+    // `[ MISSING1 -ef MISSING2 ]` — both paths fail to stat
+    // → Status(1), NOT Status(0). Pins that "missing ==
+    // missing" doesn't accidentally return true; the
+    // comparison only succeeds when both paths actually
+    // resolve to a real file with matching dev+inode.
+    let pid = std::process::id();
+    let script = format!(
+        "[ /pmos-not-here-ef-both-a-{pid} -ef /pmos-not-here-ef-both-b-{pid} ]\necho $?\nexit\n"
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-ef both missing) status 1: {stdout:?}"
+    );
+}
+
+#[test]
+fn bracket_negate_dash_ef_works() {
+    // `[ ! PATH1 -ef PATH2 ]` where PATH1 and PATH2 are
+    // different files — `-ef` returns Status(1); `!` inverts
+    // to Status(0). Pins that the existing `! EXPR` peeling
+    // wraps the binary file-test forms transparently the
+    // same way it wraps the unary forms (the negation path
+    // is operator-agnostic, it just inverts the inner
+    // result).
+    let dir = scratch_dir("negate-dash-ef");
+    let a = write_file(&dir, "a", b"a");
+    let b = write_file(&dir, "b", b"b");
+    let script = format!(
+        "[ ! {} -ef {} ]\necho $?\nexit\n",
+        a.display(),
+        b.display()
+    );
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(! -ef different) inverted status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
