@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 /// Shell-wide mode flags toggled at runtime by `set`.
 ///
 /// Surfaces the POSIX `errexit` (`set -e` / `set -o
-/// errexit`), `nounset` (`set -u` / `set -o nounset`), and
-/// `xtrace` (`set -x` / `set -o xtrace`) modes. Future
-/// flags (`set -n` for "syntax-check only") slot in as
-/// sibling fields on this struct without changing any
+/// errexit`), `nounset` (`set -u` / `set -o nounset`),
+/// `xtrace` (`set -x` / `set -o xtrace`), and `noexec`
+/// (`set -n` / `set -o noexec`) modes. Future flags slot in
+/// as sibling fields on this struct without changing any
 /// existing call site — `dispatch_builtin` already takes
 /// `flags: &mut ShellFlags`, so a new mode is one extra
 /// field plus one extra `set` arm.
@@ -67,6 +67,26 @@ pub struct ShellFlags {
     /// during dispatch. Off by default — POSIX shells start
     /// with xtrace cleared.
     pub xtrace: bool,
+    /// `set -n` / `set -o noexec`: parse and tokenise each
+    /// line but do NOT dispatch any command — every command
+    /// is a no-op syntax-check. Useful for "lint" mode: feed
+    /// a script through `sh -n` to catch quote / expansion
+    /// errors without executing anything. Variable expansion
+    /// still runs (so `set -nu` still surfaces unset-var
+    /// errors at expansion time before the dispatch
+    /// short-circuit fires). The trace block ALSO skips
+    /// under noexec because no command executes — under
+    /// `set -nx` no `+ ` lines appear. Critical exemption:
+    /// the `set` builtin itself ALWAYS runs even under
+    /// noexec (otherwise `set +n` could never disable the
+    /// flag once enabled — practical necessity). Every
+    /// other builtin including `exit` is silently skipped;
+    /// the script terminates only on EOF (the
+    /// validated-successfully exit path) or on an
+    /// expansion-layer error (the `set -u` short-circuit).
+    /// Off by default — POSIX shells start with noexec
+    /// cleared.
+    pub noexec: bool,
 }
 
 /// Outcome of dispatching one builtin.
@@ -302,8 +322,8 @@ fn builtin_unset<E: Write>(
 
 /// POSIX `set` builtin — mode-flag toggle.
 ///
-/// v1 supports the `errexit`, `nounset`, and `xtrace`
-/// flags in two equivalent shapes each:
+/// v1 supports the `errexit`, `nounset`, `xtrace`, and
+/// `noexec` flags in two equivalent shapes each:
 ///
 /// * `set -e` / `set -o errexit` — turn errexit ON.
 /// * `set +e` / `set +o errexit` — turn errexit OFF.
@@ -311,6 +331,8 @@ fn builtin_unset<E: Write>(
 /// * `set +u` / `set +o nounset` — turn nounset OFF.
 /// * `set -x` / `set -o xtrace` — turn xtrace ON.
 /// * `set +x` / `set +o xtrace` — turn xtrace OFF.
+/// * `set -n` / `set -o noexec` — turn noexec ON.
+/// * `set +n` / `set +o noexec` — turn noexec OFF.
 ///
 /// `set` with no args is a no-op in v1 (POSIX defines this
 /// as "print every shell variable" but the v1 `env` builtin
@@ -334,6 +356,11 @@ fn builtin_unset<E: Write>(
 /// the `set -x` line itself prints under whatever value
 /// xtrace had BEFORE the line was processed — the first
 /// `set -x` doesn't trace itself; subsequent commands do.
+/// noexec is the load-bearing case: under `set -n` every
+/// dispatch is short-circuited EXCEPT the `set` builtin
+/// itself — without that exemption `set +n` could never
+/// clear the flag, leaving the user permanently stuck in
+/// syntax-check mode.
 fn builtin_set<E: Write>(
     args: &[&str],
     flags: &mut ShellFlags,
@@ -361,6 +388,8 @@ fn builtin_set<E: Write>(
             "+u" => flags.nounset = false,
             "-x" => flags.xtrace = true,
             "+x" => flags.xtrace = false,
+            "-n" => flags.noexec = true,
+            "+n" => flags.noexec = false,
             "-o" | "+o" => {
                 // `set -o NAME` / `set +o NAME` — the
                 // long-option form. The polarity (`-` vs
@@ -377,6 +406,7 @@ fn builtin_set<E: Write>(
                     "errexit" => flags.errexit = on,
                     "nounset" => flags.nounset = on,
                     "xtrace" => flags.xtrace = on,
+                    "noexec" => flags.noexec = on,
                     other => {
                         let _ = writeln!(
                             stderr,

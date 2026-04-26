@@ -253,6 +253,30 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         };
         let expanded_refs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
 
+        // POSIX `set -n` / noexec: under syntax-check mode,
+        // skip BOTH the trace and the dispatch — every
+        // command is a no-op once expansion succeeds. The
+        // expansion-layer errors (quote errors, set -u
+        // unset-var failures) ALREADY surfaced above; this
+        // arm only short-circuits the post-expansion trace
+        // and dispatch path. Critical exemption: the `set`
+        // builtin itself ALWAYS runs even under noexec —
+        // without that escape hatch `set +n` could never
+        // clear the flag once enabled, leaving the user
+        // permanently stuck in syntax-check mode. Every
+        // other builtin (including `exit`) is silently
+        // skipped; the script terminates only on EOF (the
+        // validated-successfully path) or on an
+        // expansion-layer error (the `set -u` short-circuit
+        // above). The check sits BEFORE the trace block so
+        // `set -nx` produces zero `+ ` lines — POSIX is
+        // undefined on the interaction but "no command runs
+        // → no trace" matches the existing trace-skip rule
+        // for blank lines and expansion errors.
+        if flags.noexec && expanded_refs[0] != "set" {
+            continue;
+        }
+
         // POSIX `set -x` / xtrace: write each command to
         // stderr BEFORE executing it, prefixed by `+ ` (the
         // default POSIX PS4 prompt; v1 doesn't customise
@@ -262,19 +286,21 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // BEFORE dispatch (so the trace precedes the
         // command's own output). Blank lines (the
         // `parts.is_empty()` continue above), quote errors
-        // (the `Err(QuoteError::*)` continues above), and
+        // (the `Err(QuoteError::*)` continues above),
         // expansion errors (the `Err(NotSet)` Exit-1
-        // short-circuit above) all skip this point — none of
-        // those cases produces an executed command, so per
-        // POSIX none should trace. The first `set -x` line
-        // also doesn't trace itself: at this point xtrace is
-        // still false from the initial state; the dispatch
-        // below flips it for subsequent commands. Conversely
-        // `set +x` traces itself because at its trace point
-        // xtrace is still true from the previous line; the
-        // clear happens during dispatch. Trace failures are
-        // intentionally swallowed (`let _`) — a trace write
-        // failure shouldn't terminate the REPL because the
+        // short-circuit above), and noexec lines (the
+        // `flags.noexec` continue above) all skip this
+        // point — none of those cases produces an executed
+        // command, so per POSIX none should trace. The
+        // first `set -x` line also doesn't trace itself: at
+        // this point xtrace is still false from the initial
+        // state; the dispatch below flips it for subsequent
+        // commands. Conversely `set +x` traces itself
+        // because at its trace point xtrace is still true
+        // from the previous line; the clear happens during
+        // dispatch. Trace failures are intentionally
+        // swallowed (`let _`) — a trace write failure
+        // shouldn't terminate the REPL because the
         // diagnostic itself is best-effort; the IoError arm
         // below handles fatal stderr write failures from the
         // dispatch path.
@@ -1260,7 +1286,7 @@ mod expand_tests {
         // dispatch loop translates this into the stderr
         // diagnostic and the Exit(1) termination.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false };
+        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
         let err = expand_vars("$UNSET", &env, 0, &flags).unwrap_err();
         assert_eq!(err, ExpandError::NotSet("UNSET".to_string()));
     }
@@ -1271,7 +1297,7 @@ mod expand_tests {
         // nounset behavior — no `:-` modifier means the
         // braced arm goes through the same error path.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false };
+        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
         let err = expand_vars("${UNSET}", &env, 0, &flags).unwrap_err();
         assert_eq!(err, ExpandError::NotSet("UNSET".to_string()));
     }
@@ -1284,7 +1310,7 @@ mod expand_tests {
         // because it's the load-bearing semantic that lets
         // the `:-` form remain useful under `set -u`.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false };
+        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
         assert_eq!(
             expand_vars("${UNSET:-fallback}", &env, 0, &flags).unwrap(),
             "fallback"
@@ -1299,7 +1325,7 @@ mod expand_tests {
         // nounset doesn't accidentally interfere when the var
         // IS set.
         let env = env_with(&[("X", "hello")]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false };
+        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
         assert_eq!(
             expand_vars("${X:-fallback}", &env, 0, &flags).unwrap(),
             "hello"
@@ -1312,7 +1338,7 @@ mod expand_tests {
         // a known initial value of 0) — `set -u` MUST NOT
         // fire on it. Same for the braced form `${?}`.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false };
+        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
         assert_eq!(expand_vars("$?", &env, 0, &flags).unwrap(), "0");
         assert_eq!(expand_vars("${?}", &env, 7, &flags).unwrap(), "7");
     }
@@ -1323,7 +1349,7 @@ mod expand_tests {
         // normally — no false-positive error. Pin both the
         // bare and braced forms.
         let env = env_with(&[("X", "hello")]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false };
+        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
         assert_eq!(expand_vars("$X", &env, 0, &flags).unwrap(), "hello");
         assert_eq!(expand_vars("${X}", &env, 0, &flags).unwrap(), "hello");
     }
@@ -1335,7 +1361,7 @@ mod expand_tests {
         // as "unset", so nounset MUST NOT trip. The literal
         // `${X` is returned as-is.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false };
+        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
         assert_eq!(expand_vars("${X", &env, 0, &flags).unwrap(), "${X");
     }
 }
