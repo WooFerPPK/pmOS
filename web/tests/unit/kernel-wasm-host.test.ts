@@ -288,10 +288,13 @@ describe("process lifecycle", () => {
     // observation has fired yet because no user Worker is attached).
     expect(text).toContain("Name:\tproc\n");
     expect(text).toContain("State:\tR (running)\n");
+    expect(text).toContain(`Tgid:\t${pid}\n`);
     expect(text).toContain(`Pid:\t${pid}\n`);
     expect(text).toContain("PPid:\t0\n");
+    expect(text).toContain("TracerPid:\t0\n");
     expect(text).toContain("VmSize:\t0 kB\n");
     expect(text).toContain("VmPeak:\t0 kB\n");
+    expect(text).toContain("Threads:\t1\n");
   });
 
   it("/proc/uptime surfaces a live monotonic seconds-since-boot via the live procfs source", async () => {

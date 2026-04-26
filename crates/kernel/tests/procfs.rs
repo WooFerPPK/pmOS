@@ -229,9 +229,13 @@ fn status_reports_state_zombie_after_proc_exit() {
 // ---- Additional shape / layout assertions --------------------------
 
 #[test]
-fn status_ends_with_trailing_newline_and_six_fields() {
-    // Six `Key: Value\n` lines, in the documented order. The
-    // buffer ends on `\n` — no trailing whitespace.
+fn status_ends_with_trailing_newline_and_nine_fields() {
+    // Nine `Key: Value\n` lines, in the documented order. The
+    // buffer ends on `\n` — no trailing whitespace. Order matches
+    // the Linux /proc/<pid>/status field ordering: Name, State,
+    // Tgid (= Pid in v1's one-thread-per-process model), Pid,
+    // PPid, TracerPid (always 0), VmSize, VmPeak, Threads
+    // (always 1).
     let mut table = ProcessTable::new();
     let pid = table.allocate_pid();
     table.insert(make_process(pid, 1, "sh")).unwrap();
@@ -243,13 +247,16 @@ fn status_ends_with_trailing_newline_and_six_fields() {
 
     assert!(text.ends_with('\n'));
     let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
-    assert_eq!(lines.len(), 6, "expected 6 lines, got {:?}", lines);
+    assert_eq!(lines.len(), 9, "expected 9 lines, got {:?}", lines);
     assert!(lines[0].starts_with("Name:\t"), "line 0: {:?}", lines[0]);
     assert!(lines[1].starts_with("State:\t"), "line 1: {:?}", lines[1]);
-    assert!(lines[2].starts_with("Pid:\t"), "line 2: {:?}", lines[2]);
-    assert!(lines[3].starts_with("PPid:\t"), "line 3: {:?}", lines[3]);
-    assert!(lines[4].starts_with("VmSize:\t"), "line 4: {:?}", lines[4]);
-    assert!(lines[5].starts_with("VmPeak:\t"), "line 5: {:?}", lines[5]);
+    assert!(lines[2].starts_with("Tgid:\t"), "line 2: {:?}", lines[2]);
+    assert!(lines[3].starts_with("Pid:\t"), "line 3: {:?}", lines[3]);
+    assert!(lines[4].starts_with("PPid:\t"), "line 4: {:?}", lines[4]);
+    assert_eq!(lines[5], "TracerPid:\t0", "line 5: {:?}", lines[5]);
+    assert!(lines[6].starts_with("VmSize:\t"), "line 6: {:?}", lines[6]);
+    assert!(lines[7].starts_with("VmPeak:\t"), "line 7: {:?}", lines[7]);
+    assert_eq!(lines[8], "Threads:\t1", "line 8: {:?}", lines[8]);
 }
 
 #[test]

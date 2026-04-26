@@ -553,12 +553,18 @@ fn decode_pid_ino(ino: Ino) -> Option<(Pid, Ino)> {
 /// a fixed order, with a trailing newline. Callers receive a
 /// `Vec<u8>` sized for the snapshot (no heap allocation beyond
 /// the one `format!` that backs it).
+///
+/// `Threads` and `TracerPid` are hardcoded constants because v1
+/// has no thread or ptrace concepts; the lines exist for parity
+/// with Linux `/proc/<pid>/status` parsers (sysmon, htop, etc.)
+/// that expect them.
 fn format_pid_status(snap: &ProcStatusSnapshot) -> Vec<u8> {
     let text = format!(
-        "Name:\t{}\nState:\t{} ({})\nPid:\t{}\nPPid:\t{}\nVmSize:\t{} kB\nVmPeak:\t{} kB\n",
+        "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nVmSize:\t{} kB\nVmPeak:\t{} kB\nThreads:\t1\n",
         snap.name,
         snap.state.letter(),
         snap.state.name(),
+        snap.pid,
         snap.pid,
         snap.ppid,
         bytes_to_status_kib(snap.vm_size_bytes),
