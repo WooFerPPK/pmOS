@@ -312,11 +312,20 @@ function main(): void {
   // which boots a four-pid tree (init + hello-std + display-server
   // + display-client-demo) and exercises the full display-server
   // IPC round-trip end-to-end through real concurrent user Workers.
+  // The `#boot-to-desktop` hash selects `/bin/init-desktop`, which
+  // boots the real desktop (init-desktop + display-server + shell)
+  // — the T127 Playwright spec uses this to pin the cold-boot path
+  // through wallpaper paint.
   if (!window.location.hash.includes("mock-kernel")) {
     const hash = window.location.hash;
-    const bootBinary = hash.includes("input-echo")
-      ? "/bin/hello_input_echo"
-      : "/bin/init";
+    let bootBinary: string;
+    if (hash.includes("input-echo")) {
+      bootBinary = "/bin/hello_input_echo";
+    } else if (hash.includes("boot-to-desktop")) {
+      bootBinary = "/bin/init-desktop";
+    } else {
+      bootBinary = "/bin/init";
+    }
     runRealKernelMode(bootBinary);
     return;
   }

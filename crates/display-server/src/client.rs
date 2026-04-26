@@ -194,6 +194,13 @@ pub struct Toplevel {
     /// shell) clears the flag and the surface re-enters the
     /// blit pass with its existing state intact.
     pub minimized: bool,
+    /// `true` after the server has emitted an initial
+    /// `xdg_toplevel.configure` event on this toplevel.
+    /// Used by `Server::composite_surface_commit` to fire
+    /// the initial configure exactly once after the first
+    /// commit — Wayland clients block on receiving a
+    /// configure before painting their first real frame.
+    pub initial_configure_sent: bool,
     /// Most-recent maximize state — set by
     /// `pmd_xdg_toplevel.set_maximized()` and cleared by
     /// `unset_maximized()` (T132). The actual configure
@@ -216,6 +223,7 @@ impl Toplevel {
             y,
             minimized: false,
             maximized: false,
+            initial_configure_sent: false,
         }
     }
 }

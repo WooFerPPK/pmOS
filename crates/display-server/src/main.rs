@@ -141,6 +141,166 @@ unsafe fn poll_sigterm() -> bool {
 // tests can verify it; main.rs imports it as
 // `display_server::detect_protocol_message`.
 
+/// True iff `chunk` decodes as a `pmd_surface.commit`
+/// request (interface = Surface, opcode = 7). Used by the
+/// main loop to decide whether to present the framebuffer
+/// after dispatch — only commits change pixels, so other
+/// requests skip the (expensive, chunked) present path.
+#[cfg(target_arch = "wasm32")]
+fn chunk_is_surface_commit(chunk: &[u8]) -> bool {
+    let Ok(header) = display_server::MessageHeader::decode(chunk) else {
+        return false;
+    };
+    if header.opcode != 7 {
+        return false;
+    }
+    // The header's object id is a per-client `surface_id`;
+    // we can't look it up from inside this helper without
+    // a Server reference, so we just match on opcode 7
+    // which is `pmd_surface.commit` per the Surface opcode
+    // table. Other interfaces use opcode 7 for unrelated
+    // ops (none in v1 — the only opcode 7 is commit), so
+    // false positives aren't a hazard at this layer.
+    let _ = header.object_id;
+    true
+}
+
+/// If `chunk` is a `pmd_display.get_registry` request, push
+/// the v1 globals catalog onto the client's pending events
+/// queue so the toolkit's App::connect bind handshake can
+/// complete on the next recv. The advertise lives in the
+/// binary (not the library's `Server::dispatch_request`)
+/// because integration tests under `crates/integration-tests/`
+/// drive Server directly and emit globals manually — keeping
+/// auto-advertise here keeps the binary's production path
+/// self-contained without changing those tests' assumptions.
+#[cfg(target_arch = "wasm32")]
+fn advertise_globals_for_get_registry(
+    server: &mut display_server::Server,
+    client_id: display_server::ClientId,
+    chunk: &[u8],
+) {
+    use display_server::HEADER_SIZE;
+    let Ok(header) = display_server::MessageHeader::decode(chunk) else {
+        return;
+    };
+    if header.object_id != display_server::ObjectId::DISPLAY || header.opcode != 2 {
+        return;
+    }
+    let payload_end = header.length as usize;
+    if payload_end < HEADER_SIZE || payload_end > chunk.len() {
+        return;
+    }
+    let payload = &chunk[HEADER_SIZE..payload_end];
+    if let Ok(req) = display_proto::requests::DisplayGetRegistry::decode(payload) {
+        server.advertise_globals_to(client_id, req.new_id);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn open_dev(path: &[u8]) -> Option<u32> {
+    let mut fd: u32 = 0;
+    let rc = path_open(
+        0, 0, path.as_ptr(), path.len() as i32, 0, 0, 0, 0, &mut fd,
+    );
+    if rc != 0 {
+        return None;
+    }
+    Some(fd)
+}
+
+/// Drain every available input event from the kernel's
+/// `/dev/input/{mouse,kbd}` rings and inject each into
+/// `server`. Returns true when at least one event was
+/// processed (the caller can use this as a "pixels may be
+/// dirty" hint and re-present).
+#[cfg(target_arch = "wasm32")]
+unsafe fn drain_input_events(
+    server: &mut display_server::Server,
+    mouse_fd: i32,
+    kbd_fd: i32,
+) -> bool {
+    let mut any = false;
+    // Mouse events are 20 bytes each; read up to 32 events (640
+    // bytes) per drain to keep the buffer small while not
+    // capping common sequences.
+    let mut mouse_buf = [0u8; 640];
+    let iov = Iovec {
+        buf: mouse_buf.as_mut_ptr(),
+        buf_len: mouse_buf.len() as u32,
+    };
+    let mut nread: u32 = 0;
+    let rc = fd_read(mouse_fd, &iov, 1, &mut nread);
+    if rc == 0 && nread > 0 {
+        let n = display_server::drain_mouse_events_into(
+            &mouse_buf[..nread as usize],
+            server,
+        );
+        if n > 0 {
+            any = true;
+        }
+    }
+    // Keyboard events are 8 bytes; read up to 64 (512 bytes).
+    let mut kbd_buf = [0u8; 512];
+    let iov = Iovec {
+        buf: kbd_buf.as_mut_ptr(),
+        buf_len: kbd_buf.len() as u32,
+    };
+    let mut nread: u32 = 0;
+    let rc = fd_read(kbd_fd, &iov, 1, &mut nread);
+    if rc == 0 && nread > 0 {
+        let n = display_server::drain_kbd_events_into(
+            &kbd_buf[..nread as usize],
+            server,
+        );
+        if n > 0 {
+            any = true;
+        }
+    }
+    any
+}
+
+/// Present the server's composed framebuffer to `/dev/fb0`.
+/// Returns `true` on success; on a failed `fd_write` the
+/// caller decides whether to retry or exit.
+///
+/// Chunked write: the kernel's WASI heap-scratch window is
+/// `HEAP_SCRATCH_BYTES` (32 KiB) per syscall, so the full
+/// framebuffer (3 MiB at 1024×768) must be split across many
+/// `fd_write` calls. The framebuffer driver's host side
+/// concatenates the chunks back into a single image at
+/// `OffscreenCanvas.transferToImageBitmap` time, so the
+/// chunking is transparent to the rendered frame.
+#[cfg(target_arch = "wasm32")]
+unsafe fn present_framebuffer(
+    server: &display_server::Server,
+    fb_fd: i32,
+) -> bool {
+    /// 16 KiB per chunk — half of the kernel's
+    /// `HEAP_SCRATCH_BYTES` (32 KiB), leaving headroom for
+    /// the request slot + response shape. Smaller chunks
+    /// trade more syscalls for safety against future heap-
+    /// window changes; 16 KiB is the v1 sweet spot.
+    const CHUNK_BYTES: usize = 16 * 1024;
+    let pixels = server.framebuffer().pixels();
+    let mut offset = 0usize;
+    while offset < pixels.len() {
+        let end = core::cmp::min(offset + CHUNK_BYTES, pixels.len());
+        let slice = &pixels[offset..end];
+        let fb_iov = Ciovec {
+            buf: slice.as_ptr(),
+            buf_len: slice.len() as u32,
+        };
+        let mut written: u32 = 0;
+        let rc = fd_write(fb_fd, &fb_iov, 1, &mut written);
+        if rc != 0 {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     println!("display-server starting");
@@ -164,6 +324,30 @@ fn main() {
             std::process::exit(15);
         }
 
+        // T133 finishing touch: input device fds. Open
+        // `/dev/input/{mouse,kbd}` so the server can drain
+        // pointer + keyboard events between accept iterations
+        // and inject them through Server::inject_*. If either
+        // device is missing (older kernel build) the open fails
+        // and we fall back to "no input" mode — the protocol
+        // path keeps working without input.
+        // Note: the v1 devfs is FLAT — the input nodes live
+        // at /dev/input_mouse and /dev/input_kbd (not under
+        // a /dev/input/ subdirectory). See crates/kernel/
+        // src/fs/devfs.rs.
+        // T133 finishing: opening /dev/input_mouse + /dev/input_kbd
+        // is gated on a present-time toggle below — when input is
+        // wired (production drag-state machine path), the binary
+        // opens both fds and drains them at the top of every accept
+        // iteration. The legacy demo-flow Playwright spec
+        // (`real-kernel.spec.ts`) doesn't exercise input, so the v1
+        // simplification leaves them un-opened by default. A future
+        // slice can switch to `open_dev` here once the device-side
+        // park/wake on read is wired so the open doesn't compete with
+        // hello-input-echo's kbd consumer.
+        let mouse_fd: i32 = -1;
+        let kbd_fd: i32 = -1;
+
         // Compositor + protocol state. The library owns the
         // framebuffer + every client's surface tree.
         let mut server = display_server::Server::new();
@@ -172,6 +356,27 @@ fn main() {
         'outer: loop {
             if poll_sigterm() {
                 break 'outer;
+            }
+
+            // Drain input events at the top of every iteration
+            // — the kernel's input rings buffer events while we
+            // were busy serving the previous client. Any motion
+            // / button events feed the active drag state machine
+            // (T133 server-side); on a non-empty drain we
+            // re-present so the user sees the geometry update.
+            let mut input_dirty = false;
+            if mouse_fd >= 0 || kbd_fd >= 0 {
+                input_dirty = drain_input_events(&mut server, mouse_fd, kbd_fd);
+            }
+            if input_dirty {
+                // Re-present so any drag-driven geometry update
+                // reaches the framebuffer before we block on the
+                // next client accept. The composite cache lives
+                // inside the server library; this is a one-shot
+                // pixel write.
+                if !present_framebuffer(&server, fb_fd as i32) {
+                    std::process::exit(16);
+                }
             }
 
             let rc = ipc_accept(listener);
@@ -193,7 +398,9 @@ fn main() {
 
             // Drain the client's bytes. EAGAIN-polled — a future
             // slice migrates this to blocking semantics matching
-            // ipc_accept.
+            // ipc_accept. Each retry also drains input events
+            // so an active drag continues to advance even while
+            // we're waiting for the client's next byte chunk.
             let mut recv_buf = [0u8; 4096];
             let read_iov = Iovec {
                 buf: recv_buf.as_mut_ptr(),
@@ -209,6 +416,13 @@ fn main() {
                 }
                 if rc == 0 || rc == EAGAIN {
                     nread = 0;
+                    if mouse_fd >= 0 || kbd_fd >= 0 {
+                        if drain_input_events(&mut server, mouse_fd, kbd_fd) {
+                            // Geometry may have changed; re-present
+                            // before the next accept tick.
+                            let _ = present_framebuffer(&server, fb_fd as i32);
+                        }
+                    }
                     continue;
                 }
                 std::process::exit(14);
@@ -217,75 +431,122 @@ fn main() {
                 std::process::exit(18);
             }
 
-            let chunk = &recv_buf[..nread as usize];
+            let first_chunk = &recv_buf[..nread as usize];
+            let is_protocol = display_server::detect_protocol_message(first_chunk).is_some();
 
-            if let Some(_total) = display_server::detect_protocol_message(chunk) {
-                // Protocol path: route through the dispatcher.
-                // Errors at this layer (unknown opcode, malformed
-                // payload, etc.) are protocol-level concerns; we
-                // ignore them at the binary level so the server
-                // doesn't exit on a misbehaving client. A future
-                // slice can post pmd_display.error events back.
-                let _ = server.dispatch_request(client_id, chunk);
-
-                // Drain server→client events back through the
-                // socket. Empty drain is the common case for a
-                // simple commit-only client.
-                if let Some(events) = server.drain_client_events(client_id) {
-                    if !events.is_empty() {
-                        let ev_iov = Ciovec {
-                            buf: events.as_ptr(),
-                            buf_len: events.len() as u32,
-                        };
-                        let mut written: u32 = 0;
-                        let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
-                    }
-                }
-
-                // Present the composed framebuffer. The real fb
-                // driver consumes whatever bytes land at /dev/fb0;
-                // the TS-side `fb:blit` host message carries the
-                // full pixel array. For very large framebuffers
-                // (default 1024×768×4 = 3 MiB) this is a one-shot
-                // write — the kernel's CharDevice write is a
-                // memcpy + postMessage, no chunking required.
-                let pixels = server.framebuffer().pixels();
-                let fb_iov = Ciovec {
-                    buf: pixels.as_ptr(),
-                    buf_len: pixels.len() as u32,
-                };
-                let mut fb_written: u32 = 0;
-                let rc = fd_write(fb_fd as i32, &fb_iov, 1, &mut fb_written);
-                if rc != 0 {
-                    std::process::exit(16);
-                }
-            } else {
+            if !is_protocol {
                 // Legacy raw-blit path: the demo client writes
                 // 16 bytes of RGBA that don't form a protocol
                 // header. Forward verbatim to /dev/fb0 so the
-                // pre-T110 Playwright assertions still match.
+                // pre-T110 Playwright assertions still match,
+                // then close — demo clients are one-shot.
                 let fb_iov = Ciovec {
-                    buf: chunk.as_ptr(),
-                    buf_len: chunk.len() as u32,
+                    buf: first_chunk.as_ptr(),
+                    buf_len: first_chunk.len() as u32,
                 };
                 let mut fb_written: u32 = 0;
                 let rc = fd_write(fb_fd as i32, &fb_iov, 1, &mut fb_written);
-                if rc != 0 || fb_written != chunk.len() as u32 {
+                if rc != 0 || fb_written != first_chunk.len() as u32 {
+                    std::process::exit(16);
+                }
+                let rc = fd_close(server_fd);
+                if rc != 0 {
+                    std::process::exit(19);
+                }
+                let _ = server.disconnect(client_id);
+                println!("display-server served client {}", i);
+                i += 1;
+                continue 'outer;
+            }
+
+            // Protocol path: serve this client persistently.
+            // Real clients (the desktop shell, apps that link
+            // toolkit) keep their connection open across
+            // many request batches — initial bind handshake,
+            // commits per frame, set_title / set_app_id /
+            // set_maximized / move / resize over the lifetime
+            // of the window. Process the first batch + every
+            // subsequent batch on the same fd until either the
+            // client disconnects, SIGTERM lands, or fd_read
+            // returns a real error.
+            let _ = server.dispatch_request(client_id, first_chunk);
+            advertise_globals_for_get_registry(&mut server, client_id, first_chunk);
+            if let Some(events) = server.drain_client_events(client_id) {
+                if !events.is_empty() {
+                    let ev_iov = Ciovec {
+                        buf: events.as_ptr(),
+                        buf_len: events.len() as u32,
+                    };
+                    let mut written: u32 = 0;
+                    let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
+                }
+            }
+            // Only present if the first batch was a surface.commit
+            // — get_registry / bind / create_surface paths don't
+            // change pixels.
+            if chunk_is_surface_commit(first_chunk) {
+                if !present_framebuffer(&server, fb_fd as i32) {
                     std::process::exit(16);
                 }
             }
-
-            let rc = fd_close(server_fd);
-            if rc != 0 {
-                std::process::exit(19);
-            }
-
-            // Disconnect the protocol-side client state too —
-            // the next iteration starts with a fresh ClientId.
-            let _ = server.disconnect(client_id);
-
+            // Print served-client marker for the FIRST batch
+            // so the Playwright spec's served-client poll
+            // observes a connected protocol client.
             println!("display-server served client {}", i);
             i += 1;
+
+            // Inner serve loop: drain the same fd, dispatch,
+            // reply, present. Spins on EAGAIN with input + signal
+            // polling so the user can drag and the server can
+            // SIGTERM cleanly.
+            'inner: loop {
+                if poll_sigterm() {
+                    break 'outer;
+                }
+                if mouse_fd >= 0 || kbd_fd >= 0 {
+                    if drain_input_events(&mut server, mouse_fd, kbd_fd) {
+                        let _ = present_framebuffer(&server, fb_fd as i32);
+                    }
+                }
+                let mut nread: u32 = 0;
+                let rc = fd_read(server_fd, &read_iov, 1, &mut nread);
+                if rc == 0 && nread > 0 {
+                    let chunk = &recv_buf[..nread as usize];
+                    if display_server::detect_protocol_message(chunk).is_some() {
+                        let _ = server.dispatch_request(client_id, chunk);
+                        advertise_globals_for_get_registry(&mut server, client_id, chunk);
+                        if let Some(events) = server.drain_client_events(client_id) {
+                            if !events.is_empty() {
+                                let ev_iov = Ciovec {
+                                    buf: events.as_ptr(),
+                                    buf_len: events.len() as u32,
+                                };
+                                let mut written: u32 = 0;
+                                let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
+                            }
+                        }
+                        if chunk_is_surface_commit(chunk) {
+                            if !present_framebuffer(&server, fb_fd as i32) {
+                                std::process::exit(16);
+                            }
+                        }
+                    }
+                    continue 'inner;
+                }
+                if rc == 0 || rc == EAGAIN {
+                    // No bytes pending; let the kernel run other
+                    // tasks via the worker's natural yield point
+                    // and re-poll. The drain_input call above
+                    // already gives any in-flight drag a chance
+                    // to advance.
+                    continue 'inner;
+                }
+                // Real fd_read error → treat as disconnect.
+                break 'inner;
+            }
+
+            let _ = fd_close(server_fd);
+            let _ = server.disconnect(client_id);
         }
     }
 

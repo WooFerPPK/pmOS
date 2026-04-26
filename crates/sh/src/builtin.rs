@@ -958,20 +958,31 @@ fn integer_expected<E: Write>(
 /// shell-test approximation of "does the owner bit allow
 /// it" rather than the full effective-uid `access(2)` call.
 fn evaluate_file_test(op: &str, path: &str) -> BuiltinOutcome {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(_) => return BuiltinOutcome::Status(1),
     };
+    // mode() lives on PermissionsExt which is unix-only;
+    // wasip1 has no mode/uid concept, so any statted entry
+    // is treated as readable+writable+executable for
+    // `-r / -w / -x` purposes. This matches busybox-on-wasi
+    // semantics — shell scripts that run on the wasi target
+    // see permissive POSIX bits.
+    #[cfg(unix)]
+    let mode_bit = |bit: u32| -> bool { meta.permissions().mode() & bit != 0 };
+    #[cfg(not(unix))]
+    let mode_bit = |_bit: u32| -> bool { true };
     let pass = match op {
         "-e" => true,
         "-f" => meta.is_file(),
         "-d" => meta.is_dir(),
         "-s" => meta.len() > 0,
-        "-r" => meta.permissions().mode() & 0o400 != 0,
-        "-w" => meta.permissions().mode() & 0o200 != 0,
-        "-x" => meta.permissions().mode() & 0o100 != 0,
+        "-r" => mode_bit(0o400),
+        "-w" => mode_bit(0o200),
+        "-x" => mode_bit(0o100),
         _ => unreachable!("evaluate_file_test called with non-file-test op {op}"),
     };
     bool_to_status(pass)
@@ -1039,8 +1050,25 @@ fn evaluate_binary_file_test(op: &str, path1: &str, path2: &str) -> BuiltinOutco
         },
         "-ef" => match (&meta1, &meta2) {
             (Ok(m1), Ok(m2)) => {
-                use std::os::unix::fs::MetadataExt;
-                bool_to_status(m1.dev() == m2.dev() && m1.ino() == m2.ino())
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    bool_to_status(m1.dev() == m2.dev() && m1.ino() == m2.ino())
+                }
+                #[cfg(not(unix))]
+                {
+                    // wasi has no stable dev/ino accessor on
+                    // Metadata. Fall back to len + modified()
+                    // equality — coarse but consistent: two
+                    // files that share length + mtime are
+                    // treated as the "same file" by `-ef`
+                    // here. Real link detection lands when
+                    // wasi exposes inode numbers.
+                    let _ = (m1, m2);
+                    bool_to_status(
+                        m1.len() == m2.len() && m1.modified().ok() == m2.modified().ok(),
+                    )
+                }
             }
             _ => bool_to_status(false),
         },

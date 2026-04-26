@@ -1491,3 +1491,190 @@ fn taskbar_height_reservation_subtracts_from_work_area_height() {
     s.set_taskbar_height_px(0);
     assert_eq!(s.work_area_height(), 600);
 }
+
+#[test]
+fn drain_mouse_events_routes_motion_to_inject_pointer_motion() {
+    use display_server::{drain_mouse_events_into, mouse_event_kind, MOUSE_EVENT_SIZE};
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let _c = s.accept();
+    // Build two motion events back-to-back.
+    let mut bytes = Vec::new();
+    for (x, y) in [(100i32, 50i32), (250, 175)] {
+        let mut event = [0u8; MOUSE_EVENT_SIZE];
+        event[0..4].copy_from_slice(&mouse_event_kind::MOTION.to_le_bytes());
+        event[4..8].copy_from_slice(&x.to_le_bytes());
+        event[8..12].copy_from_slice(&y.to_le_bytes());
+        bytes.extend_from_slice(&event);
+    }
+    let n = drain_mouse_events_into(&bytes, &mut s);
+    assert_eq!(n, 2);
+    // Final pointer position is the last motion's coordinates.
+    assert_eq!(s.pointer_position(), (250, 175));
+}
+
+#[test]
+fn drain_mouse_events_routes_button_event_through_inject_pointer_button() {
+    use display_server::{drain_mouse_events_into, mouse_event_kind, mouse_button_state, MOUSE_EVENT_SIZE};
+    use display_server::ids::ObjectId;
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let c = s.accept();
+    // Set up a toplevel + buffer so hit_test has a window to find.
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let xdg_shell_id = ObjectId::new(9);
+    let surface_id = ObjectId::new(11);
+    let pool_id = ObjectId::new(13);
+    let buffer_id = ObjectId::new(15);
+    let toplevel_id = ObjectId::new(17);
+    s.dispatch_request(c, &encode_request_bytes(ObjectId::DISPLAY, 2, &registry_id.raw().to_le_bytes())).unwrap();
+    for (name, iface, bound) in [(1u32, "pmd_compositor", compositor_id), (2, "pmd_shm", shm_id), (3, "pmd_xdg_shell", xdg_shell_id)] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload)).unwrap();
+    }
+    s.dispatch_request(c, &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes())).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(shm_id, 1, &shm_create_pool_payload(pool_id, 16))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(pool_id, 1, &shm_pool_create_buffer_payload(buffer_id, 0, 2, 2, 8, 0))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(xdg_shell_id, 1, &xdg_get_toplevel_payload(toplevel_id, surface_id))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 2, &surface_attach_payload(buffer_id, 0, 0))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 7, &[])).unwrap();
+
+    // Build a motion + press sequence.
+    let mut bytes = Vec::new();
+    for (kind, x, y, button, state) in [
+        (mouse_event_kind::MOTION, 1i32, 1i32, 0u32, 0u32),
+        (mouse_event_kind::BUTTON, 1, 1, 1, mouse_button_state::PRESSED),
+    ] {
+        let mut event = [0u8; MOUSE_EVENT_SIZE];
+        event[0..4].copy_from_slice(&kind.to_le_bytes());
+        event[4..8].copy_from_slice(&x.to_le_bytes());
+        event[8..12].copy_from_slice(&y.to_le_bytes());
+        event[12..16].copy_from_slice(&button.to_le_bytes());
+        event[16..20].copy_from_slice(&state.to_le_bytes());
+        bytes.extend_from_slice(&event);
+    }
+    let n = drain_mouse_events_into(&bytes, &mut s);
+    assert_eq!(n, 2);
+    // The press inside the toplevel sets keyboard focus to that surface.
+    assert_eq!(s.keyboard_focus(), Some((c, surface_id)));
+}
+
+#[test]
+fn drain_mouse_events_drives_active_drag_advance() {
+    // Full T133 round-trip through the input path: a client
+    // sends move(serial=1), the server starts a drag, then a
+    // packed motion event from /dev/input/mouse arrives and
+    // drives the drag. The toplevel's origin updates.
+    use display_server::{drain_mouse_events_into, mouse_event_kind, MOUSE_EVENT_SIZE};
+    use display_server::ids::ObjectId;
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let c = s.accept();
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let xdg_shell_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+    let toplevel_id = ObjectId::new(11);
+    s.dispatch_request(c, &encode_request_bytes(ObjectId::DISPLAY, 2, &registry_id.raw().to_le_bytes())).unwrap();
+    for (name, iface, bound) in [(1u32, "pmd_compositor", compositor_id), (2, "pmd_xdg_shell", xdg_shell_id)] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload)).unwrap();
+    }
+    s.dispatch_request(c, &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes())).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(xdg_shell_id, 1, &xdg_get_toplevel_payload(toplevel_id, surface_id))).unwrap();
+
+    // Plant pointer + send move(serial=1) — the dispatch fires
+    // start_drag_from_request which captures the pointer + origin.
+    let initial_origin = (s.client(c).unwrap().toplevel(toplevel_id).unwrap().x,
+                          s.client(c).unwrap().toplevel(toplevel_id).unwrap().y);
+    s.inject_pointer_motion(100, 100);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    s.dispatch_request(c, &encode_request_bytes(toplevel_id, 7 /* move */, &payload)).unwrap();
+    assert!(s.is_dragging());
+
+    // Mouse motion event from the /dev/input/mouse ring.
+    let mut event = [0u8; MOUSE_EVENT_SIZE];
+    event[0..4].copy_from_slice(&mouse_event_kind::MOTION.to_le_bytes());
+    event[4..8].copy_from_slice(&140i32.to_le_bytes());
+    event[8..12].copy_from_slice(&130i32.to_le_bytes());
+    let n = drain_mouse_events_into(&event, &mut s);
+    assert_eq!(n, 1);
+    let new_origin = (s.client(c).unwrap().toplevel(toplevel_id).unwrap().x,
+                      s.client(c).unwrap().toplevel(toplevel_id).unwrap().y);
+    assert_eq!(new_origin.0, initial_origin.0 + 40);
+    assert_eq!(new_origin.1, initial_origin.1 + 30);
+}
+
+#[test]
+fn drain_kbd_events_routes_keys_to_focused_surface() {
+    use display_server::{drain_kbd_events_into, kbd_key_state, KBD_EVENT_SIZE};
+    use display_server::ids::ObjectId;
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let c = s.accept();
+    // Set up a toplevel with a buffer + bind keyboard so we
+    // can observe the routed key event.
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let xdg_shell_id = ObjectId::new(9);
+    let seat_id = ObjectId::new(11);
+    let surface_id = ObjectId::new(13);
+    let pool_id = ObjectId::new(15);
+    let buffer_id = ObjectId::new(17);
+    let toplevel_id = ObjectId::new(19);
+    let kbd_object_id = ObjectId::new(21);
+    s.dispatch_request(c, &encode_request_bytes(ObjectId::DISPLAY, 2, &registry_id.raw().to_le_bytes())).unwrap();
+    for (name, iface, bound) in [
+        (1u32, "pmd_compositor", compositor_id),
+        (2, "pmd_shm", shm_id),
+        (3, "pmd_xdg_shell", xdg_shell_id),
+        (4, "pmd_seat", seat_id),
+    ] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload)).unwrap();
+    }
+    s.dispatch_request(c, &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes())).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(shm_id, 1, &shm_create_pool_payload(pool_id, 16))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(pool_id, 1, &shm_pool_create_buffer_payload(buffer_id, 0, 2, 2, 8, 0))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(xdg_shell_id, 1, &xdg_get_toplevel_payload(toplevel_id, surface_id))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 2, &surface_attach_payload(buffer_id, 0, 0))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 7, &[])).unwrap();
+    // get_keyboard payload is just the new_id.
+    s.dispatch_request(c, &encode_request_bytes(seat_id, 2 /* get_keyboard */, &kbd_object_id.raw().to_le_bytes())).unwrap();
+    s.set_keyboard_focus(Some((c, surface_id)));
+
+    // Build a key-press event.
+    let mut event = [0u8; KBD_EVENT_SIZE];
+    event[0..4].copy_from_slice(&65u32.to_le_bytes()); // 'A'
+    event[4..8].copy_from_slice(&kbd_key_state::PRESSED.to_le_bytes());
+    let n = drain_kbd_events_into(&event, &mut s);
+    assert_eq!(n, 1);
+    // The injected key reaches the focused client's keyboard
+    // event queue. Drain client events and look for the key.
+    let bytes = s.drain_client_events(c).unwrap_or_default();
+    assert!(!bytes.is_empty(), "key inject must emit a keyboard.key event");
+}
+
+#[test]
+fn decode_mouse_event_rejects_unknown_kind() {
+    use display_server::{decode_mouse_event, MOUSE_EVENT_SIZE};
+    let mut event = [0u8; MOUSE_EVENT_SIZE];
+    event[0..4].copy_from_slice(&999u32.to_le_bytes());
+    assert!(decode_mouse_event(&event).is_none());
+}
+
+#[test]
+fn decode_mouse_event_rejects_short_buffer() {
+    use display_server::decode_mouse_event;
+    let event = [0u8; 10];
+    assert!(decode_mouse_event(&event).is_none());
+}
+
+#[test]
+fn decode_kbd_event_rejects_unknown_state() {
+    use display_server::{decode_kbd_event, KBD_EVENT_SIZE};
+    let mut event = [0u8; KBD_EVENT_SIZE];
+    event[0..4].copy_from_slice(&65u32.to_le_bytes());
+    event[4..8].copy_from_slice(&999u32.to_le_bytes());
+    assert!(decode_kbd_event(&event).is_none());
+}

@@ -51,8 +51,25 @@ mod wasm_main {
             iovs_len: i32,
             nwritten_ptr: *mut u32,
         ) -> i32;
+        fn sched_yield() -> i32;
         fn proc_exit(rval: i32) -> !;
     }
+
+    /// EAGAIN errno code (matches abi::errno::EAGAIN).
+    const EAGAIN: i32 = 6;
+    /// EINVAL errno code (positive form per WASI). Returned
+    /// by `fd_write` while the socket is still `Connecting`
+    /// — the server hasn't called `ipc_accept` yet.
+    const EINVAL: i32 = 28;
+    /// Max busy-poll iterations FdConnection::recv waits
+    /// for bytes before returning empty. Tuned so a fresh
+    /// connect → bind → reply round-trip lands within the
+    /// poll budget on a reasonably loaded substrate.
+    const RECV_MAX_POLLS: u32 = 50_000;
+    /// Max busy-poll iterations FdConnection::send waits
+    /// for the connecting → connected transition before
+    /// giving up (logged as a dropped write).
+    const SEND_MAX_POLLS: u32 = 50_000;
 
     #[link(wasm_import_module = "pmos_ext")]
     extern "C" {
@@ -103,9 +120,26 @@ mod wasm_main {
                 buf: bytes.as_ptr(),
                 buf_len: bytes.len() as u32,
             };
-            let mut nwritten: u32 = 0;
-            unsafe {
-                let _ = fd_write(self.fd, &iov, 1, &mut nwritten);
+            // EINVAL retry: the first write right after
+            // `display_connect` may race the server's
+            // `ipc_accept`. While the socket is in the
+            // `Connecting` state the kernel returns EINVAL.
+            // Retry with sched_yield until the server
+            // promotes us to `Connected` and the write lands.
+            for _ in 0..SEND_MAX_POLLS {
+                let mut nwritten: u32 = 0;
+                let rc = unsafe { fd_write(self.fd, &iov, 1, &mut nwritten) };
+                if rc == 0 && nwritten as usize == bytes.len() {
+                    return;
+                }
+                if rc == EINVAL || rc == EAGAIN {
+                    unsafe { let _ = sched_yield(); }
+                    continue;
+                }
+                // Real failure — drop the write. The toolkit's
+                // protocol layer will eventually surface the
+                // missing reply as MissingGlobal or similar.
+                return;
             }
         }
 
@@ -126,15 +160,35 @@ mod wasm_main {
                 buf_len: buf.len() as u32,
             };
             let mut nread: u32 = 0;
-            let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
-            if rc != 0 || nread == 0 {
+            // Busy-poll on EAGAIN: PMos's socket fd_read
+            // returns EAGAIN-immediately when no bytes are
+            // queued. The toolkit's App::connect drain loop
+            // breaks on a single empty recv, so the v1
+            // adapter has to give the server a chance to
+            // produce its registry advertisements before
+            // returning empty. Each EAGAIN spin yields the
+            // worker so the kernel can run the display
+            // server's accept + dispatch path.
+            for _ in 0..RECV_MAX_POLLS {
+                let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
+                if rc == 0 && nread > 0 {
+                    return buf[..nread as usize].to_vec();
+                }
+                if rc == 0 || rc == EAGAIN {
+                    nread = 0;
+                    unsafe { let _ = sched_yield(); }
+                    continue;
+                }
+                // Real I/O error or EOF — give up and let
+                // the toolkit drain loop terminate.
                 return alloc::vec::Vec::new();
             }
-            buf[..nread as usize].to_vec()
+            alloc::vec::Vec::new()
         }
     }
 
     pub fn run() {
+        println!("shell: starting");
         let fd = unsafe { display_connect() };
         if fd < 0 {
             // display_connect failed — bail with the negated
@@ -143,9 +197,9 @@ mod wasm_main {
         }
         let conn = FdConnection::new(fd);
         let taskbar = Taskbar::new(0, 0);
+        println!("shell: connected to /run/display");
         match run_shell_with_taskbar(conn, u32::MAX, taskbar) {
-            Ok(ShellExit::CloseRequested) => unsafe { proc_exit(0) },
-            Ok(ShellExit::IterationLimit) => unsafe { proc_exit(0) },
+            Ok(_) => unsafe { proc_exit(0) },
             Err(_) => unsafe { proc_exit(1) },
         }
     }

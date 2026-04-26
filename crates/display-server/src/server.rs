@@ -525,6 +525,7 @@ impl Server {
             && header.opcode == 7 /* commit */
         {
             self.composite_surface_commit(client_id, header.object_id);
+            self.maybe_emit_initial_configure(client_id, header.object_id);
         }
 
         // T131: cross-client shell_manager.minimize_window
@@ -696,6 +697,81 @@ impl Server {
     /// release; exposed for tests + restore paths.
     pub fn end_drag(&mut self) -> Option<DragState> {
         self.active_drag.take()
+    }
+
+    /// If `surface_id`'s toplevel has not yet received an
+    /// `xdg_toplevel.configure`, emit one now sized to the
+    /// work area and flag the toplevel as configured. The
+    /// initial configure is the Wayland-style handshake
+    /// that tells the client "you may now paint real
+    /// frames"; the toolkit's `Window::dispatch` blocks
+    /// the paint loop on `is_configured = true`. Called
+    /// from the surface-commit dispatch hook so the very
+    /// first commit synthesises the configure (clients
+    /// commit an empty buffer or a placeholder buffer
+    /// before they know the size).
+    pub fn maybe_emit_initial_configure(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) {
+        let work_area_w = self.work_area_width() as i32;
+        let work_area_h = self.work_area_height() as i32;
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        // Find the toplevel that owns this surface.
+        let toplevel_id = match client.toplevel_by_surface.get(&surface_id) {
+            Some(&id) => id,
+            None => return,
+        };
+        let already_sent = client
+            .toplevels
+            .get(&toplevel_id)
+            .map(|t| t.initial_configure_sent)
+            .unwrap_or(true);
+        if already_sent {
+            return;
+        }
+        let serial = client.next_configure_serial();
+        let _ = client.emit_xdg_toplevel_configure(
+            toplevel_id,
+            serial,
+            work_area_w,
+            work_area_h,
+            0,
+        );
+        if let Some(toplevel) = client.toplevels.get_mut(&toplevel_id) {
+            toplevel.initial_configure_sent = true;
+        }
+    }
+
+    /// Emit the v1 globals catalog onto `registry_id` for
+    /// `client_id`. Called by the post-dispatch hook in
+    /// [`Server::dispatch_request`] after a successful
+    /// `pmd_display.get_registry`. Advertises the four
+    /// universal globals (compositor, shm, xdg_shell, seat)
+    /// plus pmd_shell_manager — gated on the client holding
+    /// `Cap::Shell` since binding shell_manager requires
+    /// that cap (see [`crate::client::interface_required_cap`]).
+    /// The numeric `name` values are the registry handles
+    /// the client echoes back through `registry.bind`.
+    pub fn advertise_globals_to(
+        &mut self,
+        client_id: ClientId,
+        registry_id: ObjectId,
+    ) {
+        use abi::cap::Cap;
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        let _ = client.emit_global(registry_id, 1, "pmd_compositor", 1);
+        let _ = client.emit_global(registry_id, 2, "pmd_shm", 1);
+        let _ = client.emit_global(registry_id, 3, "pmd_xdg_shell", 1);
+        let _ = client.emit_global(registry_id, 4, "pmd_seat", 1);
+        if client.capabilities.contains(Cap::Shell) {
+            let _ = client.emit_global(registry_id, 5, "pmd_shell_manager", 1);
+        }
     }
 
     /// Walk every client's toplevel table and flip the

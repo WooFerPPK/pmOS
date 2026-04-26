@@ -69,6 +69,160 @@ pub fn detect_protocol_message(bytes: &[u8]) -> Option<usize> {
     }
 }
 
+/// Wire size of a packed mouse input event in bytes. Mirrors
+/// `web/src/shared/input-proto.ts` MOUSE_EVENT_SIZE so the
+/// kernel-side `/dev/input/mouse` ring and the display-server's
+/// reader speak the same format.
+pub const MOUSE_EVENT_SIZE: usize = 20;
+
+/// Wire size of a packed keyboard input event in bytes.
+/// Mirrors `web/src/shared/input-proto.ts` KBD_EVENT_SIZE.
+pub const KBD_EVENT_SIZE: usize = 8;
+
+/// Discriminant values for the `kind` field of a packed
+/// mouse event. Mirrors `MouseEventKind` in the TS shared
+/// proto.
+pub mod mouse_event_kind {
+    pub const MOTION: u32 = 0;
+    pub const BUTTON: u32 = 1;
+    pub const WHEEL: u32 = 2;
+}
+
+/// Mouse-button-state values for the `state` field of a
+/// `mouse_event_kind::BUTTON` packed event.
+pub mod mouse_button_state {
+    pub const RELEASED: u32 = 0;
+    pub const PRESSED: u32 = 1;
+}
+
+/// Keyboard-key-state values for the `state` field of a
+/// keyboard event.
+pub mod kbd_key_state {
+    pub const RELEASED: u32 = 0;
+    pub const PRESSED: u32 = 1;
+}
+
+/// Decoded mouse event ready to inject into [`Server`]
+/// via [`Server::inject_pointer_motion`] /
+/// [`Server::inject_pointer_button`]. Wheel events carry
+/// signed deltas; motion + button events carry pointer-state
+/// changes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DecodedMouseEvent {
+    Motion { x: i32, y: i32 },
+    Button { x: i32, y: i32, button: u32, state: u32 },
+    Wheel { x: i32, y: i32, delta_x: i32, delta_y: i32 },
+}
+
+/// Decode one packed mouse event off the front of `bytes`,
+/// returning the decoded event and the number of bytes
+/// consumed. Returns `None` if `bytes.len() <
+/// MOUSE_EVENT_SIZE` or the kind discriminant is unknown.
+/// Tests for `bytes` that hold multiple events: the caller
+/// advances `bytes` by `MOUSE_EVENT_SIZE` between decodes
+/// and re-calls.
+pub fn decode_mouse_event(bytes: &[u8]) -> Option<(DecodedMouseEvent, usize)> {
+    if bytes.len() < MOUSE_EVENT_SIZE {
+        return None;
+    }
+    let kind = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let x = i32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let y = i32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let event = match kind {
+        mouse_event_kind::MOTION => DecodedMouseEvent::Motion { x, y },
+        mouse_event_kind::BUTTON => {
+            let button = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+            let state = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+            if state != mouse_button_state::RELEASED && state != mouse_button_state::PRESSED {
+                return None;
+            }
+            DecodedMouseEvent::Button { x, y, button, state }
+        }
+        mouse_event_kind::WHEEL => {
+            let delta_x = i32::from_le_bytes(bytes[12..16].try_into().ok()?);
+            let delta_y = i32::from_le_bytes(bytes[16..20].try_into().ok()?);
+            DecodedMouseEvent::Wheel { x, y, delta_x, delta_y }
+        }
+        _ => return None,
+    };
+    Some((event, MOUSE_EVENT_SIZE))
+}
+
+/// Decoded keyboard event ready to inject via
+/// [`Server::inject_keyboard_key`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DecodedKbdEvent {
+    pub key: u32,
+    pub state: u32,
+}
+
+/// Decode one packed keyboard event off the front of `bytes`,
+/// same shape as [`decode_mouse_event`]. The `state` field
+/// is validated against [`kbd_key_state`].
+pub fn decode_kbd_event(bytes: &[u8]) -> Option<(DecodedKbdEvent, usize)> {
+    if bytes.len() < KBD_EVENT_SIZE {
+        return None;
+    }
+    let key = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let state = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if state != kbd_key_state::RELEASED && state != kbd_key_state::PRESSED {
+        return None;
+    }
+    Some((DecodedKbdEvent { key, state }, KBD_EVENT_SIZE))
+}
+
+/// Drain every complete mouse event from `bytes` and inject
+/// each into `server`. Returns the number of events
+/// successfully injected. Stops at the first malformed event
+/// (kind out of range, state out of range, etc.) — the
+/// caller decides whether to also log/restart the input
+/// stream. Trailing partial bytes (less than
+/// [`MOUSE_EVENT_SIZE`]) are silently discarded.
+pub fn drain_mouse_events_into(bytes: &[u8], server: &mut Server) -> usize {
+    let mut consumed = 0usize;
+    let mut count = 0usize;
+    while consumed + MOUSE_EVENT_SIZE <= bytes.len() {
+        let Some((event, used)) = decode_mouse_event(&bytes[consumed..]) else {
+            break;
+        };
+        match event {
+            DecodedMouseEvent::Motion { x, y } => {
+                server.inject_pointer_motion(x, y);
+            }
+            DecodedMouseEvent::Button { button, state, .. } => {
+                server.inject_pointer_button(button, state);
+            }
+            DecodedMouseEvent::Wheel { .. } => {
+                // v1 doesn't route wheel events to clients yet;
+                // the shell's window manager will pick this up
+                // in a future slice. Dropping the event keeps
+                // the contract that "every input byte is
+                // consumed" while not yet propagating wheel.
+            }
+        }
+        consumed += used;
+        count += 1;
+    }
+    count
+}
+
+/// Drain every complete keyboard event from `bytes` and
+/// inject each into `server`. Same shape as
+/// [`drain_mouse_events_into`].
+pub fn drain_kbd_events_into(bytes: &[u8], server: &mut Server) -> usize {
+    let mut consumed = 0usize;
+    let mut count = 0usize;
+    while consumed + KBD_EVENT_SIZE <= bytes.len() {
+        let Some((event, used)) = decode_kbd_event(&bytes[consumed..]) else {
+            break;
+        };
+        server.inject_keyboard_key(event.key, event.state);
+        consumed += used;
+        count += 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod detect_tests {
     use super::*;

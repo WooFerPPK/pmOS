@@ -12,5 +12,9 @@ path = "src/lib.rs"
 name = "init"
 path = "src/main.rs"
 
+[[bin]]
+name = "init-desktop"
+path = "src/main_desktop.rs"
+
 [dependencies]
 abi = { path = "../abi" }
