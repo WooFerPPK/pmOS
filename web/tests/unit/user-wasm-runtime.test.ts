@@ -50,6 +50,7 @@ import {
 } from "../../src/user-wasm-runtime";
 import {
   CAPSET_ALL,
+  CAPSET_ORDINARY_APP,
   DEV,
   encodeSpawnManifest,
   ERRNO,
@@ -140,6 +141,7 @@ let helloYieldLoopWasmBytes: ArrayBuffer;
 let helloCapListWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 let helloClockWasmBytes: ArrayBuffer;
+let memAdversaryWasmBytes: ArrayBuffer;
 let initWasmBytes: ArrayBuffer;
 let displayServerWasmBytes: ArrayBuffer;
 let displayClientDemoWasmBytes: ArrayBuffer;
@@ -249,6 +251,14 @@ beforeAll(() => {
     repoRoot,
     "target/wasm32-wasip1/release/hello-clock.wasm",
   );
+  // T172: mem-adversary is the Principle V acceptance gate —
+  // a wasm32-wasip1 cdylib (so dashes → underscores in the
+  // filename) that runs every probe a malicious user-wasm could
+  // attempt and asserts each one is rejected by the kernel.
+  const memAdversaryPath = path.join(
+    repoRoot,
+    "target/wasm32-wasip1/release/mem_adversary.wasm",
+  );
   // `init` is also a bin target, no dash-preservation concerns.
   const initPath = path.join(
     repoRoot,
@@ -291,6 +301,7 @@ beforeAll(() => {
     helloCapListPath,
     helloStdPath,
     helloClockPath,
+    memAdversaryPath,
     initPath,
     displayServerPath,
     displayClientDemoPath,
@@ -337,6 +348,7 @@ beforeAll(() => {
   helloCapListWasmBytes = loadWasm(helloCapListPath);
   helloStdWasmBytes = loadWasm(helloStdPath);
   helloClockWasmBytes = loadWasm(helloClockPath);
+  memAdversaryWasmBytes = loadWasm(memAdversaryPath);
   initWasmBytes = loadWasm(initPath);
   displayServerWasmBytes = loadWasm(displayServerPath);
   displayClientDemoWasmBytes = loadWasm(displayClientDemoPath);
@@ -2370,6 +2382,90 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
 
     expect(exitCode).toBe(42);
     expect(consoleWrites).toHaveLength(0);
+  });
+
+  it("mem-adversary runs every Principle V probe and reports OK on full isolation hold (T172)", async () => {
+    // T172: Principle V acceptance gate. Spawn the mem-adversary
+    // wasm binary with a deliberately limited cap set
+    // (CAPSET_ORDINARY_APP — just DisplayClient) so the cap-
+    // gated probes (proc_kill on a stranger's pid, proc_spawn
+    // with a cap superset) actually exercise the
+    // ENOTCAPABLE rejection path. The binary prints PASS lines
+    // for every rejected probe and `mem-adversary OK\n` on
+    // success, exits 0; any breach exits with the probe index
+    // (1..=8) and prints `mem-adversary BREACH probe N\n`.
+    const consoleWrites: Uint8Array[] = [];
+    const captures: CapturedSpawn[] = [];
+    const binaryRegistry = new Map<string, BufferSource>([
+      ["/bin/mem-adversary", memAdversaryWasmBytes],
+    ]);
+    const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      onConsoleWrite: (bytes) => {
+        consoleWrites.push(bytes);
+      },
+      onSpawnProcess: captureSpawn(binaryRegistry, captures),
+    });
+
+    const init = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(init, 0);
+    kernel.installConsoleFd(init, 1);
+    kernel.installConsoleFd(init, 2);
+    kernel.markRunning(init);
+
+    // Spawn the adversary with ORDINARY_APP caps so cap-gated
+    // probes hit ENOTCAPABLE rather than getting waved through.
+    const manifest = encodeSpawnManifest({
+      path: "/bin/mem-adversary",
+      caps: CAPSET_ORDINARY_APP,
+    });
+    const spawnResult = kernel.dispatch(
+      init,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 1,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawnResult.response!.status).toBe(0);
+
+    const history = await runAllSpawns(kernel, captures);
+    expect(history).toHaveLength(1);
+    // Concatenate every console write into one byte stream so
+    // the assertion failure surfaces the probe details.
+    const totalLen = consoleWrites.reduce((s, b) => s + b.length, 0);
+    const merged = new Uint8Array(totalLen);
+    let off = 0;
+    for (const b of consoleWrites) {
+      merged.set(b, off);
+      off += b.length;
+    }
+    const text = new TextDecoder().decode(merged);
+    // Exit 0 means every probe was correctly rejected. A non-
+    // zero exit code is the index of the probe that succeeded
+    // when it should have failed (i.e., a Principle V breach).
+    expect(history[0]!.exitCode, `console:\n${text}`).toBe(0);
+    expect(text).toContain("mem-adversary OK\n");
+    expect(text).not.toContain("BREACH");
+
+    // Each universal probe (1, 3, 4, 5, 6, 7) should have a PASS
+    // line. Probes 2 and 8 depend on cap presence; with
+    // ORDINARY_APP, both are exercised (no PROC_KILL_ANY for 2,
+    // not CAPSET_ALL for 8) — so all 8 probes should PASS.
+    for (const name of [
+      "PASS cap_check_invalid_id",
+      "PASS proc_kill_fake_pid",
+      "PASS proc_caps_get_fake_pid",
+      "PASS fd_read_unowned_fd",
+      "PASS fd_close_unowned_fd",
+      "PASS path_open_nonexistent_path",
+      "PASS path_open_unknown_pid_status",
+      "PASS proc_spawn_cap_superset",
+    ]) {
+      expect(text).toContain(name);
+    }
   });
 });
 

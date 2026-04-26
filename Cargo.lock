@@ -170,6 +170,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mem-adversary"
+version = "0.1.0"
+
+[[package]]
 name = "preferences"
 version = "0.1.0"
 

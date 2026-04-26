@@ -26,7 +26,7 @@ build:
         -p hello-self-probe -p hello-ppid -p hello-caps \
         -p hello-raise -p hello-wait-noop -p hello-cap-check \
         -p hello-random -p hello-fd-close-bad -p hello-fd-close-good \
-        -p hello-yield-loop -p hello-cap-list
+        -p hello-yield-loop -p hello-cap-list -p mem-adversary
     cd web && npx esbuild src/bootstrap.ts --bundle --outfile=../build/assets/bootstrap.js --format=esm
     cd web && npx esbuild src/kernel-worker-entry.ts --bundle --outfile=../build/assets/kernel-worker.js --format=esm
     cd web && npx esbuild src/user-worker-entry.ts --bundle --outfile=../build/assets/user-worker.js --format=esm
