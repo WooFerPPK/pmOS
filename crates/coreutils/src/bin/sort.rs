@@ -197,16 +197,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut reverse = false;
     let mut unique = false;
-    let mut numeric = false;
-    let mut fold = false;
     let mut check_only = false;
     let mut silent_check = false;
-    let mut ignore_blanks = false;
-    let mut ignore_nonprinting = false;
-    let mut dictionary_order = false;
-    let mut version_sort = false;
+    let mut options = KeyOptions::default();
     let mut output: Option<String> = None;
-    let mut key_field: Option<usize> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     let mut idx = 0usize;
@@ -226,14 +220,14 @@ fn main() -> ExitCode {
                 match ch {
                     'r' => reverse = true,
                     'u' => unique = true,
-                    'n' => numeric = true,
-                    'f' => fold = true,
+                    'n' => options.numeric = true,
+                    'f' => options.fold = true,
                     'c' => check_only = true,
                     'C' => silent_check = true,
-                    'b' => ignore_blanks = true,
-                    'i' => ignore_nonprinting = true,
-                    'd' => dictionary_order = true,
-                    'V' => version_sort = true,
+                    'b' => options.ignore_blanks = true,
+                    'i' => options.ignore_nonprinting = true,
+                    'd' => options.dictionary_order = true,
+                    'V' => options.version_sort = true,
                     'o' => {
                         let value = if ci < cluster.len() {
                             let rest: String = cluster[ci..].iter().collect();
@@ -265,7 +259,7 @@ fn main() -> ExitCode {
                             .as_deref()
                             .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0));
                         match parsed {
-                            Some(n) => key_field = Some(n),
+                            Some(n) => options.key_field = Some(n),
                             None => {
                                 let display = value_opt.as_deref().unwrap_or("<missing>");
                                 let _ = writeln!(
@@ -321,45 +315,26 @@ fn main() -> ExitCode {
     }
 
     if check_only || silent_check {
-        return check_sorted(
-            &lines,
-            numeric,
-            fold,
-            ignore_blanks,
-            ignore_nonprinting,
-            dictionary_order,
-            key_field,
-            version_sort,
-            reverse,
-            unique,
-            silent_check,
-        );
+        return check_sorted(&lines, &options, reverse, unique, silent_check);
     }
 
-    if key_field.is_some() {
-        lines.sort_by_key(|line| {
-            key_for(
-                line,
-                numeric,
-                fold,
-                ignore_blanks,
-                ignore_nonprinting,
-                dictionary_order,
-                key_field,
-                version_sort,
-            )
-        });
-    } else if numeric {
+    if options.key_field.is_some() {
+        lines.sort_by_key(|line| key_for(line, &options));
+    } else if options.numeric {
         lines.sort_by_key(|line| parse_leading_int(line));
-    } else if version_sort {
-        lines.sort_by_key(|line| Key::Version(maybe_fold_for_version(line, fold)));
-    } else if dictionary_order {
-        lines.sort_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
-    } else if ignore_nonprinting {
-        lines.sort_by_key(|line| filter_printable_then_maybe_fold(line, ignore_blanks, fold));
-    } else if fold {
-        lines.sort_by_key(|line| fold_to_upper_bytes(maybe_trim(line, ignore_blanks)));
-    } else if ignore_blanks {
+    } else if options.version_sort {
+        lines.sort_by_key(|line| Key::Version(maybe_fold_for_version(line, options.fold)));
+    } else if options.dictionary_order {
+        lines.sort_by_key(|line| {
+            filter_dictionary_then_maybe_fold(line, options.ignore_blanks, options.fold)
+        });
+    } else if options.ignore_nonprinting {
+        lines.sort_by_key(|line| {
+            filter_printable_then_maybe_fold(line, options.ignore_blanks, options.fold)
+        });
+    } else if options.fold {
+        lines.sort_by_key(|line| fold_to_upper_bytes(maybe_trim(line, options.ignore_blanks)));
+    } else if options.ignore_blanks {
         lines.sort_by_key(|line| trim_leading_blanks(line).as_bytes().to_vec());
     } else {
         lines.sort();
@@ -368,30 +343,25 @@ fn main() -> ExitCode {
         lines.reverse();
     }
     if unique {
-        if key_field.is_some() {
-            lines.dedup_by_key(|line| {
-                key_for(
-                    line,
-                    numeric,
-                    fold,
-                    ignore_blanks,
-                    ignore_nonprinting,
-                    dictionary_order,
-                    key_field,
-                    version_sort,
-                )
-            });
-        } else if numeric {
+        if options.key_field.is_some() {
+            lines.dedup_by_key(|line| key_for(line, &options));
+        } else if options.numeric {
             lines.dedup();
-        } else if version_sort {
-            lines.dedup_by_key(|line| Key::Version(maybe_fold_for_version(line, fold)));
-        } else if dictionary_order {
-            lines.dedup_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
-        } else if ignore_nonprinting {
-            lines.dedup_by_key(|line| filter_printable_then_maybe_fold(line, ignore_blanks, fold));
-        } else if fold {
-            lines.dedup_by_key(|line| fold_to_upper_bytes(maybe_trim(line, ignore_blanks)));
-        } else if ignore_blanks {
+        } else if options.version_sort {
+            lines.dedup_by_key(|line| Key::Version(maybe_fold_for_version(line, options.fold)));
+        } else if options.dictionary_order {
+            lines.dedup_by_key(|line| {
+                filter_dictionary_then_maybe_fold(line, options.ignore_blanks, options.fold)
+            });
+        } else if options.ignore_nonprinting {
+            lines.dedup_by_key(|line| {
+                filter_printable_then_maybe_fold(line, options.ignore_blanks, options.fold)
+            });
+        } else if options.fold {
+            lines.dedup_by_key(|line| {
+                fold_to_upper_bytes(maybe_trim(line, options.ignore_blanks))
+            });
+        } else if options.ignore_blanks {
             lines.dedup_by_key(|line| trim_leading_blanks(line).as_bytes().to_vec());
         } else {
             lines.dedup();
@@ -427,6 +397,55 @@ fn main() -> ExitCode {
     if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct KeyOptions {
+    numeric: bool,
+    fold: bool,
+    ignore_blanks: bool,
+    ignore_nonprinting: bool,
+    dictionary_order: bool,
+    key_field: Option<usize>,
+    version_sort: bool,
+}
+
+#[allow(dead_code)]
+impl KeyOptions {
+    fn with_numeric(mut self) -> Self {
+        self.numeric = true;
+        self
+    }
+
+    fn with_fold(mut self) -> Self {
+        self.fold = true;
+        self
+    }
+
+    fn with_ignore_blanks(mut self) -> Self {
+        self.ignore_blanks = true;
+        self
+    }
+
+    fn with_ignore_nonprinting(mut self) -> Self {
+        self.ignore_nonprinting = true;
+        self
+    }
+
+    fn with_dictionary_order(mut self) -> Self {
+        self.dictionary_order = true;
+        self
+    }
+
+    fn with_field(mut self, field: usize) -> Self {
+        self.key_field = Some(field);
+        self
+    }
+
+    fn with_version_sort(mut self) -> Self {
+        self.version_sort = true;
+        self
+    }
+}
+
 #[derive(PartialEq, Eq)]
 enum Key {
     Numeric(i64),
@@ -454,31 +473,30 @@ impl PartialOrd for Key {
     }
 }
 
-fn key_for(
-    line: &str,
-    numeric: bool,
-    fold: bool,
-    ignore_blanks: bool,
-    ignore_nonprinting: bool,
-    dictionary_order: bool,
-    key_field: Option<usize>,
-    version_sort: bool,
-) -> Key {
-    let base: &str = match key_field {
+fn key_for(line: &str, options: &KeyOptions) -> Key {
+    let base: &str = match options.key_field {
         Some(n) => select_field(line, n),
         None => line,
     };
-    if numeric {
+    if options.numeric {
         Key::Numeric(parse_leading_int(base))
-    } else if version_sort {
-        Key::Version(maybe_fold_for_version(base, fold))
-    } else if dictionary_order {
-        Key::Bytes(filter_dictionary_then_maybe_fold(base, ignore_blanks, fold))
-    } else if ignore_nonprinting {
-        Key::Bytes(filter_printable_then_maybe_fold(base, ignore_blanks, fold))
+    } else if options.version_sort {
+        Key::Version(maybe_fold_for_version(base, options.fold))
+    } else if options.dictionary_order {
+        Key::Bytes(filter_dictionary_then_maybe_fold(
+            base,
+            options.ignore_blanks,
+            options.fold,
+        ))
+    } else if options.ignore_nonprinting {
+        Key::Bytes(filter_printable_then_maybe_fold(
+            base,
+            options.ignore_blanks,
+            options.fold,
+        ))
     } else {
-        let s = maybe_trim(base, ignore_blanks);
-        if fold {
+        let s = maybe_trim(base, options.ignore_blanks);
+        if options.fold {
             Key::Bytes(fold_to_upper_bytes(s))
         } else {
             Key::Bytes(s.as_bytes().to_vec())
@@ -492,39 +510,15 @@ fn select_field(line: &str, field: usize) -> &str {
 
 fn check_sorted(
     lines: &[String],
-    numeric: bool,
-    fold: bool,
-    ignore_blanks: bool,
-    ignore_nonprinting: bool,
-    dictionary_order: bool,
-    key_field: Option<usize>,
-    version_sort: bool,
+    options: &KeyOptions,
     reverse: bool,
     unique: bool,
     silent: bool,
 ) -> ExitCode {
     use std::cmp::Ordering;
     for i in 1..lines.len() {
-        let prev = key_for(
-            &lines[i - 1],
-            numeric,
-            fold,
-            ignore_blanks,
-            ignore_nonprinting,
-            dictionary_order,
-            key_field,
-            version_sort,
-        );
-        let curr = key_for(
-            &lines[i],
-            numeric,
-            fold,
-            ignore_blanks,
-            ignore_nonprinting,
-            dictionary_order,
-            key_field,
-            version_sort,
-        );
+        let prev = key_for(&lines[i - 1], options);
+        let curr = key_for(&lines[i], options);
         let ord = prev.cmp(&curr);
         let violation = match (reverse, unique) {
             (false, false) => ord == Ordering::Greater,
@@ -718,4 +712,100 @@ fn parse_leading_int(s: &str) -> i64 {
         return 0;
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_options_have_no_flags_set() {
+        assert_eq!(
+            KeyOptions::default(),
+            KeyOptions {
+                numeric: false,
+                fold: false,
+                ignore_blanks: false,
+                ignore_nonprinting: false,
+                dictionary_order: false,
+                key_field: None,
+                version_sort: false,
+            }
+        );
+    }
+
+    #[test]
+    fn with_numeric_sets_only_numeric() {
+        let opts = KeyOptions::default().with_numeric();
+        assert!(opts.numeric);
+        assert!(!opts.fold);
+        assert!(!opts.ignore_blanks);
+        assert!(!opts.ignore_nonprinting);
+        assert!(!opts.dictionary_order);
+        assert!(!opts.version_sort);
+        assert_eq!(opts.key_field, None);
+    }
+
+    #[test]
+    fn with_field_sets_field_value() {
+        let opts = KeyOptions::default().with_field(2);
+        assert_eq!(opts.key_field, Some(2));
+        assert!(!opts.numeric);
+    }
+
+    #[test]
+    fn builder_methods_compose() {
+        let opts = KeyOptions::default()
+            .with_numeric()
+            .with_fold()
+            .with_field(3);
+        assert!(opts.numeric);
+        assert!(opts.fold);
+        assert_eq!(opts.key_field, Some(3));
+        assert!(!opts.ignore_blanks);
+        assert!(!opts.dictionary_order);
+        assert!(!opts.version_sort);
+    }
+
+    #[test]
+    fn remaining_builder_methods_set_their_flags() {
+        let opts = KeyOptions::default()
+            .with_ignore_blanks()
+            .with_ignore_nonprinting()
+            .with_dictionary_order();
+        assert!(opts.ignore_blanks);
+        assert!(opts.ignore_nonprinting);
+        assert!(opts.dictionary_order);
+        assert!(!opts.numeric);
+        assert!(!opts.fold);
+        assert!(!opts.version_sort);
+        assert_eq!(opts.key_field, None);
+    }
+
+    #[test]
+    fn key_for_with_default_options_returns_bytes_variant() {
+        let k = key_for("hello", &KeyOptions::default());
+        assert!(matches!(&k, Key::Bytes(b) if b.as_slice() == b"hello"));
+    }
+
+    #[test]
+    fn key_for_with_numeric_options_returns_numeric_variant() {
+        let k = key_for("42", &KeyOptions::default().with_numeric());
+        assert!(matches!(k, Key::Numeric(42)));
+    }
+
+    #[test]
+    fn key_for_with_version_options_returns_version_variant() {
+        let k = key_for("v1.0.10", &KeyOptions::default().with_version_sort());
+        assert!(matches!(&k, Key::Version(s) if s == "v1.0.10"));
+    }
+
+    #[test]
+    fn key_for_dispatch_precedence_numeric_over_version() {
+        let k = key_for(
+            "42",
+            &KeyOptions::default().with_numeric().with_version_sort(),
+        );
+        assert!(matches!(k, Key::Numeric(42)));
+    }
 }
