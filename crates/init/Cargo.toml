@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "init"
+path = "src/lib.rs"
+
 [[bin]]
 name = "init"
 path = "src/main.rs"

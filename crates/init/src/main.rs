@@ -83,6 +83,41 @@ const SIGTERM: i32 = 15;
 fn main() {
     println!("init starting");
 
+    // T095: read /etc/init.conf if present. The parser lives in
+    // `init::conf` and is exhaustively tested in `crates/init/
+    // tests/init.rs`. The current demo-spawn flow below ignores
+    // the parsed config (the v1 boot path runs a hardcoded set
+    // of demo children that the Playwright + vitest harnesses
+    // pin); the read happens for two reasons: (1) it exercises
+    // the parser end-to-end on the wasm32-wasip1 target so a
+    // regression in `read_to_string` / TOML decoding surfaces in
+    // the boot log, (2) future shell-respawn work can switch
+    // the spawn loop to config-driven without touching the
+    // read path.
+    match std::fs::read_to_string("/etc/init.conf") {
+        Ok(text) => match init::conf::InitConfig::parse(&text) {
+            Ok(cfg) => {
+                println!(
+                    "init: /etc/init.conf parsed (boot.shell={}, boot.display_server={}, autostart={})",
+                    cfg.boot.shell,
+                    cfg.boot.display_server,
+                    cfg.boot.autostart.len(),
+                );
+            }
+            Err(err) => {
+                println!(
+                    "init: /etc/init.conf parse failed: {} (using built-in defaults)",
+                    err,
+                );
+            }
+        },
+        Err(_) => {
+            // Common in v1 — `/etc` is on tmpfs and nothing
+            // populates it at boot. Silent fall-through to the
+            // demo flow below.
+        }
+    }
+
     // Track spawned pids so the reap loop can distinguish which
     // child just exited and drive the delayed SIGTERM to
     // display-server.
