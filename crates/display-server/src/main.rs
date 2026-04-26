@@ -335,18 +335,22 @@ fn main() {
         // at /dev/input_mouse and /dev/input_kbd (not under
         // a /dev/input/ subdirectory). See crates/kernel/
         // src/fs/devfs.rs.
-        // T133 finishing: opening /dev/input_mouse + /dev/input_kbd
-        // is gated on a present-time toggle below — when input is
-        // wired (production drag-state machine path), the binary
-        // opens both fds and drains them at the top of every accept
-        // iteration. The legacy demo-flow Playwright spec
-        // (`real-kernel.spec.ts`) doesn't exercise input, so the v1
-        // simplification leaves them un-opened by default. A future
-        // slice can switch to `open_dev` here once the device-side
-        // park/wake on read is wired so the open doesn't compete with
-        // hello-input-echo's kbd consumer.
-        let mouse_fd: i32 = -1;
-        let kbd_fd: i32 = -1;
+        // T133: open /dev/input_mouse + /dev/input_kbd so the
+        // server can drain pointer + keyboard events between
+        // accept iterations and inject them through
+        // Server::inject_*. When the open fails (older kernel
+        // build, devfs missing the node) the server falls back
+        // to "no input" mode silently.
+        // Note: the v1 devfs is FLAT — the input nodes live at
+        // /dev/input_mouse / /dev/input_kbd (not under a
+        // /dev/input/ subdirectory). See crates/kernel/src/fs/
+        // devfs.rs.
+        let mouse_fd = open_dev(b"/dev/input_mouse")
+            .map(|fd| fd as i32)
+            .unwrap_or(-1);
+        let kbd_fd = open_dev(b"/dev/input_kbd")
+            .map(|fd| fd as i32)
+            .unwrap_or(-1);
 
         // Compositor + protocol state. The library owns the
         // framebuffer + every client's surface tree.
