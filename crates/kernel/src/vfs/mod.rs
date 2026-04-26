@@ -469,10 +469,14 @@ impl Vfs {
 
     /// Return structured storage counters for an exact mountpoint.
     /// Filesystems without quota-backed storage return `Ok(None)`.
-    pub fn storage_usage(&mut self, mountpoint: &str) -> Result<Option<StorageUsage>, FsError> {
+    /// Read-only — the trait method `Filesystem::storage_usage`
+    /// takes `&self`, so the procfs projection can call this
+    /// through a `&Kernel` reborrow without disturbing the outer
+    /// `&mut Kernel` borrow held by the syscall dispatcher.
+    pub fn storage_usage(&self, mountpoint: &str) -> Result<Option<StorageUsage>, FsError> {
         let normalised = path::normalize(mountpoint);
         let mount_id = self.mounts.id_of(&normalised).ok_or(FsError::NotFound)?;
-        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        let fs = self.mounts.fs(mount_id).ok_or(FsError::NotFound)?;
         Ok(fs.storage_usage())
     }
 

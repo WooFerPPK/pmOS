@@ -86,7 +86,7 @@ use crate::fs::devfs::{DevFs, DEV_CONSOLE};
 use crate::fs::opfs::{block::WasmBlockDevice, mkfs::mkfs as opfs_mkfs, OpfsFs};
 use crate::fs::procfs::{
     format_argv_cmdline, proc_state_to_status, ProcFdSnapshot, ProcFs, ProcFsSource,
-    ProcStatusSnapshot,
+    ProcStatusSnapshot, StorageSnapshot,
 };
 use crate::fs::tmpfs::TmpFs;
 use crate::proc::ProcState;
@@ -307,6 +307,24 @@ impl ProcFsSource for LiveProcFsSource {
                 out.push(ProcFdSnapshot { fd, target });
             }
             out
+        })
+    }
+
+    fn storage_info(&self) -> Option<StorageSnapshot> {
+        // /proc/storage projects the OPFS quota counters that
+        // T084's block driver surfaces through `OpfsFs::
+        // storage_usage`. The kernel's boot path mounts the OPFS
+        // image at `/persist`; if that mount isn't present (no
+        // FileSystemSyncAccessHandle, jsdom, private mode) the
+        // procfs default formats `0 0 0\n` so userspace parsers
+        // don't fail.
+        Self::with_kernel(|k| {
+            let usage = k.vfs.storage_usage("/persist").ok()??;
+            Some(StorageSnapshot {
+                quota_bytes: usage.quota_bytes,
+                used_bytes: usage.used_bytes,
+                file_count: usage.file_count,
+            })
         })
     }
 }

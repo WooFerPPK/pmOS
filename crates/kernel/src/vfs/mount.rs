@@ -164,6 +164,20 @@ impl MountTable {
         None
     }
 
+    /// Borrow a filesystem by mount id, immutably. Mirrors
+    /// [`fs_mut`] but for read-only callers (notably the procfs
+    /// storage projection — which only calls
+    /// `Filesystem::storage_usage(&self)` and so doesn't need a
+    /// mutable borrow against the kernel singleton).
+    pub fn fs(&self, id: MountId) -> Option<&(dyn Filesystem + '_)> {
+        for m in self.mounts.iter() {
+            if m.id == id {
+                return Some(&*m.fs);
+            }
+        }
+        None
+    }
+
     /// Return the normalised mountpoint path for a mount id, or
     /// `None` if no such mount is installed.
     pub fn mountpoint_of(&self, id: MountId) -> Option<&str> {

@@ -634,6 +634,96 @@ describe("process lifecycle", () => {
     expect(open.response!.status).toBe(-ERRNO.ENOENT);
   });
 
+  it("/proc/storage reads the live OPFS quota counters when /persist is mounted (T084 + T169)", async () => {
+    const { BlockDriver } = await import("../../src/drivers/block");
+    const handle = makeMemSyncAccessHandle();
+    const blockDriver = BlockDriver.withHandle(handle, 4096);
+    const { host } = await freshHost({ blockDriver });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // /proc/storage should now reflect the freshly-mkfs'd OPFS:
+    // quota = total_blocks * BLOCK_SIZE = 4096 * 4096 = 16 MiB,
+    // used = 1 block (the superblock at LBA 0) * 4096 + the
+    // inode-table writes mkfs does, file_count = 1 (the root
+    // inode allocated by mkfs).
+    const pathBytes = new TextEncoder().encode("/proc/storage");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 5501,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 5502,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    // Line shape: "<quota> <used> <files>\n"
+    const m = text.match(/^(\d+) (\d+) (\d+)\n$/);
+    expect(m).not.toBeNull();
+    if (!m) return;
+    const quota = Number(m[1]);
+    const used = Number(m[2]);
+    const files = Number(m[3]);
+    // 4096 blocks * 4096 = 16 MiB.
+    expect(quota).toBe(4096 * 4096);
+    // Some bytes used (mkfs wrote at minimum the superblock +
+    // root inode), but not the whole disk.
+    expect(used).toBeGreaterThan(0);
+    expect(used).toBeLessThan(quota);
+    // mkfs allocated at least the root inode.
+    expect(files).toBeGreaterThanOrEqual(1);
+  });
+
+  it("/proc/storage falls back to '0 0 0' when no OPFS is mounted at /persist", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/proc/storage");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 5601,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 5602,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    expect(text).toBe("0 0 0\n");
+  });
+
   it("/proc/<pid>/maps surfaces the live wasm linear-memory layout via the live procfs source", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
