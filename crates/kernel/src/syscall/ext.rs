@@ -9,25 +9,27 @@
 //!
 //! ## Coverage
 //!
-//! As of the FS_WATCH delegation slice, the dispatcher routes
-//! the following extension opcodes (`contracts/syscalls.md §3`):
+//! As of the HOST_FILE_RECV slice, the dispatcher routes every
+//! extension opcode (`contracts/syscalls.md §3`):
 //! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
 //! `IPC_ACCEPT`, `IPC_SEND`, `IPC_RECV`, `IPC_PIPE`, `PROC_SELF`,
 //! `PROC_PARENT`, `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`,
 //! `PROC_CAPS_GET`, `DISPLAY_CONNECT`, `DISPLAY_BIND`,
 //! `CAP_CHECK`, `CAP_LIST`, `CAP_GRANT`, `MOUNT`, `UMOUNT`,
-//! `FS_WATCH`.
+//! `FS_WATCH`, `HOST_FILE_RECV`.
 //!
-//! The remaining extension opcodes fall through the `_ =>` arm
-//! and return `ENOSYS`:
-//!
-//! * `HOST_FILE_RECV` (0x1500) — needs the drag-drop token
-//!   table + driver plumbing described in
-//!   `contracts/syscalls.md §3.6`. `HOST_FILE_RECV` is now the
-//!   canonical ext-range ENOSYS probe target in
-//!   `known_ext_opcode_without_handler_returns_enosys`; it
-//!   inherits that role from `FS_WATCH`, which now ships a
-//!   handler.
+//! Every opcode in `abi::ext::FIRST..LAST_EXCL` now has a
+//! handler — the `_ =>` arm exists only to catch reserved-but-
+//! unallocated opcode numbers in the gaps between the subsystem
+//! groups (e.g. `0x1008` between `IPC_PIPE` and `PROC_SPAWN`,
+//! `0x1106..0x11ff` between the last `proc_*` opcode and
+//! `DISPLAY_CONNECT`, etc.). The
+//! `known_ext_opcode_without_handler_returns_enosys` test was
+//! rotated to a synthetic unallocated extension-range opcode
+//! (`0x1008`) so the `_ =>` arm stays covered against future
+//! regressions; once a future opcode lands at any unallocated
+//! number, that test should be re-rotated to a still-unused
+//! number in `FIRST..LAST_EXCL`.
 
 extern crate alloc;
 
@@ -80,6 +82,7 @@ pub fn dispatch_ext(
         op::MOUNT => ServiceOutcome::Done(handle_mount(kernel, pid, req, heap)),
         op::UMOUNT => ServiceOutcome::Done(handle_umount(kernel, pid, req, heap)),
         op::FS_WATCH => ServiceOutcome::Done(handle_fs_watch(kernel, pid, req, heap)),
+        op::HOST_FILE_RECV => ServiceOutcome::Done(handle_host_file_recv(kernel, pid, req)),
         _ => ServiceOutcome::Done(Response::err(req.request_id, ENOSYS)),
     }
 }
@@ -1243,6 +1246,74 @@ fn handle_fs_watch(
     }
 
     match kernel.fs_watch(pid, path, mask) {
+        Ok(fd) => Response::ok(req.request_id, fd as i64),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- host_file_recv ---------------------------------------------------
+//
+// Layout (per `contracts/syscalls.md §3.6`):
+//   args[0..4] = token (u32) — bootstrap-minted handle that
+//                identifies the host file the caller wants to
+//                receive. The bootstrap mints tokens when a user
+//                drops a file on the browser tab (DOM `drop`
+//                event) or picks one via the file-manager
+//                `Import…` menu (`<input type="file">` change),
+//                and posts a `host_file_dropped(token, name,
+//                size, mime)` notification on the kernel-side
+//                IPC endpoint `/run/host-files`. A subscribed
+//                userland process (typically the file manager)
+//                reads the notification and calls this opcode
+//                with the carried token.
+//   No heap input/output (the bytes are streamed via subsequent
+//   `fd_read` calls on the returned fd, not crammed into the
+//   syscall response).
+//
+// Response:
+//   value      = freshly-allocated host-file fd-number on success.
+//                Userland reads the file's bytes via `fd_read` on
+//                this fd and closes via `fd_close` (which drops
+//                the kernel-side bytes — the spec spells this
+//                "Closing the fd releases the browser-side `File`
+//                reference").
+//   status     = -EBADF if `token` is unknown OR has already been
+//                consumed by a prior recv (the spec collapses
+//                both into EBADF — "Exactly one `host_file_recv`
+//                call is permitted per token; a second call with
+//                the same token returns `EBADF`. ... any other
+//                caller [unknown token] receives `EBADF`").
+//                -ESRCH if the caller's pid has been removed from
+//                the process table mid-flight (defensive — in
+//                normal execution the dispatcher requires the pid
+//                to exist, so this arm is a guard for tests that
+//                deliberately remove the process).
+//                -EMFILE if the caller's fd table is full. The
+//                host-file payload is rolled back into the
+//                pending table so a fd-limit failure doesn't
+//                burn the token (userland can free up an fd slot
+//                and retry).
+//
+// **No capability check** — per spec §3.6: "no capability is
+// required beyond ordinary IPC-endpoint subscription. The
+// bootstrap is trusted to only produce tokens for files the
+// *user* chose via explicit DOM events. Only processes that
+// subscribe to `/run/host-files` and receive an unsolicited
+// `host_file_dropped` notification have a meaningful reason to
+// call this syscall; any other caller receives `EBADF` for an
+// unknown token." The EBADF-on-unknown-token arm is the
+// effective access control.
+//
+// The opcode is a thin adapter over `Kernel::host_file_recv`
+// which owns the token-lookup + fd-alloc + rollback semantics.
+// `kerr_to_errno` maps `KernelError::BadFd` → `-EBADF`,
+// `OutOfFds` → `-EMFILE`, `NoSuchPid` → `-ESRCH` — every error
+// arm of the semantic method has a canonical errno on the wire
+// surface.
+
+fn handle_host_file_recv(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
+    let token = args_u32(req, 0);
+    match kernel.host_file_recv(pid, token) {
         Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }

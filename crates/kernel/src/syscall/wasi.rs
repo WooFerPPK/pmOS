@@ -812,7 +812,7 @@ use abi::wasi::filetype as ft;
 
 fn filetype_for(object: FdObject) -> u8 {
     match object {
-        FdObject::Vnode { .. } => ft::REGULAR_FILE,
+        FdObject::Vnode { .. } | FdObject::HostFile { .. } => ft::REGULAR_FILE,
         FdObject::CharDevice(_) => ft::CHARACTER_DEVICE,
         FdObject::Socket(_) | FdObject::DisplayConn(_) => ft::SOCKET_STREAM,
         FdObject::PipeRead(_)
@@ -953,6 +953,22 @@ fn handle_fd_filestat_get(
         FdObject::SignalChannel => (ft::UNKNOWN, 0, 0, 0, 1, 0, 0, 0),
         FdObject::Watch { watch_id } => {
             (ft::UNKNOWN, 0, watch_id.0 as u64, 0, 1, 0, 0, 0)
+        }
+        FdObject::HostFile { token } => {
+            // Per `contracts/syscalls.md §3.6`: returns the host
+            // file's size in `st_size` and zero for all timestamps.
+            // Look the size up from the live HostFileFd state; if
+            // the kernel-side state has been dropped (impossible in
+            // a well-behaved fd lifecycle but defensive), fall back
+            // to size=0. The fd itself is the source of truth — the
+            // bootstrap-side bytes can't change once the kernel
+            // owns them.
+            let size = kernel
+                .host_file_fds
+                .get(&token)
+                .map(|s| s.file.size())
+                .unwrap_or(0);
+            (ft::REGULAR_FILE, 0, token as u64, size, 1, 0, 0, 0)
         }
     };
 
@@ -2402,6 +2418,27 @@ fn fd_readiness(
             } else {
                 let nbytes = (n_events * crate::vfs::WatchEvent::SIZE) as u64;
                 (true, nbytes, 0, None)
+            }
+        }
+        FdObject::HostFile { token } => {
+            // Host-file fds are read-only — write-side poll is
+            // meaningless → EINVAL, mirroring Watch's read-only
+            // stance. The read side is always "ready": the bytes
+            // are kernel-resident from the moment the recv
+            // succeeded, so a poll never has to wait. Past EOF
+            // signals via the HANGUP flag so the caller doesn't
+            // spin (mirror of the Vnode arm's EOF semantic).
+            if !is_read {
+                return (false, 0, 0, Some(EINVAL));
+            }
+            let Some(state) = kernel.host_file_fds.get(&token) else {
+                return (false, 0, 0, Some(EBADF));
+            };
+            let total = state.file.size();
+            if state.offset >= total {
+                (true, 0, FD_READWRITE_HANGUP, None)
+            } else {
+                (true, total - state.offset, 0, None)
             }
         }
         FdObject::PipeRead(_)

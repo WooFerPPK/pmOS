@@ -34,6 +34,7 @@ use abi::ext::Pid;
 use crate::cap::{CapError, CapTable};
 use crate::dev::{DevError, DeviceDispatcher};
 use crate::fd::{FdEntry, FdError, FdFlags, FdObject, FdTable};
+use crate::host_file::{HostFile, HostFileFd};
 use crate::ipc::{IpcError, IpcTable, PipeId, SocketId, SocketType};
 use crate::proc::{
     table::{InsertError, ZombieTarget},
@@ -256,6 +257,32 @@ pub struct Kernel {
     /// ipc_recv from an already-parked pid returns -EAGAIN. Mirror
     /// of the `parked_acceptor`/`parked_waiters` one-parker rules.
     pub(crate) parked_recvers: alloc::collections::BTreeMap<Pid, RecvParker>,
+    /// Pending host-imported-file payloads keyed by the bootstrap-
+    /// minted token (`contracts/syscalls.md §3.6`). Populated by the
+    /// future TS-side bootstrap drag-drop notification path via
+    /// [`Kernel::host_file_dropped`]; consumed by the userland-facing
+    /// [`Kernel::host_file_recv`] which moves the entry to
+    /// [`Kernel::host_file_fds`] keyed by the same token. Per spec:
+    /// "Exactly one `host_file_recv` call is permitted per token; a
+    /// second call with the same token returns `EBADF`." The
+    /// pending-table-to-fd-table migration enforces that — once a
+    /// token is consumed, the pending entry is gone.
+    ///
+    /// Kernel-wide rather than per-pid: the bootstrap doesn't know
+    /// which pid will eventually call `host_file_recv` (the file
+    /// manager subscribes to `/run/host-files` and any pid with a
+    /// subscription may pick up a token), and the §3.6 wire surface
+    /// passes the token by value rather than by destination-pid.
+    pub(crate) host_files: BTreeMap<u32, HostFile>,
+    /// Per-fd streaming state for HostFile fds, keyed by the
+    /// consumed token. Populated by [`Kernel::host_file_recv`];
+    /// torn down by the `release_object` arm on close. The same
+    /// token is the discriminator carried inside
+    /// [`FdObject::HostFile`], so a single map lookup translates
+    /// from the userland-facing fd-number through `FdTable::get`'s
+    /// `FdObject` to the streaming state — no per-fd allocation
+    /// beyond the table entry.
+    pub(crate) host_file_fds: BTreeMap<u32, HostFileFd>,
 }
 
 /// Optional heap payload attached to a pending wake. Slice 2c.1.
@@ -342,6 +369,8 @@ impl Kernel {
             pending_wakes: alloc::vec::Vec::new(),
             parked_waiters: alloc::collections::BTreeMap::new(),
             parked_recvers: alloc::collections::BTreeMap::new(),
+            host_files: BTreeMap::new(),
+            host_file_fds: BTreeMap::new(),
         }
     }
 
@@ -648,6 +677,17 @@ impl Kernel {
                 };
                 Ok(watch.drain_into(buf))
             }
+            FdObject::HostFile { token } => {
+                // Host-imported file fds stream from the kernel-side
+                // `host_file_fds` table keyed by token. Reads at or
+                // past EOF return 0 (POSIX-shaped end-of-file). The
+                // table entry is created by `Kernel::host_file_recv`
+                // and torn down by `release_object` on close.
+                let Some(state) = self.host_file_fds.get_mut(&token) else {
+                    return Err(KernelError::BadFd);
+                };
+                Ok(state.read(buf))
+            }
             FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => {
                 Err(KernelError::NotSupportedOnFd)
             }
@@ -739,7 +779,8 @@ impl Kernel {
             FdObject::PipeRead(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel
-            | FdObject::Watch { .. } => Err(KernelError::NotSupportedOnFd),
+            | FdObject::Watch { .. }
+            | FdObject::HostFile { .. } => Err(KernelError::NotSupportedOnFd),
         };
         if matches!(result, Err(KernelError::PipeBroken)) {
             self.post_sigpipe(pid);
@@ -1762,6 +1803,18 @@ impl Kernel {
                 // queue events into a queue that will never be drained.
                 let _ = self.vfs.unregister_watch(watch_id);
             }
+            FdObject::HostFile { token } => {
+                // Drop the kernel-side host-file bytes — closing the
+                // fd "releases the browser-side `File` reference"
+                // per `contracts/syscalls.md §3.6`. The kernel-side
+                // bytes stand in for that reference today; the TS-
+                // side bootstrap-cleanup hook (which would actually
+                // null out the JS-side `File` object) is a future
+                // slice. A close on a token that never had a recv
+                // (or a token whose state was already drained) is a
+                // silent no-op — `BTreeMap::remove` returns None.
+                let _ = self.host_file_fds.remove(&token);
+            }
             FdObject::Vnode { .. }
             | FdObject::CharDevice(_)
             | FdObject::DisplayConn(_)
@@ -2596,6 +2649,121 @@ impl Kernel {
         }
     }
 
+    /// Register a host-imported file under `token`. Called by the
+    /// (future) TS-side bootstrap path when a user drops a file on
+    /// the browser tab or picks one via the file-manager `Import…`
+    /// menu. Inserts the payload into [`Self::host_files`] keyed by
+    /// `token` so a subsequent [`Self::host_file_recv`] can consume
+    /// it.
+    ///
+    /// Token-collision policy: a second `host_file_dropped` with the
+    /// same `token` overwrites the prior entry. The bootstrap is the
+    /// only producer of tokens, and the spec leaves collision policy
+    /// to the producer. In practice the bootstrap mints monotonically
+    /// increasing tokens so collisions never happen — but the kernel
+    /// stays defensive (silently drop the prior bytes rather than
+    /// panic) so a buggy bootstrap can't crash the kernel.
+    ///
+    /// No capability gate: the bootstrap is the trust root for host-
+    /// file imports. If a malicious userland program ever gets the
+    /// ability to call this method directly (it doesn't today — only
+    /// the kernel-side bootstrap notification path will), the cap
+    /// check would belong on the entry to that path, not here.
+    pub fn host_file_dropped(&mut self, token: u32, file: HostFile) {
+        self.host_files.insert(token, file);
+    }
+
+    /// Snapshot of all currently-pending host-file tokens. Test-
+    /// helper accessor; production code routes through
+    /// [`Self::host_file_recv`] which consumes a single token.
+    pub fn host_file_pending_tokens(&self) -> alloc::vec::Vec<u32> {
+        self.host_files.keys().copied().collect()
+    }
+
+    /// True iff `token` has an active fd-state entry — i.e. some
+    /// process has called `host_file_recv(token)` and has not yet
+    /// closed the resulting fd. Test-helper accessor mirroring
+    /// [`Self::host_file_pending_tokens`]; production code never
+    /// needs this since the fd-close arm of `release_object` is
+    /// the only consumer of the entry.
+    pub fn host_file_has_active_fd(&self, token: u32) -> bool {
+        self.host_file_fds.contains_key(&token)
+    }
+
+    /// `host_file_recv(pid, token) -> fd`. Per
+    /// `contracts/syscalls.md §3.6`: consumes the pending host-file
+    /// payload registered under `token` (by a prior
+    /// [`Self::host_file_dropped`] call) and installs an
+    /// [`FdObject::HostFile`] in `pid`'s fd table. The new fd is
+    /// readable via `fd_read` (streams the bytes) and closes via
+    /// `fd_close` (drops the kernel-side bytes; the spec spells this
+    /// "Closing the fd releases the browser-side `File` reference").
+    ///
+    /// Errors:
+    /// * [`KernelError::NoSuchPid`] — unknown pid.
+    /// * [`KernelError::BadFd`] — `token` does not match any pending
+    ///   host-file entry. Surfaces as `-EBADF` at the wire layer.
+    ///   The spec uses EBADF for two distinct conditions: an unknown
+    ///   token (never produced by the bootstrap, or already consumed
+    ///   by an earlier recv) AND a second recv attempt against an
+    ///   already-consumed token. Both look identical from the kernel
+    ///   side: the table doesn't have the token, so EBADF wins.
+    /// * [`KernelError::OutOfFds`] — caller's fd table is full.
+    ///   Surfaces as `-EMFILE`. The host-file payload is rolled back
+    ///   into the pending table so a fd-limit failure doesn't burn
+    ///   the token (the userland caller can free up an fd slot and
+    ///   retry).
+    ///
+    /// Atomic-reject ordering: caller-pid-exists is checked BEFORE
+    /// the token lookup so a recv-from-unknown-pid leaves the
+    /// pending table untouched. Token lookup runs BEFORE the fd
+    /// alloc; if the alloc fails, the kernel re-inserts the
+    /// HostFile under the same token so userland's retry observes
+    /// the same EBADF-vs-EMFILE distinction the first call would
+    /// have produced if the fd table had been one slot deeper.
+    ///
+    /// The spec mentions an `ENOENT` arm for "a token that
+    /// references an expired `File`". v1 doesn't model File
+    /// lifecycle separately from token lifecycle (a token is "live"
+    /// while it's in `host_files` and "consumed" once recv has
+    /// removed it); a future tab-close cleanup hook would clear the
+    /// table en masse, mapping to EBADF for any straggler recv. The
+    /// ENOENT path becomes meaningful when the bootstrap can mark a
+    /// token "expired but still nominally present" (e.g. browser
+    /// freed the underlying File but the token table hasn't caught
+    /// up); that's a future slice.
+    pub fn host_file_recv(&mut self, pid: Pid, token: u32) -> Result<u32, KernelError> {
+        // Pid existence check first — a recv from an unknown pid is
+        // an ESRCH-shaped condition (KernelError::NoSuchPid), not a
+        // BadFd. Probing the pid via `fds()` short-circuits before
+        // the token lookup so an unknown-pid attack can't enumerate
+        // pending tokens by observing a different errno.
+        self.fds(pid)?;
+        let Some(file) = self.host_files.remove(&token) else {
+            return Err(KernelError::BadFd);
+        };
+        let table = self
+            .fds
+            .get_mut(&pid)
+            .ok_or(KernelError::NoSuchPid)?;
+        match table.alloc(FdEntry::new(FdObject::HostFile { token })) {
+            Ok(fd) => {
+                self.host_file_fds
+                    .insert(token, HostFileFd::new(file));
+                Ok(fd)
+            }
+            Err(e) => {
+                // Roll back: re-insert the host file so a retry
+                // observes the same token. Keeps the fd-limit
+                // failure non-destructive — a userland that can
+                // close an unrelated fd and retry succeeds, instead
+                // of losing the imported file outright.
+                self.host_files.insert(token, file);
+                Err(e.into())
+            }
+        }
+    }
+
     /// VFS-mutation wrapper: create a regular file at `abs_path`
     /// with `mode`, then notify any watchers on the parent
     /// directory's inode with `WATCH_CREATE` carrying the new
@@ -2740,7 +2908,8 @@ impl Kernel {
             | FdObject::Socket(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel
-            | FdObject::Watch { .. } => {}
+            | FdObject::Watch { .. }
+            | FdObject::HostFile { .. } => {}
         }
     }
 }

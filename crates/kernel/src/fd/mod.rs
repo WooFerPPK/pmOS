@@ -113,6 +113,14 @@ impl FdFlags {
 ///   extension opcode. `fd_read` drains queued [`WatchEvent`]s as
 ///   8-byte fixed-size records; `fd_close` unregisters the watch
 ///   from the VFS notifier.
+/// * `HostFile` — a host-imported-file fd returned by the
+///   `host_file_recv` extension opcode (`contracts/syscalls.md
+///   §3.6`). `fd_read` streams the host file's bytes from the
+///   kernel-side `host_file_fds` table; `fd_close` drops the
+///   stashed bytes (releasing the browser-side `File` reference).
+///   The carried `token` is the bootstrap-minted u32 the userland
+///   caller passed to `host_file_recv`; the kernel uses it as the
+///   key into `Kernel::host_file_fds`.
 ///
 /// The kernel's syscall dispatcher pattern-matches on this enum
 /// to route `fd_read`/`fd_write`/`ipc_send`/etc. to the right
@@ -127,6 +135,7 @@ pub enum FdObject {
     DisplayConn(u32),
     SignalChannel,
     Watch { watch_id: WatchId },
+    HostFile { token: u32 },
 }
 
 /// A single fd-table entry.

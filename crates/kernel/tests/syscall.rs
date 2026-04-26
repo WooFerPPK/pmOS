@@ -141,28 +141,41 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `HOST_FILE_RECV` is in the extension range (0x1500) but still has
-    // no handler — the host file-recv path needs the drag-drop token
-    // table + driver-side bootstrap notification plumbing described in
-    // `contracts/syscalls.md §3.6`, none of which exists yet. Same
-    // shape as the WASI case above: decoded as a known extension
-    // opcode, routed to `dispatch_ext`'s `_ =>` arm, ENOSYS echoed
-    // back with the request_id intact.
+    // Probe the dispatcher's `_ =>` ENOSYS arm with an unallocated
+    // extension-range opcode (`0x1008`, in the gap between
+    // `IPC_PIPE = 0x1007` and `PROC_SPAWN = 0x1100`). As of the
+    // HOST_FILE_RECV slice, every opcode in
+    // `abi::ext::FIRST..LAST_EXCL` (0x1000..=0x1500) has a handler —
+    // so the probe target had to rotate from a real-but-unimplemented
+    // opcode to a synthetic unallocated one, mirroring the rotation
+    // path the WASI probe took when `FD_FDSTAT_SET_RIGHTS` landed.
     //
-    // (This probe was `PROC_SPAWN` before that handler landed, then
-    // `PROC_WAIT`, then `PROC_KILL`, then `PROC_CAPS_GET`, then
-    // `CAP_GRANT`, then `IPC_SEND`, then `IPC_RECV`, then `MOUNT`,
-    // then `FS_WATCH`. Each rotation tightens the unimplemented-opcode
-    // surface; `HOST_FILE_RECV` is the last remaining T072
-    // fall-through opcode — once it lands, this test will need a
-    // synthetic unallocated extension-range opcode the way the WASI
-    // probe does.)
+    // Rotation history: `PROC_SPAWN` → `PROC_WAIT` → `PROC_KILL` →
+    // `PROC_CAPS_GET` → `CAP_GRANT` → `IPC_SEND` → `IPC_RECV` →
+    // `MOUNT` → `FS_WATCH` → `HOST_FILE_RECV` → unallocated 0x1008.
+    // Each rotation tightened the unimplemented-opcode surface until
+    // none remained; the synthetic-opcode probe defends the `_ =>`
+    // arm against a future regression where someone deletes the arm
+    // because "every opcode is handled now."
+    //
+    // 0x1008 is `is_ext()` (FIRST=0x1000, LAST_EXCL=0x1501) but is
+    // not declared in `abi::ext` — it sits in the IPC subsystem's
+    // gap between IPC_PIPE (0x1007) and the start of the `proc_*`
+    // group at 0x1100. If a future slice ever allocates 0x1008,
+    // this test should re-rotate to a still-unallocated extension
+    // number (0x1009..0x10ff or 0x1106..0x11ff, etc.).
+    const UNALLOCATED_EXT_OPCODE: u16 = 0x1008;
+    assert!(
+        op_ext::is_ext(UNALLOCATED_EXT_OPCODE),
+        "probe target must live in the extension range",
+    );
+
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::HOST_FILE_RECV,
+        opcode: UNALLOCATED_EXT_OPCODE,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -13922,4 +13935,317 @@ fn fs_watch_emfile_when_fd_table_full_rolls_back_registration() {
         watch_count_before,
         "EMFILE rolls the watch registry back to its prior len"
     );
+}
+
+// ---------- host_file_recv ----------------------------------------------
+//
+// Wire layout per `contracts/syscalls.md §3.6`:
+//   HOST_FILE_RECV (0x1500):
+//     args[0..4] = token (u32) — bootstrap-minted handle.
+//     No heap input/output.
+//   Response: value = freshly-allocated host-file fd-number on success.
+//
+// The semantic surface lives on `Kernel::host_file_recv`, which
+// consumes a `Kernel::host_file_dropped`-installed pending entry
+// keyed by the same token. The test surface drives both halves
+// (the bootstrap-side `host_file_dropped` and the userland-side
+// `host_file_recv`) directly on `Kernel`, since the actual TS-side
+// bootstrap drag-drop wiring is an out-of-scope future slice.
+
+/// Pack the host_file_recv opcode's single-u32 inline args window.
+fn host_file_recv_args(token: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&token.to_le_bytes());
+    args
+}
+
+/// Drive a HOST_FILE_RECV request and return the response.
+fn dispatch_host_file_recv(
+    k: &mut Kernel,
+    pid: abi::ext::Pid,
+    heap: &mut [u8],
+    token: u32,
+    request_id: u32,
+) -> abi::ring::Response {
+    let req = Request {
+        opcode: op_ext::HOST_FILE_RECV,
+        flags: 0,
+        request_id,
+        args: host_file_recv_args(token),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    dispatch(k, pid, &req, heap)
+}
+
+/// Drop a host file into the kernel's pending table. Wraps
+/// `Kernel::host_file_dropped` to keep the test bodies short.
+fn drop_host_file(k: &mut Kernel, token: u32, name: &str, bytes: &[u8]) {
+    k.host_file_dropped(
+        token,
+        kernel::host_file::HostFile::new(name, "application/octet-stream", bytes.to_vec()),
+    );
+}
+
+#[test]
+fn host_file_recv_returns_fd_for_pending_token() {
+    // Happy path: drop a file under token 100, recv it from a
+    // running process, assert the response carries a valid fd, the
+    // caller's fd table holds an `FdObject::HostFile { token: 100 }`
+    // at that slot, and the pending-tokens table no longer lists
+    // token 100 (the recv consumed it).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filemgr", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 100, "drop.txt", b"hello");
+    assert_eq!(k.host_file_pending_tokens(), vec![100]);
+
+    let resp = dispatch_host_file_recv(&mut k, pid, &mut heap, 100, 800);
+    assert_eq!(resp.status, 0);
+    assert!(resp.value >= 0, "host-file fd-number is non-negative");
+
+    let new_fd = resp.value as u32;
+    let table = k.fds(pid).expect("caller has fd table");
+    let entry = table.get(new_fd).expect("new fd installed");
+    match entry.object {
+        FdObject::HostFile { token } => assert_eq!(token, 100),
+        other => panic!("expected FdObject::HostFile, got {:?}", other),
+    }
+    assert!(
+        k.host_file_pending_tokens().is_empty(),
+        "recv consumed the pending token",
+    );
+}
+
+#[test]
+fn host_file_recv_streams_bytes_via_fd_read() {
+    // Confirm the returned fd is read-compatible: drop "hello world"
+    // under token 200, recv to get a fd, then drive `Kernel::fd_read`
+    // and assert the bytes round-trip and a follow-up read at EOF
+    // returns 0 (POSIX-shaped end-of-file). This exercises the
+    // `FdObject::HostFile` arm of `Kernel::fd_read` end-to-end.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 200, "msg.txt", b"hello world");
+    let resp = dispatch_host_file_recv(&mut k, pid, &mut heap, 200, 801);
+    assert_eq!(resp.status, 0);
+    let fd = resp.value as u32;
+
+    let mut buf = [0u8; 16];
+    let n = k.fd_read(pid, fd, &mut buf).expect("fd_read");
+    assert_eq!(n, 11, "read returns the full payload length");
+    assert_eq!(&buf[..n], b"hello world");
+
+    // Past EOF: returns 0 without touching the buffer beyond the
+    // earlier write.
+    let n2 = k.fd_read(pid, fd, &mut buf).expect("second fd_read");
+    assert_eq!(n2, 0);
+}
+
+#[test]
+fn host_file_recv_unknown_token_returns_ebadf() {
+    // No `host_file_dropped` was ever called — token 300 is not in
+    // the pending table → -EBADF. Per spec: "any other caller
+    // [unknown token] receives `EBADF` for an unknown token."
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filemgr", 0);
+    let mut heap = vec![0u8; 64];
+
+    let resp = dispatch_host_file_recv(&mut k, pid, &mut heap, 300, 802);
+    assert_eq!(resp.status, -errno::EBADF);
+    assert_eq!(resp.request_id, 802);
+}
+
+#[test]
+fn host_file_recv_second_call_for_same_token_returns_ebadf() {
+    // Per spec: "Exactly one `host_file_recv` call is permitted per
+    // token; a second call with the same token returns `EBADF`."
+    // Drop one file, recv it (success), recv again with the same
+    // token (-EBADF since the pending entry was consumed).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filemgr", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 400, "once.txt", b"only-once");
+
+    let r1 = dispatch_host_file_recv(&mut k, pid, &mut heap, 400, 803);
+    assert_eq!(r1.status, 0);
+    assert!(r1.value >= 0);
+
+    let r2 = dispatch_host_file_recv(&mut k, pid, &mut heap, 400, 804);
+    assert_eq!(r2.status, -errno::EBADF);
+    assert_eq!(r2.request_id, 804);
+}
+
+#[test]
+fn host_file_recv_multiple_tokens_route_independently() {
+    // Drop two files under tokens 500 and 501. Recv 501 first, then
+    // 500. Assert each fd reads back the correct payload — the
+    // token table is keyed by token (not insertion order), so a
+    // recv against the second-dropped token yields the second
+    // payload regardless of recv order.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filemgr", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 500, "first.txt", b"first-payload");
+    drop_host_file(&mut k, 501, "second.txt", b"second");
+
+    // Recv 501 first.
+    let r501 = dispatch_host_file_recv(&mut k, pid, &mut heap, 501, 805);
+    let fd_501 = r501.value as u32;
+    let mut buf = [0u8; 32];
+    let n = k.fd_read(pid, fd_501, &mut buf).expect("read 501");
+    assert_eq!(&buf[..n], b"second");
+
+    // Then recv 500.
+    let r500 = dispatch_host_file_recv(&mut k, pid, &mut heap, 500, 806);
+    let fd_500 = r500.value as u32;
+    let n = k.fd_read(pid, fd_500, &mut buf).expect("read 500");
+    assert_eq!(&buf[..n], b"first-payload");
+}
+
+#[test]
+fn host_file_recv_close_releases_kernel_side_bytes() {
+    // Per spec: "Closing the fd releases the browser-side `File`
+    // reference." The kernel-side analog: the `host_file_fds` entry
+    // for the consumed token is dropped on `fd_close` via the
+    // `release_object` arm. After close, the token is no longer in
+    // either the pending table OR the fd-state table — a fresh
+    // `host_file_dropped` could reuse the token without colliding
+    // with a stale entry.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filemgr", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 600, "closeme.txt", b"abc");
+    let resp = dispatch_host_file_recv(&mut k, pid, &mut heap, 600, 807);
+    let fd = resp.value as u32;
+    // Pre-close: the fd-state table holds an entry for token 600.
+    assert!(k.host_file_has_active_fd(600));
+
+    k.fd_close(pid, fd).expect("fd_close on host-file fd");
+    // Post-close: the fd-state entry is gone; pending table never
+    // had the token (it was consumed by recv).
+    assert!(!k.host_file_has_active_fd(600));
+    assert!(!k.host_file_pending_tokens().contains(&600));
+    // The fd itself is no longer open in the caller's table.
+    assert!(k.fds(pid).unwrap().get(fd).is_none());
+}
+
+#[test]
+fn host_file_recv_proc_exit_releases_kernel_side_bytes() {
+    // Process exit drains every fd in the table via
+    // `release_fd_table_resources`, which routes each `FdObject`
+    // through `release_object`. The HostFile arm should be hit on
+    // exit just like the Watch arm — confirms an exit-during-an-
+    // open-host-file-fd doesn't leak the kernel-side bytes.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "shortlived", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 700, "lifecycle.txt", b"transient");
+    let resp = dispatch_host_file_recv(&mut k, pid, &mut heap, 700, 808);
+    let _fd = resp.value as u32;
+    assert!(k.host_file_has_active_fd(700));
+
+    k.proc_exit(pid, ExitStatus::Exited(0)).expect("proc_exit");
+    assert!(
+        !k.host_file_has_active_fd(700),
+        "proc_exit drains the host-file fd-state",
+    );
+}
+
+#[test]
+fn host_file_recv_emfile_rolls_back_to_pending() {
+    // If the caller's fd table is full when `host_file_recv` runs,
+    // the kernel returns -EMFILE AND re-inserts the pending host
+    // file under the same token so a retry observes the same
+    // EBADF-vs-EMFILE distinction the first call would have
+    // produced if the fd table had been one slot deeper. The
+    // alternative (consume on the EMFILE path) would burn the
+    // token irrecoverably — userland could never recover the
+    // dropped file.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filemgr", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 800, "emfile.txt", b"x");
+
+    // Tighten the caller's fd table to a deterministic small limit
+    // and fill it. Mirrors the fs_watch_emfile pattern.
+    let mut tight = kernel::fd::FdTable::with_limit(8);
+    for fd in 0..8u32 {
+        tight
+            .install_at(fd, kernel::fd::FdEntry::new(FdObject::CharDevice(DEV_CONSOLE)))
+            .expect("install at");
+    }
+    *k.fds_mut(pid).unwrap() = tight;
+
+    let resp = dispatch_host_file_recv(&mut k, pid, &mut heap, 800, 809);
+    assert_eq!(resp.status, -errno::EMFILE);
+    assert_eq!(
+        k.host_file_pending_tokens(),
+        vec![800],
+        "EMFILE rolls the host-file back into the pending table",
+    );
+    assert!(
+        !k.host_file_has_active_fd(800),
+        "no fd-state entry was installed on the EMFILE path",
+    );
+}
+
+#[test]
+fn host_file_recv_dispatches_via_ext_opcode_round_trip() {
+    // Wire-path test through the dispatcher's full ext arm: encode
+    // the request with `op_ext::HOST_FILE_RECV` (0x1500), drive
+    // `dispatch`, assert the response matches what a direct
+    // `Kernel::host_file_recv` call would have produced. Confirms
+    // the opcode constant routes to `handle_host_file_recv` and
+    // not to the `_ =>` ENOSYS arm.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "wire", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 900, "wire.bin", b"wire-payload");
+
+    let req = Request {
+        opcode: op_ext::HOST_FILE_RECV,
+        flags: 0,
+        request_id: 810,
+        args: host_file_recv_args(900),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert!(resp.value >= 0);
+    assert_eq!(resp.request_id, 810);
+}
+
+#[test]
+fn host_file_dropped_collision_overwrites_prior() {
+    // Defensive token-collision policy: a second `host_file_dropped`
+    // with the same token overwrites the prior pending entry. The
+    // bootstrap is the only producer of tokens and mints them
+    // monotonically in practice, so collisions never happen in
+    // production — but the kernel stays defensive (silently drop
+    // the prior bytes rather than panic) so a buggy bootstrap
+    // can't crash the kernel. The recv after a collision yields
+    // the LATER bytes.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "filemgr", 0);
+    let mut heap = vec![0u8; 64];
+
+    drop_host_file(&mut k, 1000, "first.txt", b"FIRST");
+    drop_host_file(&mut k, 1000, "second.txt", b"SECOND");
+
+    let resp = dispatch_host_file_recv(&mut k, pid, &mut heap, 1000, 811);
+    let fd = resp.value as u32;
+    let mut buf = [0u8; 16];
+    let n = k.fd_read(pid, fd, &mut buf).expect("fd_read");
+    assert_eq!(&buf[..n], b"SECOND");
 }

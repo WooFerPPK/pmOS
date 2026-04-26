@@ -38,6 +38,7 @@ pub mod ipc;
 pub mod syscall;
 pub mod cap;
 pub mod dev;
+pub mod host_file;
 pub mod sys;
 
 // wasm32-only entry points: the narrow extern "C" seam that lets
