@@ -61,10 +61,25 @@
 //! commute in practice — verified by test); `-iu` dedupes after the
 //! filter; `-in` is a no-op since `parse_leading_int` only consumes
 //! ASCII digits which are all printable; `-ic` checks ordering with
-//! filtered keys. `-ru` / `-ur` /
+//! filtered keys. `-d` filters the comparison key down to POSIX
+//! `[[:blank:]]` (space + horizontal tab) plus POSIX `[[:alnum:]]`
+//! (ASCII letters A-Z / a-z plus digits 0-9) — STRICTER than `-i`
+//! since `-d` also drops punctuation that `-i` keeps; the filter is
+//! COMPARISON-ONLY (original line bytes preserved on output, mirroring
+//! `-b` / `-f` / `-i`), via `filter_dictionary`. `-d` composes with
+//! the existing comparators: `-df` filters THEN folds; `-db` pairs
+//! with the leading-blank trim (since blanks are kept by the
+//! dictionary set the trim is mostly subsumed but composes cleanly);
+//! `-du` dedupes after filter; `-dn` is dominated by numeric since
+//! digits are kept by `-d`; `-dc` checks with dictionary keys. When
+//! BOTH `-d` and `-i` are set, `-d` dominates: `-d`'s output is a
+//! strict subset of `-i`'s, so applying `-i` after `-d` would be a
+//! no-op — the dispatch checks `dictionary_order` first to pin this
+//! invariant. `-ru` / `-ur` /
 //! `-nr` / `-nu` / `-nru` / `-fr` / `-fu` / `-fnu` / `-cn` / `-cf` /
 //! `-cr` / `-cu` / `-b` / `-bf` / `-bu` / `-bfu` / `-cb` / `-i` /
-//! `-if` / `-iu` / `-ib` / `-ic` etc. apply the chosen combination.
+//! `-if` / `-iu` / `-ib` / `-ic` / `-d` / `-df` / `-du` / `-db` /
+//! `-dc` / `-di` etc. apply the chosen combination.
 //! Unknown flags write `sort: unknown flag: <flag>` to stderr and
 //! exit 2 (matching grep's open-error/usage exit code).
 //!
@@ -84,6 +99,7 @@ fn main() -> ExitCode {
     let mut check_only = false;
     let mut ignore_blanks = false;
     let mut ignore_nonprinting = false;
+    let mut dictionary_order = false;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     for arg in args {
@@ -101,6 +117,7 @@ fn main() -> ExitCode {
                     'c' => check_only = true,
                     'b' => ignore_blanks = true,
                     'i' => ignore_nonprinting = true,
+                    'd' => dictionary_order = true,
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -143,6 +160,7 @@ fn main() -> ExitCode {
             fold,
             ignore_blanks,
             ignore_nonprinting,
+            dictionary_order,
             reverse,
             unique,
         );
@@ -150,6 +168,8 @@ fn main() -> ExitCode {
 
     if numeric {
         lines.sort_by_key(|line| parse_leading_int(line));
+    } else if dictionary_order {
+        lines.sort_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
     } else if ignore_nonprinting {
         lines.sort_by_key(|line| filter_printable_then_maybe_fold(line, ignore_blanks, fold));
     } else if fold {
@@ -165,6 +185,8 @@ fn main() -> ExitCode {
     if unique {
         if numeric {
             lines.dedup();
+        } else if dictionary_order {
+            lines.dedup_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
         } else if ignore_nonprinting {
             lines.dedup_by_key(|line| filter_printable_then_maybe_fold(line, ignore_blanks, fold));
         } else if fold {
@@ -200,9 +222,12 @@ fn key_for(
     fold: bool,
     ignore_blanks: bool,
     ignore_nonprinting: bool,
+    dictionary_order: bool,
 ) -> Key {
     if numeric {
         Key::Numeric(parse_leading_int(line))
+    } else if dictionary_order {
+        Key::Bytes(filter_dictionary_then_maybe_fold(line, ignore_blanks, fold))
     } else if ignore_nonprinting {
         Key::Bytes(filter_printable_then_maybe_fold(line, ignore_blanks, fold))
     } else {
@@ -221,13 +246,28 @@ fn check_sorted(
     fold: bool,
     ignore_blanks: bool,
     ignore_nonprinting: bool,
+    dictionary_order: bool,
     reverse: bool,
     unique: bool,
 ) -> ExitCode {
     use std::cmp::Ordering;
     for i in 1..lines.len() {
-        let prev = key_for(&lines[i - 1], numeric, fold, ignore_blanks, ignore_nonprinting);
-        let curr = key_for(&lines[i], numeric, fold, ignore_blanks, ignore_nonprinting);
+        let prev = key_for(
+            &lines[i - 1],
+            numeric,
+            fold,
+            ignore_blanks,
+            ignore_nonprinting,
+            dictionary_order,
+        );
+        let curr = key_for(
+            &lines[i],
+            numeric,
+            fold,
+            ignore_blanks,
+            ignore_nonprinting,
+            dictionary_order,
+        );
         let ord = prev.cmp(&curr);
         let violation = match (reverse, unique) {
             (false, false) => ord == Ordering::Greater,
@@ -279,6 +319,33 @@ fn filter_printable(s: &str) -> Vec<u8> {
 fn filter_printable_then_maybe_fold(line: &str, ignore_blanks: bool, fold: bool) -> Vec<u8> {
     let trimmed = maybe_trim(line, ignore_blanks);
     let filtered = filter_printable(trimmed);
+    if fold {
+        filtered
+            .iter()
+            .map(|b| if b.is_ascii_lowercase() { b - 32 } else { *b })
+            .collect()
+    } else {
+        filtered
+    }
+}
+
+fn filter_dictionary(s: &str) -> Vec<u8> {
+    s.bytes()
+        .filter(|b| {
+            matches!(
+                b,
+                b' ' | b'\t'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+        .collect()
+}
+
+fn filter_dictionary_then_maybe_fold(line: &str, ignore_blanks: bool, fold: bool) -> Vec<u8> {
+    let trimmed = maybe_trim(line, ignore_blanks);
+    let filtered = filter_dictionary(trimmed);
     if fold {
         filtered
             .iter()

@@ -847,3 +847,164 @@ fn dash_i_handles_high_bit_bytes_as_nonprinting() {
     assert_eq!(without_i.stdout, "banana\n\u{00e9}apple\n".as_bytes());
     cleanup(&dir);
 }
+
+#[test]
+fn dash_d_filters_punctuation_for_sort() {
+    let dir = scratch_dir("d_basic");
+    let path = write_file(&dir, "in.txt", b"co-op\ncoop\nca!t\n");
+
+    let out = Command::new(SORT)
+        .arg("-d")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"ca!t\nco-op\ncoop\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_d_preserves_punctuation_in_output() {
+    let dir = scratch_dir("d_preserve");
+    let path = write_file(&dir, "in.txt", b"co-op\nca-t\n");
+
+    let out = Command::new(SORT)
+        .arg("-d")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"ca-t\nco-op\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_d_collapses_punctuation_in_dedup() {
+    let dir = scratch_dir("du");
+    let path = write_file(&dir, "in.txt", b"co-op\ncoop\n");
+
+    let out = Command::new(SORT)
+        .arg("-du")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"co-op\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_di_d_dominates_i() {
+    let dir = scratch_dir("di_dominance");
+    let path = write_file(&dir, "in.txt", b"co-op\ncoop\nca!t\n");
+
+    let with_di = Command::new(SORT)
+        .arg("-di")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    let with_d = Command::new(SORT)
+        .arg("-d")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(with_di.status.success(), "exit status: {:?}", with_di.status);
+    assert!(with_d.status.success(), "exit status: {:?}", with_d.status);
+    assert_eq!(with_di.stdout, with_d.stdout);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_df_combines_filter_then_fold() {
+    let dir = scratch_dir("df");
+    let path = write_file(&dir, "in.txt", b"Co-Op\nco-op\nCOOP\n");
+
+    let out = Command::new(SORT)
+        .arg("-df")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"Co-Op\nco-op\nCOOP\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_db_combines_filter_and_trim() {
+    let dir = scratch_dir("db");
+    let path = write_file(&dir, "in.txt", b"   co-op\nca-t\n");
+
+    let out = Command::new(SORT)
+        .arg("-db")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"ca-t\n   co-op\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_dn_no_op_for_numeric() {
+    let dir = scratch_dir("dn");
+    let path = write_file(&dir, "in.txt", b"   42\nfoo-bar\n2\n");
+
+    let with_d = Command::new(SORT)
+        .arg("-dn")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    let without_d = Command::new(SORT)
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(with_d.status.success(), "exit status: {:?}", with_d.status);
+    assert!(
+        without_d.status.success(),
+        "exit status: {:?}",
+        without_d.status
+    );
+    assert_eq!(with_d.stdout, without_d.stdout);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_dc_checks_with_dictionary_keys() {
+    let out = run_check(&["-dc"], b"apple-1\napple!2\n");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+
+    let plain_check = run_check(&["-c"], b"apple-1\napple!2\n");
+    assert_eq!(
+        plain_check.status.code(),
+        Some(1),
+        "plain check should fail: apple-1 (-=45) > apple!2 (!=33) under raw lex"
+    );
+    let plain_stderr = String::from_utf8_lossy(&plain_check.stderr);
+    assert!(
+        plain_stderr.contains("disorder"),
+        "stderr = {plain_stderr:?}"
+    );
+}
+
+#[test]
+fn dash_d_alone_with_no_input_is_empty_output() {
+    let out = run_check(&["-d"], b"");
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+}
