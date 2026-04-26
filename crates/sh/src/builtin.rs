@@ -10,9 +10,10 @@
 //!
 //! The set is the minimal v1 dispatch: `:`, `true`, `false`,
 //! `echo`, `exit`, `cd`, `pwd`, `env`, `export`, `unset`,
-//! `set`. Anything else returns [`BuiltinOutcome::NotBuiltin`]
-//! so the REPL can fall through to the "command not found"
-//! path until a future slice wires `proc_spawn` into userland.
+//! `set`, `test` / `[`. Anything else returns
+//! [`BuiltinOutcome::NotBuiltin`] so the REPL can fall through
+//! to the "command not found" path until a future slice wires
+//! `proc_spawn` into userland.
 
 use core::str::FromStr;
 use std::collections::BTreeMap;
@@ -118,6 +119,8 @@ pub(crate) fn dispatch_builtin<W: Write, E: Write>(
         "export" => builtin_export(&tokens[1..], env, stdout, stderr),
         "unset" => builtin_unset(&tokens[1..], env, stderr),
         "set" => builtin_set(&tokens[1..], flags, stderr),
+        "test" => evaluate_test(&tokens[1..], false, stderr),
+        "[" => evaluate_test(&tokens[1..], true, stderr),
         _ => BuiltinOutcome::NotBuiltin,
     }
 }
@@ -394,6 +397,199 @@ fn builtin_set<E: Write>(
         i += 1;
     }
     BuiltinOutcome::Continue
+}
+
+/// POSIX `test` / `[` conditional expression evaluator.
+///
+/// Shared between the `test` and `[` dispatch arms. The
+/// `for_bracket` flag flips the trailing-`]` requirement:
+///
+/// * `for_bracket = true` (the `[` invocation): the LAST arg
+///   MUST be `]`. If absent, the call returns
+///   `BuiltinOutcome::Status(2)` with `[: missing ]` on
+///   stderr. The trailing `]` is stripped before the
+///   arg-arity matrix runs.
+/// * `for_bracket = false` (the `test` invocation): the LAST
+///   arg MUST NOT be `]`. The `]` token is treated as a
+///   regular operand — and since `]` is not a valid operator
+///   anywhere in POSIX `test` syntax, the resulting
+///   expression usually fails the unary / binary operator
+///   lookup and produces a usage error.
+///
+/// After the `]` handling, the arity matrix is:
+///
+/// * 0 args → `Status(1)` (POSIX-defined: empty `test`
+///   evaluates to false).
+/// * 1 arg → `Status(0)` if non-empty, else `Status(1)`
+///   (single-arg shorthand for `[ -n STR ]`).
+/// * 2 args → either `! EXPR` (negate the 1-arg form) or a
+///   unary operator (`-z` / `-n`) plus operand.
+/// * 3 args → either `! EXPR` (negate the 2-arg form) or a
+///   binary form `STR1 OP STR2` (string `=` / `!=` or integer
+///   `-eq` / `-ne` / `-lt` / `-le` / `-gt` / `-ge`).
+/// * 4 args → must start with `!` (negate the 3-arg form);
+///   any other 4-arg shape is `Status(2)` "too many
+///   arguments".
+/// * 5+ args → `Status(2)` "too many arguments".
+///
+/// Negation rules: `! EXPR` inverts a Status(0) → Status(1)
+/// and a Status(1) → Status(0). A Status(2) usage error from
+/// the inner expression is NOT inverted; it propagates as
+/// Status(2) (POSIX-aligned: a syntax error in the inner
+/// expression is still a syntax error of the whole).
+///
+/// Integer ops require BOTH operands to parse as `i64` via
+/// `str::parse::<i64>`; non-integer operands produce a
+/// `<command>: <op>: integer expression expected: <arg>`
+/// diagnostic on stderr and return `Status(2)`.
+///
+/// Deferred (out of v1 scope): file-test operators (`-e`,
+/// `-f`, `-d`, `-r`, `-w`, `-x`, `-s`, `-L`, `-h`, etc. —
+/// need a VFS bridge through `Vfs::stat`); terminal-test
+/// operator (`-t fd` — needs terminal detection); compound
+/// expressions with `-a` / `-o` / `(` / `)` (POSIX-deprecated,
+/// scripts should use `&&` / `||` at the shell level which
+/// v1 also lacks); bash-extended operators (`==`, `=~`, `<`
+/// / `>` for string ordering, the `[[` double-bracket form).
+/// Each unrecognised operator surfaces as `unknown unary
+/// operator: <X>` or `unknown binary operator: <X>` (NOT a
+/// silent failure) so users get a clear "this slice didn't
+/// implement that yet" signal rather than mysterious wrong
+/// answers.
+fn evaluate_test<E: Write>(
+    raw_args: &[&str],
+    for_bracket: bool,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    let command = if for_bracket { "[" } else { "test" };
+
+    // Strip the trailing `]` for the `[` form; reject when
+    // missing. The `test` form rejects nothing here — a
+    // trailing `]` in `test` is just a regular operand.
+    let args: &[&str] = if for_bracket {
+        match raw_args.last() {
+            Some(&"]") => &raw_args[..raw_args.len() - 1],
+            _ => {
+                let _ = writeln!(stderr, "{command}: missing ]");
+                let _ = stderr.flush();
+                return BuiltinOutcome::Status(2);
+            }
+        }
+    } else {
+        raw_args
+    };
+
+    // Negation: `! EXPR` strips the leading `!` and inverts
+    // the result of the inner expression. Usage errors
+    // (Status(2)) propagate without inversion.
+    if let Some((&"!", rest)) = args.split_first() {
+        return match evaluate_test_expr(rest, command, stderr) {
+            BuiltinOutcome::Status(0) => BuiltinOutcome::Status(1),
+            BuiltinOutcome::Status(1) => BuiltinOutcome::Status(0),
+            other => other,
+        };
+    }
+
+    evaluate_test_expr(args, command, stderr)
+}
+
+/// Inner evaluator without the `]`-stripping or top-level
+/// negation handling — those live in [`evaluate_test`] so
+/// negation can wrap any of the 0/1/2/3-arg forms uniformly.
+fn evaluate_test_expr<E: Write>(
+    args: &[&str],
+    command: &str,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    match args.len() {
+        0 => BuiltinOutcome::Status(1),
+        1 => {
+            if args[0].is_empty() {
+                BuiltinOutcome::Status(1)
+            } else {
+                BuiltinOutcome::Status(0)
+            }
+        }
+        2 => {
+            // Unary operator + operand. `-z STR` (true if
+            // empty), `-n STR` (true if non-empty). Anything
+            // else is "unknown unary operator".
+            let (op, operand) = (args[0], args[1]);
+            match op {
+                "-z" => bool_to_status(operand.is_empty()),
+                "-n" => bool_to_status(!operand.is_empty()),
+                other => {
+                    let _ = writeln!(stderr, "{command}: unknown unary operator: {other}");
+                    let _ = stderr.flush();
+                    BuiltinOutcome::Status(2)
+                }
+            }
+        }
+        3 => {
+            // Binary operator. String ops `=` / `!=` first
+            // because they take any operands; integer ops
+            // require both args parse as `i64`.
+            let (lhs, op, rhs) = (args[0], args[1], args[2]);
+            match op {
+                "=" => bool_to_status(lhs == rhs),
+                "!=" => bool_to_status(lhs != rhs),
+                "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+                    let lhs_n = match lhs.parse::<i64>() {
+                        Ok(n) => n,
+                        Err(_) => return integer_expected(command, op, lhs, stderr),
+                    };
+                    let rhs_n = match rhs.parse::<i64>() {
+                        Ok(n) => n,
+                        Err(_) => return integer_expected(command, op, rhs, stderr),
+                    };
+                    let result = match op {
+                        "-eq" => lhs_n == rhs_n,
+                        "-ne" => lhs_n != rhs_n,
+                        "-lt" => lhs_n < rhs_n,
+                        "-le" => lhs_n <= rhs_n,
+                        "-gt" => lhs_n > rhs_n,
+                        "-ge" => lhs_n >= rhs_n,
+                        _ => unreachable!("op verified above"),
+                    };
+                    bool_to_status(result)
+                }
+                other => {
+                    let _ = writeln!(stderr, "{command}: unknown binary operator: {other}");
+                    let _ = stderr.flush();
+                    BuiltinOutcome::Status(2)
+                }
+            }
+        }
+        _ => {
+            let _ = writeln!(stderr, "{command}: too many arguments");
+            let _ = stderr.flush();
+            BuiltinOutcome::Status(2)
+        }
+    }
+}
+
+/// Map a Rust `bool` to the POSIX `test` outcome:
+/// `true` → `Status(0)`, `false` → `Status(1)`.
+fn bool_to_status(value: bool) -> BuiltinOutcome {
+    if value {
+        BuiltinOutcome::Status(0)
+    } else {
+        BuiltinOutcome::Status(1)
+    }
+}
+
+/// Emit the POSIX-flavoured "integer expression expected"
+/// usage error and return `Status(2)`. Shared between the
+/// `lhs` / `rhs` parse-failure paths.
+fn integer_expected<E: Write>(
+    command: &str,
+    op: &str,
+    arg: &str,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    let _ = writeln!(stderr, "{command}: {op}: integer expression expected: {arg}");
+    let _ = stderr.flush();
+    BuiltinOutcome::Status(2)
 }
 
 /// Collapse `.` / `..` / repeated `/` segments in `path`,
