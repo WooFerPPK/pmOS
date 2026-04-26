@@ -278,34 +278,47 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         }
 
         // POSIX `set -x` / xtrace: write each command to
-        // stderr BEFORE executing it, prefixed by `+ ` (the
-        // default POSIX PS4 prompt; v1 doesn't customise
-        // PS4). The trace fires HERE — AFTER expansion
-        // succeeds (so var refs are resolved and the trace
-        // shows what actually runs, not the input bytes) and
-        // BEFORE dispatch (so the trace precedes the
-        // command's own output). Blank lines (the
-        // `parts.is_empty()` continue above), quote errors
-        // (the `Err(QuoteError::*)` continues above),
-        // expansion errors (the `Err(NotSet)` Exit-1
-        // short-circuit above), and noexec lines (the
-        // `flags.noexec` continue above) all skip this
-        // point — none of those cases produces an executed
-        // command, so per POSIX none should trace. The
-        // first `set -x` line also doesn't trace itself: at
-        // this point xtrace is still false from the initial
-        // state; the dispatch below flips it for subsequent
-        // commands. Conversely `set +x` traces itself
-        // because at its trace point xtrace is still true
-        // from the previous line; the clear happens during
-        // dispatch. Trace failures are intentionally
-        // swallowed (`let _`) — a trace write failure
-        // shouldn't terminate the REPL because the
+        // stderr BEFORE executing it, prefixed by the value
+        // of the `PS4` env var (defaulting to `"+ "` when
+        // unset — the POSIX-mandated default prompt). The
+        // trace fires HERE — AFTER expansion succeeds (so
+        // var refs are resolved and the trace shows what
+        // actually runs, not the input bytes) and BEFORE
+        // dispatch (so the trace precedes the command's own
+        // output). Blank lines (the `parts.is_empty()`
+        // continue above), quote errors (the
+        // `Err(QuoteError::*)` continues above), expansion
+        // errors (the `Err(NotSet)` Exit-1 short-circuit
+        // above), and noexec lines (the `flags.noexec`
+        // continue above) all skip this point — none of
+        // those cases produces an executed command, so per
+        // POSIX none should trace. The first `set -x` line
+        // also doesn't trace itself: at this point xtrace is
+        // still false from the initial state; the dispatch
+        // below flips it for subsequent commands. Conversely
+        // `set +x` traces itself because at its trace point
+        // xtrace is still true from the previous line; the
+        // clear happens during dispatch. Trace failures are
+        // intentionally swallowed (`let _`) — a trace write
+        // failure shouldn't terminate the REPL because the
         // diagnostic itself is best-effort; the IoError arm
         // below handles fatal stderr write failures from the
-        // dispatch path.
+        // dispatch path. PS4 is read from the env map AT
+        // TRACE TIME (NOT cached at trace-enable time) so
+        // `export PS4="++ "; set -x; ...` traces the next
+        // command with `++ ` immediately. PS4 is written
+        // VERBATIM with NO recursive expansion in v1: a
+        // future slice could expand `${VAR}` / `$VAR`
+        // references inside PS4 (POSIX bash does), but that
+        // requires a recursion guard to prevent
+        // `PS4="$PS4 "` from looping infinitely; we defer
+        // until that guard is built. An empty PS4
+        // (`export PS4=`) produces a bare command line with
+        // no prefix — the user has explicit control over
+        // every byte of the prefix including its absence.
         if flags.xtrace {
-            let _ = writeln!(stderr, "+ {}", expanded_refs.join(" "));
+            let prefix = env.get("PS4").map(|s| s.as_str()).unwrap_or("+ ");
+            let _ = writeln!(stderr, "{}{}", prefix, expanded_refs.join(" "));
             let _ = stderr.flush();
         }
 
