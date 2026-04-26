@@ -214,8 +214,24 @@ impl ProcFsSource for LiveProcFsSource {
     }
 
     fn loadavg(&self) -> String {
-        // Real loadavg needs scheduler-tick averaging; deferred.
-        String::from("0.00 0.00 0.00 0/0 0\n")
+        // Linux format: "<1m> <5m> <15m> <running>/<total> <last_pid>\n".
+        // The three load averages stay 0.00 until the scheduler
+        // tracks busy/idle ticks; running/total/last_pid project
+        // live state through the process table.
+        Self::with_kernel(|k| {
+            let live = k.procs.live_pids();
+            let total = live.len();
+            let mut running = 0usize;
+            for pid in &live {
+                if let Some(proc) = k.procs.get(*pid) {
+                    if proc.state == ProcState::Running {
+                        running += 1;
+                    }
+                }
+            }
+            let last_pid = k.procs.next_pid_peek().saturating_sub(1);
+            format!("0.00 0.00 0.00 {}/{} {}\n", running, total, last_pid)
+        })
     }
 
     fn pid_status(&self, pid: Pid) -> Option<ProcStatusSnapshot> {

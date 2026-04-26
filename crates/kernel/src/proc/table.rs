@@ -75,6 +75,15 @@ impl ProcessTable {
         self.alloc.allocate()
     }
 
+    /// The next pid `allocate_pid` will return — equals
+    /// `last_allocated_pid + 1`, or `1` if no pid has been
+    /// allocated yet. Used by `/proc/loadavg`'s `last_pid` field
+    /// projection (subtract 1 to get the most-recently-allocated
+    /// pid; `saturating_sub(1)` handles the pre-allocation case).
+    pub fn next_pid_peek(&self) -> Pid {
+        self.alloc.peek()
+    }
+
     /// Insert a newly-created process. The pid must match
     /// `proc.pid` and must not already be in use.
     pub fn insert(&mut self, proc: Process) -> Result<(), InsertError> {

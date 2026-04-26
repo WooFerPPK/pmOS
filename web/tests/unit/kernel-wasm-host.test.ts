@@ -297,6 +297,45 @@ describe("process lifecycle", () => {
     expect(text).toContain("Threads:\t1\n");
   });
 
+  it("/proc/loadavg surfaces live running/total/last_pid via the live procfs source", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/proc/loadavg");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4401,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 4402,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    // Format: "<1m> <5m> <15m> <running>/<total> <last_pid>\n".
+    // Loads stay 0.00 until the scheduler tracks busy/idle ticks;
+    // the running/total/last_pid trio projects live state. The
+    // single registered+running process means running=total=1
+    // and last_pid=<pid>.
+    expect(text).toBe(`0.00 0.00 0.00 1/1 ${pid}\n`);
+  });
+
   it("/proc/uptime surfaces a live monotonic seconds-since-boot via the live procfs source", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
