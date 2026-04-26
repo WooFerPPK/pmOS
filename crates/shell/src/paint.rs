@@ -1,11 +1,11 @@
-//! Desktop-shell paint-wallpaper slice.
+//! Desktop-shell paint loop — wallpaper + taskbar.
 //!
-//! Exposes [`run_shell`] — the paint-wallpaper event loop
-//! used by the `shell` binary and the `tests/paint_wallpaper.rs`
-//! integration test. Separates connection setup (done by
-//! `main`) from the long-running loop so tests can drive
-//! the loop with a mock connection without going through
-//! the real WASI IPC shim.
+//! Exposes [`run_shell`] — the shell's main event loop
+//! used by the `shell` binary and the
+//! `tests/paint_wallpaper.rs` integration test. Separates
+//! connection setup (done by `main`) from the long-running
+//! loop so tests can drive the loop with a mock connection
+//! without going through the real WASI IPC shim.
 //!
 //! Scope for this slice:
 //!
@@ -16,15 +16,20 @@
 //! * loop up to `max_dispatch_iterations` times
 //! * on the first configure event: allocate a
 //!   [`toolkit::BufferPool`], paint the wallpaper colour
-//!   into the back canvas, and commit exactly once
+//!   into the back canvas, paint the [`crate::Taskbar`]
+//!   strip on top, and commit exactly once
 //! * return [`ShellExit::CloseRequested`] on
 //!   `xdg_toplevel::close`, or [`ShellExit::IterationLimit`]
 //!   on cap exhaustion
 //!
-//! Explicitly deferred: taskbar, launcher, click handling,
+//! Explicitly deferred: launcher, click handling on the
+//! taskbar, `pmd_shell_manager` event-stream wiring (the
+//! taskbar paints with whatever entries the caller has
+//! pushed in via [`crate::Taskbar::add_window`]),
 //! frame-callback-driven redraw, real IPC wiring. See T121
 //! partial note in `tasks.md` for the running scope list.
 
+use crate::taskbar::Taskbar;
 use toolkit::draw::{Color, Rect};
 use toolkit::theme::Theme;
 use toolkit::{App, BufferPool, ClientError, Connection, Window};
@@ -73,6 +78,20 @@ pub fn run_shell<C: Connection>(
     connection: C,
     max_dispatch_iterations: u32,
 ) -> Result<ShellExit, ClientError> {
+    run_shell_with_taskbar(connection, max_dispatch_iterations, Taskbar::new(0, 0))
+}
+
+/// Variant of [`run_shell`] that accepts a pre-populated
+/// [`Taskbar`] so callers (production shell main, test
+/// fixtures) can stage entries before the paint loop fires.
+/// The taskbar's framebuffer dimensions are fixed up to the
+/// surface's configured size on the first paint iteration —
+/// callers don't have to know the size up front.
+pub fn run_shell_with_taskbar<C: Connection>(
+    connection: C,
+    max_dispatch_iterations: u32,
+    mut taskbar: Taskbar,
+) -> Result<ShellExit, ClientError> {
     let mut app = App::connect(connection)?;
     let mut window = Window::new(&mut app)?;
     window.set_title("PMos")?;
@@ -99,6 +118,7 @@ pub fn run_shell<C: Connection>(
             } else {
                 (cfg_w, cfg_h)
             };
+            taskbar.set_framebuffer_size(w, h);
 
             let mut pool = BufferPool::new(window.app_mut(), w, h)?;
             if let Some(mut canvas) = pool.acquire_back_canvas() {
@@ -111,6 +131,7 @@ pub fn run_shell<C: Connection>(
                     },
                     wallpaper,
                 );
+                taskbar.draw(&mut canvas);
                 // Drop the canvas borrow before committing.
                 drop(canvas);
                 pool.commit_and_swap(&mut window)?;

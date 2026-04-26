@@ -457,3 +457,29 @@ fn shell_connect_failure_surfaces_client_error() {
         "expected MissingGlobal(pmd_compositor), got {err:?}"
     );
 }
+
+#[test]
+fn shell_with_taskbar_runs_to_iteration_limit_without_panicking() {
+    // T121 follow-up: run_shell_with_taskbar wraps the
+    // wallpaper paint with a Taskbar paint pass. This test
+    // pins that the additional paint doesn't break the
+    // happy-path event loop: the shell still emits its
+    // expected surface.commit sequence and exits via the
+    // iteration cap (no close event).
+    use shell::{run_shell_with_taskbar, Taskbar};
+
+    let mut conn = MockConnection::new();
+    seed_full_registry(&mut conn);
+    conn.push_inbound_on_request(
+        SURFACE_ID,
+        SURFACE_OPCODE_COMMIT,
+        build_configure_event(TOPLEVEL_ID, 1, 800, 600),
+    );
+
+    // Pre-populate a taskbar with one entry — exercises the
+    // entry-paint path inside the loop.
+    let mut taskbar = Taskbar::new(0, 0);
+    taskbar.add_window(7, "Term", "pmos.term");
+    let exit = run_shell_with_taskbar(conn, 5, taskbar).expect("must succeed");
+    assert_eq!(exit, ShellExit::IterationLimit);
+}
