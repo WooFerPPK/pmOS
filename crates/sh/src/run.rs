@@ -206,21 +206,48 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
                     }
                 }
             }
-            if let Some(ExpandError::NotSet(name)) = bail {
-                // POSIX `set -u` diagnostic shape — bash and
-                // dash both write `<shellname>: <name>:
-                // parameter not set\n` and exit 1. Pin the
-                // exit-1 termination so userland can detect
-                // nounset failures distinctly from a generic
-                // command failure (which would surface the
-                // command's own exit status under errexit).
-                if writeln!(stderr, "sh: {name}: parameter not set").is_err() {
-                    return ExitStatus::IoError;
+            match bail {
+                Some(ExpandError::NotSet(name)) => {
+                    // POSIX `set -u` diagnostic shape — bash
+                    // and dash both write `<shellname>:
+                    // <name>: parameter not set\n` and exit 1.
+                    // Pin the exit-1 termination so userland
+                    // can detect nounset failures distinctly
+                    // from a generic command failure (which
+                    // would surface the command's own exit
+                    // status under errexit).
+                    if writeln!(stderr, "sh: {name}: parameter not set").is_err() {
+                        return ExitStatus::IoError;
+                    }
+                    if stderr.flush().is_err() {
+                        return ExitStatus::IoError;
+                    }
+                    return ExitStatus::Exit(1);
                 }
-                if stderr.flush().is_err() {
-                    return ExitStatus::IoError;
+                Some(ExpandError::Required { name, message }) => {
+                    // POSIX `${NAME:?error}` diagnostic shape
+                    // — bash and dash both write `<shellname>:
+                    // <name>: <message>\n` (or `<shellname>:
+                    // <name>: parameter null or not set\n`
+                    // when no message was provided) and exit
+                    // 1. The exit-1 termination matches the
+                    // `set -u` short-circuit shape because
+                    // both are expansion-layer failures that
+                    // happened before the failing-expansion
+                    // command had a chance to run; the
+                    // dispatch_builtin call is skipped.
+                    let phrase = message
+                        .as_deref()
+                        .unwrap_or("parameter null or not set");
+                    if writeln!(stderr, "sh: {name}: {phrase}").is_err() {
+                        return ExitStatus::IoError;
+                    }
+                    if stderr.flush().is_err() {
+                        return ExitStatus::IoError;
+                    }
+                    return ExitStatus::Exit(1);
                 }
-                return ExitStatus::Exit(1);
+                None => {}
             }
             acc
         };
@@ -328,15 +355,18 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 /// so the REPL can write a POSIX-style diagnostic and
 /// terminate (or, in future variants, recover).
 ///
-/// Currently only `NotSet` exists, surfaced when `set -u`
-/// (nounset) is on AND the bare-`$NAME` or braced-`${NAME}`
-/// form references an unset name (the `${NAME:-default}`
-/// form is exempt because the default-value path provides
-/// the fallback; `$?` / `${?}` is exempt because
-/// `last_status` is always defined). Future expansion
-/// errors (`${VAR:?error}` would surface a `Required`
-/// variant; recursive-expansion overflow would surface a
-/// `Depth` variant) slot in as sibling variants.
+/// `NotSet` is surfaced when `set -u` (nounset) is on AND
+/// the bare-`$NAME` or braced-`${NAME}` form references an
+/// unset name (the `${NAME:-default}` form is exempt
+/// because the default-value path provides the fallback;
+/// `$?` / `${?}` is exempt because `last_status` is always
+/// defined). `Required` is surfaced by the
+/// `${NAME:?error}` form when NAME is unset OR empty —
+/// this fires REGARDLESS of the nounset flag (the `:?`
+/// form has its own diagnostic mechanism that does not
+/// depend on `set -u`). Future expansion errors
+/// (recursive-expansion overflow would surface a `Depth`
+/// variant) slot in as sibling variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpandError {
     /// A bare or braced reference targeted an unset name
@@ -344,6 +374,25 @@ pub enum ExpandError {
     /// the dispatch loop can write `sh: <name>: parameter
     /// not set\n` to stderr.
     NotSet(String),
+    /// A `${NAME:?error}` (or `${NAME:?}`) reference
+    /// targeted an unset OR empty name. Carries the
+    /// offending name plus the optional custom message
+    /// so the dispatch loop can write `sh: <name>:
+    /// <message>\n` (or `sh: <name>: parameter null or not
+    /// set\n` when no message was provided) to stderr.
+    /// Fires regardless of `flags.nounset` — the `:?` form
+    /// is its own diagnostic mechanism.
+    Required {
+        /// The variable name (the bytes between `${` and
+        /// the `:?` modifier).
+        name: String,
+        /// The custom error message (the bytes between
+        /// `:?` and the closing `}`), or `None` when the
+        /// form was the bare `${NAME:?}` with an empty
+        /// message — in which case the dispatch loop
+        /// substitutes the POSIX default phrase.
+        message: Option<String>,
+    },
 }
 
 /// Expand `$NAME` and `${NAME}` references inside one
@@ -394,6 +443,26 @@ pub enum ExpandError {
 ///   exempt from `set -u` because the whole purpose of
 ///   the default-value form is to provide a fallback for
 ///   unset vars.
+/// * `${NAME:?error}` is the POSIX "error if unset"
+///   parameter expansion. If NAME is set AND non-empty,
+///   the expansion is the var's value (the error message
+///   is discarded). If NAME is unset OR set to the empty
+///   string, the function returns
+///   `Err(ExpandError::Required { name, message })` —
+///   carrying the offending name plus the message bytes
+///   (everything between `:?` and the first `}`). The
+///   message is wrapped in `Some(_)` when non-empty and
+///   `None` for the bare `${NAME:?}` form so the dispatch
+///   loop can substitute the POSIX default phrase
+///   `parameter null or not set`. Like `:-`, the message
+///   is a literal string — `$VAR` references inside are
+///   NOT recursively expanded in this slice. Unlike `:-`,
+///   the `:?` form fires REGARDLESS of `flags.nounset` —
+///   the form has its own diagnostic mechanism that does
+///   not depend on `set -u`. The colon prefix means
+///   empty-string-set is treated as unset (the no-colon
+///   `${NAME?error}` form would distinguish empty-vs-
+///   unset; not in v1).
 /// * Unset names expand to the empty string when
 ///   `flags.nounset` is false (the default). When
 ///   `flags.nounset` is true, an unset name in a bare or
@@ -420,12 +489,13 @@ pub enum ExpandError {
 /// * Other parameter-expansion modifiers are NOT
 ///   implemented in this slice and are deferred to future
 ///   T142 partials: `${VAR-default}` (no colon — only-if-
-///   unset, treats empty-string as set); `${VAR:=default}`
-///   (default-and-assign — would mutate env);
-///   `${VAR:?error}` (error-if-unset); `${VAR:+alt}`
-///   (alternate-if-set); `${VAR:offset:length}` (substring).
-///   Each of these would extend the `:-` parser path with a
-///   new modifier-byte branch.
+///   unset, treats empty-string as set); `${VAR?error}`
+///   (no-colon error-if-unset, treats empty-string as
+///   set); `${VAR:=default}` (default-and-assign — would
+///   mutate env); `${VAR:+alt}` (alternate-if-set);
+///   `${VAR:offset:length}` (substring). Each of these
+///   would extend the `:-` / `:?` parser path with a new
+///   modifier-byte branch.
 pub(crate) fn expand_vars(
     token: &str,
     env: &BTreeMap<String, String>,
@@ -501,12 +571,19 @@ pub(crate) fn expand_vars(
                     i = close + 1;
                     continue;
                 }
-                // Look for the `:-` modifier inside the brace
-                // region. The name part is everything up to
-                // the modifier; the default part is everything
-                // after, up to the closing `}`. Without the
+                // Look for the `:-` or `:?` modifier inside the
+                // brace region. The name part is everything up
+                // to the modifier; the modifier-specific tail
+                // (default value or error message) is everything
+                // after, up to the closing `}`. Without any
                 // modifier the whole region is the name (the
-                // existing simple-brace behavior).
+                // existing simple-brace behavior). `:-` is
+                // checked first because it predates `:?` in the
+                // implementation; either modifier consumes the
+                // first occurrence in the region (so a name
+                // containing a literal `:` would be
+                // misinterpreted, but POSIX names cannot contain
+                // `:` so this is a non-issue).
                 if let Some(sep) = find_colon_dash(region.as_bytes()) {
                     let name = &region[..sep];
                     let default = &region[sep + 2..];
@@ -527,6 +604,42 @@ pub(crate) fn expand_vars(
                         // empty-value case.
                         out.push_str(env.get(name).expect("checked above"));
                     }
+                } else if let Some(sep) = find_colon_question(region.as_bytes()) {
+                    // POSIX `${NAME:?error}` "error if unset"
+                    // form. Like `:-`, the colon prefix means
+                    // empty-string-set is treated as unset
+                    // (the no-colon `${NAME?error}` form would
+                    // distinguish empty-vs-unset; not in v1).
+                    // This fires REGARDLESS of `flags.nounset`
+                    // — the `:?` form has its own diagnostic
+                    // mechanism, so `set -u` is moot here.
+                    // When the var IS set and non-empty, the
+                    // expansion is the var's value (the
+                    // message is discarded). The message is a
+                    // literal string — `$VAR` references
+                    // inside the message are NOT recursively
+                    // expanded in this slice (mirrors the
+                    // `:-` default not recursively expanding).
+                    let name = &region[..sep];
+                    let message = &region[sep + 2..];
+                    let fire = match env.get(name) {
+                        None => true,
+                        Some(v) => v.is_empty(),
+                    };
+                    if fire {
+                        return Err(ExpandError::Required {
+                            name: name.to_string(),
+                            message: if message.is_empty() {
+                                None
+                            } else {
+                                Some(message.to_string())
+                            },
+                        });
+                    }
+                    // Safe: matched `Some(v)` above and the
+                    // empty branch ruled out the empty-value
+                    // case (otherwise `fire` would be true).
+                    out.push_str(env.get(name).expect("checked above"));
                 } else if let Some(value) = env.get(region) {
                     out.push_str(value);
                 } else if flags.nounset {
@@ -590,6 +703,24 @@ fn find_colon_dash(bytes: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i + 1 < bytes.len() {
         if bytes[i] == b':' && bytes[i + 1] == b'-' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the byte offset of the first `:?` two-byte sequence
+/// inside the given slice, or `None` if absent. Sibling of
+/// `find_colon_dash`, used by the braced-form expander to
+/// split `${NAME:?error}` into the name and message halves.
+/// Returns the offset of the `:` (so the caller can take
+/// `&region[..sep]` for the name and `&region[sep + 2..]`
+/// for the error message).
+fn find_colon_question(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b':' && bytes[i + 1] == b'?' {
             return Some(i);
         }
         i += 1;
