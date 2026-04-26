@@ -717,32 +717,116 @@ export function capBit(cap: number): bigint {
 // the heap payload in future slices; this helper will grow
 // correspondingly.
 
-/** Arguments to a `PROC_SPAWN` syscall (first-landing shape). */
+/** Arguments to a `PROC_SPAWN` syscall. */
 export interface SpawnManifest {
   /** Absolute path of the binary to spawn. */
   readonly path: string;
   /** Capability bitset the child should hold. Must be a subset of the caller's own caps. */
   readonly caps: bigint;
+  /**
+   * Optional argv passed to the child as `proc.argv`. Recoverable
+   * via the WASI `args_sizes_get` / `args_get` syscalls. Empty
+   * when omitted.
+   *
+   * Combined byte length (sum of `arg.length + 1` per entry) MUST
+   * fit in u16 (≤ 65535 bytes); larger argvs are rejected with
+   * `RangeError` at encode time. This is a wire-format limit, not
+   * a kernel one — the limit comes from the two u16 fields packed
+   * into the syscall args window.
+   */
+  readonly argv?: readonly string[];
+  /**
+   * Optional envp passed to the child as `proc.envp`. Each entry
+   * is a `[key, value]` pair; the kernel stores them in a
+   * `BTreeMap<String, String>` (sorted by key) and returns them
+   * via `environ_sizes_get` / `environ_get` as
+   * `KEY=VALUE\0` byte stream.
+   *
+   * Combined byte length (sum of `key.length + 1 + value.length +
+   * 1` per entry) MUST fit in u16. Keys with `=` in them are
+   * rejected by the kernel parser.
+   */
+  readonly envp?: readonly (readonly [string, string])[];
 }
 
 /**
  * Build the `(args, heap)` pair for a [`PROC_SPAWN`] syscall from a
- * typed manifest. `args` goes in `SyscallRequest.args` (or pack
- * path_len into `arg0` if preferred), and `heap` goes at the offset
- * `SyscallRequest.heapPtr` points at.
+ * typed manifest.
+ *
+ * Wire format:
+ *   args[0..4]   = path_len (u32 LE)
+ *   args[4..12]  = caps bitset (u64 LE)
+ *   args[12..14] = argv_buf_len (u16 LE) — bytes the argv part of
+ *                  the heap occupies; 0 when manifest.argv is empty
+ *   args[14..16] = envp_buf_len (u16 LE)
+ *   heap         = path_bytes ++ argv_bytes ++ envp_bytes
+ *
+ *   argv_bytes = arg0\0arg1\0arg2\0...      (NUL-terminated)
+ *   envp_bytes = KEY0=VAL0\0KEY1=VAL1\0...  (NUL-terminated)
  */
 export function encodeSpawnManifest(
   manifest: SpawnManifest,
 ): { args: Uint8Array; heap: Uint8Array } {
-  const path = new TextEncoder().encode(manifest.path);
+  const enc = new TextEncoder();
+  const pathBytes = enc.encode(manifest.path);
+
+  // Build argv buffer: NUL-terminated strings concatenated.
+  let argvBytes = new Uint8Array(0);
+  if (manifest.argv !== undefined && manifest.argv.length > 0) {
+    const parts = manifest.argv.map((s) => enc.encode(s));
+    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
+    if (totalLen > 0xffff) {
+      throw new RangeError(
+        `encodeSpawnManifest: argv buf size ${totalLen} exceeds u16 max (65535)`,
+      );
+    }
+    argvBytes = new Uint8Array(totalLen);
+    let off = 0;
+    for (const part of parts) {
+      argvBytes.set(part, off);
+      argvBytes[off + part.length] = 0;
+      off += part.length + 1;
+    }
+  }
+
+  // Build envp buffer: KEY=VAL\0KEY=VAL\0...
+  let envpBytes = new Uint8Array(0);
+  if (manifest.envp !== undefined && manifest.envp.length > 0) {
+    const parts = manifest.envp.map(([k, v]) => {
+      if (k.includes("=")) {
+        throw new RangeError(
+          `encodeSpawnManifest: envp key ${JSON.stringify(k)} contains '=' (forbidden by the wire format)`,
+        );
+      }
+      return enc.encode(`${k}=${v}`);
+    });
+    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
+    if (totalLen > 0xffff) {
+      throw new RangeError(
+        `encodeSpawnManifest: envp buf size ${totalLen} exceeds u16 max (65535)`,
+      );
+    }
+    envpBytes = new Uint8Array(totalLen);
+    let off = 0;
+    for (const part of parts) {
+      envpBytes.set(part, off);
+      envpBytes[off + part.length] = 0;
+      off += part.length + 1;
+    }
+  }
+
   const args = new Uint8Array(16);
   const view = new DataView(args.buffer);
-  // args[0..4] = path_len
-  view.setUint32(0, path.length, true);
-  // args[4..12] = caps bitset (u64 LE)
+  view.setUint32(0, pathBytes.length, true);
   view.setBigUint64(4, manifest.caps, true);
-  // args[12..16] = reserved (zero)
-  return { args, heap: path };
+  view.setUint16(12, argvBytes.length, true);
+  view.setUint16(14, envpBytes.length, true);
+
+  const heap = new Uint8Array(pathBytes.length + argvBytes.length + envpBytes.length);
+  heap.set(pathBytes, 0);
+  heap.set(argvBytes, pathBytes.length);
+  heap.set(envpBytes, pathBytes.length + argvBytes.length);
+  return { args, heap };
 }
 
 /** `abi::cap::CapSet::ALL` — every bit set. */

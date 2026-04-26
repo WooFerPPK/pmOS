@@ -3313,13 +3313,15 @@ fn sched_yield_returns_ok() {
 
 // ---- args / environ ---------------------------------------------------
 //
-// v1 answer for all four: empty. A Rust std binary's init probe sees
-// (0, 0) on the *_SIZES_GET side and writes nothing on the *_GET side,
-// which is exactly what `std::env::args()` / `std::env::vars()`
-// degrade into.
+// argv + envp pass from `proc_spawn`'s SpawnManifest into the child's
+// `Process.argv` / `Process.envp` records, then back out to the child
+// at libc-init time through the four WASI opcodes below. Empty argv /
+// envp → (0, 0) sizes + empty _GET writes. Non-empty argv → bytes
+// `arg0\0arg1\0...`. Non-empty envp → `KEY0=VAL0\0KEY1=VAL1\0...`
+// sorted by key (BTreeMap iteration order).
 
 #[test]
-fn args_sizes_get_returns_zero_argc_and_zero_buf_size() {
+fn args_sizes_get_returns_zero_argc_and_zero_buf_size_when_argv_is_empty() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "argsy", 0);
     let mut heap = vec![0u8; 64];
@@ -3344,7 +3346,7 @@ fn args_sizes_get_returns_zero_argc_and_zero_buf_size() {
 }
 
 #[test]
-fn args_get_is_a_noop_success() {
+fn args_get_is_a_noop_success_when_argv_is_empty() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "argsy", 0);
     let mut heap = vec![0u8; 16];
@@ -3359,11 +3361,12 @@ fn args_get_is_a_noop_success() {
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 0);
     assert!(heap.iter().all(|&b| b == 0));
 }
 
 #[test]
-fn environ_sizes_get_returns_zero_envc_and_zero_buf_size() {
+fn environ_sizes_get_returns_zero_envc_and_zero_buf_size_when_envp_is_empty() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "environey", 0);
     let mut heap = vec![0u8; 32];
@@ -3384,7 +3387,7 @@ fn environ_sizes_get_returns_zero_envc_and_zero_buf_size() {
 }
 
 #[test]
-fn environ_get_is_a_noop_success() {
+fn environ_get_is_a_noop_success_when_envp_is_empty() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "environey", 0);
     let mut heap = vec![0u8; 16];
@@ -3399,6 +3402,185 @@ fn environ_get_is_a_noop_success() {
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, 0);
+    assert_eq!(resp.extra_len, 0);
+}
+
+// ---- argv / envp populated via proc_spawn -----------------------------
+//
+// The next set of tests spawns a child with non-empty argv + envp and
+// reads them back through the four WASI opcodes, exercising the full
+// "kernel stores → handler retrieves" path.
+
+fn spawn_child_with(
+    k: &mut Kernel,
+    name: &str,
+    argv: alloc::vec::Vec<&str>,
+    envp: alloc::vec::Vec<(&str, &str)>,
+) -> abi::ext::Pid {
+    let parent = make_running_proc(k, "parent", 0);
+    let argv_owned: alloc::vec::Vec<alloc::string::String> =
+        argv.iter().map(|s| (*s).to_string()).collect();
+    let envp_owned: alloc::collections::BTreeMap<alloc::string::String, alloc::string::String> =
+        envp.iter()
+            .map(|(k_, v)| ((*k_).to_string(), (*v).to_string()))
+            .collect();
+    let child = k
+        .proc_spawn(
+            parent,
+            kernel::sys::SpawnArgs {
+                name,
+                argv: argv_owned,
+                envp: envp_owned,
+                cwd: "/",
+                caps: initial::INIT,
+                stdin: FdObject::CharDevice(DEV_CONSOLE),
+                stdout: FdObject::CharDevice(DEV_CONSOLE),
+                stderr: FdObject::CharDevice(DEV_CONSOLE),
+            },
+        )
+        .expect("spawn");
+    // proc_spawn auto-transitions to Ready; bump to Running so
+    // the dispatcher accepts syscalls from this pid.
+    k.procs
+        .transition(child, ProcState::Running)
+        .expect("transition child to Running");
+    child
+}
+
+#[test]
+fn args_sizes_get_returns_argc_and_buf_size_from_live_argv() {
+    let mut k = make_kernel();
+    let pid = spawn_child_with(&mut k, "child", vec!["a", "bb", "ccc"], vec![]);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::ARGS_SIZES_GET,
+        flags: 0,
+        request_id: 90,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let argc = u32::from_le_bytes(heap[0..4].try_into().unwrap());
+    let buf_size = u32::from_le_bytes(heap[4..8].try_into().unwrap());
+    assert_eq!(argc, 3);
+    // "a\0" + "bb\0" + "ccc\0" = 2 + 3 + 4 = 9 bytes.
+    assert_eq!(buf_size, 9);
+}
+
+#[test]
+fn args_get_writes_concatenated_nul_terminated_argv() {
+    let mut k = make_kernel();
+    let pid = spawn_child_with(&mut k, "child", vec!["a", "bb", "ccc"], vec![]);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::ARGS_GET,
+        flags: 0,
+        request_id: 91,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.extra_len, 9);
+    assert_eq!(&heap[..9], b"a\0bb\0ccc\0");
+}
+
+#[test]
+fn args_get_returns_einval_when_heap_window_is_too_small() {
+    let mut k = make_kernel();
+    let pid = spawn_child_with(&mut k, "child", vec!["a", "bb", "ccc"], vec![]);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::ARGS_GET,
+        flags: 0,
+        request_id: 92,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 5, // need 9 bytes but only 5 offered
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -abi::errno::EINVAL);
+}
+
+#[test]
+fn environ_sizes_get_returns_envc_and_buf_size_from_live_envp() {
+    let mut k = make_kernel();
+    let pid = spawn_child_with(
+        &mut k,
+        "child",
+        vec![],
+        vec![("FOO", "1"), ("BAR", "two")],
+    );
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::ENVIRON_SIZES_GET,
+        flags: 0,
+        request_id: 93,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let envc = u32::from_le_bytes(heap[0..4].try_into().unwrap());
+    let buf_size = u32::from_le_bytes(heap[4..8].try_into().unwrap());
+    assert_eq!(envc, 2);
+    // "BAR=two\0" + "FOO=1\0" = 8 + 6 = 14 bytes.
+    assert_eq!(buf_size, 14);
+}
+
+#[test]
+fn environ_get_writes_sorted_concatenated_nul_terminated_envp() {
+    let mut k = make_kernel();
+    let pid = spawn_child_with(
+        &mut k,
+        "child",
+        vec![],
+        vec![("FOO", "1"), ("BAR", "two")],
+    );
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::ENVIRON_GET,
+        flags: 0,
+        request_id: 94,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.extra_len, 14);
+    // BTreeMap iterates in key-sorted order: BAR first, then FOO.
+    assert_eq!(&heap[..14], b"BAR=two\0FOO=1\0");
+}
+
+#[test]
+fn environ_get_envvar_with_empty_value_round_trips() {
+    let mut k = make_kernel();
+    let pid = spawn_child_with(&mut k, "child", vec![], vec![("EMPTY", "")]);
+    let mut heap = vec![0u8; 64];
+
+    let req = Request {
+        opcode: op_wasi::ENVIRON_GET,
+        flags: 0,
+        request_id: 95,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 16,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    // "EMPTY=\0" = 7 bytes. The `=` is mandatory even when value is empty.
+    assert_eq!(resp.extra_len, 7);
+    assert_eq!(&heap[..7], b"EMPTY=\0");
 }
 
 // ---- fd_fdstat_get ----------------------------------------------------
@@ -11434,6 +11616,38 @@ fn proc_spawn_args(path_len: u32, caps_bits: u64) -> [u8; 16] {
     args
 }
 
+/// Build a `proc_spawn` args window with argv + envp byte-counts
+/// packed at offsets 12 and 14 respectively. Both are u16 LE.
+fn proc_spawn_args_with_argv_envp(
+    path_len: u32,
+    caps_bits: u64,
+    argv_buf_len: u16,
+    envp_buf_len: u16,
+) -> [u8; 16] {
+    let mut args = proc_spawn_args(path_len, caps_bits);
+    args[12..14].copy_from_slice(&argv_buf_len.to_le_bytes());
+    args[14..16].copy_from_slice(&envp_buf_len.to_le_bytes());
+    args
+}
+
+/// Pack a `path | argv | envp` payload into the heap. Mirrors the
+/// JS-side `encodeSpawnManifest` for tests.
+fn pack_spawn_payload(path: &str, argv: &[&str], envp: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(path.as_bytes());
+    for arg in argv {
+        out.extend_from_slice(arg.as_bytes());
+        out.push(0);
+    }
+    for (k, v) in envp {
+        out.extend_from_slice(k.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(v.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
 fn install_default_stdio(k: &mut Kernel, pid: abi::ext::Pid) {
     k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
         .unwrap();
@@ -14626,4 +14840,189 @@ fn host_file_dropped_collision_overwrites_prior() {
     let mut buf = [0u8; 16];
     let n = k.fd_read(pid, fd, &mut buf).expect("fd_read");
     assert_eq!(&buf[..n], b"SECOND");
+}
+
+// ---- proc_spawn argv + envp wire format -----------------------------
+
+#[test]
+fn proc_spawn_with_argv_threads_argv_into_child_process() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+
+    let path = "/usr/bin/cat";
+    let argv = ["cat", "-n", "/etc/version"];
+    let payload = pack_spawn_payload(path, &argv, &[]);
+    // argv_buf = "cat\0-n\0/etc/version\0" = 4 + 3 + 13 = 20 bytes.
+    let argv_buf_len: u16 = (argv.iter().map(|s| s.len() + 1).sum::<usize>()) as u16;
+    let mut heap = vec![0u8; 4096];
+    heap[..payload.len()].copy_from_slice(&payload);
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 200,
+        args: proc_spawn_args_with_argv_envp(
+            path.len() as u32,
+            abi::cap::initial::INIT.0,
+            argv_buf_len,
+            0,
+        ),
+        heap_ptr: 0,
+        heap_len: payload.len() as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let child = resp.value as i32;
+
+    let proc = k.procs.get(child).expect("child process");
+    assert_eq!(proc.argv, argv.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert!(proc.envp.is_empty());
+}
+
+#[test]
+fn proc_spawn_with_envp_threads_envp_into_child_process() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+
+    let path = "/usr/bin/sh";
+    let envp = [("PATH", "/bin:/usr/bin"), ("TZ", "UTC")];
+    let payload = pack_spawn_payload(path, &[], &envp);
+    let envp_buf_len: u16 = envp
+        .iter()
+        .map(|(k, v)| k.len() + 1 + v.len() + 1)
+        .sum::<usize>() as u16;
+    let mut heap = vec![0u8; 4096];
+    heap[..payload.len()].copy_from_slice(&payload);
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 201,
+        args: proc_spawn_args_with_argv_envp(
+            path.len() as u32,
+            abi::cap::initial::INIT.0,
+            0,
+            envp_buf_len,
+        ),
+        heap_ptr: 0,
+        heap_len: payload.len() as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let child = resp.value as i32;
+
+    let proc = k.procs.get(child).expect("child process");
+    assert!(proc.argv.is_empty());
+    assert_eq!(proc.envp.get("PATH").unwrap(), "/bin:/usr/bin");
+    assert_eq!(proc.envp.get("TZ").unwrap(), "UTC");
+    assert_eq!(proc.envp.len(), 2);
+}
+
+#[test]
+fn proc_spawn_with_argv_and_envp_round_trips_through_args_get_environ_get() {
+    // End-to-end: spawn a child with non-empty argv + envp via the
+    // PROC_SPAWN opcode, then issue ARGS_GET + ENVIRON_GET against
+    // the child to confirm the bytes round-trip.
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+
+    let path = "/usr/bin/echo";
+    let argv = ["echo", "hello", "world"];
+    let envp = [("LANG", "C")];
+    let payload = pack_spawn_payload(path, &argv, &envp);
+    let argv_buf_len: u16 = argv.iter().map(|s| s.len() + 1).sum::<usize>() as u16;
+    let envp_buf_len: u16 = envp
+        .iter()
+        .map(|(k, v)| k.len() + 1 + v.len() + 1)
+        .sum::<usize>() as u16;
+    let mut heap = vec![0u8; 4096];
+    heap[..payload.len()].copy_from_slice(&payload);
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 202,
+        args: proc_spawn_args_with_argv_envp(
+            path.len() as u32,
+            abi::cap::initial::INIT.0,
+            argv_buf_len,
+            envp_buf_len,
+        ),
+        heap_ptr: 0,
+        heap_len: payload.len() as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+    assert_eq!(resp.status, 0);
+    let child = resp.value as i32;
+    k.procs
+        .transition(child, ProcState::Running)
+        .expect("transition child to Running");
+
+    // ARGS_GET against the child must return the same bytes pack_spawn_payload built.
+    let mut heap2 = vec![0u8; 64];
+    let args_get_req = Request {
+        opcode: op_wasi::ARGS_GET,
+        flags: 0,
+        request_id: 203,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 32,
+    };
+    let r = dispatch(&mut k, child, &args_get_req, &mut heap2);
+    assert_eq!(r.status, 0);
+    assert_eq!(r.extra_len, argv_buf_len as u32);
+    assert_eq!(&heap2[..r.extra_len as usize], b"echo\0hello\0world\0");
+
+    // ENVIRON_GET against the child returns BTreeMap-sorted entries.
+    let mut heap3 = vec![0u8; 64];
+    let env_get_req = Request {
+        opcode: op_wasi::ENVIRON_GET,
+        flags: 0,
+        request_id: 204,
+        args: [0u8; 16],
+        heap_ptr: 0,
+        heap_len: 32,
+    };
+    let r = dispatch(&mut k, child, &env_get_req, &mut heap3);
+    assert_eq!(r.status, 0);
+    assert_eq!(r.extra_len, envp_buf_len as u32);
+    assert_eq!(&heap3[..r.extra_len as usize], b"LANG=C\0");
+}
+
+#[test]
+fn proc_spawn_with_invalid_envp_entry_returns_einval() {
+    // An envp entry without an `=` is rejected at parse time.
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+
+    let path = "/bin/sh";
+    let mut heap = vec![0u8; 256];
+    heap[..path.len()].copy_from_slice(path.as_bytes());
+    // envp = "BARE\0" (no `=`).
+    let bad_envp = b"BARE\0";
+    heap[path.len()..path.len() + bad_envp.len()].copy_from_slice(bad_envp);
+
+    let req = Request {
+        opcode: op_ext::PROC_SPAWN,
+        flags: 0,
+        request_id: 205,
+        args: proc_spawn_args_with_argv_envp(
+            path.len() as u32,
+            abi::cap::initial::INIT.0,
+            0,
+            bad_envp.len() as u16,
+        ),
+        heap_ptr: 0,
+        heap_len: (path.len() + bad_envp.len()) as u32,
+    };
+    let resp = dispatch(&mut k, parent, &req, &mut heap);
+    assert_eq!(resp.status, -abi::errno::EINVAL);
 }

@@ -269,6 +269,72 @@ export class UserWasmRuntime {
   }
 
   /**
+   * Shared helper for `args_get` + `environ_get`. Both opcodes
+   * receive a pointer-table address + a flat-buffer address from
+   * the user; the kernel delivers a NUL-separated byte stream of
+   * `count` entries, and the shim writes `ptr_table[i] = buf +
+   * offset_of_entry_i` once the bytes are in user memory.
+   *
+   * Internally does two dispatches: the matching `_SIZES_GET` to
+   * learn `count` + `buf_size` (we can't size the heap window
+   * blindly), then the `_GET` with `heapLen = buf_size`.
+   *
+   * Empty entry lists short-circuit: if count == 0 the shim
+   * writes nothing and returns success. WASI permits this.
+   */
+  private copy_get(
+    sizesOpcode: number,
+    getOpcode: number,
+    ptrTablePtr: number,
+    bufPtr: number,
+  ): number {
+    if (this.memory === undefined) return ERRNO.EINVAL;
+    const sizes = this.backend.dispatch({
+      opcode: sizesOpcode,
+      requestId: 0,
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    if (sizes.response.status !== 0) return -sizes.response.status;
+    const sizesView = new DataView(
+      sizes.heapOut.buffer,
+      sizes.heapOut.byteOffset,
+      sizes.heapOut.byteLength,
+    );
+    const count = sizesView.getUint32(0, true);
+    const bufSize = sizesView.getUint32(4, true);
+    if (count === 0 || bufSize === 0) {
+      return 0;
+    }
+    const got = this.backend.dispatch({
+      opcode: getOpcode,
+      requestId: 0,
+      heapPtr: 0,
+      heapLen: bufSize,
+    });
+    if (got.response.status !== 0) return -got.response.status;
+    const heapBytes = got.heapOut.subarray(0, bufSize);
+    // Copy the kernel's byte stream into the user's flat buffer.
+    const userBuf = new Uint8Array(this.memory.buffer, bufPtr, bufSize);
+    userBuf.set(heapBytes);
+    // Walk the bytes and write the pointer table. Each entry ends
+    // at the next NUL; entry `i` starts at `bufPtr + offset` where
+    // offset is the byte position of the start of entry `i` in the
+    // flat buffer.
+    const tableView = new DataView(this.memory.buffer);
+    let offset = 0;
+    for (let i = 0; i < count; i += 1) {
+      tableView.setUint32(ptrTablePtr + i * 4, bufPtr + offset, true);
+      // Advance to the next NUL (or end of buffer).
+      while (offset < bufSize && heapBytes[offset] !== 0) {
+        offset += 1;
+      }
+      offset += 1; // skip the NUL terminator itself
+    }
+    return 0;
+  }
+
+  /**
    * Build the `wasi_snapshot_preview1` import namespace the user
    * wasm expects. Each function closes over `this` so it can
    * reach the user's memory (for iovec reads + nwritten writes)
@@ -818,31 +884,36 @@ export class UserWasmRuntime {
 
       // WASI `args_get` / `environ_get`.
       //
-      // Signature: (argv_ptr: i32, argv_buf_ptr: i32) -> errno.
+      // Signature: (ptr_table: i32, buf: i32) -> errno.
       //
-      // v1 returns an empty list, so there's nothing for the shim
-      // to write into user memory — the kernel handler is a no-op
-      // success. The out-pointers are accepted and ignored; when
-      // argc transitions to non-zero, the handler + this shim gain
-      // a pointer-table build step in lockstep.
-      args_get: (_argvPtr: number, _argvBufPtr: number): number => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.ARGS_GET,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0,
-        });
-        return response.status !== 0 ? -response.status : 0;
+      // The kernel delivers a flat NUL-separated byte stream (the
+      // shape `format_argv_cmdline` uses on the kernel side):
+      //   argv: arg0\0arg1\0arg2\0...
+      //   envp: KEY0=VAL0\0KEY1=VAL1\0...
+      // Parsing the pointer table is the shim's job — the kernel
+      // doesn't know the user's `ptr_table` address and doesn't
+      // need to. Two-phase dispatch:
+      //   1. *_SIZES_GET to get count + buf_size (so we know how
+      //      to size the heap window AND how many entries to walk).
+      //   2. *_GET with `heapLen = buf_size` to receive the bytes.
+      // Then copy heap → user `buf` and write `ptr_table[i] = buf
+      // + offset_of_entry_i`.
+      args_get: (argvPtr: number, argvBufPtr: number): number => {
+        return this.copy_get(
+          OP_WASI.ARGS_SIZES_GET,
+          OP_WASI.ARGS_GET,
+          argvPtr,
+          argvBufPtr,
+        );
       },
 
-      environ_get: (_envPtr: number, _envBufPtr: number): number => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.ENVIRON_GET,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0,
-        });
-        return response.status !== 0 ? -response.status : 0;
+      environ_get: (envPtr: number, envBufPtr: number): number => {
+        return this.copy_get(
+          OP_WASI.ENVIRON_SIZES_GET,
+          OP_WASI.ENVIRON_GET,
+          envPtr,
+          envBufPtr,
+        );
       },
 
       // WASI `fd_fdstat_get`.

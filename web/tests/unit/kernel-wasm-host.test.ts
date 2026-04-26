@@ -6535,6 +6535,97 @@ describe("dispatch: PROC_SPAWN", () => {
     });
   });
 
+  it("spawn with argv + envp threads them through to ARGS_GET / ENVIRON_GET on the child", async () => {
+    const { host } = await freshHost();
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/echo",
+      caps: CAPSET_ALL,
+      argv: ["echo", "hello", "world"],
+      envp: [
+        ["PATH", "/bin:/usr/bin"],
+        ["LANG", "C"],
+      ],
+    });
+
+    const spawn = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 410,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawn.response!.status).toBe(0);
+    const child = Number(spawn.response!.value);
+    host.markRunning(child);
+
+    // ARGS_SIZES_GET on the child returns (3, "echo\0hello\0world\0".length).
+    const argsSizes = host.dispatch(child, {
+      opcode: OP_WASI.ARGS_SIZES_GET,
+      requestId: 411,
+      args: new Uint8Array(16),
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(argsSizes.response!.status).toBe(0);
+    const argsSizesView = new DataView(
+      argsSizes.heapOut!.buffer,
+      argsSizes.heapOut!.byteOffset,
+    );
+    expect(argsSizesView.getUint32(0, true)).toBe(3);
+    expect(argsSizesView.getUint32(4, true)).toBe("echo\0hello\0world\0".length);
+
+    // ARGS_GET writes the NUL-terminated argv concatenated.
+    const argsGet = host.dispatch(child, {
+      opcode: OP_WASI.ARGS_GET,
+      requestId: 412,
+      args: new Uint8Array(16),
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(argsGet.response!.status).toBe(0);
+    const argsBytes = argsGet.heapOut!.subarray(0, argsGet.response!.extraLen);
+    expect(new TextDecoder().decode(argsBytes)).toBe("echo\0hello\0world\0");
+
+    // ENVIRON_SIZES_GET sees BTreeMap-sorted entries: LANG before PATH.
+    const envSizes = host.dispatch(child, {
+      opcode: OP_WASI.ENVIRON_SIZES_GET,
+      requestId: 413,
+      args: new Uint8Array(16),
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(envSizes.response!.status).toBe(0);
+    const envSizesView = new DataView(
+      envSizes.heapOut!.buffer,
+      envSizes.heapOut!.byteOffset,
+    );
+    expect(envSizesView.getUint32(0, true)).toBe(2);
+    // "LANG=C\0" + "PATH=/bin:/usr/bin\0" = 7 + 19 = 26.
+    expect(envSizesView.getUint32(4, true)).toBe(26);
+
+    // ENVIRON_GET returns the sorted byte stream.
+    const envGet = host.dispatch(child, {
+      opcode: OP_WASI.ENVIRON_GET,
+      requestId: 414,
+      args: new Uint8Array(16),
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(envGet.response!.status).toBe(0);
+    const envBytes = envGet.heapOut!.subarray(0, envGet.response!.extraLen);
+    expect(new TextDecoder().decode(envBytes)).toBe("LANG=C\0PATH=/bin:/usr/bin\0");
+  });
+
   it("rolls back the new pid when onSpawnProcess rejects", async () => {
     const { host, spawnCalls } = await freshHost({
       spawnOutcome: () => ({ ok: false, errno: ERRNO.EINVAL }),

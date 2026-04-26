@@ -33,7 +33,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use abi::cap::{Cap, CapSet};
@@ -750,6 +750,42 @@ fn handle_display_bind(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response
 //      rejects, we roll back the process-table entry by marking it
 //      Zombie and reaping it so no pid is leaked on a failed spawn.
 
+/// Parse a NUL-terminated UTF-8 byte stream into a `Vec<String>`.
+/// Each entry is everything up to the next `\0`; the stream MUST
+/// end with a `\0` (i.e. be empty or be of shape `e0\0e1\0...\0`).
+/// Returns `None` on invalid UTF-8 or a missing trailing NUL.
+fn parse_nul_separated(bytes: &[u8]) -> Option<Vec<alloc::string::String>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    if *bytes.last().unwrap() != 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    for chunk in bytes[..bytes.len() - 1].split(|b| *b == 0) {
+        out.push(core::str::from_utf8(chunk).ok()?.into());
+    }
+    Some(out)
+}
+
+/// Parse a NUL-terminated `KEY=VALUE` byte stream into a sorted
+/// `BTreeMap`. Entries without `=` are rejected. Duplicate keys
+/// are accepted; the last value wins (matches POSIX
+/// putenv-by-overwrite semantics).
+fn parse_envp(
+    bytes: &[u8],
+) -> Option<alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>> {
+    let entries = parse_nul_separated(bytes)?;
+    let mut out = alloc::collections::BTreeMap::new();
+    for entry in entries {
+        let eq = entry.find('=')?;
+        let key = entry[..eq].to_string();
+        let value = entry[eq + 1..].to_string();
+        out.insert(key, value);
+    }
+    Some(out)
+}
+
 fn handle_proc_spawn(
     kernel: &mut Kernel,
     pid: Pid,
@@ -758,15 +794,41 @@ fn handle_proc_spawn(
 ) -> Response {
     let path_len = args_u32(req, 0) as usize;
     let caps = CapSet(args_u64(req, 4));
+    // args[12..14] = argv_buf_len (u16 LE), args[14..16] = envp_buf_len (u16 LE).
+    // Tightly packed so the existing path_len + caps fit in the same
+    // 16-byte args window. Both default to zero for callers that
+    // don't pass argv/envp (the pre-T084-followups wire format).
+    let argv_buf_len = u16::from_le_bytes([req.args[12], req.args[13]]) as usize;
+    let envp_buf_len = u16::from_le_bytes([req.args[14], req.args[15]]) as usize;
+    let total_heap = path_len + argv_buf_len + envp_buf_len;
 
-    let Some(path_bytes) = heap_in(req, heap) else {
+    let Some(payload) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
-    if path_bytes.len() != path_len {
+    if payload.len() != total_heap {
         return Response::err(req.request_id, EINVAL);
     }
+    let path_bytes = &payload[..path_len];
+    let argv_bytes = &payload[path_len..path_len + argv_buf_len];
+    let envp_bytes = &payload[path_len + argv_buf_len..];
+
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
+    };
+
+    // Parse argv: NUL-terminated UTF-8 strings concatenated. An
+    // empty `argv_bytes` yields an empty Vec.
+    let argv = match parse_nul_separated(argv_bytes) {
+        Some(v) => v,
+        None => return Response::err(req.request_id, EINVAL),
+    };
+
+    // Parse envp: same NUL-terminated layout, but each entry is
+    // `KEY=VALUE`. Entries without `=` are rejected (invalid
+    // shape). Empty `envp_bytes` yields an empty BTreeMap.
+    let envp = match parse_envp(envp_bytes) {
+        Some(m) => m,
+        None => return Response::err(req.request_id, EINVAL),
     };
 
     // Inherit the parent's stdin/stdout/stderr by cloning its fd
@@ -796,8 +858,8 @@ fn handle_proc_spawn(
         name: path,
         caps,
         cwd: "/",
-        argv: Vec::new(),
-        envp: BTreeMap::new(),
+        argv,
+        envp,
         stdin,
         stdout,
         stderr,

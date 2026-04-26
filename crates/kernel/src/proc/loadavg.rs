@@ -7,9 +7,11 @@
 //! weighted by the complementary `(1 - decay)` factor. The three
 //! decay factors target tau values of 1, 5, and 15 minutes:
 //!
-//!     EXP_1  = exp(-5/60)  ≈ 0.92013
-//!     EXP_5  = exp(-5/300) ≈ 0.98349
-//!     EXP_15 = exp(-5/900) ≈ 0.99463
+//! ```text
+//! EXP_1  = exp(-5/60)  ≈ 0.92013
+//! EXP_5  = exp(-5/300) ≈ 0.98349
+//! EXP_15 = exp(-5/900) ≈ 0.99463
+//! ```
 //!
 //! PMos uses Linux's fixed-point representation (FIXED_1 = 1<<11
 //! = 2048) so the no_std kernel does not need `f64::exp` or any

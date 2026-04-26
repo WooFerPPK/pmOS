@@ -61,10 +61,10 @@ pub fn dispatch_wasi(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u
         op::CLOCK_RES_GET => handle_clock_res_get(req),
         op::RANDOM_GET => handle_random_get(req, heap),
         op::SCHED_YIELD => handle_sched_yield(req),
-        op::ARGS_SIZES_GET => handle_args_sizes_get(req, heap),
-        op::ARGS_GET => handle_args_get(req),
-        op::ENVIRON_SIZES_GET => handle_environ_sizes_get(req, heap),
-        op::ENVIRON_GET => handle_environ_get(req),
+        op::ARGS_SIZES_GET => handle_args_sizes_get(kernel, pid, req, heap),
+        op::ARGS_GET => handle_args_get(kernel, pid, req, heap),
+        op::ENVIRON_SIZES_GET => handle_environ_sizes_get(kernel, pid, req, heap),
+        op::ENVIRON_GET => handle_environ_get(kernel, pid, req, heap),
         op::FD_FDSTAT_GET => handle_fd_fdstat_get(kernel, pid, req, heap),
         op::FD_FILESTAT_GET => handle_fd_filestat_get(kernel, pid, req, heap),
         op::PATH_FILESTAT_GET => handle_path_filestat_get(kernel, pid, req, heap),
@@ -705,39 +705,63 @@ fn handle_sched_yield(req: &Request) -> Response {
 
 // ---- args_sizes_get / args_get / environ_sizes_get / environ_get ------
 //
-// PMos doesn't pass argv or envp to user wasm in v1 — every binary
-// starts with an empty argument list and an empty environment. These
-// handlers exist so that a Rust `std` binary (whose libc init probes
-// all four of these opcodes before `main` runs) doesn't panic on
-// `-ENOSYS`. Userland sees `(argc=0, buf_size=0)` and `(envc=0,
-// buf_size=0)` and moves on.
+// PMos's argv/envp originate at `proc_spawn` time: the parent packs a
+// `SpawnManifest` carrying argv + envp, the kernel stores them in the
+// child's `Process` record (`proc.argv: Vec<String>`,
+// `proc.envp: BTreeMap<String, String>`), and these four WASI opcodes
+// are the path the child uses to read them back at libc-init time.
 //
-// A future slice can attach a real argv/envp to `SpawnArgs`, thread
-// them through `Kernel::proc_spawn` into the child's Process record,
-// and have these handlers read from there. The wire format stays the
-// same — *_SIZES_GET returns two u32s, *_GET writes N byte-blobs +
-// N pointers into the caller's heap scratch.
-//
-// Layout for the _SIZES_GET pair:
+// Wire format for _SIZES_GET:
 //   args      = unused
 //   heap_ptr  = output offset (8 bytes: (count u32, buf_size u32) LE)
 //   heap_len  = 8 (or >=8; only the first 8 bytes are written)
 // Response:
-//   value     = 0 (success)
+//   value     = 0 (success), or -ESRCH for an unknown pid (defence
+//               in depth — the dispatcher already validates pid)
 //   extra_len = 8 (bytes written)
 //
-// Layout for the _GET pair (with count == 0, nothing to write):
+// Wire format for _GET:
 //   args      = unused
-//   heap_ptr  = unused
-//   heap_len  = unused
+//   heap_ptr  = output offset
+//   heap_len  = total argv_buf_size (or envp_buf_size) the matching
+//               _SIZES_GET reported. Caller-side WASI shim usually
+//               does an internal _SIZES_GET first to size the heap
+//               window, then issues _GET with that exact size.
 // Response:
 //   value     = 0 (success)
+//   extra_len = bytes written (== buf_size; matches _SIZES_GET)
+//   On `EINVAL`: heap_len was below buf_size; the shim should re-
+//   query _SIZES_GET and retry.
+//
+// Buffer encoding for _GET:
+//   argv:  arg0\0arg1\0arg2\0...        (concatenated NUL-terminated)
+//   envp:  KEY0=VAL0\0KEY1=VAL1\0...    (sorted by key — BTreeMap order)
+// The user-side shim parses these by walking NUL boundaries; argv[i]
+// pointers + envp[i] pointers are computed shim-side (the kernel does
+// not need to know the user's argv array address, only deliver the
+// flat byte stream).
 
-fn write_two_zero_u32s(req: &Request, heap: &mut [u8]) -> Response {
+fn argv_buf_size(argv: &alloc::vec::Vec<alloc::string::String>) -> u32 {
+    argv.iter().map(|s| s.len() as u32 + 1).sum()
+}
+
+fn envp_buf_size(envp: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>) -> u32 {
+    envp.iter()
+        .map(|(k, v)| k.len() as u32 + 1 + v.len() as u32 + 1)
+        .sum()
+}
+
+fn handle_args_sizes_get(kernel: &Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
+    let Some(proc) = kernel.procs.get(pid) else {
+        return Response::err(req.request_id, abi::errno::ESRCH);
+    };
+    let argc = proc.argv.len() as u32;
+    let buf_size = argv_buf_size(&proc.argv);
     let Some(buf) = heap_out_mut(req, heap, 8) else {
         return Response::err(req.request_id, EINVAL);
     };
-    buf[..8].copy_from_slice(&[0u8; 8]);
+    buf[0..4].copy_from_slice(&argc.to_le_bytes());
+    buf[4..8].copy_from_slice(&buf_size.to_le_bytes());
     Response {
         request_id: req.request_id,
         status: 0,
@@ -747,20 +771,113 @@ fn write_two_zero_u32s(req: &Request, heap: &mut [u8]) -> Response {
     }
 }
 
-fn handle_args_sizes_get(req: &Request, heap: &mut [u8]) -> Response {
-    write_two_zero_u32s(req, heap)
+fn handle_args_get(kernel: &Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
+    let Some(proc) = kernel.procs.get(pid) else {
+        return Response::err(req.request_id, abi::errno::ESRCH);
+    };
+    let buf_size = argv_buf_size(&proc.argv);
+    if buf_size == 0 {
+        // Empty argv — nothing to write, but the call still succeeds
+        // with extra_len = 0.
+        return Response {
+            request_id: req.request_id,
+            status: 0,
+            value: 0,
+            extra_len: 0,
+            _pad: [0u8; 12],
+        };
+    }
+    // The caller's `heap_len` must be at least `buf_size` — anything
+    // smaller would truncate the payload and force the shim to do a
+    // partial-write parse. Reject with EINVAL so the shim can
+    // re-query ARGS_SIZES_GET and retry with a bigger window.
+    if (req.heap_len as usize) < buf_size as usize {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Some(buf) = heap_out_mut(req, heap, buf_size as usize) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let mut offset = 0usize;
+    for arg in &proc.argv {
+        let bytes = arg.as_bytes();
+        buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        buf[offset + bytes.len()] = 0;
+        offset += bytes.len() + 1;
+    }
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: buf_size,
+        _pad: [0u8; 12],
+    }
 }
 
-fn handle_args_get(req: &Request) -> Response {
-    Response::ok(req.request_id, 0)
+fn handle_environ_sizes_get(
+    kernel: &Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let Some(proc) = kernel.procs.get(pid) else {
+        return Response::err(req.request_id, abi::errno::ESRCH);
+    };
+    let envc = proc.envp.len() as u32;
+    let buf_size = envp_buf_size(&proc.envp);
+    let Some(buf) = heap_out_mut(req, heap, 8) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    buf[0..4].copy_from_slice(&envc.to_le_bytes());
+    buf[4..8].copy_from_slice(&buf_size.to_le_bytes());
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: 8,
+        _pad: [0u8; 12],
+    }
 }
 
-fn handle_environ_sizes_get(req: &Request, heap: &mut [u8]) -> Response {
-    write_two_zero_u32s(req, heap)
-}
-
-fn handle_environ_get(req: &Request) -> Response {
-    Response::ok(req.request_id, 0)
+fn handle_environ_get(kernel: &Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
+    let Some(proc) = kernel.procs.get(pid) else {
+        return Response::err(req.request_id, abi::errno::ESRCH);
+    };
+    let buf_size = envp_buf_size(&proc.envp);
+    if buf_size == 0 {
+        return Response {
+            request_id: req.request_id,
+            status: 0,
+            value: 0,
+            extra_len: 0,
+            _pad: [0u8; 12],
+        };
+    }
+    if (req.heap_len as usize) < buf_size as usize {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Some(buf) = heap_out_mut(req, heap, buf_size as usize) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let mut offset = 0usize;
+    for (key, value) in &proc.envp {
+        let kb = key.as_bytes();
+        let vb = value.as_bytes();
+        buf[offset..offset + kb.len()].copy_from_slice(kb);
+        offset += kb.len();
+        buf[offset] = b'=';
+        offset += 1;
+        buf[offset..offset + vb.len()].copy_from_slice(vb);
+        offset += vb.len();
+        buf[offset] = 0;
+        offset += 1;
+    }
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 0,
+        extra_len: buf_size,
+        _pad: [0u8; 12],
+    }
 }
 
 // ---- fd_fdstat_get ----------------------------------------------------
