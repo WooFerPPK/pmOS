@@ -634,6 +634,46 @@ describe("process lifecycle", () => {
     expect(open.response!.status).toBe(-ERRNO.ENOENT);
   });
 
+  it("/proc/<pid>/maps surfaces the live wasm linear-memory layout via the live procfs source", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    // Record a memory observation so the maps line has a non-zero
+    // end address (mirrors the user-Worker → main → kernel-worker
+    // → kernel_record_process_memory plumbing from T168).
+    host.recordProcessMemory(pid, 16 * 65536); // 16 wasm pages = 1 MiB
+
+    const path = `/proc/${pid}/maps`;
+    const pathBytes = new TextEncoder().encode(path);
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 5401,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 5402,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 256,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    // Single line: 1 MiB region with rw-p, [wasm-memory] tag.
+    expect(text).toMatch(/^00000000-00100000 rw-p 00000000 00:00 0 +\[wasm-memory\]\n$/);
+  });
+
   it("/proc/<pid>/fd lists installed file descriptors via the live procfs source", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);

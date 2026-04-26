@@ -23,9 +23,10 @@ use abi::cap::CapSet;
 use abi::ext::Pid;
 
 use kernel::fs::procfs::{
-    fd_symlink_ino, format_argv_cmdline, pid_cmdline_ino, pid_fd_dir_ino, pid_status_ino,
-    pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs, ProcFsSource, ProcStatusSnapshot,
-    ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
+    fd_symlink_ino, format_argv_cmdline, format_pid_maps, pid_cmdline_ino, pid_fd_dir_ino,
+    pid_maps_ino, pid_status_ino, pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs,
+    ProcFsSource, ProcStatusSnapshot, ProcStatusState, StaticProcFsSource, StorageSnapshot,
+    PID_STRIDE,
 };
 use kernel::proc::{table::ProcessTable, ExitStatus, ProcState, Process};
 use kernel::vfs::{FsError, NodeType, Vfs};
@@ -981,4 +982,155 @@ fn kernel_procfs_source_pid_cmdline_none_for_missing_pid() {
     let table = ProcessTable::new();
     let source = KernelProcFsSource::new(&table);
     assert!(source.pid_cmdline(999).is_none());
+}
+
+// ---- /proc/<pid>/maps tests ----------------------------------------
+
+fn read_maps(vfs: &mut Vfs, pid: Pid) -> Result<Vec<u8>, FsError> {
+    let path = format!("/proc/{pid}/maps");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    let mut off: u64 = 0;
+    loop {
+        let n = vfs.read(&path, off, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        off += n as u64;
+    }
+    Ok(out)
+}
+
+#[test]
+fn maps_emits_single_wasm_memory_line_with_rw_p_perms() {
+    let pid: Pid = 7;
+    let mut snap = stub_status(pid, 1, "hello");
+    snap.vm_size_bytes = 16 * 64 * 1024; // 16 wasm pages = 1 MiB
+    let mut vfs = vfs_with_snapshots(vec![snap]);
+
+    let bytes = read_maps(&mut vfs, pid).expect("read maps");
+    let text = core::str::from_utf8(&bytes).expect("utf-8");
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    assert_eq!(lines.len(), 1, "expected exactly one region: {:?}", lines);
+    let line = lines[0];
+    // Address range: 00000000-00100000 (1 MiB).
+    assert!(line.starts_with("00000000-00100000"), "line: {:?}", line);
+    // Permissions: rw-p (private, no execute — wasm execution
+    // rights live in the module table, not in linear memory).
+    assert!(line.contains(" rw-p "), "missing rw-p perms in {:?}", line);
+    // Offset is zero; dev:inode 00:00; pathname [wasm-memory].
+    assert!(line.contains(" 00000000 00:00 0 "), "wrong meta in {:?}", line);
+    assert!(line.ends_with(" [wasm-memory]\n"), "wrong tag in {:?}", line);
+}
+
+#[test]
+fn maps_zero_size_emits_zero_length_region() {
+    // A pre-spawn process has vm_size_bytes = 0; maps must still
+    // be readable and emit a deterministic single line so sysmon
+    // can render it without special-casing.
+    let pid: Pid = 9;
+    let snap = stub_status(pid, 1, "preboot");
+    let mut vfs = vfs_with_snapshots(vec![snap]);
+
+    let bytes = read_maps(&mut vfs, pid).expect("read maps");
+    let text = core::str::from_utf8(&bytes).expect("utf-8");
+    assert!(text.starts_with("00000000-00000000 rw-p "), "line: {:?}", text);
+}
+
+#[test]
+fn maps_address_range_tracks_vm_size_bytes() {
+    let cases = [
+        (1u64, "00000000-00000001"),
+        (4096u64, "00000000-00001000"),
+        (1024u64 * 1024, "00000000-00100000"),
+        (1024u64 * 1024 * 1024, "00000000-40000000"),
+    ];
+    for (size, prefix) in cases {
+        let pid: Pid = 11;
+        let mut snap = stub_status(pid, 1, "p");
+        snap.vm_size_bytes = size;
+        let mut vfs = vfs_with_snapshots(vec![snap]);
+        let bytes = read_maps(&mut vfs, pid).expect("read maps");
+        let text = core::str::from_utf8(&bytes).expect("utf-8");
+        assert!(text.starts_with(prefix), "size={} got {:?}", size, text);
+    }
+}
+
+#[test]
+fn maps_lookup_returns_correct_inode() {
+    let pid: Pid = 13;
+    let snap = stub_status(pid, 1, "lookup-test");
+    let mut vfs = vfs_with_snapshots(vec![snap]);
+
+    let stat = vfs.stat("/proc/13/maps").expect("stat");
+    assert_eq!(stat.ino, pid_maps_ino(pid));
+}
+
+#[test]
+fn maps_appears_in_pid_dir_readdir() {
+    let pid: Pid = 17;
+    let snap = stub_status(pid, 1, "readdir-test");
+    let mut vfs = vfs_with_snapshots(vec![snap]);
+
+    let entries = vfs.readdir("/proc/17").expect("readdir");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"maps"), "no `maps` entry: {:?}", names);
+    let maps_entry = entries.iter().find(|e| e.name == "maps").unwrap();
+    assert_eq!(maps_entry.ino, pid_maps_ino(pid));
+    assert_eq!(maps_entry.ty, NodeType::RegularFile);
+}
+
+#[test]
+fn maps_stat_reports_regular_file_mode_0o444() {
+    let pid: Pid = 19;
+    let mut snap = stub_status(pid, 1, "stat-test");
+    snap.vm_size_bytes = 65536;
+    let mut vfs = vfs_with_snapshots(vec![snap]);
+
+    let stat = vfs.stat("/proc/19/maps").expect("stat");
+    assert_eq!(stat.ty, NodeType::RegularFile);
+    assert_eq!(stat.mode & 0o777, 0o444);
+    // Size == content length (one line of text).
+    let bytes = read_maps(&mut vfs, pid).unwrap();
+    assert_eq!(stat.size, bytes.len() as u64);
+}
+
+#[test]
+fn maps_lookup_rejects_nonexistent_pid() {
+    let mut vfs = vfs_with_snapshots(vec![]);
+    assert!(matches!(
+        vfs.stat("/proc/999/maps"),
+        Err(FsError::NotFound)
+    ));
+}
+
+#[test]
+fn maps_format_helper_round_trips_vm_size() {
+    let mut snap = stub_status(42, 1, "fmt");
+    snap.vm_size_bytes = 0x12345;
+    let bytes = format_pid_maps(&snap);
+    let text = core::str::from_utf8(&bytes).unwrap();
+    assert!(text.starts_with("00000000-00012345"));
+    assert!(text.ends_with(" [wasm-memory]\n"));
+}
+
+#[test]
+fn kernel_procfs_source_projects_live_vm_size_to_maps() {
+    // End-to-end: a real Process with vm_size_bytes set + a
+    // KernelProcFsSource should produce maps bytes matching the
+    // live VmSize.
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    table.insert(make_process(pid, 1, "live")).unwrap();
+    table.transition(pid, ProcState::Ready).unwrap();
+    table.record_memory_size(pid, 8 * 65536); // 8 wasm pages
+
+    let snap = KernelProcFsSource::new(&table)
+        .pid_status(pid)
+        .expect("status snapshot");
+    let bytes = format_pid_maps(&snap);
+    let text = core::str::from_utf8(&bytes).unwrap();
+    // 8 * 65536 = 524288 = 0x80000.
+    assert!(text.starts_with("00000000-00080000"), "{}", text);
 }

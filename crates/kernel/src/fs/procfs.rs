@@ -468,6 +468,8 @@ const PID_OFFSET_STATUS: Ino = 1;
 const PID_OFFSET_FD_DIR: Ino = 2;
 /// Offset within a pid's stride for the `cmdline` file.
 const PID_OFFSET_CMDLINE: Ino = 3;
+/// Offset within a pid's stride for the `maps` file.
+const PID_OFFSET_MAPS: Ino = 4;
 
 /// Start of the per-fd symlink inode range — one stride per pid,
 /// within that the raw fd number is the offset. Chosen well above
@@ -504,6 +506,12 @@ pub const fn pid_fd_dir_ino(pid: Pid) -> Ino {
 #[inline]
 pub const fn pid_cmdline_ino(pid: Pid) -> Ino {
     pid_dir_ino(pid) + PID_OFFSET_CMDLINE
+}
+
+/// Map a pid to its `maps` file ino.
+#[inline]
+pub const fn pid_maps_ino(pid: Pid) -> Ino {
+    pid_dir_ino(pid) + PID_OFFSET_MAPS
 }
 
 /// Map a `(pid, fd)` pair to the symlink ino that represents
@@ -580,6 +588,46 @@ fn bytes_to_status_kib(bytes: u64) -> u64 {
     } else {
         ((bytes - 1) / 1024) + 1
     }
+}
+
+/// Serialise a `/proc/<pid>/maps` line for the process's wasm
+/// linear memory.
+///
+/// Linux `/proc/<pid>/maps` lists every memory region in the
+/// address space — code, data, heap, stack, shared libraries —
+/// each on its own line:
+///
+///   `<start_hex>-<end_hex> <perms> <offset_hex> <dev>:<inode> <inum> <pathname>`
+///
+/// PMos's wasm32 process model has a SINGLE region per process:
+/// the `WebAssembly.Memory` object the user Worker owns. The
+/// kernel cannot introspect into wasm-internal subdivisions
+/// (text vs data vs stack vs heap) — those are an artifact of
+/// the linker that's lost by the time the binary executes. So
+/// we surface one line per process, spanning the full linear
+/// memory at addresses `0x00000000..0x<vm_size_bytes>`, with
+/// permissions `rw-p` (the wasm runtime always grants the user
+/// process read+write access to its own memory; no `x` bit
+/// because wasm execution rights live in the module table, not
+/// in linear memory) and the pathname `[wasm-memory]` —
+/// matching Linux's `[stack]` / `[heap]` convention for
+/// kernel-managed regions with no on-disk file.
+///
+/// `dev:inode` is `00:00 0` because there's no backing file.
+/// Off is `00000000` because the region maps from offset zero
+/// of the (virtual) backing.
+///
+/// Empty (zero-length) regions emit a single line with end
+/// equal to start — sysmon can still walk the file deterministically
+/// without special-casing pre-spawn processes.
+pub fn format_pid_maps(snap: &ProcStatusSnapshot) -> Vec<u8> {
+    use alloc::format;
+    let end = snap.vm_size_bytes;
+    let line = format!(
+        "{:08x}-{:08x} rw-p 00000000 00:00 0                          [wasm-memory]\n",
+        0u64, end,
+    );
+    line.into_bytes()
 }
 
 /// Serialise an `argv` slice into the exact byte layout
@@ -663,6 +711,10 @@ impl ProcFs {
         if slot == PID_OFFSET_CMDLINE {
             return self.source.pid_cmdline(pid);
         }
+        if slot == PID_OFFSET_MAPS {
+            let snap = self.source.pid_status(pid)?;
+            return Some(format_pid_maps(&snap));
+        }
         None
     }
 
@@ -717,6 +769,7 @@ impl Filesystem for ProcFs {
                         Err(FsError::NotFound)
                     }
                 }
+                "maps" => Ok(pid_maps_ino(pid)),
                 _ => Err(FsError::NotFound),
             };
         }
@@ -792,6 +845,11 @@ impl Filesystem for ProcFs {
                     ty: NodeType::RegularFile,
                 });
             }
+            out.push(DirEntry {
+                name: "maps".to_string(),
+                ino: pid_maps_ino(pid),
+                ty: NodeType::RegularFile,
+            });
             return Ok(());
         }
         if self.is_live_fd_dir(dir) {
@@ -904,7 +962,10 @@ impl Filesystem for ProcFs {
         }
         // Per-pid regular files: recognise the stride offset.
         if let Some((_pid, slot)) = decode_pid_ino(ino) {
-            if slot == PID_OFFSET_STATUS || slot == PID_OFFSET_CMDLINE {
+            if slot == PID_OFFSET_STATUS
+                || slot == PID_OFFSET_CMDLINE
+                || slot == PID_OFFSET_MAPS
+            {
                 let content = self.contents_for(ino).ok_or(FsError::NotFound)?;
                 return Ok(FileStat {
                     ino,
