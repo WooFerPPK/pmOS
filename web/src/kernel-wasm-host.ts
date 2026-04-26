@@ -311,6 +311,21 @@ export interface KernelWasmHostOptions {
    * isn't available).
    */
   readonly blockDriver?: Driver;
+  /**
+   * Optional [`Driver`] (a `NetDriver`) the host calls whenever a
+   * `driver_call(Net, ...)` lands. Same dispatch shape as
+   * `blockDriver`: the driver may read AND write the payload
+   * buffer (HTTP responses + WebSocket frames are written back
+   * into the caller's heap window), and the result `value` is
+   * written into the kernel's `result_ptr`.
+   *
+   * Production wiring: `new NetDriver()` is constructed in
+   * `bootRealKernel` and passed in. When omitted, every
+   * `driver_call(Net, ...)` returns transport-error rc 1 — the
+   * kernel-side network code can detect "no net driver attached"
+   * and gracefully degrade to offline operation.
+   */
+  readonly netDriver?: Driver;
 }
 
 // ---- Dispatch result -------------------------------------------------
@@ -470,6 +485,17 @@ export class KernelWasmHost implements Kernel {
       blockDriver.init(blockDriverHost);
     }
 
+    // Initialise the net driver (T086). Request/response shape;
+    // no postToMain or pushInputToKernel needed.
+    const netDriver = options.netDriver;
+    if (netDriver !== undefined) {
+      const netDriverHost: DriverHost = {
+        postToMain: (): void => {},
+        pushInputToKernel: (): void => {},
+      };
+      netDriver.init(netDriverHost);
+    }
+
     const imports: WebAssembly.Imports = {
       env: {
         pmos_host_now_ns: (): bigint => nowNs(),
@@ -540,11 +566,37 @@ export class KernelWasmHost implements Kernel {
               return -(result.errno ?? 5 /* EIO */);
             }
             return 1;
+          } else if (dev === DEV.NET) {
+            if (netDriver === undefined) {
+              // No net driver — kernel-side network code sees
+              // transport error and degrades gracefully (no
+              // outbound connections, FETCH_BEGIN returns Err).
+              return 1;
+            }
+            // Net driver shape mirrors block driver: direct view
+            // into kernel memory so OP_FETCH_POLL / OP_WS_RECV
+            // can write response bytes back without a copy.
+            const view = new Uint8Array(memory.buffer, argsPtr, argsLen);
+            const result = netDriver.call(op, view);
+            if (result.ok) {
+              if (resultPtr !== 0) {
+                new DataView(memory.buffer).setUint32(
+                  resultPtr,
+                  result.value >>> 0,
+                  true,
+                );
+              }
+              return 0;
+            }
+            if (result.error === 3 /* DriverErrorCode.Errno */) {
+              return -(result.errno ?? 5 /* EIO */);
+            }
+            return 1;
           }
-          // Input / net: not wired yet. Return 0 ("success") for
-          // all devs so the kernel's side of driver_call doesn't
-          // propagate a spurious error back into the dispatch
-          // path for devices we just don't route to a callback.
+          // Input: not wired yet. Return 0 ("success") for
+          // unhandled devs so the kernel's side of driver_call
+          // doesn't propagate a spurious error back into the
+          // dispatch path for devices we just don't route.
           return 0;
         },
 

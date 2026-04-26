@@ -131,6 +131,15 @@ export interface WorkerEntryOptions {
    * deterministic without touching the real browser surface.
    */
   readonly blockDriver?: import("./drivers/types").Driver;
+  /**
+   * Optional pre-built [`NetDriver`] (T086). When unset
+   * (production), `bootRealKernel` constructs a default
+   * `new NetDriver()` that wraps `globalThis.fetch` +
+   * `globalThis.WebSocket`. Tests pass a `NetDriver(fakeFetcher,
+   * fakeWsFactory)` so HTTP / WebSocket round-trips don't hit
+   * the real network.
+   */
+  readonly netDriver?: import("./drivers/types").Driver;
 }
 
 /**
@@ -390,6 +399,23 @@ async function bootRealKernel(
       blockDriver = undefined;
     }
   }
+
+  // T086: instantiate the net driver. Default constructor wraps
+  // `globalThis.fetch` + `WebSocket`; when `globalThis.fetch` is
+  // missing (rare), the driver still constructs but every call
+  // surfaces ECONNRESET — graceful degradation rather than a
+  // boot-time refusal.
+  let netDriver: import("./drivers/types").Driver | undefined;
+  if (options.netDriver !== undefined) {
+    netDriver = options.netDriver;
+  } else {
+    try {
+      const { NetDriver } = await import("./drivers/net");
+      netDriver = new NetDriver();
+    } catch {
+      netDriver = undefined;
+    }
+  }
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -403,6 +429,7 @@ async function bootRealKernel(
     },
     ...(registry !== undefined ? { binaryRegistry: registry } : {}),
     ...(blockDriver !== undefined ? { blockDriver } : {}),
+    ...(netDriver !== undefined ? { netDriver } : {}),
     kernelWorkerChannel: {
       postMessage: (msg: KernelToMain): void => {
         messaging.postMessage(msg);
