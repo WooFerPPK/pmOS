@@ -111,6 +111,34 @@
 //! write, so combining `-c`/`-C` with `-o` is a usage error:
 //! `sort: cannot combine -c and -o` (or `-C and -o`) on stderr, exit 1,
 //! no file created.
+//! `-k N` selects field N (1-indexed) as the comparison key (POSIX
+//! `--key=N` long form deferred). The line is whitespace-tokenized
+//! via `str::split_whitespace` (POSIX `[[:blank:]]` runs collapse to
+//! a single separator); the Nth token IS the key, with tokens after
+//! N ignored for sorting. Both `-k N` (space-separated) and `-kN`
+//! (no space) forms are accepted, mirroring `-o FILE` shape. Lines
+//! with fewer than N tokens treat the missing key as the empty
+//! string (which sorts first among empty-key lines, preserved by
+//! stable sort). The OUTPUT is the FULL ORIGINAL LINE — `-k` is a
+//! key SELECTOR, not a field PROJECTOR; only the comparison position
+//! reflects the chosen field. Composition order is select_field →
+//! trim → filter (printable / dictionary) → fold, so `-k` composes
+//! with `-n` (numeric on the field), `-f` (case-fold the field),
+//! `-r` (reverse the field-key sort), `-u` (dedupe by field key),
+//! `-c`/`-C` (check by field key), `-b` (trim leading blanks of the
+//! field — usually a no-op since `split_whitespace` already trims),
+//! `-d` (dictionary filter on the field), `-i` (printable filter on
+//! the field). Invalid `-k` parameters — `-k 0` (zero is invalid;
+//! fields are 1-indexed), `-k -1` (negative), `-k foo` (non-integer),
+//! `-k` with no following argv value (placeholder `<missing>`),
+//! `-k ""` (empty string) — all write
+//! `sort: invalid field specification: <value>\n` to stderr and exit 1.
+//! Explicitly deferred (out of slice scope, future `-k` follow-ups):
+//! `-k N,M` start-end range form; `-k N.C` start-field-plus-character-offset
+//! form; the full `-k F[.C][OPTS][,F[.C][OPTS]]` POSIX notation; per-key
+//! sort options like `-k 2n,3` (per-key flag overrides); `-t SEP` custom
+//! field separator (currently hardcoded to whitespace); `--key=` long
+//! form alias.
 //! Unknown flags write `sort: unknown flag: <flag>` to stderr and
 //! exit 2 (matching grep's open-error/usage exit code).
 //!
@@ -133,6 +161,7 @@ fn main() -> ExitCode {
     let mut ignore_nonprinting = false;
     let mut dictionary_order = false;
     let mut output: Option<String> = None;
+    let mut key_field: Option<usize> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
     let mut idx = 0usize;
@@ -173,6 +202,33 @@ fn main() -> ExitCode {
                             return ExitCode::from(2);
                         };
                         output = Some(value);
+                    }
+                    'k' => {
+                        let value_opt: Option<String> = if ci < cluster.len() {
+                            let rest: String = cluster[ci..].iter().collect();
+                            ci = cluster.len();
+                            Some(rest)
+                        } else if idx < args.len() {
+                            let v = args[idx].clone();
+                            idx += 1;
+                            Some(v)
+                        } else {
+                            None
+                        };
+                        let parsed = value_opt
+                            .as_deref()
+                            .and_then(|v| v.parse::<usize>().ok().filter(|&n| n > 0));
+                        match parsed {
+                            Some(n) => key_field = Some(n),
+                            None => {
+                                let display = value_opt.as_deref().unwrap_or("<missing>");
+                                let _ = writeln!(
+                                    io::stderr(),
+                                    "sort: invalid field specification: {display}"
+                                );
+                                return ExitCode::from(1);
+                            }
+                        }
                     }
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
@@ -226,13 +282,26 @@ fn main() -> ExitCode {
             ignore_blanks,
             ignore_nonprinting,
             dictionary_order,
+            key_field,
             reverse,
             unique,
             silent_check,
         );
     }
 
-    if numeric {
+    if key_field.is_some() {
+        lines.sort_by_key(|line| {
+            key_for(
+                line,
+                numeric,
+                fold,
+                ignore_blanks,
+                ignore_nonprinting,
+                dictionary_order,
+                key_field,
+            )
+        });
+    } else if numeric {
         lines.sort_by_key(|line| parse_leading_int(line));
     } else if dictionary_order {
         lines.sort_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
@@ -249,7 +318,19 @@ fn main() -> ExitCode {
         lines.reverse();
     }
     if unique {
-        if numeric {
+        if key_field.is_some() {
+            lines.dedup_by_key(|line| {
+                key_for(
+                    line,
+                    numeric,
+                    fold,
+                    ignore_blanks,
+                    ignore_nonprinting,
+                    dictionary_order,
+                    key_field,
+                )
+            });
+        } else if numeric {
             lines.dedup();
         } else if dictionary_order {
             lines.dedup_by_key(|line| filter_dictionary_then_maybe_fold(line, ignore_blanks, fold));
@@ -306,21 +387,30 @@ fn key_for(
     ignore_blanks: bool,
     ignore_nonprinting: bool,
     dictionary_order: bool,
+    key_field: Option<usize>,
 ) -> Key {
+    let base: &str = match key_field {
+        Some(n) => select_field(line, n),
+        None => line,
+    };
     if numeric {
-        Key::Numeric(parse_leading_int(line))
+        Key::Numeric(parse_leading_int(base))
     } else if dictionary_order {
-        Key::Bytes(filter_dictionary_then_maybe_fold(line, ignore_blanks, fold))
+        Key::Bytes(filter_dictionary_then_maybe_fold(base, ignore_blanks, fold))
     } else if ignore_nonprinting {
-        Key::Bytes(filter_printable_then_maybe_fold(line, ignore_blanks, fold))
+        Key::Bytes(filter_printable_then_maybe_fold(base, ignore_blanks, fold))
     } else {
-        let s = maybe_trim(line, ignore_blanks);
+        let s = maybe_trim(base, ignore_blanks);
         if fold {
             Key::Bytes(fold_to_upper_bytes(s))
         } else {
             Key::Bytes(s.as_bytes().to_vec())
         }
     }
+}
+
+fn select_field(line: &str, field: usize) -> &str {
+    line.split_whitespace().nth(field - 1).unwrap_or("")
 }
 
 fn check_sorted(
@@ -330,6 +420,7 @@ fn check_sorted(
     ignore_blanks: bool,
     ignore_nonprinting: bool,
     dictionary_order: bool,
+    key_field: Option<usize>,
     reverse: bool,
     unique: bool,
     silent: bool,
@@ -343,6 +434,7 @@ fn check_sorted(
             ignore_blanks,
             ignore_nonprinting,
             dictionary_order,
+            key_field,
         );
         let curr = key_for(
             &lines[i],
@@ -351,6 +443,7 @@ fn check_sorted(
             ignore_blanks,
             ignore_nonprinting,
             dictionary_order,
+            key_field,
         );
         let ord = prev.cmp(&curr);
         let violation = match (reverse, unique) {

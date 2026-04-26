@@ -1433,3 +1433,305 @@ fn dash_o_with_no_input_writes_empty_file() {
     );
     cleanup(&dir);
 }
+
+// ---------- -k field-keyed sort ----------
+
+#[test]
+fn dash_k_selects_field_n_for_sort() {
+    let dir = scratch_dir("k_basic");
+    let path = write_file(&dir, "in.txt", b"alpha 3\nbravo 1\ncharlie 2\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(out.stdout, b"bravo 1\ncharlie 2\nalpha 3\n");
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_k_glued_form_works() {
+    let dir = scratch_dir("k_glued");
+    let path = write_file(&dir, "in.txt", b"alpha 3\nbravo 1\ncharlie 2\n");
+
+    let glued = Command::new(SORT)
+        .arg("-k2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+    let spaced = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(glued.status.success(), "exit status: {:?}", glued.status);
+    assert!(spaced.status.success(), "exit status: {:?}", spaced.status);
+    assert_eq!(glued.stdout, spaced.stdout);
+    assert_eq!(glued.stdout, b"bravo 1\ncharlie 2\nalpha 3\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_k_zero_is_invalid_field() {
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("0")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: invalid field specification: 0"),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_k_negative_is_invalid_field() {
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("-1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: invalid field specification: -1"),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_k_non_integer_is_invalid_field() {
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("foo")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: invalid field specification: foo"),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_k_with_no_value_is_invalid_field() {
+    let out = Command::new(SORT)
+        .arg("-k")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: invalid field specification: <missing>"),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_k_empty_string_is_invalid_field() {
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sort: invalid field specification: "),
+        "stderr = {stderr:?}"
+    );
+}
+
+#[test]
+fn dash_k_missing_field_uses_empty_key() {
+    let dir = scratch_dir("k_missing");
+    let path = write_file(&dir, "in.txt", b"alpha\nbravo 1\ncharlie\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"alpha\ncharlie\nbravo 1\n",
+        "lines with no field 2 (empty key) sort first stably; bravo 1's field 2 is '1'"
+    );
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_k_preserves_full_line_in_output() {
+    let dir = scratch_dir("k_preserve");
+    let path = write_file(&dir, "in.txt", b"keep all this z\nkeep all this a\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("4")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"keep all this a\nkeep all this z\n",
+        "output must be the FULL line, not just the field"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_kn_combines_field_and_numeric() {
+    let dir = scratch_dir("kn");
+    let path = write_file(&dir, "in.txt", b"x 100\ny 9\nz 50\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg("-n")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"y 9\nz 50\nx 100\n",
+        "numeric on field 2: 9 < 50 < 100"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_kr_combines_field_and_reverse() {
+    let dir = scratch_dir("kr");
+    let path = write_file(&dir, "in.txt", b"alpha 3\nbravo 1\ncharlie 2\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg("-r")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"alpha 3\ncharlie 2\nbravo 1\n",
+        "reverse of field-2 sort: 3 > 2 > 1"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_ku_dedupes_by_field_key() {
+    let dir = scratch_dir("ku");
+    let path = write_file(&dir, "in.txt", b"red apple\nblue apple\ngreen banana\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg("-u")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"red apple\ngreen banana\n",
+        "dedupe by field-2 key collapses duplicate 'apple' keys to the first"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_kc_checks_with_field_keys() {
+    let field_sorted = run_check(&["-k", "2", "-c"], b"red 1\nblue 2\ngreen 3\n");
+    assert!(
+        field_sorted.status.success(),
+        "exit status: {:?}, stderr: {:?}",
+        field_sorted.status,
+        String::from_utf8_lossy(&field_sorted.stderr)
+    );
+    assert!(field_sorted.stderr.is_empty());
+
+    let plain_check = run_check(&["-c"], b"red 1\nblue 2\ngreen 3\n");
+    assert_eq!(
+        plain_check.status.code(),
+        Some(1),
+        "plain -c should fail because 'red 1' > 'blue 2' under raw lex (r > b)"
+    );
+    let stderr = String::from_utf8_lossy(&plain_check.stderr);
+    assert!(stderr.contains("disorder"), "stderr = {stderr:?}");
+}
+
+#[test]
+fn dash_kf_combines_field_and_fold() {
+    let dir = scratch_dir("kf");
+    let path = write_file(&dir, "in.txt", b"x BANANA\ny apple\nz Cherry\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg("-f")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"y apple\nx BANANA\nz Cherry\n",
+        "fold of field 2: apple < BANANA < Cherry case-insensitively"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_kd_combines_field_and_dictionary() {
+    let dir = scratch_dir("kd");
+    let path = write_file(&dir, "in.txt", b"x co-op\ny coop\nz ca!t\n");
+
+    let out = Command::new(SORT)
+        .arg("-k")
+        .arg("2")
+        .arg("-d")
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert_eq!(
+        out.stdout,
+        b"z ca!t\nx co-op\ny coop\n",
+        "dictionary filter on field 2: 'cat' < 'coop' (== 'coop' from co-op stripped) — stable, x before y"
+    );
+    cleanup(&dir);
+}
