@@ -299,32 +299,32 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
 function main(): void {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
 
-  // Real-kernel mode is the default boot path. The legacy
-  // MockKernel demo (faux shell + live terminal + boot-screen
-  // check rows) is kept accessible via `#mock-kernel` so existing
-  // bookmarks + the preview-era demo story still work; `#real-kernel`
-  // continues to force the new path for anyone who was using that
-  // hash explicitly. Demo-binary hash:
+  // Boot-to-desktop is the default boot path: bare URL spawns
+  // `/bin/init-desktop`, which spawns the real display-server +
+  // shell binaries and paints the wallpaper + taskbar. Hashes
+  // select the alternative paths used by tests + the preview
+  // demo:
+  //   * `#real-kernel` → `/bin/init` (the legacy four-pid demo
+  //     tree: init + hello-std + display-server +
+  //     display-client-demo × 2 + IPC round-trip + SIGTERM
+  //     teardown). The `real-kernel.spec.ts` Playwright spec
+  //     uses this hash explicitly.
   //   * `#input-echo` → `/bin/hello_input_echo` (no_std cdylib
   //     that polls `/dev/input_kbd` + echoes to stdout — the
-  //     browser-side proof of the input round-trip)
-  // Anything else (bare URL, `#real-kernel`) → `/bin/init` default,
-  // which boots a four-pid tree (init + hello-std + display-server
-  // + display-client-demo) and exercises the full display-server
-  // IPC round-trip end-to-end through real concurrent user Workers.
-  // The `#boot-to-desktop` hash selects `/bin/init-desktop`, which
-  // boots the real desktop (init-desktop + display-server + shell)
-  // — the T127 Playwright spec uses this to pin the cold-boot path
-  // through wallpaper paint.
+  //     browser-side proof of the input round-trip).
+  //   * `#mock-kernel` → fall through to the legacy MockKernel
+  //     boot-screen check rows below (faux shell + live
+  //     terminal + capability checks).
+  //   * `#boot-to-desktop` → explicit alias for the default.
   if (!window.location.hash.includes("mock-kernel")) {
     const hash = window.location.hash;
     let bootBinary: string;
     if (hash.includes("input-echo")) {
       bootBinary = "/bin/hello_input_echo";
-    } else if (hash.includes("boot-to-desktop")) {
-      bootBinary = "/bin/init-desktop";
-    } else {
+    } else if (hash.includes("real-kernel")) {
       bootBinary = "/bin/init";
+    } else {
+      bootBinary = "/bin/init-desktop";
     }
     runRealKernelMode(bootBinary);
     return;

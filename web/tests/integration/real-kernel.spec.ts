@@ -71,7 +71,10 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
     consoleLines.push(`[pageerror] ${err.message}`);
   });
 
-  await page.goto("/index.html");
+  // The bare URL now boots /bin/init-desktop (wallpaper + shell).
+  // This spec exercises the legacy 4-pid demo tree, so target
+  // `#real-kernel` explicitly to opt into the demo flow.
+  await page.goto("/index.html#real-kernel");
 
   // T095/T110 slice: the trailing observable is `init exiting`,
   // printed after init's proc_wait supervision loop has reaped

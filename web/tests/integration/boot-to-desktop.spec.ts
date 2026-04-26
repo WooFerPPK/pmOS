@@ -48,7 +48,11 @@ test("boot-to-desktop: init-desktop spawns display-server + shell, shell paints 
   });
 
   const t0 = Date.now();
-  await page.goto("/index.html#boot-to-desktop");
+  // The bare URL now boots /bin/init-desktop (wallpaper + shell)
+  // by default; the `#boot-to-desktop` hash is an explicit alias
+  // for the same path. Target the bare URL so the spec doubles as
+  // a smoke test that the default boot path works.
+  await page.goto("/index.html");
 
   // Phase 1: init-desktop announces and spawns the two
   // children. Cold-start CI gets a generous timeout because

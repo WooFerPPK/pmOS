@@ -1,10 +1,10 @@
-# PMos demo build — how to run it
+# PMos build — how to run it
 
-This directory is a self-contained static deployment of the PMos
-boot-screen demo. It shows the PMos boot sequence in a browser,
-verifies every environment capability the real kernel will need,
-and stalls at "kernel loading…" because the kernel WASM is not
-yet compiled.
+This directory is a self-contained static deployment of PMos.
+The kernel, display server, desktop shell, and every bundled
+binary are present as `.wasm` files; opening `index.html` in a
+COOP/COEP-isolated browser tab boots the kernel, spawns init,
+and renders the desktop wallpaper.
 
 **The entire bundle is static files.** There is no server
 component, no backend, no database, no account system. This is
@@ -96,56 +96,67 @@ Cloudflare Worker in front of your Pages URL that injects the
 two headers on every response. The `docs/deploy-github-pages.md`
 write-up (T209 polish task in `tasks.md`) covers this.
 
+## URL routes
+
+The default URL boots straight to the desktop. Use a URL hash
+to select a different boot path:
+
+* `/` (no hash) → spawns init-desktop, which spawns the full
+  display-server + shell binaries; the desktop renders a
+  wallpaper and a taskbar. `#boot-to-desktop` is an explicit
+  alias for the same path.
+* `/#real-kernel` → legacy demo flow (4-pid tree:
+  init + hello-std + display-server + display-client-demo × 2;
+  ends with `display-server fb blit ok` + `init exiting`).
+* `/#input-echo` → boots `/bin/hello_input_echo` (no kernel
+  scheduler activity beyond a single user Worker; types echoed
+  to console).
+* `/#mock-kernel` → keeps the legacy preview boot screen with
+  capability checks instead of running the kernel.
+
 ## What you should see
 
-A dark blue terminal-style boot screen with:
+For `/#boot-to-desktop`:
 
 ```
-PMos 0.1.0-demo
-browser-hosted operating system — demo build
-
-[  OK  ] Cross-origin isolation (COOP/COEP)    crossOriginIsolated === true
-[  OK  ] SharedArrayBuffer                     typeof === 'function'
-[  OK  ] Atomics.wait                          available
-[  OK  ] Origin Private Filesystem (OPFS)      navigator.storage.getDirectory ok
-[  OK  ] Service worker                        navigator.serviceWorker present
-[  OK  ] OffscreenCanvas                       transfer-to-worker supported
-[ WAIT ] Kernel WASM load (/assets/kernel.wasm) HTTP 404 — not yet built
-[  --  ] Display server                        not wired in the demo
-[  --  ] Desktop shell                         not wired in the demo
+init-desktop starting
+init-desktop spawned display-server pid=3
+init-desktop spawned shell pid=4
+init-desktop entering supervision loop
+display-server starting
+shell: starting
+shell: connected to /run/display
+display-server served client 0
 ```
 
-If every row above "Kernel WASM load" is OK, your deployment is
-correct and the next build (real Rust kernel + display server +
-toolkit + shell) will take over automatically. If any of those
-rows is FAIL, your headers are wrong and you should fix them
-before adding more moving parts.
+After the served-client line lands, the desktop's wallpaper +
+taskbar paints to the framebuffer canvas. Cold-load is ~400 ms
+in headless Chromium.
 
-## What's NOT in this demo
+For the default real-kernel boot:
 
-* No actual kernel. The WASM binary at `/assets/kernel.wasm`
-  does not exist yet — the "Kernel WASM load" line stalls
-  deliberately to prove the real fetch path works.
-* No display server, window toolkit, desktop shell, or any
-  bundled applications. Those are Phase 2+ of the real build
-  (T098+ in `tasks.md`).
-* No OPFS filesystem persistence. The demo only *checks* that
-  OPFS is available; it does not write or read anything.
-* No service worker precache. The `sw.js` is a skeleton that
-  will be filled in by T087 once the manifest lists real
-  assets to cache.
+```
+init starting
+init spawned hello-std pid=3
+init spawned display-server pid=4
+init spawned display-client-demo pid=5
+…
+display-server served client 0
+display-server served client 1
+init reaped child pid=…
+init sent SIGTERM to display-server pid=4
+display-server fb blit ok
+init exiting
+```
 
-## Next steps to see the real kernel
+## Troubleshooting
 
-1. Install Rust with `rustup` and add the
-   `wasm32-unknown-unknown` target.
-2. Run `just build` from the repo root (requires `just`, `node`,
-   `cargo`, and the `wasm32-unknown-unknown` target).
-3. `dist/assets/kernel.wasm` will be produced.
-4. Reload the page. The "Kernel WASM load" line will turn OK
-   and the boot sequence will continue into the real kernel
-   init. (Real kernel wire-up to `bootstrap.ts` lands in
-   T085 of `tasks.md`.)
+If the boot screen shows **FAIL** for any environment row,
+your headers are wrong. Open devtools → Network → click any
+asset → Headers tab; every response must include
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. Without them
+`SharedArrayBuffer` won't construct and the kernel can't run.
 
 ## Reporting problems
 
