@@ -383,11 +383,78 @@ describe("process lifecycle", () => {
       read.heapOut!.slice(0, Number(read.response!.value)),
     );
     // Format: "<1m> <5m> <15m> <running>/<total> <last_pid>\n".
-    // Loads stay 0.00 until the scheduler tracks busy/idle ticks;
-    // the running/total/last_pid trio projects live state. The
-    // single registered+running process means running=total=1
-    // and last_pid=<pid>.
+    // With nowNs frozen at 0 (deterministic test clock), the
+    // load averages never accumulate decay — they stay 0.00.
+    // The running/total/last_pid trio projects live state:
+    // one registered+running process → running=total=1,
+    // last_pid=<pid>.
     expect(text).toBe(`0.00 0.00 0.00 1/1 ${pid}\n`);
+  });
+
+  it("/proc/loadavg accumulates non-zero averages as the kernel clock advances", async () => {
+    // Drive the wasm-side `Platform::now_ns` host import from a
+    // mutable counter so each /proc/loadavg read sees a different
+    // monotonic time. After many sample intervals the 1m EMA
+    // should reflect the runnable count of the registered process.
+    let now = 0n;
+    const { host } = await freshHost({ nowNs: () => now });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/proc/loadavg");
+    function readLoadavg(): string {
+      const open = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.PATH_OPEN,
+          requestId: 5301,
+          arg0: 0,
+          heapPtr: 0,
+          heapLen: pathBytes.length,
+        },
+        pathBytes,
+      );
+      const fd = Number(open.response!.value);
+      const read = host.dispatch(pid, {
+        opcode: OP_WASI.FD_READ,
+        requestId: 5302,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: 64,
+      });
+      return new TextDecoder().decode(
+        read.heapOut!.slice(0, Number(read.response!.value)),
+      );
+    }
+
+    // First read at now=0 seeds the LoadAverages without a decay
+    // step — loads still 0.00.
+    expect(readLoadavg()).toMatch(/^0\.00 0\.00 0\.00 1\/1 /);
+
+    // Advance the clock by 100 sample intervals (500 seconds) and
+    // read again. Each read folds in one EMA step per elapsed
+    // sample interval. With one Running process the runnable
+    // count is 1; the 1m average converges fast (approaches 1.0
+    // by step ~30), the 5m average is still climbing past ~0.6,
+    // and the 15m average is well below at ~0.28.
+    now = BigInt(500) * 1_000_000_000n;
+    const text = readLoadavg();
+    const fields = text.split(" ");
+    expect(fields).toHaveLength(5);
+    const [oneM, fiveM, fifteenM, ratio, lastPid] = fields;
+    // 1m approaches 1.00 from below — match a single-digit-then-
+    // two-decimal float at least 0.90 (well past initial decay).
+    expect(parseFloat(oneM!)).toBeGreaterThan(0.9);
+    expect(parseFloat(oneM!)).toBeLessThan(1.05);
+    // 5m converges slower; still climbing at this point.
+    expect(parseFloat(fiveM!)).toBeGreaterThan(0.5);
+    expect(parseFloat(fiveM!)).toBeLessThan(parseFloat(oneM!));
+    // 15m slowest of all; just past 1/4 of the way at 500s.
+    expect(parseFloat(fifteenM!)).toBeGreaterThan(0.1);
+    expect(parseFloat(fifteenM!)).toBeLessThan(parseFloat(fiveM!));
+    // Suffix unchanged: still one running process.
+    expect(ratio).toBe("1/1");
+    expect(lastPid).toMatch(/^\d+\n$/);
   });
 
   it("/proc/uptime surfaces a live monotonic seconds-since-boot via the live procfs source", async () => {

@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use abi::cap::CapSet;
 use abi::ext::Pid;
 
+pub mod loadavg;
 pub mod sched;
 pub mod signal;
 pub mod table;

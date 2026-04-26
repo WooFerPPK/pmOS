@@ -217,23 +217,39 @@ impl ProcFsSource for LiveProcFsSource {
 
     fn loadavg(&self) -> String {
         // Linux format: "<1m> <5m> <15m> <running>/<total> <last_pid>\n".
-        // The three load averages stay 0.00 until the scheduler
-        // tracks busy/idle ticks; running/total/last_pid project
-        // live state through the process table.
-        Self::with_kernel(|k| {
-            let live = k.procs.live_pids();
-            let total = live.len();
-            let mut running = 0usize;
-            for pid in &live {
-                if let Some(proc) = k.procs.get(*pid) {
-                    if proc.state == ProcState::Running {
-                        running += 1;
-                    }
+        //
+        // The three averages come from `Scheduler::load_averages`
+        // (a Linux CALC_LOAD-style EMA over `Running + Ready`
+        // process counts; see `proc/loadavg.rs`). We tick the
+        // averages here, on every read of `/proc/loadavg`, so a
+        // long-idle kernel (no syscalls between sample windows)
+        // catches up to wall-clock time at the moment the user
+        // queries the file. Each 5-second interval that has
+        // elapsed since the last tick applies one EMA step.
+        //
+        // `running/total` and `last_pid` project live state
+        // through the process table — same as before the live
+        // averaging landed.
+        let kernel = kernel_mut();
+        let live = kernel.procs.live_pids();
+        let total = live.len();
+        let mut running = 0usize;
+        let mut runnable = 0u32;
+        for pid in &live {
+            if let Some(proc) = kernel.procs.get(*pid) {
+                if proc.state == ProcState::Running {
+                    running += 1;
+                    runnable = runnable.saturating_add(1);
+                } else if proc.state == ProcState::Ready {
+                    runnable = runnable.saturating_add(1);
                 }
             }
-            let last_pid = k.procs.next_pid_peek().saturating_sub(1);
-            format!("0.00 0.00 0.00 {}/{} {}\n", running, total, last_pid)
-        })
+        }
+        let last_pid = kernel.procs.next_pid_peek().saturating_sub(1);
+        let now = crate::platform::current().now_ns();
+        kernel.sched.load_averages.tick(now, runnable);
+        let three = kernel.sched.load_averages.format_three();
+        format!("{} {}/{} {}\n", three, running, total, last_pid)
     }
 
     fn pid_status(&self, pid: Pid) -> Option<ProcStatusSnapshot> {

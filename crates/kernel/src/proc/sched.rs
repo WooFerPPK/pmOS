@@ -23,6 +23,7 @@ use alloc::collections::VecDeque;
 
 use abi::ext::Pid;
 
+use super::loadavg::LoadAverages;
 use super::{ProcState, ProcessTable};
 
 /// Ready-queue scheduler.
@@ -37,6 +38,13 @@ pub struct Scheduler {
     /// The currently "running" pid, if any — the one the kernel
     /// considers the holder of exclusive single-threaded resources.
     current: Option<Pid>,
+    /// 1/5/15-minute moving averages of the runnable process count,
+    /// fed by the kernel's `/proc/loadavg` projection. The averages
+    /// update lazily — every `tick` checks whether at least one
+    /// 5-second sample interval has elapsed and applies one EMA
+    /// step per elapsed interval. See `proc/loadavg.rs` for the
+    /// arithmetic.
+    pub load_averages: LoadAverages,
 }
 
 impl Scheduler {
@@ -44,6 +52,7 @@ impl Scheduler {
         Scheduler {
             ready_queue: VecDeque::new(),
             current: None,
+            load_averages: LoadAverages::new(),
         }
     }
 
