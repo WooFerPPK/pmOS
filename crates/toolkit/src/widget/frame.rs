@@ -49,6 +49,14 @@ pub const TITLEBAR_HEIGHT: u32 = 22;
 /// the border for a particular theme, one edit lands it.
 pub const BORDER_WIDTH: u32 = 1;
 
+/// Hit-test margin for the resize edges of a decorated
+/// window, in pixels. Pointers within this margin of any
+/// of the four window edges land on a resize-edge outcome
+/// rather than the titlebar / content area, so users can
+/// grab the resize edges even though the visible border is
+/// only [`BORDER_WIDTH`] pixels thick.
+pub const RESIZE_HIT_MARGIN: u32 = 4;
+
 /// Close-button side length. The button is a square.
 pub const CLOSE_BUTTON_SIZE: u32 = 16;
 

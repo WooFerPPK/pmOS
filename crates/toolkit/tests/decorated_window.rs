@@ -233,3 +233,117 @@ fn decorated_window_unset_maximized_forwards_to_window() {
     dw.unset_maximized().expect("unset_maximized");
     assert!(!dw.is_maximized());
 }
+
+#[test]
+fn left_edge_click_within_margin_returns_resize_edge_left() {
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    use toolkit::widget::frame::{RESIZE_HIT_MARGIN, TITLEBAR_HEIGHT};
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 300, 200);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    // Click 1 px from the left edge, at a y past the
+    // titlebar so it's in the resize hit-band.
+    let cy = bounds.y + (TITLEBAR_HEIGHT as i32) + 10;
+    let outcome = dw.handle_pointer_down(bounds.x + 1, cy);
+    assert_eq!(outcome, DecoratedPointerOutcome::ResizeEdge(edge::LEFT));
+    // Sanity: the helper agrees.
+    assert_eq!(
+        dw.resize_edge_at(bounds.x + (RESIZE_HIT_MARGIN as i32) - 1, cy),
+        Some(edge::LEFT)
+    );
+}
+
+#[test]
+fn right_edge_click_within_margin_returns_resize_edge_right() {
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    use toolkit::widget::frame::TITLEBAR_HEIGHT;
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 300, 200);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    let cx = bounds.right() - 1;
+    let cy = bounds.y + (TITLEBAR_HEIGHT as i32) + 10;
+    let outcome = dw.handle_pointer_down(cx, cy);
+    assert_eq!(outcome, DecoratedPointerOutcome::ResizeEdge(edge::RIGHT));
+}
+
+#[test]
+fn bottom_left_corner_click_returns_resize_edge_bottom_left() {
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 300, 200);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    let cx = bounds.x + 1;
+    let cy = bounds.bottom() - 1;
+    let outcome = dw.handle_pointer_down(cx, cy);
+    assert_eq!(outcome, DecoratedPointerOutcome::ResizeEdge(edge::BOTTOM_LEFT));
+}
+
+#[test]
+fn bottom_right_corner_click_returns_resize_edge_bottom_right() {
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 300, 200);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    let cx = bounds.right() - 1;
+    let cy = bounds.bottom() - 1;
+    let outcome = dw.handle_pointer_down(cx, cy);
+    assert_eq!(outcome, DecoratedPointerOutcome::ResizeEdge(edge::BOTTOM_RIGHT));
+}
+
+#[test]
+fn bottom_edge_click_within_margin_returns_resize_edge_bottom() {
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 300, 200);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    // Centre x so neither LEFT nor RIGHT triggers, just BOTTOM.
+    let cx = bounds.x + (bounds.width as i32) / 2;
+    let cy = bounds.bottom() - 1;
+    let outcome = dw.handle_pointer_down(cx, cy);
+    assert_eq!(outcome, DecoratedPointerOutcome::ResizeEdge(edge::BOTTOM));
+}
+
+#[test]
+fn top_edge_does_not_surface_a_resize_edge_outcome() {
+    // Per the design note in DecoratedPointerOutcome::ResizeEdge,
+    // the top edge falls through to Titlebar so titlebar-drag
+    // wins over a hidden resize hit-box at the top of the
+    // window. This pins that contract.
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 300, 200);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    // Click at the very top edge, away from the close button.
+    let outcome = dw.handle_pointer_down(20, bounds.y + 1);
+    assert_eq!(outcome, DecoratedPointerOutcome::Titlebar);
+    // Helper also returns None for clicks in the titlebar's
+    // vertical span.
+    assert_eq!(dw.resize_edge_at(20, bounds.y + 1), None);
+}
+
+#[test]
+fn resize_edge_at_returns_none_outside_bounds() {
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 100, 100);
+    let dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    assert_eq!(dw.resize_edge_at(-5, 50), None);
+    assert_eq!(dw.resize_edge_at(500, 50), None);
+    assert_eq!(dw.resize_edge_at(50, -5), None);
+    assert_eq!(dw.resize_edge_at(50, 500), None);
+}
+
+#[test]
+fn request_move_forwards_to_window_no_panic() {
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 200, 100);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    dw.request_move(42).expect("request_move");
+}
+
+#[test]
+fn request_resize_forwards_to_window_no_panic() {
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 200, 100);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    dw.request_resize(99, edge::BOTTOM_RIGHT).expect("request_resize");
+}

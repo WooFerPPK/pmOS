@@ -37,11 +37,11 @@ pub use events::{
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
 pub use requests::{
-    buffer_format, CompositorCreateSurface, DisplayGetRegistry, RegistryBind, SeatGetKeyboard,
-    SeatGetPointer, ShellManagerCloseWindow, ShellManagerFocusWindow,
-    ShellManagerMinimizeWindow, ShellManagerSubscribeWindows, ShmCreatePool,
-    ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage, XdgShellGetToplevel,
-    XdgToplevelAckConfigure, XdgToplevelSetAppId, XdgToplevelSetMaximized, XdgToplevelSetTitle,
-    XdgToplevelUnsetMaximized,
+    buffer_format, xdg_toplevel_resize_edge, CompositorCreateSurface, DisplayGetRegistry,
+    RegistryBind, SeatGetKeyboard, SeatGetPointer, ShellManagerCloseWindow,
+    ShellManagerFocusWindow, ShellManagerMinimizeWindow, ShellManagerSubscribeWindows,
+    ShmCreatePool, ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage, XdgShellGetToplevel,
+    XdgToplevelAckConfigure, XdgToplevelMove, XdgToplevelResize, XdgToplevelSetAppId,
+    XdgToplevelSetMaximized, XdgToplevelSetTitle, XdgToplevelUnsetMaximized,
 };
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

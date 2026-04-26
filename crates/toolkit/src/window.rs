@@ -279,6 +279,37 @@ impl<'a, C: Connection> Window<'a, C> {
             .xdg_toplevel_unset_maximized(self.xdg_toplevel)
     }
 
+    /// Ask the server to initiate an interactive move drag.
+    /// Sends `pmd_xdg_toplevel.move(serial)`. The caller
+    /// passes the serial from the pointer-button event that
+    /// started the drag — typically the most recent
+    /// `pmd_pointer.button` event the app handled. The
+    /// server takes over pointer events for the drag and
+    /// sends `configure` events as the toplevel moves.
+    pub fn request_move(&mut self, serial: u32) -> Result<(), ClientError> {
+        self.app
+            .client_mut()
+            .xdg_toplevel_move(self.xdg_toplevel, serial)
+    }
+
+    /// Ask the server to initiate an interactive resize
+    /// drag. Sends `pmd_xdg_toplevel.resize(serial, edges)`.
+    /// `edges` is a bitfield of
+    /// [`display_proto::xdg_toplevel_resize_edge`] bits —
+    /// either a single edge (`TOP` / `BOTTOM` / `LEFT` /
+    /// `RIGHT`) or one of the four corner combinations
+    /// (`TOP_LEFT` / `TOP_RIGHT` / `BOTTOM_LEFT` /
+    /// `BOTTOM_RIGHT`).
+    pub fn request_resize(
+        &mut self,
+        serial: u32,
+        edges: u32,
+    ) -> Result<(), ClientError> {
+        self.app
+            .client_mut()
+            .xdg_toplevel_resize(self.xdg_toplevel, serial, edges)
+    }
+
     /// The surface object id. Escape hatch for downstream
     /// buffer attachment (T119) and direct protocol use.
     pub fn surface(&self) -> ObjectId {

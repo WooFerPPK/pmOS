@@ -461,3 +461,58 @@ fn window_maximize_restore_round_trip_via_state_bit() {
     assert!(!window.is_maximized());
     assert_eq!(window.configured_size(), (800, 600));
 }
+
+#[test]
+fn window_request_move_sends_move_request_with_serial() {
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+
+    window.request_move(0x1234_5678).expect("request_move must succeed");
+
+    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let requests = parse_requests(&bytes);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].object_id, toplevel_id);
+    assert_eq!(requests[0].opcode, 7 /* move */);
+    assert_eq!(requests[0].payload.len(), 4);
+    assert_eq!(
+        u32::from_le_bytes(requests[0].payload[..4].try_into().unwrap()),
+        0x1234_5678
+    );
+}
+
+#[test]
+fn window_request_resize_sends_resize_request_with_serial_and_edges() {
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+
+    window
+        .request_resize(0xCAFE, edge::BOTTOM_RIGHT)
+        .expect("request_resize must succeed");
+
+    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let requests = parse_requests(&bytes);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].object_id, toplevel_id);
+    assert_eq!(requests[0].opcode, 8 /* resize */);
+    assert_eq!(requests[0].payload.len(), 8);
+    assert_eq!(
+        u32::from_le_bytes(requests[0].payload[..4].try_into().unwrap()),
+        0xCAFE
+    );
+    assert_eq!(
+        u32::from_le_bytes(requests[0].payload[4..8].try_into().unwrap()),
+        edge::BOTTOM_RIGHT
+    );
+}

@@ -348,6 +348,69 @@ impl XdgToplevelUnsetMaximized {
     }
 }
 
+/// Edge bits for [`XdgToplevelResize::edges`]. A resize-drag
+/// can be along a single edge or along two edges meeting at
+/// a corner — e.g. `TOP | LEFT` for the top-left corner.
+/// Mirrors Wayland's `xdg_toplevel.resize_edge` enum but
+/// encoded as a u32 bitfield rather than a fixed enum, since
+/// the v1 collapsed `pmd_xdg_toplevel` is byte-stable around
+/// bit fields. Zero is a degenerate "no edge" value the
+/// server should reject.
+pub mod xdg_toplevel_resize_edge {
+    pub const TOP: u32 = 1 << 0;
+    pub const BOTTOM: u32 = 1 << 1;
+    pub const LEFT: u32 = 1 << 2;
+    pub const RIGHT: u32 = 1 << 3;
+    pub const TOP_LEFT: u32 = TOP | LEFT;
+    pub const TOP_RIGHT: u32 = TOP | RIGHT;
+    pub const BOTTOM_LEFT: u32 = BOTTOM | LEFT;
+    pub const BOTTOM_RIGHT: u32 = BOTTOM | RIGHT;
+}
+
+/// `pmd_xdg_toplevel.move(u32 serial)` — ask the server to
+/// initiate an interactive move drag. The client passes the
+/// serial of the pointer-button event that started the drag
+/// so the server can reject mismatched/stale requests. The
+/// server takes over pointer events for the duration of the
+/// drag and emits `configure` events as the toplevel moves.
+///
+/// Spec note: Wayland's `xdg_toplevel.move` carries a `seat`
+/// argument too; v1 has only one seat (`pmd_seat`) so the
+/// argument is implicit and the wire payload only carries
+/// the serial.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XdgToplevelMove {
+    pub serial: u32,
+}
+
+impl XdgToplevelMove {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgToplevelMove {
+            serial: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_xdg_toplevel.resize(u32 serial, u32 edges)` — ask
+/// the server to initiate an interactive resize drag along
+/// the given edge(s). `edges` is a bitfield of
+/// [`xdg_toplevel_resize_edge`] bits. The server emits
+/// `configure` events with new sizes as the drag proceeds.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XdgToplevelResize {
+    pub serial: u32,
+    pub edges: u32,
+}
+
+impl XdgToplevelResize {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgToplevelResize {
+            serial: read_u32(payload, 0)?,
+            edges: read_u32(payload, 4)?,
+        })
+    }
+}
+
 // ---- pmd_seat (narrowed Wayland wl_seat) ----------------------
 
 /// `pmd_seat.get_pointer(new_id pointer)` — carve a new

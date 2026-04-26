@@ -549,6 +549,34 @@ impl<C: Connection> Client<C> {
         self.send_request(toplevel_id, 6 /* unset_maximized */, &[])
     }
 
+    /// Send `pmd_xdg_toplevel.move(u32 serial)` — ask the
+    /// server to initiate an interactive move drag. The
+    /// `serial` should be the serial of the pointer-button
+    /// event that started the drag.
+    pub fn xdg_toplevel_move(
+        &mut self,
+        toplevel_id: ObjectId,
+        serial: u32,
+    ) -> Result<(), ClientError> {
+        self.send_request(toplevel_id, 7 /* move */, &serial.to_le_bytes())
+    }
+
+    /// Send `pmd_xdg_toplevel.resize(u32 serial, u32 edges)`
+    /// — ask the server to initiate an interactive resize
+    /// drag along the given edge(s). `edges` is a bitfield
+    /// of [`display_proto::xdg_toplevel_resize_edge`] bits.
+    pub fn xdg_toplevel_resize(
+        &mut self,
+        toplevel_id: ObjectId,
+        serial: u32,
+        edges: u32,
+    ) -> Result<(), ClientError> {
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&serial.to_le_bytes());
+        payload[4..].copy_from_slice(&edges.to_le_bytes());
+        self.send_request(toplevel_id, 8 /* resize */, &payload)
+    }
+
     /// Parse as many complete server-bound events out of the
     /// input byte stream as possible. Stops at the first
     /// partial message (returning the events parsed so far

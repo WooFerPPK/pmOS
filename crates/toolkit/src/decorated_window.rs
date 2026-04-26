@@ -54,7 +54,7 @@
 use crate::draw::{Canvas, Rect};
 use crate::theme::Theme;
 use crate::widget::frame::{
-    PointerOutcome, WindowFrame, BORDER_WIDTH, TITLEBAR_HEIGHT,
+    PointerOutcome, WindowFrame, BORDER_WIDTH, RESIZE_HIT_MARGIN, TITLEBAR_HEIGHT,
 };
 use crate::window::Window;
 use crate::protocol::{ClientError, Connection};
@@ -62,9 +62,11 @@ use crate::protocol::{ClientError, Connection};
 /// Outcome of routing a pointer-down event through a
 /// [`DecoratedWindow`]. Mirrors [`PointerOutcome`] but with
 /// `Close` already actioned (the underlying [`Window`] has had
-/// `close_requested` flipped) and with `Outside` collapsed into
+/// `close_requested` flipped), with `Outside` collapsed into
 /// `Content` since the decorated window's bounds always include
-/// the full content area.
+/// the full content area, and with the new `ResizeEdge(bits)`
+/// variant for clicks within [`RESIZE_HIT_MARGIN`] of any
+/// non-titlebar edge.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DecoratedPointerOutcome {
     /// Press landed on the close button. The decorated window
@@ -72,12 +74,21 @@ pub enum DecoratedPointerOutcome {
     /// the app should `break` out of its main loop after this.
     Close,
     /// Press landed on the titlebar outside the close button.
-    /// Apps that support drag-to-move can record the pointer
-    /// position here and start tracking until pointer-up.
-    /// Server-side interactive move (xdg_toplevel.move) is a
-    /// separate slice; this signal tells the app the press was
-    /// on the titlebar so a future move-handler can fire.
+    /// Apps that support drag-to-move call
+    /// [`DecoratedWindow::request_move`] with the pointer-event
+    /// serial to ask the server to start an interactive move.
     Titlebar,
+    /// Press landed within [`RESIZE_HIT_MARGIN`] of one of the
+    /// non-titlebar edges (left / right / bottom edges + the
+    /// three non-top corners). The carried bitfield is a
+    /// [`display_proto::xdg_toplevel_resize_edge`] mask the app
+    /// passes to [`DecoratedWindow::request_resize`] to ask the
+    /// server to start an interactive resize. Top-edge resize
+    /// is intentionally NOT surfaced here — clicks at the top
+    /// of the titlebar fall through to `Titlebar` so the dwm-
+    /// style "click anywhere on the titlebar to drag" gesture
+    /// works without users hitting an invisible resize hit-box.
+    ResizeEdge(u32),
     /// Press landed in the content area. Apps route this to
     /// their own widget tree using
     /// `decorated.content_rect()` as the origin.
@@ -194,6 +205,41 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
         self.frame.draw(canvas);
     }
 
+    /// Resize-edge hit-test. Returns the
+    /// [`display_proto::xdg_toplevel_resize_edge`] bitfield
+    /// for clicks within [`RESIZE_HIT_MARGIN`] of one of the
+    /// non-titlebar window edges (left, right, bottom — plus
+    /// the bottom-left and bottom-right corners which combine
+    /// two adjacent edge bits). Returns `None` for clicks
+    /// outside the window or on the titlebar's vertical span,
+    /// since clicks on the titlebar should drag-to-move
+    /// rather than resize.
+    pub fn resize_edge_at(&self, x: i32, y: i32) -> Option<u32> {
+        use display_proto::xdg_toplevel_resize_edge as edge;
+        let b = self.bounds;
+        // Outside the bounds entirely: no resize edge.
+        if x < b.x || x >= b.right() || y < b.y || y >= b.bottom() {
+            return None;
+        }
+        // Pointers in the titlebar's vertical span are
+        // claimed by the titlebar / close button, not the
+        // resize edges.
+        if y < b.y + TITLEBAR_HEIGHT as i32 {
+            return None;
+        }
+        let m = RESIZE_HIT_MARGIN as i32;
+        let mut edges = 0u32;
+        if x < b.x + m {
+            edges |= edge::LEFT;
+        } else if x >= b.right() - m {
+            edges |= edge::RIGHT;
+        }
+        if y >= b.bottom() - m {
+            edges |= edge::BOTTOM;
+        }
+        if edges == 0 { None } else { Some(edges) }
+    }
+
     /// Route a pointer-down event through the chrome.
     ///
     /// On a press over the close button, the decorated window
@@ -202,7 +248,15 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
     /// should exit on its next iteration. On other regions, the
     /// returned variant tells the caller where the click
     /// landed; the caller decides what to do.
+    ///
+    /// Routing precedence: resize-edge bands (non-titlebar
+    /// edges within [`RESIZE_HIT_MARGIN`]) win over the rest
+    /// so users can grab a resize handle even at the very
+    /// edge of the content area.
     pub fn handle_pointer_down(&mut self, x: i32, y: i32) -> DecoratedPointerOutcome {
+        if let Some(edges) = self.resize_edge_at(x, y) {
+            return DecoratedPointerOutcome::ResizeEdge(edges);
+        }
         match self.frame.pointer_down(x, y) {
             PointerOutcome::Close => {
                 self.close_clicked = true;
@@ -212,6 +266,29 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
             PointerOutcome::Content => DecoratedPointerOutcome::Content,
             PointerOutcome::Outside => DecoratedPointerOutcome::Outside,
         }
+    }
+
+    /// Ask the server to start an interactive move drag.
+    /// Forwards to [`Window::request_move`]. The caller passes
+    /// the serial of the pointer-button event that started the
+    /// drag — typically the most recent
+    /// `pmd_pointer.button` event the app handled. Apps using
+    /// chrome call this from their pointer-down handler on a
+    /// `DecoratedPointerOutcome::Titlebar` outcome.
+    pub fn request_move(&mut self, serial: u32) -> Result<(), ClientError> {
+        self.window.request_move(serial)
+    }
+
+    /// Ask the server to start an interactive resize drag.
+    /// Forwards to [`Window::request_resize`]. `edges` is the
+    /// bitfield from [`Self::resize_edge_at`] /
+    /// [`DecoratedPointerOutcome::ResizeEdge`].
+    pub fn request_resize(
+        &mut self,
+        serial: u32,
+        edges: u32,
+    ) -> Result<(), ClientError> {
+        self.window.request_resize(serial, edges)
     }
 
     /// Route a pointer-up event through the chrome. Today this
@@ -366,12 +443,14 @@ mod tests {
             match o {
                 DecoratedPointerOutcome::Close => "close",
                 DecoratedPointerOutcome::Titlebar => "titlebar",
+                DecoratedPointerOutcome::ResizeEdge(_) => "resize_edge",
                 DecoratedPointerOutcome::Content => "content",
                 DecoratedPointerOutcome::Outside => "outside",
             }
         }
         assert_eq!(describe(DecoratedPointerOutcome::Close), "close");
         assert_eq!(describe(DecoratedPointerOutcome::Titlebar), "titlebar");
+        assert_eq!(describe(DecoratedPointerOutcome::ResizeEdge(0)), "resize_edge");
         assert_eq!(describe(DecoratedPointerOutcome::Content), "content");
         assert_eq!(describe(DecoratedPointerOutcome::Outside), "outside");
     }
