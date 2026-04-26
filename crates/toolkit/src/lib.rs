@@ -20,6 +20,7 @@
 //! stubs — the protocol slice is the foundation.
 
 pub mod app;
+pub mod decorated_window;
 pub mod draw;
 pub mod layout;
 pub mod protocol;
@@ -28,6 +29,7 @@ pub mod widget;
 pub mod window;
 
 pub use app::App;
+pub use decorated_window::{DecoratedPointerOutcome, DecoratedWindow};
 pub use draw::BufferPool;
 pub use protocol::{
     Client, ClientError, ClientEvent, ClientEventWithPayload, Connection, MemoryConnection,

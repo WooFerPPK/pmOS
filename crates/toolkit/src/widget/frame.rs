@@ -160,6 +160,32 @@ impl WindowFrame {
         &self.app_id
     }
 
+    /// Replace the app-id (titlebar caption). The next
+    /// `draw` will paint the new label after re-running the
+    /// fit-to-width truncation logic.
+    pub fn set_app_id(&mut self, app_id: impl Into<String>) {
+        self.app_id = app_id.into();
+    }
+
+    /// Resize the chrome bounds. Used by `DecoratedWindow`
+    /// when the server sends a configure event with a new
+    /// window size; the close button rect is recomputed so
+    /// it stays anchored to the new top-right corner.
+    pub fn set_bounds(&mut self, bounds: Rect) {
+        self.bounds = bounds;
+        let close_rect = compute_close_button_rect(bounds);
+        self.close_button.set_bounds(close_rect);
+    }
+
+    /// Route a pointer-up event through the chrome. Used by
+    /// `DecoratedWindow::handle_pointer_up`. Today this just
+    /// resets any close-button pressed state so a click that
+    /// pressed but moved off before release doesn't leave
+    /// the button visually "stuck".
+    pub fn pointer_up(&mut self, _x: i32, _y: i32) {
+        self.close_button.set_state(ButtonState::Resting);
+    }
+
     pub fn is_focused(&self) -> bool {
         self.focused
     }

@@ -81,10 +81,13 @@ pub trait Connection {
 }
 
 /// In-memory [`Connection`] for tests. `send` appends to the
-/// internal buffer; `drain_outbound` takes the buffer.
+/// outbound buffer; `drain_outbound` takes that buffer.
+/// `feed_inbound` lets paired-with-server tests stage bytes the
+/// server has emitted; `recv` drains those staged bytes.
 #[derive(Default)]
 pub struct MemoryConnection {
     outbound: Vec<u8>,
+    inbound: Vec<u8>,
 }
 
 impl MemoryConnection {
@@ -92,10 +95,20 @@ impl MemoryConnection {
         MemoryConnection::default()
     }
 
-    /// Non-draining view of the buffered bytes. Used by tests
-    /// that want to inspect state without consuming it.
+    /// Non-draining view of the buffered outbound bytes. Used
+    /// by tests that want to inspect state without consuming
+    /// it.
     pub fn outbound(&self) -> &[u8] {
         &self.outbound
+    }
+
+    /// Stage a batch of bytes on the inbound side. The next
+    /// call to [`Connection::recv`] returns everything that has
+    /// been fed so far. Used by tests that pair an `App` with a
+    /// real `display_server::Server` and shuttle the server's
+    /// outbound bytes back into the client.
+    pub fn feed_inbound(&mut self, bytes: &[u8]) {
+        self.inbound.extend_from_slice(bytes);
     }
 }
 
@@ -106,6 +119,10 @@ impl Connection for MemoryConnection {
 
     fn drain_outbound(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbound)
+    }
+
+    fn recv(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.inbound)
     }
 }
 

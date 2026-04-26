@@ -114,6 +114,12 @@ impl Button {
         self.bounds
     }
 
+    /// Replace the button's bounds. The caption resizes via
+    /// internal fit-to-width logic on the next draw.
+    pub fn set_bounds(&mut self, bounds: Rect) {
+        self.bounds = bounds;
+    }
+
     pub fn caption(&self) -> &str {
         self.caption.text()
     }
