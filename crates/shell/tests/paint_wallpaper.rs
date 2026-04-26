@@ -209,6 +209,7 @@ fn build_configure_event(
         serial,
         width,
         height,
+        states: 0,
     };
     let mut payload = Vec::new();
     event.encode(&mut payload);

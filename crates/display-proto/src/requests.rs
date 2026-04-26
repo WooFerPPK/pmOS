@@ -322,6 +322,32 @@ impl XdgToplevelAckConfigure {
     }
 }
 
+/// `pmd_xdg_toplevel.set_maximized()` — ask the server to
+/// maximize this toplevel. Empty payload — the server
+/// answers (eventually) with `configure(serial, w, h,
+/// states | MAXIMIZED)`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XdgToplevelSetMaximized;
+
+impl XdgToplevelSetMaximized {
+    pub fn decode(_payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgToplevelSetMaximized)
+    }
+}
+
+/// `pmd_xdg_toplevel.unset_maximized()` — ask the server to
+/// restore this toplevel from a previously-set maximized
+/// state. Empty payload — the server answers with
+/// `configure(serial, w, h, states & !MAXIMIZED)`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XdgToplevelUnsetMaximized;
+
+impl XdgToplevelUnsetMaximized {
+    pub fn decode(_payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(XdgToplevelUnsetMaximized)
+    }
+}
+
 // ---- pmd_seat (narrowed Wayland wl_seat) ----------------------
 
 /// `pmd_seat.get_pointer(new_id pointer)` — carve a new

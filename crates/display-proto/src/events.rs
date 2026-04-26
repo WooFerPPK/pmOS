@@ -407,14 +407,34 @@ impl KeyboardKey {
 
 // ---- pmd_xdg_toplevel events (§11 + §12 merged) ---------------
 
+/// Bitfield values for [`XdgToplevelConfigure::states`].
+/// Mirrors Wayland's `xdg_toplevel.state` enum but encoded
+/// as a u32 bitfield rather than a variable-length array,
+/// since the v1 collapsed `pmd_xdg_toplevel` sends a fixed
+/// 16-byte payload. Only bits that v1 actively uses are
+/// allocated; future slices can grow the bitfield without
+/// breaking decode (zero is the "no states" default).
+pub mod xdg_toplevel_state {
+    /// The window is currently maximized — the toolkit
+    /// should re-lay-out to fill the work area.
+    pub const MAXIMIZED: u32 = 1 << 0;
+    /// The window is currently fullscreen.
+    pub const FULLSCREEN: u32 = 1 << 1;
+    /// The window is being resized — the toolkit should
+    /// throttle expensive recomputation.
+    pub const RESIZING: u32 = 1 << 2;
+    /// The window has keyboard focus.
+    pub const ACTIVATED: u32 = 1 << 3;
+}
+
 /// `pmd_xdg_toplevel.configure(u32 serial, i32 width,
-/// i32 height)` — the server is proposing a size for the
-/// window.
+/// i32 height, u32 states)` — the server is proposing a size
+/// + state for the window.
 ///
 /// Spec §11 + §12: the `serial` value (from `pmd_xdg_surface`)
-/// and the suggested `width` / `height` (from
-/// `pmd_xdg_toplevel`) are merged into one event in the v1
-/// collapsed `pmd_xdg_toplevel`. The client must reply with
+/// and the suggested `width` / `height` + window-state bitfield
+/// (from `pmd_xdg_toplevel`) are merged into one event in the
+/// v1 collapsed `pmd_xdg_toplevel`. The client must reply with
 /// [`crate::requests::XdgToplevelAckConfigure`] carrying
 /// the same `serial`.
 ///
@@ -422,11 +442,17 @@ impl KeyboardKey {
 /// the client's preferred size" — v1 always sends an
 /// explicit size, but the sentinel is kept for forward
 /// compatibility with the spec.
+///
+/// `states` is a bitfield of [`xdg_toplevel_state`] bits;
+/// `0` means "no special state". Older test fixtures that
+/// pre-date the states extension can pass `0` to get the
+/// previous configure semantics.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct XdgToplevelConfigure {
     pub serial: u32,
     pub width: i32,
     pub height: i32,
+    pub states: u32,
 }
 
 impl XdgToplevelConfigure {
@@ -435,6 +461,7 @@ impl XdgToplevelConfigure {
             serial: read_u32(payload, 0)?,
             width: read_i32(payload, 4)?,
             height: read_i32(payload, 8)?,
+            states: read_u32(payload, 12)?,
         })
     }
 
@@ -442,6 +469,7 @@ impl XdgToplevelConfigure {
         write_u32(out, self.serial);
         write_i32(out, self.width);
         write_i32(out, self.height);
+        write_u32(out, self.states);
     }
 }
 

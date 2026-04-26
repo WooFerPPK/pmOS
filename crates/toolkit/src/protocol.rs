@@ -527,6 +527,28 @@ impl<C: Connection> Client<C> {
         )
     }
 
+    /// Send `pmd_xdg_toplevel.set_maximized()` — ask the
+    /// server to maximize this toplevel. The server replies
+    /// with a `configure(serial, w, h, states | MAXIMIZED)`
+    /// event when it accepts.
+    pub fn xdg_toplevel_set_maximized(
+        &mut self,
+        toplevel_id: ObjectId,
+    ) -> Result<(), ClientError> {
+        self.send_request(toplevel_id, 5 /* set_maximized */, &[])
+    }
+
+    /// Send `pmd_xdg_toplevel.unset_maximized()` — ask the
+    /// server to restore this toplevel from a previously-set
+    /// maximized state. The server replies with
+    /// `configure(serial, w, h, states & !MAXIMIZED)`.
+    pub fn xdg_toplevel_unset_maximized(
+        &mut self,
+        toplevel_id: ObjectId,
+    ) -> Result<(), ClientError> {
+        self.send_request(toplevel_id, 6 /* unset_maximized */, &[])
+    }
+
     /// Parse as many complete server-bound events out of the
     /// input byte stream as possible. Stops at the first
     /// partial message (returning the events parsed so far

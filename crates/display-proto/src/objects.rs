@@ -348,6 +348,8 @@ const XDG_TOPLEVEL_REQUESTS: &[Opcode] = &[
     Opcode { number: 2, direction: Direction::Request, name: "set_app_id" },
     Opcode { number: 3, direction: Direction::Request, name: "destroy" },
     Opcode { number: 4, direction: Direction::Request, name: "ack_configure" },
+    Opcode { number: 5, direction: Direction::Request, name: "set_maximized" },
+    Opcode { number: 6, direction: Direction::Request, name: "unset_maximized" },
 ];
 
 const XDG_TOPLEVEL_EVENTS: &[Opcode] = &[

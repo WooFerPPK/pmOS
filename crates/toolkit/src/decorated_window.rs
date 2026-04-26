@@ -239,6 +239,29 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
         self.close_clicked || self.window.close_requested()
     }
 
+    /// True iff the server's most-recent configure event
+    /// included the `MAXIMIZED` state bit. Forwards to
+    /// [`Window::is_maximized`].
+    pub fn is_maximized(&self) -> bool {
+        self.window.is_maximized()
+    }
+
+    /// Send `pmd_xdg_toplevel.set_maximized()`. The server's
+    /// configure reply will set [`Self::is_maximized`] to
+    /// `true` and (in v1) propose a work-area-sized
+    /// `configured_size`; the caller should re-`resize` the
+    /// chrome to that size on the next dispatch tick.
+    pub fn set_maximized(&mut self) -> Result<(), ClientError> {
+        self.window.set_maximized()
+    }
+
+    /// Send `pmd_xdg_toplevel.unset_maximized()`. The server's
+    /// configure reply will set [`Self::is_maximized`] to
+    /// `false` and propose the previous (non-maximized) size.
+    pub fn unset_maximized(&mut self) -> Result<(), ClientError> {
+        self.window.unset_maximized()
+    }
+
     /// Borrow the wrapped window. Apps that need to issue
     /// protocol requests not surfaced by the decorated facade
     /// (commit, attach buffer, etc.) reach in here.

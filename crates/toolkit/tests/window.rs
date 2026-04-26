@@ -102,13 +102,30 @@ fn build_global_event(
 
 /// Build a single framed `pmd_xdg_toplevel.configure` event
 /// targeting `toplevel_id` with `(serial, width, height)`.
+/// The `states` bitfield is fixed at zero — see
+/// [`build_configure_event_with_states`] for the
+/// state-bearing variant used by maximize/restore tests.
 fn build_configure_event(
     toplevel_id: ObjectId,
     serial: u32,
     width: i32,
     height: i32,
 ) -> Vec<u8> {
-    let event = XdgToplevelConfigure { serial, width, height };
+    build_configure_event_with_states(toplevel_id, serial, width, height, 0)
+}
+
+/// Build a `configure` event payload carrying a non-zero
+/// states bitfield. Used by maximize/restore tests to
+/// inject the `MAXIMIZED` / `ACTIVATED` / etc. state bits
+/// the toolkit decodes from the configure event payload.
+fn build_configure_event_with_states(
+    toplevel_id: ObjectId,
+    serial: u32,
+    width: i32,
+    height: i32,
+    states: u32,
+) -> Vec<u8> {
+    let event = XdgToplevelConfigure { serial, width, height, states };
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut out = vec![0u8; HEADER_SIZE + payload.len()];
@@ -315,4 +332,132 @@ fn window_dispatch_records_close() {
     // yet.
     let client = window.app().client();
     assert_eq!(client.get(toplevel_id), Some(Interface::XdgToplevel));
+}
+
+#[test]
+fn window_dispatch_decodes_states_bitfield() {
+    use display_proto::xdg_toplevel_state;
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+
+    let mixed = xdg_toplevel_state::MAXIMIZED | xdg_toplevel_state::ACTIVATED;
+    window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .push_inbound(build_configure_event_with_states(toplevel_id, 7, 1024, 768, mixed));
+
+    let _ = window.dispatch().expect("dispatch must succeed");
+    assert!(window.is_configured());
+    assert_eq!(window.configured_size(), (1024, 768));
+    assert_eq!(window.states(), mixed);
+    assert!(window.is_maximized());
+    assert!(window.is_activated());
+    assert!(!window.is_fullscreen());
+}
+
+#[test]
+fn window_states_default_to_zero_until_configure_lands() {
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let window = Window::new(&mut app).expect("window creation must succeed");
+    assert_eq!(window.states(), 0);
+    assert!(!window.is_maximized());
+    assert!(!window.is_fullscreen());
+    assert!(!window.is_activated());
+}
+
+#[test]
+fn window_set_maximized_sends_request_with_empty_payload() {
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+
+    window.set_maximized().expect("set_maximized must succeed");
+
+    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let requests = parse_requests(&bytes);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].object_id, toplevel_id);
+    assert_eq!(requests[0].opcode, 5 /* set_maximized */);
+    assert!(requests[0].payload.is_empty());
+}
+
+#[test]
+fn window_unset_maximized_sends_request_with_empty_payload() {
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+
+    window.unset_maximized().expect("unset_maximized must succeed");
+
+    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let requests = parse_requests(&bytes);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].object_id, toplevel_id);
+    assert_eq!(requests[0].opcode, 6 /* unset_maximized */);
+    assert!(requests[0].payload.is_empty());
+}
+
+#[test]
+fn window_maximize_restore_round_trip_via_state_bit() {
+    use display_proto::xdg_toplevel_state;
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+
+    // First configure: not maximized.
+    window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .push_inbound(build_configure_event_with_states(toplevel_id, 1, 800, 600, 0));
+    let _ = window.dispatch().expect("dispatch 1");
+    assert!(!window.is_maximized());
+    assert_eq!(window.configured_size(), (800, 600));
+
+    // Server response to set_maximized: configure with MAXIMIZED bit + work-area-sized geometry.
+    window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .push_inbound(build_configure_event_with_states(
+            toplevel_id,
+            2,
+            1920,
+            1080,
+            xdg_toplevel_state::MAXIMIZED,
+        ));
+    let _ = window.dispatch().expect("dispatch 2");
+    assert!(window.is_maximized());
+    assert_eq!(window.configured_size(), (1920, 1080));
+
+    // Server response to unset_maximized: previous size + clear MAXIMIZED.
+    window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .push_inbound(build_configure_event_with_states(toplevel_id, 3, 800, 600, 0));
+    let _ = window.dispatch().expect("dispatch 3");
+    assert!(!window.is_maximized());
+    assert_eq!(window.configured_size(), (800, 600));
 }

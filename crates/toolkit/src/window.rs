@@ -81,6 +81,10 @@ pub struct Window<'a, C: Connection> {
     /// `true` iff at least one `xdg_toplevel::configure`
     /// has been received.
     configured: bool,
+    /// Most-recent state bitfield from `xdg_toplevel::
+    /// configure(... states)`. Decoded against
+    /// [`display_proto::xdg_toplevel_state`] bits.
+    states: u32,
     /// `true` iff the server has emitted
     /// `xdg_toplevel::close`.
     close_requested: bool,
@@ -119,6 +123,7 @@ impl<'a, C: Connection> Window<'a, C> {
             app_id: String::new(),
             configured_size: (0, 0),
             configured: false,
+            states: 0,
             close_requested: false,
         })
     }
@@ -184,6 +189,7 @@ impl<'a, C: Connection> Window<'a, C> {
                         let height = decoded.height.max(0) as u32;
                         self.configured_size = (width, height);
                         self.configured = true;
+                        self.states = decoded.states;
                         self.app
                             .client_mut()
                             .xdg_toplevel_ack_configure(self.xdg_toplevel, decoded.serial)?;
@@ -223,6 +229,54 @@ impl<'a, C: Connection> Window<'a, C> {
     /// app wants before destroying the `Window`.
     pub fn close_requested(&self) -> bool {
         self.close_requested
+    }
+
+    /// The most-recent state bitfield from
+    /// `xdg_toplevel::configure(... states)`. Decoded
+    /// against [`display_proto::xdg_toplevel_state`] bits.
+    /// Returns `0` until the first configure event lands.
+    pub fn states(&self) -> u32 {
+        self.states
+    }
+
+    /// True iff the server's most-recent configure event
+    /// included the `MAXIMIZED` state bit.
+    pub fn is_maximized(&self) -> bool {
+        (self.states & display_proto::xdg_toplevel_state::MAXIMIZED) != 0
+    }
+
+    /// True iff the server's most-recent configure event
+    /// included the `FULLSCREEN` state bit.
+    pub fn is_fullscreen(&self) -> bool {
+        (self.states & display_proto::xdg_toplevel_state::FULLSCREEN) != 0
+    }
+
+    /// True iff the server's most-recent configure event
+    /// included the `ACTIVATED` state bit (keyboard focus).
+    pub fn is_activated(&self) -> bool {
+        (self.states & display_proto::xdg_toplevel_state::ACTIVATED) != 0
+    }
+
+    /// Send `pmd_xdg_toplevel.set_maximized()` — ask the
+    /// server to maximize this window. The server replies
+    /// (eventually) with a `configure` carrying the
+    /// `MAXIMIZED` state bit + new size; the toolkit picks
+    /// it up via [`Window::dispatch`].
+    pub fn set_maximized(&mut self) -> Result<(), ClientError> {
+        self.app
+            .client_mut()
+            .xdg_toplevel_set_maximized(self.xdg_toplevel)
+    }
+
+    /// Send `pmd_xdg_toplevel.unset_maximized()` — ask the
+    /// server to restore this window from a previously-set
+    /// maximized state. The server replies with a
+    /// `configure` carrying the previous (non-maximized)
+    /// size + state.
+    pub fn unset_maximized(&mut self) -> Result<(), ClientError> {
+        self.app
+            .client_mut()
+            .xdg_toplevel_unset_maximized(self.xdg_toplevel)
     }
 
     /// The surface object id. Escape hatch for downstream

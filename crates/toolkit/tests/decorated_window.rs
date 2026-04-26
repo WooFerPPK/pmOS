@@ -209,3 +209,27 @@ fn pointer_up_resets_close_button_state_safely() {
     // tests.
     let _ = dw.frame();
 }
+
+#[test]
+fn decorated_window_set_maximized_forwards_to_window() {
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 200, 100);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    assert!(!dw.is_maximized());
+    dw.set_maximized().expect("set_maximized");
+    // The wire-level effect is checked by the Window tests;
+    // here we just pin the forwarding round-trip — calling
+    // through DecoratedWindow doesn't panic and the inner
+    // window state hasn't been mutated client-side
+    // (is_maximized still false until configure lands).
+    assert!(!dw.is_maximized());
+}
+
+#[test]
+fn decorated_window_unset_maximized_forwards_to_window() {
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 200, 100);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    dw.unset_maximized().expect("unset_maximized");
+    assert!(!dw.is_maximized());
+}
