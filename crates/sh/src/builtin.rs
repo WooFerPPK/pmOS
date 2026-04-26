@@ -386,26 +386,42 @@ fn builtin_unset<E: Write>(
 ///   accepted in v1 — matches the `export` lenient
 ///   identifier policy in this file.
 ///
+/// Default-mode trailing-backslash line continuation
+/// (POSIX): without `-r`, a TRAILING single backslash at
+/// the end of an input line is a line-continuation marker
+/// — the backslash and the following newline are stripped
+/// and ANOTHER `read_line` call appends a second line.
+/// Multiple consecutive continuations are supported
+/// (`"a\\\nb\\\nc\n"` → `"abc"`). The "is this a
+/// continuation" check counts trailing backslashes on the
+/// post-strip text: an ODD count means the LAST backslash
+/// stands alone (continuation), an EVEN count means every
+/// backslash is paired and the last one is escaped by the
+/// previous (no continuation, all backslashes pass through
+/// verbatim). With `-r` (raw mode), backslashes are LITERAL
+/// — no continuation, no escape interpretation, just strip
+/// `\n` / `\r` and assign verbatim.
+///
 /// Deferred (out of v1 scope):
-/// * All `read` flags: `-r` (raw, no backslash escape
-///   processing), `-n N` (read N chars), `-N N` (read
-///   exactly N chars), `-t SEC` (timeout), `-p PROMPT`
-///   (prompt before reading), `-s` (silent / no echo),
-///   `-d DELIM` (custom line delimiter), `-a ARRAY` (read
-///   into an array). Any `-X` arg in v1 is treated as a
-///   regular var name (a bash-style "unknown flag rejected"
-///   path would need a flag-parser layer that doesn't
-///   exist yet; keeping the v1 path lenient avoids a
-///   confusing error for users typing the canonical bash
-///   `read -r line` who would otherwise get `not a valid
-///   identifier` for `-r`).
+/// * The `--` end-of-flags separator (POSIX `read -- VAR`
+///   to read into a var literally named `-r`) — would need
+///   a tiny extension to the flag-walk loop.
+/// * Combined / clustered short flags like `-rs` or `-rt 5`
+///   (the v1 path stays single-flag-at-a-time; `-rX` is
+///   treated as a regular var name, NOT a `-r` flag with a
+///   `-X` cluster).
+/// * The remaining `read` flags: `-n N` (read N chars),
+///   `-N N` (read EXACTLY N chars), `-t SEC` (timeout),
+///   `-p PROMPT` (prompt before reading), `-s` (silent /
+///   no echo), `-d DELIM` (custom line delimiter),
+///   `-a ARRAY` (read into an array). Each ships
+///   independently when the need arises.
 /// * IFS-based field splitting for multi-VAR reads.
 /// * POSIX identifier-charset validation (matches the
 ///   existing `export` behavior — empty-name is the only
 ///   rejected shape).
-/// * Trailing backslash handling for line continuation
-///   (would require a multi-line read loop with an
-///   unescaped-newline detector).
+/// * Backslash-as-IFS-delimiter-escape (waits on IFS slice).
+/// * Backslash-as-prompt-escape with `-p` (waits on -p slice).
 /// * Heredoc / herestring interaction (those are
 ///   tokenizer-level concerns, not builtin-level).
 fn builtin_read<R: BufRead, E: Write>(
@@ -414,41 +430,91 @@ fn builtin_read<R: BufRead, E: Write>(
     stdin: &mut R,
     stderr: &mut E,
 ) -> BuiltinOutcome {
-    if args.is_empty() {
+    // v1 single-flag parse: only the standalone `-r` form
+    // is recognised. Combined short flags (`-rs`, `-rX`)
+    // and the `--` end-of-flags separator are deferred.
+    let (raw, names) = if !args.is_empty() && args[0] == "-r" {
+        (true, &args[1..])
+    } else {
+        (false, args)
+    };
+    if names.is_empty() {
         let _ = write!(stderr, "sh: read: missing variable name\n");
         let _ = stderr.flush();
         return BuiltinOutcome::Status(2);
     }
-    if args[0].is_empty() {
+    if names[0].is_empty() {
         let _ = write!(stderr, "sh: read: : not a valid identifier\n");
         let _ = stderr.flush();
         return BuiltinOutcome::Status(2);
     }
-    let mut line = String::new();
-    match stdin.read_line(&mut line) {
-        Ok(0) => BuiltinOutcome::Status(1),
-        Ok(_) => {
-            // Strip one trailing `\n`, then one trailing
-            // `\r` (defensive CRLF stripping — copy-pasted
-            // input from Windows terminals often arrives
-            // with `\r\n` line endings; the user did NOT
-            // type the `\r` so we should not preserve it).
-            // Internal whitespace is left alone.
-            let stripped = line
-                .trim_end_matches('\n')
-                .trim_end_matches('\r')
-                .to_string();
-            // v1 multi-VAR simplification: first var gets
-            // the whole line; every remaining var gets the
-            // empty string. Full IFS-splitting is deferred.
-            env.insert(args[0].to_string(), stripped);
-            for extra in &args[1..] {
-                env.insert((*extra).to_string(), String::new());
+    let mut accumulated = String::new();
+    let mut any_line_read = false;
+    loop {
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => {
+                // EOF. If we had read at least one line
+                // already (continuation case), return what
+                // we've accumulated with Status(0) — the
+                // pre-EOF reads succeeded as far as they
+                // could. If no input was read at all, the
+                // canonical EOF Status(1) applies.
+                if any_line_read {
+                    env.insert(names[0].to_string(), accumulated);
+                    for extra in &names[1..] {
+                        env.insert((*extra).to_string(), String::new());
+                    }
+                    return BuiltinOutcome::Status(0);
+                }
+                return BuiltinOutcome::Status(1);
             }
-            BuiltinOutcome::Status(0)
+            Ok(_) => {
+                any_line_read = true;
+                // Strip one trailing `\n`, then one trailing
+                // `\r` (defensive CRLF stripping — copy-pasted
+                // input from Windows terminals often arrives
+                // with `\r\n` line endings; the user did NOT
+                // type the `\r` so we should not preserve it).
+                // Internal whitespace is left alone.
+                let stripped = line
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r');
+                if raw {
+                    // Raw mode: backslashes are literal,
+                    // no continuation, no escape handling.
+                    accumulated.push_str(stripped);
+                    break;
+                }
+                // Default mode: count trailing backslashes.
+                // An ODD count → the last one is a
+                // continuation marker (strip it, read more
+                // and append). An EVEN count → all
+                // backslashes are paired escapes; pass them
+                // through verbatim and stop.
+                let trailing = stripped
+                    .bytes()
+                    .rev()
+                    .take_while(|b| *b == b'\\')
+                    .count();
+                if trailing % 2 == 1 {
+                    accumulated.push_str(&stripped[..stripped.len() - 1]);
+                    continue;
+                }
+                accumulated.push_str(stripped);
+                break;
+            }
+            Err(_) => return BuiltinOutcome::Status(1),
         }
-        Err(_) => BuiltinOutcome::Status(1),
     }
+    // v1 multi-VAR simplification: first var gets the whole
+    // line; every remaining var gets the empty string. Full
+    // IFS-splitting is deferred.
+    env.insert(names[0].to_string(), accumulated);
+    for extra in &names[1..] {
+        env.insert((*extra).to_string(), String::new());
+    }
+    BuiltinOutcome::Status(0)
 }
 
 /// POSIX `set` builtin — mode-flag toggle.

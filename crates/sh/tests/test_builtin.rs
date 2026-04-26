@@ -1447,3 +1447,165 @@ fn read_handles_unicode_line() {
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("h\u{00e9}llo"));
 }
+
+// ---------- read -r flag ----------
+//
+// Without `-r`, POSIX `read` interprets a trailing
+// backslash at the end of an input line as a
+// line-continuation marker — the backslash and following
+// newline are stripped, and a SECOND line is read and
+// concatenated. Multiple consecutive continuations chain.
+// A trailing backslash with another backslash before it
+// (an EVEN count of trailing backslashes) is NOT a
+// continuation — the second-to-last backslash escapes the
+// last one and the value is preserved verbatim. With `-r`,
+// ALL backslashes are LITERAL — no continuation handling,
+// no escape interpretation. `read -r` is the SAFE form
+// that virtually all modern POSIX scripts use (the
+// canonical idiom is `while IFS= read -r line; do ... done`).
+//
+// EOF mid-continuation: when the FIRST line ends with a
+// continuation backslash but EOF arrives before the SECOND
+// line, the v1 simplification returns whatever was
+// accumulated with `Status(0)` (because at least one line
+// WAS read successfully) — POSIX permits either the
+// "Status(0) with partial value" or "Status(1) with no
+// value" reading; v1 picks the more useful one for
+// scripts that want to capture what they got.
+
+#[test]
+fn read_r_treats_trailing_backslash_as_literal() {
+    // `read -r X` against `"foo\\\n"` reads ONE line and
+    // assigns `X=foo\\` — the backslash is preserved
+    // because raw mode disables continuation handling.
+    let (status, _stdout, stderr, env) =
+        drive("read -r X\nfoo\\\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("foo\\"));
+}
+
+#[test]
+fn read_default_treats_trailing_backslash_as_continuation() {
+    // Without `-r`, `"foo\\\nbar\n"` is a continuation:
+    // the backslash + newline are stripped, the second
+    // line is appended → `X=foobar`.
+    let (status, _stdout, stderr, env) =
+        drive("read X\nfoo\\\nbar\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("foobar"));
+}
+
+#[test]
+fn read_default_handles_multiple_continuations() {
+    // Three lines joined by two continuation backslashes
+    // → `"a\\\nb\\\nc\n"` → `X=abc`. Pins that the
+    // continuation loop runs until a non-continuation
+    // line is reached.
+    let (status, _stdout, stderr, env) =
+        drive("read X\na\\\nb\\\nc\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("abc"));
+}
+
+#[test]
+fn read_default_double_backslash_is_not_continuation() {
+    // `"foo\\\\\n"` has TWO trailing backslashes (even
+    // count) — the second-to-last escapes the last, so
+    // there's no continuation. Both backslashes are
+    // preserved verbatim → `X=foo\\\\`.
+    let (status, _stdout, stderr, env) =
+        drive("read X\nfoo\\\\\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("foo\\\\"));
+}
+
+#[test]
+fn read_r_passes_through_double_backslash() {
+    // Same input as the previous test but with `-r`.
+    // The result is identical (`X=foo\\\\`) because raw
+    // mode also preserves all backslashes — but the path
+    // through the code differs (the trailing-count check
+    // is bypassed entirely in raw mode).
+    let (status, _stdout, stderr, env) =
+        drive("read -r X\nfoo\\\\\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("foo\\\\"));
+}
+
+#[test]
+fn read_r_with_multi_var_works() {
+    // The `-r` flag consumes the first arg slot; the
+    // remaining args are var names. The v1 multi-VAR
+    // simplification still applies — first var gets the
+    // whole line, the rest get the empty string.
+    let (status, _stdout, stderr, env) =
+        drive("read -r A B C\nx y z\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("A").map(String::as_str), Some("x y z"));
+    assert_eq!(env.get("B").map(String::as_str), Some(""));
+    assert_eq!(env.get("C").map(String::as_str), Some(""));
+}
+
+#[test]
+fn read_r_with_no_var_names_is_usage_error() {
+    // `read -r` with no var names after the flag → same
+    // diagnostic as bare `read`. The flag is consumed but
+    // the missing-name check fires before any read.
+    let (status, _stdout, stderr, env) =
+        drive("read -r\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stderr.contains("sh: read: missing variable name"),
+        "stderr missing usage diagnostic: {stderr:?}"
+    );
+    assert!(env.is_empty(), "unexpected env entries: {env:?}");
+}
+
+#[test]
+fn read_default_eof_during_continuation_returns_partial_value() {
+    // FIRST line ends with a continuation backslash but
+    // EOF arrives before the SECOND line. v1 simplification:
+    // return whatever was accumulated (`X=foo` after the
+    // continuation backslash is stripped) with Status(0)
+    // because at least one line was read successfully.
+    // Uses direct `run_with_env` because the input must
+    // end EXACTLY at the continuation backslash so the
+    // second `read_line` returns Ok(0).
+    use std::io::BufReader;
+    use std::io::Cursor;
+    let stdin = BufReader::new(Cursor::new(b"read X\nfoo\\\n".to_vec()));
+    let mut stdout = Vec::<u8>::new();
+    let mut stderr = Vec::<u8>::new();
+    let mut env = BTreeMap::<String, String>::new();
+    let mut flags = ShellFlags::default();
+    let status = run_with_env(stdin, &mut stdout, &mut stderr, &mut env, &mut flags);
+    // REPL hits EOF after the read returns Status(0). Eof
+    // maps to exit code 0.
+    assert_eq!(status, ExitStatus::Eof);
+    assert!(
+        String::from_utf8(stderr).expect("stderr utf-8").is_empty(),
+        "unexpected stderr"
+    );
+    // Partial value preserved: the continuation backslash
+    // was stripped, the EOF aborted the second-line read,
+    // and what remains is `foo`.
+    assert_eq!(env.get("X").map(String::as_str), Some("foo"));
+}
+
+#[test]
+fn read_r_preserves_backslash_in_middle_of_line() {
+    // Backslash in the MIDDLE of the line — `-r` mode has
+    // no escape interpretation anywhere, so `"foo\\bar\n"`
+    // reads as `X=foo\\bar` verbatim.
+    let (status, _stdout, stderr, env) =
+        drive("read -r X\nfoo\\bar\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("foo\\bar"));
+}
