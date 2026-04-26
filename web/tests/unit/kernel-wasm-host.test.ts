@@ -294,6 +294,45 @@ describe("process lifecycle", () => {
     expect(text).toContain("VmPeak:\t0 kB\n");
   });
 
+  it("/proc/uptime surfaces a live monotonic seconds-since-boot via the live procfs source", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/proc/uptime");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4301,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 4302,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 64,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    // Format: "<uptime_seconds> 0\n" — uptime is the live
+    // `now_ns - boot_time_ns` projected through Kernel.boot_time_ns
+    // captured at Kernel::new. The host harness instantiates the
+    // kernel synchronously in this test, so seconds may be 0 or
+    // very small but the format must be parseable.
+    expect(text).toMatch(/^\d+ 0\n$/);
+  });
+
   it("/proc/<pid>/fd lists installed file descriptors via the live procfs source", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);

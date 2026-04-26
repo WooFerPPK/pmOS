@@ -212,6 +212,11 @@ pub struct Kernel {
     pub vfs: Vfs,
     pub ipc: IpcTable,
     pub devs: DeviceDispatcher,
+    /// Monotonic timestamp captured at `Kernel::new`, used as the
+    /// boot-time reference for `/proc/uptime`. Sourced from
+    /// `platform::current().now_ns()` so the same clock that
+    /// services `clock_time_get` drives the procfs uptime line.
+    pub boot_time_ns: u64,
     /// Per-process fd tables. Kept in sync with `procs`: every
     /// live pid has an entry. Reaping a process removes it here
     /// too so the drop-order of object-side resources is
@@ -364,6 +369,7 @@ impl Kernel {
             vfs: Vfs::new(),
             ipc: IpcTable::new(),
             devs: DeviceDispatcher::new(),
+            boot_time_ns: crate::platform::current().now_ns(),
             fds: BTreeMap::new(),
             signal_inboxes: BTreeMap::new(),
             pending_wakes: alloc::vec::Vec::new(),

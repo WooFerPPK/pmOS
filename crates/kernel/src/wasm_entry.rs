@@ -183,11 +183,16 @@ impl ProcFsSource for LiveProcFsSource {
     }
 
     fn uptime(&self) -> String {
-        // Real uptime needs a kernel-side monotonic clock plumbed
-        // through `crate::platform::Platform::now_ns`; deferred to
-        // a clock-source slice. Until then, mirror the static
-        // placeholder so user-space parsers don't fail.
-        String::from("0 0\n")
+        // `<seconds_since_boot> <idle_seconds>\n` — Linux serves
+        // both as floats with two decimals; v1 emits integer
+        // seconds because the only consumer is sysmon. Idle time
+        // stays 0 until the scheduler tracks per-tick idle/busy.
+        Self::with_kernel(|k| {
+            let now = crate::platform::current().now_ns();
+            let elapsed = now.saturating_sub(k.boot_time_ns);
+            let secs = elapsed / 1_000_000_000;
+            format!("{} 0\n", secs)
+        })
     }
 
     fn meminfo(&self) -> String {
