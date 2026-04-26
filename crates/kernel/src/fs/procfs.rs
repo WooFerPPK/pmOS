@@ -310,7 +310,7 @@ impl<'a> KernelProcFsSource<'a> {
 /// [`ProcStatusState`] the `/proc/<pid>/status` file serves. The
 /// mapping matches `project_state` in `tests/procfs.rs`.
 #[inline]
-fn proc_state_to_status(state: ProcState) -> ProcStatusState {
+pub fn proc_state_to_status(state: ProcState) -> ProcStatusState {
     match state {
         ProcState::Running => ProcStatusState::Running,
         ProcState::Starting

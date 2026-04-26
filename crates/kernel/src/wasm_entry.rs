@@ -76,9 +76,16 @@ use abi::cap::CapSet;
 use abi::ext::Pid;
 use abi::ring::{Request, SLOT_SIZE};
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::fd::{FdFlags, FdObject};
 use crate::fs::devfs::{DevFs, DEV_CONSOLE};
-use crate::fs::procfs::ProcFs;
+use crate::fs::procfs::{
+    format_argv_cmdline, proc_state_to_status, ProcFdSnapshot, ProcFs, ProcFsSource,
+    ProcStatusSnapshot,
+};
 use crate::fs::tmpfs::TmpFs;
 use crate::proc::ProcState;
 use crate::sys::{Kernel, RegisterArgs};
@@ -127,6 +134,127 @@ fn kernel_mut() -> &'static mut Kernel {
     }
 }
 
+/// Borrow the global kernel immutably. Used by [`LiveProcFsSource`]
+/// to project read-only kernel state into `/proc` without taking
+/// a fresh `&mut` (which would alias with the dispatch's outer
+/// `kernel_mut` borrow). Panics if `kernel_init` hasn't been
+/// called yet.
+fn kernel_ref() -> &'static Kernel {
+    unsafe {
+        KERNEL
+            .as_ref()
+            .expect("kernel_init must be called before any other kernel_* export")
+    }
+}
+
+// ---- live procfs source ------------------------------------------------
+
+/// `ProcFsSource` projecting the live kernel singleton through
+/// `/proc`. Each method call derefs `KERNEL` via `kernel_ref`,
+/// snapshots the requested data into owned values, and returns —
+/// no reference to kernel state escapes the call.
+///
+/// Replaces the `ProcFs::with_static()` placeholder in
+/// `kernel_init` so `/proc/<pid>/status`, `/proc/<pid>/cmdline`,
+/// and the top-level `/proc/version` reflect the running kernel
+/// instead of canned test data.
+///
+/// Safety relies on the wasm32 single-threaded runtime: each
+/// procfs read fires inside a syscall whose outer `kernel_mut`
+/// has exclusive access; we take a fresh `&Kernel` for the
+/// duration of one method call, never store it across call
+/// boundaries, and only ever read.
+pub struct LiveProcFsSource;
+
+impl LiveProcFsSource {
+    fn with_kernel<R>(f: impl FnOnce(&Kernel) -> R) -> R {
+        f(kernel_ref())
+    }
+}
+
+impl ProcFsSource for LiveProcFsSource {
+    fn version(&self) -> String {
+        format!(
+            "PMos {} (wasm32, ABI {}.{})\n",
+            env!("CARGO_PKG_VERSION"),
+            abi::version::ABI_VERSION.0,
+            abi::version::ABI_VERSION.1,
+        )
+    }
+
+    fn uptime(&self) -> String {
+        // Real uptime needs a kernel-side monotonic clock plumbed
+        // through `crate::platform::Platform::now_ns`; deferred to
+        // a clock-source slice. Until then, mirror the static
+        // placeholder so user-space parsers don't fail.
+        String::from("0 0\n")
+    }
+
+    fn meminfo(&self) -> String {
+        // System-wide totals derived from per-process VM
+        // accounting that landed in T168. Format mirrors the
+        // existing placeholder shape ("total peak available")
+        // in bytes, sourced from the live process table.
+        Self::with_kernel(|k| {
+            let mut total: u64 = 0;
+            let mut peak: u64 = 0;
+            for pid in k.procs.live_pids() {
+                if let Some(proc) = k.procs.get(pid) {
+                    total = total.saturating_add(proc.vm_size_bytes);
+                    peak = peak.saturating_add(proc.vm_peak_bytes);
+                }
+            }
+            format!("{} {} {}\n", total, peak, total)
+        })
+    }
+
+    fn loadavg(&self) -> String {
+        // Real loadavg needs scheduler-tick averaging; deferred.
+        String::from("0.00 0.00 0.00 0/0 0\n")
+    }
+
+    fn pid_status(&self, pid: Pid) -> Option<ProcStatusSnapshot> {
+        Self::with_kernel(|k| {
+            let proc = k.procs.get(pid)?;
+            if proc.state == ProcState::Dead {
+                return None;
+            }
+            Some(ProcStatusSnapshot {
+                pid: proc.pid,
+                ppid: proc.ppid,
+                name: proc.name.clone(),
+                state: proc_state_to_status(proc.state),
+                vm_size_bytes: proc.vm_size_bytes,
+                vm_peak_bytes: proc.vm_peak_bytes,
+            })
+        })
+    }
+
+    fn live_pids(&self) -> Vec<Pid> {
+        Self::with_kernel(|k| k.procs.live_pids())
+    }
+
+    fn pid_cmdline(&self, pid: Pid) -> Option<Vec<u8>> {
+        Self::with_kernel(|k| {
+            let proc = k.procs.get(pid)?;
+            if proc.state == ProcState::Dead {
+                return None;
+            }
+            Some(format_argv_cmdline(&proc.argv))
+        })
+    }
+
+    fn pid_fds(&self, _pid: Pid) -> Vec<ProcFdSnapshot> {
+        // pid_fds projection from the live FdTable through to
+        // `/proc/<pid>/fd/<n>` symlinks is the next slice on top
+        // of this one — needs the FdObject → path mapping that
+        // KernelProcFsSource owns in tests but doesn't yet
+        // export through the live source. The default empty Vec
+        // matches the codex T168 first-landing slice (876d855).
+        Vec::new()
+    }
+}
+
 // ---- init --------------------------------------------------------------
 
 /// Initialise the global kernel with the v1 default mount
@@ -159,7 +287,7 @@ pub extern "C" fn kernel_init() -> i32 {
             return -1;
         }
         if k.vfs
-            .mount("/proc", Box::new(ProcFs::with_static()))
+            .mount("/proc", Box::new(ProcFs::new(Box::new(LiveProcFsSource))))
             .is_err()
         {
             return -1;

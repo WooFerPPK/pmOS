@@ -213,6 +213,87 @@ describe("process lifecycle", () => {
     expect(host.syncAll()).toBe(true);
   });
 
+  it("/proc/version surfaces a live PMos version line via the live procfs source", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const pathBytes = new TextEncoder().encode("/proc/version");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4001,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 4002,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 256,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    // The live source emits "PMos <semver> (wasm32, ABI <maj>.<min>)\n".
+    // The static placeholder it replaced was "PMos 0.1.0-alpha (native-test)\n".
+    expect(text).toMatch(/^PMos \S+ \(wasm32, ABI \d+\.\d+\)\n$/);
+  });
+
+  it("/proc/<pid>/status surfaces live process metadata via the live procfs source", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const path = `/proc/${pid}/status`;
+    const pathBytes = new TextEncoder().encode(path);
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4101,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 4102,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 512,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    // Six-line format pinned by T168 (status_ends_with_trailing_newline_and_six_fields).
+    // The live source projects the running process — name "proc" (the
+    // default kernel_register_process name), state R (running, post
+    // markRunning), pid + ppid 0, and zero VmSize/VmPeak (no memory
+    // observation has fired yet because no user Worker is attached).
+    expect(text).toContain("Name:\tproc\n");
+    expect(text).toContain("State:\tR (running)\n");
+    expect(text).toContain(`Pid:\t${pid}\n`);
+    expect(text).toContain("PPid:\t0\n");
+    expect(text).toContain("VmSize:\t0 kB\n");
+    expect(text).toContain("VmPeak:\t0 kB\n");
+  });
+
   it("markRunning on a nonexistent pid throws", async () => {
     const { host } = await freshHost();
     expect(() => host.markRunning(9999)).toThrow(/markRunning/);
