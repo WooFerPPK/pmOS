@@ -17,7 +17,7 @@
 
 use core::str::FromStr;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 /// Shell-wide mode flags toggled at runtime by `set`.
@@ -119,11 +119,24 @@ pub(crate) enum BuiltinOutcome {
 /// through every dispatch lets a future flag (`set -u` /
 /// `set -x` / `set -n`) be observed inside any builtin
 /// without revisiting this signature.
-pub(crate) fn dispatch_builtin<W: Write, E: Write>(
+///
+/// `stdin` is the shell's input-line source — the same
+/// `BufRead` that the REPL pulls command lines from. The
+/// `read` builtin consumes from it directly so that
+/// `read VAR` blocks on the SAME stdin the REPL is reading
+/// (i.e. when the user pipes `printf "x\ny\n" | sh -c
+/// 'read A; read B'` into the shell, the two `read` calls
+/// see `x` and `y` respectively, NOT the REPL line they
+/// were typed on). Every other builtin ignores it; the
+/// signature is `&mut R: BufRead` so a future builtin
+/// (e.g. `wait` for input, a hypothetical `eval`-from-stdin
+/// shape) can plug in without revisiting the signature.
+pub(crate) fn dispatch_builtin<R: BufRead, W: Write, E: Write>(
     tokens: &[&str],
     cwd: &mut PathBuf,
     env: &mut BTreeMap<String, String>,
     flags: &mut ShellFlags,
+    stdin: &mut R,
     stdout: &mut W,
     stderr: &mut E,
 ) -> BuiltinOutcome {
@@ -139,6 +152,7 @@ pub(crate) fn dispatch_builtin<W: Write, E: Write>(
         "export" => builtin_export(&tokens[1..], env, stdout, stderr),
         "unset" => builtin_unset(&tokens[1..], env, stderr),
         "set" => builtin_set(&tokens[1..], flags, stderr),
+        "read" => builtin_read(&tokens[1..], env, stdin, stderr),
         "test" => evaluate_test(&tokens[1..], false, stderr),
         "[" => evaluate_test(&tokens[1..], true, stderr),
         _ => BuiltinOutcome::NotBuiltin,
@@ -318,6 +332,123 @@ fn builtin_unset<E: Write>(
         env.remove(*arg);
     }
     BuiltinOutcome::Continue
+}
+
+/// POSIX `read` builtin — pull a single line from stdin
+/// into a named env var.
+///
+/// The canonical input primitive in POSIX shell scripts:
+/// blocks until a newline-terminated line is available on
+/// stdin, then assigns the line text (with the trailing
+/// newline stripped) to the named variable in the env map.
+/// Returns `Status(0)` on a successful read, `Status(1)`
+/// on EOF (POSIX-canonical) or any underlying I/O error
+/// (silent — POSIX `read` writes diagnostics ONLY for
+/// usage errors, never for read-failure paths), `Status(2)`
+/// for usage errors (no args, empty-string var name).
+///
+/// Exact behavior:
+///
+/// * `read VAR` reads ONE line via `BufRead::read_line`
+///   into a fresh `String`. The line is delivered WITH its
+///   trailing newline; the helper strips one trailing `\n`
+///   then one trailing `\r` (defensive against CRLF input,
+///   common from copy-pasted text). Internal whitespace is
+///   preserved verbatim — `read X` against `"  foo bar  \n"`
+///   assigns `X="  foo bar  "`. The post-strip text (which
+///   may be empty for a bare-newline line) is inserted into
+///   the env map; an existing entry under the same name is
+///   overwritten.
+/// * `read VAR1 VAR2 VAR3` (multiple vars) — v1 simplification:
+///   the entire line goes to the FIRST var, every remaining
+///   var is set to the empty string. Full POSIX IFS-splitting
+///   (split the line on `IFS` whitespace, give the first
+///   N-1 tokens to vars 1..N-1 and the joined remainder to
+///   the last var) is explicitly DEFERRED. The shape is
+///   right (assignments happen, env map mutates) so scripts
+///   that use the multi-var form for "consume the line and
+///   discard the rest" already work; future slices will
+///   refine the splitting.
+/// * EOF (stdin exhausted, `read_line` returns `Ok(0)`) →
+///   no assignment, `Status(1)`. Pre-existing entries under
+///   any of the named vars are left untouched.
+/// * I/O error from `read_line` → no assignment,
+///   `Status(1)`, NO stderr write (POSIX-aligned silent
+///   failure).
+/// * `read` with NO args → `sh: read: missing variable
+///   name\n` to stderr, `Status(2)`. Usage error, no env
+///   mutation.
+/// * `read ""` (empty-string var name) → `sh: read: : not a
+///   valid identifier\n` to stderr, `Status(2)`. Mirrors
+///   the existing `export` empty-name diagnostic shape.
+///   Non-empty names (including names that bash would
+///   reject like `read 1foo` or `read foo-bar`) are
+///   accepted in v1 — matches the `export` lenient
+///   identifier policy in this file.
+///
+/// Deferred (out of v1 scope):
+/// * All `read` flags: `-r` (raw, no backslash escape
+///   processing), `-n N` (read N chars), `-N N` (read
+///   exactly N chars), `-t SEC` (timeout), `-p PROMPT`
+///   (prompt before reading), `-s` (silent / no echo),
+///   `-d DELIM` (custom line delimiter), `-a ARRAY` (read
+///   into an array). Any `-X` arg in v1 is treated as a
+///   regular var name (a bash-style "unknown flag rejected"
+///   path would need a flag-parser layer that doesn't
+///   exist yet; keeping the v1 path lenient avoids a
+///   confusing error for users typing the canonical bash
+///   `read -r line` who would otherwise get `not a valid
+///   identifier` for `-r`).
+/// * IFS-based field splitting for multi-VAR reads.
+/// * POSIX identifier-charset validation (matches the
+///   existing `export` behavior — empty-name is the only
+///   rejected shape).
+/// * Trailing backslash handling for line continuation
+///   (would require a multi-line read loop with an
+///   unescaped-newline detector).
+/// * Heredoc / herestring interaction (those are
+///   tokenizer-level concerns, not builtin-level).
+fn builtin_read<R: BufRead, E: Write>(
+    args: &[&str],
+    env: &mut BTreeMap<String, String>,
+    stdin: &mut R,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    if args.is_empty() {
+        let _ = write!(stderr, "sh: read: missing variable name\n");
+        let _ = stderr.flush();
+        return BuiltinOutcome::Status(2);
+    }
+    if args[0].is_empty() {
+        let _ = write!(stderr, "sh: read: : not a valid identifier\n");
+        let _ = stderr.flush();
+        return BuiltinOutcome::Status(2);
+    }
+    let mut line = String::new();
+    match stdin.read_line(&mut line) {
+        Ok(0) => BuiltinOutcome::Status(1),
+        Ok(_) => {
+            // Strip one trailing `\n`, then one trailing
+            // `\r` (defensive CRLF stripping — copy-pasted
+            // input from Windows terminals often arrives
+            // with `\r\n` line endings; the user did NOT
+            // type the `\r` so we should not preserve it).
+            // Internal whitespace is left alone.
+            let stripped = line
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string();
+            // v1 multi-VAR simplification: first var gets
+            // the whole line; every remaining var gets the
+            // empty string. Full IFS-splitting is deferred.
+            env.insert(args[0].to_string(), stripped);
+            for extra in &args[1..] {
+                env.insert((*extra).to_string(), String::new());
+            }
+            BuiltinOutcome::Status(0)
+        }
+        Err(_) => BuiltinOutcome::Status(1),
+    }
 }
 
 /// POSIX `set` builtin — mode-flag toggle.

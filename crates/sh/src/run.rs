@@ -329,7 +329,15 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // is never observed; only the recoverable arms
         // (`Continue`, `Status(N)`, `NotBuiltin`) update the
         // stash for the next command's `$?`.
-        match dispatch_builtin(&expanded_refs, &mut cwd, env, flags, &mut stdout, &mut stderr) {
+        match dispatch_builtin(
+            &expanded_refs,
+            &mut cwd,
+            env,
+            flags,
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        ) {
             BuiltinOutcome::Continue => {
                 last_status = 0;
             }

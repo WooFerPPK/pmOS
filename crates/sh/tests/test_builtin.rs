@@ -1245,3 +1245,205 @@ fn bracket_negate_dash_ef_works() {
     );
     cleanup(&dir);
 }
+
+// ---------- read builtin ----------
+//
+// `read VAR` pulls one line from the shell's stdin into a
+// named env var. The dispatcher threads stdin into
+// `dispatch_builtin` so the builtin reads from the SAME
+// `BufRead` source the REPL pulls command lines from. Tests
+// drive `run_with_env` with multi-line stdin scripts where
+// some lines are commands (`read X`, `echo $X`, `exit`) and
+// the lines BETWEEN them are the input the `read` builtin
+// consumes — the REPL's own `read_line` loop and the
+// `read` builtin's `read_line` call share the same reader,
+// so they alternate correctly: the REPL reads the `read X`
+// command line, dispatches into the builtin, the builtin
+// reads the next line for X, control returns to the REPL,
+// which reads the next command line for `echo $X`. This
+// shape pins the "shared stdin source" semantic by relying
+// on it.
+
+#[test]
+fn read_assigns_line_to_var_returns_zero() {
+    // Canonical happy path: `read X` pulls `hello` from
+    // stdin; `echo $X` proves the env mutation took effect.
+    // Status(0) → `$?` → `0` after the read.
+    let (status, stdout, stderr, env) =
+        drive("read X\nhello\necho $X\necho $?\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("hello"));
+    assert!(
+        stdout.contains("hello\n"),
+        "stdout missing echoed X value: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-read status 0: {stdout:?}"
+    );
+}
+
+#[test]
+fn read_strips_trailing_newline_only() {
+    // Internal whitespace must survive verbatim — `read`
+    // does NOT split or trim the line body, only its
+    // trailing newline. `LINE="foo bar"` after `read LINE`
+    // against `"foo bar\n"`.
+    let (status, _stdout, stderr, env) =
+        drive("read LINE\nfoo bar\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("LINE").map(String::as_str), Some("foo bar"));
+}
+
+#[test]
+fn read_strips_crlf() {
+    // CRLF input (common from copy-paste) must yield a
+    // value with neither `\r` nor `\n`. The defensive
+    // strip-`\n`-then-strip-`\r` shape produces `foo` from
+    // `"foo\r\n"`.
+    let (status, _stdout, stderr, env) =
+        drive("read X\nfoo\r\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("foo"));
+}
+
+#[test]
+fn read_returns_one_on_eof() {
+    // Stdin exhausted right after the `read X` command line
+    // → the read builtin's own `read_line` returns Ok(0),
+    // Status(1), no env mutation. With `set -e` enabled,
+    // the failing status terminates the REPL with Exit(1).
+    // Critical: the input must contain ONLY the `set -e`
+    // and `read X` lines — any subsequent line would be
+    // consumed BY the read instead of triggering EOF.
+    use std::io::BufReader;
+    use std::io::Cursor;
+    let stdin = BufReader::new(Cursor::new(b"set -e\nread X\n".to_vec()));
+    let mut stdout = Vec::<u8>::new();
+    let mut stderr = Vec::<u8>::new();
+    let mut env = BTreeMap::<String, String>::new();
+    let mut flags = ShellFlags::default();
+    let status = run_with_env(stdin, &mut stdout, &mut stderr, &mut env, &mut flags);
+    // errexit trips on the `read X` Status(1) → REPL exits
+    // with the same byte. NO `X` entry should exist post-loop.
+    assert_eq!(status, ExitStatus::Exit(1));
+    assert!(env.get("X").is_none(), "unexpected X entry: {env:?}");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+}
+
+#[test]
+fn read_returns_one_after_last_line() {
+    // Multi-line input: `a` and `b` arrive on stdin, then
+    // EOF. Three sequential `read X` calls — the first two
+    // succeed (X=a then X=b), the third hits EOF and
+    // returns Status(1), leaving X=b unchanged. The script
+    // pattern is "REPL line + read-input line" alternating
+    // (because the read builtin and the REPL share stdin —
+    // a line typed AFTER `read X` is consumed BY the read,
+    // not interpreted as a REPL command). The third `read
+    // X` is the LAST line of the input so the `read_line`
+    // call inside it hits EOF cleanly. The REPL's own next
+    // iteration also hits EOF, returning ExitStatus::Eof.
+    use std::io::BufReader;
+    use std::io::Cursor;
+    let stdin = BufReader::new(Cursor::new(
+        b"read X\na\nread X\nb\nread X\n".to_vec(),
+    ));
+    let mut stdout = Vec::<u8>::new();
+    let mut stderr = Vec::<u8>::new();
+    let mut env = BTreeMap::<String, String>::new();
+    let mut flags = ShellFlags::default();
+    let status = run_with_env(stdin, &mut stdout, &mut stderr, &mut env, &mut flags);
+    // REPL hits EOF after the third read returns Status(1)
+    // (the read consumed the input completely). Eof maps
+    // to exit code 0 in `ExitStatus::code()`.
+    assert_eq!(status, ExitStatus::Eof);
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    // After all reads complete, X must hold the value from
+    // the LAST successful read (`b`) — the EOF read does
+    // not overwrite.
+    assert_eq!(env.get("X").map(String::as_str), Some("b"));
+}
+
+#[test]
+fn read_no_args_is_usage_error() {
+    // Bare `read` (no var name) → stderr diagnostic plus
+    // Status(2). The REPL stays alive so the trailing
+    // `exit` runs.
+    let (status, _stdout, stderr, env) =
+        drive("read\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stderr.contains("sh: read: missing variable name"),
+        "stderr missing usage diagnostic: {stderr:?}"
+    );
+    // Sanity: no env mutation from a usage error.
+    assert!(env.is_empty(), "unexpected env entries: {env:?}");
+}
+
+#[test]
+fn read_empty_name_is_invalid_identifier() {
+    // `read ""` (empty-string var name from a quoted empty
+    // arg) → stderr diagnostic plus Status(2). Mirrors the
+    // existing `export` empty-name handling.
+    let (status, _stdout, stderr, env) =
+        drive("read \"\"\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stderr.contains("sh: read: : not a valid identifier"),
+        "stderr missing invalid-identifier diagnostic: {stderr:?}"
+    );
+    // No env mutation; the empty-name short-circuit fires
+    // BEFORE the read attempt.
+    assert!(env.is_empty(), "unexpected env entries: {env:?}");
+}
+
+#[test]
+fn read_multi_var_first_gets_line_rest_empty() {
+    // v1 simplification: `read A B C` against `"x y z\n"`
+    // assigns A="x y z", B="", C="" — no IFS-splitting yet.
+    // Pin the simplification explicitly so the future
+    // IFS-splitting slice has a clear regression target
+    // (this test will be UPDATED, not deleted, when the
+    // real splitting lands).
+    let (status, _stdout, stderr, env) =
+        drive("read A B C\nx y z\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("A").map(String::as_str), Some("x y z"));
+    assert_eq!(env.get("B").map(String::as_str), Some(""));
+    assert_eq!(env.get("C").map(String::as_str), Some(""));
+}
+
+#[test]
+fn read_overwrites_existing_var() {
+    // Pre-seed X=old; `read X` against `"new\n"` must
+    // replace the existing entry, not append. Confirms the
+    // `BTreeMap::insert` shape (overwrite-on-collision)
+    // matches the user's mental model for `read`.
+    let mut seed = BTreeMap::new();
+    seed.insert("X".to_string(), "old".to_string());
+    let (status, _stdout, stderr, env) =
+        drive("read X\nnew\nexit\n", seed);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("new"));
+}
+
+#[test]
+fn read_handles_unicode_line() {
+    // Rust `BufRead::read_line` is utf-8 native, so
+    // multibyte sequences round-trip cleanly through the
+    // string buffer. Pin that the strip-trailing-newline
+    // logic doesn't accidentally trim a multibyte tail
+    // byte (the `\n` / `\r` matchers are single-byte ASCII
+    // chars, so they cannot match inside a utf-8 sequence).
+    let (status, _stdout, stderr, env) =
+        drive("read X\nh\u{00e9}llo\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(env.get("X").map(String::as_str), Some("h\u{00e9}llo"));
+}
