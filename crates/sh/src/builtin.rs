@@ -443,19 +443,36 @@ fn builtin_set<E: Write>(
 /// `<command>: <op>: integer expression expected: <arg>`
 /// diagnostic on stderr and return `Status(2)`.
 ///
-/// Deferred (out of v1 scope): file-test operators (`-e`,
-/// `-f`, `-d`, `-r`, `-w`, `-x`, `-s`, `-L`, `-h`, etc. —
-/// need a VFS bridge through `Vfs::stat`); terminal-test
-/// operator (`-t fd` — needs terminal detection); compound
-/// expressions with `-a` / `-o` / `(` / `)` (POSIX-deprecated,
-/// scripts should use `&&` / `||` at the shell level which
-/// v1 also lacks); bash-extended operators (`==`, `=~`, `<`
-/// / `>` for string ordering, the `[[` double-bracket form).
-/// Each unrecognised operator surfaces as `unknown unary
-/// operator: <X>` or `unknown binary operator: <X>` (NOT a
-/// silent failure) so users get a clear "this slice didn't
-/// implement that yet" signal rather than mysterious wrong
-/// answers.
+/// File-test operators (`-e`, `-f`, `-d`, `-r`, `-w`, `-x`,
+/// `-s`) live in the 2-arg branch as well — they query
+/// `std::fs::metadata` for the operand path. `Err(_)` from
+/// metadata (file missing, unreachable, permission denied at
+/// the lookup itself) maps to `Status(1)` for ALL file-test
+/// ops; `Ok(meta)` then gates the answer on the relevant
+/// metadata field (`is_file()`, `is_dir()`, `len() > 0`, or
+/// the owner-permission bit via `PermissionsExt::mode()`).
+/// File-test ops produce NO stderr output for "missing" /
+/// "unreachable" / "no permission" — those are normal `false`
+/// results, not usage errors. Only structural mistakes
+/// (wrong arg count, unknown operator) write to stderr.
+///
+/// Deferred (out of v1 scope): symlink-test operators (`-L`,
+/// `-h` — need `lstat` instead of `stat`); FIFO / socket /
+/// device / setuid-setgid-sticky tests (`-p`, `-S`, `-b`,
+/// `-c`, `-g`, `-u`, `-k` — need filesystem features the v1
+/// substrate doesn't model); terminal-test operator (`-t fd`
+/// — needs FD tracking); ownership tests (`-N`, `-O`, `-G` —
+/// need uid/gid surfacing); binary file-test ops (`-nt`,
+/// `-ot`, `-ef` — newer-than / older-than / equal-files);
+/// compound expressions with `-a` / `-o` / `(` / `)`
+/// (POSIX-deprecated, scripts should use `&&` / `||` at the
+/// shell level which v1 also lacks); bash-extended operators
+/// (`==`, `=~`, `<` / `>` for string ordering, the `[[`
+/// double-bracket form). Each unrecognised operator surfaces
+/// as `unknown unary operator: <X>` or `unknown binary
+/// operator: <X>` (NOT a silent failure) so users get a
+/// clear "this slice didn't implement that yet" signal
+/// rather than mysterious wrong answers.
 fn evaluate_test<E: Write>(
     raw_args: &[&str],
     for_bracket: bool,
@@ -512,12 +529,18 @@ fn evaluate_test_expr<E: Write>(
         }
         2 => {
             // Unary operator + operand. `-z STR` (true if
-            // empty), `-n STR` (true if non-empty). Anything
-            // else is "unknown unary operator".
+            // empty), `-n STR` (true if non-empty), plus the
+            // POSIX file-test ops (`-e`, `-f`, `-d`, `-r`,
+            // `-w`, `-x`, `-s`) which delegate to
+            // `evaluate_file_test`. Anything else is "unknown
+            // unary operator".
             let (op, operand) = (args[0], args[1]);
             match op {
                 "-z" => bool_to_status(operand.is_empty()),
                 "-n" => bool_to_status(!operand.is_empty()),
+                "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" => {
+                    evaluate_file_test(op, operand)
+                }
                 other => {
                     let _ = writeln!(stderr, "{command}: unknown unary operator: {other}");
                     let _ = stderr.flush();
@@ -590,6 +613,60 @@ fn integer_expected<E: Write>(
     let _ = writeln!(stderr, "{command}: {op}: integer expression expected: {arg}");
     let _ = stderr.flush();
     BuiltinOutcome::Status(2)
+}
+
+/// Evaluate a POSIX file-test unary operator (`-e`, `-f`,
+/// `-d`, `-r`, `-w`, `-x`, `-s`) against `path`. ALL ops
+/// return `Status(1)` when `std::fs::metadata(path)` errors
+/// — the path is missing, unreachable, or otherwise
+/// unstattable, which POSIX defines as a `false` outcome
+/// rather than a usage error. NO stderr output for the
+/// metadata-error path; the caller's `Status(1)` is the
+/// signal. The single helper handles the common metadata
+/// fetch + error-mapping once and dispatches on the
+/// operator inside the inner match.
+///
+/// Path handling: the operand is passed verbatim to
+/// `std::fs::metadata`. Variable expansion, glob expansion,
+/// quote stripping have all already happened in the upstream
+/// dispatcher, so the operand here is the literal byte
+/// string the user typed (post-expansion). An empty operand
+/// is a valid path string but always fails metadata lookup
+/// (POSIX/Linux refuse `stat("")`), giving `Status(1)`,
+/// which matches bash / dash behaviour for `[ -e "" ]`.
+///
+/// Permissions semantics for `-r` / `-w` / `-x`: this slice
+/// uses `std::os::unix::fs::PermissionsExt::mode()` to read
+/// the owner-permission bits (mode & 0o400 / 0o200 / 0o100).
+/// On the native test target (`x86_64-unknown-linux-gnu`) the
+/// trait is freely available; on `wasm32-wasip1` the trait
+/// is also surfaced because wasip1's `std` shim re-exports
+/// the Unix permission model. The owner-bit check is
+/// deliberately simpler than the full `access(2)` "would
+/// this user actually be able to open it" semantic — POSIX
+/// `test -r` / `-w` / `-x` is allowed to be conservative
+/// here and the v1 substrate doesn't model multiple users
+/// anyway. The check matches the typical POSIX-utility
+/// shell-test approximation of "does the owner bit allow
+/// it" rather than the full effective-uid `access(2)` call.
+fn evaluate_file_test(op: &str, path: &str) -> BuiltinOutcome {
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return BuiltinOutcome::Status(1),
+    };
+    let pass = match op {
+        "-e" => true,
+        "-f" => meta.is_file(),
+        "-d" => meta.is_dir(),
+        "-s" => meta.len() > 0,
+        "-r" => meta.permissions().mode() & 0o400 != 0,
+        "-w" => meta.permissions().mode() & 0o200 != 0,
+        "-x" => meta.permissions().mode() & 0o100 != 0,
+        _ => unreachable!("evaluate_file_test called with non-file-test op {op}"),
+    };
+    bool_to_status(pass)
 }
 
 /// Collapse `.` / `..` / repeated `/` segments in `path`,

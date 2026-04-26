@@ -27,7 +27,11 @@
 //! error propagated), and the diagnostic shapes.
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Cursor};
+use std::fs;
+use std::io::{BufReader, Cursor, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sh::{run_with_env, ExitStatus, ShellFlags};
 
@@ -433,5 +437,424 @@ fn bracket_unknown_binary_operator() {
     assert!(
         stderr.contains("unknown binary operator: -X"),
         "stderr missing unknown-binary diagnostic: {stderr:?}"
+    );
+}
+
+// ---------- File-test operators ----------
+//
+// These tests cover the POSIX file-test unary operators
+// added in the T144 follow-up after the foundational `[`/
+// `test` slice (d2c6e59). Each test creates an isolated
+// scratch directory under `std::env::temp_dir()` keyed by
+// test tag + pid + counter so parallel test execution
+// doesn't collide. The directory is cleaned up at the end
+// of each successful test (a failing test leaves it on
+// disk for debugging — this matches the cat / coreutils
+// scratch-dir convention).
+//
+// All tests drive the full REPL via `drive` (which calls
+// `run_with_env`); they construct a path with absolute-form
+// (under `temp_dir()`), splice it into the input script as
+// the operand to `[ -X PATH ]`, and assert on `$?` after.
+// File-test ops take the operand verbatim (no expansion in
+// the file-test layer; expansion already happened in the
+// dispatch loop), so the absolute path is what
+// `std::fs::metadata` sees.
+
+static FILE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn scratch_dir(tag: &str) -> PathBuf {
+    let n = FILE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "pmos-sh-filetest-{}-{}-{}",
+        tag,
+        std::process::id(),
+        n
+    ));
+    fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = dir.join(name);
+    let mut f = fs::File::create(&path).expect("create temp file");
+    f.write_all(bytes).expect("write temp file");
+    path
+}
+
+fn cleanup(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bracket_dash_e_existing_file_returns_zero() {
+    // `[ -e PATH ]` on an existing regular file → Status(0).
+    let dir = scratch_dir("dash-e-file");
+    let file = write_file(&dir, "real", b"x");
+    let script = format!("[ -e {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-e existing) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_e_existing_directory_returns_zero() {
+    // `[ -e PATH ]` on a directory also returns Status(0)
+    // (the operator tests existence regardless of file
+    // type). Pins that `-e` is type-agnostic.
+    let dir = scratch_dir("dash-e-dir");
+    let script = format!("[ -e {} ]\necho $?\nexit\n", dir.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-e dir) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_e_missing_path_returns_one() {
+    // `[ -e /nonexistent/path ]` → Status(1) with NO
+    // stderr output (missing file is a normal `false`,
+    // not a usage error).
+    let (status, stdout, stderr, _env) = drive(
+        "[ -e /pmos-definitely-not-here-12345 ]\necho $?\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-e missing) status 1: {stdout:?}"
+    );
+}
+
+#[test]
+fn bracket_dash_e_empty_path_returns_one() {
+    // `[ -e '' ]` — empty path string is a valid string
+    // but `stat("")` always fails → Status(1). Pins that
+    // empty-string operand goes through the metadata path
+    // and returns `false` rather than triggering a panic
+    // or odd diagnostic.
+    let (status, stdout, stderr, _env) =
+        drive("[ -e '' ]\necho $?\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-e empty) status 1: {stdout:?}"
+    );
+}
+
+#[test]
+fn bracket_dash_f_regular_file_returns_zero() {
+    // `[ -f PATH ]` true only for regular files.
+    let dir = scratch_dir("dash-f-file");
+    let file = write_file(&dir, "real", b"content");
+    let script = format!("[ -f {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-f file) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_f_directory_returns_one() {
+    // `[ -f PATH ]` on a directory → Status(1). Pins the
+    // type discrimination — `-f` is NOT the same as `-e`.
+    let dir = scratch_dir("dash-f-dir");
+    let script = format!("[ -f {} ]\necho $?\nexit\n", dir.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-f dir) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_f_missing_returns_one() {
+    // `[ -f /nonexistent ]` → Status(1) with NO stderr.
+    let (status, stdout, stderr, _env) = drive(
+        "[ -f /pmos-not-here-67890 ]\necho $?\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-f missing) status 1: {stdout:?}"
+    );
+}
+
+#[test]
+fn bracket_dash_d_directory_returns_zero() {
+    // `[ -d PATH ]` true only for directories.
+    let dir = scratch_dir("dash-d-dir");
+    let script = format!("[ -d {} ]\necho $?\nexit\n", dir.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-d dir) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_d_regular_file_returns_one() {
+    // `[ -d PATH ]` on a regular file → Status(1). The
+    // mirror of `bracket_dash_f_directory_returns_one`.
+    let dir = scratch_dir("dash-d-file");
+    let file = write_file(&dir, "real", b"x");
+    let script = format!("[ -d {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-d file) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_d_missing_returns_one() {
+    // `[ -d /nonexistent ]` → Status(1).
+    let (status, stdout, stderr, _env) = drive(
+        "[ -d /pmos-not-a-dir-13579 ]\necho $?\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-d missing) status 1: {stdout:?}"
+    );
+}
+
+#[test]
+fn bracket_dash_s_nonempty_file_returns_zero() {
+    // `[ -s PATH ]` true when file exists AND has size > 0.
+    let dir = scratch_dir("dash-s-nonempty");
+    let file = write_file(&dir, "data", b"ABCDE");
+    let script = format!("[ -s {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-s nonempty) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_s_empty_file_returns_one() {
+    // `[ -s PATH ]` on an empty (zero-byte) file →
+    // Status(1). Pins the size check vs the existence
+    // check (an empty file would pass `-e` and `-f`).
+    let dir = scratch_dir("dash-s-empty");
+    let file = write_file(&dir, "empty", b"");
+    let script = format!("[ -s {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-s empty) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_s_missing_returns_one() {
+    // `[ -s /nonexistent ]` → Status(1).
+    let (status, stdout, stderr, _env) = drive(
+        "[ -s /pmos-no-such-file-24680 ]\necho $?\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-s missing) status 1: {stdout:?}"
+    );
+}
+
+#[test]
+fn bracket_dash_r_readable_file_returns_zero() {
+    // `[ -r PATH ]` true when owner-read bit (0o400) is
+    // set on the file. Files created via `fs::File::create`
+    // get default permissions that include owner-read on
+    // every Unix-like host (the umask doesn't strip 0o400
+    // by default), so a freshly-created scratch file
+    // passes `-r`.
+    let dir = scratch_dir("dash-r-readable");
+    let file = write_file(&dir, "rfile", b"x");
+    let script = format!("[ -r {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-r readable) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_r_unreadable_file_returns_one() {
+    // `[ -r PATH ]` returns Status(1) when the owner-read
+    // bit is cleared. Force the bit off via
+    // `set_permissions(0o000)`. This pins that the bit
+    // check is real, not "any-reachable-file passes".
+    // Skipped on non-root contexts only if the
+    // set_permissions call would silently succeed but the
+    // test cannot run as root — it's safe everywhere
+    // because metadata reads don't need read permission on
+    // the file itself, only on its parent directory.
+    let dir = scratch_dir("dash-r-unreadable");
+    let file = write_file(&dir, "norfile", b"x");
+    let mut perm = fs::metadata(&file).expect("metadata").permissions();
+    perm.set_mode(0o000);
+    fs::set_permissions(&file, perm).expect("clear perms");
+    let script = format!("[ -r {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    // Restore writable permissions so cleanup can rm.
+    let mut restore = fs::metadata(&file).expect("metadata").permissions();
+    restore.set_mode(0o600);
+    let _ = fs::set_permissions(&file, restore);
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-r unreadable) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_w_writable_file_returns_zero() {
+    // `[ -w PATH ]` true when owner-write bit (0o200) is
+    // set. Default file creation includes owner-write.
+    let dir = scratch_dir("dash-w-writable");
+    let file = write_file(&dir, "wfile", b"x");
+    let script = format!("[ -w {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-w writable) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_x_executable_file_returns_zero_when_set() {
+    // `[ -x PATH ]` true when owner-exec bit (0o100) is
+    // set. Default file creation does NOT include
+    // owner-exec, so set it explicitly to 0o700 and verify
+    // the test passes.
+    let dir = scratch_dir("dash-x-exec");
+    let file = write_file(&dir, "xfile", b"x");
+    let mut perm = fs::metadata(&file).expect("metadata").permissions();
+    perm.set_mode(0o700);
+    fs::set_permissions(&file, perm).expect("set exec");
+    let script = format!("[ -x {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(-x set) status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_x_non_executable_file_returns_one() {
+    // `[ -x PATH ]` on a 0o600 (rw-only) file → Status(1).
+    // Pins the bit check vs "any-reachable-file passes".
+    let dir = scratch_dir("dash-x-no-exec");
+    let file = write_file(&dir, "noxfile", b"x");
+    let mut perm = fs::metadata(&file).expect("metadata").permissions();
+    perm.set_mode(0o600);
+    fs::set_permissions(&file, perm).expect("clear exec");
+    let script = format!("[ -x {} ]\necho $?\nexit\n", file.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("1\n"),
+        "stdout missing post-(-x cleared) status 1: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_negate_dash_e_returns_zero_for_missing() {
+    // `[ ! -e /missing ]` — the negation correctly wraps
+    // the file-test form. `-e /missing` returns Status(1);
+    // `!` inverts it to Status(0). Pins that the negation
+    // path treats file-test ops as ordinary boolean tests.
+    let (status, stdout, stderr, _env) = drive(
+        "[ ! -e /pmos-yet-another-missing-99999 ]\necho $?\nexit\n",
+        BTreeMap::new(),
+    );
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(! -e missing) inverted status 0: {stdout:?}"
+    );
+}
+
+#[test]
+fn bracket_negate_dash_f_returns_zero_for_directory() {
+    // `[ ! -f DIR ]` — `-f DIR` returns Status(1) (DIR is
+    // not a regular file); `!` inverts to Status(0).
+    let dir = scratch_dir("negate-dash-f");
+    let script = format!("[ ! -f {} ]\necho $?\nexit\n", dir.display());
+    let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        stdout.contains("0\n"),
+        "stdout missing post-(! -f dir) inverted status 0: {stdout:?}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn bracket_dash_l_still_unknown_unary_operator() {
+    // `-L` (symlink test) is explicitly DEFERRED in this
+    // slice (needs `lstat` instead of `stat`). It must
+    // surface as `unknown unary operator: -L` so users get
+    // a clear "not yet implemented" signal rather than a
+    // silent wrong answer. Pins the deferred-op
+    // discoverability property for the remaining file-test
+    // operators.
+    let (status, _stdout, stderr, _env) =
+        drive("[ -L /tmp ]\nexit\n", BTreeMap::new());
+    assert_eq!(status, ExitStatus::Exit(0));
+    assert!(
+        stderr.contains("unknown unary operator: -L"),
+        "stderr missing unknown-unary diagnostic for deferred -L: {stderr:?}"
     );
 }
