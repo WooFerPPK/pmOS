@@ -393,40 +393,38 @@ pub extern "C" fn kernel_init() -> i32 {
         // the OPFS root and answers `driver_call(DevId::Block,
         // ...)` requests.
         //
-        // Boot policy:
-        //   1. Open the block device. If the host driver isn't
-        //      ready (no FileSystemSyncAccessHandle support, hard
-        //      private-mode block, etc.), skip the OPFS mount and
-        //      let userspace fall back to tmpfs at /. Returning -1
-        //      here would brick the kernel for any environment
-        //      that can't persist; FR-013a's persistence is best-
-        //      effort.
-        //   2. Try `OpfsFs::mount` against the device. On
-        //      `FsError::Io` (bad magic / bad checksum — the
-        //      first-boot or fresh-OPFS case) `mkfs` the device
-        //      and re-mount. Other `FsError`s leak through; the
-        //      mount returns `-1` and the kernel halts.
-        //   3. On the second-mount failure, return `-1` — that
-        //      means mkfs succeeded but the filesystem still
-        //      doesn't read back, which is a kernel bug, not a
-        //      runtime expectation we can recover from.
+        // Boot policy: persistence is best-effort (FR-013a). Any
+        // failure along the chain — driver not ready, mount on
+        // the existing image fails, mkfs fails on the fresh image,
+        // re-mount after mkfs fails, or VFS mount(/persist) fails
+        // — falls through silently to "no /persist". The kernel
+        // boots without persistence rather than refusing to start
+        // at all; the desktop renders, apps run, only persisted
+        // state across reloads is lost. Returning -1 here would
+        // brick the kernel for any environment whose OPFS can't
+        // be used (private-mode browsers, partitioned storage,
+        // schema-incompat upgrade from a prior PMos version, etc.).
         #[cfg(target_arch = "wasm32")]
         if let Ok(device) = WasmBlockDevice::open() {
             let opfs = match OpfsFs::mount(alloc::boxed::Box::new(device)) {
-                Ok(fs) => fs,
+                Ok(fs) => Some(fs),
                 Err(_) => {
-                    let device = match WasmBlockDevice::open() {
-                        Ok(d) => d,
-                        Err(_) => return -1,
-                    };
-                    match opfs_mkfs(alloc::boxed::Box::new(device)) {
-                        Ok(fs) => fs,
-                        Err(_) => return -1,
+                    // Existing image didn't pass magic/checksum;
+                    // try mkfs on a freshly-opened device. If any
+                    // step here fails, fall through to None.
+                    match WasmBlockDevice::open() {
+                        Ok(device) => match opfs_mkfs(alloc::boxed::Box::new(device)) {
+                            Ok(fs) => Some(fs),
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
                     }
                 }
             };
-            if k.vfs.mount("/persist", Box::new(opfs)).is_err() {
-                return -1;
+            if let Some(opfs) = opfs {
+                // VFS mount failure here is unusual but still
+                // best-effort: drop /persist and continue.
+                let _ = k.vfs.mount("/persist", Box::new(opfs));
             }
         }
         KERNEL = Some(k);
