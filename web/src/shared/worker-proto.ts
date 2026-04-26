@@ -94,6 +94,14 @@ export type MainToKernel =
       readonly kind: "proc:memory";
       readonly pid: number;
       readonly bytes: number;
+    }
+  | {
+      // Best-effort persistence barrier. Main posts this on the
+      // `pagehide` lifecycle event so OPFS-backed mutations survive
+      // the user closing the tab; the kernel calls `vfs.sync_dirty()`
+      // and never replies. Any flush failure is recorded as a panic
+      // surface but does not block the page from going away.
+      readonly kind: "sync:request";
     };
 
 /** Kernel-worker → main-thread. */

@@ -106,6 +106,7 @@ interface KernelExports {
     bytesLo: number,
     bytesHi: number,
   ) => number;
+  readonly kernel_sync_all: () => number;
   readonly kernel_dispatch: (pid: number) => number;
   readonly kernel_take_next_wake_for_pid: (pid: number) => number;
   readonly kernel_resp_heap_ptr: () => number;
@@ -623,6 +624,22 @@ export class KernelWasmHost implements Kernel {
         `KernelWasmHost.recordProcessMemory(${pid}, ${bytes}): rc=${rc}`,
       );
     }
+  }
+
+  /**
+   * Best-effort flush of every dirty VFS mount through the kernel's
+   * `vfs.sync_dirty()` path. Wired up to `pagehide` on the main
+   * thread so OPFS-backed mutations survive the user closing the
+   * tab while a long-running process is still mid-flight. Mounts
+   * whose `sync` hook errors stay dirty for the next attempt; this
+   * call returns without throwing in that case so the pagehide
+   * handler can finish synchronously.
+   *
+   * Returns `true` if every dirty mount flushed cleanly, `false` if
+   * any mount's `sync` hook errored.
+   */
+  syncAll(): boolean {
+    return this.exports.kernel_sync_all() === 0;
   }
 
   /**

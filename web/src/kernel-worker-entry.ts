@@ -198,6 +198,18 @@ export function installWorkerEntry(
       }
       return;
     }
+    if (msg.kind === "sync:request") {
+      if (realKernel !== undefined) {
+        try {
+          realKernel.syncAll();
+        } catch {
+          // sync_dirty errors are non-fatal: the dirty bit stays set
+          // for the next sync attempt. The pagehide handler can't
+          // wait for a reply anyway, so swallowing here is correct.
+        }
+      }
+      return;
+    }
     if (msg.kind === "proc:exited") {
       if (msg.memoryBytes !== undefined && realKernel !== undefined) {
         try {

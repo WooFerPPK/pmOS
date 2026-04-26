@@ -359,6 +359,30 @@ pub extern "C" fn kernel_record_process_memory(pid: Pid, bytes_lo: u32, bytes_hi
     }
 }
 
+/// Best-effort flush of every dirty VFS mount.
+///
+/// Called from the browser on `pagehide` (and other lifecycle
+/// transitions where persistence may be the last thing to fire
+/// before the page goes away) so OPFS-backed mutations are not
+/// lost when the tab closes. Mirrors the proc_exit sync hook —
+/// the per-process barrier covers normal exits, this export
+/// covers the "user closes the tab while a process is running"
+/// case.
+///
+/// Returns `0` if every dirty mount flushed cleanly, `-1` if
+/// any mount returned an error from its `sync` hook (the others
+/// are still flushed; mounts whose sync errored stay dirty for
+/// the next attempt).
+#[no_mangle]
+pub extern "C" fn kernel_sync_all() -> i32 {
+    let kernel = kernel_mut();
+    if kernel.vfs.sync_dirty().is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
 // ---- dispatch ----------------------------------------------------------
 
 /// Dispatch the request currently sitting in [`REQ_SCRATCH`] on

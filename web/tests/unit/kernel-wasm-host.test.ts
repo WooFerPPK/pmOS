@@ -189,6 +189,30 @@ describe("process lifecycle", () => {
     );
   });
 
+  it("syncAll on a fresh kernel returns true", async () => {
+    const { host } = await freshHost();
+    expect(host.syncAll()).toBe(true);
+  });
+
+  it("syncAll after a tmpfs mutation still returns true (tmpfs sync is a no-op)", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const pathBytes = new TextEncoder().encode("/tmp/persist");
+    host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 7,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(host.syncAll()).toBe(true);
+  });
+
   it("markRunning on a nonexistent pid throws", async () => {
     const { host } = await freshHost();
     expect(() => host.markRunning(9999)).toThrow(/markRunning/);

@@ -299,3 +299,47 @@ describe("createSpawnRouter", () => {
     }
   });
 });
+
+// ---- T137: pagehide-driven persistence sync -------------------------
+
+describe("installPagehideSync", () => {
+  interface FakeTarget {
+    readonly listeners: Array<() => void>;
+    addEventListener(type: "pagehide", listener: () => void): void;
+  }
+  function makeFakeTarget(): FakeTarget {
+    const listeners: Array<() => void> = [];
+    return {
+      listeners,
+      addEventListener(type, listener) {
+        listeners.push(listener);
+      },
+    };
+  }
+
+  it("registers a pagehide listener that posts sync:request to the kernel Worker", async () => {
+    const { installPagehideSync } = await import("../../src/bootstrap");
+    const kernel = makeFakeKernel();
+    const target = makeFakeTarget();
+    const listener = installPagehideSync(kernel, target);
+    expect(target.listeners).toEqual([listener]);
+    expect(kernel.posted).toEqual([]);
+    listener();
+    expect(kernel.posted).toEqual([{ kind: "sync:request" }]);
+  });
+
+  it("each subsequent pagehide fires another sync:request (e.g., bfcache restore + re-stash)", async () => {
+    const { installPagehideSync } = await import("../../src/bootstrap");
+    const kernel = makeFakeKernel();
+    const target = makeFakeTarget();
+    const listener = installPagehideSync(kernel, target);
+    listener();
+    listener();
+    listener();
+    expect(kernel.posted).toEqual([
+      { kind: "sync:request" },
+      { kind: "sync:request" },
+      { kind: "sync:request" },
+    ]);
+  });
+});

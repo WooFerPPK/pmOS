@@ -592,6 +592,42 @@ describe("installWorkerEntry with useRealKernel", () => {
     await entry.whenReady;
     expect(entry.scaffold?.driverCount).toBe(1);
   });
+
+  it("forwards a sync:request to realKernel.syncAll() once the host is bound", async () => {
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, { kernelWasmBytes });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: false,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+    await entry.whenReady;
+    const host = entry.realKernel;
+    expect(host).toBeDefined();
+    if (!host) return;
+    let calls = 0;
+    const original = host.syncAll.bind(host);
+    host.syncAll = (): boolean => {
+      calls += 1;
+      return original();
+    };
+    msg.send({ kind: "sync:request" });
+    expect(calls).toBe(1);
+  });
+
+  it("ignores a sync:request before the real kernel finishes booting (no panic)", () => {
+    const msg = makeMessaging();
+    installWorkerEntry(msg, { kernelWasmBytes });
+    // Don't send `boot` — sync:request should be dropped silently
+    // because there is no kernel to flush yet.
+    msg.send({ kind: "sync:request" });
+    const panics = msg.posted.filter((m) => m.kind === "panic");
+    expect(panics).toEqual([]);
+  });
 });
 
 // ---- T233: kernel-Worker dispatch loop choreography -----------------

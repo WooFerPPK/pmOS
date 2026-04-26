@@ -1012,6 +1012,12 @@ function runRealKernelMode(bootBinary: string): void {
     const msg: MainToKernel = { kind: "input:kbd", bytes };
     worker.postMessage(msg);
   });
+
+  // T137: pagehide-driven persistence sync. The kernel's per-process
+  // proc_exit hook covers normal exits; this covers the "user closes
+  // the tab while a process is mid-flight" case so OPFS-backed
+  // mutations are not lost.
+  installPagehideSync(worker);
 }
 
 /**
@@ -1174,6 +1180,38 @@ export interface SpawnRouterDeps {
 export interface SpawnedEntry {
   readonly worker: UserWorkerLike;
   readonly sab: ArrayBufferLike;
+}
+
+/**
+ * Subset of the `EventTarget` surface needed by
+ * [`installPagehideSync`] — production code passes `window`, tests
+ * pass a stub that captures the listener and fires it on demand.
+ */
+export interface PagehideTarget {
+  addEventListener(type: "pagehide", listener: () => void): void;
+}
+
+/**
+ * Post a best-effort `sync:request` to the kernel Worker on the
+ * `pagehide` lifecycle event so OPFS-backed mutations survive the
+ * user closing the tab. Mirrors the per-process `proc_exit` sync
+ * hook: `proc_exit` flushes the exiting pid's dirty mounts;
+ * `pagehide` flushes everything still dirty.
+ *
+ * `pagehide` is preferred over `beforeunload` (which has UX
+ * implications) and `unload` (which is unreliable in modern
+ * browsers — bfcache short-circuits it). Returns the listener so
+ * tests can fire it synchronously.
+ */
+export function installPagehideSync(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  target: PagehideTarget = window,
+): () => void {
+  const listener = (): void => {
+    kernelWorker.postMessage({ kind: "sync:request" });
+  };
+  target.addEventListener("pagehide", listener);
+  return listener;
 }
 
 /** The handle [`createSpawnRouter`] returns. */
