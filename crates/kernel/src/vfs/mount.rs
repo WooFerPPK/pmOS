@@ -21,7 +21,13 @@ use super::{Filesystem, FsError};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MountId(pub u32);
 
-/// A single mount: path + filesystem.
+/// A single mount: path + filesystem + mount-flag bits.
+///
+/// `flags` is a `u32` bitset matching the `MOUNT_*` family in
+/// [`abi::ext::mount_flags`]. Bootstrap mounts created via
+/// [`MountTable::insert`] start with `flags = 0`; the syscall
+/// surface populates non-zero values via [`MountTable::set_flags`]
+/// (the in-place mutator that backs `MOUNT_REMOUNT`).
 pub struct Mount {
     pub id: MountId,
     /// The absolute path at which this filesystem is mounted,
@@ -29,6 +35,9 @@ pub struct Mount {
     /// never with a trailing slash).
     pub mountpoint: String,
     pub fs: Box<dyn Filesystem>,
+    /// Mount-flag bitset (`MOUNT_*` family). Mutated in place by
+    /// [`MountTable::set_flags`] to implement REMOUNT semantics.
+    pub flags: u32,
 }
 
 pub struct MountTable {
@@ -71,10 +80,35 @@ impl MountTable {
             id,
             mountpoint,
             fs,
+            flags: 0,
         });
         self.mounts
             .sort_by(|a, b| b.mountpoint.len().cmp(&a.mountpoint.len()));
         Ok(id)
+    }
+
+    /// Mutate an existing mount's flag bitset in place. Returns the
+    /// mount-id of the mutated entry, or `FsError::NotFound` if no
+    /// mount matches `mountpoint`. Used by `Kernel::mount` when the
+    /// `MOUNT_REMOUNT` bit is set on the call. The mountpoint
+    /// comparison is exact (not longest-prefix) — `/dev/null` would
+    /// NOT match a mount installed at `/dev`, mirroring the
+    /// exact-match semantics of `MountTable::remove`.
+    pub fn set_flags(&mut self, mountpoint: &str, flags: u32) -> Result<MountId, FsError> {
+        for m in self.mounts.iter_mut() {
+            if m.mountpoint == mountpoint {
+                m.flags = flags;
+                return Ok(m.id);
+            }
+        }
+        Err(FsError::NotFound)
+    }
+
+    /// Read an installed mount's current flag bitset by mountpoint.
+    /// Returns `None` if no mount matches `mountpoint`. Exact
+    /// (non-prefix) match, paired with [`MountTable::set_flags`].
+    pub fn flags_of(&self, mountpoint: &str) -> Option<u32> {
+        self.mounts.iter().find(|m| m.mountpoint == mountpoint).map(|m| m.flags)
     }
 
     /// Remove a mount by normalised path. Returns the freed

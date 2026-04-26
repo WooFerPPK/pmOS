@@ -2485,25 +2485,46 @@ impl Kernel {
     // tmpfs instances at different paths, or a fuse-style
     // filesystem) lands.
 
-    /// `mount(target, fstype)`: install a fresh filesystem of kind
-    /// `fstype` at the absolute path `target`. v1 only accepts
-    /// `fstype == "tmpfs"`. The semantic primitive lives on
-    /// `Vfs::mount`; this method adds the privilege check and the
-    /// path-validity invariants documented in
-    /// `contracts/syscalls.md §3.5`.
+    /// `mount(target, fstype, flags)`: install a fresh filesystem
+    /// of kind `fstype` at the absolute path `target`, OR — if
+    /// `flags & MOUNT_REMOUNT` — atomically mutate an existing
+    /// mount's flag bitset in place. v1 only accepts
+    /// `fstype == "tmpfs"` for fresh mounts. The semantic primitive
+    /// for fresh mounts lives on `Vfs::mount`; this method adds the
+    /// privilege check and the path-validity invariants documented
+    /// in `contracts/syscalls.md §3.5`.
+    ///
+    /// `MOUNT_REMOUNT` semantics (POSIX `MS_REMOUNT`-shaped):
+    /// when this bit is set, `fstype` is IGNORED (POSIX preserves
+    /// the original fstype on remount; the existing mount entry's
+    /// filesystem trait object is the authoritative source). The
+    /// `target` parameter MUST point to an existing mount; if not,
+    /// `-EINVAL` ("the target is not a mount point"). The cap check
+    /// uses the same `Cap::Mount` as the regular mount path — no
+    /// new capability. The full path-validity gauntlet
+    /// (existence/dir/empty) is SKIPPED on remount, because the
+    /// target is already a live mount and the empty-dir invariant
+    /// only applies at first-install time. Routing happens at the
+    /// top of the method — REMOUNT is a separate code path that
+    /// shares only the cap check + path normalisation. See
+    /// [`Kernel::remount`].
     ///
     /// Errors:
     /// * [`KernelError::NotCapable`] — caller does not hold
     ///   [`Cap::Mount`].
     /// * [`KernelError::InvalidArgument`] — path is not absolute, is
-    ///   the root `/`, fstype is anything other than `"tmpfs"`, OR
-    ///   the target directory is non-empty (a fresh mount over a
-    ///   directory with existing entries would shadow them
-    ///   irreversibly until umount; v1 rejects it outright).
+    ///   the root `/` (fresh-mount path only — REMOUNT explicitly
+    ///   permits `/` so init can re-flag the root filesystem),
+    ///   fstype is anything other than `"tmpfs"` (fresh-mount path
+    ///   only), OR the target directory is non-empty (a fresh mount
+    ///   over a directory with existing entries would shadow them
+    ///   irreversibly until umount; v1 rejects it outright). For
+    ///   REMOUNT: `target` is not currently a mount point.
     /// * [`KernelError::Fs(FsError::NotFound)`] (→ ENOENT) — target
-    ///   path doesn't resolve.
+    ///   path doesn't resolve (fresh-mount path only).
     /// * [`KernelError::Fs(FsError::NotADirectory)`] (→ ENOTDIR) —
-    ///   target exists but isn't a directory.
+    ///   target exists but isn't a directory (fresh-mount path
+    ///   only).
     /// * [`KernelError::Fs(FsError::AlreadyExists)`] (→ EBUSY at the
     ///   syscall layer) — target is already a mount point. The FS
     ///   variant pre-exists for `MountTable::insert`'s duplicate-path
@@ -2511,8 +2532,23 @@ impl Kernel {
     ///   existing mount IS a "this thing is already there" condition.
     ///   The dispatcher maps `AlreadyExists` to EEXIST by default,
     ///   which is wrong for mount semantics — the syscall handler
-    ///   in `ext.rs` translates it to EBUSY explicitly.
-    pub fn mount(&mut self, pid: Pid, target: &str, fstype: &str) -> Result<(), KernelError> {
+    ///   in `ext.rs` translates it to EBUSY explicitly. (Fresh-mount
+    ///   path only; REMOUNT WANTS the entry to exist.)
+    pub fn mount(
+        &mut self,
+        pid: Pid,
+        target: &str,
+        fstype: &str,
+        flags: u32,
+    ) -> Result<(), KernelError> {
+        if (flags & abi::ext::mount_flags::MOUNT_REMOUNT) != 0 {
+            // POSIX MS_REMOUNT: source/fstype ignored. The cap
+            // check + path validity live on Kernel::remount so the
+            // remount path stays self-contained — no test
+            // accidentally regresses by changing the order of
+            // operations in the fresh-mount block below.
+            return self.remount(pid, target, flags);
+        }
         if !self.caps.check(pid, Cap::Mount)? {
             return Err(KernelError::NotCapable);
         }
@@ -2552,7 +2588,80 @@ impl Kernel {
             "tmpfs" => alloc::boxed::Box::new(crate::fs::tmpfs::TmpFs::new()),
             _ => return Err(KernelError::InvalidArgument),
         };
-        self.vfs.mount(&normalised, fs).map(|_| ()).map_err(KernelError::from)
+        let mount_id = self.vfs.mount(&normalised, fs).map_err(KernelError::from)?;
+        // Persist the requested flag bitset on the new entry. The
+        // initial insert defaults flags to 0 (see MountTable::insert);
+        // a non-zero `flags` argument on a FRESH mount becomes the
+        // entry's starting flag bitset, so a future REMOUNT clears
+        // exactly those bits the caller installed here. The masking
+        // strips MOUNT_REMOUNT itself — that bit is a control-flow
+        // signal for THIS call, not a persisted property of the
+        // resulting mount entry. (Without the mask a "create new
+        // mount with REMOUNT bit speculatively set" call would
+        // route to remount, fail with EINVAL, and never store
+        // anything — but the mask is defence-in-depth in case a
+        // future caller passes REMOUNT|other_bits.)
+        let _ = self.vfs.set_mount_flags(
+            &normalised,
+            flags & !abi::ext::mount_flags::MOUNT_REMOUNT,
+        );
+        let _ = mount_id;
+        Ok(())
+    }
+
+    /// `remount(target, flags)`: atomically change an existing
+    /// mount's flag bitset in place. POSIX `MS_REMOUNT` semantics —
+    /// no umount/remount, no fresh filesystem instance, no change
+    /// to the mount-id, mountpoint, or backing fstype. The fstype
+    /// the caller passed to the original `mount()` is ignored on
+    /// remount (the existing in-table entry is authoritative).
+    ///
+    /// Routed to from [`Kernel::mount`] when the call's `flags`
+    /// argument has the `MOUNT_REMOUNT` bit set; not normally
+    /// invoked directly by the syscall handler. Public so semantic
+    /// tests in `tests/sys.rs` (or future direct-callers like an
+    /// init-binary helper) can exercise the path without round-
+    /// tripping through `Kernel::mount`'s flags-routing branch.
+    ///
+    /// The persisted flag value strips `MOUNT_REMOUNT` itself —
+    /// that bit is a per-call control-flow signal, not a property
+    /// of the resulting mount entry. So calling
+    /// `remount(/a, MOUNT_REMOUNT)` clears all OTHER flags on /a,
+    /// which mirrors POSIX behaviour where the new flag set
+    /// replaces (not OR-merges with) the existing one.
+    ///
+    /// Errors:
+    /// * [`KernelError::NotCapable`] — caller does not hold
+    ///   [`Cap::Mount`]. Same cap as a fresh mount.
+    /// * [`KernelError::InvalidArgument`] — path is not absolute OR
+    ///   the path is not currently a mount point. POSIX says
+    ///   "EINVAL — the target is not a mount point" for this case.
+    pub fn remount(
+        &mut self,
+        pid: Pid,
+        target: &str,
+        flags: u32,
+    ) -> Result<(), KernelError> {
+        if !self.caps.check(pid, Cap::Mount)? {
+            return Err(KernelError::NotCapable);
+        }
+        if !target.starts_with('/') {
+            return Err(KernelError::InvalidArgument);
+        }
+        let normalised = crate::vfs::path::normalize(target);
+        // Persisted flags exclude the REMOUNT control bit — see the
+        // doc-comment above for why. set_mount_flags returns
+        // FsError::NotFound when `normalised` isn't in the mount
+        // table; the §3.5 wire surface promises EINVAL for that
+        // case (POSIX "target is not a mount point"), so we map
+        // NotFound → InvalidArgument here rather than letting the
+        // dispatcher render it as ENOENT.
+        let persisted = flags & !abi::ext::mount_flags::MOUNT_REMOUNT;
+        match self.vfs.set_mount_flags(&normalised, persisted) {
+            Ok(_id) => Ok(()),
+            Err(FsError::NotFound) => Err(KernelError::InvalidArgument),
+            Err(e) => Err(KernelError::Fs(e)),
+        }
     }
 
     /// `umount(target)`: remove the mount installed at `target`. The

@@ -118,6 +118,29 @@ pub const CAP_GRANT: u16 = 0x1302;
 pub const MOUNT:  u16 = 0x1400;
 pub const UMOUNT: u16 = 0x1401;
 
+/// Mount-flag bits passed to the `mount` opcode.
+///
+/// The wire encoding piggybacks on [`abi::ring::Request::flags`] (a
+/// per-request `u16` field documented as "reserved in v1, MUST be
+/// zero"). The MOUNT handler reads `req.flags as u32` and forwards
+/// them to `Kernel::mount`. This avoids touching the args window
+/// (already 16 bytes full of path_ptr/path_len/fstype_ptr/fstype_len)
+/// and keeps the `Request` struct layout stable. Only the lowest
+/// `u16` of mount flags is reachable in v1; future flag bits beyond
+/// bit 15 (e.g. NOATIME, NODEV) will require a wire revision.
+pub mod mount_flags {
+    /// `MS_REMOUNT`: atomically change an existing mount's flags
+    /// without unmounting + remounting. The `source` and `fstype`
+    /// arguments are IGNORED when this bit is set (POSIX semantics);
+    /// the kernel locates the mount by `target` and mutates the
+    /// in-table flags field in place. The canonical use case is
+    /// remounting the root filesystem read-only at shutdown
+    /// (umount-of-root is impossible, so the only path to a
+    /// post-shutdown read-only state is in-place flag mutation).
+    /// `target` not currently a mountpoint → -EINVAL.
+    pub const MOUNT_REMOUNT: u32 = 1 << 0;
+}
+
 // --- 3.7 Filesystem watch (added in v1.1) ---------------------------------
 pub const FS_WATCH: u16 = 0x1402;
 

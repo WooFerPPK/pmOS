@@ -13265,7 +13265,7 @@ fn mount_path_already_a_mount_returns_ebusy() {
         abi::cap::CapSet::from_caps(&[Cap::Mount]),
     );
     k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
-    k.mount(pid, "/mnt", "tmpfs").expect("first mount");
+    k.mount(pid, "/mnt", "tmpfs", 0).expect("first mount");
     let mount_count_after_first = k.vfs.mount_count();
 
     let mut heap = vec![0u8; 256];
@@ -13411,7 +13411,7 @@ fn umount_happy_path_removes_mount() {
     );
     k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
     let mount_count_pre = k.vfs.mount_count();
-    k.mount(pid, "/mnt", "tmpfs").expect("mount");
+    k.mount(pid, "/mnt", "tmpfs", 0).expect("mount");
     k.vfs.create("/mnt/probe", 0o644).expect("create in mount");
     assert_eq!(k.vfs.mount_count(), mount_count_pre + 1);
 
@@ -13480,7 +13480,7 @@ fn umount_caller_lacks_fs_mount_returns_enotcapable() {
         abi::cap::CapSet::from_caps(&[Cap::Mount]),
     );
     k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
-    k.mount(setup, "/mnt", "tmpfs").expect("mount");
+    k.mount(setup, "/mnt", "tmpfs", 0).expect("mount");
     let mount_count_after = k.vfs.mount_count();
 
     let unprivileged = make_proc_with_caps(
@@ -13520,7 +13520,7 @@ fn umount_with_open_fds_returns_ebusy() {
         abi::cap::CapSet::from_caps(&[Cap::Mount]),
     );
     k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
-    k.mount(pid, "/mnt", "tmpfs").expect("mount");
+    k.mount(pid, "/mnt", "tmpfs", 0).expect("mount");
     k.vfs.create("/mnt/pin", 0o644).expect("create pin");
     let (mount_id, ino) = k.vfs.resolve("/mnt/pin").expect("resolve pin");
     k.install_fd(
@@ -13560,6 +13560,390 @@ fn umount_with_open_fds_returns_ebusy() {
     };
     let resp2 = dispatch(&mut k, pid, &req2, &mut heap);
     assert_eq!(resp2.status, 0, "umount succeeds after the pinning fd closes");
+}
+
+// ---------- mount remount ----------
+//
+// MOUNT_REMOUNT semantics — POSIX MS_REMOUNT-shaped: mutate an
+// existing mount entry's flag bitset in place WITHOUT umounting +
+// remounting. The wire encoding piggybacks on the per-request
+// `Request.flags: u16` field (the args window is full at 16 bytes).
+// `source` and `fstype` parameters are IGNORED on remount; only the
+// flag bitset changes. The cap check uses the same `Cap::Mount` as
+// the regular mount path.
+//
+// Preserved properties on remount:
+// * mount-id (the entry is mutated, not replaced)
+// * underlying filesystem trait object (no fresh tmpfs constructed)
+// * mountpoint string
+//
+// Mutated property on remount:
+// * `flags` field on the Mount entry; new value REPLACES old (POSIX
+//   semantics — not OR-merged), with the MOUNT_REMOUNT bit itself
+//   stripped before persistence (it's a control-flow signal, not a
+//   property of the resulting mount).
+
+#[test]
+fn mount_remount_changes_flags_in_place() {
+    // Mount /a (no flags), then remount with a non-zero flag bit.
+    // The mount table entry MUST keep the same mount-id (proving
+    // it's the same entry, mutated in place — not removed and
+    // re-installed) and the new flag value MUST be visible via
+    // `vfs.mount_flags`. The mount_count MUST NOT change (no new
+    // entries inserted; no entries removed).
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
+    k.mount(pid, "/a", "tmpfs", 0).expect("first mount");
+    let mount_count_before = k.vfs.mount_count();
+    let mount_id_before = k
+        .vfs
+        .mountpoints()
+        .into_iter()
+        .find(|(_id, mp)| mp == "/a")
+        .map(|(id, _)| id)
+        .expect("/a in mount table");
+    assert_eq!(k.vfs.mount_flags("/a"), Some(0), "fresh mount starts at flags=0");
+
+    // Pick a flag bit that ISN'T MOUNT_REMOUNT itself — bit 1 is
+    // unused so it can't accidentally collide with REMOUNT.
+    const PROBE_BIT: u32 = 1 << 1;
+    k.mount(
+        pid,
+        "/a",
+        "tmpfs",
+        abi::ext::mount_flags::MOUNT_REMOUNT | PROBE_BIT,
+    )
+    .expect("remount");
+
+    assert_eq!(k.vfs.mount_count(), mount_count_before, "no new mount entry");
+    assert_eq!(
+        k.vfs.mount_flags("/a"),
+        Some(PROBE_BIT),
+        "flags updated; REMOUNT bit itself stripped before persistence",
+    );
+    let mount_id_after = k
+        .vfs
+        .mountpoints()
+        .into_iter()
+        .find(|(_id, mp)| mp == "/a")
+        .map(|(id, _)| id)
+        .expect("/a still in mount table");
+    assert_eq!(
+        mount_id_before, mount_id_after,
+        "mount-id preserved across remount (mutation, not replacement)",
+    );
+}
+
+#[test]
+fn mount_remount_on_unmounted_target_returns_einval() {
+    // /not-mounted is not in the mount table. POSIX says
+    // "EINVAL — the target is not a mount point" for MS_REMOUNT
+    // on a non-mountpoint; we mirror that exactly.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    let mount_count_before = k.vfs.mount_count();
+
+    let err = k
+        .mount(
+            pid,
+            "/not-mounted",
+            "tmpfs",
+            abi::ext::mount_flags::MOUNT_REMOUNT,
+        )
+        .expect_err("remount on non-mountpoint must fail");
+    assert!(
+        matches!(err, kernel::sys::KernelError::InvalidArgument),
+        "got {err:?}",
+    );
+    assert_eq!(
+        k.vfs.mount_count(),
+        mount_count_before,
+        "no side effect on the mount table",
+    );
+}
+
+#[test]
+fn mount_remount_ignores_source_parameter() {
+    // POSIX MS_REMOUNT: source string is ignored. The wire format
+    // doesn't carry an explicit `source` parameter (only target +
+    // fstype + flags), but the call still passes a value through;
+    // this test pins that the flags update succeeds regardless of
+    // what fstype/source-shaped value the caller hands us. The
+    // mount entry's underlying filesystem trait object is
+    // unaffected — we verify by writing a file before AND after the
+    // remount and confirming both reads succeed (same fs instance
+    // surviving the remount).
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
+    k.mount(pid, "/a", "tmpfs", 0).expect("first mount");
+    k.vfs.create("/a/before.txt", 0o644).expect("create before");
+
+    // The "source" slot in our wire format is conceptually the
+    // mountpoint itself; the slice instructions name it "source"
+    // for parity with POSIX `mount(source, target, fstype, flags)`.
+    // Remount with a different *mountpoint* string is impossible
+    // here (there's no source param to mismatch), so this test
+    // exercises the same property via the fstype slot — see
+    // `mount_remount_ignores_fstype_parameter` for the fstype
+    // arm. Here we just confirm the underlying fs survives the
+    // remount transition: the file we created BEFORE the remount
+    // is still resolvable AFTER.
+    k.mount(
+        pid,
+        "/a",
+        "tmpfs",
+        abi::ext::mount_flags::MOUNT_REMOUNT | (1 << 2),
+    )
+    .expect("remount");
+
+    let (_mount_id, _ino) = k.vfs.resolve("/a/before.txt").expect("file survives remount");
+    assert_eq!(k.vfs.mount_flags("/a"), Some(1 << 2), "flag bit installed");
+}
+
+#[test]
+fn mount_remount_ignores_fstype_parameter() {
+    // Pass an UNKNOWN fstype string ("ext4" — the v1 factory only
+    // knows tmpfs and would reject it on a fresh mount with
+    // -EINVAL). On REMOUNT the fstype is ignored entirely, so the
+    // call MUST succeed despite "ext4" being unknown. This pins
+    // that the REMOUNT branch routes BEFORE the fstype-factory
+    // dispatch runs.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
+    k.mount(pid, "/a", "tmpfs", 0).expect("first mount");
+
+    k.mount(
+        pid,
+        "/a",
+        "ext4", // unknown fstype, would EINVAL on fresh mount
+        abi::ext::mount_flags::MOUNT_REMOUNT | (1 << 3),
+    )
+    .expect("remount must ignore fstype");
+
+    assert_eq!(k.vfs.mount_flags("/a"), Some(1 << 3), "flag bit installed");
+}
+
+#[test]
+fn mount_remount_requires_cap_mount() {
+    // Caller holds DisplayClient (a non-MOUNT cap) → -ENOTCAPABLE.
+    // The remount path uses the SAME `Cap::Mount` as the regular
+    // mount path; no new "remount" cap is introduced. Even though
+    // /a is a real mount, the cap check fires first and the flag
+    // bitset is unchanged.
+    let mut k = make_kernel();
+    let setup = make_proc_with_caps(
+        &mut k,
+        "setup",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
+    k.mount(setup, "/a", "tmpfs", 0).expect("first mount");
+    assert_eq!(k.vfs.mount_flags("/a"), Some(0));
+
+    let unprivileged = make_proc_with_caps(
+        &mut k,
+        "no-mount",
+        abi::cap::CapSet::from_caps(&[Cap::DisplayClient]),
+    );
+    let err = k
+        .mount(
+            unprivileged,
+            "/a",
+            "tmpfs",
+            abi::ext::mount_flags::MOUNT_REMOUNT | (1 << 4),
+        )
+        .expect_err("unprivileged remount must fail");
+    assert!(
+        matches!(err, kernel::sys::KernelError::NotCapable),
+        "got {err:?}",
+    );
+    assert_eq!(
+        k.vfs.mount_flags("/a"),
+        Some(0),
+        "flag bitset unchanged after rejected remount",
+    );
+}
+
+#[test]
+fn mount_without_remount_creates_new_entry() {
+    // Regression test: the existing non-REMOUNT mount path is
+    // unchanged. Cap-checked, fstype-validated, empty-dir-checked,
+    // installed at the target, mount_count increments by one. The
+    // new flags=0 default applies; a non-zero `flags` argument
+    // (without REMOUNT) is persisted on the new entry.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
+    let mount_count_before = k.vfs.mount_count();
+
+    // flags=0 — the historical default; the entry starts at 0.
+    k.mount(pid, "/a", "tmpfs", 0).expect("fresh mount");
+    assert_eq!(k.vfs.mount_count(), mount_count_before + 1);
+    assert_eq!(k.vfs.mount_flags("/a"), Some(0));
+
+    // A non-zero flag bit on a fresh mount (REMOUNT bit NOT set)
+    // is persisted as the entry's starting flag bitset.
+    k.vfs.mkdir("/b", 0o755).expect("mkdir /b");
+    k.mount(pid, "/b", "tmpfs", 1 << 2).expect("fresh mount with flags");
+    assert_eq!(k.vfs.mount_count(), mount_count_before + 2);
+    assert_eq!(k.vfs.mount_flags("/b"), Some(1 << 2));
+}
+
+#[test]
+fn mount_remount_dispatches_via_ext_opcode() {
+    // Full wire path: the MOUNT opcode (0x1400) with the
+    // MOUNT_REMOUNT bit set in `Request.flags` reaches
+    // `Kernel::remount` through `dispatch_ext`. The pre-existing
+    // mount at /a gets its flag bitset updated; status=0; value=0.
+    // This test pins the wire-encoding choice (per-request flags
+    // field carries the mount flag bitset) — a future slice that
+    // moves the flags into a heap layout would have to update this
+    // test deliberately.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
+    k.mount(pid, "/a", "tmpfs", 0).expect("first mount");
+    let mount_count_before = k.vfs.mount_count();
+
+    let mut heap = vec![0u8; 256];
+    let path = b"/a";
+    // Pass an arbitrary fstype string — REMOUNT ignores it. We
+    // pass "ignored" instead of "tmpfs" to make the ignored-ness
+    // explicit in the test.
+    let fstype = b"ignored";
+    heap[..path.len()].copy_from_slice(path);
+    heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+
+    const PROBE_BIT: u32 = 1 << 5;
+    let req = Request {
+        opcode: op_ext::MOUNT,
+        // The wire encoding for mount flags: the per-request
+        // `flags: u16` field (NOT the args window, which is full
+        // at 4×u32). MOUNT_REMOUNT | PROBE_BIT, narrowed to u16.
+        flags: (abi::ext::mount_flags::MOUNT_REMOUNT | PROBE_BIT) as u16,
+        request_id: 200,
+        args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+        heap_ptr: 0,
+        heap_len: (path.len() + fstype.len()) as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+
+    assert_eq!(resp.request_id, 200);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 0);
+    assert_eq!(k.vfs.mount_count(), mount_count_before, "no new entry");
+    assert_eq!(
+        k.vfs.mount_flags("/a"),
+        Some(PROBE_BIT),
+        "flag bitset updated via the wire path",
+    );
+}
+
+#[test]
+fn mount_remount_clears_a_set_flag() {
+    // POSIX MS_REMOUNT REPLACES (not OR-merges) the flag bitset.
+    // Set up /a with a non-zero starting flag, then remount with
+    // flags = MOUNT_REMOUNT | 0 (i.e. no flags persisted). The
+    // entry's flag bitset MUST drop to 0 — a "remount with no
+    // flags" call clears every previously-installed bit.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/a", 0o755).expect("mkdir /a");
+    k.mount(pid, "/a", "tmpfs", 1 << 2).expect("first mount with flags");
+    assert_eq!(k.vfs.mount_flags("/a"), Some(1 << 2));
+
+    // Remount with REMOUNT bit only — persisted bits = 0 after
+    // the REMOUNT bit is stripped.
+    k.mount(pid, "/a", "tmpfs", abi::ext::mount_flags::MOUNT_REMOUNT)
+        .expect("remount clearing flags");
+
+    assert_eq!(
+        k.vfs.mount_flags("/a"),
+        Some(0),
+        "REMOUNT with no other bits clears all previously-set flags",
+    );
+}
+
+#[test]
+fn mount_remount_root_is_supported() {
+    // The canonical use case: remount the root filesystem read-only
+    // (or read-write) without unmounting it first. Since `/` is the
+    // root, umount-then-mount is impossible (no fallback root
+    // exists); REMOUNT is the only path. The fresh-mount branch
+    // explicitly REJECTS `/` with -EINVAL ("path is the root"); the
+    // REMOUNT branch MUST permit it. This test pins that
+    // asymmetry.
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    // make_kernel() installs a tmpfs at "/" already. Confirm the
+    // root entry exists with flags=0.
+    assert_eq!(k.vfs.mount_flags("/"), Some(0), "root mount exists at flags=0");
+    let mount_count_before = k.vfs.mount_count();
+    let root_id_before = k
+        .vfs
+        .mountpoints()
+        .into_iter()
+        .find(|(_id, mp)| mp == "/")
+        .map(|(id, _)| id)
+        .expect("/ in mount table");
+
+    const PROBE_BIT: u32 = 1 << 6;
+    k.mount(
+        pid,
+        "/",
+        "tmpfs",
+        abi::ext::mount_flags::MOUNT_REMOUNT | PROBE_BIT,
+    )
+    .expect("root remount");
+
+    assert_eq!(k.vfs.mount_flags("/"), Some(PROBE_BIT), "root flags updated");
+    assert_eq!(k.vfs.mount_count(), mount_count_before, "no new mount");
+    let root_id_after = k
+        .vfs
+        .mountpoints()
+        .into_iter()
+        .find(|(_id, mp)| mp == "/")
+        .map(|(id, _)| id)
+        .expect("/ still in mount table");
+    assert_eq!(
+        root_id_before, root_id_after,
+        "root mount-id preserved across remount",
+    );
 }
 
 // ---- fs_watch ----------------------------------------------------------

@@ -1106,7 +1106,17 @@ fn handle_mount(
         return Response::err(req.request_id, EINVAL);
     };
 
-    match kernel.mount(pid, path, fstype) {
+    // The `mount` opcode encodes mount-flag bits (MOUNT_REMOUNT et
+    // al.) in the per-request `flags: u16` field — the args window
+    // is already 16 bytes full (4×u32 for path/fstype ptr+len) so
+    // there's no inline space for an extra u32. The Request struct
+    // already carries `flags: u16` documented as "reserved in v1,
+    // MUST be zero", so this is the natural home for the new
+    // mount-flag bitset. Widened to u32 for the Kernel::mount
+    // signature; the high 16 bits are always zero in v1.
+    let flags = req.flags as u32;
+
+    match kernel.mount(pid, path, fstype, flags) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(crate::sys::KernelError::Fs(crate::vfs::FsError::AlreadyExists)) => {
             Response::err(req.request_id, EBUSY)

@@ -403,6 +403,24 @@ impl Vfs {
         self.mounts.len()
     }
 
+    /// Mutate an existing mount's flag bitset in place. Pass-through
+    /// to [`MountTable::set_flags`]; the path is normalised first so
+    /// callers can pass `/dev/` or `/dev` interchangeably (mirrors
+    /// the [`Vfs::mount`] / [`Vfs::umount`] normalisation step). Used
+    /// by `Kernel::mount` to implement the `MOUNT_REMOUNT` flag.
+    pub fn set_mount_flags(&mut self, mountpoint: &str, flags: u32) -> Result<MountId, FsError> {
+        let normalised = path::normalize(mountpoint);
+        self.mounts.set_flags(&normalised, flags)
+    }
+
+    /// Read a mount's current flag bitset by mountpoint. Returns
+    /// `None` if the path is not a mount point. Pass-through to
+    /// [`MountTable::flags_of`] with normalisation.
+    pub fn mount_flags(&self, mountpoint: &str) -> Option<u32> {
+        let normalised = path::normalize(mountpoint);
+        self.mounts.flags_of(&normalised)
+    }
+
     /// Snapshot every installed mount's `(id, mountpoint)`. Returned
     /// as owned `String`s so the caller doesn't need to keep an
     /// immutable borrow of `Vfs` alive while iterating — useful from
