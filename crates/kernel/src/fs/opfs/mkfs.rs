@@ -161,7 +161,9 @@ pub fn mkfs(mut device: DynBlockDevice) -> Result<OpfsFs, FsError> {
 /// order.
 fn create_system_tree(fs: &mut OpfsFs) -> Result<(), FsError> {
     // First create the direct children of /.
-    for name in ["bin", "dev", "etc", "home", "opt", "proc", "run", "tmp", "usr"] {
+    for name in [
+        "bin", "dev", "etc", "home", "opt", "proc", "run", "tmp", "usr",
+    ] {
         let mode = if name == "proc" { 0o555 } else { 0o755 };
         fs.mkdir(ROOT_INO, name, mode)?;
     }
@@ -285,10 +287,8 @@ pub fn default_init_conf() -> &'static [u8] {
 
 const TERMINAL_DESKTOP: &[u8] =
     include_bytes!("../../../assets/usr/share/applications/terminal.desktop");
-const FILES_DESKTOP: &[u8] =
-    include_bytes!("../../../assets/usr/share/applications/files.desktop");
-const EDIT_DESKTOP: &[u8] =
-    include_bytes!("../../../assets/usr/share/applications/edit.desktop");
+const FILES_DESKTOP: &[u8] = include_bytes!("../../../assets/usr/share/applications/files.desktop");
+const EDIT_DESKTOP: &[u8] = include_bytes!("../../../assets/usr/share/applications/edit.desktop");
 const SETTINGS_DESKTOP: &[u8] =
     include_bytes!("../../../assets/usr/share/applications/settings.desktop");
 const SYSMON_DESKTOP: &[u8] =

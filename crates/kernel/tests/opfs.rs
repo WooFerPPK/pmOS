@@ -45,7 +45,38 @@ fn mkfs_produces_a_readable_superblock() {
     assert_eq!(sb.inode_table_blocks, DEFAULT_INODE_TABLE_BLOCKS);
     assert_eq!(sb.root_ino, ROOT_INO);
     assert!(sb.inode_free < sb.inode_count, "mkfs consumed some inodes");
-    assert!(sb.data_block_free < sb.data_block_count, "mkfs consumed some data blocks");
+    assert!(
+        sb.data_block_free < sb.data_block_count,
+        "mkfs consumed some data blocks"
+    );
+}
+
+#[test]
+fn storage_usage_matches_superblock_counters() {
+    let fs = fresh_fs();
+    let sb = fs.superblock();
+    let usage = fs.storage_usage().expect("opfs reports storage usage");
+
+    assert_eq!(usage.quota_bytes, TEST_BLOCKS * BLOCK_SIZE as u64);
+    assert_eq!(
+        usage.used_bytes,
+        (sb.total_blocks - sb.data_block_free) * BLOCK_SIZE as u64,
+    );
+    assert_eq!(usage.file_count, sb.inode_count - sb.inode_free);
+}
+
+#[test]
+fn storage_usage_updates_after_allocations() {
+    let mut fs = fresh_fs();
+    let before = fs.storage_usage().expect("opfs reports storage usage");
+
+    let ino = fs.create(ROOT_INO, "usage.txt", 0o644).unwrap();
+    fs.write(ino, 0, b"storage accounting").unwrap();
+
+    let after = fs.storage_usage().expect("opfs reports storage usage");
+    assert!(after.file_count > before.file_count);
+    assert!(after.used_bytes > before.used_bytes);
+    assert_eq!(after.quota_bytes, before.quota_bytes);
 }
 
 #[test]
@@ -63,8 +94,11 @@ fn mkfs_refuses_tiny_device() {
 #[test]
 fn mkfs_system_tree_exists() {
     let mut fs = fresh_fs();
-    for top in ["bin", "dev", "etc", "home", "opt", "proc", "run", "tmp", "usr"] {
-        fs.lookup(ROOT_INO, top).unwrap_or_else(|e| panic!("/{top} missing: {e:?}"));
+    for top in [
+        "bin", "dev", "etc", "home", "opt", "proc", "run", "tmp", "usr",
+    ] {
+        fs.lookup(ROOT_INO, top)
+            .unwrap_or_else(|e| panic!("/{top} missing: {e:?}"));
     }
     let usr_ino = fs.lookup(ROOT_INO, "usr").unwrap();
     fs.lookup(usr_ino, "bin").unwrap();
@@ -296,7 +330,10 @@ fn unlink_removes_file() {
     let ino = fs.create(ROOT_INO, "gone.txt", 0o644).unwrap();
     fs.write(ino, 0, b"bye").unwrap();
     fs.unlink(ROOT_INO, "gone.txt").unwrap();
-    assert_eq!(fs.lookup(ROOT_INO, "gone.txt").unwrap_err(), FsError::NotFound);
+    assert_eq!(
+        fs.lookup(ROOT_INO, "gone.txt").unwrap_err(),
+        FsError::NotFound
+    );
 }
 
 #[test]
@@ -323,7 +360,10 @@ fn rename_within_directory() {
     let src = fs.create(ROOT_INO, "src.txt", 0o644).unwrap();
     fs.write(src, 0, b"content").unwrap();
     fs.rename(ROOT_INO, "src.txt", ROOT_INO, "dst.txt").unwrap();
-    assert_eq!(fs.lookup(ROOT_INO, "src.txt").unwrap_err(), FsError::NotFound);
+    assert_eq!(
+        fs.lookup(ROOT_INO, "src.txt").unwrap_err(),
+        FsError::NotFound
+    );
     let dst = fs.lookup(ROOT_INO, "dst.txt").unwrap();
     assert_eq!(dst, src);
     let mut buf = [0u8; 16];
@@ -655,9 +695,9 @@ fn mkfs_installs_default_desktop_entries() {
     ];
 
     for (name, expected) in cases {
-        let ino = fs.lookup(apps_ino, name).unwrap_or_else(|_| {
-            panic!("mkfs missing /usr/share/applications/{name}")
-        });
+        let ino = fs
+            .lookup(apps_ino, name)
+            .unwrap_or_else(|_| panic!("mkfs missing /usr/share/applications/{name}"));
         let st = fs.stat(ino).unwrap();
         assert_eq!(st.ty, NodeType::RegularFile, "{name} not a regular file");
         assert_eq!(st.mode, 0o644, "{name} wrong mode");
@@ -676,12 +716,19 @@ fn mkfs_installs_default_desktop_entries() {
     }
 
     // Check cap hints specific to settings and sysmon.
-    let settings_content =
-        core::str::from_utf8(default_settings_desktop()).unwrap();
-    assert!(settings_content.contains("KEYMAP_ADMIN"), "settings.desktop missing KEYMAP_ADMIN");
+    let settings_content = core::str::from_utf8(default_settings_desktop()).unwrap();
+    assert!(
+        settings_content.contains("KEYMAP_ADMIN"),
+        "settings.desktop missing KEYMAP_ADMIN"
+    );
 
-    let sysmon_content =
-        core::str::from_utf8(default_sysmon_desktop()).unwrap();
-    assert!(sysmon_content.contains("PROC_ENUMERATE"), "sysmon.desktop missing PROC_ENUMERATE");
-    assert!(sysmon_content.contains("PROC_KILL_ANY"), "sysmon.desktop missing PROC_KILL_ANY");
+    let sysmon_content = core::str::from_utf8(default_sysmon_desktop()).unwrap();
+    assert!(
+        sysmon_content.contains("PROC_ENUMERATE"),
+        "sysmon.desktop missing PROC_ENUMERATE"
+    );
+    assert!(
+        sysmon_content.contains("PROC_KILL_ANY"),
+        "sysmon.desktop missing PROC_KILL_ANY"
+    );
 }

@@ -148,7 +148,10 @@ impl Transaction {
         }
         let mut block = initial;
         patch(&mut block);
-        self.ops.push(JournalOp { target_lba, data: block });
+        self.ops.push(JournalOp {
+            target_lba,
+            data: block,
+        });
         Ok(())
     }
 
@@ -291,10 +294,7 @@ impl Journal {
     /// Returns the number of transactions applied. The caller is
     /// expected to flush the device afterwards (we flush
     /// internally between txns too, so intermediate state is safe).
-    pub fn apply_committed(
-        &mut self,
-        device: &mut dyn BlockDevice,
-    ) -> Result<usize, FsError> {
+    pub fn apply_committed(&mut self, device: &mut dyn BlockDevice) -> Result<usize, FsError> {
         let mut applied = 0usize;
         while self.tail != self.head {
             // Read the header at the current tail slot.
@@ -388,8 +388,14 @@ fn decode_header_block(b: &Block) -> Option<(u32, Vec<Lba>)> {
     for i in 0..op_count {
         let off = 16 + i * 16;
         let lba = u64::from_le_bytes([
-            b[off], b[off + 1], b[off + 2], b[off + 3],
-            b[off + 4], b[off + 5], b[off + 6], b[off + 7],
+            b[off],
+            b[off + 1],
+            b[off + 2],
+            b[off + 3],
+            b[off + 4],
+            b[off + 5],
+            b[off + 6],
+            b[off + 7],
         ]);
         lbas.push(lba);
     }
@@ -425,9 +431,18 @@ mod tests {
     #[test]
     fn encode_decode_header_round_trip() {
         let ops = [
-            JournalOp { target_lba: 100, data: [0u8; BLOCK_SIZE] },
-            JournalOp { target_lba: 200, data: [0u8; BLOCK_SIZE] },
-            JournalOp { target_lba: 300, data: [0u8; BLOCK_SIZE] },
+            JournalOp {
+                target_lba: 100,
+                data: [0u8; BLOCK_SIZE],
+            },
+            JournalOp {
+                target_lba: 200,
+                data: [0u8; BLOCK_SIZE],
+            },
+            JournalOp {
+                target_lba: 300,
+                data: [0u8; BLOCK_SIZE],
+            },
         ];
         let block = encode_header_block(42, &ops);
         let (seq, lbas) = decode_header_block(&block).expect("decode");
@@ -437,7 +452,10 @@ mod tests {
 
     #[test]
     fn torn_header_rejected_by_crc() {
-        let ops = [JournalOp { target_lba: 1, data: [0u8; BLOCK_SIZE] }];
+        let ops = [JournalOp {
+            target_lba: 1,
+            data: [0u8; BLOCK_SIZE],
+        }];
         let mut block = encode_header_block(1, &ops);
         block[100] ^= 0xFF; // flip a bit in the middle
         assert!(decode_header_block(&block).is_none());

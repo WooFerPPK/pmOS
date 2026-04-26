@@ -130,6 +130,20 @@ pub struct DirEntry {
     pub ty: NodeType,
 }
 
+/// Structured storage counters for a mounted filesystem.
+///
+/// `quota_bytes` is the total addressable capacity backing the
+/// filesystem; `used_bytes` is the currently allocated portion of
+/// that capacity; `file_count` counts allocated inodes/nodes. Not
+/// every filesystem has meaningful quota data, so the trait method
+/// returning this type is optional.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StorageUsage {
+    pub quota_bytes: u64,
+    pub used_bytes: u64,
+    pub file_count: u64,
+}
+
 /// Errors a filesystem operation can return.
 ///
 /// Each variant maps to a specific WASI errno. The mapping is
@@ -306,6 +320,14 @@ pub trait Filesystem: Send {
         Ok(())
     }
 
+    /// Return structured storage counters for this filesystem, if
+    /// it has a quota-backed storage device. tmpfs/devfs/procfs
+    /// inherit `None`; OPFS overrides with its superblock-derived
+    /// counters.
+    fn storage_usage(&self) -> Option<StorageUsage> {
+        None
+    }
+
     /// A short human name used in `/proc/mounts`-style output.
     /// Examples: "tmpfs", "devfs", "procfs", "opfs".
     fn kind_name(&self) -> &'static str;
@@ -443,6 +465,15 @@ impl Vfs {
     pub fn mount_flags(&self, mountpoint: &str) -> Option<u32> {
         let normalised = path::normalize(mountpoint);
         self.mounts.flags_of(&normalised)
+    }
+
+    /// Return structured storage counters for an exact mountpoint.
+    /// Filesystems without quota-backed storage return `Ok(None)`.
+    pub fn storage_usage(&mut self, mountpoint: &str) -> Result<Option<StorageUsage>, FsError> {
+        let normalised = path::normalize(mountpoint);
+        let mount_id = self.mounts.id_of(&normalised).ok_or(FsError::NotFound)?;
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        Ok(fs.storage_usage())
     }
 
     /// Snapshot every installed mount's `(id, mountpoint)`. Returned

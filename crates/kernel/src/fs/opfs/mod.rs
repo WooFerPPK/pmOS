@@ -41,7 +41,9 @@
 use alloc::vec::Vec;
 
 use crate::platform;
-use crate::vfs::{DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NanosSinceEpoch};
+use crate::vfs::{
+    DirEntry, FileStat, Filesystem, FsError, Ino, Mode, NanosSinceEpoch, StorageUsage,
+};
 
 pub mod block;
 pub mod journal;
@@ -101,11 +103,7 @@ impl OpfsFs {
 
     /// Direct-construct from an already-initialised superblock.
     /// Used by `mkfs` after it has built a fresh image in-place.
-    pub(crate) fn from_parts(
-        device: DynBlockDevice,
-        sb: Superblock,
-        journal: Journal,
-    ) -> Self {
+    pub(crate) fn from_parts(device: DynBlockDevice, sb: Superblock, journal: Journal) -> Self {
         OpfsFs {
             device,
             sb,
@@ -142,10 +140,7 @@ impl OpfsFs {
     /// to protect against, so the journal adds no value and
     /// creates a chicken-and-egg (the root inode must exist
     /// before the journal can replay onto anything).
-    pub(crate) fn write_inode_direct(
-        &mut self,
-        ino: &InodeOnDisk,
-    ) -> Result<(), FsError> {
+    pub(crate) fn write_inode_direct(&mut self, ino: &InodeOnDisk) -> Result<(), FsError> {
         let (lba, block) = self.make_inode_block_update(ino)?;
         self.device.write(lba, &block)?;
         Ok(())
@@ -181,7 +176,10 @@ impl OpfsFs {
     /// [`stage_inode_write`] which routes through
     /// [`Transaction::add_or_merge_write`] so multiple inode
     /// slots in the same block merge correctly.
-    fn make_inode_block_update(&mut self, ino: &InodeOnDisk) -> Result<(Lba, [u8; BLOCK_SIZE]), FsError> {
+    fn make_inode_block_update(
+        &mut self,
+        ino: &InodeOnDisk,
+    ) -> Result<(Lba, [u8; BLOCK_SIZE]), FsError> {
         let (lba, within) = self.inode_lba(ino.ino)?;
         let mut block = [0u8; BLOCK_SIZE];
         self.device.read(lba, &mut block)?;
@@ -425,10 +423,8 @@ impl OpfsFs {
                 return Err(FsError::Io);
             }
             let offset_in_block = (cursor % BLOCK_SIZE as u64) as usize;
-            let chunk = core::cmp::min(
-                (BLOCK_SIZE - offset_in_block) as u64,
-                end - cursor,
-            ) as usize;
+            let chunk =
+                core::cmp::min((BLOCK_SIZE - offset_in_block) as u64, end - cursor) as usize;
             let mut block = [0u8; BLOCK_SIZE];
             self.device.read(lba, &mut block)?;
             buf[written..written + chunk]
@@ -471,10 +467,8 @@ impl OpfsFs {
             let block_ix = (cursor / BLOCK_SIZE as u64) as usize;
             let lba = file.direct[block_ix];
             let offset_in_block = (cursor % BLOCK_SIZE as u64) as usize;
-            let chunk = core::cmp::min(
-                (BLOCK_SIZE - offset_in_block) as u64,
-                end - cursor,
-            ) as usize;
+            let chunk =
+                core::cmp::min((BLOCK_SIZE - offset_in_block) as u64, end - cursor) as usize;
             let mut block = [0u8; BLOCK_SIZE];
             // Read-modify-write so we don't clobber bytes outside
             // the write range (matters for sub-block writes past
@@ -852,10 +846,7 @@ impl Filesystem for OpfsFs {
 
     fn stat(&mut self, ino: Ino) -> Result<FileStat, FsError> {
         let i = self.read_inode(ino)?;
-        let ty = i
-            .kind
-            .to_node_type()
-            .ok_or(FsError::NotFound)?;
+        let ty = i.kind.to_node_type().ok_or(FsError::NotFound)?;
         Ok(FileStat {
             ino: i.ino,
             ty,
@@ -910,6 +901,16 @@ impl Filesystem for OpfsFs {
         self.write_superblock()?;
         self.device.flush()?;
         Ok(())
+    }
+
+    fn storage_usage(&self) -> Option<StorageUsage> {
+        let block_size = BLOCK_SIZE as u64;
+        let allocated_blocks = self.sb.total_blocks.saturating_sub(self.sb.data_block_free);
+        Some(StorageUsage {
+            quota_bytes: self.sb.total_blocks.saturating_mul(block_size),
+            used_bytes: allocated_blocks.saturating_mul(block_size),
+            file_count: self.sb.inode_count.saturating_sub(self.sb.inode_free),
+        })
     }
 
     fn kind_name(&self) -> &'static str {

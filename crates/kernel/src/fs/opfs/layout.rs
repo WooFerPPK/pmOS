@@ -77,8 +77,7 @@ pub const DEFAULT_INODE_TABLE_BLOCKS: u64 = 128;
 
 /// Minimum block count for a valid OPFS image: superblock + journal +
 /// inode table + at least one data block.
-pub const MIN_BLOCK_COUNT: u64 =
-    1 + DEFAULT_JOURNAL_BLOCKS + DEFAULT_INODE_TABLE_BLOCKS + 1;
+pub const MIN_BLOCK_COUNT: u64 = 1 + DEFAULT_JOURNAL_BLOCKS + DEFAULT_INODE_TABLE_BLOCKS + 1;
 
 // --- Superblock ---------------------------------------------------------
 
@@ -382,8 +381,14 @@ impl DirEntryOnDisk {
 
 fn u64_at(b: &[u8; BLOCK_SIZE], at: usize) -> u64 {
     u64::from_le_bytes([
-        b[at], b[at + 1], b[at + 2], b[at + 3],
-        b[at + 4], b[at + 5], b[at + 6], b[at + 7],
+        b[at],
+        b[at + 1],
+        b[at + 2],
+        b[at + 3],
+        b[at + 4],
+        b[at + 5],
+        b[at + 6],
+        b[at + 7],
     ])
 }
 
@@ -393,8 +398,14 @@ fn u32_at(b: &[u8; BLOCK_SIZE], at: usize) -> u32 {
 
 fn u64_at_slice(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes([
-        b[at], b[at + 1], b[at + 2], b[at + 3],
-        b[at + 4], b[at + 5], b[at + 6], b[at + 7],
+        b[at],
+        b[at + 1],
+        b[at + 2],
+        b[at + 3],
+        b[at + 4],
+        b[at + 5],
+        b[at + 6],
+        b[at + 7],
     ])
 }
 
@@ -515,8 +526,14 @@ mod tests {
 
     #[test]
     fn dir_entry_chain_decode() {
-        let a = DirEntryOnDisk { ino: 1, name: "a".to_string() };
-        let b = DirEntryOnDisk { ino: 2, name: "longer".to_string() };
+        let a = DirEntryOnDisk {
+            ino: 1,
+            name: "a".to_string(),
+        };
+        let b = DirEntryOnDisk {
+            ino: 2,
+            name: "longer".to_string(),
+        };
         let mut buf = a.encode();
         buf.extend(b.encode());
 

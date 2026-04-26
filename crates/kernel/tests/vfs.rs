@@ -8,6 +8,9 @@
 #![cfg(feature = "native-platform")]
 
 use kernel::fs::devfs::{DevFs, DEV_CONSOLE, DEV_NULL};
+use kernel::fs::opfs::block::MockBlockDevice;
+use kernel::fs::opfs::layout::BLOCK_SIZE;
+use kernel::fs::opfs::mkfs::mkfs;
 use kernel::fs::procfs::ProcFs;
 use kernel::fs::tmpfs::TmpFs;
 use kernel::vfs::{DirEntry, FsError, NodeType, Vfs};
@@ -68,6 +71,24 @@ fn successful_mutations_mark_mount_dirty_until_sync() {
 
     vfs.sync_dirty().unwrap();
     assert_eq!(vfs.dirty_mount_count(), 0);
+}
+
+#[test]
+fn storage_usage_projects_exact_mount_counters() {
+    let mut vfs = fresh_vfs_with_root_tmpfs();
+    assert_eq!(vfs.storage_usage("/").unwrap(), None);
+
+    let blocks = 4096;
+    let opfs = mkfs(Box::new(MockBlockDevice::new(blocks))).expect("mkfs");
+    vfs.mount("/persist", Box::new(opfs)).unwrap();
+
+    let usage = vfs
+        .storage_usage("/persist")
+        .unwrap()
+        .expect("opfs reports storage usage");
+    assert_eq!(usage.quota_bytes, blocks * BLOCK_SIZE as u64);
+    assert!(usage.used_bytes > 0);
+    assert!(usage.file_count > 0);
 }
 
 #[test]
