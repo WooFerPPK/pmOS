@@ -92,6 +92,25 @@
 //! `-if` / `-iu` / `-ib` / `-ic` / `-d` / `-df` / `-du` / `-db` /
 //! `-dc` / `-di` / `-C` / `-Cn` / `-Cf` / `-Cr` / `-Cu` / `-Cb` /
 //! `-Ci` / `-Cd` / `-cC` (silent dominates) etc. apply the chosen combination.
+//! `-o FILE` redirects the sorted output to FILE instead of stdout
+//! (POSIX `--output=FILE` long form). Both `-o FILE` (space-separated)
+//! and `-oFILE` (no space) forms are accepted; the parameter is the
+//! NEXT arg or the rest of the cluster, NOT an input path. The output
+//! file is opened with truncate semantics (existing content discarded).
+//! Critical invariant: input is fully READ then sorted IN MEMORY
+//! before the output file is ever opened, so the in-place sort
+//! `sort -o foo foo` works cleanly — `foo` is read first, sorted
+//! second, then truncated and rewritten with the sorted result.
+//! File-write errors (parent dir missing, permission denied, disk
+//! full) write `sort: <path>: <error>\n` to stderr and exit 1.
+//! `-o` composes with every other sort flag: `sort -no FILE` writes
+//! the numeric-sorted result to FILE; `sort -uo FILE` writes the
+//! unique result; `sort -fo FILE` writes the case-folded result; etc.
+//! The ONE rejected combination is `-co` / `-Co` (output-redirect
+//! with check-only mode) — check mode produces no sorted output to
+//! write, so combining `-c`/`-C` with `-o` is a usage error:
+//! `sort: cannot combine -c and -o` (or `-C and -o`) on stderr, exit 1,
+//! no file created.
 //! Unknown flags write `sort: unknown flag: <flag>` to stderr and
 //! exit 2 (matching grep's open-error/usage exit code).
 //!
@@ -113,15 +132,23 @@ fn main() -> ExitCode {
     let mut ignore_blanks = false;
     let mut ignore_nonprinting = false;
     let mut dictionary_order = false;
+    let mut output: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
     let mut sep_seen = false;
-    for arg in args {
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = args[idx].clone();
+        idx += 1;
         if !sep_seen && arg == "--" {
             sep_seen = true;
             continue;
         }
         if !sep_seen && arg.starts_with('-') && arg != "-" {
-            for ch in arg[1..].chars() {
+            let cluster: Vec<char> = arg[1..].chars().collect();
+            let mut ci = 0usize;
+            while ci < cluster.len() {
+                let ch = cluster[ci];
+                ci += 1;
                 match ch {
                     'r' => reverse = true,
                     'u' => unique = true,
@@ -132,6 +159,21 @@ fn main() -> ExitCode {
                     'b' => ignore_blanks = true,
                     'i' => ignore_nonprinting = true,
                     'd' => dictionary_order = true,
+                    'o' => {
+                        let value = if ci < cluster.len() {
+                            let rest: String = cluster[ci..].iter().collect();
+                            ci = cluster.len();
+                            rest
+                        } else if idx < args.len() {
+                            let v = args[idx].clone();
+                            idx += 1;
+                            v
+                        } else {
+                            let _ = writeln!(io::stderr(), "sort: option requires an argument: -o");
+                            return ExitCode::from(2);
+                        };
+                        output = Some(value);
+                    }
                     _ => {
                         let _ = writeln!(io::stderr(), "sort: unknown flag: {arg}");
                         return ExitCode::from(2);
@@ -141,6 +183,15 @@ fn main() -> ExitCode {
         } else {
             paths.push(arg);
         }
+    }
+
+    if output.is_some() && check_only {
+        let _ = writeln!(io::stderr(), "sort: cannot combine -c and -o");
+        return ExitCode::from(1);
+    }
+    if output.is_some() && silent_check {
+        let _ = writeln!(io::stderr(), "sort: cannot combine -C and -o");
+        return ExitCode::from(1);
     }
 
     let mut lines: Vec<String> = Vec::new();
@@ -213,12 +264,29 @@ fn main() -> ExitCode {
         }
     }
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    for line in &lines {
-        if writeln!(out, "{line}").is_err() {
-            had_error = true;
-            break;
+    if let Some(path) = output.as_deref() {
+        match fs::File::create(path) {
+            Ok(mut file) => {
+                for line in &lines {
+                    if let Err(e) = writeln!(file, "{line}") {
+                        let _ = writeln!(io::stderr(), "sort: {path}: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "sort: {path}: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for line in &lines {
+            if writeln!(out, "{line}").is_err() {
+                had_error = true;
+                break;
+            }
         }
     }
 

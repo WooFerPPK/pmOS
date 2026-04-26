@@ -1169,3 +1169,267 @@ fn dash_capital_c_used_in_script_friendly_conditional() {
     assert!(sorted.stdout.is_empty());
     assert!(sorted.stderr.is_empty());
 }
+
+#[test]
+fn dash_o_writes_sorted_output_to_file() {
+    let dir = scratch_dir("o_basic");
+    let out_path = dir.join("sorted.txt");
+
+    let mut child = Command::new(SORT)
+        .arg("-o")
+        .arg(&out_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sort");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"banana\napple\ncherry\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("wait sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must be empty when -o redirects, got {:?}",
+        out.stdout
+    );
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let written = fs::read(&out_path).expect("read output file");
+    assert_eq!(written, b"apple\nbanana\ncherry\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_o_no_space_form_works() {
+    let dir = scratch_dir("o_nospace");
+    let out_path = dir.join("sorted.txt");
+    let arg = format!("-o{}", out_path.display());
+
+    let mut child = Command::new(SORT)
+        .arg(&arg)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sort");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"banana\napple\n")
+        .expect("write stdin");
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("wait sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let written = fs::read(&out_path).expect("read output file");
+    assert_eq!(written, b"apple\nbanana\n");
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_o_truncates_existing_file() {
+    let dir = scratch_dir("o_truncate");
+    let out_path = write_file(&dir, "out.txt", b"PRE-EXISTING JUNK\nMORE JUNK\n");
+    let in_path = write_file(&dir, "in.txt", b"c\na\nb\n");
+
+    let out = Command::new(SORT)
+        .arg("-o")
+        .arg(&out_path)
+        .arg(&in_path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let written = fs::read(&out_path).expect("read output file");
+    assert_eq!(
+        written, b"a\nb\nc\n",
+        "existing junk must be truncated, NOT appended"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_o_in_place_sort_works() {
+    let dir = scratch_dir("o_inplace");
+    let path = write_file(&dir, "data.txt", b"cherry\nbanana\napple\n");
+
+    let out = Command::new(SORT)
+        .arg("-o")
+        .arg(&path)
+        .arg(&path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let written = fs::read(&path).expect("read output file");
+    assert_eq!(
+        written, b"apple\nbanana\ncherry\n",
+        "input must be fully read BEFORE the output file is opened so in-place sort works"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_o_combines_with_n_for_numeric_output_to_file() {
+    let dir = scratch_dir("o_n");
+    let in_path = write_file(&dir, "in.txt", b"10\n2\n1\n");
+    let out_path = dir.join("out.txt");
+
+    let out = Command::new(SORT)
+        .arg("-no")
+        .arg(&out_path)
+        .arg(&in_path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let written = fs::read(&out_path).expect("read output file");
+    assert_eq!(
+        written, b"1\n2\n10\n",
+        "numeric sort must apply before the file is written"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_o_combines_with_u_for_unique_output_to_file() {
+    let dir = scratch_dir("o_u");
+    let in_path = write_file(&dir, "in.txt", b"a\nb\na\nb\nc\n");
+    let out_path = dir.join("out.txt");
+
+    let out = Command::new(SORT)
+        .arg("-uo")
+        .arg(&out_path)
+        .arg(&in_path)
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let written = fs::read(&out_path).expect("read output file");
+    assert_eq!(
+        written, b"a\nb\nc\n",
+        "unique dedup must apply before the file is written"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_o_missing_directory_returns_error() {
+    let dir = scratch_dir("o_missing_dir");
+    let in_path = write_file(&dir, "in.txt", b"b\na\n");
+    let bogus = dir.join("does-not-exist").join("nested").join("out.txt");
+
+    let out = Command::new(SORT)
+        .arg("-o")
+        .arg(&bogus)
+        .arg(&in_path)
+        .output()
+        .expect("spawn sort");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sort:"), "stderr = {stderr:?}");
+    assert!(
+        stderr.contains(&bogus.to_string_lossy().to_string()),
+        "stderr should mention the path, got {stderr:?}"
+    );
+    assert!(
+        !bogus.exists(),
+        "no file should have been created at the bogus path"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_co_combination_returns_usage_error() {
+    let dir = scratch_dir("co_reject");
+    let out_path = dir.join("out.txt");
+
+    let out = Command::new(SORT)
+        .arg("-c")
+        .arg("-o")
+        .arg(&out_path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot combine -c and -o"),
+        "stderr = {stderr:?}"
+    );
+    assert!(
+        !out_path.exists(),
+        "no file should have been created when -co was rejected"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_capital_co_combination_returns_usage_error() {
+    let dir = scratch_dir("Co_reject");
+    let out_path = dir.join("out.txt");
+
+    let out = Command::new(SORT)
+        .arg("-C")
+        .arg("-o")
+        .arg(&out_path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+
+    assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot combine -C and -o"),
+        "stderr = {stderr:?}"
+    );
+    assert!(
+        !out_path.exists(),
+        "no file should have been created when -Co was rejected"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn dash_o_with_no_input_writes_empty_file() {
+    let dir = scratch_dir("o_empty");
+    let out_path = dir.join("out.txt");
+
+    let out = Command::new(SORT)
+        .arg("-o")
+        .arg(&out_path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sort");
+
+    assert!(out.status.success(), "exit status: {:?}", out.status);
+    assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
+    assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
+    let written = fs::read(&out_path).expect("read output file");
+    assert!(
+        written.is_empty(),
+        "empty stdin under -o must produce empty file, got {written:?}"
+    );
+    cleanup(&dir);
+}
