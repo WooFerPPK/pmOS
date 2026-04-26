@@ -22,7 +22,7 @@
 
 use alloc::vec::Vec;
 
-use crate::vfs::{Ino, MountId};
+use crate::vfs::{Ino, MountId, WatchId};
 
 /// Maximum fd number a process may hold in v1. A process that
 /// tries to allocate past this returns `EMFILE`.
@@ -109,6 +109,10 @@ impl FdFlags {
 ///   (T072 / T100).
 /// * `SignalChannel` — the per-process signal inbox IPC fd that
 ///   every process inherits at spawn.
+/// * `Watch` — a filesystem-watch fd returned by the `fs_watch`
+///   extension opcode. `fd_read` drains queued [`WatchEvent`]s as
+///   8-byte fixed-size records; `fd_close` unregisters the watch
+///   from the VFS notifier.
 ///
 /// The kernel's syscall dispatcher pattern-matches on this enum
 /// to route `fd_read`/`fd_write`/`ipc_send`/etc. to the right
@@ -122,6 +126,7 @@ pub enum FdObject {
     Socket(u32),
     DisplayConn(u32),
     SignalChannel,
+    Watch { watch_id: WatchId },
 }
 
 /// A single fd-table entry.

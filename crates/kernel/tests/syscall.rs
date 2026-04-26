@@ -141,28 +141,28 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
-    // `FS_WATCH` is in the extension range (0x1402) but still has no
-    // handler — filesystem watch needs an event-queue + watch-point
-    // notification machinery on tmpfs/OPFS that doesn't exist yet
-    // (`contracts/syscalls.md §3.7`). Same shape as the WASI case
-    // above: decoded as a known extension opcode, routed to
-    // `dispatch_ext`'s `_ =>` arm, ENOSYS echoed back with the
-    // request_id intact.
+    // `HOST_FILE_RECV` is in the extension range (0x1500) but still has
+    // no handler — the host file-recv path needs the drag-drop token
+    // table + driver-side bootstrap notification plumbing described in
+    // `contracts/syscalls.md §3.6`, none of which exists yet. Same
+    // shape as the WASI case above: decoded as a known extension
+    // opcode, routed to `dispatch_ext`'s `_ =>` arm, ENOSYS echoed
+    // back with the request_id intact.
     //
     // (This probe was `PROC_SPAWN` before that handler landed, then
     // `PROC_WAIT`, then `PROC_KILL`, then `PROC_CAPS_GET`, then
-    // `CAP_GRANT`, then `IPC_SEND`, then `IPC_RECV`, then `MOUNT`.
-    // Each rotation tightens the unimplemented-opcode surface;
-    // `FS_WATCH` is the next stable target until the event-queue
-    // slice arrives. The remaining fall-through opcode is
-    // `HOST_FILE_RECV` (0x1500), which depends on driver-side
-    // drag-drop plumbing that bypasses the in-kernel test surface.)
+    // `CAP_GRANT`, then `IPC_SEND`, then `IPC_RECV`, then `MOUNT`,
+    // then `FS_WATCH`. Each rotation tightens the unimplemented-opcode
+    // surface; `HOST_FILE_RECV` is the last remaining T072
+    // fall-through opcode — once it lands, this test will need a
+    // synthetic unallocated extension-range opcode the way the WASI
+    // probe does.)
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "test", 0);
     let mut heap = vec![0u8; 4096];
 
     let req = Request {
-        opcode: op_ext::FS_WATCH,
+        opcode: op_ext::HOST_FILE_RECV,
         flags: 0,
         request_id: 7,
         args: [0u8; 16],
@@ -12668,4 +12668,379 @@ fn umount_with_open_fds_returns_ebusy() {
     };
     let resp2 = dispatch(&mut k, pid, &req2, &mut heap);
     assert_eq!(resp2.status, 0, "umount succeeds after the pinning fd closes");
+}
+
+// ---- fs_watch ----------------------------------------------------------
+//
+// Wire layout per `contracts/syscalls.md §3.7`:
+//   FS_WATCH (0x1402):
+//     args[0..4]   = path_ptr (u32) — heap offset of the path bytes.
+//     args[4..8]   = path_len (u32) — length of the path bytes.
+//     args[8..12]  = mask (u32) — bit-OR of WATCH_CREATE / WATCH_DELETE
+//                                  / WATCH_MODIFY.
+//     args[12..16] = flags (u32) — v1 only accepts 0; non-zero → EINVAL
+//                                  atomic-reject.
+//     heap input: path bytes at heap[path_ptr..path_ptr+path_len].
+//   Response: value = freshly-allocated watch fd-number on success.
+//
+// The semantic surface lives on `Kernel::fs_watch`, which wraps
+// `Vfs::register_watch` with an `FdObject::Watch` install in the
+// caller's fd table; the underlying watch registry is owned by
+// `Vfs::watches` (the new `WatchTable` introduced in this slice).
+// Mutation hooks fire from `Kernel::vfs_create`, `vfs_mkdir`,
+// `vfs_unlink`, `vfs_rmdir`, and the `notify_modify` arm of
+// `Kernel::fd_write` so a watcher observes events for every
+// in-tree mutation path that lands today.
+
+/// Pack the fs_watch opcode's 3-u32 + flags inline args window.
+fn fs_watch_args(path_ptr: u32, path_len: u32, mask: u32, flags: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&path_ptr.to_le_bytes());
+    args[4..8].copy_from_slice(&path_len.to_le_bytes());
+    args[8..12].copy_from_slice(&mask.to_le_bytes());
+    args[12..16].copy_from_slice(&flags.to_le_bytes());
+    args
+}
+
+/// Drive an FS_WATCH request and return the response. Helper to
+/// remove boilerplate from the per-error-case tests.
+fn dispatch_fs_watch(
+    k: &mut Kernel,
+    pid: abi::ext::Pid,
+    heap: &mut [u8],
+    path: &[u8],
+    mask: u32,
+    flags: u32,
+    request_id: u32,
+) -> abi::ring::Response {
+    heap[..path.len()].copy_from_slice(path);
+    let req = Request {
+        opcode: op_ext::FS_WATCH,
+        flags: 0,
+        request_id,
+        args: fs_watch_args(0, path.len() as u32, mask, flags),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    dispatch(k, pid, &req, heap)
+}
+
+#[test]
+fn fs_watch_register_returns_watch_fd() {
+    // Happy path: register a watch on the root tmpfs, assert the
+    // response value is a valid fd-number AND the caller's fd table
+    // now holds an `FdObject::Watch` at that slot.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let mut heap = vec![0u8; 256];
+
+    let resp = dispatch_fs_watch(
+        &mut k,
+        pid,
+        &mut heap,
+        b"/",
+        abi::ext::WATCH_CREATE | abi::ext::WATCH_DELETE,
+        0,
+        700,
+    );
+
+    assert_eq!(resp.status, 0);
+    assert!(resp.value >= 0, "watch fd-number is non-negative");
+    let new_fd = resp.value as u32;
+    let table = k.fds(pid).expect("caller has fd table");
+    let entry = table.get(new_fd).expect("new fd installed");
+    match entry.object {
+        FdObject::Watch { watch_id } => {
+            assert!(
+                k.watch_get(watch_id).is_some(),
+                "watch id round-trips through the registry"
+            );
+        }
+        other => panic!("expected FdObject::Watch, got {:?}", other),
+    }
+}
+
+#[test]
+fn fs_watch_path_does_not_exist_returns_enoent() {
+    // Unknown path → the underlying VFS resolve fails with NotFound,
+    // which the dispatcher maps to ENOENT.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let mut heap = vec![0u8; 256];
+    let resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/no/such/path", abi::ext::WATCH_CREATE, 0, 701,
+    );
+    assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn fs_watch_path_not_absolute_returns_einval() {
+    // Path "no-leading-slash" → -EINVAL atomic-reject. No watch
+    // installed; no fd allocated.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let mut heap = vec![0u8; 256];
+    let watch_count_before = k.vfs.watches().len();
+    let fd_count_before = k.fds(pid).unwrap().open_count();
+    let resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"no-leading-slash", abi::ext::WATCH_CREATE, 0, 702,
+    );
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.vfs.watches().len(), watch_count_before);
+    assert_eq!(k.fds(pid).unwrap().open_count(), fd_count_before);
+}
+
+#[test]
+fn fs_watch_invalid_utf8_path_returns_einval() {
+    // Path bytes 0xff 0xfe 0xff are not valid UTF-8 → -EINVAL
+    // BEFORE any side effect.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let mut heap = vec![0u8; 256];
+    let watch_count_before = k.vfs.watches().len();
+    let path = &[0xffu8, 0xfe, 0xff][..];
+    heap[..path.len()].copy_from_slice(path);
+    let req = Request {
+        opcode: op_ext::FS_WATCH,
+        flags: 0,
+        request_id: 703,
+        args: fs_watch_args(0, path.len() as u32, abi::ext::WATCH_CREATE, 0),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.vfs.watches().len(), watch_count_before);
+}
+
+#[test]
+fn fs_watch_zero_mask_returns_einval() {
+    // mask = 0 → no events requested → -EINVAL atomic-reject.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let mut heap = vec![0u8; 256];
+    let resp = dispatch_fs_watch(&mut k, pid, &mut heap, b"/", 0, 0, 704);
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.vfs.watches().len(), 0);
+}
+
+#[test]
+fn fs_watch_unknown_mask_bits_return_einval() {
+    // mask with an unrecognised bit (0x8000_0000) → -EINVAL even
+    // when valid bits are also set. The atomic-reject invariant
+    // means a single bad bit kills the whole register.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let mut heap = vec![0u8; 256];
+    let resp = dispatch_fs_watch(
+        &mut k,
+        pid,
+        &mut heap,
+        b"/",
+        abi::ext::WATCH_CREATE | 0x8000_0000,
+        0,
+        705,
+    );
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.vfs.watches().len(), 0);
+}
+
+#[test]
+fn fs_watch_invalid_flags_atomic_reject() {
+    // flags != 0 → -EINVAL BEFORE any allocation. v1's spec
+    // documents a RECURSIVE bit but the handler doesn't implement
+    // it; passing it (or any non-zero value) fails atomically.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let mut heap = vec![0u8; 256];
+    let resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 1, 706,
+    );
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert_eq!(k.vfs.watches().len(), 0);
+}
+
+#[test]
+fn fs_watch_create_event_is_delivered() {
+    // Register a watch on /dir, create /dir/file, fd_read on the
+    // watch_fd returns one CREATE event with the new file's inode.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    k.vfs.mkdir("/dir", 0o755).expect("mkdir");
+    let mut heap = vec![0u8; 256];
+
+    let reg_resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_CREATE, 0, 710,
+    );
+    assert_eq!(reg_resp.status, 0);
+    let watch_fd = reg_resp.value as u32;
+
+    // Trigger a create event by going through the watch-aware
+    // wrapper so the notify hook fires.
+    let new_ino = k.vfs_create("/dir/file", 0o644).expect("create");
+
+    // Drain the watch fd via the kernel's fd_read seam — bypasses
+    // dispatcher serialization but exercises the same code path.
+    let mut buf = [0u8; 16];
+    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    assert_eq!(n, 8, "one event = one 8-byte record");
+    let mask = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let inode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    assert_eq!(mask, abi::ext::WATCH_CREATE);
+    assert_eq!(inode as u64, new_ino);
+}
+
+#[test]
+fn fs_watch_delete_event_is_delivered() {
+    // Register a watch on /dir, unlink an existing /dir/file, the
+    // watch fd reports a DELETE event with the unlinked file's
+    // inode.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    k.vfs.mkdir("/dir", 0o755).expect("mkdir");
+    let pre_ino = k.vfs.create("/dir/file", 0o644).expect("create");
+    let mut heap = vec![0u8; 256];
+
+    let reg_resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_DELETE, 0, 720,
+    );
+    assert_eq!(reg_resp.status, 0);
+    let watch_fd = reg_resp.value as u32;
+
+    k.vfs_unlink("/dir/file").expect("unlink");
+
+    let mut buf = [0u8; 16];
+    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    assert_eq!(n, 8);
+    let mask = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let inode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    assert_eq!(mask, abi::ext::WATCH_DELETE);
+    assert_eq!(inode as u64, pre_ino);
+}
+
+#[test]
+fn fs_watch_modify_event_is_delivered() {
+    // Register a watch on /file, write to it, the watch fd reports a
+    // MODIFY event with the file's own inode.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    let file_ino = k.vfs.create("/file", 0o644).expect("create");
+    // Open the file so we have a writable Vnode fd.
+    let writer_fd = k
+        .path_open(pid, "/file", 0, 0, 0, FdFlags::EMPTY)
+        .expect("path_open");
+    let mut heap = vec![0u8; 256];
+
+    let reg_resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/file", abi::ext::WATCH_MODIFY, 0, 730,
+    );
+    assert_eq!(reg_resp.status, 0);
+    let watch_fd = reg_resp.value as u32;
+
+    k.fd_write(pid, writer_fd, b"hi").expect("fd_write");
+
+    let mut buf = [0u8; 16];
+    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    assert_eq!(n, 8);
+    let mask = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let inode = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    assert_eq!(mask, abi::ext::WATCH_MODIFY);
+    assert_eq!(inode as u64, file_ino);
+}
+
+#[test]
+fn fs_watch_no_event_when_mask_excludes() {
+    // Register a watch on /dir with mask = DELETE only. A create
+    // mutation must NOT queue an event because CREATE isn't in the
+    // mask. fd_read on the watch fd returns 0 bytes.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    k.vfs.mkdir("/dir", 0o755).expect("mkdir");
+    let mut heap = vec![0u8; 256];
+
+    let reg_resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_DELETE, 0, 740,
+    );
+    assert_eq!(reg_resp.status, 0);
+    let watch_fd = reg_resp.value as u32;
+
+    k.vfs_create("/dir/file", 0o644).expect("create");
+
+    let mut buf = [0u8; 16];
+    let n = k.fd_read(pid, watch_fd, &mut buf).expect("fd_read on watch");
+    assert_eq!(n, 0, "create event filtered out by DELETE-only mask");
+}
+
+#[test]
+fn fs_watch_close_unregisters() {
+    // Register a watch, close the watch fd. A subsequent mutation
+    // does NOT find the watch in the registry, so no event is
+    // queued. Verify by counting watches before / after the close
+    // (the registry's `len()` drops back to 0) AND by mutating and
+    // confirming no new events appear (the queue itself is gone
+    // along with the watch).
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    k.vfs.mkdir("/dir", 0o755).expect("mkdir");
+    let mut heap = vec![0u8; 256];
+
+    let reg_resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/dir", abi::ext::WATCH_CREATE, 0, 750,
+    );
+    assert_eq!(reg_resp.status, 0);
+    let watch_fd = reg_resp.value as u32;
+    assert_eq!(k.vfs.watches().len(), 1);
+
+    k.fd_close(pid, watch_fd).expect("fd_close");
+    assert_eq!(k.vfs.watches().len(), 0, "close unregisters the watch");
+
+    // Subsequent mutations don't queue events anywhere — the watch
+    // is gone. Just confirm the create still works without panic.
+    k.vfs_create("/dir/post-close", 0o644).expect("create after close");
+}
+
+#[test]
+fn fs_watch_emfile_when_fd_table_full_rolls_back_registration() {
+    // Force the fd table to its soft limit BEFORE the watch
+    // register so the install fails with EMFILE. The kernel must
+    // roll back the watch from the registry on this path so we
+    // don't leak a watch slot the caller can never close.
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watcher", 0);
+    // Replace the fd table with one that has capacity for exactly
+    // its current open fds (stdin/stdout/stderr would normally be
+    // installed by spawn — but `register_process` doesn't auto-
+    // populate them, so the table is empty by default). We
+    // use the public install_fd to fill the table to a synthetic
+    // limit by saturating with /dev/console fds.
+    for fd in 0..16u32 {
+        k.install_fd(pid, fd, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+            .expect("install fd");
+    }
+    let watch_count_before = k.vfs.watches().len();
+
+    // Use a custom-limit table to trigger EMFILE deterministically.
+    // The default soft limit is 1024 — too many to fill in a
+    // reasonable test. We rely on table.alloc returning OutOfFds
+    // when the soft limit is hit; instead construct a small table
+    // and shadow it onto the pid's slot via a public API. Since
+    // `Kernel` exposes `fds_mut`, we can replace the table.
+    let mut tight = kernel::fd::FdTable::with_limit(16);
+    for fd in 0..16u32 {
+        tight
+            .install_at(fd, kernel::fd::FdEntry::new(FdObject::CharDevice(DEV_CONSOLE)))
+            .expect("install at");
+    }
+    *k.fds_mut(pid).unwrap() = tight;
+
+    let mut heap = vec![0u8; 64];
+    let resp = dispatch_fs_watch(
+        &mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 0, 760,
+    );
+    assert_eq!(resp.status, -errno::EMFILE);
+    assert_eq!(
+        k.vfs.watches().len(),
+        watch_count_before,
+        "EMFILE rolls the watch registry back to its prior len"
+    );
 }

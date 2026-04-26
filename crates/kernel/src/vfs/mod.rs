@@ -39,8 +39,10 @@ use alloc::vec::Vec;
 
 pub mod mount;
 pub mod path;
+pub mod watch;
 
 pub use mount::{Mount, MountId, MountTable};
+pub use watch::{Watch, WatchEvent, WatchId, WatchTable};
 
 /// Per-filesystem inode identifier. Meaning depends on the
 /// concrete [`Filesystem`]; the VFS treats it as opaque.
@@ -316,13 +318,63 @@ pub trait Filesystem: Send {
 /// The kernel-wide virtual filesystem.
 pub struct Vfs {
     mounts: MountTable,
+    watches: WatchTable,
 }
 
 impl Vfs {
     pub fn new() -> Self {
         Vfs {
             mounts: MountTable::new(),
+            watches: WatchTable::new(),
         }
+    }
+
+    /// Borrow the watch table immutably. Used by the syscall layer
+    /// to inspect the registry from `fd_read` / `fd_close` paths
+    /// that need a `&mut Watch`.
+    pub fn watches(&self) -> &WatchTable {
+        &self.watches
+    }
+
+    /// Mutably borrow the watch table. The kernel uses this to
+    /// drain a watch's event queue into a userland heap_out window
+    /// from the `fd_read` Watch arm.
+    pub fn watches_mut(&mut self) -> &mut WatchTable {
+        &mut self.watches
+    }
+
+    /// Resolve `abs_path` and install a fresh watch on the resulting
+    /// `(mount_id, ino)` pair. Caller is responsible for validating
+    /// `mask` against [`abi::ext::WATCH_MASK_ALL`] and for rejecting
+    /// non-absolute paths BEFORE calling this method — the VFS
+    /// surface is intentionally minimal so the syscall handler owns
+    /// the wire-level validation invariants.
+    pub fn register_watch(
+        &mut self,
+        abs_path: &str,
+        mask: u32,
+    ) -> Result<WatchId, FsError> {
+        let (mount_id, ino) = self.resolve(abs_path)?;
+        Ok(self.watches.register(mount_id, ino, mask))
+    }
+
+    /// Remove a watch by id. Returns `true` iff the id named a
+    /// previously-registered watch. The `fd_close` Watch arm uses
+    /// the bool only for debug-assertion purposes — a stale id (a
+    /// watch already unregistered by an earlier close) is not an
+    /// error at the caller layer.
+    pub fn unregister_watch(&mut self, id: WatchId) -> bool {
+        self.watches.unregister(id)
+    }
+
+    /// Push a single event onto every watch subscribed to
+    /// `(mount_id, inode)`. Watches whose mask doesn't include the
+    /// event's bit drop it silently. Called from the kernel's
+    /// mutation-wrapping methods (`Kernel::vfs_create`,
+    /// `Kernel::vfs_unlink`, etc.) AFTER the underlying VFS call
+    /// succeeds so a failed mutation never queues a phantom event.
+    pub fn notify(&mut self, mount_id: MountId, inode: Ino, event: WatchEvent) {
+        self.watches.notify(mount_id, inode, event);
     }
 
     /// Install a mount at an absolute path. Every subsequent

@@ -40,7 +40,7 @@ use crate::proc::{
     ExitStatus, ProcState, Process, ProcessTable, Scheduler, SignalInbox,
 };
 pub use crate::proc::Signal;
-use crate::vfs::{DirEntry, FsError, Ino, MountId, NodeType, Vfs};
+use crate::vfs::{DirEntry, FsError, Ino, MountId, NodeType, Vfs, WatchEvent, WatchId};
 
 /// Error returned by the high-level kernel API.
 ///
@@ -488,7 +488,10 @@ impl Kernel {
                 }
                 Err(crate::vfs::FsError::NotFound) => {
                     let effective_mode: u32 = if mode == 0 { 0o644 } else { mode as u32 };
-                    self.vfs.create(path, effective_mode)?;
+                    // Use the watch-aware wrapper so a watcher on
+                    // the parent directory observes the implicit
+                    // create that O_CREAT performs.
+                    self.vfs_create(path, effective_mode)?;
                     // Freshly-created regular file; follow_symlink
                     // is moot because the target isn't a symlink.
                     self.vfs.open(path)?
@@ -630,6 +633,21 @@ impl Kernel {
                 }
                 Ok(written)
             }
+            FdObject::Watch { watch_id } => {
+                // Watch fds drain the per-watch event queue into the
+                // caller's buffer in 8-byte records (mask u32 LE +
+                // inode u32 LE). An empty queue returns 0 bytes
+                // (non-blocking — a future slice may park the caller
+                // on the watch the way ipc_recv parks on a socket).
+                // A buffer shorter than one record returns 0 too,
+                // matching `fd_read`'s no-op semantic when the
+                // window can't hold a single record.
+                let watches = self.vfs.watches_mut();
+                let Some(watch) = watches.get_mut(watch_id) else {
+                    return Err(KernelError::BadFd);
+                };
+                Ok(watch.drain_into(buf))
+            }
             FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => {
                 Err(KernelError::NotSupportedOnFd)
             }
@@ -662,18 +680,25 @@ impl Kernel {
         let result: Result<usize, KernelError> = match entry.object {
             FdObject::Vnode { mount_id, ino } => {
                 match self.vfs.write_ino(mount_id, ino, entry.offset, buf) {
-                    Ok(n) => match self
-                        .fds
-                        .get_mut(&pid)
-                        .and_then(|t| t.get_mut(fd))
-                        .ok_or(KernelError::BadFd)
-                    {
-                        Ok(slot) => {
-                            slot.offset = slot.offset.saturating_add(n as u64);
-                            Ok(n)
-                        }
-                        Err(e) => Err(e),
-                    },
+                    Ok(n) => {
+                        let slot = match self
+                            .fds
+                            .get_mut(&pid)
+                            .and_then(|t| t.get_mut(fd))
+                            .ok_or(KernelError::BadFd)
+                        {
+                            Ok(s) => s,
+                            Err(e) => return Err(e),
+                        };
+                        slot.offset = slot.offset.saturating_add(n as u64);
+                        // Watch hook: a successful write fires
+                        // WATCH_MODIFY on the file's own inode. Zero-
+                        // byte writes still notify — POSIX doesn't
+                        // distinguish them and a watcher waiting on
+                        // a touch() probe would otherwise miss it.
+                        self.notify_modify(mount_id, ino);
+                        Ok(n)
+                    }
                     Err(e) => Err(KernelError::Fs(e)),
                 }
             }
@@ -713,7 +738,8 @@ impl Kernel {
             }
             FdObject::PipeRead(_)
             | FdObject::DisplayConn(_)
-            | FdObject::SignalChannel => Err(KernelError::NotSupportedOnFd),
+            | FdObject::SignalChannel
+            | FdObject::Watch { .. } => Err(KernelError::NotSupportedOnFd),
         };
         if matches!(result, Err(KernelError::PipeBroken)) {
             self.post_sigpipe(pid);
@@ -1730,6 +1756,12 @@ impl Kernel {
                     Err(_) => {}
                 }
             }
+            FdObject::Watch { watch_id } => {
+                // Unregister the watch from the VFS notifier so future
+                // mutations on the watched (mount, inode) pair don't
+                // queue events into a queue that will never be drained.
+                let _ = self.vfs.unregister_watch(watch_id);
+            }
             FdObject::Vnode { .. }
             | FdObject::CharDevice(_)
             | FdObject::DisplayConn(_)
@@ -2516,6 +2548,170 @@ impl Kernel {
         self.vfs.umount(&normalised).map(|_| ()).map_err(KernelError::from)
     }
 
+    /// `fs_watch(pid, abs_path, mask) -> watch_fd`. Resolves
+    /// `abs_path` through the VFS, registers a fresh watch on the
+    /// resulting `(mount_id, ino)` pair, allocates an
+    /// [`FdObject::Watch`] in `pid`'s fd table, returns the new
+    /// fd number. The caller (the FS_WATCH opcode handler) is
+    /// responsible for validating `mask` against
+    /// [`abi::ext::WATCH_MASK_ALL`] BEFORE calling — a zero mask
+    /// or a mask with unknown bits is the handler's atomic-reject
+    /// concern, not this method's.
+    ///
+    /// Errors:
+    /// * [`KernelError::NoSuchPid`] — unknown pid.
+    /// * [`KernelError::Fs`]`(FsError::NotFound)` — `abs_path`
+    ///   doesn't resolve. Surfaces as `-ENOENT` at the wire layer.
+    /// * [`KernelError::OutOfFds`] — caller's fd table is full.
+    ///   Surfaces as `-EMFILE`. The watch is rolled back from the
+    ///   VFS registry on this path so a failed install doesn't
+    ///   leak a watch slot the caller has no fd for.
+    pub fn fs_watch(
+        &mut self,
+        pid: Pid,
+        abs_path: &str,
+        mask: u32,
+    ) -> Result<u32, KernelError> {
+        let watch_id = self.vfs.register_watch(abs_path, mask)?;
+        let table = match self.fds.get_mut(&pid) {
+            Some(t) => t,
+            None => {
+                let _ = self.vfs.unregister_watch(watch_id);
+                return Err(KernelError::NoSuchPid);
+            }
+        };
+        match table.alloc(FdEntry::new(FdObject::Watch { watch_id })) {
+            Ok(fd) => Ok(fd),
+            Err(e) => {
+                // Roll back the watch registration so a fd-limit
+                // failure doesn't leak a registry slot.
+                let _ = self.vfs.unregister_watch(watch_id);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// VFS-mutation wrapper: create a regular file at `abs_path`
+    /// with `mode`, then notify any watchers on the parent
+    /// directory's inode with `WATCH_CREATE` carrying the new
+    /// child's inode.
+    ///
+    /// The wasi `path_open(O_CREAT)` and `path_unlink_file`
+    /// handlers call this (and its siblings) instead of
+    /// `Vfs::create` directly so the notify hook runs in lockstep
+    /// with the underlying mutation. A failed mutation does NOT
+    /// notify — there is no event to report.
+    pub fn vfs_create(&mut self, abs_path: &str, mode: u32) -> Result<Ino, FsError> {
+        let new_ino = self.vfs.create(abs_path, mode)?;
+        // Resolve parent AFTER the successful create. A
+        // mutation-time resolve_parent failure (which would happen
+        // if the path were truly malformed) is impossible here:
+        // create just succeeded so the parent resolves. Skip the
+        // notify silently if it somehow doesn't — a failed parent
+        // lookup post-create is a kernel invariant violation, not a
+        // user-facing error.
+        if let Ok((mount_id, parent_ino, _)) = self.vfs.resolve_parent(abs_path) {
+            self.vfs.notify(
+                mount_id,
+                parent_ino,
+                WatchEvent { mask: abi::ext::WATCH_CREATE, inode: new_ino as u32 },
+            );
+        }
+        Ok(new_ino)
+    }
+
+    /// VFS-mutation wrapper: create a directory at `abs_path` with
+    /// `mode`, then notify the parent's watchers with
+    /// `WATCH_CREATE` and the new directory's inode.
+    pub fn vfs_mkdir(&mut self, abs_path: &str, mode: u32) -> Result<Ino, FsError> {
+        let new_ino = self.vfs.mkdir(abs_path, mode)?;
+        if let Ok((mount_id, parent_ino, _)) = self.vfs.resolve_parent(abs_path) {
+            self.vfs.notify(
+                mount_id,
+                parent_ino,
+                WatchEvent { mask: abi::ext::WATCH_CREATE, inode: new_ino as u32 },
+            );
+        }
+        Ok(new_ino)
+    }
+
+    /// VFS-mutation wrapper: unlink the regular file at `abs_path`,
+    /// then notify the parent's watchers with `WATCH_DELETE`
+    /// carrying the just-removed child's inode.
+    ///
+    /// Pre-resolves the child's inode BEFORE the unlink only when
+    /// at least one watcher is interested in this filesystem (a
+    /// fast `WatchTable::is_empty` probe) — otherwise the resolve
+    /// is wasted work AND the resolve-failure errno (NotFound on a
+    /// path that doesn't exist) would mask the real underlying
+    /// errno (e.g. devfs's ReadOnly, surfaced as EROFS). The pre-
+    /// resolve guard preserves the wasi handler's error contract
+    /// while still capturing the inode for the notify path when a
+    /// watcher actually exists.
+    pub fn vfs_unlink(&mut self, abs_path: &str) -> Result<(), FsError> {
+        let pre_inode = if !self.vfs.watches().is_empty() {
+            self.vfs.resolve(abs_path).ok()
+        } else {
+            None
+        };
+        self.vfs.unlink(abs_path)?;
+        if let (Some((mount_id, child_ino)), Ok((_, parent_ino, _))) =
+            (pre_inode, self.vfs.resolve_parent(abs_path))
+        {
+            self.vfs.notify(
+                mount_id,
+                parent_ino,
+                WatchEvent { mask: abi::ext::WATCH_DELETE, inode: child_ino as u32 },
+            );
+        }
+        Ok(())
+    }
+
+    /// VFS-mutation wrapper: remove the empty directory at
+    /// `abs_path`, then notify the parent's watchers with
+    /// `WATCH_DELETE` carrying the just-removed child's inode.
+    /// Same pattern as [`Self::vfs_unlink`].
+    pub fn vfs_rmdir(&mut self, abs_path: &str) -> Result<(), FsError> {
+        let pre_inode = if !self.vfs.watches().is_empty() {
+            self.vfs.resolve(abs_path).ok()
+        } else {
+            None
+        };
+        self.vfs.rmdir(abs_path)?;
+        if let (Some((mount_id, child_ino)), Ok((_, parent_ino, _))) =
+            (pre_inode, self.vfs.resolve_parent(abs_path))
+        {
+            self.vfs.notify(
+                mount_id,
+                parent_ino,
+                WatchEvent { mask: abi::ext::WATCH_DELETE, inode: child_ino as u32 },
+            );
+        }
+        Ok(())
+    }
+
+    /// Notify any watchers on `(mount_id, ino)` that a write just
+    /// landed on that inode with `WATCH_MODIFY`. Called from
+    /// [`Self::fd_write`]'s `Vnode` arm AFTER the underlying
+    /// `Vfs::write_ino` succeeds. A failed write does not notify.
+    /// Public so tests can assert the hook fires on the expected
+    /// inode without piping every mutation through a wrapper
+    /// method.
+    pub fn notify_modify(&mut self, mount_id: MountId, ino: Ino) {
+        self.vfs.notify(
+            mount_id,
+            ino,
+            WatchEvent { mask: abi::ext::WATCH_MODIFY, inode: ino as u32 },
+        );
+    }
+
+    /// Borrow a watch by id. Used by tests + the FS_WATCH opcode
+    /// handler's introspection paths to confirm a register/unregister
+    /// round-trip.
+    pub fn watch_get(&self, id: WatchId) -> Option<&crate::vfs::Watch> {
+        self.vfs.watches().watches.get(&id)
+    }
+
     /// Bump the kernel-side refcount on a pipe-ended fd object.
     /// Called when we're about to install the same object into a
     /// second fd (proc_spawn inheritance, `dup` inside a
@@ -2538,7 +2734,8 @@ impl Kernel {
             | FdObject::CharDevice(_)
             | FdObject::Socket(_)
             | FdObject::DisplayConn(_)
-            | FdObject::SignalChannel => {}
+            | FdObject::SignalChannel
+            | FdObject::Watch { .. } => {}
         }
     }
 }

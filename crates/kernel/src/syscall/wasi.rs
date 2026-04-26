@@ -815,7 +815,8 @@ fn filetype_for(object: FdObject) -> u8 {
         FdObject::Socket(_) | FdObject::DisplayConn(_) => ft::SOCKET_STREAM,
         FdObject::PipeRead(_)
         | FdObject::PipeWrite(_)
-        | FdObject::SignalChannel => ft::UNKNOWN,
+        | FdObject::SignalChannel
+        | FdObject::Watch { .. } => ft::UNKNOWN,
     }
 }
 
@@ -948,6 +949,9 @@ fn handle_fd_filestat_get(
             (ft::UNKNOWN, 0, id as u64, 0, 1, 0, 0, 0)
         }
         FdObject::SignalChannel => (ft::UNKNOWN, 0, 0, 0, 1, 0, 0, 0),
+        FdObject::Watch { watch_id } => {
+            (ft::UNKNOWN, 0, watch_id.0 as u64, 0, 1, 0, 0, 0)
+        }
     };
 
     let Some(buf) = heap_out_mut(req, heap, fs_off::SIZE) else {
@@ -1466,7 +1470,7 @@ fn handle_path_unlink_file(
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs.unlink(path) {
+    match kernel.vfs_unlink(path) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(
             req.request_id,
@@ -1772,7 +1776,7 @@ fn handle_path_create_directory(
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs.mkdir(path, 0o755) {
+    match kernel.vfs_mkdir(path, 0o755) {
         Ok(_) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(
             req.request_id,
@@ -1794,7 +1798,7 @@ fn handle_path_remove_directory(
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs.rmdir(path) {
+    match kernel.vfs_rmdir(path) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(
             req.request_id,
@@ -2373,6 +2377,31 @@ fn fd_readiness(
         FdObject::CharDevice(devnum) => char_device_readiness(kernel, devnum, is_read),
         FdObject::Socket(id) => socket_readiness(kernel, SocketId(id), is_read),
         FdObject::SignalChannel => signal_channel_readiness(kernel, pid, is_read),
+        FdObject::Watch { watch_id } => {
+            // Watch fds are read-only — they expose a queue of
+            // events. A poll on the write side is meaningless →
+            // EINVAL, mirroring SignalChannel's read-only stance.
+            // The read side reports "ready" iff the queue has at
+            // least one event; an empty queue is "not ready" and
+            // a future blocking-fd_read slice would park the caller
+            // here the way poll on a SignalChannel parks today.
+            if !is_read {
+                return (false, 0, 0, Some(EINVAL));
+            }
+            let n_events = kernel
+                .vfs
+                .watches()
+                .watches
+                .get(&watch_id)
+                .map(|w| w.events.len())
+                .unwrap_or(0);
+            if n_events == 0 {
+                (false, 0, 0, None)
+            } else {
+                let nbytes = (n_events * crate::vfs::WatchEvent::SIZE) as u64;
+                (true, nbytes, 0, None)
+            }
+        }
         FdObject::PipeRead(_)
         | FdObject::PipeWrite(_)
         | FdObject::DisplayConn(_) => {

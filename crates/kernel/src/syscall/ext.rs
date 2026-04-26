@@ -9,26 +9,25 @@
 //!
 //! ## Coverage
 //!
-//! As of the MOUNT / UMOUNT delegation slice, the dispatcher
-//! routes the following extension opcodes
-//! (`contracts/syscalls.md §3`): `IPC_SOCKET`, `IPC_BIND`,
-//! `IPC_LISTEN`, `IPC_CONNECT`, `IPC_ACCEPT`, `IPC_SEND`,
-//! `IPC_RECV`, `IPC_PIPE`, `PROC_SELF`, `PROC_PARENT`,
-//! `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`, `PROC_CAPS_GET`,
-//! `DISPLAY_CONNECT`, `DISPLAY_BIND`, `CAP_CHECK`, `CAP_LIST`,
-//! `CAP_GRANT`, `MOUNT`, `UMOUNT`.
+//! As of the FS_WATCH delegation slice, the dispatcher routes
+//! the following extension opcodes (`contracts/syscalls.md §3`):
+//! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
+//! `IPC_ACCEPT`, `IPC_SEND`, `IPC_RECV`, `IPC_PIPE`, `PROC_SELF`,
+//! `PROC_PARENT`, `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`,
+//! `PROC_CAPS_GET`, `DISPLAY_CONNECT`, `DISPLAY_BIND`,
+//! `CAP_CHECK`, `CAP_LIST`, `CAP_GRANT`, `MOUNT`, `UMOUNT`,
+//! `FS_WATCH`.
 //!
 //! The remaining extension opcodes fall through the `_ =>` arm
 //! and return `ENOSYS`:
 //!
-//! * `FS_WATCH` (0x1402) — needs an event queue + watch-point
-//!   notification machinery that doesn't exist yet. `FS_WATCH`
-//!   is now the canonical ext-range ENOSYS probe target in
-//!   `known_ext_opcode_without_handler_returns_enosys`; it
-//!   inherits that role from `MOUNT`, which now ships a handler.
 //! * `HOST_FILE_RECV` (0x1500) — needs the drag-drop token
 //!   table + driver plumbing described in
-//!   `contracts/syscalls.md §3.6`.
+//!   `contracts/syscalls.md §3.6`. `HOST_FILE_RECV` is now the
+//!   canonical ext-range ENOSYS probe target in
+//!   `known_ext_opcode_without_handler_returns_enosys`; it
+//!   inherits that role from `FS_WATCH`, which now ships a
+//!   handler.
 
 extern crate alloc;
 
@@ -37,6 +36,7 @@ use alloc::vec::Vec;
 
 use abi::cap::{Cap, CapSet};
 use abi::errno::{EAGAIN, EBADF, EBUSY, ECHILD, EINVAL, ENOSYS, ESRCH};
+use abi::ext::WATCH_MASK_ALL;
 use abi::ext::{self as op, Pid};
 use abi::ring::{Request, Response};
 
@@ -79,6 +79,7 @@ pub fn dispatch_ext(
         op::DISPLAY_BIND => ServiceOutcome::Done(handle_display_bind(kernel, pid, req)),
         op::MOUNT => ServiceOutcome::Done(handle_mount(kernel, pid, req, heap)),
         op::UMOUNT => ServiceOutcome::Done(handle_umount(kernel, pid, req, heap)),
+        op::FS_WATCH => ServiceOutcome::Done(handle_fs_watch(kernel, pid, req, heap)),
         _ => ServiceOutcome::Done(Response::err(req.request_id, ENOSYS)),
     }
 }
@@ -1138,6 +1139,89 @@ fn handle_umount(
     match kernel.umount(pid, path) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(crate::sys::KernelError::WouldBlock) => Response::err(req.request_id, EBUSY),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- fs_watch ---------------------------------------------------------
+//
+// Layout (per `contracts/syscalls.md §3.7`):
+//   args[0..4]   = path_ptr (u32) — heap offset where the absolute
+//                  watch path bytes live.
+//   args[4..8]   = path_len (u32) — length of the watch path bytes.
+//   args[8..12]  = mask (u32) — bit-OR of `WATCH_CREATE` /
+//                  `WATCH_DELETE` / `WATCH_MODIFY`. Zero or any
+//                  unknown bit → -EINVAL atomic-reject (no watch
+//                  installed; no fd allocated).
+//   args[12..16] = flags (u32) — v1 only accepts 0. The wire spec
+//                  documents two flag bits (`RECURSIVE`,
+//                  `COALESCE_MODIFY`) but neither is implemented in
+//                  v1; any non-zero value → -EINVAL BEFORE any
+//                  side effect, mirroring the strict-flag invariant
+//                  of `ipc_send` / `ipc_recv` / `mount`.
+//   heap input: path bytes at heap[path_ptr..path_ptr+path_len].
+//
+// Response:
+//   value = freshly-allocated watch fd-number on success (>= 0).
+//           Userland reads this fd via `fd_read` to drain queued
+//           [`WatchEvent`]s as 8-byte fixed-size records (mask u32
+//           LE + inode u32 LE).
+//   status = -EINVAL if the heap range is out of bounds, the path
+//                  is not valid UTF-8, the path is not absolute, the
+//                  mask is zero, the mask contains unknown bits,
+//                  OR flags != 0.
+//            -ENOENT if `path` doesn't resolve through the VFS.
+//            -EMFILE if the caller's fd table is full.
+//
+// No capability check in v1. The §3.7 spec doesn't gate `fs_watch`
+// on a cap; a future slice may add `Cap::FsWatch` for paths that
+// would otherwise leak metadata about other users' filesystems —
+// but v1 is a single-user OS and every process can already
+// `path_open + readdir` any directory it can name, so an extra cap
+// would be ceremony without protection.
+//
+// Watch-side state lives on the `Vfs::watches` registry (keyed by
+// `(MountId, Inode)`), not on the per-process fd table beyond the
+// `FdObject::Watch` discriminator. Closing the fd via `fd_close`
+// runs `release_object`'s Watch arm which calls
+// `Vfs::unregister_watch`, so a process exit (which drains every
+// fd) cleans up watches automatically.
+
+fn handle_fs_watch(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> Response {
+    let path_ptr = args_u32(req, 0) as usize;
+    let path_len = args_u32(req, 4) as usize;
+    let mask = args_u32(req, 8);
+    let flags = args_u32(req, 12);
+
+    // Atomic-reject: every wire-level invariant runs BEFORE we
+    // touch the watch registry. A malformed call leaves the
+    // kernel state untouched.
+    if flags != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if mask == 0 || (mask & !WATCH_MASK_ALL) != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Some(path_end) = path_ptr.checked_add(path_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if path_end > heap.len() {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Ok(path) = core::str::from_utf8(&heap[path_ptr..path_end]) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if !path.starts_with('/') {
+        return Response::err(req.request_id, EINVAL);
+    }
+
+    match kernel.fs_watch(pid, path, mask) {
+        Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }

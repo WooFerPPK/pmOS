@@ -132,6 +132,24 @@ pub enum FsWatchKind {
     RenamedTo   = 5,
 }
 
+/// `fs_watch` event-mask bits used by the `mask` argument and by the
+/// per-event header. Distinct from [`FsWatchKind`] (which numbers the
+/// event variants 1..5 in the wire-format record): the mask is a
+/// bit-OR of these constants, so `WATCH_CREATE | WATCH_MODIFY`
+/// subscribes a watch to both create AND modify notifications. v1
+/// implements `WATCH_CREATE`, `WATCH_DELETE`, `WATCH_MODIFY`; rename
+/// events are deferred and any unknown bit in the mask → `-EINVAL`
+/// at register time.
+pub const WATCH_CREATE: u32 = 0x0001;
+pub const WATCH_DELETE: u32 = 0x0002;
+pub const WATCH_MODIFY: u32 = 0x0004;
+
+/// Bit-mask of every `WATCH_*` flag this kernel understands. Used by
+/// the `fs_watch` opcode handler to reject unknown bits before
+/// allocating a watch (atomic-reject — no half-installed watch on a
+/// malformed mask).
+pub const WATCH_MASK_ALL: u32 = WATCH_CREATE | WATCH_DELETE | WATCH_MODIFY;
+
 /// `fs_watch` flag bits.
 pub mod fs_watch_flags {
     pub const RECURSIVE:       u32 = 0x0001;
