@@ -439,6 +439,12 @@ pub struct Client {
     /// Object id of this client's `pmd_keyboard`, same
     /// semantics as [`Client::pointer_id`].
     pub keyboard_id: Option<ObjectId>,
+    /// Monotonically increasing counter used for the
+    /// `xdg_toplevel.configure` event's `serial` field. The
+    /// client must echo each value back through
+    /// `ack_configure(serial)`. Starts at 1; 0 is reserved
+    /// as a sentinel "no configure has been sent yet".
+    pub next_configure_serial: u32,
 }
 
 impl Client {
@@ -471,6 +477,7 @@ impl Client {
             next_toplevel_offset: 0,
             pointer_id: None,
             keyboard_id: None,
+            next_configure_serial: 1,
         }
     }
 
@@ -1175,6 +1182,43 @@ impl Client {
         let mut payload = Vec::new();
         event.encode(&mut payload);
         self.emit_raw(registry_id, 2 /* global_remove */, &payload)
+    }
+
+    /// Emit `pmd_xdg_toplevel.configure(serial, width,
+    /// height, states)` — spec §11/§12 collapsed. The
+    /// `serial` is the value the client must echo back
+    /// via `ack_configure`; `states` is a bitfield of
+    /// [`display_proto::xdg_toplevel_state`] bits — pass
+    /// `0` for "no special state".
+    pub fn emit_xdg_toplevel_configure(
+        &mut self,
+        toplevel_id: ObjectId,
+        serial: u32,
+        width: i32,
+        height: i32,
+        states: u32,
+    ) -> Result<usize, ClientError> {
+        use display_proto::events::XdgToplevelConfigure;
+        let event = XdgToplevelConfigure { serial, width, height, states };
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.emit_raw(toplevel_id, 1 /* configure */, &payload)
+    }
+
+    /// Allocate the next `serial` for `emit_xdg_toplevel_configure`.
+    /// Increments the per-client counter; never returns 0.
+    pub fn next_configure_serial(&mut self) -> u32 {
+        let s = self.next_configure_serial;
+        self.next_configure_serial = self.next_configure_serial.saturating_add(1).max(1);
+        s
+    }
+
+    /// Emit `pmd_xdg_toplevel.close` — spec §12. No payload.
+    pub fn emit_xdg_toplevel_close(
+        &mut self,
+        toplevel_id: ObjectId,
+    ) -> Result<usize, ClientError> {
+        self.emit_raw(toplevel_id, 2 /* close */, &[])
     }
 
     /// Emit `pmd_shell_manager.window_created(window_id,

@@ -1290,3 +1290,204 @@ fn minimized_toplevel_skips_the_composite_blit() {
         .unwrap();
     assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &[0x00, 0x00, 0xff, 0xff]);
 }
+
+#[test]
+fn set_maximized_request_emits_configure_with_maximized_state_bit() {
+    use display_proto::xdg_toplevel_state;
+    use display_proto::events::XdgToplevelConfigure;
+    use display_proto::wire::HEADER_SIZE as PROTO_HEADER_SIZE;
+    use display_server::ids::ObjectId;
+
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let c = s.accept();
+
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let xdg_shell_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+    let toplevel_id = ObjectId::new(11);
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(ObjectId::DISPLAY, 2, &registry_id.raw().to_le_bytes()),
+    )
+    .unwrap();
+    for (name, iface, bound) in [(1u32, "pmd_compositor", compositor_id), (2, "pmd_xdg_shell", xdg_shell_id)] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload)).unwrap();
+    }
+    s.dispatch_request(c, &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes())).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(xdg_shell_id, 1, &xdg_get_toplevel_payload(toplevel_id, surface_id))).unwrap();
+
+    // Drain the bind events so the next pending event is the configure.
+    let _ = s.drain_client_events(c);
+
+    // Send set_maximized — should trigger a configure emit on the same client.
+    s.dispatch_request(c, &encode_request_bytes(toplevel_id, 5 /* set_maximized */, &[])).unwrap();
+    assert!(s.client(c).unwrap().toplevel(toplevel_id).unwrap().maximized);
+
+    // The next event in the queue is the configure. Decode it.
+    let bytes = s.drain_client_events(c).expect("client must exist");
+    assert!(!bytes.is_empty(), "set_maximized must emit a configure");
+    let header = display_proto::wire::MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, toplevel_id);
+    assert_eq!(header.opcode, 1 /* configure */);
+    let payload = &bytes[PROTO_HEADER_SIZE..header.length as usize];
+    let configure = XdgToplevelConfigure::decode(payload).unwrap();
+    assert_eq!(configure.width, 800);
+    assert_eq!(configure.height, 600);
+    assert_eq!(configure.states & xdg_toplevel_state::MAXIMIZED, xdg_toplevel_state::MAXIMIZED);
+    assert!(configure.serial > 0);
+}
+
+#[test]
+fn unset_maximized_request_emits_configure_with_no_states_bits() {
+    use display_proto::events::XdgToplevelConfigure;
+    use display_proto::wire::HEADER_SIZE as PROTO_HEADER_SIZE;
+    use display_server::ids::ObjectId;
+
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let c = s.accept();
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let xdg_shell_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+    let toplevel_id = ObjectId::new(11);
+    s.dispatch_request(c, &encode_request_bytes(ObjectId::DISPLAY, 2, &registry_id.raw().to_le_bytes())).unwrap();
+    for (name, iface, bound) in [(1u32, "pmd_compositor", compositor_id), (2, "pmd_xdg_shell", xdg_shell_id)] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload)).unwrap();
+    }
+    s.dispatch_request(c, &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes())).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(xdg_shell_id, 1, &xdg_get_toplevel_payload(toplevel_id, surface_id))).unwrap();
+    let _ = s.drain_client_events(c);
+
+    s.dispatch_request(c, &encode_request_bytes(toplevel_id, 6 /* unset_maximized */, &[])).unwrap();
+    assert!(!s.client(c).unwrap().toplevel(toplevel_id).unwrap().maximized);
+
+    let bytes = s.drain_client_events(c).unwrap();
+    let header = display_proto::wire::MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.opcode, 1 /* configure */);
+    let payload = &bytes[PROTO_HEADER_SIZE..header.length as usize];
+    let configure = XdgToplevelConfigure::decode(payload).unwrap();
+    assert_eq!(configure.states, 0);
+}
+
+#[test]
+fn move_request_starts_a_drag_and_pointer_motion_translates_origin() {
+    use display_server::ids::ObjectId;
+
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let c = s.accept();
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let xdg_shell_id = ObjectId::new(7);
+    let surface_id = ObjectId::new(9);
+    let toplevel_id = ObjectId::new(11);
+    s.dispatch_request(c, &encode_request_bytes(ObjectId::DISPLAY, 2, &registry_id.raw().to_le_bytes())).unwrap();
+    for (name, iface, bound) in [(1u32, "pmd_compositor", compositor_id), (2, "pmd_xdg_shell", xdg_shell_id)] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload)).unwrap();
+    }
+    s.dispatch_request(c, &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes())).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(xdg_shell_id, 1, &xdg_get_toplevel_payload(toplevel_id, surface_id))).unwrap();
+    let initial_origin = (s.client(c).unwrap().toplevel(toplevel_id).unwrap().x,
+                          s.client(c).unwrap().toplevel(toplevel_id).unwrap().y);
+
+    // Plant the pointer at (100, 100) and send move(serial=1).
+    s.inject_pointer_motion(100, 100);
+    assert!(!s.is_dragging());
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes()); // serial
+    s.dispatch_request(c, &encode_request_bytes(toplevel_id, 7 /* move */, &payload)).unwrap();
+    assert!(s.is_dragging(), "move request must start a drag");
+
+    // Pointer moves to (140, 130) — toplevel origin should
+    // translate by (40, 30).
+    s.inject_pointer_motion(140, 130);
+    let new_origin = (s.client(c).unwrap().toplevel(toplevel_id).unwrap().x,
+                      s.client(c).unwrap().toplevel(toplevel_id).unwrap().y);
+    assert_eq!(new_origin.0, initial_origin.0 + 40);
+    assert_eq!(new_origin.1, initial_origin.1 + 30);
+
+    // Pointer button release ends the drag.
+    s.inject_pointer_button(1, display_proto::events::pointer_button_state::RELEASED);
+    assert!(!s.is_dragging(), "release must end the drag");
+}
+
+#[test]
+fn resize_request_emits_resizing_configures_during_drag_and_final_configure_on_release() {
+    use display_proto::xdg_toplevel_state;
+    use display_proto::xdg_toplevel_resize_edge as edge;
+    use display_proto::events::XdgToplevelConfigure;
+    use display_proto::wire::HEADER_SIZE as PROTO_HEADER_SIZE;
+    use display_server::ids::ObjectId;
+
+    let mut s = Server::with_framebuffer_size(800, 600);
+    let c = s.accept();
+    let registry_id = ObjectId::new(3);
+    let compositor_id = ObjectId::new(5);
+    let shm_id = ObjectId::new(7);
+    let xdg_shell_id = ObjectId::new(9);
+    let surface_id = ObjectId::new(11);
+    let pool_id = ObjectId::new(13);
+    let buffer_id = ObjectId::new(15);
+    let toplevel_id = ObjectId::new(17);
+    s.dispatch_request(c, &encode_request_bytes(ObjectId::DISPLAY, 2, &registry_id.raw().to_le_bytes())).unwrap();
+    for (name, iface, bound) in [(1u32, "pmd_compositor", compositor_id), (2, "pmd_shm", shm_id), (3, "pmd_xdg_shell", xdg_shell_id)] {
+        let payload = registry_bind_payload(name, iface, 1, bound);
+        s.dispatch_request(c, &encode_request_bytes(registry_id, 1, &payload)).unwrap();
+    }
+    s.dispatch_request(c, &encode_request_bytes(compositor_id, 1, &surface_id.raw().to_le_bytes())).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(shm_id, 1, &shm_create_pool_payload(pool_id, 32))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(pool_id, 1, &shm_pool_create_buffer_payload(buffer_id, 0, 4, 2, 16, 0))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(xdg_shell_id, 1, &xdg_get_toplevel_payload(toplevel_id, surface_id))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 2, &surface_attach_payload(buffer_id, 0, 0))).unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface_id, 7, &[])).unwrap();
+    let _ = s.drain_client_events(c);
+
+    // Plant pointer + send resize(serial=1, edges=BOTTOM_RIGHT).
+    s.inject_pointer_motion(50, 50);
+    let _ = s.drain_client_events(c);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes()); // serial
+    payload.extend_from_slice(&edge::BOTTOM_RIGHT.to_le_bytes());
+    s.dispatch_request(c, &encode_request_bytes(toplevel_id, 8 /* resize */, &payload)).unwrap();
+    assert!(s.is_dragging());
+    // The dispatch shouldn't emit anything yet — drain is empty.
+    assert!(s.drain_client_events(c).map(|b| b.is_empty()).unwrap_or(true));
+
+    // Pointer drags by (+10, +5). The resize-drag emits a
+    // RESIZING configure with the new (4+10, 2+5) size.
+    s.inject_pointer_motion(60, 55);
+    let bytes = s.drain_client_events(c).unwrap();
+    assert!(!bytes.is_empty(), "resize-drag must emit a configure");
+    let header = display_proto::wire::MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.opcode, 1 /* configure */);
+    let p = &bytes[PROTO_HEADER_SIZE..header.length as usize];
+    let configure = XdgToplevelConfigure::decode(p).unwrap();
+    assert_eq!(configure.width, 14);
+    assert_eq!(configure.height, 7);
+    assert_eq!(configure.states, xdg_toplevel_state::RESIZING);
+
+    // Release ends the drag + emits a final configure with
+    // states = 0.
+    s.inject_pointer_button(1, display_proto::events::pointer_button_state::RELEASED);
+    assert!(!s.is_dragging());
+    let bytes = s.drain_client_events(c).unwrap();
+    let header = display_proto::wire::MessageHeader::decode(&bytes).unwrap();
+    let p = &bytes[PROTO_HEADER_SIZE..header.length as usize];
+    let configure = XdgToplevelConfigure::decode(p).unwrap();
+    assert_eq!(configure.states, 0);
+}
+
+#[test]
+fn taskbar_height_reservation_subtracts_from_work_area_height() {
+    let mut s = Server::with_framebuffer_size(800, 600);
+    assert_eq!(s.work_area_width(), 800);
+    assert_eq!(s.work_area_height(), 600);
+    s.set_taskbar_height_px(40);
+    assert_eq!(s.work_area_width(), 800);
+    assert_eq!(s.work_area_height(), 560);
+    s.set_taskbar_height_px(0);
+    assert_eq!(s.work_area_height(), 600);
+}

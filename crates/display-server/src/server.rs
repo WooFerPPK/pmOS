@@ -65,6 +65,36 @@ pub struct HitResult {
     pub local_y: i32,
 }
 
+/// What kind of interactive drag is in progress, when one
+/// is. `Move` is "follow the pointer with the toplevel's
+/// origin"; `Resize { edges }` is "follow the pointer by
+/// expanding/contracting along the named edges".
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DragKind {
+    Move,
+    Resize { edges: u32 },
+}
+
+/// State captured when a `pmd_xdg_toplevel.move` /
+/// `.resize` request is dispatched. The server consults
+/// this on every subsequent pointer-motion event to update
+/// the toplevel; the drag ends on the next pointer-button
+/// release event.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DragState {
+    pub client_id: ClientId,
+    pub toplevel_id: ObjectId,
+    pub kind: DragKind,
+    /// Pointer position when the drag started, in screen
+    /// space. Used to compute the pointer delta on each
+    /// motion event so the toplevel tracks the cursor 1:1.
+    pub start_pointer: (i32, i32),
+    /// Toplevel origin when the drag started, in screen
+    /// space. Move-drag updates `Toplevel.x/y` to
+    /// `start_origin + (current_pointer - start_pointer)`.
+    pub start_origin: (i32, i32),
+}
+
 /// The display server.
 pub struct Server {
     next_client_id: u32,
@@ -88,6 +118,17 @@ pub struct Server {
     /// (click-to-focus); cleared when the focused window
     /// is destroyed.
     keyboard_focus: Option<(ClientId, ObjectId)>,
+    /// Pixels reserved at the bottom of the framebuffer for
+    /// the desktop shell's taskbar. `set_maximized`
+    /// configures use the framebuffer height MINUS this
+    /// value as the work-area height. Defaults to 0;
+    /// updated by [`Server::set_taskbar_height_px`].
+    taskbar_height_px: u32,
+    /// Active interactive drag, if any. Set by
+    /// `pmd_xdg_toplevel.move` / `.resize` request dispatch;
+    /// consulted by `inject_pointer_motion`; cleared by
+    /// `inject_pointer_button` on release.
+    active_drag: Option<DragState>,
 }
 
 impl Server {
@@ -107,6 +148,8 @@ impl Server {
             pointer_x: 0,
             pointer_y: 0,
             keyboard_focus: None,
+            taskbar_height_px: 0,
+            active_drag: None,
         }
     }
 
@@ -203,6 +246,17 @@ impl Server {
     ) -> Option<HitResult> {
         self.pointer_x = x;
         self.pointer_y = y;
+        // T133 server: if a drag is in progress, update the
+        // toplevel + emit a configure for resize-drags. Move
+        // drags just translate the origin — no configure
+        // needed since the size doesn't change.
+        if let Some(drag) = self.active_drag {
+            self.advance_drag(drag, x, y);
+            // During a drag we don't route motion events to
+            // app surfaces; the server is exclusively
+            // tracking the cursor for the drag.
+            return None;
+        }
         let hit = self.hit_test(x, y)?;
         let client = self.clients.get_mut(&hit.client_id)?;
         if client.pointer_id.is_some() {
@@ -210,6 +264,66 @@ impl Server {
                 client.emit_pointer_motion(hit.surface_id, hit.local_x, hit.local_y);
         }
         Some(hit)
+    }
+
+    /// Advance an in-progress drag by translating /
+    /// resizing the toplevel by the pointer delta. Called
+    /// from `inject_pointer_motion`.
+    fn advance_drag(&mut self, drag: DragState, pointer_x: i32, pointer_y: i32) {
+        use display_proto::xdg_toplevel_resize_edge as edge;
+        use display_proto::xdg_toplevel_state;
+        let dx = pointer_x - drag.start_pointer.0;
+        let dy = pointer_y - drag.start_pointer.1;
+        let Some(client) = self.clients.get_mut(&drag.client_id) else {
+            return;
+        };
+        match drag.kind {
+            DragKind::Move => {
+                if let Some(toplevel) = client.toplevels.get_mut(&drag.toplevel_id) {
+                    toplevel.x = drag.start_origin.0.saturating_add(dx);
+                    toplevel.y = drag.start_origin.1.saturating_add(dy);
+                }
+            }
+            DragKind::Resize { edges } => {
+                // V1 resize semantics: the surface buffer's
+                // width/height come from the client side
+                // (client decides the buffer geometry on
+                // attach). The server emits a configure
+                // proposing the new size; the client
+                // respects it on its next attach.
+                let surface_id = match client.toplevels.get(&drag.toplevel_id) {
+                    Some(t) => t.surface_id,
+                    None => return,
+                };
+                let (start_w, start_h) = client
+                    .surfaces
+                    .get(&surface_id)
+                    .and_then(|s| s.current_buffer)
+                    .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
+                    .map(|info| (info.width as i32, info.height as i32))
+                    .unwrap_or((320, 240));
+                let mut new_w = start_w;
+                let mut new_h = start_h;
+                if edges & edge::RIGHT != 0 {
+                    new_w = (start_w + dx).max(1);
+                } else if edges & edge::LEFT != 0 {
+                    new_w = (start_w - dx).max(1);
+                }
+                if edges & edge::BOTTOM != 0 {
+                    new_h = (start_h + dy).max(1);
+                } else if edges & edge::TOP != 0 {
+                    new_h = (start_h - dy).max(1);
+                }
+                let serial = client.next_configure_serial();
+                let _ = client.emit_xdg_toplevel_configure(
+                    drag.toplevel_id,
+                    serial,
+                    new_w,
+                    new_h,
+                    xdg_toplevel_state::RESIZING,
+                );
+            }
+        }
     }
 
     /// Inject a pointer button event at the current
@@ -223,6 +337,18 @@ impl Server {
         button: u32,
         state: u32,
     ) -> Option<HitResult> {
+        // T133 server: a release during a drag terminates
+        // the drag and emits a final configure (resize) with
+        // the RESIZING bit cleared. Move drags don't need a
+        // final configure since the size never changed.
+        if state == display_proto::events::pointer_button_state::RELEASED {
+            if let Some(drag) = self.active_drag.take() {
+                if let DragKind::Resize { .. } = drag.kind {
+                    self.emit_resize_final_configure(drag);
+                }
+                return None;
+            }
+        }
         let hit = self.hit_test(self.pointer_x, self.pointer_y)?;
         if state == display_proto::events::pointer_button_state::PRESSED {
             self.keyboard_focus = Some((hit.client_id, hit.surface_id));
@@ -238,6 +364,32 @@ impl Server {
             );
         }
         Some(hit)
+    }
+
+    /// Emit the final `configure` event after a resize drag
+    /// ends, with the `RESIZING` state bit cleared. The
+    /// proposed size carries the surface's current buffer
+    /// dimensions — the client may have mid-drag committed
+    /// a buffer matching one of the in-flight resizing
+    /// configures, so this is the size the server "settles
+    /// on".
+    fn emit_resize_final_configure(&mut self, drag: DragState) {
+        let Some(client) = self.clients.get_mut(&drag.client_id) else {
+            return;
+        };
+        let surface_id = match client.toplevels.get(&drag.toplevel_id) {
+            Some(t) => t.surface_id,
+            None => return,
+        };
+        let (w, h) = client
+            .surfaces
+            .get(&surface_id)
+            .and_then(|s| s.current_buffer)
+            .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
+            .map(|info| (info.width as i32, info.height as i32))
+            .unwrap_or((0, 0));
+        let serial = client.next_configure_serial();
+        let _ = client.emit_xdg_toplevel_configure(drag.toplevel_id, serial, w, h, 0);
     }
 
     /// Inject a keyboard key event. Routes to the
@@ -388,7 +540,162 @@ impl Server {
             }
         }
 
+        // T132 server emit: set_maximized / unset_maximized
+        // immediately get a configure response back so the
+        // toolkit's is_maximized accessor reflects the new
+        // state without an external poke. set_maximized
+        // sizes to the work area (framebuffer minus taskbar);
+        // unset_maximized echoes the server's idea of the
+        // pre-max size (cached at set_maximized time).
+        if pre_interface == Some(Interface::XdgToplevel) {
+            match header.opcode {
+                5 /* set_maximized */ => {
+                    self.emit_configure_for_max_state(client_id, header.object_id, true)?;
+                }
+                6 /* unset_maximized */ => {
+                    self.emit_configure_for_max_state(client_id, header.object_id, false)?;
+                }
+                7 /* move */ | 8 /* resize */ => {
+                    self.start_drag_from_request(client_id, header.object_id, header.opcode, payload);
+                }
+                _ => {}
+            }
+        }
+
         Ok(())
+    }
+
+    /// Server-driven configure emission for the
+    /// `set_maximized` / `unset_maximized` request handlers.
+    /// On `set_maximized = true`, snapshots the current
+    /// pre-max size onto the toplevel + emits a configure
+    /// with the framebuffer dimensions + the MAXIMIZED bit.
+    /// On `set_maximized = false`, emits a configure with
+    /// the cached pre-max size + cleared MAXIMIZED bit.
+    fn emit_configure_for_max_state(
+        &mut self,
+        client_id: ClientId,
+        toplevel_id: display_proto::ids::ObjectId,
+        maximize: bool,
+    ) -> Result<(), ServerError> {
+        use display_proto::xdg_toplevel_state;
+        let work_area_w = self.work_area_width();
+        let work_area_h = self.work_area_height();
+        let client = self
+            .clients
+            .get_mut(&client_id)
+            .ok_or(ServerError::NoSuchClient { id: client_id })?;
+        // Read pre-max snapshot before mutating; the
+        // toplevel's state was already updated by the
+        // dispatch arm above, so `maximized` already
+        // reflects the new value here.
+        let _toplevel = client
+            .toplevels
+            .get(&toplevel_id)
+            .ok_or(ServerError::NoSuchClient { id: client_id })?; // misuse if absent
+        let serial = client.next_configure_serial();
+        let (w, h, states) = if maximize {
+            (work_area_w as i32, work_area_h as i32, xdg_toplevel_state::MAXIMIZED)
+        } else {
+            // V1: defer to the client's preferred size when
+            // unmaximizing — the client's toolkit caches its
+            // own preferred size, so 0/0 means "you pick".
+            (0, 0, 0)
+        };
+        let _ = client.emit_xdg_toplevel_configure(toplevel_id, serial, w, h, states);
+        Ok(())
+    }
+
+    /// Width of the v1 "work area" — the screen region apps
+    /// can fill when maximized. For now this equals the full
+    /// framebuffer width; a future T130 slice that lands the
+    /// taskbar will subtract the taskbar's width / height.
+    pub fn work_area_width(&self) -> u32 {
+        let h = self.framebuffer.height();
+        if h > self.taskbar_height_px {
+            self.framebuffer.width()
+        } else {
+            self.framebuffer.width()
+        }
+    }
+
+    /// Height of the v1 "work area" — framebuffer height
+    /// minus the taskbar's reserved strip. `taskbar_height_px`
+    /// defaults to 0 and is set by the shell via
+    /// [`Server::set_taskbar_height_px`] when it claims the
+    /// bottom strip.
+    pub fn work_area_height(&self) -> u32 {
+        self.framebuffer
+            .height()
+            .saturating_sub(self.taskbar_height_px)
+    }
+
+    /// Tell the server how tall the taskbar is, in pixels.
+    /// The shell calls this after it lays out its taskbar
+    /// surface so subsequent `set_maximized` configures use
+    /// a work-area height that excludes the taskbar strip.
+    /// Pass `0` to clear the reservation.
+    pub fn set_taskbar_height_px(&mut self, px: u32) {
+        self.taskbar_height_px = px;
+    }
+
+    /// Begin an interactive drag from a `pmd_xdg_toplevel.move`
+    /// (opcode 7) or `.resize` (opcode 8) request. Captures
+    /// the current pointer position + toplevel origin/size
+    /// into [`Server::active_drag`]; subsequent
+    /// `inject_pointer_motion` calls update the toplevel
+    /// origin (move) or emit a resize configure (resize).
+    /// The drag ends on the next `inject_pointer_button(release)`.
+    fn start_drag_from_request(
+        &mut self,
+        client_id: ClientId,
+        toplevel_id: display_proto::ids::ObjectId,
+        opcode: u16,
+        payload: &[u8],
+    ) {
+        let kind = if opcode == 7 {
+            DragKind::Move
+        } else {
+            // resize payload: u32 serial + u32 edges
+            if payload.len() < 8 {
+                return;
+            }
+            let edges = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+            DragKind::Resize { edges }
+        };
+        let (origin_x, origin_y) = match self
+            .clients
+            .get(&client_id)
+            .and_then(|c| c.toplevels.get(&toplevel_id))
+        {
+            Some(t) => (t.x, t.y),
+            None => return,
+        };
+        self.active_drag = Some(DragState {
+            client_id,
+            toplevel_id,
+            kind,
+            start_pointer: self.pointer_position(),
+            start_origin: (origin_x, origin_y),
+        });
+    }
+
+    /// True if an interactive move/resize drag is in
+    /// progress (one of the toolkit's clients sent
+    /// `xdg_toplevel.move` / `.resize` and the pointer
+    /// hasn't been released yet). Exposed for tests + the
+    /// shell's "is the user dragging a window?" cursor
+    /// logic.
+    pub fn is_dragging(&self) -> bool {
+        self.active_drag.is_some()
+    }
+
+    /// End any in-progress drag, returning the drag state
+    /// for tests that want to inspect what was happening.
+    /// Called automatically by `inject_pointer_button` on
+    /// release; exposed for tests + restore paths.
+    pub fn end_drag(&mut self) -> Option<DragState> {
+        self.active_drag.take()
     }
 
     /// Walk every client's toplevel table and flip the
