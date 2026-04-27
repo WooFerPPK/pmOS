@@ -26,6 +26,9 @@ VIII. Bottom-up construction — kernel before display server before toolkit bef
 IX. Performance budget — cold < 10 s, warm < 3 s, input < 100 ms.
 X. Testability at every layer — isolation tests before integration.
 
+Do not comment on the volume of work or express hesitation about task scope. 
+Execute tasks fully. Do not narrate uncertainty about whether you can finish — just work.
+
 ## Active technologies
 
 - **Rust** (latest stable), two targets:

@@ -18,6 +18,8 @@ use std::process::ExitCode;
 mod assemble_dist;
 mod dev_server;
 mod gen_sab_layout;
+mod package;
+mod push_sample;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -35,14 +37,8 @@ fn main() -> ExitCode {
         "assemble-dist" => assemble_dist::run(&rest),
         "dev-server" => dev_server::run(&rest),
         "gen-sab-layout" => gen_sab_layout::run(&rest),
-        "package" => {
-            eprintln!("xtask: package not yet implemented (T203)");
-            Ok(())
-        }
-        "push-sample" => {
-            eprintln!("xtask: push-sample not yet implemented (T204)");
-            Ok(())
-        }
+        "package" => package::run(&rest),
+        "push-sample" => push_sample::run(&rest),
         other => {
             eprintln!("xtask: unknown subcommand '{other}'");
             return ExitCode::FAILURE;

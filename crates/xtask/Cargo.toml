@@ -12,3 +12,4 @@ path = "src/main.rs"
 # dependency it likes. Keep dependencies tiny on purpose.
 [dependencies]
 abi = { path = "../abi" }
+pkg = { path = "../pkg" }

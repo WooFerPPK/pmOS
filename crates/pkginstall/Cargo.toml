@@ -1,0 +1,19 @@
+[package]
+name = "pkginstall"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pkginstall"
+path = "src/main.rs"
+
+[[bin]]
+name = "pkginstall-desktop-entry"
+path = "src/desktop_entry.rs"
+
+[dependencies]
+pkg = { path = "../pkg" }

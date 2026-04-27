@@ -1,0 +1,15 @@
+[package]
+name = "hello"
+version = "0.1.0"
+display_name = "Hello"
+author = "PMos"
+summary = "Sample third-party app for the install-flow integration test."
+
+[exec]
+binary = "bin/hello.wasm"
+
+[ui]
+categories = ["Demo"]
+
+[capabilities]
+required = ["DISPLAY_CLIENT"]

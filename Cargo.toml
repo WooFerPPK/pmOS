@@ -19,6 +19,8 @@ members = [
     "crates/settings",
     "crates/sysmon",
     "crates/sample-app",
+    "crates/pkg",
+    "crates/pkginstall",
     "crates/toolkit-free-client",
     "crates/hello-wasi-min",
     "crates/hello-wasi-spawner",

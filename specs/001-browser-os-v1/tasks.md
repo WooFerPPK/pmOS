@@ -425,15 +425,15 @@ These are cross-cutting deviations that exist in the repository as of commit `cb
 
 ### Implementation for US10
 
-- [ ] T198 [US10] `pkginstall` bundled CLI in `crates/pkginstall/src/main.rs`: validates a `.pmpkg.tar` against the schema in `contracts/package-manifest.md`, extracts to `/opt/<name>/`, writes `/usr/share/applications/<name>.desktop`
-- [ ] T199 [US10] `pkginstall-desktop-entry` sub-command for the case where the bundle is already extracted
+- [x] T198 [US10] `pkginstall` bundled CLI in `crates/pkginstall/src/main.rs`: validates a `.pmpkg.tar` against the schema in `contracts/package-manifest.md`, extracts to `/opt/<name>/`, writes `/usr/share/applications/<name>.desktop`
+- [x] T199 [US10] `pkginstall-desktop-entry` sub-command for the case where the bundle is already extracted
 - [ ] T200 [US10] Launcher file watcher: detects new `.desktop` files under `/usr/share/applications/` within 5 s (poll-based for v1) in `crates/shell/src/launcher_watcher.rs`
-- [ ] T201 [US10] Package-format validation library shared between `pkginstall` and the launcher in `crates/pkg/src/lib.rs`: parses manifest.toml, validates semver, validates WASM magic, validates declared caps against the known cap set
-- [ ] T202 [US10] Implement the `crates/sample-app/` hello-world app per `quickstart.md §5`: trivial toolkit window with a label
-- [ ] T203 [US10] `xtask package` subcommand that takes a crate name and produces `dist/pkgs/<name>-<ver>.pmpkg.tar`
-- [ ] T204 [US10] `just push-sample` target that builds the sample app, copies the resulting bundle into the running PMos's OPFS via a test-harness syscall (for the integration test to use)
-- [ ] T205 [P] [US10] `pkginstall` unit tests with fixture bundles in `crates/pkginstall/tests/`
-- [ ] T206 [P] [US10] Malformed-bundle tests: absolute paths, `..` segments, bad WASM magic, duplicate name, missing required fields — each MUST be rejected with a clear error, in `crates/pkg/tests/validate.rs`
+- [x] T201 [US10] Package-format validation library shared between `pkginstall` and the launcher in `crates/pkg/src/lib.rs`: parses manifest.toml, validates semver, validates WASM magic, validates declared caps against the known cap set
+- [x] T202 [US10] Implement the `crates/sample-app/` hello-world app per `quickstart.md §5`: trivial toolkit window with a label
+- [x] T203 [US10] `xtask package` subcommand that takes a crate name and produces `dist/pkgs/<name>-<ver>.pmpkg.tar`
+- [x] T204 [US10] `just push-sample` target that builds the sample app, copies the resulting bundle into the running PMos's OPFS via a test-harness syscall (for the integration test to use)
+- [x] T205 [P] [US10] `pkginstall` unit tests with fixture bundles in `crates/pkginstall/tests/`
+- [x] T206 [P] [US10] Malformed-bundle tests: absolute paths, `..` segments, bad WASM magic, duplicate name, missing required fields — each MUST be rejected with a clear error, in `crates/pkg/tests/validate.rs`
 - [ ] T207 [P] [US10] Playwright integration test `third-party-install.spec.ts`: imports `hello-0.1.0.pmpkg.tar` via the file manager's drag-drop path, runs `pkginstall` in the terminal, asserts the launcher picks it up within 5 s, launches it, verifies it shows as a separate process in sysmon, then uninstalls and asserts it disappears
 
 **Checkpoint**: end-to-end third-party app install works without a central registry. FR-036 / FR-037 / FR-038 are covered.

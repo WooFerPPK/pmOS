@@ -183,6 +183,17 @@ name = "mem-adversary"
 version = "0.1.0"
 
 [[package]]
+name = "pkg"
+version = "0.1.0"
+
+[[package]]
+name = "pkginstall"
+version = "0.1.0"
+dependencies = [
+ "pkg",
+]
+
+[[package]]
 name = "preferences"
 version = "0.1.0"
 
@@ -266,4 +277,5 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "pkg",
 ]
