@@ -984,6 +984,16 @@ function runRealKernelMode(bootBinary: string): void {
       fbHost.onModeChange((mode) => {
         renderer.setMode(mode);
         guiFbMode = mode;
+        // Pin the canvas's CSS box to the framebuffer's
+        // intrinsic pixel dims so the OS renders at native
+        // resolution instead of stretching to fill the
+        // viewport. Centred on the page; leftover space
+        // shows the body's black background. This also makes
+        // the pointer-event coordinate inversion in
+        // `toFbCoords` a 1:1 map.
+        canvas.style.width = `${mode.width}px`;
+        canvas.style.height = `${mode.height}px`;
+        canvas.style.imageRendering = "auto";
       });
       fbHost.onFrame((frame) => {
         renderer.paintFrame(frame);

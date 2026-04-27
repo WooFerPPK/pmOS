@@ -937,6 +937,9 @@ function runRealKernelMode(bootBinary) {
       fbHost.onModeChange((mode) => {
         renderer.setMode(mode);
         guiFbMode = mode;
+        canvas.style.width = `${mode.width}px`;
+        canvas.style.height = `${mode.height}px`;
+        canvas.style.imageRendering = "auto";
       });
       fbHost.onFrame((frame) => {
         renderer.paintFrame(frame);
