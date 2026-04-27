@@ -116,29 +116,51 @@ mod wasm_main {
             if bytes.is_empty() {
                 return;
             }
-            let iov = Ciovec {
-                buf: bytes.as_ptr(),
-                buf_len: bytes.len() as u32,
-            };
-            // EINVAL retry: the first write right after
-            // `display_connect` may race the server's
-            // `ipc_accept`. While the socket is in the
-            // `Connecting` state the kernel returns EINVAL.
-            // Retry with sched_yield until the server
-            // promotes us to `Connected` and the write lands.
-            for _ in 0..SEND_MAX_POLLS {
+            // Drive the full byte slice to completion. The
+            // kernel's `send_on_socket` returns whatever fits
+            // in the peer's rx_buf RIGHT NOW (cap is 64 KiB);
+            // a single write of >64 KiB OR a stream of writes
+            // faster than the peer drains will see partial
+            // sends with `nwritten < bytes.len()`. The toolkit's
+            // protocol layer assumes its messages land
+            // atomically, so this loop must keep going until
+            // every byte is on the wire.
+            //
+            // EAGAIN: rx_buf full → busy-poll with sched_yield
+            // until the peer drains.
+            // EINVAL: socket still in `Connecting` (race with
+            // server's ipc_accept) → busy-poll same as EAGAIN.
+            // Real I/O error: drop the rest. The toolkit will
+            // surface a downstream protocol error.
+            let mut sent = 0usize;
+            let mut spins_at_full: u32 = 0;
+            while sent < bytes.len() {
+                let remaining = &bytes[sent..];
+                let iov = Ciovec {
+                    buf: remaining.as_ptr(),
+                    buf_len: remaining.len() as u32,
+                };
                 let mut nwritten: u32 = 0;
                 let rc = unsafe { fd_write(self.fd, &iov, 1, &mut nwritten) };
-                if rc == 0 && nwritten as usize == bytes.len() {
-                    return;
+                if rc == 0 && nwritten > 0 {
+                    sent += nwritten as usize;
+                    spins_at_full = 0;
+                    continue;
                 }
-                if rc == EINVAL || rc == EAGAIN {
+                if rc == 0 || rc == EAGAIN || rc == EINVAL {
+                    // No bytes accepted — buf full or still
+                    // Connecting. Yield + retry, with a poll
+                    // budget so a permanently-stuck peer
+                    // surfaces as a dropped write rather than
+                    // an infinite loop.
+                    spins_at_full = spins_at_full.saturating_add(1);
+                    if spins_at_full > SEND_MAX_POLLS {
+                        return;
+                    }
                     unsafe { let _ = sched_yield(); }
                     continue;
                 }
-                // Real failure — drop the write. The toolkit's
-                // protocol layer will eventually surface the
-                // missing reply as MissingGlobal or similar.
+                // Real I/O error — give up.
                 return;
             }
         }
