@@ -1156,12 +1156,23 @@ function runRealKernelMode(bootBinary: string): void {
       bootBinary,
     },
   });
+  // Crash screen — fullscreen "PMos has stopped responding"
+  // overlay shown when the OS panics, a child reaps, or the
+  // console goes silent for >5s (the wedge case the user has
+  // been chasing). Captures the recent console tail so the
+  // BSOD shows what the OS was doing at the moment it died.
+  const crashScreen = isGuiBoot ? mountCrashScreen() : null;
+  const recentLines: string[] = [];
+  const RECENT_LINES_CAP = 80;
   consoleHost.onOutput((bytes: Uint8Array) => {
     const text = new TextDecoder().decode(bytes);
     consoleEl.textContent += text;
     console.log(`[real-kernel] ${text.replace(/\n$/, "")}`);
     if (splash) {
       splash.observeConsoleLine(text);
+    }
+    if (crashScreen) {
+      crashScreen.observeConsoleLine(text, recentLines, RECENT_LINES_CAP);
     }
   });
   consoleHost.onLifecycle((event: ConsoleLifecycleEvent) => {
@@ -1176,8 +1187,84 @@ function runRealKernelMode(bootBinary: string): void {
       if (splash) {
         splash.markFailed(`Kernel panic: ${event.message}`);
       }
+      if (crashScreen) {
+        crashScreen.show({
+          title: "Kernel panic",
+          subtitle: event.message,
+          recent: recentLines,
+        });
+      }
     }
   });
+
+  // Worker errors — uncaught exceptions inside the kernel
+  // worker itself. These are the "wasm trap" path, distinct
+  // from the kernel's own panic event.
+  worker.addEventListener("error", (ev: ErrorEvent) => {
+    const msg = ev.message || "(unknown worker error)";
+    console.error(`[pmos-bootstrap] kernel worker error: ${msg}`);
+    if (crashScreen) {
+      crashScreen.show({
+        title: "Kernel worker crashed",
+        subtitle: msg,
+        recent: recentLines,
+      });
+    }
+  });
+  worker.addEventListener("messageerror", (ev) => {
+    console.error(`[pmos-bootstrap] kernel worker messageerror`, ev);
+    if (crashScreen) {
+      crashScreen.show({
+        title: "Kernel worker message decode failed",
+        subtitle: "MessageEvent.data could not be cloned",
+        recent: recentLines,
+      });
+    }
+  });
+
+  // Unhandled promise rejections + window errors. Catches
+  // bootstrap-side bugs that aren't worker-scoped.
+  window.addEventListener("unhandledrejection", (ev: PromiseRejectionEvent) => {
+    const reason = String(ev.reason ?? "(unknown)");
+    console.error(`[pmos-bootstrap] unhandled rejection: ${reason}`);
+    if (crashScreen) {
+      crashScreen.show({
+        title: "Bootstrap promise rejected",
+        subtitle: reason,
+        recent: recentLines,
+      });
+    }
+  });
+
+  // Wedge watchdog — if the OS goes silent (no console
+  // output, no driver activity) for too long, assume a
+  // freeze and surface a crash screen. The shell prints a
+  // heartbeat every 5000 iterations; under any normal
+  // load that's many lines per second. 8s with zero output
+  // is unambiguous.
+  if (crashScreen) {
+    let lastConsoleAt = performance.now();
+    const updateLastConsole = (): void => {
+      lastConsoleAt = performance.now();
+    };
+    consoleHost.onOutput(updateLastConsole);
+    const watchdogIntervalMs = 1000;
+    const watchdogThresholdMs = 8000;
+    let bootGraceMs = 5000;
+    const watchdog = window.setInterval(() => {
+      bootGraceMs -= watchdogIntervalMs;
+      if (bootGraceMs > 0) return;
+      const silentFor = performance.now() - lastConsoleAt;
+      if (silentFor > watchdogThresholdMs) {
+        window.clearInterval(watchdog);
+        crashScreen.show({
+          title: "PMos has stopped responding",
+          subtitle: `No kernel output for ${Math.round(silentFor)}ms — the OS is wedged.`,
+          recent: recentLines,
+        });
+      }
+    }, watchdogIntervalMs);
+  }
 
   // Keyboard input: a `keydown` on `document` so the handler fires
   // regardless of which element has focus (real-kernel mode hides the
@@ -1528,6 +1615,242 @@ function mountBootSplash(): BootSplash {
   }
 
   return { markStarted, markFailed, observeConsoleLine, dismiss };
+}
+
+/**
+ * Crash-screen overlay — the "PMos has stopped responding"
+ * fullscreen red panel a user gets when the OS panics,
+ * deadlocks, or the kernel-worker itself crashes. Captures
+ * the recent console tail so the user can see what the OS
+ * was doing at the moment it died, plus a Reload button to
+ * reboot the substrate.
+ *
+ * Triggered by the runRealKernelMode wiring's
+ *   * worker `error` / `messageerror` events
+ *   * unhandledrejection / window error
+ *   * `consoleHost.onLifecycle({kind:"panic"})`
+ *   * 8-second console-silence watchdog
+ *   * `init-desktop reaped child pid=N` (any tracked
+ *     userland process exiting)
+ */
+interface CrashScreen {
+  observeConsoleLine(
+    text: string,
+    recentSink: string[],
+    cap: number,
+  ): void;
+  show(args: {
+    title: string;
+    subtitle: string;
+    recent: string[];
+  }): void;
+}
+
+function mountCrashScreen(): CrashScreen {
+  const overlay = document.createElement("div");
+  overlay.id = "pmos-crash-screen";
+  overlay.style.cssText = [
+    "position: fixed",
+    "inset: 0",
+    "display: none",
+    "flex-direction: column",
+    "align-items: center",
+    "justify-content: center",
+    "background: linear-gradient(180deg, #1a0606 0%, #0a0202 100%)",
+    "color: #ffd0d0",
+    "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+    "z-index: 10000",
+    "padding: 2rem",
+    "box-sizing: border-box",
+    "overflow: auto",
+  ].join("; ");
+
+  const container = document.createElement("div");
+  container.style.cssText = [
+    "max-width: 880px",
+    "width: 100%",
+  ].join("; ");
+
+  const banner = document.createElement("div");
+  banner.style.cssText = [
+    "background: #ff4040",
+    "color: #1a0606",
+    "padding: 0.5rem 1rem",
+    "font-weight: 700",
+    "letter-spacing: 0.3em",
+    "text-transform: uppercase",
+    "font-size: 11px",
+    "margin-bottom: 1.5rem",
+    "border-radius: 4px",
+  ].join("; ");
+  banner.textContent = "Kernel halted";
+
+  const title = document.createElement("h1");
+  title.style.cssText = [
+    "color: #ff7a7a",
+    "font-size: 32px",
+    "font-weight: 300",
+    "margin: 0 0 0.5rem 0",
+    "letter-spacing: 0.05em",
+  ].join("; ");
+
+  const subtitle = document.createElement("div");
+  subtitle.style.cssText = [
+    "color: #ffb0b0",
+    "font-size: 14px",
+    "margin-bottom: 2rem",
+    "white-space: pre-wrap",
+    "word-break: break-word",
+  ].join("; ");
+
+  const intro = document.createElement("div");
+  intro.style.cssText = [
+    "color: #d0a0a0",
+    "font-size: 12px",
+    "margin-bottom: 0.5rem",
+    "letter-spacing: 0.1em",
+    "text-transform: uppercase",
+  ].join("; ");
+  intro.textContent = "Last 80 lines of kernel output";
+
+  const log = document.createElement("pre");
+  log.style.cssText = [
+    "background: rgba(0, 0, 0, 0.4)",
+    "border: 1px solid rgba(255, 122, 122, 0.25)",
+    "border-radius: 4px",
+    "padding: 1rem",
+    "margin: 0 0 1.5rem 0",
+    "max-height: 50vh",
+    "overflow: auto",
+    "font-size: 11px",
+    "line-height: 1.5",
+    "color: #e6c8c8",
+    "white-space: pre-wrap",
+    "word-break: break-word",
+  ].join("; ");
+
+  const buttons = document.createElement("div");
+  buttons.style.cssText = [
+    "display: flex",
+    "gap: 0.75rem",
+  ].join("; ");
+
+  const reload = document.createElement("button");
+  reload.textContent = "Reload";
+  reload.style.cssText = [
+    "padding: 0.6rem 1.4rem",
+    "background: #ff7a7a",
+    "color: #1a0606",
+    "border: none",
+    "border-radius: 4px",
+    "font-family: inherit",
+    "font-weight: 600",
+    "font-size: 14px",
+    "cursor: pointer",
+  ].join("; ");
+  reload.addEventListener("click", () => {
+    window.location.reload();
+  });
+
+  const dismiss = document.createElement("button");
+  dismiss.textContent = "Dismiss";
+  dismiss.style.cssText = [
+    "padding: 0.6rem 1.4rem",
+    "background: transparent",
+    "color: #ffb0b0",
+    "border: 1px solid rgba(255, 176, 176, 0.4)",
+    "border-radius: 4px",
+    "font-family: inherit",
+    "font-size: 14px",
+    "cursor: pointer",
+  ].join("; ");
+  dismiss.addEventListener("click", () => {
+    overlay.style.display = "none";
+  });
+
+  buttons.appendChild(reload);
+  buttons.appendChild(dismiss);
+
+  container.appendChild(banner);
+  container.appendChild(title);
+  container.appendChild(subtitle);
+  container.appendChild(intro);
+  container.appendChild(log);
+  container.appendChild(buttons);
+  overlay.appendChild(container);
+  document.body.appendChild(overlay);
+
+  let shown = false;
+
+  function observeConsoleLine(
+    text: string,
+    recentSink: string[],
+    cap: number,
+  ): void {
+    for (const line of text.split("\n")) {
+      const trimmed = line.replace(/\r$/, "");
+      if (trimmed === "") continue;
+      recentSink.push(trimmed);
+      while (recentSink.length > cap) {
+        recentSink.shift();
+      }
+    }
+    // Auto-trigger on a few well-known fatal patterns the
+    // kernel can't surface as a panic event (because the
+    // panicking pid is userland, not the kernel itself).
+    const lower = text.toLowerCase();
+    if (
+      !shown &&
+      (
+        lower.includes("dispatch error") ||
+        lower.includes("real kernel panic") ||
+        lower.includes("init-desktop reaped child pid=4") ||
+        lower.includes("init-desktop reaped child pid=3")
+      )
+    ) {
+      // Defer slightly so the offending line lands in
+      // recentSink before the screen renders.
+      window.setTimeout(() => {
+        if (shown) return;
+        let title = "Userland process crashed";
+        let subtitle = text.trim().split("\n").slice(-1)[0] ?? "";
+        if (lower.includes("real kernel panic")) {
+          title = "Kernel panic";
+        } else if (lower.includes("dispatch error")) {
+          title = "Shell dispatch error";
+        } else if (lower.includes("init-desktop reaped child pid=3")) {
+          title = "Display server died";
+          subtitle = "init-desktop reaped the display-server. The desktop cannot run without it.";
+        } else if (lower.includes("init-desktop reaped child pid=4")) {
+          title = "Shell died";
+          subtitle = "init-desktop reaped the shell. The desktop cannot run without it.";
+        }
+        show({
+          title,
+          subtitle,
+          recent: recentSink,
+        });
+      }, 50);
+    }
+  }
+
+  function show(args: {
+    title: string;
+    subtitle: string;
+    recent: string[];
+  }): void {
+    if (shown) return;
+    shown = true;
+    title.textContent = args.title;
+    subtitle.textContent = args.subtitle;
+    log.textContent = args.recent.join("\n");
+    overlay.style.display = "flex";
+    // Scroll the log to the bottom so the failure line is
+    // visible without scrolling.
+    log.scrollTop = log.scrollHeight;
+  }
+
+  return { observeConsoleLine, show };
 }
 
 function showFallbackMessage(error: string): void {
