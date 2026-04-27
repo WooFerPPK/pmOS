@@ -421,16 +421,19 @@ fn main() {
         }
 
         // Connected clients we are multiplexing across. Each
-        // entry is `(server_fd, client_id, pending)`: the wasi
-        // socket fd, the protocol-layer ClientId, and a
-        // re-assembly buffer for messages split across
-        // fd_read boundaries. `legacy_demo` clients (raw-blit
-        // path) are handled inline at accept time and never
-        // land in this list.
+        // entry is `(server_fd, client_id, pending,
+        // outbound)`: the wasi socket fd, the protocol-layer
+        // ClientId, a re-assembly buffer for messages split
+        // across fd_read boundaries, and an outbound queue
+        // holding event bytes the kernel hasn't accepted yet
+        // because the peer's rx_buf was full. `legacy_demo`
+        // clients (raw-blit path) are handled inline at
+        // accept time and never land in this list.
         struct Conn {
             server_fd: i32,
             client_id: display_server::ClientId,
             pending: Vec<u8>,
+            outbound: Vec<u8>,
         }
         let mut conns: Vec<Conn> = Vec::new();
         let mut recv_buf = [0u8; 32 * 1024];
@@ -479,6 +482,7 @@ fn main() {
                         server_fd: new_fd,
                         client_id,
                         pending: Vec::with_capacity(64 * 1024),
+                        outbound: Vec::with_capacity(64 * 1024),
                     });
                     continue;
                 }
@@ -624,17 +628,52 @@ fn main() {
             // mutates, so the broadcast pass below has to
             // reach the shell's fd even if the only fd we
             // read this tick was the app's.
+            //
+            // Partial-write handling: the kernel's
+            // `send_on_socket` accepts only as many bytes as
+            // fit in the peer's rx_buf right now (cap 64 KiB).
+            // A burst of pointer events on a busy shell can
+            // saturate the rx_buf and turn a 1 KiB event
+            // batch into a 64 KiB-aligned partial write. The
+            // unwritten tail used to be dropped on the floor,
+            // which silently broke event delivery after ~30s
+            // of activity. Now: drain server-side events into
+            // a per-conn `outbound` queue + flush as much as
+            // the kernel will take, leaving the rest queued
+            // for next tick.
             for c in conns.iter_mut() {
                 if let Some(events) = server.drain_client_events(c.client_id) {
-                    if events.is_empty() {
-                        continue;
+                    if !events.is_empty() {
+                        c.outbound.extend_from_slice(&events);
                     }
+                }
+                while !c.outbound.is_empty() {
+                    let before_len = c.outbound.len();
                     let ev_iov = Ciovec {
-                        buf: events.as_ptr(),
-                        buf_len: events.len() as u32,
+                        buf: c.outbound.as_ptr(),
+                        buf_len: before_len as u32,
                     };
                     let mut written: u32 = 0;
-                    let _ = fd_write(c.server_fd, &ev_iov, 1, &mut written);
+                    let rc = fd_write(c.server_fd, &ev_iov, 1, &mut written);
+                    if rc == 0 && written > 0 {
+                        c.outbound.drain(..written as usize);
+                        if (written as usize) < before_len {
+                            // Partial — peer's rx_buf is full
+                            // for the rest. Stop trying this
+                            // tick; the next outer iteration
+                            // will retry once the client has
+                            // had a chance to drain.
+                            break;
+                        }
+                        // Full write succeeded; queue may now
+                        // be empty (loop exits) or there may
+                        // be more bytes that arrived between
+                        // the drain and the next iteration.
+                        continue;
+                    }
+                    // EAGAIN / EINVAL / error → leave bytes
+                    // queued and try again next tick.
+                    break;
                 }
             }
 

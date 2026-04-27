@@ -32,6 +32,16 @@ pub struct App<C: Connection> {
     compositor: ObjectId,
     shm: ObjectId,
     xdg_shell: ObjectId,
+    /// Re-assembly buffer for inbound bytes that don't yet
+    /// form a complete message. The kernel's `fd_read`
+    /// returns whatever the rx_buf has — and that boundary
+    /// is independent of the protocol's framing — so a
+    /// chunked event (e.g. a 2 KiB shell-manager broadcast)
+    /// can cross multiple recv calls. Each `App::dispatch`
+    /// appends the new chunk to this buffer, parses every
+    /// complete message out of it, and leaves any partial
+    /// trailing message for the next call.
+    inbound: Vec<u8>,
     /// Optional `pmd_seat` binding. Populated by
     /// [`App::connect_with_shell`] when the server advertises
     /// the global; stays `None` otherwise. The desktop shell
@@ -139,6 +149,7 @@ impl<C: Connection> App<C> {
             compositor,
             shm,
             xdg_shell,
+            inbound: Vec::with_capacity(64 * 1024),
             seat: None,
             pointer: None,
             shell_manager: None,
@@ -230,6 +241,7 @@ impl<C: Connection> App<C> {
             compositor,
             shm,
             xdg_shell,
+            inbound: Vec::with_capacity(64 * 1024),
             seat,
             pointer,
             shell_manager,
@@ -362,28 +374,35 @@ impl<C: Connection> App<C> {
         &mut self.client
     }
 
-    /// Run one event-dispatch cycle: flush any outbound
-    /// bytes through the connection, drain whatever the
+    /// Run one event-dispatch cycle: drain whatever the
     /// server has queued, parse the byte stream into
     /// [`ClientEventWithPayload`]s, and return them.
     ///
-    /// Outbound bytes are flushed by delegating to the
-    /// connection's own `drain_outbound` (callers that wrap a
-    /// real transport push those bytes onto the wire).
-    /// Partial trailing messages in the inbound stream are
-    /// silently dropped in this minimal cycle; a future slice
-    /// that adds a blocking `App::run` loop will persist the
-    /// leftover across calls.
+    /// Pulls one chunk via `recv()` and appends to the
+    /// re-assembly buffer; parses every complete message
+    /// out of the buffer (a multi-message chunk yields all
+    /// events in one call); leaves any partial trailing
+    /// message for the next dispatch. Without this
+    /// re-assembly the toolkit dropped split events, which
+    /// surfaced as "the desktop stops responding after ~30s
+    /// of activity" — pointer event traffic saturates the
+    /// kernel's 64 KiB rx_buf, fragmentation rises, and
+    /// every dropped event was a missed click.
     pub fn dispatch(
         &mut self,
     ) -> Result<Vec<ClientEventWithPayload>, ClientError> {
-        let _ = self.client.drain_outbound();
         let chunk = self.client.connection_mut().recv();
-        if chunk.is_empty() {
+        if chunk.is_empty() && self.inbound.is_empty() {
             return Ok(Vec::new());
         }
-        let (events, _consumed) =
-            self.client.push_received_with_payload(&chunk)?;
+        if !chunk.is_empty() {
+            self.inbound.extend_from_slice(&chunk);
+        }
+        let (events, consumed) =
+            self.client.push_received_with_payload(&self.inbound)?;
+        if consumed > 0 {
+            self.inbound.drain(..consumed);
+        }
         Ok(events)
     }
 
