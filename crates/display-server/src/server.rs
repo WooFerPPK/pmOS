@@ -1146,58 +1146,90 @@ impl Server {
         client_id: ClientId,
         surface_id: display_proto::ids::ObjectId,
     ) {
-        // Destructure `self` so the immutable borrow on
-        // `clients` and the mutable borrow on `framebuffer`
-        // are disjoint as far as the borrow checker is
-        // concerned.
+        // Buffer-release for the client whose surface just
+        // committed: the server's pool storage already holds
+        // a copy of the painted pixels (via shm_pool.write),
+        // so the client can recycle this buffer.
+        let released_buffer = self
+            .clients
+            .get(&client_id)
+            .and_then(|c| c.surfaces.get(&surface_id))
+            .and_then(|s| s.current_buffer)
+            .map(|att| att.buffer_id);
+        if let (Some(buffer_id), Some(client_mut)) =
+            (released_buffer, self.clients.get_mut(&client_id))
+        {
+            let _ = client_mut.emit_buffer_release(buffer_id);
+        }
+        // Re-composite the whole scene: walk every client +
+        // every toplevel in (client_id, toplevel_id) order
+        // and blit each toplevel's current buffer onto the
+        // framebuffer. (client_id, toplevel_id) is the
+        // creation order — the shell connects first so its
+        // wallpaper toplevel paints first, then app windows
+        // paint on top in the order they were created.
+        // Without this loop a single-surface blit on a later
+        // surface.commit would not restore the OTHER
+        // toplevels' pixels and the shell's wallpaper paint
+        // would erase every app window.
+        self.recomposite_scene();
+    }
+
+    /// Walk every client's surfaces in creation order and
+    /// blit each one's current buffer into the framebuffer.
+    /// Toplevel surfaces blit at the toplevel's
+    /// (x + attach.x, y + attach.y) origin; non-toplevel
+    /// surfaces blit at the attach offset (matches the
+    /// pre-multi-window behaviour the integration tests
+    /// expect). Toplevels that are minimized are skipped.
+    ///
+    /// Called after every `surface.commit` so the
+    /// framebuffer always reflects the full scene — without
+    /// this loop a single-surface blit would leave the
+    /// other windows' pixels intact only as long as nobody
+    /// painted over them, and the shell's full-screen
+    /// wallpaper paint would erase every app window on
+    /// every shell repaint.
+    fn recomposite_scene(&mut self) {
         let Server {
             clients,
             framebuffer,
             ..
         } = self;
-        let Some(client) = clients.get(&client_id) else {
-            return;
-        };
-        let Some(surface) = client.surfaces.get(&surface_id) else {
-            return;
-        };
-        let Some(attachment) = surface.current_buffer else {
-            return;
-        };
-        let Some(info) = client.buffers.get(&attachment.buffer_id) else {
-            return;
-        };
-        let Some(pool) = client.pools.get(&info.pool_id) else {
-            return;
-        };
-        let start = info.offset as usize;
-        let end = info.byte_end() as usize;
-        let Some(src_bytes) = pool.storage.get(start..end) else {
-            return;
-        };
-        let (origin_x, origin_y) =
-            if let Some(toplevel) = client.toplevel_for_surface(surface_id) {
-                // T131: minimized toplevels are unmapped —
-                // skip the blit but keep the surface state
-                // intact so a restore can re-map without a
-                // round-trip back through the client.
-                if toplevel.minimized {
-                    return;
-                }
-                (
-                    toplevel.x.saturating_add(attachment.x),
-                    toplevel.y.saturating_add(attachment.y),
-                )
-            } else {
-                (attachment.x, attachment.y)
-            };
-        framebuffer.blit_buffer(info, src_bytes, origin_x, origin_y);
-        // Buffer release: server's pool storage already
-        // holds a copy of the painted bytes, so the client
-        // can recycle this buffer immediately.
-        let buffer_id = attachment.buffer_id;
-        if let Some(client_mut) = clients.get_mut(&client_id) {
-            let _ = client_mut.emit_buffer_release(buffer_id);
+        for client in clients.values() {
+            // Iterating surfaces in BTreeMap order puts
+            // older surfaces first; toplevels added later
+            // paint on top of earlier ones (creation-order
+            // z-stack).
+            for (surface_id, surface) in client.surfaces.iter() {
+                let Some(attachment) = surface.current_buffer else {
+                    continue;
+                };
+                let Some(info) = client.buffers.get(&attachment.buffer_id) else {
+                    continue;
+                };
+                let Some(pool) = client.pools.get(&info.pool_id) else {
+                    continue;
+                };
+                let start = info.offset as usize;
+                let end = info.byte_end() as usize;
+                let Some(src_bytes) = pool.storage.get(start..end) else {
+                    continue;
+                };
+                let (origin_x, origin_y) =
+                    if let Some(toplevel) = client.toplevel_for_surface(*surface_id) {
+                        if toplevel.minimized {
+                            continue;
+                        }
+                        (
+                            toplevel.x.saturating_add(attachment.x),
+                            toplevel.y.saturating_add(attachment.y),
+                        )
+                    } else {
+                        (attachment.x, attachment.y)
+                    };
+                framebuffer.blit_buffer(info, src_bytes, origin_x, origin_y);
+            }
         }
     }
 }
