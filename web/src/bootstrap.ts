@@ -975,6 +975,7 @@ function runRealKernelMode(bootBinary: string): void {
   // wallpaper paint reaches the kernel host but stops there — the
   // canvas stays black. Text-only boots skip this entirely (no
   // paint pipeline to wire).
+  let guiFbMode: { width: number; height: number } | null = null;
   if (isGuiBoot) {
     const canvas = document.getElementById("pmos-fb");
     if (canvas instanceof HTMLCanvasElement) {
@@ -982,9 +983,76 @@ function runRealKernelMode(bootBinary: string): void {
       const renderer = new FbRenderer({ canvas });
       fbHost.onModeChange((mode) => {
         renderer.setMode(mode);
+        guiFbMode = mode;
       });
       fbHost.onFrame((frame) => {
         renderer.paintFrame(frame);
+      });
+
+      // Pointer + keyboard input for the GUI desktop. Each
+      // DOM event is converted to framebuffer-space
+      // coordinates (the canvas's intrinsic buffer is sized
+      // to the framebuffer; CSS stretches it across the
+      // viewport, so we invert that mapping with the
+      // canvas's bounding rect) and posted to the kernel
+      // worker as the existing `input:mouse` /  `input:kbd`
+      // packed envelopes. The display server's
+      // `drain_input_events` path then injects each event
+      // into `Server::inject_pointer_*` and the click
+      // ultimately reaches the shell's pointer object.
+      const toFbCoords = (
+        event: PointerEvent,
+      ): [number, number] | null => {
+        if (!guiFbMode) return null;
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return null;
+        const fx = ((event.clientX - rect.left) / rect.width) * guiFbMode.width;
+        const fy = ((event.clientY - rect.top) / rect.height) * guiFbMode.height;
+        const x = Math.max(0, Math.min(guiFbMode.width - 1, Math.floor(fx)));
+        const y = Math.max(0, Math.min(guiFbMode.height - 1, Math.floor(fy)));
+        return [x, y];
+      };
+      const domButtonToProtoButton = (domButton: number): number => {
+        switch (domButton) {
+          case 0: return MouseButton.Left;
+          case 1: return MouseButton.Middle;
+          case 2: return MouseButton.Right;
+          default: return domButton;
+        }
+      };
+      canvas.addEventListener("pointermove", (event) => {
+        const coords = toFbCoords(event);
+        if (!coords) return;
+        const [x, y] = coords;
+        worker.postMessage({
+          kind: "input:mouse",
+          bytes: packMouseMotion(x, y),
+        } satisfies MainToKernel);
+      });
+      canvas.addEventListener("pointerdown", (event) => {
+        const coords = toFbCoords(event);
+        if (!coords) return;
+        const [x, y] = coords;
+        const button = domButtonToProtoButton(event.button);
+        worker.postMessage({
+          kind: "input:mouse",
+          bytes: packMouseButton(x, y, button, MouseButtonState.Pressed),
+        } satisfies MainToKernel);
+      });
+      canvas.addEventListener("pointerup", (event) => {
+        const coords = toFbCoords(event);
+        if (!coords) return;
+        const [x, y] = coords;
+        const button = domButtonToProtoButton(event.button);
+        worker.postMessage({
+          kind: "input:mouse",
+          bytes: packMouseButton(x, y, button, MouseButtonState.Released),
+        } satisfies MainToKernel);
+      });
+      // Suppress the browser's default right-click menu so
+      // a future shell context-menu has somewhere to land.
+      canvas.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
       });
     }
   }
