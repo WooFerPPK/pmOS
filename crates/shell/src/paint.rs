@@ -292,6 +292,20 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     let mut force_first_paint_done = false;
 
     let mut iter_count: u32 = 0;
+    let mut total_events: u64 = 0;
+    let mut total_motion: u64 = 0;
+    let mut total_buttons: u64 = 0;
+    let mut total_paints: u64 = 0;
+    let mut last_heartbeat_iter: u32 = 0;
+    // Heartbeat cadence: every N iterations, print a one-line
+    // summary even if nothing else is going on. A fast empty
+    // loop covers tens of thousands of iters/sec; tune the
+    // cadence so the heartbeat fires roughly every 5s under
+    // sustained idle. If iter_count freezes between two
+    // pages's worth of console output, the shell is wedged
+    // somewhere; if it keeps ticking but no events arrive,
+    // the inbound channel is broken.
+    const HEARTBEAT_EVERY: u32 = 5_000;
     for _ in 0..max_dispatch_iterations {
         iter_count = iter_count.wrapping_add(1);
         let events = match window.dispatch() {
@@ -302,9 +316,34 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
             }
         };
 
+        if iter_count.wrapping_sub(last_heartbeat_iter) >= HEARTBEAT_EVERY {
+            println!(
+                "shell: heartbeat iter={} total_events={} motion={} buttons={} paints={} close_req={} configured={}",
+                iter_count,
+                total_events,
+                total_motion,
+                total_buttons,
+                total_paints,
+                window.close_requested(),
+                window.is_configured(),
+            );
+            last_heartbeat_iter = iter_count;
+        }
+
         if window.close_requested() {
             println!("shell: close_requested at iter {}, exiting", iter_count);
             return Ok(ShellExit::CloseRequested);
+        }
+
+        if !events.is_empty() {
+            total_events += events.len() as u64;
+            for ev in &events {
+                if ev.interface == Interface::Pointer && ev.opcode == 1 {
+                    total_motion += 1;
+                } else if ev.interface == Interface::Pointer && ev.opcode == 2 {
+                    total_buttons += 1;
+                }
+            }
         }
 
         // Only log "interesting" events — pointer motion can
@@ -452,8 +491,17 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                     println!("shell: commit_and_swap failed at iter {}: {:?}", iter_count, e);
                     return Err(e);
                 }
-                println!("shell: painted frame at iter {} (taskbar entries={}, launcher_open={})",
-                    iter_count, taskbar.entries().len(), launcher_open);
+                total_paints += 1;
+                // Only spam the per-paint line every 50th
+                // paint so the long-run heartbeat stays
+                // readable. Boot's first few paints still
+                // print individually.
+                if total_paints <= 5 || total_paints % 50 == 0 {
+                    println!(
+                        "shell: painted frame #{} at iter {} (taskbar={}, launcher_open={})",
+                        total_paints, iter_count, taskbar.entries().len(), launcher_open,
+                    );
+                }
                 needs_paint = false;
             } else {
                 println!("shell: acquire_back_canvas returned None at iter {}", iter_count);

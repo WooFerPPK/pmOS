@@ -442,7 +442,33 @@ fn main() {
             buf_len: recv_buf.len() as u32,
         };
 
+        let mut tick_count: u64 = 0;
+        let mut total_accepts: u64 = 0;
+        let mut total_msgs_dispatched: u64 = 0;
+        let mut total_bytes_written: u64 = 0;
+        let mut total_bytes_queued: u64 = 0;
+        let mut total_present: u64 = 0;
+        let mut last_heartbeat_tick: u64 = 0;
+        const HEARTBEAT_EVERY: u64 = 50_000;
         'outer: loop {
+            tick_count = tick_count.wrapping_add(1);
+            if tick_count.wrapping_sub(last_heartbeat_tick) >= HEARTBEAT_EVERY {
+                let outbound_total: usize = conns.iter().map(|c| c.outbound.len()).sum();
+                let pending_total: usize = conns.iter().map(|c| c.pending.len()).sum();
+                println!(
+                    "display-server: heartbeat tick={} clients={} accepts={} msgs={} writes_b={} queued_b={} presents={} outbound_q_b={} pending_b={}",
+                    tick_count,
+                    conns.len(),
+                    total_accepts,
+                    total_msgs_dispatched,
+                    total_bytes_written,
+                    total_bytes_queued,
+                    total_present,
+                    outbound_total,
+                    pending_total,
+                );
+                last_heartbeat_tick = tick_count;
+            }
             if poll_sigterm() {
                 break 'outer;
             }
@@ -484,6 +510,11 @@ fn main() {
                         pending: Vec::with_capacity(64 * 1024),
                         outbound: Vec::with_capacity(64 * 1024),
                     });
+                    total_accepts += 1;
+                    println!(
+                        "display-server: accepted fd={} client_id={:?} (live_clients={})",
+                        new_fd, client_id, conns.len(),
+                    );
                     continue;
                 }
                 if rc == -EINTR {
@@ -583,6 +614,7 @@ fn main() {
                             client_id,
                             &msg_owned,
                         );
+                        total_msgs_dispatched += 1;
                         if opcode == 7 {
                             had_commit = true;
                         }
@@ -612,6 +644,10 @@ fn main() {
                     // next client.
                 } else {
                     // Real error — disconnect this client.
+                    println!(
+                        "display-server: disconnecting client_id={:?} fd={} rc={}",
+                        client_id, server_fd, rc,
+                    );
                     let _ = fd_close(server_fd);
                     let _ = server.disconnect(client_id);
                     conns.swap_remove(idx);
@@ -656,6 +692,7 @@ fn main() {
                     let mut written: u32 = 0;
                     let rc = fd_write(c.server_fd, &ev_iov, 1, &mut written);
                     if rc == 0 && written > 0 {
+                        total_bytes_written += written as u64;
                         c.outbound.drain(..written as usize);
                         if (written as usize) < before_len {
                             // Partial — peer's rx_buf is full
@@ -663,6 +700,7 @@ fn main() {
                             // tick; the next outer iteration
                             // will retry once the client has
                             // had a chance to drain.
+                            total_bytes_queued += (before_len - written as usize) as u64;
                             break;
                         }
                         // Full write succeeded; queue may now
@@ -673,6 +711,7 @@ fn main() {
                     }
                     // EAGAIN / EINVAL / error → leave bytes
                     // queued and try again next tick.
+                    total_bytes_queued += before_len as u64;
                     break;
                 }
             }
@@ -681,6 +720,7 @@ fn main() {
                 if !present_framebuffer(&server, fb_fd as i32) {
                     std::process::exit(16);
                 }
+                total_present += 1;
             }
 
             // Yield so other workers (kernel-worker, app
