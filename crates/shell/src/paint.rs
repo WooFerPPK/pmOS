@@ -241,13 +241,44 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     slots: &[LauncherSlot],
     mut spawner: S,
 ) -> Result<ShellExit, ClientError> {
-    let mut app = App::connect_with_shell(connection)?;
-    let mut window = Window::new(&mut app)?;
-    window.set_title("PMos")?;
-    window.commit()?;
+    println!("shell: run_desktop_shell entered");
+    let mut app = match App::connect_with_shell(connection) {
+        Ok(a) => {
+            println!(
+                "shell: App::connect_with_shell ok (seat={:?} pointer={:?} shell_manager={:?})",
+                a.seat(), a.pointer(), a.shell_manager(),
+            );
+            a
+        }
+        Err(e) => {
+            println!("shell: App::connect_with_shell failed: {:?}", e);
+            return Err(e);
+        }
+    };
+    let mut window = match Window::new(&mut app) {
+        Ok(w) => w,
+        Err(e) => {
+            println!("shell: Window::new failed: {:?}", e);
+            return Err(e);
+        }
+    };
+    if let Err(e) = window.set_title("PMos") {
+        println!("shell: set_title failed: {:?}", e);
+        return Err(e);
+    }
+    if let Err(e) = window.commit() {
+        println!("shell: commit failed: {:?}", e);
+        return Err(e);
+    }
+    println!("shell: window created + committed");
 
     if window.app_mut().shell_manager().is_some() {
-        let _ = window.app_mut().shell_manager_subscribe_windows();
+        match window.app_mut().shell_manager_subscribe_windows() {
+            Ok(_) => println!("shell: subscribed to shell_manager"),
+            Err(e) => println!("shell: subscribe failed: {:?}", e),
+        }
+    } else {
+        println!("shell: no shell_manager bound");
     }
 
     let theme = Theme::default();
@@ -260,14 +291,37 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     let mut needs_paint = false;
     let mut force_first_paint_done = false;
 
+    let mut iter_count: u32 = 0;
     for _ in 0..max_dispatch_iterations {
-        let events = window.dispatch()?;
+        iter_count = iter_count.wrapping_add(1);
+        let events = match window.dispatch() {
+            Ok(e) => e,
+            Err(e) => {
+                println!("shell: dispatch error at iter {}: {:?}", iter_count, e);
+                return Err(e);
+            }
+        };
 
         if window.close_requested() {
+            println!("shell: close_requested at iter {}, exiting", iter_count);
             return Ok(ShellExit::CloseRequested);
         }
 
+        if !events.is_empty() {
+            println!(
+                "shell: iter {} got {} events, configured={} size={:?}",
+                iter_count,
+                events.len(),
+                window.is_configured(),
+                window.configured_size(),
+            );
+        }
+
         for event in events {
+            println!(
+                "shell:   event interface={:?} opcode={} object_id={:?} payload_len={}",
+                event.interface, event.opcode, event.object_id, event.payload.len(),
+            );
             match (event.interface, event.opcode) {
                 (Interface::ShellManager, 1 /* window_created */) => {
                     if let Ok(decoded) = ShellWindowCreated::decode(&event.payload) {
@@ -363,7 +417,14 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
             // changes; otherwise reuse so the back/front
             // swap doesn't churn allocations.
             if last_size != (w, h) {
-                pool = Some(BufferPool::new(window.app_mut(), w, h)?);
+                println!("shell: allocating BufferPool {}x{}", w, h);
+                pool = Some(match BufferPool::new(window.app_mut(), w, h) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        println!("shell: BufferPool::new failed: {:?}", e);
+                        return Err(e);
+                    }
+                });
                 last_size = (w, h);
             }
             let p = pool.as_mut().expect("pool initialised when w/h are set");
@@ -378,12 +439,20 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                     draw_launcher_menu(&mut canvas, &taskbar, &theme, slots, menu_hover);
                 }
                 drop(canvas);
-                p.commit_and_swap(&mut window)?;
+                if let Err(e) = p.commit_and_swap(&mut window) {
+                    println!("shell: commit_and_swap failed at iter {}: {:?}", iter_count, e);
+                    return Err(e);
+                }
+                println!("shell: painted frame at iter {} (taskbar entries={}, launcher_open={})",
+                    iter_count, taskbar.entries().len(), launcher_open);
                 needs_paint = false;
+            } else {
+                println!("shell: acquire_back_canvas returned None at iter {}", iter_count);
             }
         }
     }
 
+    println!("shell: iteration limit hit ({} iters)", iter_count);
     Ok(ShellExit::IterationLimit)
 }
 
@@ -511,11 +580,17 @@ fn handle_press<C: Connection, S: Spawner>(
     spawner: &mut S,
     app: &mut App<C>,
 ) {
+    println!(
+        "shell: handle_press at ({}, {}) launcher_open={} taskbar_bounds={:?}",
+        x, y, *launcher_open, taskbar.bounds(),
+    );
     // Menu has highest priority while open.
     if *launcher_open {
         if let Some(idx) = launcher_menu_row_at(taskbar, slots, x, y) {
             let path = slots[idx].exec;
+            println!("shell: launcher row {} ({}) clicked, spawning", idx, path);
             let rc = spawner.spawn(path);
+            println!("shell: spawn rc={}", rc);
             // We deliberately don't surface the spawn rc
             // up — a failed spawn is logged but the user's
             // click is still consumed (the menu closes).
@@ -534,9 +609,11 @@ fn handle_press<C: Connection, S: Spawner>(
     }
 
     let lb = launcher_button_bounds(taskbar);
+    println!("shell: launcher button bounds: {:?}", lb);
     if x >= lb.x && x < lb.right() && y >= lb.y && y < lb.bottom() {
         *launcher_open = !*launcher_open;
         *menu_hover = None;
+        println!("shell: launcher toggled, now open={}", *launcher_open);
         return;
     }
 
@@ -544,8 +621,11 @@ fn handle_press<C: Connection, S: Spawner>(
         match click {
             crate::taskbar::TaskbarClick::Focus { window_id }
             | crate::taskbar::TaskbarClick::Restore { window_id } => {
+                println!("shell: focus_window({})", window_id);
                 let _ = app.shell_manager_focus_window(window_id);
             }
         }
+    } else {
+        println!("shell: click missed everything");
     }
 }
