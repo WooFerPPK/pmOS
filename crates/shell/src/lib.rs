@@ -38,6 +38,7 @@
 #![forbid(unsafe_code)]
 
 pub mod launcher;
+pub mod launcher_watcher;
 pub mod paint;
 pub mod session;
 pub mod taskbar;

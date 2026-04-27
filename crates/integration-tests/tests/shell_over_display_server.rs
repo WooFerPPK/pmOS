@@ -653,3 +653,40 @@ fn shell_close_and_minimize_window_requests_dispatch_with_distinct_opcodes() {
     assert_eq!(journal[0].opcode_name, "close_window");
     assert_eq!(journal[1].opcode_name, "minimize_window");
 }
+
+/// T177 verification: window_created events delivered after the
+/// shell has subscribed land in the session's window list. The
+/// catch-up replay-on-subscribe path is exercised inside
+/// `boot_shell_with_shell_manager` (it sends subscribe_windows and
+/// the server's `subscribe_windows_for` snapshots the existing
+/// toplevels into the wire). This test pins the post-subscribe
+/// streaming half of the contract — the same wire shape the replay
+/// uses to deliver pre-existing windows.
+#[test]
+fn shell_session_window_list_reflects_window_created_event() {
+    let (mut session, mut server, server_client_id) = boot_shell_with_shell_manager();
+    let shell_manager_id = session.bound(Interface::ShellManager).unwrap();
+
+    // Sanity: window list starts empty.
+    assert!(session.windows().is_empty());
+
+    // Server emits a window_created for window_id=42.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_window_created(shell_manager_id, 42, "term", "pmos.term")
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(session.windows().len(), 1);
+    assert!(session.windows().contains_key(&42));
+
+    // A second window_created adds to the list.
+    server
+        .client_mut(server_client_id)
+        .unwrap()
+        .emit_window_created(shell_manager_id, 7, "edit", "pmos.edit")
+        .unwrap();
+    pump_events_into_shell(&mut server, server_client_id, &mut session);
+    assert_eq!(session.windows().len(), 2);
+    assert!(session.windows().contains_key(&7));
+}

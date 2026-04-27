@@ -193,7 +193,7 @@ fn split_semicolons(s: &str) -> Vec<String> {
 
 // ── Launcher ─────────────────────────────────────────────────────────────────
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Desktop-shell app launcher.
 ///
@@ -225,6 +225,13 @@ impl Launcher {
     /// The current cached entry list.
     pub fn entries(&self) -> &[DesktopEntry] {
         &self.entries
+    }
+
+    /// Timestamp of the most recent successful poll. Used by
+    /// [`launcher_watcher::tick`] to decide whether the next
+    /// caller-tick should fire a poll.
+    pub fn last_poll(&self) -> Duration {
+        self.last_poll
     }
 
     /// Advance the poll clock.

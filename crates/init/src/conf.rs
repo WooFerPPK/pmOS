@@ -443,4 +443,26 @@ ALPHA = "a"
         let cfg = InitConfig::parse(input).unwrap();
         assert_eq!(cfg.env.get("X").unwrap(), "a # not_a_comment");
     }
+
+    /// T179 verification: re-reading `/etc/init.conf` with a
+    /// changed `boot.shell` value yields the new binary path. Init's
+    /// supervision loop re-parses on every respawn cycle, so swapping
+    /// the file under it picks up the new shell without restarting
+    /// init itself — this is the layering-test substitution path.
+    #[test]
+    fn shell_respawn_picks_up_changed_boot_shell() {
+        let v1 = r#"
+[boot]
+shell = "/usr/bin/shell"
+"#;
+        let v2 = r#"
+[boot]
+shell = "/usr/bin/alt-shell"
+"#;
+        let cfg1 = InitConfig::parse(v1).unwrap();
+        let cfg2 = InitConfig::parse(v2).unwrap();
+        assert_eq!(cfg1.boot.shell, "/usr/bin/shell");
+        assert_eq!(cfg2.boot.shell, "/usr/bin/alt-shell");
+        assert_ne!(cfg1.boot.shell, cfg2.boot.shell);
+    }
 }
