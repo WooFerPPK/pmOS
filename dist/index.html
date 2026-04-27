@@ -16,16 +16,26 @@
         color: #fff;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       }
-      body {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
+      /* Default: canvas fills viewport (text-only boot paths,
+         pre-set-mode startup screens). Once GUI boot's
+         onModeChange fires, bootstrap.ts switches the body
+         to flex-centered and pins the canvas to the
+         framebuffer's intrinsic pixel size. */
       #pmos-fb {
         display: block;
         width: 100vw;
         height: 100vh;
         image-rendering: pixelated;
+      }
+      body.pmos-gui-mode {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      body.pmos-gui-mode #pmos-fb {
+        width: auto;
+        height: auto;
+        image-rendering: auto;
       }
       /* Hidden textarea used by the console driver for stdin reads
          and the test harness for input injection. */

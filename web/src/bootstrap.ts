@@ -987,13 +987,13 @@ function runRealKernelMode(bootBinary: string): void {
         // Pin the canvas's CSS box to the framebuffer's
         // intrinsic pixel dims so the OS renders at native
         // resolution instead of stretching to fill the
-        // viewport. Centred on the page; leftover space
-        // shows the body's black background. This also makes
-        // the pointer-event coordinate inversion in
-        // `toFbCoords` a 1:1 map.
+        // viewport. The CSS class triggers flex-centering
+        // on body + `width:auto/height:auto` on the canvas
+        // (which then renders at the canvas element's
+        // intrinsic pixel size = the framebuffer mode).
+        document.body.classList.add("pmos-gui-mode");
         canvas.style.width = `${mode.width}px`;
         canvas.style.height = `${mode.height}px`;
-        canvas.style.imageRendering = "auto";
       });
       fbHost.onFrame((frame) => {
         renderer.paintFrame(frame);
