@@ -307,7 +307,13 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
             return Ok(ShellExit::CloseRequested);
         }
 
-        if !events.is_empty() {
+        // Only log "interesting" events — pointer motion can
+        // arrive in floods (one per pixel of mouse drag) and
+        // crowds out everything useful.
+        let interesting = events
+            .iter()
+            .any(|e| !(e.interface == Interface::Pointer && e.opcode == 1));
+        if interesting {
             println!(
                 "shell: iter {} got {} events, configured={} size={:?}",
                 iter_count,
@@ -318,10 +324,13 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
         }
 
         for event in events {
-            println!(
-                "shell:   event interface={:?} opcode={} object_id={:?} payload_len={}",
-                event.interface, event.opcode, event.object_id, event.payload.len(),
-            );
+            let is_motion = event.interface == Interface::Pointer && event.opcode == 1;
+            if !is_motion {
+                println!(
+                    "shell:   event interface={:?} opcode={} object_id={:?} payload_len={}",
+                    event.interface, event.opcode, event.object_id, event.payload.len(),
+                );
+            }
             match (event.interface, event.opcode) {
                 (Interface::ShellManager, 1 /* window_created */) => {
                     if let Ok(decoded) = ShellWindowCreated::decode(&event.payload) {
@@ -352,7 +361,7 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                         let _ = p.handle_release(event.object_id);
                     }
                 }
-                (Interface::Pointer, 3 /* motion */) => {
+                (Interface::Pointer, 1 /* motion */) => {
                     if let Ok(motion) = PointerMotion::decode(&event.payload) {
                         let new_hover = if launcher_open {
                             launcher_menu_row_at(&taskbar, slots, motion.x, motion.y)
@@ -367,7 +376,7 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                         }
                     }
                 }
-                (Interface::Pointer, 4 /* button */) => {
+                (Interface::Pointer, 2 /* button */) => {
                     if let Ok(button) = PointerButton::decode(&event.payload) {
                         if button.state == display_proto::events::pointer_button_state::PRESSED {
                             // Convert from surface-local
