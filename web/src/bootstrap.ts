@@ -967,7 +967,18 @@ function runRealKernelMode(bootBinary: string): void {
   // legacy demo flow) get the console-pre overlay.
   const isGuiBoot = bootBinary === "/bin/init-desktop";
   const consoleEl = mountRealKernelConsole(isGuiBoot);
+  // Boot splash — fullscreen progress overlay covering the page
+  // while the kernel + display server + shell come up. Each
+  // milestone (browser env checks, kernel module mounted,
+  // userland processes started, wallpaper painted) lights up a
+  // line. The splash dismisses itself once the desktop's first
+  // frame lands.
+  const splash = isGuiBoot ? mountBootSplash() : null;
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  if (splash) {
+    splash.markStarted("Browser environment ready");
+    splash.markStarted("Kernel worker spawned");
+  }
 
   // GUI boot: wire the FbHost → FbRenderer pair so `fb:set-mode` /
   // `fb:blit` messages from the kernel Worker actually paint pixels
@@ -994,9 +1005,20 @@ function runRealKernelMode(bootBinary: string): void {
         document.body.classList.add("pmos-gui-mode");
         canvas.style.width = `${mode.width}px`;
         canvas.style.height = `${mode.height}px`;
+        if (splash) {
+          splash.markStarted(`Framebuffer mode set ${mode.width}×${mode.height}`);
+        }
       });
+      let firstFrameSeen = false;
       fbHost.onFrame((frame) => {
         renderer.paintFrame(frame);
+        if (!firstFrameSeen) {
+          firstFrameSeen = true;
+          if (splash) {
+            splash.markStarted("Desktop wallpaper rendered");
+            splash.dismiss();
+          }
+        }
       });
 
       // Pointer + keyboard input for the GUI desktop. Each
@@ -1138,13 +1160,22 @@ function runRealKernelMode(bootBinary: string): void {
     const text = new TextDecoder().decode(bytes);
     consoleEl.textContent += text;
     console.log(`[real-kernel] ${text.replace(/\n$/, "")}`);
+    if (splash) {
+      splash.observeConsoleLine(text);
+    }
   });
   consoleHost.onLifecycle((event: ConsoleLifecycleEvent) => {
     if (event.kind === "ready") {
       console.log("[pmos-bootstrap] real kernel ready");
+      if (splash) {
+        splash.markStarted("Kernel ready");
+      }
     } else if (event.kind === "panic") {
       console.error(`[pmos-bootstrap] real kernel panic: ${event.message}`);
       consoleEl.textContent += `\n[panic] ${event.message}\n`;
+      if (splash) {
+        splash.markFailed(`Kernel panic: ${event.message}`);
+      }
     }
   });
 
@@ -1245,6 +1276,258 @@ function mountRealKernelConsole(gui: boolean = false): HTMLPreElement {
   }
   document.body.appendChild(pre);
   return pre;
+}
+
+/**
+ * Boot-splash overlay. Paints a fullscreen progress screen
+ * during the kernel + display server + shell startup. Each
+ * milestone (env checks, kernel spawn, init-desktop spawn,
+ * display-server bind, shell connect, wallpaper paint) lights
+ * up a row. The splash dismisses itself when the desktop's
+ * first frame lands.
+ *
+ * Designed to be observable: every line carries a status icon
+ * and a short timestamp so the user can see the OS coming up
+ * step by step instead of staring at a black page.
+ */
+interface BootSplash {
+  /** Mark a known step as completed (or move "in progress"
+   *  forward). Idempotent — duplicate marks are ignored. */
+  markStarted(label: string): void;
+  /** Mark a step that the boot raised an error on. The
+   *  splash stays visible so the user can read the failure. */
+  markFailed(label: string): void;
+  /** Forward a console line; the splash matches it against
+   *  known kernel/userland milestones (`init-desktop spawned
+   *  display-server`, `shell: connected to /run/display`, …)
+   *  and updates the corresponding step. */
+  observeConsoleLine(text: string): void;
+  /** Animate-out and remove the overlay. Called after the
+   *  first wallpaper blit lands so the user sees the desktop
+   *  immediately. */
+  dismiss(): void;
+}
+
+interface BootStep {
+  readonly label: string;
+  /** Substrings the splash watches for in console output to
+   *  auto-mark this step as started. */
+  readonly consoleHints: readonly string[];
+  /** Timestamp (ms since boot) when started. */
+  startedAt: number | null;
+  /** True if a failure was reported against this step. */
+  failed: boolean;
+  /** Custom failure message override. */
+  failureMessage: string | null;
+}
+
+function mountBootSplash(): BootSplash {
+  const t0 = performance.now();
+  const overlay = document.createElement("div");
+  overlay.id = "pmos-boot-splash";
+  overlay.style.cssText = [
+    "position: fixed",
+    "inset: 0",
+    "display: flex",
+    "flex-direction: column",
+    "align-items: center",
+    "justify-content: center",
+    "background: radial-gradient(circle at 50% 35%, #1a2638 0%, #060a12 100%)",
+    "color: #e6e6e6",
+    "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+    "z-index: 1000",
+    "transition: opacity 350ms ease-out",
+    "opacity: 1",
+    // Don't intercept clicks; once the canvas is alive the
+    // user's clicks need to reach it. (The splash dismiss
+    // animation overlaps for ~350ms; pointer-events:none
+    // makes the splash transparent to input during that
+    // window.)
+    "pointer-events: none",
+  ].join("; ");
+
+  const titleBlock = document.createElement("div");
+  titleBlock.style.cssText = [
+    "margin-bottom: 2.5rem",
+    "text-align: center",
+  ].join("; ");
+  const title = document.createElement("div");
+  title.textContent = "PMos";
+  title.style.cssText = [
+    "font-size: 56px",
+    "font-weight: 200",
+    "letter-spacing: 0.4em",
+    "color: #ffffff",
+    "margin-bottom: 0.4rem",
+  ].join("; ");
+  const subtitle = document.createElement("div");
+  subtitle.textContent = "browser-native operating system";
+  subtitle.style.cssText = [
+    "font-size: 12px",
+    "letter-spacing: 0.25em",
+    "text-transform: uppercase",
+    "color: #5b7fa9",
+  ].join("; ");
+  titleBlock.appendChild(title);
+  titleBlock.appendChild(subtitle);
+
+  const list = document.createElement("div");
+  list.style.cssText = [
+    "min-width: 480px",
+    "max-width: 80vw",
+    "padding: 1rem 1.25rem",
+    "background: rgba(10, 14, 20, 0.55)",
+    "border: 1px solid rgba(91, 127, 169, 0.25)",
+    "border-radius: 6px",
+    "font-size: 13px",
+    "line-height: 1.9",
+  ].join("; ");
+
+  overlay.appendChild(titleBlock);
+  overlay.appendChild(list);
+  document.body.appendChild(overlay);
+
+  const steps: BootStep[] = [
+    { label: "Browser environment ready",     consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
+    { label: "Kernel worker spawned",         consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
+    { label: "Kernel ready",                  consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
+    { label: "init (PID 1) running",          consoleHints: ["init-desktop starting"],                      startedAt: null, failed: false, failureMessage: null },
+    { label: "display-server spawned",        consoleHints: ["init-desktop spawned display-server"],        startedAt: null, failed: false, failureMessage: null },
+    { label: "shell spawned",                 consoleHints: ["init-desktop spawned shell"],                 startedAt: null, failed: false, failureMessage: null },
+    { label: "init supervising children",     consoleHints: ["init-desktop entering supervision loop"],     startedAt: null, failed: false, failureMessage: null },
+    { label: "display-server bound /run/display", consoleHints: ["display-server starting"],                startedAt: null, failed: false, failureMessage: null },
+    { label: "shell connected to display",    consoleHints: ["shell: connected to /run/display"],           startedAt: null, failed: false, failureMessage: null },
+    { label: "shell handshake complete",      consoleHints: ["display-server served client 0"],             startedAt: null, failed: false, failureMessage: null },
+    { label: "Framebuffer mode set 1024×768", consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
+    { label: "Desktop wallpaper rendered",    consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
+  ];
+
+  const rows: HTMLDivElement[] = steps.map((step) => {
+    const row = document.createElement("div");
+    row.style.cssText = [
+      "display: flex",
+      "align-items: baseline",
+      "gap: 0.75rem",
+      "color: #5b7fa9",
+      "transition: color 150ms ease",
+    ].join("; ");
+    const icon = document.createElement("span");
+    icon.textContent = "○";
+    icon.style.cssText = "width: 1.2rem; text-align: center; font-size: 14px;";
+    const label = document.createElement("span");
+    label.textContent = step.label;
+    label.style.cssText = "flex: 1;";
+    const elapsed = document.createElement("span");
+    elapsed.style.cssText = "color: #4a5f7a; font-size: 11px; min-width: 4.5rem; text-align: right;";
+    row.appendChild(icon);
+    row.appendChild(label);
+    row.appendChild(elapsed);
+    list.appendChild(row);
+    return row;
+  });
+
+  function findStep(label: string): number {
+    return steps.findIndex((s) => s.label === label);
+  }
+
+  function paintRow(i: number): void {
+    const step = steps[i];
+    const row = rows[i];
+    if (!step || !row) return;
+    const icon = row.children[0] as HTMLElement;
+    const elapsed = row.children[2] as HTMLElement;
+    if (step.failed) {
+      icon.textContent = "✗";
+      icon.style.color = "#ff7a7a";
+      row.style.color = "#ff9c9c";
+      elapsed.textContent = step.failureMessage ?? "failed";
+      return;
+    }
+    if (step.startedAt !== null) {
+      icon.textContent = "✓";
+      icon.style.color = "#7ad0a3";
+      row.style.color = "#dde7f0";
+      const ms = Math.round(step.startedAt - t0);
+      elapsed.textContent = `+${ms}ms`;
+      return;
+    }
+    icon.textContent = "○";
+    icon.style.color = "#3e5474";
+    row.style.color = "#5b7fa9";
+    elapsed.textContent = "";
+  }
+
+  for (let i = 0; i < steps.length; i += 1) {
+    paintRow(i);
+  }
+
+  function markStarted(label: string): void {
+    const i = findStep(label);
+    if (i < 0) return;
+    if (steps[i].startedAt !== null) return;
+    steps[i].startedAt = performance.now();
+    paintRow(i);
+  }
+
+  function markFailed(label: string): void {
+    // Not necessarily one of the canned steps — append a
+    // synthetic row at the bottom so the user sees the
+    // failure in context.
+    const synthetic: BootStep = {
+      label,
+      consoleHints: [],
+      startedAt: null,
+      failed: true,
+      failureMessage: "failed",
+    };
+    steps.push(synthetic);
+    const row = document.createElement("div");
+    row.style.cssText = [
+      "display: flex",
+      "align-items: baseline",
+      "gap: 0.75rem",
+      "color: #ff9c9c",
+    ].join("; ");
+    const icon = document.createElement("span");
+    icon.textContent = "✗";
+    icon.style.cssText = "width: 1.2rem; text-align: center; color: #ff7a7a;";
+    const labelEl = document.createElement("span");
+    labelEl.textContent = label;
+    labelEl.style.cssText = "flex: 1;";
+    const elapsed = document.createElement("span");
+    elapsed.textContent = "failed";
+    elapsed.style.cssText = "color: #ff7a7a; font-size: 11px;";
+    row.appendChild(icon);
+    row.appendChild(labelEl);
+    row.appendChild(elapsed);
+    list.appendChild(row);
+    rows.push(row);
+  }
+
+  function observeConsoleLine(text: string): void {
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      for (const step of steps) {
+        if (step.startedAt !== null) continue;
+        for (const hint of step.consoleHints) {
+          if (trimmed.includes(hint)) {
+            markStarted(step.label);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  function dismiss(): void {
+    overlay.style.opacity = "0";
+    window.setTimeout(() => {
+      overlay.remove();
+    }, 400);
+  }
+
+  return { markStarted, markFailed, observeConsoleLine, dismiss };
 }
 
 function showFallbackMessage(error: string): void {

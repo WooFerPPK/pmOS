@@ -1,5 +1,5 @@
 {
-  "version": 23,
+  "version": 24,
   "assets": [
     "_headers",
     "assets/bin/cat.wasm",
