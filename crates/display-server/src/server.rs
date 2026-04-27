@@ -129,6 +129,14 @@ pub struct Server {
     /// consulted by `inject_pointer_motion`; cleared by
     /// `inject_pointer_button` on release.
     active_drag: Option<DragState>,
+    /// Cross-client auto-layout counter. Each new toplevel
+    /// across ANY client is positioned at
+    /// (counter, counter) and the counter advances by
+    /// AUTO_LAYOUT_STEP. Without this, every client's first
+    /// toplevel would land at (0, 0) and stack invisibly
+    /// — so spawning two `hello-toplevel` instances looks
+    /// like nothing happened on the second click.
+    next_toplevel_offset: i32,
 }
 
 impl Server {
@@ -150,6 +158,7 @@ impl Server {
             keyboard_focus: None,
             taskbar_height_px: 0,
             active_drag: None,
+            next_toplevel_offset: 0,
         }
     }
 
@@ -644,14 +653,15 @@ impl Server {
             }
         }
 
-        // get_toplevel installed a new toplevel; broadcast
-        // window_created. Toplevel ids are server-allocated
-        // monotonically per client, so we read the just-installed
-        // entry from the client's toplevels map.
+        // get_toplevel installed a new toplevel; reposition
+        // it using the server-global staircase so two
+        // separate clients' first toplevels don't both land
+        // at (0, 0). Then broadcast window_created.
         if pre_interface == Some(Interface::XdgShell) && header.opcode == 1 /* get_toplevel */ {
             if let Ok(req) =
                 display_proto::requests::XdgShellGetToplevel::decode(payload)
             {
+                self.position_new_toplevel(client_id, req.new_id);
                 self.broadcast_window_created(client_id, req.new_id);
             }
         }
@@ -669,6 +679,30 @@ impl Server {
         // nothing extra on commit.
 
         Ok(())
+    }
+
+    /// Override a just-installed toplevel's auto-layout
+    /// position with the server-global counter so each new
+    /// window across ANY client lands at a different spot.
+    /// The per-client `Client::next_toplevel_offset` already
+    /// stepped, but its counter starts at 0 for every fresh
+    /// client; without this two separate processes would
+    /// have their first toplevel both land at (0, 0) and
+    /// stack invisibly.
+    fn position_new_toplevel(
+        &mut self,
+        client_id: ClientId,
+        toplevel_id: display_proto::ids::ObjectId,
+    ) {
+        use crate::client::AUTO_LAYOUT_STEP;
+        let pos = self.next_toplevel_offset;
+        self.next_toplevel_offset = self.next_toplevel_offset.saturating_add(AUTO_LAYOUT_STEP);
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            if let Some(toplevel) = client.toplevels.get_mut(&toplevel_id) {
+                toplevel.x = pos;
+                toplevel.y = pos;
+            }
+        }
     }
 
     /// Mark `client_id` as subscribed to shell_manager

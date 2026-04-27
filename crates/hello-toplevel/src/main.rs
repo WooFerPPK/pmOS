@@ -16,6 +16,7 @@
 //! click on the taskbar; close request via
 //! shell_manager.close_window).
 
+use toolkit::draw::font::GLYPH_HEIGHT;
 use toolkit::draw::{Color, Rect};
 use toolkit::{App, BufferPool, Window};
 
@@ -183,10 +184,13 @@ fn run_window<C: toolkit::protocol::Connection>(
     // out against the desktop wallpaper grey.
     let fill = Color::rgb(0xc8, 0x60, 0xa8);
     let mut painted = false;
-    let mut iters: u32 = 0;
-    let max_iters: u32 = 200_000;
-    while iters < max_iters {
-        iters += 1;
+    // Loop forever — the only legitimate exit is the
+    // server emitting `xdg_toplevel.close` (e.g. user
+    // clicked the close button or shell-manager.close_window).
+    // A bounded iteration count caused the demo to paint
+    // once + spin its way to exit in seconds, which the
+    // user observed as a "purple flash that disappeared".
+    loop {
         let _ = window.dispatch()?;
         if window.close_requested() {
             return Ok(());
@@ -201,9 +205,30 @@ fn run_window<C: toolkit::protocol::Connection>(
             let (w, h) = (320u32, 200u32);
             let mut pool: BufferPool = BufferPool::new(window.app_mut(), w, h)?;
             if let Some(mut canvas) = pool.acquire_back_canvas() {
+                // Solid fill, then a thin border, then a
+                // titlebar-like strip with a label so the
+                // demo is clearly recognisable as a window
+                // (not just an unframed colour blob).
                 canvas.fill_rect(
                     Rect { x: 0, y: 0, width: w, height: h },
                     fill,
+                );
+                let titlebar_h = 22u32;
+                let titlebar = Color::rgb(0x88, 0x40, 0x70);
+                canvas.fill_rect(
+                    Rect { x: 0, y: 0, width: w, height: titlebar_h },
+                    titlebar,
+                );
+                let title = "Hello Window";
+                let tx = 8;
+                let ty = ((titlebar_h as i32 - GLYPH_HEIGHT as i32) / 2).max(0);
+                canvas.draw_text(tx, ty, title, Color::rgb(0xff, 0xff, 0xff));
+                let body = "Spawned via the desktop launcher.";
+                canvas.draw_text(
+                    14,
+                    titlebar_h as i32 + 24,
+                    body,
+                    Color::rgb(0xff, 0xff, 0xff),
                 );
                 drop(canvas);
                 pool.commit_and_swap(&mut window)?;
@@ -211,7 +236,6 @@ fn run_window<C: toolkit::protocol::Connection>(
             }
         }
     }
-    Ok(())
 }
 
 fn main() {
