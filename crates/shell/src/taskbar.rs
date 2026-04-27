@@ -356,7 +356,9 @@ impl Taskbar {
         if bounds.is_empty() {
             return;
         }
-        canvas.fill_rect(bounds, self.theme.window_background);
+        // Taskbar uses the titlebar palette so its strip
+        // stands out against the (lighter) wallpaper.
+        canvas.fill_rect(bounds, self.theme.titlebar_active);
         canvas.stroke_rect(bounds, self.theme.border_active);
         for idx in 0..self.entries.len() {
             let Some(rect) = self.entry_rect(idx) else {
