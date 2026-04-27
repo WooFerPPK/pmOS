@@ -296,6 +296,7 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     let mut total_motion: u64 = 0;
     let mut total_buttons: u64 = 0;
     let mut total_paints: u64 = 0;
+    let mut stuck_acquire_count: u64 = 0;
     let mut last_heartbeat_iter: u32 = 0;
     // Heartbeat cadence: every N iterations, print a one-line
     // summary even if nothing else is going on. A fast empty
@@ -318,12 +319,14 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
 
         if iter_count.wrapping_sub(last_heartbeat_iter) >= HEARTBEAT_EVERY {
             println!(
-                "shell: heartbeat iter={} total_events={} motion={} buttons={} paints={} close_req={} configured={}",
+                "shell: heartbeat iter={} total_events={} motion={} buttons={} paints={} stuck_acquire={} needs_paint={} close_req={} configured={}",
                 iter_count,
                 total_events,
                 total_motion,
                 total_buttons,
                 total_paints,
+                stuck_acquire_count,
+                needs_paint,
                 window.close_requested(),
                 window.is_configured(),
             );
@@ -476,7 +479,30 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                 last_size = (w, h);
             }
             let p = pool.as_mut().expect("pool initialised when w/h are set");
-            if let Some(mut canvas) = p.acquire_back_canvas() {
+            // Detect prolonged back-pressure: if every
+            // acquire returns None for many iterations the
+            // server has stopped emitting buffer-release
+            // events and we'll never paint again. Log every
+            // 100 stuck iterations so we know to investigate.
+            let acquire_attempt = p.acquire_back_canvas();
+            if acquire_attempt.is_none() {
+                stuck_acquire_count += 1;
+                if stuck_acquire_count == 1 || stuck_acquire_count % 100 == 0 {
+                    println!(
+                        "shell: acquire_back_canvas returned None at iter {} (stuck for {} attempts)",
+                        iter_count, stuck_acquire_count,
+                    );
+                }
+            } else {
+                if stuck_acquire_count > 0 {
+                    println!(
+                        "shell: acquire recovered after {} stuck attempts at iter {}",
+                        stuck_acquire_count, iter_count,
+                    );
+                    stuck_acquire_count = 0;
+                }
+            }
+            if let Some(mut canvas) = acquire_attempt {
                 canvas.fill_rect(
                     Rect { x: 0, y: 0, width: w, height: h },
                     wallpaper,
@@ -492,19 +518,17 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                     return Err(e);
                 }
                 total_paints += 1;
-                // Only spam the per-paint line every 50th
+                // Only spam the per-paint line every 20th
                 // paint so the long-run heartbeat stays
                 // readable. Boot's first few paints still
                 // print individually.
-                if total_paints <= 5 || total_paints % 50 == 0 {
+                if total_paints <= 5 || total_paints % 20 == 0 {
                     println!(
                         "shell: painted frame #{} at iter {} (taskbar={}, launcher_open={})",
                         total_paints, iter_count, taskbar.entries().len(), launcher_open,
                     );
                 }
                 needs_paint = false;
-            } else {
-                println!("shell: acquire_back_canvas returned None at iter {}", iter_count);
             }
         }
     }
