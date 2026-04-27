@@ -352,6 +352,21 @@ impl Server {
         let hit = self.hit_test(self.pointer_x, self.pointer_y)?;
         if state == display_proto::events::pointer_button_state::PRESSED {
             self.keyboard_focus = Some((hit.client_id, hit.surface_id));
+            // Find the toplevel id that owns the hit surface
+            // and broadcast a window_focused event so every
+            // subscribed shell repaints its taskbar.
+            let mut focused_window_id: Option<u32> = None;
+            if let Some(client) = self.clients.get(&hit.client_id) {
+                for (toplevel_id, toplevel) in client.toplevels.iter() {
+                    if toplevel.surface_id == hit.surface_id {
+                        focused_window_id = Some(toplevel_id.0);
+                        break;
+                    }
+                }
+            }
+            if let Some(wid) = focused_window_id {
+                self.broadcast_window_focused(wid);
+            }
         }
         let client = self.clients.get_mut(&hit.client_id)?;
         if client.pointer_id.is_some() {
@@ -451,8 +466,23 @@ impl Server {
     /// Drop a client, e.g. on connection close. Returns the
     /// removed client so the caller can inspect its final
     /// state (mostly for tests).
+    ///
+    /// Side-effect: every toplevel the dropped client owned
+    /// triggers a `pmd_shell_manager.window_destroyed`
+    /// broadcast so subscribed shells can prune the
+    /// associated taskbar entries before the connection's
+    /// last events are flushed.
     pub fn disconnect(&mut self, id: ClientId) -> Option<Client> {
-        self.clients.remove(&id)
+        let dying_window_ids: alloc::vec::Vec<u32> = self
+            .clients
+            .get(&id)
+            .map(|c| c.toplevels.keys().map(|tid| tid.0).collect())
+            .unwrap_or_default();
+        let removed = self.clients.remove(&id);
+        for wid in dying_window_ids {
+            self.broadcast_window_destroyed(wid);
+        }
+        removed
     }
 
     /// Number of currently-connected clients.
@@ -563,7 +593,261 @@ impl Server {
             }
         }
 
+        // pmd_shell_manager hooks. Subscribe is a one-shot —
+        // once a client has called subscribe_windows, any
+        // subsequent toplevel mutation triggers a broadcast.
+        // The catch-up snapshot fires inline so the client's
+        // taskbar populates with everything that's already
+        // open before the subscription landed.
+        if pre_interface == Some(Interface::ShellManager) {
+            match header.opcode {
+                1 /* subscribe_windows */ => {
+                    self.subscribe_windows_for(client_id);
+                }
+                2 /* focus_window */ => {
+                    if let Ok(req) =
+                        display_proto::requests::ShellManagerFocusWindow::decode(payload)
+                    {
+                        self.focus_window_by_id(req.window_id);
+                    }
+                }
+                3 /* close_window */ => {
+                    if let Ok(req) =
+                        display_proto::requests::ShellManagerCloseWindow::decode(payload)
+                    {
+                        self.close_window_by_id(req.window_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Broadcast hooks for toplevel lifecycle events.
+        // `set_title` / `set_app_id` were applied to the
+        // client's per-toplevel state by the underlying
+        // `apply_toplevel_state` call inside dispatch_request;
+        // we now have to fan out a window_title_changed event
+        // to every subscribed client.
+        if pre_interface == Some(Interface::XdgToplevel) {
+            match header.opcode {
+                1 /* set_title */ => {
+                    self.broadcast_window_title_changed(client_id, header.object_id);
+                }
+                2 /* set_app_id */ => {
+                    // app_id changes don't have a dedicated
+                    // event; the title-changed event covers the
+                    // taskbar's repaint trigger since both
+                    // affect the visible label.
+                    self.broadcast_window_title_changed(client_id, header.object_id);
+                }
+                _ => {}
+            }
+        }
+
+        // get_toplevel installed a new toplevel; broadcast
+        // window_created. Toplevel ids are server-allocated
+        // monotonically per client, so we read the just-installed
+        // entry from the client's toplevels map.
+        if pre_interface == Some(Interface::XdgShell) && header.opcode == 1 /* get_toplevel */ {
+            if let Ok(req) =
+                display_proto::requests::XdgShellGetToplevel::decode(payload)
+            {
+                self.broadcast_window_created(client_id, req.new_id);
+            }
+        }
+
+        // surface.commit on a surface that has a toplevel
+        // means the window has produced its first paintable
+        // frame; many shells repaint the taskbar after this
+        // because the window's title may have just been set.
+        // We treat the FIRST commit as the canonical
+        // window_created broadcast trigger if the window was
+        // never broadcast before — get_toplevel fires before
+        // the title is set, so a delayed-broadcast pattern
+        // would wait for the first commit. For v1 we keep the
+        // simpler get_toplevel-time broadcast above and do
+        // nothing extra on commit.
+
         Ok(())
+    }
+
+    /// Mark `client_id` as subscribed to shell_manager
+    /// window-list events and emit a catch-up snapshot of
+    /// every currently-open toplevel through the client's
+    /// shell_manager object. No-op if the client has no
+    /// bound shell_manager.
+    fn subscribe_windows_for(&mut self, client_id: ClientId) {
+        let Some(shell_manager_id) = self
+            .clients
+            .get(&client_id)
+            .and_then(|c| c.shell_manager_id)
+        else {
+            return;
+        };
+        // Snapshot every (window_id, title, app_id, focused)
+        // tuple BEFORE mutating the subscriber so the iteration
+        // borrow is independent of the mutation.
+        let snapshot: alloc::vec::Vec<(u32, alloc::string::String, alloc::string::String, bool)> = self
+            .clients
+            .values()
+            .flat_map(|c| {
+                let pinned_focus = self.keyboard_focus;
+                c.toplevels
+                    .iter()
+                    .map(move |(_, t)| {
+                        let focused = pinned_focus
+                            .map(|(_, surf)| surf == t.surface_id)
+                            .unwrap_or(false);
+                        (t.id.0, t.title.clone(), t.app_id.clone(), focused)
+                    })
+                    .collect::<alloc::vec::Vec<_>>()
+            })
+            .collect();
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        client.shell_manager_subscribed = true;
+        for (window_id, title, app_id, focused) in &snapshot {
+            let _ = client.emit_window_created(shell_manager_id, *window_id, title, app_id);
+            if *focused {
+                let _ = client.emit_window_focused(shell_manager_id, *window_id);
+            }
+        }
+    }
+
+    /// Broadcast `window_created` to every subscribed client.
+    /// Called from the post-dispatch hook for `get_toplevel`;
+    /// at that point the title is empty (set_title comes
+    /// later) but the taskbar already wants to show an entry.
+    /// A subsequent `set_title` triggers a `window_title_changed`
+    /// broadcast that updates the existing entry in place.
+    fn broadcast_window_created(
+        &mut self,
+        owning_client_id: ClientId,
+        toplevel_id: display_proto::ids::ObjectId,
+    ) {
+        let Some(owning) = self.clients.get(&owning_client_id) else {
+            return;
+        };
+        let Some(toplevel) = owning.toplevels.get(&toplevel_id) else {
+            return;
+        };
+        let title = toplevel.title.clone();
+        let app_id = toplevel.app_id.clone();
+        let window_id = toplevel.id.0;
+        for client in self.clients.values_mut() {
+            if !client.shell_manager_subscribed {
+                continue;
+            }
+            let Some(sm_id) = client.shell_manager_id else {
+                continue;
+            };
+            let _ = client.emit_window_created(sm_id, window_id, &title, &app_id);
+        }
+    }
+
+    /// Broadcast `window_destroyed` to every subscribed
+    /// client. Called when a toplevel is removed from a
+    /// client's table (e.g. on disconnect or via
+    /// `xdg_toplevel.destroy`).
+    pub fn broadcast_window_destroyed(&mut self, window_id: u32) {
+        for client in self.clients.values_mut() {
+            if !client.shell_manager_subscribed {
+                continue;
+            }
+            let Some(sm_id) = client.shell_manager_id else {
+                continue;
+            };
+            let _ = client.emit_window_destroyed(sm_id, window_id);
+        }
+    }
+
+    /// Broadcast `window_title_changed` to every subscribed
+    /// client. Called from the post-dispatch hooks for
+    /// `set_title` / `set_app_id`.
+    fn broadcast_window_title_changed(
+        &mut self,
+        owning_client_id: ClientId,
+        toplevel_id: display_proto::ids::ObjectId,
+    ) {
+        let Some(owning) = self.clients.get(&owning_client_id) else {
+            return;
+        };
+        let Some(toplevel) = owning.toplevels.get(&toplevel_id) else {
+            return;
+        };
+        let new_title = toplevel.title.clone();
+        let window_id = toplevel.id.0;
+        for client in self.clients.values_mut() {
+            if !client.shell_manager_subscribed {
+                continue;
+            }
+            let Some(sm_id) = client.shell_manager_id else {
+                continue;
+            };
+            let _ = client.emit_window_title_changed(sm_id, window_id, &new_title);
+        }
+    }
+
+    /// Broadcast `window_focused(window_id)` to every
+    /// subscribed client. Called from the click-to-focus
+    /// path inside `inject_pointer_button` and from the
+    /// shell_manager.focus_window dispatch hook.
+    fn broadcast_window_focused(&mut self, window_id: u32) {
+        for client in self.clients.values_mut() {
+            if !client.shell_manager_subscribed {
+                continue;
+            }
+            let Some(sm_id) = client.shell_manager_id else {
+                continue;
+            };
+            let _ = client.emit_window_focused(sm_id, window_id);
+        }
+    }
+
+    /// Implementation of `pmd_shell_manager.focus_window`.
+    /// Walk every client; the toplevel whose ObjectId matches
+    /// `window_id` becomes the keyboard focus target. The
+    /// shell uses this from the taskbar click-to-focus path.
+    fn focus_window_by_id(&mut self, window_id: u32) {
+        let target = display_proto::ids::ObjectId::new(window_id);
+        let mut hit: Option<(ClientId, display_proto::ids::ObjectId)> = None;
+        for (cid, client) in self.clients.iter() {
+            if let Some(t) = client.toplevels.get(&target) {
+                hit = Some((*cid, t.surface_id));
+                break;
+            }
+        }
+        if let Some((cid, surface_id)) = hit {
+            self.keyboard_focus = Some((cid, surface_id));
+            // Restoring a minimized toplevel is part of the
+            // "click to focus" UX — the shell expects a
+            // single focus_window call to bring the window
+            // back regardless of prior minimized state.
+            self.set_toplevel_minimized_across_clients(target, false);
+            self.broadcast_window_focused(window_id);
+        }
+    }
+
+    /// Implementation of `pmd_shell_manager.close_window`.
+    /// Sends `xdg_toplevel.close` to the owning client so it
+    /// can tear down its surface; the client's subsequent
+    /// drop of the toplevel triggers a window_destroyed
+    /// broadcast in the disconnect path.
+    fn close_window_by_id(&mut self, window_id: u32) {
+        let target = display_proto::ids::ObjectId::new(window_id);
+        let mut owning: Option<ClientId> = None;
+        for (cid, client) in self.clients.iter() {
+            if client.toplevels.contains_key(&target) {
+                owning = Some(*cid);
+                break;
+            }
+        }
+        if let Some(cid) = owning {
+            if let Some(client) = self.clients.get_mut(&cid) {
+                let _ = client.emit_xdg_toplevel_close(target);
+            }
+        }
     }
 
     /// Server-driven configure emission for the
@@ -874,6 +1158,13 @@ impl Server {
                 (attachment.x, attachment.y)
             };
         framebuffer.blit_buffer(info, src_bytes, origin_x, origin_y);
+        // Buffer release: server's pool storage already
+        // holds a copy of the painted bytes, so the client
+        // can recycle this buffer immediately.
+        let buffer_id = attachment.buffer_id;
+        if let Some(client_mut) = clients.get_mut(&client_id) {
+            let _ = client_mut.emit_buffer_release(buffer_id);
+        }
     }
 }
 

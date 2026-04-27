@@ -453,6 +453,18 @@ pub struct Client {
     /// `ack_configure(serial)`. Starts at 1; 0 is reserved
     /// as a sentinel "no configure has been sent yet".
     pub next_configure_serial: u32,
+    /// Object id of this client's bound `pmd_shell_manager`,
+    /// if any. Set by the registry.bind auto-install path
+    /// when the target interface is `Interface::ShellManager`.
+    /// The display server's broadcast machinery walks every
+    /// client whose `shell_manager_id` is `Some` AND whose
+    /// `shell_manager_subscribed` is true, emitting
+    /// window_* events on the shell_manager object.
+    pub shell_manager_id: Option<ObjectId>,
+    /// True iff this client has sent
+    /// `pmd_shell_manager.subscribe_windows`. Window-list
+    /// events are only broadcast to subscribed clients.
+    pub shell_manager_subscribed: bool,
 }
 
 impl Client {
@@ -486,6 +498,8 @@ impl Client {
             pointer_id: None,
             keyboard_id: None,
             next_configure_serial: 1,
+            shell_manager_id: None,
+            shell_manager_subscribed: false,
         }
     }
 
@@ -872,6 +886,9 @@ impl Client {
                     }
                 }
                 self.install_client_object(req.new_id, target)?;
+                if target == Interface::ShellManager {
+                    self.shell_manager_id = Some(req.new_id);
+                }
                 Ok(())
             }
             (Interface::Compositor, 1 /* create_surface */) => {
@@ -1240,6 +1257,20 @@ impl Client {
         let s = self.next_configure_serial;
         self.next_configure_serial = self.next_configure_serial.saturating_add(1).max(1);
         s
+    }
+
+    /// Emit `pmd_buffer.release(buffer_id)`. Sent to the
+    /// owning client after the server has finished
+    /// composing a buffer, so the client can recycle it
+    /// for the next frame. v1 emits this immediately after
+    /// the blit since the server's pool storage is its own
+    /// copy — the client never needs to wait on a real GPU
+    /// fence.
+    pub fn emit_buffer_release(
+        &mut self,
+        buffer_id: ObjectId,
+    ) -> Result<usize, ClientError> {
+        self.emit_raw(buffer_id, 1 /* release */, &[])
     }
 
     /// Emit `pmd_xdg_toplevel.close` — spec §12. No payload.

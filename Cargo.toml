@@ -44,6 +44,7 @@ members = [
     "crates/hello-cap-list",
     "crates/hello-std",
     "crates/hello-clock",
+    "crates/hello-toplevel",
     "crates/mem-adversary",
     "crates/integration-tests",
     "crates/xtask",

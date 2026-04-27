@@ -257,18 +257,9 @@ var FbRenderer = class {
       frame.rgba.byteLength
     );
     const imageData = this.imageDataFactory(rgba, frame.width, frame.height);
-    if (this.usingFastPath && this.offscreen !== null && this.offscreenCtx !== null) {
-      this.offscreenCtx.putImageData(imageData, 0, 0);
-      const bitmap = this.offscreen.transferToImageBitmap();
-      const ctx = this.canvas.getContext("2d");
-      if (ctx !== null) {
-        ctx.drawImage(bitmap, 0, 0);
-      }
-    } else {
-      const ctx = this.canvas.getContext("2d");
-      if (ctx !== null) {
-        ctx.putImageData(imageData, 0, 0);
-      }
+    const ctx = this.canvas.getContext("2d");
+    if (ctx !== null) {
+      ctx.putImageData(imageData, 0, 0);
     }
     this.presentsCompleted += 1;
     for (const h of this.handlers) {

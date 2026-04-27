@@ -152,6 +152,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     // output filename, so the assembled artefact is `hello-std.wasm`.
     ("hello-std", "hello-std"),
     ("hello-clock", "hello-clock"),
+    ("hello-toplevel", "hello-toplevel"),
     // `coreutils` crate ships multiple bin targets; the wasm file is
     // named after the bin, not the crate. First up: `cat`.
     ("coreutils", "cat"),
@@ -203,7 +204,7 @@ fn dst_relative(dst: &Path) -> String {
 }
 
 fn build_manifest_json(paths: &[String]) -> String {
-    let mut s = String::from("{\n  \"version\": 14,\n  \"assets\": [\n");
+    let mut s = String::from("{\n  \"version\": 16,\n  \"assets\": [\n");
     for (i, p) in paths.iter().enumerate() {
         s.push_str("    \"");
         for c in p.chars() {

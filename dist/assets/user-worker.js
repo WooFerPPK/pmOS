@@ -2603,6 +2603,32 @@ var UserWasmRuntime = class {
         if (response.status !== 0) return response.status;
         return Number(response.value);
       },
+      // `ipc_accept_nonblock(listener_fd: i32) -> i32`
+      //
+      // Variant of `ipc_accept` that surfaces -EAGAIN
+      // immediately on an empty backlog instead of parking
+      // the caller. Used by the display server's
+      // multiplexed poll loop where the listener is one of
+      // many fds being polled per tick.
+      //
+      // Implemented by setting the IPC_ACCEPT flags u16
+      // (args[4..6]) to NONBLOCK=0x0001. The opcode is the
+      // same as `ipc_accept`.
+      ipc_accept_nonblock: (listenerFd) => {
+        const args = new Uint8Array(16);
+        const view = new DataView(args.buffer);
+        view.setUint32(0, listenerFd, true);
+        view.setUint16(4, 1, true);
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.IPC_ACCEPT,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        if (response.status !== 0) return response.status;
+        return Number(response.value);
+      },
       // `display_bind() -> i32`
       //
       // Bind the kernel-wide `/run/display` listening socket

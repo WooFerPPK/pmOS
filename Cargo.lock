@@ -116,6 +116,15 @@ name = "hello-std"
 version = "0.1.0"
 
 [[package]]
+name = "hello-toplevel"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "display-proto",
+ "toolkit",
+]
+
+[[package]]
 name = "hello-wait-noop"
 version = "0.1.0"
 

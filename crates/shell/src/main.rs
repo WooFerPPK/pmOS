@@ -34,7 +34,7 @@ static _KEEP_RUN_SHELL_WITH_TASKBAR: fn(
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_main {
-    use shell::{run_shell_with_taskbar, ShellExit, Taskbar};
+    use shell::{run_desktop_shell, Taskbar, DEFAULT_LAUNCHER_SLOTS};
     use toolkit::protocol::Connection;
 
     #[link(wasm_import_module = "wasi_snapshot_preview1")]
@@ -53,6 +53,33 @@ mod wasm_main {
         ) -> i32;
         fn sched_yield() -> i32;
         fn proc_exit(rval: i32) -> !;
+    }
+
+    #[link(wasm_import_module = "pmos_ext")]
+    extern "C" {
+        /// Spawn a child process. Returns a positive child
+        /// pid on success, negative errno on failure.
+        fn proc_spawn(path_ptr: *const u8, path_len: u32, caps: u64) -> i32;
+    }
+
+    /// Closure-friendly wrapper the shell library calls when
+    /// the launcher dispatches a row. Maps each known exec
+    /// path to a cap set the kernel will accept (the parent
+    /// shell holds DESKTOP_SHELL caps; ORDINARY_APP is a
+    /// strict subset for plain apps; the privileged settings
+    /// app gets KEYMAP_ADMIN delegated).
+    pub fn shell_spawn(path: &str) -> i32 {
+        // Default to ORDINARY_APP (DisplayClient only). The
+        // settings binary needs KEYMAP_ADMIN delegated since
+        // its purpose is to switch the system keymap.
+        let caps = if path == "/bin/settings" {
+            abi::cap::initial::SETTINGS.0
+        } else if path == "/bin/sysmon" {
+            abi::cap::initial::SYSMON.0
+        } else {
+            abi::cap::initial::ORDINARY_APP.0
+        };
+        unsafe { proc_spawn(path.as_ptr(), path.len() as u32, caps) }
     }
 
     /// EAGAIN errno code (matches abi::errno::EAGAIN).
@@ -254,7 +281,13 @@ mod wasm_main {
         let conn = FdConnection::new(fd);
         let taskbar = Taskbar::new(0, 0);
         println!("shell: connected to /run/display");
-        match run_shell_with_taskbar(conn, u32::MAX, taskbar) {
+        match run_desktop_shell(
+            conn,
+            u32::MAX,
+            taskbar,
+            DEFAULT_LAUNCHER_SLOTS,
+            shell_spawn,
+        ) {
             Ok(_) => unsafe { proc_exit(0) },
             Err(_) => unsafe { proc_exit(1) },
         }

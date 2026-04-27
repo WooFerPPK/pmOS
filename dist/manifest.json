@@ -1,5 +1,5 @@
 {
-  "version": 14,
+  "version": 16,
   "assets": [
     "_headers",
     "assets/bin/cat.wasm",
@@ -13,6 +13,7 @@
     "assets/bin/head.wasm",
     "assets/bin/hello-clock.wasm",
     "assets/bin/hello-std.wasm",
+    "assets/bin/hello-toplevel.wasm",
     "assets/bin/hello_cap_check.wasm",
     "assets/bin/hello_cap_list.wasm",
     "assets/bin/hello_caps.wasm",

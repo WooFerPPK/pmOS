@@ -30,7 +30,13 @@
 //! partial note in `tasks.md` for the running scope list.
 
 use crate::taskbar::Taskbar;
-use toolkit::draw::{Color, Rect};
+use display_proto::events::{
+    PointerButton, PointerMotion, ShellWindowCreated, ShellWindowDestroyed,
+    ShellWindowFocused, ShellWindowTitleChanged,
+};
+use display_proto::Interface;
+use toolkit::draw::font::GLYPH_HEIGHT;
+use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::theme::Theme;
 use toolkit::{App, BufferPool, ClientError, Connection, Window};
 
@@ -145,4 +151,401 @@ pub fn run_shell_with_taskbar<C: Connection>(
     }
 
     Ok(ShellExit::IterationLimit)
+}
+
+/// One slot in the launcher's app catalog. Each slot is a
+/// pair of (label, exec-path). Clicking a launcher item
+/// invokes the caller-supplied [`SpawnFn`] with the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LauncherSlot {
+    pub label: &'static str,
+    pub exec: &'static str,
+}
+
+/// Default catalog the production shell ships with.
+/// Each entry is a `.wasm` binary the kernel will spawn when
+/// the corresponding launcher row is clicked. The list is
+/// hard-coded for v1; a future slice swaps it for a
+/// `.desktop` file scan via [`crate::launcher::Launcher`].
+pub const DEFAULT_LAUNCHER_SLOTS: &[LauncherSlot] = &[
+    LauncherSlot { label: "Hello Window", exec: "/bin/hello-toplevel" },
+    LauncherSlot { label: "Term",         exec: "/bin/term" },
+    LauncherSlot { label: "Files",        exec: "/bin/files" },
+    LauncherSlot { label: "Edit",         exec: "/bin/edit" },
+    LauncherSlot { label: "Settings",     exec: "/bin/settings" },
+    LauncherSlot { label: "Sysmon",       exec: "/bin/sysmon" },
+];
+
+/// Width of the launcher button in pixels — the leftmost
+/// item on the taskbar strip. Reads "Launch" by default.
+pub const LAUNCHER_BUTTON_WIDTH: u32 = 80;
+/// Margin between the launcher button and the leftmost
+/// taskbar entry.
+pub const LAUNCHER_BUTTON_RIGHT_MARGIN: u32 = 6;
+/// Width of the popup menu when the launcher is open.
+pub const LAUNCHER_MENU_WIDTH: u32 = 200;
+/// Per-row height inside the launcher menu.
+pub const LAUNCHER_MENU_ROW_HEIGHT: u32 = 24;
+/// Inset the menu's text from the row's left edge.
+pub const LAUNCHER_MENU_TEXT_MARGIN: u32 = 8;
+/// Pixels of padding inside the menu (top + bottom).
+pub const LAUNCHER_MENU_PADDING: u32 = 4;
+
+/// Function the shell calls when the user requests an app
+/// be launched. Production main supplies a function that
+/// invokes `pmos_ext.proc_spawn`; tests pass a closure that
+/// records the spawn request without crossing a syscall.
+/// Returns a non-negative pid on success, negative errno on
+/// failure (matches the wasi shim's signed-i32 convention).
+pub type SpawnFn = fn(path: &str) -> i32;
+
+/// Trait alternative to [`SpawnFn`] so callers can use closures
+/// or method handles. Implemented for any `FnMut(&str) -> i32`.
+pub trait Spawner {
+    fn spawn(&mut self, path: &str) -> i32;
+}
+
+impl<F> Spawner for F
+where
+    F: FnMut(&str) -> i32,
+{
+    fn spawn(&mut self, path: &str) -> i32 {
+        (self)(path)
+    }
+}
+
+/// Run the desktop shell's full event-driven loop.
+///
+/// Differences from [`run_shell_with_taskbar`]:
+///
+/// * Uses [`App::connect_with_shell`] so `pmd_seat`,
+///   `pmd_pointer`, and `pmd_shell_manager` are bound up
+///   front (when the server advertises them).
+/// * Subscribes to `pmd_shell_manager.window_*` so the
+///   taskbar repopulates from server-broadcast events
+///   (its OWN toplevel + every other client's toplevels
+///   added/removed/focused at runtime).
+/// * Routes `pmd_pointer.button` events through the
+///   launcher and the taskbar — clicking a taskbar entry
+///   sends `pmd_shell_manager.focus_window`, clicking the
+///   launcher button opens a popup menu, clicking a popup
+///   row dispatches the configured exec path through
+///   the supplied [`Spawner`].
+/// * Repaints the wallpaper / taskbar / launcher only when
+///   state actually changed, so the loop yields back to
+///   the worker between frames.
+pub fn run_desktop_shell<C: Connection, S: Spawner>(
+    connection: C,
+    max_dispatch_iterations: u32,
+    mut taskbar: Taskbar,
+    slots: &[LauncherSlot],
+    mut spawner: S,
+) -> Result<ShellExit, ClientError> {
+    let mut app = App::connect_with_shell(connection)?;
+    let mut window = Window::new(&mut app)?;
+    window.set_title("PMos")?;
+    window.commit()?;
+
+    if window.app_mut().shell_manager().is_some() {
+        let _ = window.app_mut().shell_manager_subscribe_windows();
+    }
+
+    let theme = Theme::default();
+    let wallpaper = theme.window_background;
+    let mut last_size: (u32, u32) = (0, 0);
+    let mut pool: Option<BufferPool> = None;
+    let mut launcher_open = false;
+    let mut menu_hover: Option<usize> = None;
+
+    let mut needs_paint = false;
+    let mut force_first_paint_done = false;
+
+    for _ in 0..max_dispatch_iterations {
+        let events = window.dispatch()?;
+
+        if window.close_requested() {
+            return Ok(ShellExit::CloseRequested);
+        }
+
+        for event in events {
+            match (event.interface, event.opcode) {
+                (Interface::ShellManager, 1 /* window_created */) => {
+                    if let Ok(decoded) = ShellWindowCreated::decode(&event.payload) {
+                        taskbar.add_window(decoded.window_id, decoded.title, decoded.app_id);
+                        needs_paint = true;
+                    }
+                }
+                (Interface::ShellManager, 2 /* window_destroyed */) => {
+                    if let Ok(decoded) = ShellWindowDestroyed::decode(&event.payload) {
+                        taskbar.remove_window(decoded.window_id);
+                        needs_paint = true;
+                    }
+                }
+                (Interface::ShellManager, 3 /* window_focused */) => {
+                    if let Ok(decoded) = ShellWindowFocused::decode(&event.payload) {
+                        taskbar.set_focused_window(decoded.window_id);
+                        needs_paint = true;
+                    }
+                }
+                (Interface::ShellManager, 4 /* window_title_changed */) => {
+                    if let Ok(decoded) = ShellWindowTitleChanged::decode(&event.payload) {
+                        taskbar.set_window_title(decoded.window_id, decoded.new_title);
+                        needs_paint = true;
+                    }
+                }
+                (Interface::Buffer, 1 /* release */) => {
+                    if let Some(p) = pool.as_mut() {
+                        let _ = p.handle_release(event.object_id);
+                    }
+                }
+                (Interface::Pointer, 3 /* motion */) => {
+                    if let Ok(motion) = PointerMotion::decode(&event.payload) {
+                        let new_hover = if launcher_open {
+                            launcher_menu_row_at(&taskbar, slots, motion.x, motion.y)
+                        } else {
+                            None
+                        };
+                        if new_hover != menu_hover {
+                            menu_hover = new_hover;
+                            if launcher_open {
+                                needs_paint = true;
+                            }
+                        }
+                    }
+                }
+                (Interface::Pointer, 4 /* button */) => {
+                    if let Ok(button) = PointerButton::decode(&event.payload) {
+                        if button.state == display_proto::events::pointer_button_state::PRESSED {
+                            // Convert from surface-local
+                            // coordinates the server emitted
+                            // back to framebuffer-space. The
+                            // shell's only window is full-
+                            // screen at (0,0), so local ==
+                            // screen for our hit tests. If
+                            // future slices position the
+                            // wallpaper surface differently
+                            // we'll compose with the toplevel
+                            // origin here.
+                            handle_press(
+                                button.x,
+                                button.y,
+                                &taskbar,
+                                slots,
+                                &mut launcher_open,
+                                &mut menu_hover,
+                                &mut spawner,
+                                window.app_mut(),
+                            );
+                            needs_paint = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // First paint always fires once configure lands.
+        if !force_first_paint_done && window.is_configured() {
+            needs_paint = true;
+            force_first_paint_done = true;
+        }
+
+        if needs_paint && window.is_configured() {
+            let (cfg_w, cfg_h) = window.configured_size();
+            let (w, h) = if cfg_w == 0 || cfg_h == 0 {
+                (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            } else {
+                (cfg_w, cfg_h)
+            };
+            taskbar.set_framebuffer_size(w, h);
+
+            // Re-allocate the pool only when geometry
+            // changes; otherwise reuse so the back/front
+            // swap doesn't churn allocations.
+            if last_size != (w, h) {
+                pool = Some(BufferPool::new(window.app_mut(), w, h)?);
+                last_size = (w, h);
+            }
+            let p = pool.as_mut().expect("pool initialised when w/h are set");
+            if let Some(mut canvas) = p.acquire_back_canvas() {
+                canvas.fill_rect(
+                    Rect { x: 0, y: 0, width: w, height: h },
+                    wallpaper,
+                );
+                taskbar.draw(&mut canvas);
+                draw_launcher_button(&mut canvas, &taskbar, &theme, launcher_open);
+                if launcher_open {
+                    draw_launcher_menu(&mut canvas, &taskbar, &theme, slots, menu_hover);
+                }
+                drop(canvas);
+                p.commit_and_swap(&mut window)?;
+                needs_paint = false;
+            }
+        }
+    }
+
+    Ok(ShellExit::IterationLimit)
+}
+
+/// Bounds of the launcher button in framebuffer space —
+/// leftmost slot of the taskbar strip.
+fn launcher_button_bounds(taskbar: &Taskbar) -> Rect {
+    let bar = taskbar.bounds();
+    let pad = 2_i32;
+    let h = (crate::taskbar::TASKBAR_HEIGHT as i32 - pad * 2).max(1) as u32;
+    Rect::new(
+        bar.x + (crate::taskbar::TASKBAR_LEFT_MARGIN as i32),
+        bar.y + pad,
+        LAUNCHER_BUTTON_WIDTH,
+        h,
+    )
+}
+
+/// Bounds of the launcher menu when open. Anchored above
+/// the launcher button, growing upward.
+fn launcher_menu_bounds(taskbar: &Taskbar, slots: &[LauncherSlot]) -> Rect {
+    let bar = taskbar.bounds();
+    let height =
+        LAUNCHER_MENU_PADDING * 2 + LAUNCHER_MENU_ROW_HEIGHT * slots.len() as u32;
+    let x = bar.x + (crate::taskbar::TASKBAR_LEFT_MARGIN as i32);
+    let y = bar.y - height as i32;
+    Rect::new(x, y, LAUNCHER_MENU_WIDTH, height)
+}
+
+/// Bounds of menu row `idx` in framebuffer space.
+fn launcher_menu_row_bounds(
+    taskbar: &Taskbar,
+    slots: &[LauncherSlot],
+    idx: usize,
+) -> Option<Rect> {
+    if idx >= slots.len() {
+        return None;
+    }
+    let menu = launcher_menu_bounds(taskbar, slots);
+    let y = menu.y
+        + LAUNCHER_MENU_PADDING as i32
+        + (idx as i32) * LAUNCHER_MENU_ROW_HEIGHT as i32;
+    Some(Rect::new(menu.x, y, LAUNCHER_MENU_WIDTH, LAUNCHER_MENU_ROW_HEIGHT))
+}
+
+/// Hit-test a point against the menu rows; returns the
+/// hovered row index if any.
+fn launcher_menu_row_at(
+    taskbar: &Taskbar,
+    slots: &[LauncherSlot],
+    x: i32,
+    y: i32,
+) -> Option<usize> {
+    let menu = launcher_menu_bounds(taskbar, slots);
+    if x < menu.x || x >= menu.right() || y < menu.y || y >= menu.bottom() {
+        return None;
+    }
+    for idx in 0..slots.len() {
+        let row = launcher_menu_row_bounds(taskbar, slots, idx)?;
+        if y >= row.y && y < row.bottom() {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Paint the "Launch" button onto the canvas. Distinguishes
+/// open / closed states with the active-titlebar / hover
+/// palette swap.
+fn draw_launcher_button(
+    canvas: &mut Canvas<'_>,
+    taskbar: &Taskbar,
+    theme: &Theme,
+    open: bool,
+) {
+    let bounds = launcher_button_bounds(taskbar);
+    let fill = if open {
+        theme.button_fill_pressed
+    } else {
+        theme.button_fill
+    };
+    canvas.fill_rect(bounds, fill);
+    canvas.stroke_rect(bounds, theme.border_active);
+    let label = "Launch";
+    let text_x = bounds.x + 8;
+    let text_y = bounds.y + ((bounds.height as i32 - GLYPH_HEIGHT as i32) / 2).max(0);
+    canvas.draw_text(text_x, text_y, label, theme.button_text);
+}
+
+/// Paint the launcher popup menu (only when open).
+fn draw_launcher_menu(
+    canvas: &mut Canvas<'_>,
+    taskbar: &Taskbar,
+    theme: &Theme,
+    slots: &[LauncherSlot],
+    hover: Option<usize>,
+) {
+    let menu = launcher_menu_bounds(taskbar, slots);
+    canvas.fill_rect(menu, theme.window_background);
+    canvas.stroke_rect(menu, theme.border_active);
+    for (idx, slot) in slots.iter().enumerate() {
+        let Some(row) = launcher_menu_row_bounds(taskbar, slots, idx) else {
+            continue;
+        };
+        if Some(idx) == hover {
+            canvas.fill_rect(row, theme.button_fill_hover);
+        }
+        let text_x = row.x + LAUNCHER_MENU_TEXT_MARGIN as i32;
+        let text_y =
+            row.y + ((row.height as i32 - GLYPH_HEIGHT as i32) / 2).max(0);
+        canvas.draw_text(text_x, text_y, slot.label, theme.label_text);
+    }
+}
+
+/// Shared press routing — checks the launcher menu first
+/// (so a click inside an open menu picks a row), then the
+/// launcher button (toggle open/closed), then the taskbar
+/// (focus / restore on entry click).
+fn handle_press<C: Connection, S: Spawner>(
+    x: i32,
+    y: i32,
+    taskbar: &Taskbar,
+    slots: &[LauncherSlot],
+    launcher_open: &mut bool,
+    menu_hover: &mut Option<usize>,
+    spawner: &mut S,
+    app: &mut App<C>,
+) {
+    // Menu has highest priority while open.
+    if *launcher_open {
+        if let Some(idx) = launcher_menu_row_at(taskbar, slots, x, y) {
+            let path = slots[idx].exec;
+            let rc = spawner.spawn(path);
+            // We deliberately don't surface the spawn rc
+            // up — a failed spawn is logged but the user's
+            // click is still consumed (the menu closes).
+            let _ = rc;
+            *launcher_open = false;
+            *menu_hover = None;
+            return;
+        }
+        // Click outside the menu closes it.
+        *launcher_open = false;
+        *menu_hover = None;
+        // Fall through to the taskbar / launcher button
+        // tests below so a click that lands on a taskbar
+        // entry while the menu is open still focuses that
+        // window.
+    }
+
+    let lb = launcher_button_bounds(taskbar);
+    if x >= lb.x && x < lb.right() && y >= lb.y && y < lb.bottom() {
+        *launcher_open = !*launcher_open;
+        *menu_hover = None;
+        return;
+    }
+
+    if let Some(click) = taskbar.handle_pointer_down(x, y) {
+        match click {
+            crate::taskbar::TaskbarClick::Focus { window_id }
+            | crate::taskbar::TaskbarClick::Restore { window_id } => {
+                let _ = app.shell_manager_focus_window(window_id);
+            }
+        }
+    }
 }

@@ -21,7 +21,7 @@ build:
         -p hello-wasi-spawner -p ipc-self-test -p hello-framebuffer \
         -p display-server-lite -p hello-wasi-bootstrap \
         -p hello-fb-blit -p hello-input-echo \
-        -p hello-std -p hello-clock \
+        -p hello-std -p hello-clock -p hello-toplevel \
         -p hello-sigchld -p hello-kill-probe -p hello-pid \
         -p hello-self-probe -p hello-ppid -p hello-caps \
         -p hello-raise -p hello-wait-noop -p hello-cap-check \

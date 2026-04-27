@@ -45,7 +45,12 @@ pub mod taskbar;
 pub use launcher::{
     DesktopEntry, DesktopEntryStore, Launcher, LauncherError, MemoryStore,
 };
-pub use paint::{run_shell, run_shell_with_taskbar, ShellExit, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+pub use paint::{
+    run_desktop_shell, run_shell, run_shell_with_taskbar, LauncherSlot, ShellExit,
+    Spawner, DEFAULT_HEIGHT, DEFAULT_LAUNCHER_SLOTS, DEFAULT_WIDTH,
+    LAUNCHER_BUTTON_RIGHT_MARGIN, LAUNCHER_BUTTON_WIDTH, LAUNCHER_MENU_PADDING,
+    LAUNCHER_MENU_ROW_HEIGHT, LAUNCHER_MENU_TEXT_MARGIN, LAUNCHER_MENU_WIDTH,
+};
 pub use session::{
     GlobalEntry, Session, SessionError, SessionStep, INTERESTING_INTERFACES,
 };

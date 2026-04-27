@@ -87,13 +87,14 @@ extern "C" {
         nread_ptr: *mut u32,
     ) -> i32;
     fn fd_close(fd: i32) -> i32;
+    fn sched_yield() -> i32;
 }
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "pmos_ext")]
 extern "C" {
     fn display_bind() -> i32;
-    fn ipc_accept(listener_fd: i32) -> i32;
+    fn ipc_accept_nonblock(listener_fd: i32) -> i32;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -140,68 +141,6 @@ unsafe fn poll_sigterm() -> bool {
 // Protocol-vs-raw-blit detection lives in the lib so native
 // tests can verify it; main.rs imports it as
 // `display_server::detect_protocol_message`.
-
-/// True iff any framed message in `chunk` is a
-/// `pmd_surface.commit` request (interface = Surface,
-/// opcode = 7). Used by the main loop to decide whether
-/// to present the framebuffer after dispatching a chunk —
-/// only commits change pixels, so other requests skip the
-/// (expensive, chunked) present path. Walks the chunk
-/// header-by-header so a multi-message batch with a commit
-/// at the end still triggers a present.
-#[cfg(target_arch = "wasm32")]
-fn chunk_contains_commit(chunk: &[u8]) -> bool {
-    use display_server::HEADER_SIZE;
-    let mut offset = 0usize;
-    while offset + HEADER_SIZE <= chunk.len() {
-        let Ok(header) = display_server::MessageHeader::decode(&chunk[offset..]) else {
-            return false;
-        };
-        let msg_len = header.length as usize;
-        if msg_len < HEADER_SIZE || offset + msg_len > chunk.len() {
-            return false;
-        }
-        if header.opcode == 7 {
-            return true;
-        }
-        offset += msg_len;
-    }
-    false
-}
-
-/// Dispatch every framed message in `chunk` against
-/// `server` for the given client. The toolkit's send-side
-/// stream batches consecutive requests into a single fd_write,
-/// and the kernel coalesces them into one rx_buf, so by the
-/// time `fd_read` returns a chunk it usually contains 1-N
-/// complete protocol messages. Walks the chunk header-by-
-/// header until either the buffer is consumed or a malformed
-/// header surfaces. Each message's request is fed through
-/// `Server::dispatch_request`; the binary's auto-advertise
-/// hook fires per-message so multi-batch chunks containing a
-/// `display.get_registry` still produce the globals catalog.
-#[cfg(target_arch = "wasm32")]
-fn dispatch_all_messages(
-    server: &mut display_server::Server,
-    client_id: display_server::ClientId,
-    chunk: &[u8],
-) {
-    use display_server::HEADER_SIZE;
-    let mut offset = 0usize;
-    while offset + HEADER_SIZE <= chunk.len() {
-        let Ok(header) = display_server::MessageHeader::decode(&chunk[offset..]) else {
-            return;
-        };
-        let msg_len = header.length as usize;
-        if msg_len < HEADER_SIZE || offset + msg_len > chunk.len() {
-            return;
-        }
-        let msg = &chunk[offset..offset + msg_len];
-        let _ = server.dispatch_request(client_id, msg);
-        advertise_globals_for_get_registry(server, client_id, msg);
-        offset += msg_len;
-    }
-}
 
 /// If `chunk` is a `pmd_display.get_registry` request, push
 /// the v1 globals catalog onto the client's pending events
@@ -420,7 +359,6 @@ fn main() {
 
     const EAGAIN: i32 = 6;
     const EINTR: i32 = 27;
-    const MAX_POLLS: u32 = 10_000;
 
     unsafe {
         let listener = display_bind();
@@ -482,239 +420,238 @@ fn main() {
             std::process::exit(16);
         }
 
+        // Connected clients we are multiplexing across. Each
+        // entry is `(server_fd, client_id, pending)`: the wasi
+        // socket fd, the protocol-layer ClientId, and a
+        // re-assembly buffer for messages split across
+        // fd_read boundaries. `legacy_demo` clients (raw-blit
+        // path) are handled inline at accept time and never
+        // land in this list.
+        struct Conn {
+            server_fd: i32,
+            client_id: display_server::ClientId,
+            pending: Vec<u8>,
+        }
+        let mut conns: Vec<Conn> = Vec::new();
+        let mut recv_buf = [0u8; 32 * 1024];
+        let read_iov = Iovec {
+            buf: recv_buf.as_mut_ptr(),
+            buf_len: recv_buf.len() as u32,
+        };
+
         'outer: loop {
             if poll_sigterm() {
                 break 'outer;
             }
 
-            // Drain input events at the top of every iteration
-            // — the kernel's input rings buffer events while we
-            // were busy serving the previous client. Any motion
-            // / button events feed the active drag state machine
-            // (T133 server-side); on a non-empty drain we
-            // re-present so the user sees the geometry update.
-            let mut input_dirty = false;
+            // Drain input events at the top of every iteration.
+            // Pointer motion + button events feed the active-drag
+            // machinery and the click-to-focus path; geometry-
+            // dirtying events trigger a re-present after the
+            // poll cycle.
+            let mut frame_dirty = false;
             if mouse_fd >= 0 || kbd_fd >= 0 {
-                input_dirty = drain_input_events(&mut server, mouse_fd, kbd_fd);
-            }
-            if input_dirty {
-                // Re-present so any drag-driven geometry update
-                // reaches the framebuffer before we block on the
-                // next client accept. The composite cache lives
-                // inside the server library; this is a one-shot
-                // pixel write.
-                if !present_framebuffer(&server, fb_fd as i32) {
-                    std::process::exit(16);
+                if drain_input_events(&mut server, mouse_fd, kbd_fd) {
+                    frame_dirty = true;
                 }
             }
 
-            let rc = ipc_accept(listener);
-            if rc < 0 {
+            // Accept any pending connections in a tight loop —
+            // ipc_accept returns EAGAIN when the backlog is empty,
+            // EINTR if a signal landed mid-call. Other negatives
+            // are fatal as before.
+            loop {
+                let rc = ipc_accept_nonblock(listener);
+                if rc >= 0 {
+                    let new_fd = rc;
+                    // Grant Cap::Shell to every protocol-speaking
+                    // client so the desktop shell can bind
+                    // pmd_shell_manager. The kernel's
+                    // display_connect already gates who is
+                    // permitted to connect at all (Cap::DisplayClient);
+                    // cross-client cap-checking inside the
+                    // display server is stronger than what the
+                    // single-process v1 substrate needs.
+                    let mut caps = abi::cap::CapSet::EMPTY;
+                    caps.insert(abi::cap::Cap::Shell);
+                    let client_id = server.accept_with_caps(caps);
+                    conns.push(Conn {
+                        server_fd: new_fd,
+                        client_id,
+                        pending: Vec::with_capacity(64 * 1024),
+                    });
+                    continue;
+                }
                 if rc == -EINTR {
                     if poll_sigterm() {
                         break 'outer;
                     }
-                    continue 'outer;
+                    continue;
+                }
+                if rc == -EAGAIN {
+                    break;
                 }
                 std::process::exit(12);
             }
-            let server_fd: i32 = rc;
 
-            // Allocate a protocol-side ClientId for this fd. We
-            // will dispatch any protocol messages we read against
-            // this id.
-            let client_id = server.accept();
+            // Walk every connected client. For each, do one
+            // non-blocking fd_read; if bytes came in, run the
+            // first-chunk protocol-vs-raw-blit detection if
+            // we haven't dispatched anything for this client
+            // yet (pending is empty AND no journal entries
+            // have been recorded). Otherwise run the streamed
+            // dispatch loop.
+            let mut commit_dirty = false;
+            let mut idx = 0;
+            while idx < conns.len() {
+                let server_fd = conns[idx].server_fd;
+                let client_id = conns[idx].client_id;
 
-            // Drain the client's bytes. EAGAIN-polled — a future
-            // slice migrates this to blocking semantics matching
-            // ipc_accept. Each retry also drains input events
-            // so an active drag continues to advance even while
-            // we're waiting for the client's next byte chunk.
-            //
-            // 32 KiB recv buffer fits a full shm_pool.write
-            // chunk (24 KiB pixel data + 4-byte offset + header)
-            // plus a bit of headroom; the toolkit's BufferPool
-            // sizes its writes to fit in one syscall.
-            let mut recv_buf = [0u8; 32 * 1024];
-            let read_iov = Iovec {
-                buf: recv_buf.as_mut_ptr(),
-                buf_len: recv_buf.len() as u32,
-            };
-            let mut nread: u32 = 0;
-            let mut got_bytes = false;
-            for _ in 0..MAX_POLLS {
-                let rc = fd_read(server_fd, &read_iov, 1, &mut nread);
-                if rc == 0 && nread > 0 {
-                    got_bytes = true;
-                    break;
-                }
-                if rc == 0 || rc == EAGAIN {
-                    nread = 0;
-                    if mouse_fd >= 0 || kbd_fd >= 0 {
-                        if drain_input_events(&mut server, mouse_fd, kbd_fd) {
-                            // Geometry may have changed; re-present
-                            // before the next accept tick.
-                            let _ = present_framebuffer(&server, fb_fd as i32);
-                        }
-                    }
-                    continue;
-                }
-                std::process::exit(14);
-            }
-            if !got_bytes {
-                std::process::exit(18);
-            }
-
-            let first_chunk = &recv_buf[..nread as usize];
-            let is_protocol = display_server::detect_protocol_message(first_chunk).is_some();
-
-            if !is_protocol {
-                // Legacy raw-blit path: the demo client writes
-                // 16 bytes of RGBA that don't form a protocol
-                // header. Forward verbatim to /dev/fb0 so the
-                // pre-T110 Playwright assertions still match,
-                // then close — demo clients are one-shot.
-                let fb_iov = Ciovec {
-                    buf: first_chunk.as_ptr(),
-                    buf_len: first_chunk.len() as u32,
-                };
-                let mut fb_written: u32 = 0;
-                let rc = fd_write(fb_fd as i32, &fb_iov, 1, &mut fb_written);
-                if rc != 0 || fb_written != first_chunk.len() as u32 {
-                    std::process::exit(16);
-                }
-                let rc = fd_close(server_fd);
-                if rc != 0 {
-                    std::process::exit(19);
-                }
-                let _ = server.disconnect(client_id);
-                println!("display-server served client {}", i);
-                i += 1;
-                continue 'outer;
-            }
-
-            // Protocol path: serve this client persistently.
-            // Real clients (the desktop shell, apps that link
-            // toolkit) keep their connection open across
-            // many request batches — initial bind handshake,
-            // commits per frame, set_title / set_app_id /
-            // set_maximized / move / resize over the lifetime
-            // of the window. Process the first batch + every
-            // subsequent batch on the same fd until either the
-            // client disconnects, SIGTERM lands, or fd_read
-            // returns a real error.
-            dispatch_all_messages(&mut server, client_id, first_chunk);
-            if let Some(events) = server.drain_client_events(client_id) {
-                if !events.is_empty() {
-                    let ev_iov = Ciovec {
-                        buf: events.as_ptr(),
-                        buf_len: events.len() as u32,
-                    };
-                    let mut written: u32 = 0;
-                    let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
-                }
-            }
-            // Only present if the first batch contained a
-            // surface.commit — get_registry / bind /
-            // create_surface paths don't change pixels.
-            if chunk_contains_commit(first_chunk) {
-                if !present_framebuffer(&server, fb_fd as i32) {
-                    std::process::exit(16);
-                }
-            }
-            // Print served-client marker for the FIRST batch
-            // so the Playwright spec's served-client poll
-            // observes a connected protocol client.
-            println!("display-server served client {}", i);
-            i += 1;
-
-            // Inner serve loop: drain the same fd, dispatch,
-            // reply, present. Spins on EAGAIN with input + signal
-            // polling so the user can drag and the server can
-            // SIGTERM cleanly. `pending` accumulates bytes
-            // across reads so a message split across syscall
-            // boundaries (e.g. a chunked shm_pool.write whose
-            // tail straddles two fd_reads) is reassembled and
-            // dispatched as a single message.
-            let mut pending: Vec<u8> = Vec::with_capacity(64 * 1024);
-            'inner: loop {
-                if poll_sigterm() {
-                    break 'outer;
-                }
-                if mouse_fd >= 0 || kbd_fd >= 0 {
-                    if drain_input_events(&mut server, mouse_fd, kbd_fd) {
-                        let _ = present_framebuffer(&server, fb_fd as i32);
-                    }
-                }
                 let mut nread: u32 = 0;
                 let rc = fd_read(server_fd, &read_iov, 1, &mut nread);
                 if rc == 0 && nread > 0 {
-                    pending.extend_from_slice(&recv_buf[..nread as usize]);
+                    let chunk = &recv_buf[..nread as usize];
+
+                    // Legacy raw-blit detection: only consider it
+                    // for the very first read on this fd, before
+                    // any protocol bytes have been accumulated.
+                    let no_pending_yet = conns[idx].pending.is_empty();
+                    let no_journal_yet = server
+                        .client(client_id)
+                        .map(|c| c.journal.is_empty())
+                        .unwrap_or(false);
+                    if no_pending_yet
+                        && no_journal_yet
+                        && display_server::detect_protocol_message(chunk).is_none()
+                    {
+                        let fb_iov = Ciovec {
+                            buf: chunk.as_ptr(),
+                            buf_len: chunk.len() as u32,
+                        };
+                        let mut fb_written: u32 = 0;
+                        let rc = fd_write(fb_fd as i32, &fb_iov, 1, &mut fb_written);
+                        if rc != 0 || fb_written != chunk.len() as u32 {
+                            std::process::exit(16);
+                        }
+                        let _ = fd_close(server_fd);
+                        let _ = server.disconnect(client_id);
+                        conns.swap_remove(idx);
+                        println!("display-server served client {}", i);
+                        i += 1;
+                        continue;
+                    }
+
+                    // Protocol path: append + walk full messages.
+                    conns[idx].pending.extend_from_slice(chunk);
                     let mut had_commit = false;
                     let mut consumed_total = 0usize;
+                    let mut first_dispatch_for_this_client =
+                        no_journal_yet && no_pending_yet;
                     loop {
-                        let remaining = &pending[consumed_total..];
+                        let remaining = &conns[idx].pending[consumed_total..];
                         if remaining.len() < display_server::HEADER_SIZE {
                             break;
                         }
-                        // Read the length field directly so we can
-                        // detect "partial message — wait for more"
-                        // BEFORE MessageHeader::decode runs (it
-                        // returns InvalidLength when the declared
-                        // total exceeds the buffer length, which
-                        // is exactly the partial case for a
-                        // streamed protocol).
                         let len_field =
                             u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
                         if len_field < display_server::HEADER_SIZE {
-                            // Spec violation — drop everything.
-                            consumed_total = pending.len();
+                            // Spec violation — discard everything.
+                            consumed_total = conns[idx].pending.len();
                             break;
                         }
                         if len_field > remaining.len() {
-                            // Partial — wait for more bytes.
                             break;
                         }
-                        let msg = &remaining[..len_field];
-                        // Header decode here is just to extract the
-                        // opcode for the commit-detection branch;
-                        // dispatch itself re-decodes.
-                        let opcode = u16::from_le_bytes([msg[4], msg[5]]);
-                        let _ = server.dispatch_request(client_id, msg);
-                        advertise_globals_for_get_registry(&mut server, client_id, msg);
+                        let msg_start = consumed_total;
+                        let msg_end = consumed_total + len_field;
+                        let opcode = u16::from_le_bytes([
+                            conns[idx].pending[msg_start + 4],
+                            conns[idx].pending[msg_start + 5],
+                        ]);
+                        // Borrow the pending slice JUST for the
+                        // dispatch call, then drop the borrow so
+                        // we can mutate `conns[idx].pending` later.
+                        let msg_owned: Vec<u8> =
+                            conns[idx].pending[msg_start..msg_end].to_vec();
+                        let _ = server.dispatch_request(client_id, &msg_owned);
+                        advertise_globals_for_get_registry(
+                            &mut server,
+                            client_id,
+                            &msg_owned,
+                        );
                         if opcode == 7 {
                             had_commit = true;
                         }
                         consumed_total += len_field;
                     }
                     if consumed_total > 0 {
-                        pending.drain(..consumed_total);
-                        if let Some(events) = server.drain_client_events(client_id) {
-                            if !events.is_empty() {
-                                let ev_iov = Ciovec {
-                                    buf: events.as_ptr(),
-                                    buf_len: events.len() as u32,
-                                };
-                                let mut written: u32 = 0;
-                                let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
-                            }
-                        }
-                        if had_commit {
-                            if !present_framebuffer(&server, fb_fd as i32) {
-                                std::process::exit(16);
-                            }
+                        conns[idx].pending.drain(..consumed_total);
+                        if first_dispatch_for_this_client {
+                            // Mark the first served-client marker
+                            // exactly once, on the first chunk
+                            // that produced any dispatched message.
+                            // (The journal check earlier is the
+                            // canonical "did we dispatch anything"
+                            // test; this branch is the FIRST time
+                            // dispatched is non-empty for this fd.)
+                            println!("display-server served client {}", i);
+                            i += 1;
+                            first_dispatch_for_this_client = false;
                         }
                     }
-                    continue 'inner;
+                    let _ = first_dispatch_for_this_client;
+                    if had_commit {
+                        commit_dirty = true;
+                    }
+                } else if rc == 0 || rc == EAGAIN {
+                    // No bytes ready right now. Move on to the
+                    // next client.
+                } else {
+                    // Real error — disconnect this client.
+                    let _ = fd_close(server_fd);
+                    let _ = server.disconnect(client_id);
+                    conns.swap_remove(idx);
+                    continue;
                 }
-                if rc == 0 || rc == EAGAIN {
-                    continue 'inner;
-                }
-                break 'inner;
+                idx += 1;
             }
 
-            let _ = fd_close(server_fd);
-            let _ = server.disconnect(client_id);
+            // After the read pass, flush every client's
+            // pending events. Events can land on clients OTHER
+            // than the one we just dispatched a message for —
+            // pmd_shell_manager broadcasts events to every
+            // subscribed shell when ANY app's toplevel
+            // mutates, so the broadcast pass below has to
+            // reach the shell's fd even if the only fd we
+            // read this tick was the app's.
+            for c in conns.iter_mut() {
+                if let Some(events) = server.drain_client_events(c.client_id) {
+                    if events.is_empty() {
+                        continue;
+                    }
+                    let ev_iov = Ciovec {
+                        buf: events.as_ptr(),
+                        buf_len: events.len() as u32,
+                    };
+                    let mut written: u32 = 0;
+                    let _ = fd_write(c.server_fd, &ev_iov, 1, &mut written);
+                }
+            }
+
+            if commit_dirty || frame_dirty {
+                if !present_framebuffer(&server, fb_fd as i32) {
+                    std::process::exit(16);
+                }
+            }
+
+            // Yield so other workers (kernel-worker, app
+            // workers) get a chance to run between poll passes.
+            // Without this we burn the worker until SIGTERM.
+            let _ = sched_yield();
+        }
+
+        for c in &conns {
+            let _ = fd_close(c.server_fd);
         }
     }
 
