@@ -22,6 +22,7 @@ import type { ConsoleLifecycleEvent } from "./console-host";
 import { runEchoCheck } from "./console-check";
 import { FbHost } from "./fb-host";
 import type { FbFrame } from "./fb-host";
+import { FbRenderer } from "./fb-renderer";
 import { SAB_SIZE } from "./shared/sab-layout";
 import {
   MouseButton,
@@ -960,8 +961,33 @@ function runRealKernelMode(bootBinary: string): void {
   console.log(
     `[pmos-bootstrap] real-kernel mode enabled via URL (bootBinary=${bootBinary})`,
   );
-  const consoleEl = mountRealKernelConsole();
+  // Boot paths that paint to /dev/fb0 (init-desktop's shell
+  // wallpaper, eventually any GUI app boot) should keep the
+  // canvas visible. Text-only boots (hello_input_echo, the
+  // legacy demo flow) get the console-pre overlay.
+  const isGuiBoot = bootBinary === "/bin/init-desktop";
+  const consoleEl = mountRealKernelConsole(isGuiBoot);
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+
+  // GUI boot: wire the FbHost → FbRenderer pair so `fb:set-mode` /
+  // `fb:blit` messages from the kernel Worker actually paint pixels
+  // onto the visible canvas. Without this, the display-server's
+  // wallpaper paint reaches the kernel host but stops there — the
+  // canvas stays black. Text-only boots skip this entirely (no
+  // paint pipeline to wire).
+  if (isGuiBoot) {
+    const canvas = document.getElementById("pmos-fb");
+    if (canvas instanceof HTMLCanvasElement) {
+      const fbHost = new FbHost({ worker });
+      const renderer = new FbRenderer({ canvas });
+      fbHost.onModeChange((mode) => {
+        renderer.setMode(mode);
+      });
+      fbHost.onFrame((frame) => {
+        renderer.paintFrame(frame);
+      });
+    }
+  }
 
   // T234: track the kernel wake-slot buffer as it arrives (kernel
   // posts `kernel:wake-slot` exactly once after `KernelWasmHost.
@@ -1084,34 +1110,61 @@ function runRealKernelMode(bootBinary: string): void {
 
 /**
  * Create (and return) the `<pre id="pmos-real-console">` element
- * the real-kernel mode renders boot output into. The boot canvas
- * is hidden because we don't paint it in this mode, and the body
- * gets a minimal monospace style so the output looks like a
- * console instead of default serif prose.
+ * the real-kernel mode renders boot output into.
+ *
+ * `gui` selects between two layouts:
+ *   * `gui = false` (legacy demo + input-echo): canvas hidden,
+ *     console pre fills the viewport with a dark-monospace look.
+ *   * `gui = true` (init-desktop): canvas visible at 100vw×100vh,
+ *     console pre overlays as a small transparent log at the
+ *     top-right so boot trace stays observable without obscuring
+ *     the desktop.
  */
-function mountRealKernelConsole(): HTMLPreElement {
+function mountRealKernelConsole(gui: boolean = false): HTMLPreElement {
   const existing = document.getElementById("pmos-real-console");
   if (existing instanceof HTMLPreElement) {
     return existing;
   }
   const canvas = document.getElementById("pmos-fb");
-  if (canvas instanceof HTMLElement) {
+  if (canvas instanceof HTMLElement && !gui) {
     canvas.style.display = "none";
   }
   const pre = document.createElement("pre");
   pre.id = "pmos-real-console";
-  pre.style.cssText = [
-    "margin: 0",
-    "padding: 1.5rem",
-    "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
-    "font-size: 14px",
-    "line-height: 1.5",
-    "color: #e6e6e6",
-    "background: #0a0e14",
-    "min-height: 100vh",
-    "white-space: pre-wrap",
-    "overflow-wrap: anywhere",
-  ].join("; ");
+  if (gui) {
+    pre.style.cssText = [
+      "position: fixed",
+      "top: 0.5rem",
+      "right: 0.5rem",
+      "max-width: 30vw",
+      "max-height: 40vh",
+      "margin: 0",
+      "padding: 0.5rem 0.75rem",
+      "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+      "font-size: 11px",
+      "line-height: 1.3",
+      "color: #e6e6e6",
+      "background: rgba(10, 14, 20, 0.6)",
+      "border-radius: 4px",
+      "white-space: pre-wrap",
+      "overflow: auto",
+      "pointer-events: none",
+      "z-index: 100",
+    ].join("; ");
+  } else {
+    pre.style.cssText = [
+      "margin: 0",
+      "padding: 1.5rem",
+      "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+      "font-size: 14px",
+      "line-height: 1.5",
+      "color: #e6e6e6",
+      "background: #0a0e14",
+      "min-height: 100vh",
+      "white-space: pre-wrap",
+      "overflow-wrap: anywhere",
+    ].join("; ");
+  }
   document.body.appendChild(pre);
   return pre;
 }
