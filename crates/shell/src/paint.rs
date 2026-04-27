@@ -388,8 +388,24 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                 }
                 (Interface::ShellManager, 3 /* window_focused */) => {
                     if let Ok(decoded) = ShellWindowFocused::decode(&event.payload) {
-                        taskbar.set_focused_window(decoded.window_id);
-                        needs_paint = true;
+                        // Only repaint if the focus actually
+                        // moved between taskbar entries —
+                        // every pointer click on the wallpaper
+                        // also broadcasts a window_focused
+                        // event for the shell's own toplevel,
+                        // which would otherwise re-paint on
+                        // every cursor click and saturate the
+                        // 64 KiB rx_buf with chunked
+                        // shm_pool.write traffic.
+                        let prev_focus = taskbar
+                            .entries()
+                            .iter()
+                            .find(|e| e.focused)
+                            .map(|e| e.window_id);
+                        if prev_focus != Some(decoded.window_id) {
+                            taskbar.set_focused_window(decoded.window_id);
+                            needs_paint = true;
+                        }
                     }
                 }
                 (Interface::ShellManager, 4 /* window_title_changed */) => {
@@ -431,6 +447,18 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                             // wallpaper surface differently
                             // we'll compose with the toplevel
                             // origin here.
+                            //
+                            // Only mark needs_paint when the
+                            // press actually changed shell
+                            // visual state — opening or
+                            // closing the launcher menu,
+                            // toggling a hover, etc. A click
+                            // that "missed everything" doesn't
+                            // change pixels and shouldn't
+                            // trigger the 3 MiB chunked paint
+                            // which saturates the rx_buf.
+                            let launcher_was_open = launcher_open;
+                            let menu_hover_before = menu_hover;
                             handle_press(
                                 button.x,
                                 button.y,
@@ -441,7 +469,11 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                                 &mut spawner,
                                 window.app_mut(),
                             );
-                            needs_paint = true;
+                            let visual_change = launcher_open != launcher_was_open
+                                || menu_hover != menu_hover_before;
+                            if visual_change {
+                                needs_paint = true;
+                            }
                         }
                     }
                 }

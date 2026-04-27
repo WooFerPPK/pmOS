@@ -93,10 +93,6 @@ mod wasm_main {
     /// connect → bind → reply round-trip lands within the
     /// poll budget on a reasonably loaded substrate.
     const RECV_MAX_POLLS: u32 = 50_000;
-    /// Max busy-poll iterations FdConnection::send waits
-    /// for the connecting → connected transition before
-    /// giving up (logged as a dropped write).
-    const SEND_MAX_POLLS: u32 = 50_000;
 
     #[link(wasm_import_module = "pmos_ext")]
     extern "C" {
@@ -157,10 +153,19 @@ mod wasm_main {
             // until the peer drains.
             // EINVAL: socket still in `Connecting` (race with
             // server's ipc_accept) → busy-poll same as EAGAIN.
-            // Real I/O error: drop the rest. The toolkit will
-            // surface a downstream protocol error.
+            // Real I/O error: drop the rest. Even though that
+            // corrupts the protocol stream, there's no recovery
+            // path from here — the toolkit's request encoder
+            // doesn't track checkpoints, so a partial send of
+            // a chunked shm_pool.write would desynchronise the
+            // server's parser. The previous "give up after 50K
+            // spins" semantic was the entire wedge-cause: a
+            // brief rx_buf saturation under load turned into
+            // dropped bytes turned into a stuck protocol
+            // stream. Spin forever now; the substrate's
+            // cooperative scheduler will eventually run the
+            // peer.
             let mut sent = 0usize;
-            let mut spins_at_full: u32 = 0;
             while sent < bytes.len() {
                 let remaining = &bytes[sent..];
                 let iov = Ciovec {
@@ -171,23 +176,13 @@ mod wasm_main {
                 let rc = unsafe { fd_write(self.fd, &iov, 1, &mut nwritten) };
                 if rc == 0 && nwritten > 0 {
                     sent += nwritten as usize;
-                    spins_at_full = 0;
                     continue;
                 }
                 if rc == 0 || rc == EAGAIN || rc == EINVAL {
-                    // No bytes accepted — buf full or still
-                    // Connecting. Yield + retry, with a poll
-                    // budget so a permanently-stuck peer
-                    // surfaces as a dropped write rather than
-                    // an infinite loop.
-                    spins_at_full = spins_at_full.saturating_add(1);
-                    if spins_at_full > SEND_MAX_POLLS {
-                        return;
-                    }
                     unsafe { let _ = sched_yield(); }
                     continue;
                 }
-                // Real I/O error — give up.
+                // Real I/O error (peer closed, etc) — give up.
                 return;
             }
         }

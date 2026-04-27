@@ -52,7 +52,6 @@ mod wasm_main {
     const EINVAL: i32 = 28;
     const ECONNREFUSED: i32 = 14;
     const RECV_MAX_POLLS: u32 = 50_000;
-    const SEND_MAX_POLLS: u32 = 50_000;
     const CONNECT_MAX_POLLS: u32 = 50_000;
 
     #[repr(C)]
@@ -82,8 +81,11 @@ mod wasm_main {
             if bytes.is_empty() {
                 return;
             }
+            // Drive every byte to completion, sched_yield-ing
+            // on EAGAIN/EINVAL forever. The previous bounded
+            // poll semantic dropped bytes under load and
+            // corrupted the protocol stream.
             let mut sent = 0usize;
-            let mut spins: u32 = 0;
             while sent < bytes.len() {
                 let remaining = &bytes[sent..];
                 let iov = Ciovec {
@@ -94,14 +96,9 @@ mod wasm_main {
                 let rc = unsafe { fd_write(self.fd, &iov, 1, &mut nwritten) };
                 if rc == 0 && nwritten > 0 {
                     sent += nwritten as usize;
-                    spins = 0;
                     continue;
                 }
                 if rc == 0 || rc == EAGAIN || rc == EINVAL {
-                    spins = spins.saturating_add(1);
-                    if spins > SEND_MAX_POLLS {
-                        return;
-                    }
                     unsafe {
                         let _ = sched_yield();
                     }
