@@ -621,11 +621,20 @@ impl<C: Connection> Client<C> {
             if remaining.len() < HEADER_SIZE {
                 break;
             }
-            let header = MessageHeader::decode(remaining)?;
-            let msg_len = header.length as usize;
-            if remaining.len() < msg_len {
+            // Peek length manually before
+            // `MessageHeader::decode` so a partial trailing
+            // message stays in the re-assembly buffer
+            // instead of triggering InvalidLength.
+            let len_field =
+                u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
+            if len_field < HEADER_SIZE {
                 break;
             }
+            if remaining.len() < len_field {
+                break;
+            }
+            let header = MessageHeader::decode(remaining)?;
+            let msg_len = header.length as usize;
             let interface = self
                 .objects
                 .get(&header.object_id)
@@ -668,11 +677,32 @@ impl<C: Connection> Client<C> {
             if remaining.len() < HEADER_SIZE {
                 break;
             }
-            let header = MessageHeader::decode(remaining)?;
-            let msg_len = header.length as usize;
-            if remaining.len() < msg_len {
+            // Peek the length field directly. `MessageHeader::decode`
+            // errors out with `InvalidLength` when the declared
+            // total exceeds the available buffer — but that's
+            // exactly the "partial trailing message, wait for
+            // more bytes" case for a streamed protocol. Read the
+            // length manually so we can break-without-error
+            // before the decoder sees it.
+            let len_field =
+                u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
+            if len_field < HEADER_SIZE {
+                // Spec violation — discard the rest as
+                // unparseable. Returning `cursor` here will
+                // cause the caller to drain everything we've
+                // already parsed; the rest stays in the
+                // re-assembly buffer. Surfacing the error
+                // would kill the connection, which is too
+                // brittle for v1.
                 break;
             }
+            if remaining.len() < len_field {
+                // Partial — leave it in the re-assembly
+                // buffer for the next push.
+                break;
+            }
+            let header = MessageHeader::decode(remaining)?;
+            let msg_len = header.length as usize;
             let interface = self
                 .objects
                 .get(&header.object_id)
