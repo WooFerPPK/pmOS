@@ -391,12 +391,60 @@ function capBit(cap) {
   return 1n << BigInt(cap);
 }
 function encodeSpawnManifest(manifest) {
-  const path = new TextEncoder().encode(manifest.path);
+  const enc = new TextEncoder();
+  const pathBytes = enc.encode(manifest.path);
+  let argvBytes = new Uint8Array(0);
+  if (manifest.argv !== void 0 && manifest.argv.length > 0) {
+    const parts = manifest.argv.map((s) => enc.encode(s));
+    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
+    if (totalLen > 65535) {
+      throw new RangeError(
+        `encodeSpawnManifest: argv buf size ${totalLen} exceeds u16 max (65535)`
+      );
+    }
+    argvBytes = new Uint8Array(totalLen);
+    let off = 0;
+    for (const part of parts) {
+      argvBytes.set(part, off);
+      argvBytes[off + part.length] = 0;
+      off += part.length + 1;
+    }
+  }
+  let envpBytes = new Uint8Array(0);
+  if (manifest.envp !== void 0 && manifest.envp.length > 0) {
+    const parts = manifest.envp.map(([k, v]) => {
+      if (k.includes("=")) {
+        throw new RangeError(
+          `encodeSpawnManifest: envp key ${JSON.stringify(k)} contains '=' (forbidden by the wire format)`
+        );
+      }
+      return enc.encode(`${k}=${v}`);
+    });
+    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
+    if (totalLen > 65535) {
+      throw new RangeError(
+        `encodeSpawnManifest: envp buf size ${totalLen} exceeds u16 max (65535)`
+      );
+    }
+    envpBytes = new Uint8Array(totalLen);
+    let off = 0;
+    for (const part of parts) {
+      envpBytes.set(part, off);
+      envpBytes[off + part.length] = 0;
+      off += part.length + 1;
+    }
+  }
   const args = new Uint8Array(16);
   const view = new DataView(args.buffer);
-  view.setUint32(0, path.length, true);
+  view.setUint32(0, pathBytes.length, true);
   view.setBigUint64(4, manifest.caps, true);
-  return { args, heap: path };
+  view.setUint16(12, argvBytes.length, true);
+  view.setUint16(14, envpBytes.length, true);
+  const heap = new Uint8Array(pathBytes.length + argvBytes.length + envpBytes.length);
+  heap.set(pathBytes, 0);
+  heap.set(argvBytes, pathBytes.length);
+  heap.set(envpBytes, pathBytes.length + argvBytes.length);
+  return { args, heap };
 }
 var CAPSET_DESKTOP_SHELL = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.SHELL) | capBit(CAP.PROC_ENUMERATE) | capBit(CAP.KEYMAP_ADMIN);
 var CAPSET_ORDINARY_APP = capBit(CAP.DISPLAY_CLIENT);
@@ -529,12 +577,22 @@ var UserProcessExited = class extends Error {
   }
 };
 var UserWasmRuntime = class {
-  constructor(wasmBytes, backend) {
+  constructor(wasmBytes, backend, options = {}) {
     this.wasmBytes = wasmBytes;
     this.backend = backend;
+    this.options = options;
   }
   /** Populated when `run()` begins instantiation. */
   memory;
+  memorySizeBytes() {
+    return this.memory?.buffer.byteLength;
+  }
+  reportMemorySize() {
+    const bytes = this.memorySizeBytes();
+    if (bytes !== void 0) {
+      this.options.onMemorySizeBytes?.(bytes);
+    }
+  }
   /**
    * Instantiate the user wasm, satisfy its WASI imports with the
    * shim, call `_start`, and return the exit code.
@@ -560,6 +618,7 @@ var UserWasmRuntime = class {
       throw new Error("UserWasmRuntime: user wasm does not export `memory`");
     }
     this.memory = exports.memory;
+    this.reportMemorySize();
     try {
       exports._start();
       try {
@@ -570,11 +629,14 @@ var UserWasmRuntime = class {
         });
       } catch {
       }
+      this.reportMemorySize();
       return 0;
     } catch (err) {
       if (err instanceof UserProcessExited) {
+        this.reportMemorySize();
         return err.exitCode;
       }
+      this.reportMemorySize();
       throw err;
     }
   }
@@ -604,6 +666,60 @@ var UserWasmRuntime = class {
     const writeView = new DataView(this.memory.buffer);
     writeView.setUint32(countPtr, count, true);
     writeView.setUint32(bufSizePtr, bufSize, true);
+    return 0;
+  }
+  /**
+   * Shared helper for `args_get` + `environ_get`. Both opcodes
+   * receive a pointer-table address + a flat-buffer address from
+   * the user; the kernel delivers a NUL-separated byte stream of
+   * `count` entries, and the shim writes `ptr_table[i] = buf +
+   * offset_of_entry_i` once the bytes are in user memory.
+   *
+   * Internally does two dispatches: the matching `_SIZES_GET` to
+   * learn `count` + `buf_size` (we can't size the heap window
+   * blindly), then the `_GET` with `heapLen = buf_size`.
+   *
+   * Empty entry lists short-circuit: if count == 0 the shim
+   * writes nothing and returns success. WASI permits this.
+   */
+  copy_get(sizesOpcode, getOpcode, ptrTablePtr, bufPtr) {
+    if (this.memory === void 0) return ERRNO.EINVAL;
+    const sizes = this.backend.dispatch({
+      opcode: sizesOpcode,
+      requestId: 0,
+      heapPtr: 0,
+      heapLen: 8
+    });
+    if (sizes.response.status !== 0) return -sizes.response.status;
+    const sizesView = new DataView(
+      sizes.heapOut.buffer,
+      sizes.heapOut.byteOffset,
+      sizes.heapOut.byteLength
+    );
+    const count = sizesView.getUint32(0, true);
+    const bufSize = sizesView.getUint32(4, true);
+    if (count === 0 || bufSize === 0) {
+      return 0;
+    }
+    const got = this.backend.dispatch({
+      opcode: getOpcode,
+      requestId: 0,
+      heapPtr: 0,
+      heapLen: bufSize
+    });
+    if (got.response.status !== 0) return -got.response.status;
+    const heapBytes = got.heapOut.subarray(0, bufSize);
+    const userBuf = new Uint8Array(this.memory.buffer, bufPtr, bufSize);
+    userBuf.set(heapBytes);
+    const tableView = new DataView(this.memory.buffer);
+    let offset = 0;
+    for (let i = 0; i < count; i += 1) {
+      tableView.setUint32(ptrTablePtr + i * 4, bufPtr + offset, true);
+      while (offset < bufSize && heapBytes[offset] !== 0) {
+        offset += 1;
+      }
+      offset += 1;
+    }
     return 0;
   }
   /**
@@ -1042,30 +1158,35 @@ var UserWasmRuntime = class {
       },
       // WASI `args_get` / `environ_get`.
       //
-      // Signature: (argv_ptr: i32, argv_buf_ptr: i32) -> errno.
+      // Signature: (ptr_table: i32, buf: i32) -> errno.
       //
-      // v1 returns an empty list, so there's nothing for the shim
-      // to write into user memory — the kernel handler is a no-op
-      // success. The out-pointers are accepted and ignored; when
-      // argc transitions to non-zero, the handler + this shim gain
-      // a pointer-table build step in lockstep.
-      args_get: (_argvPtr, _argvBufPtr) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.ARGS_GET,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        return response.status !== 0 ? -response.status : 0;
+      // The kernel delivers a flat NUL-separated byte stream (the
+      // shape `format_argv_cmdline` uses on the kernel side):
+      //   argv: arg0\0arg1\0arg2\0...
+      //   envp: KEY0=VAL0\0KEY1=VAL1\0...
+      // Parsing the pointer table is the shim's job — the kernel
+      // doesn't know the user's `ptr_table` address and doesn't
+      // need to. Two-phase dispatch:
+      //   1. *_SIZES_GET to get count + buf_size (so we know how
+      //      to size the heap window AND how many entries to walk).
+      //   2. *_GET with `heapLen = buf_size` to receive the bytes.
+      // Then copy heap → user `buf` and write `ptr_table[i] = buf
+      // + offset_of_entry_i`.
+      args_get: (argvPtr, argvBufPtr) => {
+        return this.copy_get(
+          OP_WASI.ARGS_SIZES_GET,
+          OP_WASI.ARGS_GET,
+          argvPtr,
+          argvBufPtr
+        );
       },
-      environ_get: (_envPtr, _envBufPtr) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.ENVIRON_GET,
-          requestId: 0,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        return response.status !== 0 ? -response.status : 0;
+      environ_get: (envPtr, envBufPtr) => {
+        return this.copy_get(
+          OP_WASI.ENVIRON_SIZES_GET,
+          OP_WASI.ENVIRON_GET,
+          envPtr,
+          envBufPtr
+        );
       },
       // WASI `fd_fdstat_get`.
       //
@@ -2562,13 +2683,23 @@ async function runOnce(messaging, boot, options) {
     ...options.serviceHook ? { serviceHook: options.serviceHook } : {},
     ...kernelWakeSlot !== void 0 ? { kernelWakeSlot } : {}
   });
-  const runtime = new UserWasmRuntime(boot.wasmBytes, backend);
+  const runtime = new UserWasmRuntime(boot.wasmBytes, backend, {
+    onMemorySizeBytes: (bytes) => {
+      messaging.postMessage({ kind: "memory", pid: boot.pid, bytes });
+    }
+  });
   try {
     const code = await runtime.run();
-    messaging.postMessage({ kind: "exited", pid: boot.pid, code });
+    const memoryBytes = runtime.memorySizeBytes();
+    messaging.postMessage(
+      memoryBytes !== void 0 ? { kind: "exited", pid: boot.pid, code, memoryBytes } : { kind: "exited", pid: boot.pid, code }
+    );
   } catch (err) {
     const trap = err instanceof Error ? err.message : String(err);
-    messaging.postMessage({ kind: "exited", pid: boot.pid, code: -1, trap });
+    const memoryBytes = runtime.memorySizeBytes();
+    messaging.postMessage(
+      memoryBytes !== void 0 ? { kind: "exited", pid: boot.pid, code: -1, trap, memoryBytes } : { kind: "exited", pid: boot.pid, code: -1, trap }
+    );
   }
 }
 if (typeof DedicatedWorkerGlobalScope !== "undefined" && typeof self !== "undefined" && self instanceof DedicatedWorkerGlobalScope) {

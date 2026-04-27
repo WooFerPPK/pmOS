@@ -46,6 +46,22 @@ export const DEV_FB0_NODE = Devnum.Fb0;
 
 export const OP_SET_MODE = 0x01;
 export const OP_BLIT = 0x02;
+/// Begin a chunked BLIT. Payload: `(width: u32, height: u32)`.
+/// Allocates an internal `width*height*4` byte buffer; subsequent
+/// `OP_BLIT_CHUNK` calls fill it; `OP_BLIT_END` posts the buffer
+/// to main as a single `fb:blit` message. Used by the display
+/// server's `present_framebuffer` because the SAB ring's
+/// per-syscall heap window (`HEAP_SCRATCH_BYTES`, 32 KiB) is
+/// smaller than a full 800x600+ frame.
+export const OP_BLIT_BEGIN = 0x03;
+/// Append pixels to the in-progress BLIT. Payload:
+/// `(offset: u32) || pixel_bytes`. The driver writes
+/// `pixel_bytes` into the accumulator buffer at `offset`. Sender
+/// chunks the frame into SAB-ring-sized pieces.
+export const OP_BLIT_CHUNK = 0x04;
+/// Finalize the in-progress BLIT — post the accumulated buffer
+/// to main as `fb:blit` and reset internal state. Payload empty.
+export const OP_BLIT_END = 0x05;
 
 /** Main-thread-bound: "resize the logical framebuffer". */
 export interface FbSetModeMessage {
@@ -84,6 +100,11 @@ export class FramebufferDriver implements Driver {
   readonly driverId = FB_DRIVER_ID;
   readonly name = "framebuffer";
   private host: DriverHost | undefined;
+  // Chunked-blit accumulator: allocated by OP_BLIT_BEGIN,
+  // filled by OP_BLIT_CHUNK, posted + cleared by OP_BLIT_END.
+  private blitBuffer: Uint8Array | null = null;
+  private blitWidth = 0;
+  private blitHeight = 0;
 
   init(host: DriverHost): void {
     this.host = host;
@@ -99,9 +120,58 @@ export class FramebufferDriver implements Driver {
         return this.handleSetMode(host, payload);
       case OP_BLIT:
         return this.handleBlit(host, payload);
+      case OP_BLIT_BEGIN:
+        return this.handleBlitBegin(payload);
+      case OP_BLIT_CHUNK:
+        return this.handleBlitChunk(payload);
+      case OP_BLIT_END:
+        return this.handleBlitEnd(host);
       default:
         return { ok: false, error: DriverErrorCode.Transport };
     }
+  }
+
+  private handleBlitBegin(payload: Uint8Array): DriverResult {
+    if (payload.byteLength < 8) {
+      return { ok: false, error: DriverErrorCode.Transport };
+    }
+    const width = readU32LE(payload, 0);
+    const height = readU32LE(payload, 4);
+    const needed = rgbaByteCount(width, height);
+    this.blitBuffer = new Uint8Array(needed);
+    this.blitWidth = width;
+    this.blitHeight = height;
+    return { ok: true, value: 8 };
+  }
+
+  private handleBlitChunk(payload: Uint8Array): DriverResult {
+    if (payload.byteLength < 4 || this.blitBuffer === null) {
+      return { ok: false, error: DriverErrorCode.Transport };
+    }
+    const offset = readU32LE(payload, 0);
+    const data = payload.subarray(4);
+    if (offset + data.byteLength > this.blitBuffer.byteLength) {
+      return { ok: false, error: DriverErrorCode.Transport };
+    }
+    this.blitBuffer.set(data, offset);
+    return { ok: true, value: payload.byteLength };
+  }
+
+  private handleBlitEnd(host: DriverHost): DriverResult {
+    if (this.blitBuffer === null) {
+      return { ok: false, error: DriverErrorCode.Transport };
+    }
+    const message: FbBlitMessage = {
+      kind: "fb:blit",
+      width: this.blitWidth,
+      height: this.blitHeight,
+      rgba: this.blitBuffer,
+    };
+    host.postToMain(message);
+    this.blitBuffer = null;
+    this.blitWidth = 0;
+    this.blitHeight = 0;
+    return { ok: true, value: 0 };
   }
 
   // Framebuffer is write-only; no input route.
@@ -128,8 +198,6 @@ export class FramebufferDriver implements Driver {
     if (pixelBytes !== needed) {
       return { ok: false, error: DriverErrorCode.Transport };
     }
-    // Defensive copy: the kernel may recycle its payload
-    // immediately after the driver returns.
     const rgba = new Uint8Array(needed);
     rgba.set(payload.subarray(8));
     const message: FbBlitMessage = { kind: "fb:blit", width, height, rgba };

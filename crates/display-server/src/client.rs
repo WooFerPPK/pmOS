@@ -943,6 +943,27 @@ impl Client {
                 self.buffers.insert(req.new_id, info);
                 Ok(())
             }
+            (Interface::ShmPool, 4 /* write */) => {
+                use display_proto::requests::ShmPoolWrite;
+                let req = ShmPoolWrite::decode(payload).map_err(|e| {
+                    ClientError::Malformed { interface, opcode, error: e }
+                })?;
+                let pool = self
+                    .pools
+                    .get_mut(&target_id)
+                    .ok_or(ClientError::UnknownPool { pool_id: target_id })?;
+                let offset = req.offset as usize;
+                let end = offset.saturating_add(req.bytes.len());
+                if end > pool.storage.len() {
+                    return Err(ClientError::BufferOutOfPool {
+                        pool_id: target_id,
+                        pool_size: pool.size,
+                        byte_end: end as u64,
+                    });
+                }
+                pool.storage[offset..end].copy_from_slice(&req.bytes);
+                Ok(())
+            }
             (Interface::Seat, 1 /* get_pointer */) => {
                 let req = SeatGetPointer::decode(payload).map_err(|e| {
                     ClientError::Malformed {

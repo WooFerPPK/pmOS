@@ -285,7 +285,27 @@ impl BufferPool {
         let buffer_id = self.buffers[self.back_index];
         let w = self.width as i32;
         let h = self.height as i32;
+        let pool_id = self.pool_id;
+        let bytes_per_buf = (self.width as usize) * (self.height as usize) * 4;
+        let buf_offset = self.back_index * bytes_per_buf;
+        // V1 affordance: pmd_shm.create_pool elides the fd, so
+        // the server's pool storage starts empty. Push the
+        // painted pixels for this buffer into the server's pool
+        // BEFORE the attach so the compositor's blit sees the
+        // painted bytes. The toolkit chunks the write at 24 KiB
+        // per syscall to fit the SAB ring's 32 KiB heap window
+        // (HEAP_SCRATCH_BYTES); each chunk is one
+        // `pmd_shm_pool.write(offset, bytes)` request.
+        const SHM_WRITE_CHUNK_BYTES: usize = 24 * 1024;
+        let pixels_copy: Vec<u8> = self.pixels[buf_offset..buf_offset + bytes_per_buf].to_vec();
         let client = window.app_mut().client_mut();
+        let mut written = 0usize;
+        while written < pixels_copy.len() {
+            let end = core::cmp::min(written + SHM_WRITE_CHUNK_BYTES, pixels_copy.len());
+            let chunk = &pixels_copy[written..end];
+            client.shm_pool_write(pool_id, (buf_offset + written) as u32, chunk)?;
+            written = end;
+        }
         client.surface_attach(surface_id, buffer_id, 0, 0)?;
         client.surface_damage(surface_id, 0, 0, w, h)?;
         client.surface_commit(surface_id)?;

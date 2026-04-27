@@ -433,6 +433,24 @@ impl<C: Connection> Client<C> {
         Ok(buffer_id)
     }
 
+    /// Send `pmd_shm_pool.write(offset, bytes)` — v1 affordance
+    /// that copies `bytes` into the server-side pool storage at
+    /// `offset`. Wayland proper shares pool memory via fd; v1
+    /// elides that, so the toolkit calls this after each paint
+    /// (before commit) so the server's compositor sees the
+    /// painted pixels.
+    pub fn shm_pool_write(
+        &mut self,
+        pool_id: ObjectId,
+        offset: u32,
+        bytes: &[u8],
+    ) -> Result<(), ClientError> {
+        let mut payload = Vec::with_capacity(4 + bytes.len());
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        self.send_request(pool_id, 4 /* write */, &payload)
+    }
+
     /// Send `pmd_surface.attach(buffer_id, x, y)`. Does NOT
     /// install any new object — the buffer is already
     /// bound via [`Client::shm_pool_create_buffer`].

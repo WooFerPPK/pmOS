@@ -100,20 +100,12 @@ use crate::syscall::dispatch::{self, ServiceOutcome};
 /// Can be grown at the cost of more static memory if a future
 /// opcode needs it.
 /// Size of the per-syscall heap scratch window in bytes.
-///
-/// 4 MiB lets the display server's `fd_write` to `/dev/fb0`
-/// land an entire 1024×768 framebuffer (3 MiB) plus a small
-/// header in a single syscall — the FB driver's TS side
-/// (`web/src/drivers/fb.ts`) reads the chunk as one
-/// `(op, width, height, rgba)` blit payload, and the chunked-
-/// across-multiple-fd_writes path is no longer needed.
-///
-/// 4 MiB is a fixed allocation in the kernel's linear memory;
-/// for typical small syscalls (path strings, console output,
-/// environment vars, etc.) the leading bytes are used and the
-/// rest is unread. The kernel's wasm binary loads once per
-/// page so the cost is paid once at boot.
-const HEAP_SCRATCH_SIZE: usize = 4 * 1024 * 1024;
+/// 64 KiB is enough to handle the chunked-blit op sequence
+/// (`OP_BLIT_CHUNK` payloads cap at 24 KiB + a 4-byte offset
+/// header) plus every other userland syscall (path strings,
+/// console output, env vars). Larger frames present via
+/// multi-call chunking rather than one giant fd_write.
+const HEAP_SCRATCH_SIZE: usize = 64 * 1024;
 
 /// Storage for the 32-byte request slot the host writes before
 /// calling [`kernel_dispatch`]. The host gets its linear-memory

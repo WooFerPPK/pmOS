@@ -305,7 +305,19 @@ const FB_OP_SET_MODE: u8 = 0x01;
 /// FB driver op code for blit (matches OP_BLIT in
 /// `web/src/drivers/fb.ts`).
 #[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
 const FB_OP_BLIT: u8 = 0x02;
+/// Begin a chunked blit (allocates accumulator). Payload:
+/// `(width: u32 LE, height: u32 LE)`.
+#[cfg(target_arch = "wasm32")]
+const FB_OP_BLIT_BEGIN: u8 = 0x03;
+/// Append pixels to the chunked blit. Payload:
+/// `(offset: u32 LE) || pixel_bytes`.
+#[cfg(target_arch = "wasm32")]
+const FB_OP_BLIT_CHUNK: u8 = 0x04;
+/// Finalize the chunked blit — driver posts `fb:blit` to main.
+#[cfg(target_arch = "wasm32")]
+const FB_OP_BLIT_END: u8 = 0x05;
 
 /// Send `OP_SET_MODE(width, height)` to the framebuffer
 /// driver. Called once at startup so the host-side renderer
@@ -333,38 +345,73 @@ unsafe fn fb_set_mode(fb_fd: i32, width: u32, height: u32) -> bool {
 }
 
 /// Present the server's composed framebuffer to `/dev/fb0`
-/// as a single `OP_BLIT(width, height, rgba)` payload. The
-/// FB driver's TS side reads byte 0 as the op code, then
-/// expects an 8-byte (width, height) header followed by
-/// `width * height * 4` pixel bytes (RGBA). The kernel's
-/// `HEAP_SCRATCH_SIZE` (4 MiB) is large enough to land the
-/// full 1024×768 frame + header in one fd_write, so no
-/// chunking is needed.
+/// using the chunked-blit op sequence. The SAB ring's per-
+/// syscall heap window is 32 KiB; a full frame (e.g. 800×600
+/// = 1.9 MiB) doesn't fit in one fd_write, so the binary
+/// splits the frame into a `BEGIN` + N × `CHUNK` + `END`
+/// sequence. The FB driver's TS side accumulates the chunks
+/// into a single `fb:blit` postMessage, indistinguishable
+/// from a non-chunked blit on the receiving side.
 ///
-/// Returns `true` on success.
+/// Returns `true` if every chunk's fd_write succeeded.
 #[cfg(target_arch = "wasm32")]
 unsafe fn present_framebuffer(
     server: &display_server::Server,
     fb_fd: i32,
 ) -> bool {
+    /// Per-fd_write payload cap. Must fit alongside the
+    /// 4-byte (`offset: u32`) chunk header in the SAB ring's
+    /// 32 KiB heap window. 24 KiB leaves comfortable headroom
+    /// for the request slot's other fields.
+    const CHUNK_BYTES: usize = 24 * 1024;
     let fb = server.framebuffer();
     let width = fb.width();
     let height = fb.height();
     let pixels = fb.pixels();
-    // op (1 byte) + width (4 bytes) + height (4 bytes) +
-    // pixels (width*height*4 bytes).
-    let mut buf: Vec<u8> = Vec::with_capacity(9 + pixels.len());
-    buf.push(FB_OP_BLIT);
-    buf.extend_from_slice(&width.to_le_bytes());
-    buf.extend_from_slice(&height.to_le_bytes());
-    buf.extend_from_slice(pixels);
-    let iov = Ciovec {
-        buf: buf.as_ptr(),
-        buf_len: buf.len() as u32,
-    };
-    let mut written: u32 = 0;
-    let rc = fd_write(fb_fd, &iov, 1, &mut written);
-    rc == 0
+
+    // BEGIN: payload (width, height).
+    {
+        let mut hdr = [0u8; 9];
+        hdr[0] = FB_OP_BLIT_BEGIN;
+        hdr[1..5].copy_from_slice(&width.to_le_bytes());
+        hdr[5..9].copy_from_slice(&height.to_le_bytes());
+        let iov = Ciovec { buf: hdr.as_ptr(), buf_len: hdr.len() as u32 };
+        let mut written: u32 = 0;
+        let rc = fd_write(fb_fd, &iov, 1, &mut written);
+        if rc != 0 {
+            return false;
+        }
+    }
+
+    // CHUNK: walk the pixels, sending CHUNK_BYTES at a time.
+    let mut offset: usize = 0;
+    while offset < pixels.len() {
+        let end = core::cmp::min(offset + CHUNK_BYTES, pixels.len());
+        let slice = &pixels[offset..end];
+        let mut buf: Vec<u8> = Vec::with_capacity(5 + slice.len());
+        buf.push(FB_OP_BLIT_CHUNK);
+        buf.extend_from_slice(&(offset as u32).to_le_bytes());
+        buf.extend_from_slice(slice);
+        let iov = Ciovec { buf: buf.as_ptr(), buf_len: buf.len() as u32 };
+        let mut written: u32 = 0;
+        let rc = fd_write(fb_fd, &iov, 1, &mut written);
+        if rc != 0 {
+            return false;
+        }
+        offset = end;
+    }
+
+    // END: payload empty. Driver posts the assembled blit to main.
+    {
+        let hdr = [FB_OP_BLIT_END];
+        let iov = Ciovec { buf: hdr.as_ptr(), buf_len: hdr.len() as u32 };
+        let mut written: u32 = 0;
+        let rc = fd_write(fb_fd, &iov, 1, &mut written);
+        if rc != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -483,7 +530,12 @@ fn main() {
             // ipc_accept. Each retry also drains input events
             // so an active drag continues to advance even while
             // we're waiting for the client's next byte chunk.
-            let mut recv_buf = [0u8; 4096];
+            //
+            // 32 KiB recv buffer fits a full shm_pool.write
+            // chunk (24 KiB pixel data + 4-byte offset + header)
+            // plus a bit of headroom; the toolkit's BufferPool
+            // sizes its writes to fit in one syscall.
+            let mut recv_buf = [0u8; 32 * 1024];
             let read_iov = Iovec {
                 buf: recv_buf.as_mut_ptr(),
                 buf_len: recv_buf.len() as u32,
@@ -579,7 +631,12 @@ fn main() {
             // Inner serve loop: drain the same fd, dispatch,
             // reply, present. Spins on EAGAIN with input + signal
             // polling so the user can drag and the server can
-            // SIGTERM cleanly.
+            // SIGTERM cleanly. `pending` accumulates bytes
+            // across reads so a message split across syscall
+            // boundaries (e.g. a chunked shm_pool.write whose
+            // tail straddles two fd_reads) is reassembled and
+            // dispatched as a single message.
+            let mut pending: Vec<u8> = Vec::with_capacity(64 * 1024);
             'inner: loop {
                 if poll_sigterm() {
                     break 'outer;
@@ -592,9 +649,36 @@ fn main() {
                 let mut nread: u32 = 0;
                 let rc = fd_read(server_fd, &read_iov, 1, &mut nread);
                 if rc == 0 && nread > 0 {
-                    let chunk = &recv_buf[..nread as usize];
-                    if display_server::detect_protocol_message(chunk).is_some() {
-                        dispatch_all_messages(&mut server, client_id, chunk);
+                    pending.extend_from_slice(&recv_buf[..nread as usize]);
+                    let mut had_commit = false;
+                    let mut consumed_total = 0usize;
+                    loop {
+                        let remaining = &pending[consumed_total..];
+                        if remaining.len() < display_server::HEADER_SIZE {
+                            break;
+                        }
+                        let Ok(header) = display_server::MessageHeader::decode(remaining) else {
+                            consumed_total = pending.len();
+                            break;
+                        };
+                        let msg_len = header.length as usize;
+                        if msg_len < display_server::HEADER_SIZE {
+                            consumed_total = pending.len();
+                            break;
+                        }
+                        if msg_len > remaining.len() {
+                            break;
+                        }
+                        let msg = &remaining[..msg_len];
+                        let _ = server.dispatch_request(client_id, msg);
+                        advertise_globals_for_get_registry(&mut server, client_id, msg);
+                        if header.opcode == 7 {
+                            had_commit = true;
+                        }
+                        consumed_total += msg_len;
+                    }
+                    if consumed_total > 0 {
+                        pending.drain(..consumed_total);
                         if let Some(events) = server.drain_client_events(client_id) {
                             if !events.is_empty() {
                                 let ev_iov = Ciovec {
@@ -605,7 +689,7 @@ fn main() {
                                 let _ = fd_write(server_fd, &ev_iov, 1, &mut written);
                             }
                         }
-                        if chunk_contains_commit(chunk) {
+                        if had_commit {
                             if !present_framebuffer(&server, fb_fd as i32) {
                                 std::process::exit(16);
                             }
@@ -614,14 +698,8 @@ fn main() {
                     continue 'inner;
                 }
                 if rc == 0 || rc == EAGAIN {
-                    // No bytes pending; let the kernel run other
-                    // tasks via the worker's natural yield point
-                    // and re-poll. The drain_input call above
-                    // already gives any in-flight drag a chance
-                    // to advance.
                     continue 'inner;
                 }
-                // Real fd_read error → treat as disconnect.
                 break 'inner;
             }
 

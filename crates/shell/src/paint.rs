@@ -132,10 +132,10 @@ pub fn run_shell_with_taskbar<C: Connection>(
                     wallpaper,
                 );
                 taskbar.draw(&mut canvas);
-                // Drop the canvas borrow before committing.
                 drop(canvas);
                 pool.commit_and_swap(&mut window)?;
                 painted = true;
+                println!("shell: wallpaper painted");
             }
             // If acquire returned None (back buffer in-use),
             // leave `painted=false` and retry on the next

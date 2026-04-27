@@ -269,31 +269,44 @@ fn buffer_pool_commit_and_swap_attaches_and_damages() {
 
     let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
     let requests = parse_requests(&bytes);
-    assert_eq!(requests.len(), 3);
+    // commit_and_swap emits N × shm_pool.write (chunked at 24 KiB
+    // per syscall) followed by attach + damage + commit. The
+    // last 3 requests are the surface ones; the leading ones
+    // are the pixel-transfer chunks.
+    assert!(requests.len() >= 3);
+    let attach_idx = requests.len() - 3;
+    let damage_idx = requests.len() - 2;
+    let commit_idx = requests.len() - 1;
 
-    // 1. surface.attach(buffer_0, 0, 0)
-    assert_eq!(requests[0].object_id, surface_id);
-    assert_eq!(requests[0].opcode, 2 /* attach */);
-    let attach =
-        SurfaceAttach::decode(&requests[0].payload).expect("attach payload must decode");
+    // Every leading request must be a shm_pool.write on the pool.
+    for r in &requests[..attach_idx] {
+        assert_eq!(r.object_id, pool.pool_id());
+        assert_eq!(r.opcode, 4 /* write */);
+    }
+
+    // surface.attach(buffer_0, 0, 0)
+    assert_eq!(requests[attach_idx].object_id, surface_id);
+    assert_eq!(requests[attach_idx].opcode, 2 /* attach */);
+    let attach = SurfaceAttach::decode(&requests[attach_idx].payload)
+        .expect("attach payload must decode");
     assert_eq!(attach.buffer_id, buffer_0);
     assert_eq!(attach.x, 0);
     assert_eq!(attach.y, 0);
 
-    // 2. surface.damage(0, 0, w, h)
-    assert_eq!(requests[1].object_id, surface_id);
-    assert_eq!(requests[1].opcode, 3 /* damage */);
-    let damage =
-        SurfaceDamage::decode(&requests[1].payload).expect("damage payload must decode");
+    // surface.damage(0, 0, w, h)
+    assert_eq!(requests[damage_idx].object_id, surface_id);
+    assert_eq!(requests[damage_idx].opcode, 3 /* damage */);
+    let damage = SurfaceDamage::decode(&requests[damage_idx].payload)
+        .expect("damage payload must decode");
     assert_eq!(damage.x, 0);
     assert_eq!(damage.y, 0);
     assert_eq!(damage.width, WIDTH as i32);
     assert_eq!(damage.height, HEIGHT as i32);
 
-    // 3. surface.commit()
-    assert_eq!(requests[2].object_id, surface_id);
-    assert_eq!(requests[2].opcode, 7 /* commit */);
-    assert!(requests[2].payload.is_empty());
+    // surface.commit()
+    assert_eq!(requests[commit_idx].object_id, surface_id);
+    assert_eq!(requests[commit_idx].opcode, 7 /* commit */);
+    assert!(requests[commit_idx].payload.is_empty());
 
     // Sanity: buffer 1 is still unattached.
     let _ = buffer_1;
@@ -397,12 +410,15 @@ fn buffer_pool_double_buffered_ping_pong() {
     assert!(pool.is_in_use(1));
 
     // The second attach targets buffer 1 — parse outbound
-    // bytes from the second commit only.
+    // bytes from the second commit only. The trailing 3
+    // requests are attach + damage + commit; preceding ones
+    // are shm_pool.write chunks.
     let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
     let requests = parse_requests(&bytes);
-    assert_eq!(requests.len(), 3);
-    let attach =
-        SurfaceAttach::decode(&requests[0].payload).expect("attach payload must decode");
+    assert!(requests.len() >= 3);
+    let attach_idx = requests.len() - 3;
+    let attach = SurfaceAttach::decode(&requests[attach_idx].payload)
+        .expect("attach payload must decode");
     assert_eq!(attach.buffer_id, pool.buffer_id(1));
 
     // silence unused warnings

@@ -40,8 +40,8 @@ pub use requests::{
     buffer_format, xdg_toplevel_resize_edge, CompositorCreateSurface, DisplayGetRegistry,
     RegistryBind, SeatGetKeyboard, SeatGetPointer, ShellManagerCloseWindow,
     ShellManagerFocusWindow, ShellManagerMinimizeWindow, ShellManagerSubscribeWindows,
-    ShmCreatePool, ShmPoolCreateBuffer, SurfaceAttach, SurfaceDamage, XdgShellGetToplevel,
-    XdgToplevelAckConfigure, XdgToplevelMove, XdgToplevelResize, XdgToplevelSetAppId,
-    XdgToplevelSetMaximized, XdgToplevelSetTitle, XdgToplevelUnsetMaximized,
+    ShmCreatePool, ShmPoolCreateBuffer, ShmPoolWrite, SurfaceAttach, SurfaceDamage,
+    XdgShellGetToplevel, XdgToplevelAckConfigure, XdgToplevelMove, XdgToplevelResize,
+    XdgToplevelSetAppId, XdgToplevelSetMaximized, XdgToplevelSetTitle, XdgToplevelUnsetMaximized,
 };
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

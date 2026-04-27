@@ -518,18 +518,11 @@ export class KernelWasmHost implements Kernel {
             const src = new Uint8Array(memory.buffer, argsPtr, argsLen);
             options.onConsoleWrite(new Uint8Array(src));
           } else if (dev === DEV.FRAMEBUFFER) {
-            // Single copy out of kernel memory; both callback paths
-            // below share it.
             const src = new Uint8Array(memory.buffer, argsPtr, argsLen);
             const copy = new Uint8Array(src);
             if (options.onFramebufferWrite !== undefined) {
               options.onFramebufferWrite(copy);
             }
-            // Framed-driver path: byte 0 is the driver op, rest is
-            // the driver's own payload. Zero-length writes are
-            // dropped (a binary that wrote 0 bytes can't be framing
-            // anything meaningful; this matches the kernel's own
-            // tolerance of empty writes).
             if (framebufferDriver !== undefined && copy.length >= 1) {
               framebufferDriver.call(copy[0]!, copy.subarray(1));
             }

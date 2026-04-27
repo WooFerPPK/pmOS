@@ -182,7 +182,6 @@ export class FbRenderer {
     const imageData = this.imageDataFactory(rgba, frame.width, frame.height);
 
     if (this.usingFastPath && this.offscreen !== null && this.offscreenCtx !== null) {
-      // Compose offscreen → snapshot → drawImage onto visible.
       this.offscreenCtx.putImageData(imageData, 0, 0);
       const bitmap = this.offscreen.transferToImageBitmap();
       const ctx = this.canvas.getContext("2d");

@@ -1,33 +1,717 @@
-// src/drivers/types.ts
-var DriverErrorCode = {
-  /** Driver isn't wired up yet or its backing resource is gone. */
-  NotReady: 1,
-  /** Transport error: bad payload, invalid opcode, etc. */
-  Transport: 2,
-  /** The driver reports a POSIX errno to the kernel. */
-  Errno: 3
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
 };
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
+// src/drivers/types.ts
+var DriverErrorCode;
+var init_types = __esm({
+  "src/drivers/types.ts"() {
+    "use strict";
+    DriverErrorCode = {
+      /** Driver isn't wired up yet or its backing resource is gone. */
+      NotReady: 1,
+      /** Transport error: bad payload, invalid opcode, etc. */
+      Transport: 2,
+      /** The driver reports a POSIX errno to the kernel. */
+      Errno: 3
+    };
+  }
+});
 
 // src/shared/platform-constants.ts
-var DriverId = {
-  Framebuffer: 0,
-  InputKbd: 1,
-  InputMouse: 2,
-  Block: 3,
-  Net: 4,
-  Console: 5
-};
-var Devnum = {
-  Null: 1,
-  Zero: 2,
-  Random: 3,
-  Console: 4,
-  Fb0: 10,
-  InputKbd: 20,
-  InputMouse: 21
-};
+var DriverId, Devnum;
+var init_platform_constants = __esm({
+  "src/shared/platform-constants.ts"() {
+    "use strict";
+    DriverId = {
+      Framebuffer: 0,
+      InputKbd: 1,
+      InputMouse: 2,
+      Block: 3,
+      Net: 4,
+      Console: 5
+    };
+    Devnum = {
+      Null: 1,
+      Zero: 2,
+      Random: 3,
+      Console: 4,
+      Fb0: 10,
+      InputKbd: 20,
+      InputMouse: 21
+    };
+  }
+});
+
+// src/drivers/fb.ts
+var fb_exports = {};
+__export(fb_exports, {
+  DEV_FB0_NODE: () => DEV_FB0_NODE,
+  FB_DRIVER_ID: () => FB_DRIVER_ID,
+  FramebufferDriver: () => FramebufferDriver,
+  OP_BLIT: () => OP_BLIT,
+  OP_BLIT_BEGIN: () => OP_BLIT_BEGIN,
+  OP_BLIT_CHUNK: () => OP_BLIT_CHUNK,
+  OP_BLIT_END: () => OP_BLIT_END,
+  OP_SET_MODE: () => OP_SET_MODE
+});
+function rgbaByteCount(width, height) {
+  return width * height * 4;
+}
+function readU32LE(bytes, offset) {
+  return (bytes[offset] ?? 0) | (bytes[offset + 1] ?? 0) << 8 | (bytes[offset + 2] ?? 0) << 16 | (bytes[offset + 3] ?? 0) * 16777216;
+}
+var FB_DRIVER_ID, DEV_FB0_NODE, OP_SET_MODE, OP_BLIT, OP_BLIT_BEGIN, OP_BLIT_CHUNK, OP_BLIT_END, FramebufferDriver;
+var init_fb = __esm({
+  "src/drivers/fb.ts"() {
+    "use strict";
+    init_types();
+    init_platform_constants();
+    FB_DRIVER_ID = DriverId.Framebuffer;
+    DEV_FB0_NODE = Devnum.Fb0;
+    OP_SET_MODE = 1;
+    OP_BLIT = 2;
+    OP_BLIT_BEGIN = 3;
+    OP_BLIT_CHUNK = 4;
+    OP_BLIT_END = 5;
+    FramebufferDriver = class {
+      driverId = FB_DRIVER_ID;
+      name = "framebuffer";
+      host;
+      // Chunked-blit accumulator: allocated by OP_BLIT_BEGIN,
+      // filled by OP_BLIT_CHUNK, posted + cleared by OP_BLIT_END.
+      blitBuffer = null;
+      blitWidth = 0;
+      blitHeight = 0;
+      init(host) {
+        this.host = host;
+      }
+      call(op, payload) {
+        const host = this.host;
+        if (!host) {
+          return { ok: false, error: DriverErrorCode.NotReady };
+        }
+        switch (op) {
+          case OP_SET_MODE:
+            return this.handleSetMode(host, payload);
+          case OP_BLIT:
+            return this.handleBlit(host, payload);
+          case OP_BLIT_BEGIN:
+            return this.handleBlitBegin(payload);
+          case OP_BLIT_CHUNK:
+            return this.handleBlitChunk(payload);
+          case OP_BLIT_END:
+            return this.handleBlitEnd(host);
+          default:
+            return { ok: false, error: DriverErrorCode.Transport };
+        }
+      }
+      handleBlitBegin(payload) {
+        if (payload.byteLength < 8) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const width = readU32LE(payload, 0);
+        const height = readU32LE(payload, 4);
+        const needed = rgbaByteCount(width, height);
+        this.blitBuffer = new Uint8Array(needed);
+        this.blitWidth = width;
+        this.blitHeight = height;
+        return { ok: true, value: 8 };
+      }
+      handleBlitChunk(payload) {
+        if (payload.byteLength < 4 || this.blitBuffer === null) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const offset = readU32LE(payload, 0);
+        const data = payload.subarray(4);
+        if (offset + data.byteLength > this.blitBuffer.byteLength) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        this.blitBuffer.set(data, offset);
+        return { ok: true, value: payload.byteLength };
+      }
+      handleBlitEnd(host) {
+        if (this.blitBuffer === null) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const message = {
+          kind: "fb:blit",
+          width: this.blitWidth,
+          height: this.blitHeight,
+          rgba: this.blitBuffer
+        };
+        host.postToMain(message);
+        this.blitBuffer = null;
+        this.blitWidth = 0;
+        this.blitHeight = 0;
+        return { ok: true, value: 0 };
+      }
+      // Framebuffer is write-only; no input route.
+      handleSetMode(host, payload) {
+        if (payload.byteLength < 8) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const width = readU32LE(payload, 0);
+        const height = readU32LE(payload, 4);
+        const message = { kind: "fb:set-mode", width, height };
+        host.postToMain(message);
+        return { ok: true, value: 8 };
+      }
+      handleBlit(host, payload) {
+        if (payload.byteLength < 8) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const width = readU32LE(payload, 0);
+        const height = readU32LE(payload, 4);
+        const needed = rgbaByteCount(width, height);
+        const pixelBytes = payload.byteLength - 8;
+        if (pixelBytes !== needed) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const rgba = new Uint8Array(needed);
+        rgba.set(payload.subarray(8));
+        const message = { kind: "fb:blit", width, height, rgba };
+        host.postToMain(message);
+        return { ok: true, value: payload.byteLength };
+      }
+    };
+  }
+});
+
+// src/drivers/block.ts
+var block_exports = {};
+__export(block_exports, {
+  BLOCK_DRIVER_ID: () => BLOCK_DRIVER_ID,
+  BLOCK_SIZE: () => BLOCK_SIZE,
+  BlockDriver: () => BlockDriver,
+  DEFAULT_BLOCK_COUNT: () => DEFAULT_BLOCK_COUNT,
+  EINVAL: () => EINVAL,
+  EIO: () => EIO,
+  ENOSPC: () => ENOSPC,
+  OP_BLOCK_COUNT: () => OP_BLOCK_COUNT,
+  OP_FLUSH: () => OP_FLUSH,
+  OP_READ: () => OP_READ,
+  OP_WRITE: () => OP_WRITE,
+  PMOS_IMG_FILENAME: () => PMOS_IMG_FILENAME
+});
+function readU64LE(bytes, offset) {
+  const v = new DataView(bytes.buffer, bytes.byteOffset + offset, 8);
+  const lo = v.getUint32(0, true);
+  const hi = v.getUint32(4, true);
+  if (hi > 2097151) {
+    throw new Error(
+      `BlockDriver: LBA ${hi}.${lo} exceeds JavaScript safe-integer range`
+    );
+  }
+  return hi * 4294967296 + lo;
+}
+function isQuotaExceeded(e) {
+  if (typeof e !== "object" || e === null) return false;
+  const cand = e;
+  return cand.name === "QuotaExceededError";
+}
+var BLOCK_DRIVER_ID, BLOCK_SIZE, ENOSPC, EIO, EINVAL, DEFAULT_BLOCK_COUNT, OP_BLOCK_COUNT, OP_READ, OP_WRITE, OP_FLUSH, PMOS_IMG_FILENAME, BlockDriver;
+var init_block = __esm({
+  "src/drivers/block.ts"() {
+    "use strict";
+    init_types();
+    init_platform_constants();
+    BLOCK_DRIVER_ID = DriverId.Block;
+    BLOCK_SIZE = 4096;
+    ENOSPC = 51;
+    EIO = 5;
+    EINVAL = 22;
+    DEFAULT_BLOCK_COUNT = 4096;
+    OP_BLOCK_COUNT = 1;
+    OP_READ = 2;
+    OP_WRITE = 3;
+    OP_FLUSH = 4;
+    PMOS_IMG_FILENAME = "pmos.img";
+    BlockDriver = class _BlockDriver {
+      constructor(handle, blockCount) {
+        this.handle = handle;
+        this.blockCount = blockCount;
+      }
+      driverId = BLOCK_DRIVER_ID;
+      name = "block";
+      /**
+       * Open the block driver against the browser's OPFS root.
+       * Creates `pmos.img` if it doesn't exist; pre-sizes it to
+       * `blockCount * BLOCK_SIZE` bytes so the kernel sees a
+       * fixed-size device. Idempotent: reopening an existing
+       * `pmos.img` keeps its contents (the kernel reads the
+       * superblock and either mounts the existing FS or runs mkfs
+       * if the image is freshly zeroed).
+       *
+       * In tests, `rootOverride` lets a fake `OpfsRoot` stand in
+       * for `navigator.storage.getDirectory()`.
+       */
+      static async openInOpfs(blockCount = DEFAULT_BLOCK_COUNT, rootOverride) {
+        const root = rootOverride ?? await navigator.storage.getDirectory();
+        const file = await root.getFileHandle(PMOS_IMG_FILENAME, { create: true });
+        const handle = await file.createSyncAccessHandle();
+        const expectedSize = blockCount * BLOCK_SIZE;
+        if (handle.getSize() < expectedSize) {
+          handle.truncate(expectedSize);
+        }
+        return new _BlockDriver(handle, blockCount);
+      }
+      /**
+       * Test seam: construct a `BlockDriver` with a pre-built
+       * `SyncAccessHandle`. Tests use this with the in-memory
+       * `MemSyncAccessHandle` from `web/tests/unit/block.test.ts` so
+       * the driver behaviour can be exercised without touching the
+       * real OPFS surface (which jsdom doesn't expose).
+       */
+      static withHandle(handle, blockCount = DEFAULT_BLOCK_COUNT) {
+        const expectedSize = blockCount * BLOCK_SIZE;
+        if (handle.getSize() < expectedSize) {
+          handle.truncate(expectedSize);
+        }
+        return new _BlockDriver(handle, blockCount);
+      }
+      init(_host) {
+      }
+      call(op, payload) {
+        switch (op) {
+          case OP_BLOCK_COUNT:
+            return { ok: true, value: this.blockCount };
+          case OP_READ:
+            return this.read(payload);
+          case OP_WRITE:
+            return this.write(payload);
+          case OP_FLUSH:
+            return this.flushOp();
+          default:
+            return { ok: false, error: DriverErrorCode.Transport };
+        }
+      }
+      /** Permanently close the underlying handle. Tests + the
+       *  panic-overlay teardown call this; production runs a single
+       *  driver for the lifetime of the kernel Worker so this is
+       *  rarely needed. */
+      close() {
+        this.handle.close();
+      }
+      read(payload) {
+        if (payload.byteLength < 8 + BLOCK_SIZE) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL };
+        }
+        let lba;
+        try {
+          lba = readU64LE(payload, 0);
+        } catch {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL };
+        }
+        if (lba >= this.blockCount) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL };
+        }
+        const offset = lba * BLOCK_SIZE;
+        const dest = new Uint8Array(payload.buffer, payload.byteOffset + 8, BLOCK_SIZE);
+        let n;
+        try {
+          n = this.handle.read(dest, { at: offset });
+        } catch {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EIO };
+        }
+        if (n < BLOCK_SIZE) {
+          dest.fill(0, n);
+        }
+        return { ok: true, value: BLOCK_SIZE };
+      }
+      write(payload) {
+        if (payload.byteLength < 8 + BLOCK_SIZE) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL };
+        }
+        let lba;
+        try {
+          lba = readU64LE(payload, 0);
+        } catch {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL };
+        }
+        if (lba >= this.blockCount) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL };
+        }
+        const offset = lba * BLOCK_SIZE;
+        const src = new Uint8Array(payload.buffer, payload.byteOffset + 8, BLOCK_SIZE);
+        try {
+          this.handle.write(src, { at: offset });
+          return { ok: true, value: BLOCK_SIZE };
+        } catch (e) {
+          const errno = isQuotaExceeded(e) ? ENOSPC : EIO;
+          return { ok: false, error: DriverErrorCode.Errno, errno };
+        }
+      }
+      flushOp() {
+        try {
+          this.handle.flush();
+          return { ok: true, value: 0 };
+        } catch {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EIO };
+        }
+      }
+    };
+  }
+});
+
+// src/drivers/net.ts
+var net_exports = {};
+__export(net_exports, {
+  EAGAIN: () => EAGAIN,
+  EBADF: () => EBADF,
+  ECONNRESET: () => ECONNRESET,
+  EINVAL: () => EINVAL2,
+  ENOSPC: () => ENOSPC2,
+  ENOTREADY: () => ENOTREADY,
+  NET_DRIVER_ID: () => NET_DRIVER_ID,
+  NetDriver: () => NetDriver,
+  OP_FETCH_BEGIN: () => OP_FETCH_BEGIN,
+  OP_FETCH_POLL: () => OP_FETCH_POLL,
+  OP_WS_CLOSE: () => OP_WS_CLOSE,
+  OP_WS_OPEN: () => OP_WS_OPEN,
+  OP_WS_RECV: () => OP_WS_RECV,
+  OP_WS_SEND: () => OP_WS_SEND
+});
+function defaultFetcher(url, init) {
+  const reqInit = {};
+  if (init?.method !== void 0) reqInit.method = init.method;
+  if (init?.headers !== void 0) reqInit.headers = init.headers;
+  if (init?.body !== void 0) reqInit.body = init.body;
+  return globalThis.fetch(url, reqInit).then(async (r) => {
+    const headers = {};
+    r.headers.forEach((v, k) => {
+      headers[k] = v;
+    });
+    return {
+      status: r.status,
+      headers,
+      arrayBuffer: () => r.arrayBuffer()
+    };
+  });
+}
+function defaultWsFactory(url) {
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  return ws;
+}
+function isQuotaExceeded2(e) {
+  if (typeof e !== "object" || e === null) return false;
+  const cand = e;
+  return cand.name === "QuotaExceededError";
+}
+var NET_DRIVER_ID, OP_FETCH_BEGIN, OP_FETCH_POLL, OP_WS_OPEN, OP_WS_SEND, OP_WS_RECV, OP_WS_CLOSE, EBADF, EAGAIN, EINVAL2, ENOSPC2, ECONNRESET, ENOTREADY, NetDriver;
+var init_net = __esm({
+  "src/drivers/net.ts"() {
+    "use strict";
+    init_types();
+    init_platform_constants();
+    NET_DRIVER_ID = DriverId.Net;
+    OP_FETCH_BEGIN = 1;
+    OP_FETCH_POLL = 2;
+    OP_WS_OPEN = 3;
+    OP_WS_SEND = 4;
+    OP_WS_RECV = 5;
+    OP_WS_CLOSE = 6;
+    EBADF = 8;
+    EAGAIN = 9;
+    EINVAL2 = 22;
+    ENOSPC2 = 51;
+    ECONNRESET = 73;
+    ENOTREADY = 76;
+    NetDriver = class {
+      constructor(fetcher = defaultFetcher, wsFactory = defaultWsFactory) {
+        this.fetcher = fetcher;
+        this.wsFactory = wsFactory;
+      }
+      driverId = NET_DRIVER_ID;
+      name = "net";
+      fetches = /* @__PURE__ */ new Map();
+      sockets = /* @__PURE__ */ new Map();
+      nextFetchHandle = 1;
+      nextSocketHandle = 1;
+      init(_host) {
+      }
+      call(op, payload) {
+        switch (op) {
+          case OP_FETCH_BEGIN:
+            return this.fetchBegin(payload);
+          case OP_FETCH_POLL:
+            return this.fetchPoll(payload);
+          case OP_WS_OPEN:
+            return this.wsOpen(payload);
+          case OP_WS_SEND:
+            return this.wsSend(payload);
+          case OP_WS_RECV:
+            return this.wsRecv(payload);
+          case OP_WS_CLOSE:
+            return this.wsClose(payload);
+          default:
+            return { ok: false, error: DriverErrorCode.Transport };
+        }
+      }
+      // ---- fetch ---------------------------------------------------------
+      fetchBegin(payload) {
+        let cursor = 0;
+        if (payload.byteLength < 1) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const methodLen = payload[cursor];
+        cursor += 1;
+        if (cursor + methodLen + 2 > payload.byteLength) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const method = new TextDecoder().decode(
+          payload.subarray(cursor, cursor + methodLen)
+        );
+        cursor += methodLen;
+        const view = new DataView(payload.buffer, payload.byteOffset);
+        const urlLen = view.getUint16(cursor, true);
+        cursor += 2;
+        if (cursor + urlLen + 2 > payload.byteLength) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const url = new TextDecoder().decode(
+          payload.subarray(cursor, cursor + urlLen)
+        );
+        cursor += urlLen;
+        const headerCount = view.getUint16(cursor, true);
+        cursor += 2;
+        const headers = {};
+        for (let i = 0; i < headerCount; i += 1) {
+          if (cursor + 2 > payload.byteLength) {
+            return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+          }
+          const nameLen = view.getUint16(cursor, true);
+          cursor += 2;
+          if (cursor + nameLen + 2 > payload.byteLength) {
+            return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+          }
+          const name = new TextDecoder().decode(
+            payload.subarray(cursor, cursor + nameLen)
+          );
+          cursor += nameLen;
+          const valueLen = view.getUint16(cursor, true);
+          cursor += 2;
+          if (cursor + valueLen > payload.byteLength) {
+            return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+          }
+          const value = new TextDecoder().decode(
+            payload.subarray(cursor, cursor + valueLen)
+          );
+          cursor += valueLen;
+          headers[name] = value;
+        }
+        if (cursor + 4 > payload.byteLength) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const bodyLen = view.getUint32(cursor, true);
+        cursor += 4;
+        if (cursor + bodyLen > payload.byteLength) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const body = bodyLen > 0 ? new Uint8Array(payload.subarray(cursor, cursor + bodyLen)) : void 0;
+        const handle = this.nextFetchHandle;
+        this.nextFetchHandle += 1;
+        const entry = { done: false };
+        this.fetches.set(handle, entry);
+        const init = {};
+        if (method.length > 0) init.method = method;
+        if (headerCount > 0) init.headers = headers;
+        if (body !== void 0) init.body = body;
+        void this.fetcher(url, init).then(
+          async (resp) => {
+            try {
+              const buf = await resp.arrayBuffer();
+              entry.status = resp.status;
+              entry.headers = resp.headers;
+              entry.body = new Uint8Array(buf);
+              entry.done = true;
+            } catch {
+              entry.error = ECONNRESET;
+              entry.done = true;
+            }
+          },
+          () => {
+            entry.error = ECONNRESET;
+            entry.done = true;
+          }
+        );
+        return { ok: true, value: handle };
+      }
+      fetchPoll(payload) {
+        if (payload.byteLength < 4) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const view = new DataView(payload.buffer, payload.byteOffset);
+        const handle = view.getUint32(0, true);
+        const entry = this.fetches.get(handle);
+        if (!entry) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EBADF };
+        }
+        if (!entry.done) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EAGAIN };
+        }
+        if (entry.error !== void 0) {
+          this.fetches.delete(handle);
+          return { ok: false, error: DriverErrorCode.Errno, errno: entry.error };
+        }
+        const status = entry.status ?? 0;
+        const headers = entry.headers ?? {};
+        const body = entry.body ?? new Uint8Array(0);
+        const headerEntries = Object.entries(headers);
+        let needed = 4;
+        const headerBytes = [];
+        for (const [name, value] of headerEntries) {
+          const nameBytes = new TextEncoder().encode(name);
+          const valueBytes = new TextEncoder().encode(value);
+          headerBytes.push({ nameBytes, valueBytes });
+          needed += 2 + nameBytes.length + 2 + valueBytes.length;
+        }
+        needed += 4 + body.length;
+        if (4 + needed > payload.byteLength) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        let cursor = 4;
+        view.setUint16(cursor, status, true);
+        cursor += 2;
+        view.setUint16(cursor, headerEntries.length, true);
+        cursor += 2;
+        for (let i = 0; i < headerEntries.length; i += 1) {
+          const { nameBytes, valueBytes } = headerBytes[i];
+          view.setUint16(cursor, nameBytes.length, true);
+          cursor += 2;
+          payload.set(nameBytes, cursor);
+          cursor += nameBytes.length;
+          view.setUint16(cursor, valueBytes.length, true);
+          cursor += 2;
+          payload.set(valueBytes, cursor);
+          cursor += valueBytes.length;
+        }
+        view.setUint32(cursor, body.length, true);
+        cursor += 4;
+        payload.set(body, cursor);
+        cursor += body.length;
+        this.fetches.delete(handle);
+        return { ok: true, value: cursor - 4 };
+      }
+      // ---- websocket -----------------------------------------------------
+      wsOpen(payload) {
+        if (payload.byteLength < 2) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const view = new DataView(payload.buffer, payload.byteOffset);
+        const urlLen = view.getUint16(0, true);
+        if (2 + urlLen > payload.byteLength) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const url = new TextDecoder().decode(payload.subarray(2, 2 + urlLen));
+        const handle = this.nextSocketHandle;
+        this.nextSocketHandle += 1;
+        let socket;
+        try {
+          socket = this.wsFactory(url);
+        } catch {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const entry = { socket, open: false, closed: false, recvQueue: [] };
+        this.sockets.set(handle, entry);
+        socket.onopen = () => {
+          entry.open = true;
+        };
+        socket.onmessage = (ev) => {
+          let bytes;
+          if (typeof ev.data === "string") {
+            bytes = new TextEncoder().encode(ev.data);
+          } else {
+            bytes = new Uint8Array(ev.data);
+          }
+          entry.recvQueue.push(bytes);
+        };
+        socket.onerror = () => {
+          entry.closed = true;
+        };
+        socket.onclose = () => {
+          entry.closed = true;
+        };
+        return { ok: true, value: handle };
+      }
+      wsSend(payload) {
+        if (payload.byteLength < 4) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const view = new DataView(payload.buffer, payload.byteOffset);
+        const handle = view.getUint32(0, true);
+        const entry = this.sockets.get(handle);
+        if (!entry) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EBADF };
+        }
+        if (entry.closed) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: ECONNRESET };
+        }
+        const data = new Uint8Array(payload.subarray(4));
+        try {
+          entry.socket.send(data);
+          return { ok: true, value: data.length };
+        } catch (e) {
+          const errno = isQuotaExceeded2(e) ? ENOSPC2 : ECONNRESET;
+          return { ok: false, error: DriverErrorCode.Errno, errno };
+        }
+      }
+      wsRecv(payload) {
+        if (payload.byteLength < 4) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const view = new DataView(payload.buffer, payload.byteOffset);
+        const handle = view.getUint32(0, true);
+        const entry = this.sockets.get(handle);
+        if (!entry) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EBADF };
+        }
+        if (entry.recvQueue.length === 0) {
+          if (entry.closed) {
+            return { ok: false, error: DriverErrorCode.Errno, errno: ECONNRESET };
+          }
+          return { ok: true, value: 0 };
+        }
+        const frame = entry.recvQueue.shift();
+        const cap = payload.byteLength - 4;
+        if (frame.length > cap) {
+          entry.recvQueue.unshift(frame);
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        payload.set(frame, 4);
+        return { ok: true, value: frame.length };
+      }
+      wsClose(payload) {
+        if (payload.byteLength < 4) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EINVAL2 };
+        }
+        const view = new DataView(payload.buffer, payload.byteOffset);
+        const handle = view.getUint32(0, true);
+        const entry = this.sockets.get(handle);
+        if (!entry) {
+          return { ok: false, error: DriverErrorCode.Errno, errno: EBADF };
+        }
+        try {
+          entry.socket.close();
+        } catch {
+        }
+        this.sockets.delete(handle);
+        return { ok: true, value: 0 };
+      }
+    };
+  }
+});
 
 // src/drivers/console.ts
+init_types();
+init_platform_constants();
 var CONSOLE_DRIVER_ID = DriverId.Console;
 var DEV_CONSOLE_NODE = Devnum.Console;
 var OP_WRITE_LINE = 1;
@@ -72,69 +756,12 @@ var ConsoleDriver = class {
   }
 };
 
-// src/drivers/fb.ts
-var FB_DRIVER_ID = DriverId.Framebuffer;
-var DEV_FB0_NODE = Devnum.Fb0;
-var OP_SET_MODE = 1;
-var OP_BLIT = 2;
-function rgbaByteCount(width, height) {
-  return width * height * 4;
-}
-function readU32LE(bytes, offset) {
-  return (bytes[offset] ?? 0) | (bytes[offset + 1] ?? 0) << 8 | (bytes[offset + 2] ?? 0) << 16 | (bytes[offset + 3] ?? 0) * 16777216;
-}
-var FramebufferDriver = class {
-  driverId = FB_DRIVER_ID;
-  name = "framebuffer";
-  host;
-  init(host) {
-    this.host = host;
-  }
-  call(op, payload) {
-    const host = this.host;
-    if (!host) {
-      return { ok: false, error: DriverErrorCode.NotReady };
-    }
-    switch (op) {
-      case OP_SET_MODE:
-        return this.handleSetMode(host, payload);
-      case OP_BLIT:
-        return this.handleBlit(host, payload);
-      default:
-        return { ok: false, error: DriverErrorCode.Transport };
-    }
-  }
-  // Framebuffer is write-only; no input route.
-  handleSetMode(host, payload) {
-    if (payload.byteLength < 8) {
-      return { ok: false, error: DriverErrorCode.Transport };
-    }
-    const width = readU32LE(payload, 0);
-    const height = readU32LE(payload, 4);
-    const message = { kind: "fb:set-mode", width, height };
-    host.postToMain(message);
-    return { ok: true, value: 8 };
-  }
-  handleBlit(host, payload) {
-    if (payload.byteLength < 8) {
-      return { ok: false, error: DriverErrorCode.Transport };
-    }
-    const width = readU32LE(payload, 0);
-    const height = readU32LE(payload, 4);
-    const needed = rgbaByteCount(width, height);
-    const pixelBytes = payload.byteLength - 8;
-    if (pixelBytes !== needed) {
-      return { ok: false, error: DriverErrorCode.Transport };
-    }
-    const rgba = new Uint8Array(needed);
-    rgba.set(payload.subarray(8));
-    const message = { kind: "fb:blit", width, height, rgba };
-    host.postToMain(message);
-    return { ok: true, value: payload.byteLength };
-  }
-};
+// src/kernel-worker.ts
+init_fb();
 
 // src/drivers/input.ts
+init_types();
+init_platform_constants();
 var INPUT_DRIVER_ID = DriverId.InputKbd;
 var DEV_INPUT_KBD_NODE = Devnum.InputKbd;
 var DEV_INPUT_MOUSE_NODE = Devnum.InputMouse;
@@ -189,6 +816,7 @@ var InputDriver = class {
 };
 
 // src/kernel-worker.ts
+init_types();
 function bootKernelWorker(options) {
   const drivers = /* @__PURE__ */ new Map();
   const host = {
@@ -254,6 +882,9 @@ function bootKernelWorker(options) {
     }
   };
 }
+
+// src/kernel-wasm-host.ts
+init_platform_constants();
 
 // src/shared/sab-layout.ts
 var SAB_SIZE = 65536;
@@ -425,12 +1056,60 @@ function capBit(cap) {
   return 1n << BigInt(cap);
 }
 function encodeSpawnManifest(manifest) {
-  const path = new TextEncoder().encode(manifest.path);
+  const enc = new TextEncoder();
+  const pathBytes = enc.encode(manifest.path);
+  let argvBytes = new Uint8Array(0);
+  if (manifest.argv !== void 0 && manifest.argv.length > 0) {
+    const parts = manifest.argv.map((s) => enc.encode(s));
+    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
+    if (totalLen > 65535) {
+      throw new RangeError(
+        `encodeSpawnManifest: argv buf size ${totalLen} exceeds u16 max (65535)`
+      );
+    }
+    argvBytes = new Uint8Array(totalLen);
+    let off = 0;
+    for (const part of parts) {
+      argvBytes.set(part, off);
+      argvBytes[off + part.length] = 0;
+      off += part.length + 1;
+    }
+  }
+  let envpBytes = new Uint8Array(0);
+  if (manifest.envp !== void 0 && manifest.envp.length > 0) {
+    const parts = manifest.envp.map(([k, v]) => {
+      if (k.includes("=")) {
+        throw new RangeError(
+          `encodeSpawnManifest: envp key ${JSON.stringify(k)} contains '=' (forbidden by the wire format)`
+        );
+      }
+      return enc.encode(`${k}=${v}`);
+    });
+    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
+    if (totalLen > 65535) {
+      throw new RangeError(
+        `encodeSpawnManifest: envp buf size ${totalLen} exceeds u16 max (65535)`
+      );
+    }
+    envpBytes = new Uint8Array(totalLen);
+    let off = 0;
+    for (const part of parts) {
+      envpBytes.set(part, off);
+      envpBytes[off + part.length] = 0;
+      off += part.length + 1;
+    }
+  }
   const args = new Uint8Array(16);
   const view = new DataView(args.buffer);
-  view.setUint32(0, path.length, true);
+  view.setUint32(0, pathBytes.length, true);
   view.setBigUint64(4, manifest.caps, true);
-  return { args, heap: path };
+  view.setUint16(12, argvBytes.length, true);
+  view.setUint16(14, envpBytes.length, true);
+  const heap = new Uint8Array(pathBytes.length + argvBytes.length + envpBytes.length);
+  heap.set(pathBytes, 0);
+  heap.set(argvBytes, pathBytes.length);
+  heap.set(envpBytes, pathBytes.length + argvBytes.length);
+  return { args, heap };
 }
 var CAPSET_ALL = 0xffffffffffffffffn;
 var CAPSET_DESKTOP_SHELL = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.SHELL) | capBit(CAP.PROC_ENUMERATE) | capBit(CAP.KEYMAP_ADMIN);
@@ -503,11 +1182,31 @@ var KernelWasmHost = class _KernelWasmHost {
       };
       framebufferDriver.init(fbDriverHost);
     }
+    const blockDriver = options.blockDriver;
+    if (blockDriver !== void 0) {
+      const blockDriverHost = {
+        postToMain: () => {
+        },
+        pushInputToKernel: () => {
+        }
+      };
+      blockDriver.init(blockDriverHost);
+    }
+    const netDriver = options.netDriver;
+    if (netDriver !== void 0) {
+      const netDriverHost = {
+        postToMain: () => {
+        },
+        pushInputToKernel: () => {
+        }
+      };
+      netDriver.init(netDriverHost);
+    }
     const imports = {
       env: {
         pmos_host_now_ns: () => nowNs(),
         pmos_host_now_realtime_ns: () => nowRealtimeNs(),
-        pmos_host_driver_call: (dev, _op, argsPtr, argsLen, _resultPtr) => {
+        pmos_host_driver_call: (dev, op, argsPtr, argsLen, resultPtr) => {
           if (memory === void 0) return 0;
           if (dev === DEV.CONSOLE && options.onConsoleWrite !== void 0) {
             const src = new Uint8Array(memory.buffer, argsPtr, argsLen);
@@ -521,6 +1220,46 @@ var KernelWasmHost = class _KernelWasmHost {
             if (framebufferDriver !== void 0 && copy.length >= 1) {
               framebufferDriver.call(copy[0], copy.subarray(1));
             }
+          } else if (dev === DEV.BLOCK) {
+            if (blockDriver === void 0) {
+              return 1;
+            }
+            const view = new Uint8Array(memory.buffer, argsPtr, argsLen);
+            const result = blockDriver.call(op, view);
+            if (result.ok) {
+              if (resultPtr !== 0) {
+                new DataView(memory.buffer).setUint32(
+                  resultPtr,
+                  result.value >>> 0,
+                  true
+                );
+              }
+              return 0;
+            }
+            if (result.error === 3) {
+              return -(result.errno ?? 5);
+            }
+            return 1;
+          } else if (dev === DEV.NET) {
+            if (netDriver === void 0) {
+              return 1;
+            }
+            const view = new Uint8Array(memory.buffer, argsPtr, argsLen);
+            const result = netDriver.call(op, view);
+            if (result.ok) {
+              if (resultPtr !== 0) {
+                new DataView(memory.buffer).setUint32(
+                  resultPtr,
+                  result.value >>> 0,
+                  true
+                );
+              }
+              return 0;
+            }
+            if (result.error === 3) {
+              return -(result.errno ?? 5);
+            }
+            return 1;
           }
           return 0;
         },
@@ -621,6 +1360,34 @@ var KernelWasmHost = class _KernelWasmHost {
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.markRunning(${pid}): rc=${rc}`);
     }
+  }
+  recordProcessMemory(pid, bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0 || !Number.isSafeInteger(bytes)) {
+      throw new Error(`KernelWasmHost.recordProcessMemory: invalid byte count ${bytes}`);
+    }
+    const bytesLo = bytes >>> 0;
+    const bytesHi = Math.floor(bytes / 4294967296) >>> 0;
+    const rc = this.exports.kernel_record_process_memory(pid, bytesLo, bytesHi);
+    if (rc !== 0) {
+      throw new Error(
+        `KernelWasmHost.recordProcessMemory(${pid}, ${bytes}): rc=${rc}`
+      );
+    }
+  }
+  /**
+   * Best-effort flush of every dirty VFS mount through the kernel's
+   * `vfs.sync_dirty()` path. Wired up to `pagehide` on the main
+   * thread so OPFS-backed mutations survive the user closing the
+   * tab while a long-running process is still mid-flight. Mounts
+   * whose `sync` hook errors stay dirty for the next attempt; this
+   * call returns without throwing in that case so the pagehide
+   * handler can finish synchronously.
+   *
+   * Returns `true` if every dirty mount flushed cleanly, `false` if
+   * any mount's `sync` hook errored.
+   */
+  syncAll() {
+    return this.exports.kernel_sync_all() === 0;
   }
   /**
    * Test-only: spawn a child process of `parent` with
@@ -1085,6 +1852,9 @@ var KernelWasmHost = class _KernelWasmHost {
   }
 };
 
+// src/mock-kernel.ts
+init_fb();
+
 // src/shared/font.ts
 var GLYPH_WIDTH = 5;
 var GLYPH_HEIGHT = 7;
@@ -1397,7 +2167,13 @@ var MouseEventKind = {
   /** Pointer moved to (x, y) in screen space. */
   Motion: 0,
   /** A mouse button was pressed or released at (x, y). */
-  Button: 1
+  Button: 1,
+  /** Wheel scrolled by `(button, state)` reinterpreted as
+   *  `(deltaX, deltaY)` — see `packMouseWheel`. v1 reserves
+   *  this discriminant for the wheel-scroll path the
+   *  display server's window manager will route to focus
+   *  windows. */
+  Wheel: 2
 };
 var MouseButtonState = {
   Released: 0,
@@ -1409,8 +2185,21 @@ function unpackMouseEvent(bytes) {
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const kind = view.getUint32(0, true);
-  if (kind !== MouseEventKind.Motion && kind !== MouseEventKind.Button) {
+  if (kind !== MouseEventKind.Motion && kind !== MouseEventKind.Button && kind !== MouseEventKind.Wheel) {
     return null;
+  }
+  if (kind === MouseEventKind.Wheel) {
+    return {
+      kind,
+      x: view.getInt32(4, true),
+      y: view.getInt32(8, true),
+      // `button` reinterprets `deltaX` u32-bits as a u32; tests
+      // that use unpackMouseEvent on a wheel will see the raw
+      // bits, which is fine because they're expected to use
+      // unpackMouseWheel anyway.
+      button: view.getUint32(12, true),
+      state: MouseButtonState.Released
+    };
   }
   const x = view.getInt32(4, true);
   const y = view.getInt32(8, true);
@@ -1878,7 +2667,31 @@ function installWorkerEntry(messaging, options = {}) {
       }
       return;
     }
+    if (msg.kind === "proc:memory") {
+      if (realKernel !== void 0) {
+        try {
+          realKernel.recordProcessMemory(msg.pid, msg.bytes);
+        } catch {
+        }
+      }
+      return;
+    }
+    if (msg.kind === "sync:request") {
+      if (realKernel !== void 0) {
+        try {
+          realKernel.syncAll();
+        } catch {
+        }
+      }
+      return;
+    }
     if (msg.kind === "proc:exited") {
+      if (msg.memoryBytes !== void 0 && realKernel !== void 0) {
+        try {
+          realKernel.recordProcessMemory(msg.pid, msg.memoryBytes);
+        } catch {
+        }
+      }
       pidMap.delete(msg.pid);
       return;
     }
@@ -1945,7 +2758,7 @@ function bootMockKernel(messaging, config) {
   return scaffold;
 }
 async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onScaffoldReady) {
-  const fetcher = options.fetcher ?? defaultFetcher;
+  const fetcher = options.fetcher ?? defaultFetcher2;
   let bytes;
   try {
     bytes = options.kernelWasmBytes ?? await fetcher("/assets/kernel.wasm");
@@ -1964,6 +2777,35 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onS
       throw e;
     }
   }
+  let blockDriver;
+  if (options.blockDriver !== void 0) {
+    blockDriver = options.blockDriver;
+  } else {
+    try {
+      const { BlockDriver: BlockDriver2 } = await Promise.resolve().then(() => (init_block(), block_exports));
+      blockDriver = await BlockDriver2.openInOpfs();
+    } catch {
+      blockDriver = void 0;
+    }
+  }
+  let netDriver;
+  if (options.netDriver !== void 0) {
+    netDriver = options.netDriver;
+  } else {
+    try {
+      const { NetDriver: NetDriver2 } = await Promise.resolve().then(() => (init_net(), net_exports));
+      netDriver = new NetDriver2();
+    } catch {
+      netDriver = void 0;
+    }
+  }
+  let framebufferDriver;
+  try {
+    const { FramebufferDriver: FramebufferDriver2 } = await Promise.resolve().then(() => (init_fb(), fb_exports));
+    framebufferDriver = new FramebufferDriver2();
+  } catch {
+    framebufferDriver = void 0;
+  }
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -1976,6 +2818,12 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onS
       messaging.postMessage({ kind: "panic", message });
     },
     ...registry !== void 0 ? { binaryRegistry: registry } : {},
+    ...blockDriver !== void 0 ? { blockDriver } : {},
+    ...netDriver !== void 0 ? { netDriver } : {},
+    ...framebufferDriver !== void 0 ? { framebufferDriver } : {},
+    onFramebufferMessage: (msg) => {
+      messaging.postMessage(msg);
+    },
     kernelWorkerChannel: {
       postMessage: (msg) => {
         messaging.postMessage(msg);
@@ -1998,7 +2846,7 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onS
     await runBootBinary(host, config.bootBinary, pidMap, lifecycle);
   }
 }
-async function defaultFetcher(url) {
+async function defaultFetcher2(url) {
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} fetching ${url}`);

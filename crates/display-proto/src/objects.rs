@@ -276,6 +276,15 @@ const SHM_POOL_REQUESTS: &[Opcode] = &[
     Opcode { number: 1, direction: Direction::Request, name: "create_buffer" },
     Opcode { number: 2, direction: Direction::Request, name: "resize" },
     Opcode { number: 3, direction: Direction::Request, name: "destroy" },
+    // pmd_shm_pool.write(offset, bytes) — v1 affordance for
+    // transferring pixel data from client to server. Wayland
+    // proper passes an fd at create_pool time and both ends
+    // see the same memory; v1's pmd_shm.create_pool elides
+    // the fd, so we provide an explicit write request that
+    // fills the server-side pool storage at `offset` with
+    // the inline `bytes`. Toolkit's BufferPool calls this
+    // after every paint, before commit_and_swap.
+    Opcode { number: 4, direction: Direction::Request, name: "write" },
 ];
 
 const SHM_POOL_EVENTS: &[Opcode] = &[];

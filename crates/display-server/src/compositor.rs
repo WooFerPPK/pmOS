@@ -32,7 +32,10 @@ pub const BYTES_PER_PIXEL: usize = 4;
 
 /// Default framebuffer width if [`Framebuffer::new`] is
 /// called via the `Default` impl. Matches the v1 demo
-/// display mode in the spec.
+/// display mode in the spec. Full frames present via the
+/// chunked-blit op sequence (`OP_BLIT_BEGIN` + N ×
+/// `OP_BLIT_CHUNK` + `OP_BLIT_END`) so the SAB ring's
+/// 32 KiB heap window doesn't cap the frame size.
 pub const DEFAULT_WIDTH: u32 = 1024;
 
 /// Default framebuffer height if [`Framebuffer::new`] is

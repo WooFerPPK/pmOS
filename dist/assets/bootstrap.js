@@ -185,6 +185,121 @@ var FbHost = class {
   }
 };
 
+// src/fb-renderer.ts
+var FbRenderer = class {
+  canvas;
+  offscreenFactory;
+  imageDataFactory;
+  offscreen = null;
+  offscreenCtx = null;
+  handlers = [];
+  currentMode = null;
+  /**
+   * Number of frames painted since construction. Read by tests
+   * to assert the render loop ran the expected number of times
+   * without needing a canvas-pixel comparison.
+   */
+  presentsCompleted = 0;
+  /**
+   * Tracks whether the renderer is using the OffscreenCanvas
+   * fast path. Read by tests; the value is decided by
+   * `setMode` based on the factory's return value.
+   */
+  usingFastPath = false;
+  constructor(options) {
+    this.canvas = options.canvas;
+    this.offscreenFactory = options.offscreenCanvasFactory ?? defaultOffscreenFactory;
+    this.imageDataFactory = options.imageDataFactory ?? defaultImageDataFactory;
+  }
+  /** Subscribe to present-complete events. */
+  onPresentComplete(handler) {
+    this.handlers.push(handler);
+  }
+  /**
+   * Resize the canvas + (re-)create the offscreen surface for
+   * the new mode. Idempotent: passing the same geometry as the
+   * current mode is a no-op.
+   */
+  setMode(mode) {
+    if (this.currentMode !== null && this.currentMode.width === mode.width && this.currentMode.height === mode.height) {
+      return;
+    }
+    this.currentMode = mode;
+    this.canvas.width = mode.width;
+    this.canvas.height = mode.height;
+    const offscreen = this.offscreenFactory(mode.width, mode.height);
+    if (offscreen !== null) {
+      this.offscreen = offscreen;
+      this.offscreenCtx = offscreen.getContext("2d");
+      this.usingFastPath = this.offscreenCtx !== null;
+    } else {
+      this.offscreen = null;
+      this.offscreenCtx = null;
+      this.usingFastPath = false;
+    }
+  }
+  /**
+   * Paint one RGBA8 frame. The renderer assumes the frame's
+   * geometry matches the most recent `setMode`; mismatched
+   * frames are dropped so a stale blit doesn't smear wrong-
+   * sized pixels into the canvas.
+   */
+  paintFrame(frame) {
+    if (this.currentMode === null) {
+      return;
+    }
+    if (frame.width !== this.currentMode.width || frame.height !== this.currentMode.height) {
+      return;
+    }
+    const rgba = new Uint8ClampedArray(
+      frame.rgba.buffer,
+      frame.rgba.byteOffset,
+      frame.rgba.byteLength
+    );
+    const imageData = this.imageDataFactory(rgba, frame.width, frame.height);
+    if (this.usingFastPath && this.offscreen !== null && this.offscreenCtx !== null) {
+      this.offscreenCtx.putImageData(imageData, 0, 0);
+      const bitmap = this.offscreen.transferToImageBitmap();
+      const ctx = this.canvas.getContext("2d");
+      if (ctx !== null) {
+        ctx.drawImage(bitmap, 0, 0);
+      }
+    } else {
+      const ctx = this.canvas.getContext("2d");
+      if (ctx !== null) {
+        ctx.putImageData(imageData, 0, 0);
+      }
+    }
+    this.presentsCompleted += 1;
+    for (const h of this.handlers) {
+      h();
+    }
+  }
+};
+function defaultOffscreenFactory(width, height) {
+  const Ctor = globalThis.OffscreenCanvas;
+  if (Ctor === void 0) return null;
+  try {
+    const oc = new Ctor(width, height);
+    if (typeof oc.transferToImageBitmap !== "function") {
+      return null;
+    }
+    return oc;
+  } catch {
+    return null;
+  }
+}
+function defaultImageDataFactory(data, width, height) {
+  const Ctor = globalThis.ImageData;
+  if (Ctor !== void 0) {
+    try {
+      return new Ctor(data, width, height);
+    } catch {
+    }
+  }
+  return { width, height, data };
+}
+
 // src/shared/sab-layout.ts
 var SAB_SIZE = 65536;
 
@@ -194,7 +309,13 @@ var MouseEventKind = {
   /** Pointer moved to (x, y) in screen space. */
   Motion: 0,
   /** A mouse button was pressed or released at (x, y). */
-  Button: 1
+  Button: 1,
+  /** Wheel scrolled by `(button, state)` reinterpreted as
+   *  `(deltaX, deltaY)` — see `packMouseWheel`. v1 reserves
+   *  this discriminant for the wheel-scroll path the
+   *  display server's window manager will route to focus
+   *  windows. */
+  Wheel: 2
 };
 var MouseButtonState = {
   Released: 0,
@@ -235,6 +356,13 @@ function isCrossOriginIsolated() {
 }
 function hasOpfs() {
   return typeof navigator !== "undefined" && typeof navigator.storage !== "undefined" && typeof navigator.storage.getDirectory === "function";
+}
+function registerServiceWorker(scriptURL = "/assets/sw.js", options = { type: "module" }, container) {
+  const target = container ?? (typeof navigator !== "undefined" ? navigator.serviceWorker : void 0);
+  if (target === void 0) {
+    return Promise.resolve(null);
+  }
+  return target.register(scriptURL, options);
 }
 function hasServiceWorker() {
   return typeof navigator !== "undefined" && "serviceWorker" in navigator;
@@ -372,7 +500,14 @@ function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
   if (!window.location.hash.includes("mock-kernel")) {
     const hash = window.location.hash;
-    const bootBinary = hash.includes("input-echo") ? "/bin/hello_input_echo" : "/bin/init";
+    let bootBinary;
+    if (hash.includes("input-echo")) {
+      bootBinary = "/bin/hello_input_echo";
+    } else if (hash.includes("real-kernel")) {
+      bootBinary = "/bin/init";
+    } else {
+      bootBinary = "/bin/init-desktop";
+    }
     runRealKernelMode(bootBinary);
     return;
   }
@@ -799,8 +934,22 @@ function runRealKernelMode(bootBinary) {
   console.log(
     `[pmos-bootstrap] real-kernel mode enabled via URL (bootBinary=${bootBinary})`
   );
-  const consoleEl = mountRealKernelConsole();
+  const isGuiBoot = bootBinary === "/bin/init-desktop";
+  const consoleEl = mountRealKernelConsole(isGuiBoot);
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  if (isGuiBoot) {
+    const canvas = document.getElementById("pmos-fb");
+    if (canvas instanceof HTMLCanvasElement) {
+      const fbHost = new FbHost({ worker });
+      const renderer = new FbRenderer({ canvas });
+      fbHost.onModeChange((mode) => {
+        renderer.setMode(mode);
+      });
+      fbHost.onFrame((frame) => {
+        renderer.paintFrame(frame);
+      });
+    }
+  }
   let kernelWakeSlot = null;
   let peakLiveWorkers = 0;
   const router = createSpawnRouter({
@@ -871,30 +1020,54 @@ function runRealKernelMode(bootBinary) {
     const msg = { kind: "input:kbd", bytes };
     worker.postMessage(msg);
   });
+  installPagehideSync(worker);
+  installPeriodicSync(worker);
 }
-function mountRealKernelConsole() {
+function mountRealKernelConsole(gui = false) {
   const existing = document.getElementById("pmos-real-console");
   if (existing instanceof HTMLPreElement) {
     return existing;
   }
   const canvas = document.getElementById("pmos-fb");
-  if (canvas instanceof HTMLElement) {
+  if (canvas instanceof HTMLElement && !gui) {
     canvas.style.display = "none";
   }
   const pre = document.createElement("pre");
   pre.id = "pmos-real-console";
-  pre.style.cssText = [
-    "margin: 0",
-    "padding: 1.5rem",
-    'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
-    "font-size: 14px",
-    "line-height: 1.5",
-    "color: #e6e6e6",
-    "background: #0a0e14",
-    "min-height: 100vh",
-    "white-space: pre-wrap",
-    "overflow-wrap: anywhere"
-  ].join("; ");
+  if (gui) {
+    pre.style.cssText = [
+      "position: fixed",
+      "top: 0.5rem",
+      "right: 0.5rem",
+      "max-width: 30vw",
+      "max-height: 40vh",
+      "margin: 0",
+      "padding: 0.5rem 0.75rem",
+      'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+      "font-size: 11px",
+      "line-height: 1.3",
+      "color: #e6e6e6",
+      "background: rgba(10, 14, 20, 0.6)",
+      "border-radius: 4px",
+      "white-space: pre-wrap",
+      "overflow: auto",
+      "pointer-events: none",
+      "z-index: 100"
+    ].join("; ");
+  } else {
+    pre.style.cssText = [
+      "margin: 0",
+      "padding: 1.5rem",
+      'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+      "font-size: 14px",
+      "line-height: 1.5",
+      "color: #e6e6e6",
+      "background: #0a0e14",
+      "min-height: 100vh",
+      "white-space: pre-wrap",
+      "overflow-wrap: anywhere"
+    ].join("; ");
+  }
   document.body.appendChild(pre);
   return pre;
 }
@@ -929,8 +1102,35 @@ function showPanic(message) {
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
+function installPagehideSync(kernelWorker, target = window) {
+  const listener = () => {
+    kernelWorker.postMessage({ kind: "sync:request" });
+  };
+  target.addEventListener("pagehide", listener);
+  return listener;
+}
+function installPeriodicSync(kernelWorker, intervalMs = 6e4, scheduler = {
+  setInterval: (h, ms) => globalThis.setInterval(h, ms),
+  clearInterval: (h) => globalThis.clearInterval(h)
+}) {
+  if (intervalMs <= 0 || !Number.isFinite(intervalMs)) {
+    throw new Error(
+      `installPeriodicSync: intervalMs must be a positive finite number, got ${intervalMs}`
+    );
+  }
+  const handle = scheduler.setInterval(() => {
+    kernelWorker.postMessage({ kind: "sync:request" });
+  }, intervalMs);
+  return () => scheduler.clearInterval(handle);
+}
 function createSpawnRouter(deps) {
   const live = /* @__PURE__ */ new Map();
+  function recordMemory(pid, bytes) {
+    if (!live.has(pid)) {
+      return;
+    }
+    deps.kernelWorker.postMessage({ kind: "proc:memory", pid, bytes });
+  }
   function reap(pid, code, trap) {
     const entry = live.get(pid);
     if (!entry) {
@@ -953,7 +1153,17 @@ function createSpawnRouter(deps) {
       live.set(msg.pid, { worker, sab });
       worker.addEventListener("message", (ev) => {
         const m = ev.data;
-        if (m.kind === "exited" && m.pid === msg.pid) {
+        if (m.pid !== msg.pid) {
+          return;
+        }
+        if (m.kind === "memory") {
+          recordMemory(msg.pid, m.bytes);
+          return;
+        }
+        if (m.memoryBytes !== void 0) {
+          recordMemory(msg.pid, m.memoryBytes);
+        }
+        if (m.kind === "exited") {
           reap(msg.pid, m.code, m.trap);
         }
       });
@@ -994,5 +1204,12 @@ if (typeof document !== "undefined") {
 }
 export {
   SAB_SIZE,
-  createSpawnRouter
+  createSpawnRouter,
+  hasAtomicsWait,
+  hasOpfs,
+  installPagehideSync,
+  installPeriodicSync,
+  isCrossOriginIsolated,
+  registerServiceWorker,
+  showPanic
 };

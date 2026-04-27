@@ -146,6 +146,30 @@ pub mod buffer_format {
     pub const XRGB8888: u32 = 1;
 }
 
+/// `pmd_shm_pool.write(offset, bytes)` — v1 affordance to
+/// fill the server-side pool storage with pixel bytes the
+/// client just painted. Wayland proper shares the pool
+/// memory via fd; v1 elides that and uses an explicit
+/// in-protocol write so the client and server stay in
+/// sync without any out-of-band fd plumbing.
+///
+/// Wire layout: `(offset: u32 LE) || bytes`. The server
+/// validates `offset + bytes.len() <= pool.size` and writes
+/// `bytes` into `pool.storage[offset..offset+bytes.len()]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShmPoolWrite {
+    pub offset: u32,
+    pub bytes: alloc::vec::Vec<u8>,
+}
+
+impl ShmPoolWrite {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let offset = read_u32(payload, 0)?;
+        let bytes = payload.get(4..).unwrap_or(&[]).to_vec();
+        Ok(ShmPoolWrite { offset, bytes })
+    }
+}
+
 /// `pmd_surface.attach(buffer_id, x, y)` — spec §9 row 2.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceAttach {
