@@ -416,6 +416,20 @@ async function bootRealKernel(
       netDriver = undefined;
     }
   }
+
+  // Framebuffer driver — translates /dev/fb0 byte writes into
+  // `fb:set-mode` / `fb:blit` postMessage envelopes via the
+  // KernelWasmHost's `onFramebufferMessage` hook. The actual
+  // canvas paint happens on the main thread (FbHost +
+  // FbRenderer in bootstrap.ts).
+  let framebufferDriver: import("./drivers/types").Driver | undefined;
+  try {
+    const { FramebufferDriver } = await import("./drivers/fb");
+    framebufferDriver = new FramebufferDriver();
+  } catch {
+    framebufferDriver = undefined;
+  }
+
   const host = await KernelWasmHost.create(bytes, {
     // Bytes the kernel flushes from `/dev/console` ride the existing
     // ConsoleHost main-thread channel as `console:write` messages,
@@ -430,6 +444,15 @@ async function bootRealKernel(
     ...(registry !== undefined ? { binaryRegistry: registry } : {}),
     ...(blockDriver !== undefined ? { blockDriver } : {}),
     ...(netDriver !== undefined ? { netDriver } : {}),
+    ...(framebufferDriver !== undefined ? { framebufferDriver } : {}),
+    onFramebufferMessage: (msg: unknown) => {
+      // The framebuffer driver decodes write payloads into
+      // {kind: "fb:set-mode" | "fb:blit", ...} envelopes; forward
+      // each one to main where FbHost + FbRenderer paint the
+      // canvas (see web/src/bootstrap.ts runRealKernelMode's
+      // GUI-boot branch).
+      messaging.postMessage(msg as KernelToMain);
+    },
     kernelWorkerChannel: {
       postMessage: (msg: KernelToMain): void => {
         messaging.postMessage(msg);
