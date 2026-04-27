@@ -298,15 +298,15 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     let mut total_paints: u64 = 0;
     let mut stuck_acquire_count: u64 = 0;
     let mut last_heartbeat_iter: u32 = 0;
-    // Heartbeat cadence: every N iterations, print a one-line
-    // summary even if nothing else is going on. A fast empty
-    // loop covers tens of thousands of iters/sec; tune the
-    // cadence so the heartbeat fires roughly every 5s under
-    // sustained idle. If iter_count freezes between two
-    // pages's worth of console output, the shell is wedged
-    // somewhere; if it keeps ticking but no events arrive,
-    // the inbound channel is broken.
-    const HEARTBEAT_EVERY: u32 = 5_000;
+    // Heartbeat cadence — every N iterations. A no-events
+    // loop runs many thousands of iters/sec because each
+    // FdConnection.recv is bounded; under pure idle the
+    // heartbeat should fire in well under a second. If the
+    // watchdog (8s of zero console output) trips before any
+    // heartbeat lands, the shell is wedged inside one of
+    // the syscalls (recv, fd_write, sched_yield), not just
+    // event-starved.
+    const HEARTBEAT_EVERY: u32 = 1_000;
     for _ in 0..max_dispatch_iterations {
         iter_count = iter_count.wrapping_add(1);
         let events = match window.dispatch() {
