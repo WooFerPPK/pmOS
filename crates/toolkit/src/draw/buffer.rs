@@ -246,9 +246,37 @@ impl BufferPool {
     /// the forward-compatible signature for a future slice
     /// that adds a real frame loop.
     pub fn acquire_back_canvas(&mut self) -> Option<Canvas<'_>> {
-        if self.attached_in_use[self.back_index] {
-            return None;
-        }
+        // The in-use flag was a Wayland-style back-pressure
+        // signal saying "the server is still reading from
+        // this buffer; wait for buffer.release before
+        // overwriting." It deadlocked on the v1 path because:
+        //
+        // (a) the display-server's `shm_pool.write` dispatch
+        //     already copies the painted bytes out into its
+        //     own pool storage *before* attach, so the
+        //     client's local buffer pixels are no longer
+        //     load-bearing once `commit_and_swap` returns;
+        //
+        // (b) the server now re-composites the WHOLE scene
+        //     on every commit (so it keeps reading from
+        //     `current_buffer`'s pool storage indefinitely,
+        //     not just once per attach).
+        //
+        // Together these mean the in-use flag never matched
+        // the actual ownership: every paint marked the
+        // buffer in_use, but the buffer's pixels had already
+        // been consumed by shm_pool.write, and the
+        // buffer.release events arrived after the server
+        // had moved on. After both pool slots got marked
+        // in_use the shell's acquire_back_canvas returned
+        // None forever and the desktop froze on whatever
+        // frame it last managed to paint.
+        //
+        // Drop the gate entirely: the toolkit always lets
+        // the caller paint into the back slot. Even if the
+        // server were still reading the buffer's bytes
+        // (which it isn't in v1) the worst case is one
+        // partly-torn frame, not a permanent hang.
         let offset = self.buffer_offset(self.back_index);
         let len = self.per_buffer_bytes();
         let slice = &mut self.pixels[offset..offset + len];
