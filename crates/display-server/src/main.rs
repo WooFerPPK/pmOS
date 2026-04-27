@@ -657,25 +657,35 @@ fn main() {
                         if remaining.len() < display_server::HEADER_SIZE {
                             break;
                         }
-                        let Ok(header) = display_server::MessageHeader::decode(remaining) else {
-                            consumed_total = pending.len();
-                            break;
-                        };
-                        let msg_len = header.length as usize;
-                        if msg_len < display_server::HEADER_SIZE {
+                        // Read the length field directly so we can
+                        // detect "partial message — wait for more"
+                        // BEFORE MessageHeader::decode runs (it
+                        // returns InvalidLength when the declared
+                        // total exceeds the buffer length, which
+                        // is exactly the partial case for a
+                        // streamed protocol).
+                        let len_field =
+                            u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
+                        if len_field < display_server::HEADER_SIZE {
+                            // Spec violation — drop everything.
                             consumed_total = pending.len();
                             break;
                         }
-                        if msg_len > remaining.len() {
+                        if len_field > remaining.len() {
+                            // Partial — wait for more bytes.
                             break;
                         }
-                        let msg = &remaining[..msg_len];
+                        let msg = &remaining[..len_field];
+                        // Header decode here is just to extract the
+                        // opcode for the commit-detection branch;
+                        // dispatch itself re-decodes.
+                        let opcode = u16::from_le_bytes([msg[4], msg[5]]);
                         let _ = server.dispatch_request(client_id, msg);
                         advertise_globals_for_get_registry(&mut server, client_id, msg);
-                        if header.opcode == 7 {
+                        if opcode == 7 {
                             had_commit = true;
                         }
-                        consumed_total += msg_len;
+                        consumed_total += len_field;
                     }
                     if consumed_total > 0 {
                         pending.drain(..consumed_total);
