@@ -126,11 +126,20 @@ mod wasm_main {
     /// server emits at least one byte.
     pub struct FdConnection {
         fd: i32,
+        /// True after the toolkit's connect handshake
+        /// completes. Before that, `recv()` busy-polls the
+        /// EAGAIN response so the toolkit's "drain until
+        /// empty" sees the server's globals advertisement
+        /// (which the kernel may not have routed yet on the
+        /// very first recv call). After connect, `recv()`
+        /// is single-shot non-blocking — the shell's main
+        /// loop is responsible for spinning.
+        connected: core::cell::Cell<bool>,
     }
 
     impl FdConnection {
         pub fn new(fd: i32) -> Self {
-            FdConnection { fd }
+            FdConnection { fd, connected: core::cell::Cell::new(false) }
         }
     }
 
@@ -204,28 +213,42 @@ mod wasm_main {
                 buf_len: buf.len() as u32,
             };
             let mut nread: u32 = 0;
-            // Busy-poll on EAGAIN: PMos's socket fd_read
-            // returns EAGAIN-immediately when no bytes are
-            // queued. The toolkit's App::connect drain loop
-            // breaks on a single empty recv, so the v1
-            // adapter has to give the server a chance to
-            // produce its registry advertisements before
-            // returning empty. Each EAGAIN spin yields the
-            // worker so the kernel can run the display
-            // server's accept + dispatch path.
-            for _ in 0..RECV_MAX_POLLS {
-                let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
-                if rc == 0 && nread > 0 {
-                    return buf[..nread as usize].to_vec();
+            if !self.connected.get() {
+                // Pre-handshake: busy-poll because the
+                // toolkit's App::connect breaks on the first
+                // empty chunk and we need to give the server
+                // a chance to advertise its globals before
+                // we report "nothing here". The first
+                // non-empty chunk transitions us into
+                // post-handshake mode automatically.
+                for _ in 0..RECV_MAX_POLLS {
+                    let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
+                    if rc == 0 && nread > 0 {
+                        self.connected.set(true);
+                        return buf[..nread as usize].to_vec();
+                    }
+                    if rc == 0 || rc == EAGAIN {
+                        nread = 0;
+                        unsafe { let _ = sched_yield(); }
+                        continue;
+                    }
+                    return alloc::vec::Vec::new();
                 }
-                if rc == 0 || rc == EAGAIN {
-                    nread = 0;
-                    unsafe { let _ = sched_yield(); }
-                    continue;
-                }
-                // Real I/O error or EOF — give up and let
-                // the toolkit drain loop terminate.
                 return alloc::vec::Vec::new();
+            }
+            // Post-handshake: single non-blocking read. The
+            // shell's main event loop calls recv() in a
+            // tight loop and handles the empty case itself;
+            // busy-polling here multiplies the per-iteration
+            // cost by RECV_MAX_POLLS (50 000) — each poll
+            // round-trips through the SAB ring → kernel-
+            // worker → response, so a no-op recv burns tens
+            // of seconds of wall time and starves the rest
+            // of the desktop. The watchdog (8s of zero
+            // console output) trips on this every time.
+            let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
+            if rc == 0 && nread > 0 {
+                return buf[..nread as usize].to_vec();
             }
             alloc::vec::Vec::new()
         }

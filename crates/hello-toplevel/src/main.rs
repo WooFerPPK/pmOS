@@ -68,11 +68,12 @@ mod wasm_main {
 
     pub struct FdConnection {
         fd: i32,
+        connected: core::cell::Cell<bool>,
     }
 
     impl FdConnection {
         pub fn new(fd: i32) -> Self {
-            FdConnection { fd }
+            FdConnection { fd, connected: core::cell::Cell::new(false) }
         }
     }
 
@@ -119,19 +120,28 @@ mod wasm_main {
                 buf_len: buf.len() as u32,
             };
             let mut nread: u32 = 0;
-            for _ in 0..RECV_MAX_POLLS {
-                let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
-                if rc == 0 && nread > 0 {
-                    return buf[..nread as usize].to_vec();
-                }
-                if rc == 0 || rc == EAGAIN {
-                    nread = 0;
-                    unsafe {
-                        let _ = sched_yield();
+            if !self.connected.get() {
+                for _ in 0..RECV_MAX_POLLS {
+                    let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
+                    if rc == 0 && nread > 0 {
+                        self.connected.set(true);
+                        return buf[..nread as usize].to_vec();
                     }
-                    continue;
+                    if rc == 0 || rc == EAGAIN {
+                        nread = 0;
+                        unsafe {
+                            let _ = sched_yield();
+                        }
+                        continue;
+                    }
+                    return alloc::vec::Vec::new();
                 }
                 return alloc::vec::Vec::new();
+            }
+            // Post-handshake: single non-blocking read.
+            let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
+            if rc == 0 && nread > 0 {
+                return buf[..nread as usize].to_vec();
             }
             alloc::vec::Vec::new()
         }
