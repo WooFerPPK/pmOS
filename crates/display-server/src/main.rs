@@ -298,47 +298,73 @@ unsafe fn drain_input_events(
     any
 }
 
-/// Present the server's composed framebuffer to `/dev/fb0`.
-/// Returns `true` on success; on a failed `fd_write` the
-/// caller decides whether to retry or exit.
+/// FB driver op code for set-mode (matches OP_SET_MODE in
+/// `web/src/drivers/fb.ts`).
+#[cfg(target_arch = "wasm32")]
+const FB_OP_SET_MODE: u8 = 0x01;
+/// FB driver op code for blit (matches OP_BLIT in
+/// `web/src/drivers/fb.ts`).
+#[cfg(target_arch = "wasm32")]
+const FB_OP_BLIT: u8 = 0x02;
+
+/// Send `OP_SET_MODE(width, height)` to the framebuffer
+/// driver. Called once at startup so the host-side renderer
+/// knows the framebuffer's pixel dimensions before the first
+/// blit lands. Payload layout (matching
+/// `crates/kernel/src/dev/mod.rs::framebuffer_write` +
+/// `web/src/drivers/fb.ts::handleSetMode`):
 ///
-/// Chunked write: the kernel's WASI heap-scratch window is
-/// 4 KiB per syscall (`HEAP_SCRATCH_SIZE` in
-/// `crates/kernel/src/wasm_entry.rs`), so the full
-/// framebuffer (3 MiB at 1024×768) must be split across many
-/// `fd_write` calls. The framebuffer driver's host side
-/// concatenates the chunks back into a single image at
-/// `OffscreenCanvas.transferToImageBitmap` time, so the
-/// chunking is transparent to the rendered frame.
+///   ```text
+///   [op:u8 = OP_SET_MODE] [width:u32 LE] [height:u32 LE]
+///   ```
+#[cfg(target_arch = "wasm32")]
+unsafe fn fb_set_mode(fb_fd: i32, width: u32, height: u32) -> bool {
+    let mut buf = [0u8; 9];
+    buf[0] = FB_OP_SET_MODE;
+    buf[1..5].copy_from_slice(&width.to_le_bytes());
+    buf[5..9].copy_from_slice(&height.to_le_bytes());
+    let iov = Ciovec {
+        buf: buf.as_ptr(),
+        buf_len: buf.len() as u32,
+    };
+    let mut written: u32 = 0;
+    let rc = fd_write(fb_fd, &iov, 1, &mut written);
+    rc == 0
+}
+
+/// Present the server's composed framebuffer to `/dev/fb0`
+/// as a single `OP_BLIT(width, height, rgba)` payload. The
+/// FB driver's TS side reads byte 0 as the op code, then
+/// expects an 8-byte (width, height) header followed by
+/// `width * height * 4` pixel bytes (RGBA). The kernel's
+/// `HEAP_SCRATCH_SIZE` (4 MiB) is large enough to land the
+/// full 1024×768 frame + header in one fd_write, so no
+/// chunking is needed.
+///
+/// Returns `true` on success.
 #[cfg(target_arch = "wasm32")]
 unsafe fn present_framebuffer(
     server: &display_server::Server,
     fb_fd: i32,
 ) -> bool {
-    /// 2 KiB per chunk — half of the kernel's
-    /// HEAP_SCRATCH_SIZE (4 KiB), leaving headroom for
-    /// future request-shape additions. Smaller chunks trade
-    /// more syscalls for safety against future heap-window
-    /// changes; 2 KiB is the v1 sweet spot for the kernel's
-    /// 4 KiB heap.
-    const CHUNK_BYTES: usize = 2 * 1024;
-    let pixels = server.framebuffer().pixels();
-    let mut offset = 0usize;
-    while offset < pixels.len() {
-        let end = core::cmp::min(offset + CHUNK_BYTES, pixels.len());
-        let slice = &pixels[offset..end];
-        let fb_iov = Ciovec {
-            buf: slice.as_ptr(),
-            buf_len: slice.len() as u32,
-        };
-        let mut written: u32 = 0;
-        let rc = fd_write(fb_fd, &fb_iov, 1, &mut written);
-        if rc != 0 {
-            return false;
-        }
-        offset = end;
-    }
-    true
+    let fb = server.framebuffer();
+    let width = fb.width();
+    let height = fb.height();
+    let pixels = fb.pixels();
+    // op (1 byte) + width (4 bytes) + height (4 bytes) +
+    // pixels (width*height*4 bytes).
+    let mut buf: Vec<u8> = Vec::with_capacity(9 + pixels.len());
+    buf.push(FB_OP_BLIT);
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.extend_from_slice(pixels);
+    let iov = Ciovec {
+        buf: buf.as_ptr(),
+        buf_len: buf.len() as u32,
+    };
+    let mut written: u32 = 0;
+    let rc = fd_write(fb_fd, &iov, 1, &mut written);
+    rc == 0
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -396,6 +422,18 @@ fn main() {
         // framebuffer + every client's surface tree.
         let mut server = display_server::Server::new();
         let mut i: u32 = 0;
+
+        // Tell the host-side framebuffer driver about the
+        // composed framebuffer's pixel dimensions BEFORE the
+        // first present. The FB driver's TS side
+        // (`web/src/drivers/fb.ts`) sizes its `OffscreenCanvas`
+        // off the SET_MODE width/height; subsequent BLIT ops
+        // must match these dimensions exactly.
+        let fb_w = server.framebuffer().width();
+        let fb_h = server.framebuffer().height();
+        if !fb_set_mode(fb_fd as i32, fb_w, fb_h) {
+            std::process::exit(16);
+        }
 
         'outer: loop {
             if poll_sigterm() {
