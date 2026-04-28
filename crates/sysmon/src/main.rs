@@ -1,24 +1,178 @@
-//! `/usr/bin/sysmon` — CLI snapshot of live processes (T170 partial).
+//! `/usr/bin/sysmon` — system monitor (T170).
 //!
-//! The tabbed graphical sysmon (T170..) is blocked on the toolkit
-//! `Container` widget + full frame-callback runtime, so this slice
-//! ships a debugging CLI that walks `/proc`, reads each
-//! `/proc/<pid>/status` file produced by the procfs source landed
-//! in T168, and prints a fixed-width process table. Same
-//! CLI-first / GUI-deferred pattern as the T184 settings slice.
-//! `--proc-root <dir>` overrides the default `/proc` so tests can
-//! drive the binary with a temp tree. Names longer than 16 chars
-//! are truncated with a trailing `…`. Malformed status files are
-//! skipped with a stderr warning so one broken pid cannot hide the
-//! rest of the table.
+//! Native build: a `--proc-root <dir>`-friendly CLI that walks
+//! `/proc`, reads each `/proc/<pid>/status`, and prints a
+//! fixed-width process table. Used by sysmon::tests::cli for
+//! the per-pid table assertions.
+//!
+//! WASI build (the shipped /usr/bin/sysmon binary): a real
+//! toolkit GUI window painting the same process table. Refresh
+//! is on first paint only for v1; the toolkit's frame-callback
+//! drive lands in a follow-up. The Terminate button + 1 s
+//! refresh tick from the original task spec depend on the
+//! toolkit pointer-event surface (T120 hooked it up; integration
+//! still pending) — defer to the next slice.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-const NAME_COL: usize = 16;
+use sysmon::{read_status, truncate_name};
+
+#[cfg(target_arch = "wasm32")]
+mod wasm_main {
+    use super::*;
+    use toolkit::draw::font::GLYPH_HEIGHT;
+    use toolkit::draw::{Color, Rect};
+    use toolkit::protocol::Connection;
+    use toolkit::{App, BufferPool, Window};
+
+    extern crate alloc;
+
+    #[link(wasm_import_module = "wasi_snapshot_preview1")]
+    extern "C" {
+        fn fd_read(fd: i32, iovs_ptr: *const Iovec, iovs_len: i32, nread_ptr: *mut u32) -> i32;
+        fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32)
+            -> i32;
+        fn sched_yield() -> i32;
+        fn proc_exit(rval: i32) -> !;
+    }
+
+    #[link(wasm_import_module = "pmos_ext")]
+    extern "C" {
+        fn display_connect() -> i32;
+    }
+
+    const EAGAIN: i32 = 6;
+    const EINVAL: i32 = 28;
+    const ECONNREFUSED: i32 = 14;
+    const RECV_MAX_POLLS: u32 = 50_000;
+    const CONNECT_MAX_POLLS: u32 = 50_000;
+
+    #[repr(C)]
+    pub struct Ciovec { pub buf: *const u8, pub buf_len: u32 }
+    #[repr(C)]
+    pub struct Iovec { pub buf: *mut u8, pub buf_len: u32 }
+
+    pub struct FdConnection { fd: i32, connected: core::cell::Cell<bool> }
+    impl FdConnection {
+        pub fn new(fd: i32) -> Self { FdConnection { fd, connected: core::cell::Cell::new(false) } }
+    }
+    impl Connection for FdConnection {
+        fn send(&mut self, bytes: &[u8]) {
+            if bytes.is_empty() { return; }
+            let mut sent = 0usize;
+            while sent < bytes.len() {
+                let remaining = &bytes[sent..];
+                let iov = Ciovec { buf: remaining.as_ptr(), buf_len: remaining.len() as u32 };
+                let mut nwritten: u32 = 0;
+                let rc = unsafe { fd_write(self.fd, &iov, 1, &mut nwritten) };
+                if rc == 0 && nwritten > 0 { sent += nwritten as usize; continue; }
+                if rc == 0 || rc == EAGAIN || rc == EINVAL { unsafe { let _ = sched_yield(); } continue; }
+                return;
+            }
+        }
+        fn drain_outbound(&mut self) -> alloc::vec::Vec<u8> { alloc::vec::Vec::new() }
+        fn recv(&mut self) -> alloc::vec::Vec<u8> {
+            let mut buf = [0u8; 4096];
+            let iov = Iovec { buf: buf.as_mut_ptr(), buf_len: buf.len() as u32 };
+            let mut nread: u32 = 0;
+            if !self.connected.get() {
+                for _ in 0..RECV_MAX_POLLS {
+                    let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
+                    if rc == 0 && nread > 0 { self.connected.set(true); return buf[..nread as usize].to_vec(); }
+                    if rc == 0 || rc == EAGAIN { nread = 0; unsafe { let _ = sched_yield(); } continue; }
+                    return alloc::vec::Vec::new();
+                }
+                return alloc::vec::Vec::new();
+            }
+            let rc = unsafe { fd_read(self.fd, &iov, 1, &mut nread) };
+            if rc == 0 && nread > 0 { return buf[..nread as usize].to_vec(); }
+            alloc::vec::Vec::new()
+        }
+    }
+
+    pub fn run() -> ! {
+        println!("sysmon: starting");
+        let mut fd: i32 = -1;
+        for _ in 0..CONNECT_MAX_POLLS {
+            let rc = unsafe { display_connect() };
+            if rc >= 0 { fd = rc; break; }
+            if rc == -ECONNREFUSED { unsafe { let _ = sched_yield(); } continue; }
+            unsafe { proc_exit(-rc) };
+        }
+        if fd < 0 { unsafe { proc_exit(ECONNREFUSED) }; }
+        let conn = FdConnection::new(fd);
+        match run_window(conn) {
+            Ok(_) => unsafe { proc_exit(0) },
+            Err(_) => unsafe { proc_exit(1) },
+        }
+    }
+
+    fn run_window<C: Connection>(connection: C) -> Result<(), toolkit::ClientError> {
+        let mut app = App::connect(connection)?;
+        let mut window = Window::new(&mut app)?;
+        window.set_title("System Monitor")?;
+        window.set_app_id("pmos.sysmon")?;
+        window.commit()?;
+
+        let snapshot = sysmon::collect_snapshot(&PathBuf::from("/proc"));
+        let mut painted = false;
+        loop {
+            let _ = window.dispatch()?;
+            if window.close_requested() { return Ok(()); }
+            if !painted && window.is_configured() {
+                let (w, h) = (480u32, 320u32);
+                let mut pool: BufferPool = BufferPool::new(window.app_mut(), w, h)?;
+                if let Some(mut canvas) = pool.acquire_back_canvas() {
+                    let bg = Color::rgb(0xfa, 0xfa, 0xfa);
+                    let titlebar = Color::rgb(0x60, 0x40, 0x40);
+                    let header_bg = Color::rgb(0xe0, 0xe0, 0xe4);
+                    let row_alt = Color::rgb(0xf2, 0xf2, 0xf6);
+                    let text_fg = Color::rgb(0x10, 0x10, 0x10);
+
+                    canvas.fill_rect(Rect { x: 0, y: 0, width: w, height: h }, bg);
+                    let titlebar_h = 22u32;
+                    canvas.fill_rect(Rect { x: 0, y: 0, width: w, height: titlebar_h }, titlebar);
+                    canvas.draw_text(8, ((titlebar_h as i32 - GLYPH_HEIGHT as i32) / 2).max(0), "System Monitor", Color::rgb(0xff, 0xff, 0xff));
+
+                    // Header.
+                    let row_h = 14;
+                    let header_y = titlebar_h as i32 + 4;
+                    canvas.fill_rect(Rect { x: 0, y: header_y, width: w, height: row_h as u32 }, header_bg);
+                    canvas.draw_text(8, header_y + 2, "PID    NAME              STATE       PPID", text_fg);
+
+                    // Rows.
+                    let mut y = header_y + row_h + 2;
+                    for (i, line) in snapshot.iter().take(20).enumerate() {
+                        if i % 2 == 1 {
+                            canvas.fill_rect(Rect { x: 0, y, width: w, height: row_h as u32 }, row_alt);
+                        }
+                        canvas.draw_text(8, y + 2, line, text_fg);
+                        y += row_h;
+                    }
+                    drop(canvas);
+                    pool.commit_and_swap(&mut window)?;
+                    painted = true;
+                }
+            }
+        }
+    }
+}
 
 fn main() -> ExitCode {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_main::run();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        run_cli()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_cli() -> ExitCode {
     let proc_root = match parse_args() {
         Ok(p) => p,
         Err(e) => {
@@ -83,46 +237,3 @@ fn parse_args() -> Result<PathBuf, String> {
     Ok(proc_root.unwrap_or_else(|| PathBuf::from("/proc")))
 }
 
-struct StatusSnapshot {
-    name: String,
-    state: String,
-    ppid: u32,
-}
-
-fn read_status(path: &Path) -> Result<StatusSnapshot, String> {
-    let bytes = fs::read(path).map_err(|e| format!("io: {}", e))?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| String::from("not utf-8"))?;
-
-    let mut name: Option<String> = None;
-    let mut state: Option<String> = None;
-    let mut pid: Option<u32> = None;
-    let mut ppid: Option<u32> = None;
-
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("Name:\t") {
-            name = Some(v.to_string());
-        } else if let Some(v) = line.strip_prefix("State:\t") {
-            state = Some(v.to_string());
-        } else if let Some(v) = line.strip_prefix("Pid:\t") {
-            pid = Some(v.parse::<u32>().map_err(|_| String::from("bad Pid"))?);
-        } else if let Some(v) = line.strip_prefix("PPid:\t") {
-            ppid = Some(v.parse::<u32>().map_err(|_| String::from("bad PPid"))?);
-        }
-    }
-
-    let name = name.ok_or_else(|| String::from("missing Name"))?;
-    let state = state.ok_or_else(|| String::from("missing State"))?;
-    let _ = pid.ok_or_else(|| String::from("missing Pid"))?;
-    let ppid = ppid.ok_or_else(|| String::from("missing PPid"))?;
-
-    Ok(StatusSnapshot { name, state, ppid })
-}
-
-fn truncate_name(name: &str) -> String {
-    if name.chars().count() <= NAME_COL {
-        return name.to_string();
-    }
-    let mut out: String = name.chars().take(NAME_COL - 1).collect();
-    out.push('…');
-    out
-}

@@ -114,6 +114,7 @@ const USERLAND_BINS: &[(&str, &str)] = &[
     ("display-server", "display-server"),
     ("display-client-demo", "display-client-demo"),
     ("shell", "shell"),
+    ("alt-shell", "alt-shell"),
     ("sh", "sh"),
     ("term", "term"),
     ("files", "files"),

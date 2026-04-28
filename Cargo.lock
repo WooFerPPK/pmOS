@@ -7,6 +7,15 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "alt-shell"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "shell",
+ "toolkit",
+]
+
+[[package]]
 name = "coreutils"
 version = "0.1.0"
 

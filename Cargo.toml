@@ -11,6 +11,7 @@ members = [
     "crates/display-client-demo",
     "crates/toolkit",
     "crates/shell",
+    "crates/alt-shell",
     "crates/sh",
     "crates/term",
     "crates/files",
