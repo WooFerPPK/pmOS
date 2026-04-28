@@ -1,7 +1,9 @@
 {
-  "version": 34,
+  "version": 35,
   "assets": [
     "_headers",
+    "assets/CREDITS.txt",
+    "assets/LICENSE.txt",
     "assets/bin/alt-shell.wasm",
     "assets/bin/cat.wasm",
     "assets/bin/cp.wasm",
@@ -54,10 +56,22 @@
     "assets/bin/uniq.wasm",
     "assets/bin/wc.wasm",
     "assets/bootstrap.js",
+    "assets/fonts/pc-vga-16.pbm",
+    "assets/fonts/unifont-mono-14.pbm",
     "assets/hello.wasm",
     "assets/kernel-worker.js",
     "assets/kernel.wasm",
+    "assets/keymaps/dvorak.bin",
+    "assets/keymaps/uk-qwerty.bin",
+    "assets/keymaps/us-qwerty.bin",
     "assets/user-worker.js",
+    "assets/wallpapers/blue.png",
+    "assets/wallpapers/dark.png",
+    "assets/wallpapers/green.png",
+    "assets/zoneinfo/America_New_York",
+    "assets/zoneinfo/Asia_Tokyo",
+    "assets/zoneinfo/Europe_London",
+    "assets/zoneinfo/UTC",
     "index.html",
     "sw.js"
   ]

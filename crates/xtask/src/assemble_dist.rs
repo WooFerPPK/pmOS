@@ -83,6 +83,36 @@ fn run_inner() -> Result<()> {
         copy_optional(&src, &dst, &mut manifest_paths);
     }
 
+    // 4b. Bundled assets: wallpapers + keymaps + fonts + zoneinfo +
+    //     LICENSE/CREDITS. Copied recursively into dist/assets/.
+    let asset_trees: &[(&str, &str)] = &[
+        ("crates/kernel/assets/usr/share/wallpapers", "assets/wallpapers"),
+        ("crates/display-server/assets/keymaps", "assets/keymaps"),
+        ("crates/term/assets/fonts", "assets/fonts"),
+        ("crates/kernel/assets/etc/zoneinfo", "assets/zoneinfo"),
+    ];
+    for (src_dir, dst_dir) in asset_trees {
+        let src = repo_root.join(src_dir);
+        if !src.is_dir() {
+            continue;
+        }
+        let dst_dir_path = dist.join(dst_dir);
+        let _ = fs::create_dir_all(&dst_dir_path);
+        for entry in fs::read_dir(&src)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let name = entry.file_name();
+                let dst_path = dst_dir_path.join(&name);
+                copy_optional(&path, &dst_path, &mut manifest_paths);
+            }
+        }
+    }
+    for doc in &["LICENSE.txt", "CREDITS.txt"] {
+        let src = repo_root.join("crates/kernel/assets").join(doc);
+        copy_optional(&src, &dist_assets.join(doc), &mut manifest_paths);
+    }
+
     // 5. _headers file (Cloudflare Pages / Netlify format). The full
     //    set the demo path established: COOP/COEP for cross-origin
     //    isolation (required for SAB + Atomics.wait), plus a
@@ -205,7 +235,7 @@ fn dst_relative(dst: &Path) -> String {
 }
 
 fn build_manifest_json(paths: &[String]) -> String {
-    let mut s = String::from("{\n  \"version\": 34,\n  \"assets\": [\n");
+    let mut s = String::from("{\n  \"version\": 35,\n  \"assets\": [\n");
     for (i, p) in paths.iter().enumerate() {
         s.push_str("    \"");
         for c in p.chars() {
