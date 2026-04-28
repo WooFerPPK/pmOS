@@ -15,13 +15,15 @@
 //! stdout/stderr are appended to scrollback directly — there
 //! is no kernel round-trip.
 //!
-//! A future slice (Phase 4 T132 wiring) will wrap this library
-//! in a `toolkit::Client` so the terminal becomes a real
-//! display-protocol surface hosted by the display server; at
-//! that point the bin driver will grow from the stdin REPL
-//! below to a full window-hosted renderer.
+//! [`run::run_term`] is the production-facing entry point: it
+//! connects to the display server through the supplied
+//! [`toolkit::Connection`], drives the toolkit window event
+//! loop, and routes `pmd_keyboard.key` events through the
+//! per-key scancode table in [`keymap`].
 
+pub mod keymap;
 pub mod rasterizer;
+pub mod run;
 pub mod session;
 pub mod terminal;
 
@@ -32,10 +34,12 @@ pub use sh::{Shell, ShellOutput};
 // with the existing `term::CELL_HEIGHT` / `GLYPH_WIDTH`
 // usage sites.
 pub use toolkit::draw::font::{CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
+pub use keymap::{translate as translate_scancode, Modifiers};
 pub use rasterizer::{
     colors, rasterize_snapshot, rasterize_snapshot_with_palette, Palette, BYTES_PER_PIXEL,
     PADDING,
 };
+pub use run::{run_term, run_term_with_options, TermExit, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 pub use session::{
     GlobalEntry, ProtocolErrorNotice, Session, SessionError, SessionStep,
     INTERESTING_INTERFACES,

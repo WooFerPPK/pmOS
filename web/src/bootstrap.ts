@@ -25,8 +25,10 @@ import type { FbFrame } from "./fb-host";
 import { FbRenderer } from "./fb-renderer";
 import { SAB_SIZE } from "./shared/sab-layout";
 import {
+  KbdKeyState,
   MouseButton,
   MouseButtonState,
+  packKbdEvent,
   packMouseButton,
   packMouseMotion,
 } from "./shared/input-proto";
@@ -861,6 +863,53 @@ function createKernelSession(): KernelSession {
  *   * `Enter` → `\n`
  *   * `Backspace` → `\x7f` (DEL)
  */
+/**
+ * Translate a DOM `KeyboardEvent.code` into its USB HID
+ * scancode — the same `display_server::Scancode` enum the
+ * display-server's `inject_keyboard_key` and the term's
+ * `term::keymap::translate` both speak. Returns null for
+ * unmapped codes (F-keys, arrows, IME composition keys, etc.)
+ * so the caller can fall through to the browser's default
+ * handling.
+ */
+function domCodeToScancode(code: string): number | null {
+  if (code.length === 4 && code.startsWith("Key")) {
+    const ch = code.charCodeAt(3);
+    if (ch >= 65 /* 'A' */ && ch <= 90 /* 'Z' */) {
+      return 0x04 + (ch - 65);
+    }
+  }
+  if (code.length === 6 && code.startsWith("Digit")) {
+    const ch = code.charCodeAt(5);
+    if (ch === 48 /* '0' */) return 0x27;
+    if (ch >= 49 /* '1' */ && ch <= 57 /* '9' */) {
+      return 0x1e + (ch - 49);
+    }
+  }
+  switch (code) {
+    case "Enter": return 0x28;
+    case "Backspace": return 0x2a;
+    case "Tab": return 0x2b;
+    case "Space": return 0x2c;
+    case "Minus": return 0x2d;
+    case "Equal": return 0x2e;
+    case "BracketLeft": return 0x2f;
+    case "BracketRight": return 0x30;
+    case "Backslash": return 0x31;
+    case "Semicolon": return 0x33;
+    case "Quote": return 0x34;
+    case "Backquote": return 0x35;
+    case "Comma": return 0x36;
+    case "Period": return 0x37;
+    case "Slash": return 0x38;
+    case "ShiftLeft": return 0xe1;
+    case "ShiftRight": return 0xe5;
+    case "ControlLeft": return 0xe0;
+    case "ControlRight": return 0xe4;
+    default: return null;
+  }
+}
+
 function keyToBytes(key: string): Uint8Array | null {
   if (key === "Enter") {
     return new Uint8Array([0x0a]);
@@ -1141,6 +1190,37 @@ function runRealKernelMode(bootBinary: string): void {
       canvas.addEventListener("contextmenu", (event) => {
         event.preventDefault();
       });
+
+      // Keyboard input for the GUI desktop. The display-server
+      // reads `/dev/input_kbd` as packed 8-byte
+      // `(scancode_u32_le, state_u32_le)` records via
+      // `drain_kbd_events_into`; anything shorter is silently
+      // dropped. Convert each `KeyboardEvent.code` to its USB
+      // HID scancode (matching `display_server::Scancode`),
+      // pack via `packKbdEvent`, and post on both keydown +
+      // keyup so modifier transitions track on the term side.
+      window.addEventListener("keydown", (event) => {
+        const sc = domCodeToScancode(event.code);
+        if (sc === null) return;
+        // Ctrl/Meta/Alt chords stay with the browser (refresh,
+        // devtools, etc.); Shift is a real modifier the term
+        // tracks itself, so we let it pass through.
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        event.preventDefault();
+        worker.postMessage({
+          kind: "input:kbd",
+          bytes: packKbdEvent(sc, KbdKeyState.Pressed),
+        } satisfies MainToKernel);
+      });
+      window.addEventListener("keyup", (event) => {
+        const sc = domCodeToScancode(event.code);
+        if (sc === null) return;
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        worker.postMessage({
+          kind: "input:kbd",
+          bytes: packKbdEvent(sc, KbdKeyState.Released),
+        } satisfies MainToKernel);
+      });
     }
   }
 
@@ -1312,21 +1392,32 @@ function runRealKernelMode(bootBinary: string): void {
   // the bytes in `/dev/input_kbd`. A user process polling `fd_read` on
   // the node (e.g. `/bin/hello_input_echo` under `#input-echo`) picks
   // them up on its next iteration.
-  document.addEventListener("keydown", (event: KeyboardEvent) => {
-    // Ignore modifier-heavy chords (Ctrl+R, Cmd+S, etc.) so the
-    // browser shortcut path still works. F-keys and similar non-
-    // printable keys fall through `keyToBytes` as `null` too.
-    if (event.ctrlKey || event.metaKey || event.altKey) {
-      return;
-    }
-    const bytes = keyToBytes(event.key);
-    if (bytes === null) {
-      return;
-    }
-    event.preventDefault();
-    const msg: MainToKernel = { kind: "input:kbd", bytes };
-    worker.postMessage(msg);
-  });
+  // Legacy UTF-8 keydown path for non-GUI boots
+  // (`hello_input_echo` etc., where a userland process reads
+  // raw character bytes off `/dev/input_kbd`). GUI boots
+  // (init-desktop) install their own scancode-encoded path
+  // above so the display-server's 8-byte
+  // `drain_kbd_events_into` parser sees the right format;
+  // running both at once would interleave incompatible
+  // records in the ring buffer.
+  if (!isGuiBoot) {
+    document.addEventListener("keydown", (event: KeyboardEvent) => {
+      // Ignore modifier-heavy chords (Ctrl+R, Cmd+S, etc.) so
+      // the browser shortcut path still works. F-keys and
+      // similar non-printable keys fall through `keyToBytes`
+      // as `null` too.
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+      const bytes = keyToBytes(event.key);
+      if (bytes === null) {
+        return;
+      }
+      event.preventDefault();
+      const msg: MainToKernel = { kind: "input:kbd", bytes };
+      worker.postMessage(msg);
+    });
+  }
 
   // T137: pagehide-driven persistence sync. The kernel's per-process
   // proc_exit hook covers normal exits; this covers the "user closes

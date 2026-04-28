@@ -57,6 +57,13 @@ pub struct App<C: Connection> {
     /// holds `Cap::Shell`. The desktop shell uses this to
     /// subscribe to window-list events.
     shell_manager: Option<ObjectId>,
+    /// Optional `pmd_keyboard` binding allocated via
+    /// `pmd_seat.get_keyboard`. Populated by
+    /// [`App::connect_with_shell`] when the server advertised
+    /// the seat global. Apps that need text input (the term,
+    /// the editor's eventual edit mode, …) read keypress events
+    /// off the dispatch stream tagged with this object id.
+    keyboard: Option<ObjectId>,
 }
 
 impl<C: Connection> App<C> {
@@ -153,6 +160,7 @@ impl<C: Connection> App<C> {
             seat: None,
             pointer: None,
             shell_manager: None,
+            keyboard: None,
         })
     }
 
@@ -229,6 +237,18 @@ impl<C: Connection> App<C> {
         } else {
             None
         };
+        let keyboard = if let Some(seat_id) = seat {
+            // pmd_seat.get_keyboard(new_id) — opcode 2 on Seat.
+            let new_id = client.bind_new(Interface::Keyboard)?;
+            client.send_request(
+                seat_id,
+                2, /* get_keyboard */
+                &new_id.raw().to_le_bytes(),
+            )?;
+            Some(new_id)
+        } else {
+            None
+        };
         let shell_manager = Self::bind_optional(
             &mut client,
             registry_id,
@@ -245,6 +265,7 @@ impl<C: Connection> App<C> {
             seat,
             pointer,
             shell_manager,
+            keyboard,
         })
     }
 
@@ -327,6 +348,16 @@ impl<C: Connection> App<C> {
     /// [`App::connect`] was used.
     pub fn shell_manager(&self) -> Option<ObjectId> {
         self.shell_manager
+    }
+
+    /// Accessor for the bound `pmd_keyboard` object, if any.
+    /// Allocated by `pmd_seat.get_keyboard` during
+    /// [`App::connect_with_shell`]; keyboard events arrive
+    /// via [`App::dispatch`] tagged with this object id.
+    /// `None` when the server didn't advertise a seat or
+    /// [`App::connect`] was used.
+    pub fn keyboard(&self) -> Option<ObjectId> {
+        self.keyboard
     }
 
     /// Send `pmd_shell_manager.subscribe_windows()`. After
