@@ -333,6 +333,18 @@ function packMouseEvent(kind, x, y, button, state) {
   view.setUint32(16, state, true);
   return out;
 }
+var KBD_EVENT_SIZE = 8;
+var KbdKeyState = {
+  Released: 0,
+  Pressed: 1
+};
+function packKbdEvent(key, state) {
+  const out = new Uint8Array(KBD_EVENT_SIZE);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, key, true);
+  view.setUint32(4, state, true);
+  return out;
+}
 
 // src/bootstrap.ts
 var BOOT_VERSION = "0.1.0-demo";
@@ -853,6 +865,63 @@ function createKernelSession() {
   );
   return { worker, console: consoleHost, fb: fbHost };
 }
+function domCodeToScancode(code) {
+  if (code.length === 4 && code.startsWith("Key")) {
+    const ch = code.charCodeAt(3);
+    if (ch >= 65 && ch <= 90) {
+      return 4 + (ch - 65);
+    }
+  }
+  if (code.length === 6 && code.startsWith("Digit")) {
+    const ch = code.charCodeAt(5);
+    if (ch === 48) return 39;
+    if (ch >= 49 && ch <= 57) {
+      return 30 + (ch - 49);
+    }
+  }
+  switch (code) {
+    case "Enter":
+      return 40;
+    case "Backspace":
+      return 42;
+    case "Tab":
+      return 43;
+    case "Space":
+      return 44;
+    case "Minus":
+      return 45;
+    case "Equal":
+      return 46;
+    case "BracketLeft":
+      return 47;
+    case "BracketRight":
+      return 48;
+    case "Backslash":
+      return 49;
+    case "Semicolon":
+      return 51;
+    case "Quote":
+      return 52;
+    case "Backquote":
+      return 53;
+    case "Comma":
+      return 54;
+    case "Period":
+      return 55;
+    case "Slash":
+      return 56;
+    case "ShiftLeft":
+      return 225;
+    case "ShiftRight":
+      return 229;
+    case "ControlLeft":
+      return 224;
+    case "ControlRight":
+      return 228;
+    default:
+      return null;
+  }
+}
 function keyToBytes(key) {
   if (key === "Enter") {
     return new Uint8Array([10]);
@@ -1040,6 +1109,25 @@ function runRealKernelMode(bootBinary) {
       canvas.addEventListener("contextmenu", (event) => {
         event.preventDefault();
       });
+      window.addEventListener("keydown", (event) => {
+        const sc = domCodeToScancode(event.code);
+        if (sc === null) return;
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        event.preventDefault();
+        worker.postMessage({
+          kind: "input:kbd",
+          bytes: packKbdEvent(sc, KbdKeyState.Pressed)
+        });
+      });
+      window.addEventListener("keyup", (event) => {
+        const sc = domCodeToScancode(event.code);
+        if (sc === null) return;
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        worker.postMessage({
+          kind: "input:kbd",
+          bytes: packKbdEvent(sc, KbdKeyState.Released)
+        });
+      });
     }
   }
   let kernelWakeSlot = null;
@@ -1154,19 +1242,22 @@ function runRealKernelMode(bootBinary) {
       });
     }
   });
-  document.addEventListener("keydown", (event) => {
-    if (event.ctrlKey || event.metaKey || event.altKey) {
-      return;
-    }
-    const bytes = keyToBytes(event.key);
-    if (bytes === null) {
-      return;
-    }
-    event.preventDefault();
-    const msg = { kind: "input:kbd", bytes };
-    worker.postMessage(msg);
-  });
+  if (!isGuiBoot) {
+    document.addEventListener("keydown", (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+      const bytes = keyToBytes(event.key);
+      if (bytes === null) {
+        return;
+      }
+      event.preventDefault();
+      const msg = { kind: "input:kbd", bytes };
+      worker.postMessage(msg);
+    });
+  }
   installPagehideSync(worker);
+  installBeforeUnloadSync(worker);
   installPeriodicSync(worker);
 }
 function mountRealKernelConsole(gui = false) {
@@ -1615,6 +1706,13 @@ function installPagehideSync(kernelWorker, target = window) {
   target.addEventListener("pagehide", listener);
   return listener;
 }
+function installBeforeUnloadSync(kernelWorker, target = window) {
+  const listener = () => {
+    kernelWorker.postMessage({ kind: "sync:request" });
+  };
+  target.addEventListener("beforeunload", listener);
+  return listener;
+}
 function installPeriodicSync(kernelWorker, intervalMs = 6e4, scheduler = {
   setInterval: (h, ms) => globalThis.setInterval(h, ms),
   clearInterval: (h) => globalThis.clearInterval(h)
@@ -1713,6 +1811,7 @@ export {
   createSpawnRouter,
   hasAtomicsWait,
   hasOpfs,
+  installBeforeUnloadSync,
   installPagehideSync,
   installPeriodicSync,
   isCrossOriginIsolated,
