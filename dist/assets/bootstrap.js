@@ -336,6 +336,31 @@ function packMouseEvent(kind, x, y, button, state) {
 
 // src/bootstrap.ts
 var BOOT_VERSION = "0.1.0-demo";
+var EXPECTED_MANIFEST_VERSION = 39;
+async function ensureFreshBootstrap() {
+  try {
+    const resp = await fetch("/manifest.json", { cache: "no-store" });
+    if (!resp.ok) return;
+    const json = await resp.json();
+    if (typeof json.version !== "number") return;
+    if (json.version > EXPECTED_MANIFEST_VERSION) {
+      console.log(
+        `[pmos-bootstrap] cached bootstrap is stale (built for v${EXPECTED_MANIFEST_VERSION}, deployed v${json.version}); reloading`
+      );
+      if ("caches" in self) {
+        try {
+          const names = await caches.keys();
+          await Promise.all(
+            names.filter((n) => n.startsWith("pmos-")).map((n) => caches.delete(n))
+          );
+        } catch {
+        }
+      }
+      window.location.reload();
+    }
+  } catch {
+  }
+}
 function hasSharedArrayBuffer() {
   return typeof SharedArrayBuffer !== "undefined";
 }
@@ -489,6 +514,7 @@ function paintBoot(c, rows, animationFrame) {
 }
 function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
+  void ensureFreshBootstrap();
   if (!window.location.hash.includes("mock-kernel")) {
     const hash = window.location.hash;
     let bootBinary;

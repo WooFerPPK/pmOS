@@ -39,6 +39,52 @@ import type {
 
 const BOOT_VERSION = "0.1.0-demo";
 
+/**
+ * Manifest version this bundle expects to match. Bumped in lock
+ * step with `xtask assemble-dist`'s manifest.json `version` field
+ * so a stale-cached bootstrap.js can detect that the deployed
+ * dist/ has moved past it and force a fresh load. Without this,
+ * a service-worker cache that hadn't yet swapped to the new
+ * generation would keep running the old bootstrap forever.
+ */
+const EXPECTED_MANIFEST_VERSION = 39;
+
+/**
+ * Fetch /manifest.json (bypassing the SW cache) and reload the
+ * page if the deployed manifest has moved past the version this
+ * bundle was built against. Best-effort: any failure (offline,
+ * non-2xx, malformed) skips the reload silently and lets the
+ * normal boot continue.
+ */
+async function ensureFreshBootstrap(): Promise<void> {
+  try {
+    const resp = await fetch("/manifest.json", { cache: "no-store" });
+    if (!resp.ok) return;
+    const json = (await resp.json()) as { version?: number };
+    if (typeof json.version !== "number") return;
+    if (json.version > EXPECTED_MANIFEST_VERSION) {
+      console.log(
+        `[pmos-bootstrap] cached bootstrap is stale (built for v${EXPECTED_MANIFEST_VERSION}, deployed v${json.version}); reloading`,
+      );
+      // Wipe every pmos-* SW cache so the fresh bootstrap.js is
+      // fetched from the network on the reload, then reload.
+      if ("caches" in self) {
+        try {
+          const names = await caches.keys();
+          await Promise.all(
+            names.filter((n) => n.startsWith("pmos-")).map((n) => caches.delete(n)),
+          );
+        } catch {
+          // best-effort
+        }
+      }
+      window.location.reload();
+    }
+  } catch {
+    // best-effort
+  }
+}
+
 type CheckStatus = "pending" | "running" | "ok" | "fail" | "warn" | "stalled";
 
 interface CheckRow {
@@ -299,6 +345,15 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
 
 function main(): void {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
+
+  // Stale-cache guard: if the SW served an older bootstrap.js
+  // than what's currently deployed, reload immediately so we
+  // don't run code the dist has moved past. Fires before any
+  // user-visible boot work so the reload feels instantaneous.
+  // Async + fire-and-forget; the normal boot continues in
+  // parallel and either completes (versions match) or gets
+  // pre-empted by the reload.
+  void ensureFreshBootstrap();
 
   // Boot-to-desktop is the default boot path: bare URL spawns
   // `/bin/init-desktop`, which spawns the real display-server +
