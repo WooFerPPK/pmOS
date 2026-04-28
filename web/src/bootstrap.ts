@@ -1333,6 +1333,11 @@ function runRealKernelMode(bootBinary: string): void {
   // the tab while a process is mid-flight" case so OPFS-backed
   // mutations are not lost.
   installPagehideSync(worker);
+  // T137 follow-up: beforeunload as a secondary fallback. Some
+  // older browser embeddings skip pagehide on certain navigation
+  // paths; both wire to the same `sync:request` and the kernel
+  // dedupes a flush against a clean VFS.
+  installBeforeUnloadSync(worker);
   // T137 follow-up: periodic sync for long-running tabs. 60s default
   // trades I/O frequency against window-of-loss size — a hard browser
   // crash loses at most one minute of writes.
@@ -2045,6 +2050,52 @@ export function installPagehideSync(
     kernelWorker.postMessage({ kind: "sync:request" });
   };
   target.addEventListener("pagehide", listener);
+  return listener;
+}
+
+/**
+ * Subset of `EventTarget` needed by
+ * [`installBeforeUnloadSync`] — production code passes `window`,
+ * tests pass a stub that captures the listener and fires it on
+ * demand.
+ */
+export interface BeforeUnloadTarget {
+  addEventListener(
+    type: "beforeunload",
+    listener: () => void,
+  ): void;
+}
+
+/**
+ * Secondary `beforeunload` fallback for [`installPagehideSync`].
+ *
+ * In every modern browser, `pagehide` is the lifecycle event the
+ * platform guarantees fires on tab close. But the platform also
+ * documents two cases where `pagehide` may NOT fire:
+ *
+ *   * The browser was force-killed (OS kill, OOM, hard crash) —
+ *     no JS event of any kind runs. No fallback can rescue this.
+ *   * Some chromium-derived embeddings (older webview builds) skip
+ *     `pagehide` on certain navigation paths. `beforeunload` runs
+ *     in those, and is the documented secondary fallback.
+ *
+ * Both events fire identically into the same `sync:request` post,
+ * so the worst case is a duplicate flush — which the kernel's
+ * `kernel_sync_all` handles cleanly: a flush against a non-dirty
+ * VFS is a constant-time no-op (the dirty set is empty).
+ *
+ * Note: we deliberately do NOT call `event.preventDefault()` or
+ * set `returnValue` — the goal is a silent flush, not a "are you
+ * sure?" UI prompt.
+ */
+export function installBeforeUnloadSync(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  target: BeforeUnloadTarget = window,
+): () => void {
+  const listener = (): void => {
+    kernelWorker.postMessage({ kind: "sync:request" });
+  };
+  target.addEventListener("beforeunload", listener);
   return listener;
 }
 

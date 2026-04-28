@@ -288,6 +288,14 @@ pub struct Kernel {
     /// `FdObject` to the streaming state — no per-fd allocation
     /// beyond the table entry.
     pub(crate) host_file_fds: BTreeMap<u32, HostFileFd>,
+    /// Coarse flush policy that gates `vfs.sync_dirty()` on the
+    /// proc_exit and periodic-sync paths. See
+    /// [`crate::fs::opfs::flush::FlushPolicy`] for the contract;
+    /// every VFS mutation that marks a mount dirty also calls
+    /// [`FlushPolicy::record_dirty`], so by the time a periodic
+    /// sync ticks the policy already knows whether there's work
+    /// pending.
+    pub flush_policy: crate::fs::opfs::flush::FlushPolicy,
 }
 
 /// Optional heap payload attached to a pending wake. Slice 2c.1.
@@ -377,6 +385,7 @@ impl Kernel {
             parked_recvers: alloc::collections::BTreeMap::new(),
             host_files: BTreeMap::new(),
             host_file_fds: BTreeMap::new(),
+            flush_policy: crate::fs::opfs::flush::FlushPolicy::new(),
         }
     }
 
@@ -548,6 +557,7 @@ impl Kernel {
                 }
                 NodeType::RegularFile => {
                     self.vfs.truncate_ino(mount_id, ino, 0)?;
+                    self.flush_policy.record_dirty();
                 }
                 _ => {
                     // Non-regular, non-directory targets (char devices,
@@ -731,6 +741,10 @@ impl Kernel {
                         // distinguish them and a watcher waiting on
                         // a touch() probe would otherwise miss it.
                         self.notify_modify(mount_id, ino);
+                        // T136: bump the flush policy so the
+                        // periodic-sync path sees the pending
+                        // dirty work.
+                        self.flush_policy.record_dirty();
                         Ok(n)
                     }
                     Err(e) => Err(KernelError::Fs(e)),
@@ -1858,7 +1872,14 @@ impl Kernel {
         // its descriptors. Exit must still complete if a flush
         // fails; recovery/reporting for a failed OPFS flush belongs
         // to the storage driver follow-up.
-        let _ = self.vfs.sync_dirty();
+        //
+        // T136: route through `flush_policy.flush_now` so the
+        // policy state stays in sync (dirty-event counter resets,
+        // last_flush_ns advances) even when the periodic threshold
+        // hasn't fired yet. proc_exit is a hard barrier — the
+        // process is going away, flush regardless of policy.
+        let now = crate::platform::current().now_realtime_ns();
+        let _ = self.flush_policy.flush_now(&mut self.vfs, now);
         self.release_fd_table_resources(pid);
         let ppid = self.procs.get(pid).map(|p| p.ppid).unwrap_or(0);
         self.procs
@@ -2796,6 +2817,7 @@ impl Kernel {
     /// notify — there is no event to report.
     pub fn vfs_create(&mut self, abs_path: &str, mode: u32) -> Result<Ino, FsError> {
         let new_ino = self.vfs.create(abs_path, mode)?;
+        self.flush_policy.record_dirty();
         // Resolve parent AFTER the successful create. A
         // mutation-time resolve_parent failure (which would happen
         // if the path were truly malformed) is impossible here:
@@ -2821,6 +2843,7 @@ impl Kernel {
     /// `WATCH_CREATE` and the new directory's inode.
     pub fn vfs_mkdir(&mut self, abs_path: &str, mode: u32) -> Result<Ino, FsError> {
         let new_ino = self.vfs.mkdir(abs_path, mode)?;
+        self.flush_policy.record_dirty();
         if let Ok((mount_id, parent_ino, _)) = self.vfs.resolve_parent(abs_path) {
             self.vfs.notify(
                 mount_id,
@@ -2854,6 +2877,7 @@ impl Kernel {
             None
         };
         self.vfs.unlink(abs_path)?;
+        self.flush_policy.record_dirty();
         if let (Some((mount_id, child_ino)), Ok((_, parent_ino, _))) =
             (pre_inode, self.vfs.resolve_parent(abs_path))
         {
@@ -2880,6 +2904,7 @@ impl Kernel {
             None
         };
         self.vfs.rmdir(abs_path)?;
+        self.flush_policy.record_dirty();
         if let (Some((mount_id, child_ino)), Ok((_, parent_ino, _))) =
             (pre_inode, self.vfs.resolve_parent(abs_path))
         {

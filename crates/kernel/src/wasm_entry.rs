@@ -645,7 +645,17 @@ pub extern "C" fn kernel_record_process_memory(pid: Pid, bytes_lo: u32, bytes_hi
 #[no_mangle]
 pub extern "C" fn kernel_sync_all() -> i32 {
     let kernel = kernel_mut();
-    if kernel.vfs.sync_dirty().is_ok() {
+    // T136: route through `flush_policy.flush_now` so the policy
+    // state stays in sync (dirty-event counter resets, last_flush_ns
+    // advances) — both the periodic-sync tick and the pagehide
+    // last-gasp landing land here, and the policy is what tells
+    // proc_exit "no flush needed, you just did one 200 ms ago".
+    let now = crate::platform::current().now_realtime_ns();
+    if kernel
+        .flush_policy
+        .flush_now(&mut kernel.vfs, now)
+        .is_ok()
+    {
         0
     } else {
         -1

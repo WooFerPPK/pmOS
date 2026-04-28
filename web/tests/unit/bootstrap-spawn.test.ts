@@ -344,6 +344,75 @@ describe("installPagehideSync", () => {
   });
 });
 
+describe("installBeforeUnloadSync", () => {
+  interface FakeBeforeUnloadTarget {
+    readonly listeners: Array<() => void>;
+    addEventListener(type: "beforeunload", listener: () => void): void;
+  }
+  function makeFakeTarget(): FakeBeforeUnloadTarget {
+    const listeners: Array<() => void> = [];
+    return {
+      listeners,
+      addEventListener(_type, listener) {
+        listeners.push(listener);
+      },
+    };
+  }
+
+  it("registers a beforeunload listener that posts sync:request to the kernel Worker", async () => {
+    const { installBeforeUnloadSync } = await import("../../src/bootstrap");
+    const kernel = makeFakeKernel();
+    const target = makeFakeTarget();
+    const listener = installBeforeUnloadSync(kernel, target);
+    expect(target.listeners).toEqual([listener]);
+    expect(kernel.posted).toEqual([]);
+    listener();
+    expect(kernel.posted).toEqual([{ kind: "sync:request" }]);
+  });
+
+  it("fires independently from pagehide so the two-handler fallback is additive", async () => {
+    const { installBeforeUnloadSync, installPagehideSync } = await import(
+      "../../src/bootstrap"
+    );
+    const kernel = makeFakeKernel();
+    const beforeTarget = makeFakeTarget();
+    const pagehideTarget: {
+      listeners: Array<() => void>;
+      addEventListener(type: "pagehide", listener: () => void): void;
+    } = {
+      listeners: [],
+      addEventListener(_type, l) {
+        this.listeners.push(l);
+      },
+    };
+    const beforeListener = installBeforeUnloadSync(kernel, beforeTarget);
+    const pagehideListener = installPagehideSync(kernel, pagehideTarget);
+
+    // A browser that fires only `pagehide`: one sync.
+    pagehideListener();
+    expect(kernel.posted).toEqual([{ kind: "sync:request" }]);
+
+    // A browser that fires only `beforeunload`: one sync.
+    beforeListener();
+    expect(kernel.posted).toEqual([
+      { kind: "sync:request" },
+      { kind: "sync:request" },
+    ]);
+
+    // A browser that fires both: two syncs (the second is a cheap
+    // no-op against an already-clean VFS — duplicate flushes are
+    // expected and explicitly tolerated).
+    pagehideListener();
+    beforeListener();
+    expect(kernel.posted).toEqual([
+      { kind: "sync:request" },
+      { kind: "sync:request" },
+      { kind: "sync:request" },
+      { kind: "sync:request" },
+    ]);
+  });
+});
+
 describe("installPeriodicSync", () => {
   function makeFakeScheduler(): {
     setIntervalCalls: Array<{ handler: () => void; ms: number; handle: number }>;

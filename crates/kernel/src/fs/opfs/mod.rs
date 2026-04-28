@@ -46,9 +46,13 @@ use crate::vfs::{
 };
 
 pub mod block;
+pub mod flush;
 pub mod journal;
 pub mod layout;
 pub mod mkfs;
+
+#[cfg(test)]
+mod journal_test;
 
 use block::{BlockDevice, DynBlockDevice};
 use journal::{Journal, Transaction};

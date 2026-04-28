@@ -526,6 +526,213 @@ describe("process lifecycle", () => {
     expect(handle.getSize()).toBeGreaterThanOrEqual(BLOCK_SIZE);
   });
 
+  it("first-boot mkfs end-to-end produces the FR-013a starter kit under /persist (T135)", async () => {
+    // T135: end-to-end verification that the block-driver mkfs
+    // path runs when OPFS is empty.
+    //
+    // A freshly-allocated MemSyncAccessHandle starts at size=0, so
+    // the kernel's first read of LBA 0 returns zeros, OpfsFs::mount
+    // surfaces FsError::Io, and kernel_init falls through to
+    // mkfs(device). The mkfs path produces the FR-013a starter kit
+    // at /home/user — but in the kernel /persist mount, that's
+    // /persist/home/user.
+    //
+    // This test pins the spec.md FR-013a contract: every directory
+    // and every file the FR enumerates must be openable through the
+    // user-facing PATH_OPEN syscall after kernel_init returns. If
+    // mkfs landed but skipped a starter file (regression), this
+    // test fails. If mkfs didn't run at all (e.g. boot policy
+    // changed and the empty-OPFS branch was lost), every PATH_OPEN
+    // returns ENOENT and the test fails on the first one.
+    const { BlockDriver } = await import("../../src/drivers/block");
+    const handle = makeMemSyncAccessHandle();
+    expect(handle.getSize()).toBe(0); // truly empty before mkfs
+
+    const blockDriver = BlockDriver.withHandle(handle, 4096);
+    const { host } = await freshHost({ blockDriver });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    // Helper: PATH_OPEN abs_path expecting success, returns the fd.
+    function openOk(abs: string, requestId: number): number {
+      const pathBytes = new TextEncoder().encode(abs);
+      const r = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.PATH_OPEN,
+          requestId,
+          arg0: 0,
+          heapPtr: 0,
+          heapLen: pathBytes.length,
+        },
+        pathBytes,
+      );
+      expect(r.response!.status, `PATH_OPEN ${abs}`).toBe(0);
+      return Number(r.response!.value);
+    }
+
+    // FR-013a starter kit paths (under /persist because that's where
+    // the OPFS mounts; mkfs wrote /home/user/... in the OPFS root).
+    const starterDirs = [
+      "/persist",
+      "/persist/home",
+      "/persist/home/user",
+      "/persist/home/user/Downloads",
+      "/persist/home/user/Documents",
+      "/persist/home/user/Pictures",
+    ];
+    for (const [i, dir] of starterDirs.entries()) {
+      openOk(dir, 7100 + i);
+    }
+
+    const starterFiles = [
+      "/persist/home/user/README.md",
+      "/persist/home/user/Documents/welcome.txt",
+      "/persist/home/user/Documents/editing.md",
+    ];
+    for (const [i, f] of starterFiles.entries()) {
+      const fd = openOk(f, 7200 + i);
+      // Read at least one byte to confirm it's a non-empty regular
+      // file. A zero-size starter file would be a mkfs regression.
+      const r = host.dispatch(pid, {
+        opcode: OP_WASI.FD_READ,
+        requestId: 7300 + i,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: 256,
+      });
+      expect(r.response!.status, `FD_READ ${f}`).toBe(0);
+      expect(Number(r.response!.value), `${f} should be non-empty`).toBeGreaterThan(0);
+    }
+
+    // System tree paths mkfs writes alongside the starter kit. These
+    // are not part of FR-013a strictly, but they're part of the
+    // mkfs contract — the v1 system layout.
+    const systemDirs = [
+      "/persist/bin",
+      "/persist/dev",
+      "/persist/etc",
+      "/persist/home",
+      "/persist/opt",
+      "/persist/proc",
+      "/persist/run",
+      "/persist/tmp",
+      "/persist/usr",
+      "/persist/usr/bin",
+      "/persist/usr/share",
+      "/persist/usr/share/applications",
+    ];
+    for (const [i, dir] of systemDirs.entries()) {
+      openOk(dir, 7400 + i);
+    }
+
+    // /etc/init.conf — mkfs's installed default for T096.
+    openOk("/persist/etc/init.conf", 7500);
+
+    // /usr/share/applications/*.desktop — mkfs's installed defaults
+    // for T125.
+    const desktopFiles = [
+      "/persist/usr/share/applications/terminal.desktop",
+      "/persist/usr/share/applications/files.desktop",
+      "/persist/usr/share/applications/edit.desktop",
+      "/persist/usr/share/applications/settings.desktop",
+      "/persist/usr/share/applications/sysmon.desktop",
+    ];
+    for (const [i, f] of desktopFiles.entries()) {
+      openOk(f, 7600 + i);
+    }
+
+    // /usr/share/doc/pmos/{LICENSE.txt,CREDITS.txt} — T193 docs.
+    openOk("/persist/usr/share/doc", 7700);
+    openOk("/persist/usr/share/doc/pmos", 7701);
+    openOk("/persist/usr/share/doc/pmos/LICENSE.txt", 7702);
+    openOk("/persist/usr/share/doc/pmos/CREDITS.txt", 7703);
+  });
+
+  it("second boot against the same OPFS image skips mkfs (mount succeeds without re-init)", async () => {
+    // T135 partner: prove the mkfs branch is exclusively the
+    // empty-OPFS path. After a first boot has populated the image,
+    // the OpfsFs::mount call in kernel_init succeeds against the
+    // existing superblock — mkfs MUST NOT run a second time.
+    //
+    // Verification: write a custom file during boot 1, then open the
+    // same file during boot 2 and read it back. If mkfs had run a
+    // second time, it would have rewritten the inode table from
+    // scratch and the custom file would be gone.
+    const { BlockDriver } = await import("../../src/drivers/block");
+    const handle = makeMemSyncAccessHandle();
+
+    // Boot 1: write /persist/marker.txt.
+    {
+      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const { host } = await freshHost({ blockDriver });
+      const pid = host.registerProcess(CAPSET_ALL);
+      host.markRunning(pid);
+      const path = new TextEncoder().encode("/persist/marker.txt");
+      const open = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.PATH_OPEN,
+          requestId: 8001,
+          args: encodePathOpenArgs(0, OFLAG_CREAT, 0o644),
+          heapPtr: 0,
+          heapLen: path.length,
+        },
+        path,
+      );
+      expect(open.response!.status).toBe(0);
+      const fd = Number(open.response!.value);
+      const data = new TextEncoder().encode("survived-rebuild");
+      const w = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.FD_WRITE,
+          requestId: 8002,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: data.length,
+        },
+        data,
+      );
+      expect(w.response!.status).toBe(0);
+      expect(host.syncAll()).toBe(true);
+    }
+
+    // Boot 2: same handle. mkfs MUST NOT run; the marker survives.
+    {
+      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const { host } = await freshHost({ blockDriver });
+      const pid = host.registerProcess(CAPSET_ALL);
+      host.markRunning(pid);
+      const path = new TextEncoder().encode("/persist/marker.txt");
+      const open = host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.PATH_OPEN,
+          requestId: 8101,
+          arg0: 0,
+          heapPtr: 0,
+          heapLen: path.length,
+        },
+        path,
+      );
+      expect(open.response!.status).toBe(0);
+      const fd = Number(open.response!.value);
+      const r = host.dispatch(pid, {
+        opcode: OP_WASI.FD_READ,
+        requestId: 8102,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: 64,
+      });
+      expect(r.response!.status).toBe(0);
+      const text = new TextDecoder().decode(
+        r.heapOut!.slice(0, Number(r.response!.value)),
+      );
+      expect(text).toBe("survived-rebuild");
+    }
+  });
+
   it("file written under /persist persists across kernel re-mount (FR-013a)", async () => {
     const { BlockDriver } = await import("../../src/drivers/block");
     const handle = makeMemSyncAccessHandle();
