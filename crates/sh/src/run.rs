@@ -31,10 +31,13 @@
 //! assert on byte-exact stdout.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::PathBuf;
 
 use crate::builtin::{dispatch_builtin, BuiltinOutcome, ShellFlags};
+use crate::jobs::{JobStatus, JobTable};
+use crate::parser::{parse_pipeline, Pipeline, RedirOp, WordKind};
 
 /// Outcome of the REPL loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +123,17 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
     // so userland can't `export ?=foo` and break the
     // resolver — the `?` name is reserved by the shell.
     let mut last_status: i32 = 0;
+    // Background-job table for `&` pipelines + the `jobs`
+    // builtin. v1 has no real concurrency at the shell layer
+    // (every pipeline runs synchronously regardless of the
+    // background flag), so the table primarily serves as
+    // diagnostic state — `jobs` lists every backgrounded
+    // pipeline that completed during this REPL session, with
+    // its final status. Once external commands wired through
+    // `proc_spawn` lands, the same table will track LIVE
+    // pids that the foreground/background distinction
+    // becomes meaningful for.
+    let mut jobs: JobTable = JobTable::new();
 
     loop {
         if write!(stdout, "$ ").is_err() {
@@ -140,6 +154,27 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // for CRLF input) so the tokenizer sees the raw
         // arguments. Leave any embedded whitespace alone.
         let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+
+        // POSIX-style Ctrl-C handling: a `\x03` (ETX) byte
+        // anywhere in the line cancels the current command.
+        // In a real TTY, the line discipline would intercept
+        // Ctrl-C before the read returned and post SIGINT to
+        // the foreground process group; PMos has no TTY
+        // layer, so the term's keymap delivers the bare ETX
+        // byte through stdin instead. Treat it as "discard
+        // this line" — write a newline (so the next prompt
+        // starts cleanly), leave `last_status` set to 130
+        // (POSIX 128 + SIGINT=2), and reprompt without
+        // dispatching. The kernel's `proc_kill(fg_pid,
+        // SIGINT)` path lights up once external commands
+        // wired through `proc_spawn` land; until then this
+        // covers the user-feedback half of the contract.
+        if trimmed.contains('\x03') {
+            let _ = writeln!(stderr);
+            let _ = stderr.flush();
+            last_status = 130;
+            continue;
+        }
 
         // Tokenise with quote awareness. `'...'` is a literal
         // segment (no whitespace splitting, no `$VAR`
@@ -273,9 +308,13 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // undefined on the interaction but "no command runs
         // → no trace" matches the existing trace-skip rule
         // for blank lines and expansion errors.
-        if flags.noexec && expanded_refs[0] != "set" {
-            continue;
-        }
+        // The noexec / `set` exemption is re-evaluated AFTER
+        // pipeline parsing (below) so a redirected `set -e`
+        // (`set -e > foo`) still runs the `set`. The early
+        // `expanded_refs[0]` check used to do this in-place,
+        // but operator words added by the tokenizer (`>`,
+        // `|`, …) shift `expanded_refs[0]` away from the
+        // command name when redirections lead the line.
 
         // POSIX `set -x` / xtrace: write each command to
         // stderr BEFORE executing it, prefixed by the value
@@ -316,6 +355,52 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // (`export PS4=`) produces a bare command line with
         // no prefix — the user has explicit control over
         // every byte of the prefix including its absence.
+        // Parse the expanded words into a Pipeline. The
+        // tokenizer already split on the operator chars
+        // (`|`, `<`, `>`, `>>`, `&`) outside quotes, so
+        // `WordKind::classify` reports each word as either
+        // an argv word or an operator word. The parser then
+        // structures the slice into one or more stages with
+        // their redirections + the optional trailing `&`
+        // background flag. Parse failures (empty stages,
+        // missing redir targets, mid-line `&`) write a
+        // POSIX-style diagnostic to stderr and continue —
+        // the REPL stays alive, `last_status` records 2 (the
+        // bash convention for parser errors).
+        let kinds = WordKind::classify(&parts);
+        let pipeline = match parse_pipeline(&kinds, &expanded) {
+            Ok(p) => p,
+            Err(err) => {
+                if writeln!(stderr, "{}", err.diagnostic()).is_err() {
+                    return ExitStatus::IoError;
+                }
+                if stderr.flush().is_err() {
+                    return ExitStatus::IoError;
+                }
+                last_status = 2;
+                continue;
+            }
+        };
+
+        // POSIX `set -n` / noexec, evaluated AFTER parsing so
+        // redirections + pipelines don't accidentally hide
+        // the `set` exemption. Skip dispatch when noexec is
+        // on UNLESS the first stage's first argv word is
+        // `set` — otherwise once `set -n` enables noexec the
+        // user could never `set +n` to disable it. Critically
+        // this MUST come before the xtrace block so `set -nx`
+        // produces zero `+ ` lines (matching the existing
+        // pre-pipeline behaviour the `set_n_does_not_trace_
+        // under_set_x` test pins).
+        let first_argv0 = pipeline
+            .stages
+            .first()
+            .and_then(|s| s.argv.first())
+            .map(String::as_str);
+        if flags.noexec && first_argv0 != Some("set") {
+            continue;
+        }
+
         if flags.xtrace {
             let prefix = env.get("PS4").map(|s| s.as_str()).unwrap_or("+ ");
             let _ = writeln!(stderr, "{}{}", prefix, expanded_refs.join(" "));
@@ -329,23 +414,23 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         // is never observed; only the recoverable arms
         // (`Continue`, `Status(N)`, `NotBuiltin`) update the
         // stash for the next command's `$?`.
-        match dispatch_builtin(
-            &expanded_refs,
+        let outcome = run_pipeline(
+            &pipeline,
             &mut cwd,
             env,
             flags,
             &mut stdin,
             &mut stdout,
             &mut stderr,
-        ) {
+            &mut jobs,
+            &kinds,
+            &expanded,
+        );
+        match outcome {
             BuiltinOutcome::Continue => {
                 last_status = 0;
             }
             BuiltinOutcome::Status(code) => {
-                // Builtin reported a non-zero exit status but
-                // the REPL continues (e.g. `false` always
-                // returns Status(1)). Stash it for the next
-                // command's `$?` expansion.
                 last_status = code;
             }
             BuiltinOutcome::Exit(code) => return ExitStatus::Exit(code),
@@ -357,7 +442,13 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
                 // post-expansion (e.g. an unset `$CMD` produces
                 // `sh: command not found: ` with the empty
                 // first token, mirroring bash / dash).
-                if writeln!(stderr, "sh: command not found: {}", expanded_refs[0]).is_err() {
+                if writeln!(
+                    stderr,
+                    "sh: command not found: {}",
+                    pipeline.stages.last().and_then(|s| s.argv.first()).map(String::as_str).unwrap_or("")
+                )
+                .is_err()
+                {
                     return ExitStatus::IoError;
                 }
                 if stderr.flush().is_err() {
@@ -395,6 +486,353 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
             let byte = u8::try_from(last_status.rem_euclid(256)).unwrap_or(1);
             return ExitStatus::Exit(byte as i32);
         }
+    }
+}
+
+/// Run a parsed [`Pipeline`] through the builtin dispatcher.
+///
+/// Cases:
+///
+/// * **Simple pipeline** (one stage, no redirections, no
+///   background): dispatch through the parent's stdin /
+///   stdout / stderr unchanged. Byte-identical to the
+///   pre-pipeline behaviour.
+/// * **Single stage with redirections**: open each `< path`
+///   for reading and each `> path` / `>> path` for writing
+///   (truncate or append), wire them through the
+///   dispatcher, and route the rest of the I/O through the
+///   parent's streams. Multiple redirs of the same op
+///   evaluate left-to-right; the last `>` / `>>` wins for
+///   stdout (matching POSIX last-redir-wins semantics).
+/// * **Multi-stage pipeline**: chain stages by capturing
+///   each non-last stage's stdout into a `Vec<u8>` and
+///   feeding it to the next stage as a `Cursor` stdin. The
+///   v1 runner is in-process serial — every stage runs to
+///   completion before the next starts, so a stage that
+///   tries to read more than the previous stage produced
+///   sees EOF cleanly. This is the correct semantic for
+///   builtins (`echo`, `cat`-equivalent, `read`, …) since
+///   none of them read interactively. Real subprocess
+///   pipelines via `proc_spawn` + `ipc_pipe` are deferred
+///   to a kernel-side blocking-pipe slice — see the
+///   `crates/kernel/src/syscall/wasi.rs:2384` comment.
+/// * **Background (`&`)**: registers a [`Job`] in the table
+///   with the original command line, runs the pipeline
+///   synchronously (v1 has no real concurrency at the shell
+///   layer), and flips the job's status from
+///   [`JobStatus::Running`] to [`JobStatus::Exited`] /
+///   [`JobStatus::Signaled`] before returning. The `jobs`
+///   builtin lists the table; a clean (status 0) exit
+///   renders as `Done`.
+///
+/// `kinds` and `expanded` are the parser-side input slices —
+/// passed through verbatim so the runner can reconstruct
+/// the original command line for the `jobs` table without
+/// re-walking `parts`.
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline<R: BufRead, W: Write, E: Write>(
+    pipeline: &Pipeline,
+    cwd: &mut PathBuf,
+    env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
+    parent_stdin: &mut R,
+    parent_stdout: &mut W,
+    parent_stderr: &mut E,
+    jobs: &mut JobTable,
+    kinds: &[WordKind],
+    expanded: &[String],
+) -> BuiltinOutcome {
+    if pipeline.stages.is_empty() {
+        return BuiltinOutcome::Continue;
+    }
+
+    // The `jobs` builtin is dispatched here rather than in
+    // `dispatch_builtin` because it needs access to the
+    // job table (which the dispatcher doesn't see). It only
+    // applies to a simple single-stage pipeline; pipelined
+    // / redirected forms fall through to the normal
+    // dispatch path so `jobs > foo` writes the listing to
+    // the file.
+    if pipeline.is_simple() {
+        let stage = &pipeline.stages[0];
+        if stage.argv.first().map(String::as_str) == Some("jobs") {
+            return run_jobs_builtin(jobs, &stage.argv[1..], parent_stdout, parent_stderr);
+        }
+    }
+
+    // Synchronous executor — handles every shape (simple,
+    // redirected, pipelined, backgrounded). The result is
+    // whatever the LAST stage's dispatch produced (POSIX:
+    // pipeline exit status = last stage's exit status).
+    let outcome = execute_pipeline(
+        pipeline,
+        cwd,
+        env,
+        flags,
+        parent_stdin,
+        parent_stdout,
+        parent_stderr,
+        jobs,
+    );
+
+    if pipeline.background {
+        // Reconstruct the command line for the jobs entry.
+        // Operator words round-trip via the operator string;
+        // argv words round-trip via their assembled form.
+        let cmd_line = reassemble_command_line(kinds, expanded);
+        let job_id = jobs.add(0, cmd_line);
+        let status = match outcome {
+            BuiltinOutcome::Continue => JobStatus::Exited { code: 0 },
+            BuiltinOutcome::Status(c) => JobStatus::Exited { code: c },
+            BuiltinOutcome::NotBuiltin => JobStatus::Exited { code: 127 },
+            BuiltinOutcome::Exit(c) => JobStatus::Exited { code: c },
+            BuiltinOutcome::IoError => JobStatus::Done,
+        };
+        jobs.set_status(job_id, status);
+        // Backgrounded pipelines do NOT propagate their exit
+        // status to the foreground `$?` per POSIX — the
+        // shell continues with status 0 regardless of how
+        // the background job exited.
+        return BuiltinOutcome::Continue;
+    }
+    outcome
+}
+
+/// Reassemble the original command line from the parser's
+/// parallel slices. Operator words insert their literal
+/// operator string; argv words insert their expanded form.
+/// Trailing `&` is preserved as the final token.
+fn reassemble_command_line(kinds: &[WordKind], expanded: &[String]) -> String {
+    let mut buf = String::new();
+    for (i, kind) in kinds.iter().enumerate() {
+        if i > 0 {
+            buf.push(' ');
+        }
+        match kind {
+            WordKind::Argv => buf.push_str(&expanded[i]),
+            WordKind::Operator => buf.push_str(&expanded[i]),
+        }
+    }
+    buf
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline<R: BufRead, W: Write, E: Write>(
+    pipeline: &Pipeline,
+    cwd: &mut PathBuf,
+    env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
+    parent_stdin: &mut R,
+    parent_stdout: &mut W,
+    parent_stderr: &mut E,
+    jobs: &mut JobTable,
+) -> BuiltinOutcome {
+    let n = pipeline.stages.len();
+    // Buffer holding the previous stage's stdout for the next
+    // stage's stdin. `None` for the first stage (parent stdin
+    // is used directly when no `<` redir).
+    let mut prev_stdout: Option<Vec<u8>> = None;
+    // The exit status of the LAST stage — POSIX defines this
+    // as the pipeline's exit status. Earlier stages' statuses
+    // are observable only via $? AFTER the pipeline returns,
+    // and only the last stage's status counts.
+    let mut last_outcome = BuiltinOutcome::Continue;
+
+    for (i, stage) in pipeline.stages.iter().enumerate() {
+        let is_last = i == n - 1;
+
+        // Resolve stdin source for this stage.
+        let mut stage_stdin_buf: Option<Vec<u8>> = None;
+        let mut stage_stdin_file: Option<BufReader<std::fs::File>> = None;
+        // Walk the redirs left-to-right, last `<` wins.
+        if let Some(redir) = stage
+            .redirs
+            .iter()
+            .rev()
+            .find(|r| r.op == RedirOp::Stdin)
+        {
+            match std::fs::File::open(&redir.target) {
+                Ok(f) => stage_stdin_file = Some(BufReader::new(f)),
+                Err(e) => {
+                    let _ = writeln!(
+                        parent_stderr,
+                        "sh: {}: {}",
+                        redir.target,
+                        io_error_phrase(&e)
+                    );
+                    let _ = parent_stderr.flush();
+                    return BuiltinOutcome::Status(1);
+                }
+            }
+        } else if let Some(prev) = prev_stdout.take() {
+            stage_stdin_buf = Some(prev);
+        }
+
+        // Resolve stdout sink for this stage. Last `>`/`>>`
+        // wins. Captured stdout (for piping to the next
+        // stage) is the default when there's no redir AND
+        // this isn't the last stage.
+        let mut stage_stdout_file: Option<std::fs::File> = None;
+        let mut stage_stdout_buf: Option<Vec<u8>> = None;
+        if let Some(redir) = stage
+            .redirs
+            .iter()
+            .rev()
+            .find(|r| matches!(r.op, RedirOp::Stdout | RedirOp::StdoutAppend))
+        {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true);
+            if redir.op == RedirOp::StdoutAppend {
+                opts.append(true);
+            } else {
+                opts.truncate(true);
+            }
+            match opts.open(&redir.target) {
+                Ok(f) => stage_stdout_file = Some(f),
+                Err(e) => {
+                    let _ = writeln!(
+                        parent_stderr,
+                        "sh: {}: {}",
+                        redir.target,
+                        io_error_phrase(&e)
+                    );
+                    let _ = parent_stderr.flush();
+                    return BuiltinOutcome::Status(1);
+                }
+            }
+        } else if !is_last {
+            stage_stdout_buf = Some(Vec::new());
+        }
+
+        // Build typed dyn refs and dispatch.
+        let argv_refs: Vec<&str> = stage.argv.iter().map(String::as_str).collect();
+        let outcome = dispatch_stage(
+            &argv_refs,
+            cwd,
+            env,
+            flags,
+            parent_stdin,
+            parent_stdout,
+            parent_stderr,
+            stage_stdin_buf.as_deref(),
+            stage_stdin_file.as_mut(),
+            stage_stdout_file.as_mut(),
+            stage_stdout_buf.as_mut(),
+        );
+
+        // Tear down: a captured stdout buffer becomes the
+        // next stage's stdin; a redirected file is dropped
+        // (its OS-level file handle closes via Drop).
+        if let Some(buf) = stage_stdout_buf {
+            prev_stdout = Some(buf);
+        }
+        last_outcome = outcome;
+
+        // Stop short on REPL-terminating outcomes.
+        if matches!(
+            last_outcome,
+            BuiltinOutcome::Exit(_) | BuiltinOutcome::IoError
+        ) {
+            return last_outcome;
+        }
+    }
+
+    // The job table doesn't actually need to mutate inside
+    // the executor (only background bookkeeping does), but
+    // taking it as `&mut` keeps the signature uniform with
+    // the future external-pipeline path that WILL mutate it
+    // (registering each child pid, reaping zombies). The
+    // unused-mut lint is not active here because run_pipeline
+    // does mutate the table.
+    let _ = jobs;
+    last_outcome
+}
+
+/// One stage's dispatch.  Wraps `dispatch_builtin` with the
+/// per-stage I/O sources resolved by [`execute_pipeline`].
+#[allow(clippy::too_many_arguments)]
+fn dispatch_stage<R: BufRead, W: Write, E: Write>(
+    argv: &[&str],
+    cwd: &mut PathBuf,
+    env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
+    parent_stdin: &mut R,
+    parent_stdout: &mut W,
+    parent_stderr: &mut E,
+    captured_stdin: Option<&[u8]>,
+    file_stdin: Option<&mut BufReader<std::fs::File>>,
+    file_stdout: Option<&mut std::fs::File>,
+    captured_stdout: Option<&mut Vec<u8>>,
+) -> BuiltinOutcome {
+    if argv.is_empty() {
+        return BuiltinOutcome::Continue;
+    }
+
+    // Resolve stdin: file > captured-bytes > parent.
+    let mut cursor: Option<Cursor<&[u8]>> = captured_stdin.map(Cursor::new);
+    let stdin_dyn: &mut dyn BufRead = if let Some(reader) = file_stdin {
+        reader
+    } else if let Some(c) = cursor.as_mut() {
+        c
+    } else {
+        parent_stdin
+    };
+
+    // Resolve stdout: file > captured-bytes > parent.
+    let stdout_dyn: &mut dyn Write = if let Some(f) = file_stdout {
+        f
+    } else if let Some(buf) = captured_stdout {
+        buf
+    } else {
+        parent_stdout
+    };
+
+    dispatch_builtin(
+        argv,
+        cwd,
+        env,
+        flags,
+        stdin_dyn,
+        stdout_dyn,
+        parent_stderr,
+    )
+}
+
+/// `jobs` builtin — list every entry in the job table. v1
+/// honors the bare `jobs` form only; bash flags (`-l`,
+/// `-p`, `-r`, `-s`) are deferred. After listing, completed
+/// (`Exited` / `Signaled` / `Done`) jobs are purged from
+/// the table so they don't reappear in the next listing.
+fn run_jobs_builtin<W: Write, E: Write>(
+    table: &mut JobTable,
+    args: &[String],
+    stdout: &mut W,
+    stderr: &mut E,
+) -> BuiltinOutcome {
+    if !args.is_empty() {
+        let _ = writeln!(stderr, "sh: jobs: usage: jobs");
+        let _ = stderr.flush();
+        return BuiltinOutcome::Status(2);
+    }
+    if crate::jobs::render_jobs(table, stdout).is_err() {
+        return BuiltinOutcome::IoError;
+    }
+    table.purge_completed();
+    BuiltinOutcome::Continue
+}
+
+/// Map a [`std::io::Error`] to the POSIX-style phrase shells
+/// write after the offending file path: `No such file or
+/// directory`, `Permission denied`, etc. Falls back to the
+/// `Display` impl when the kind is unrecognised.
+fn io_error_phrase(err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::NotFound => "No such file or directory".to_string(),
+        ErrorKind::PermissionDenied => "Permission denied".to_string(),
+        ErrorKind::AlreadyExists => "File exists".to_string(),
+        ErrorKind::InvalidInput => "Invalid argument".to_string(),
+        _ => err.to_string(),
     }
 }
 
@@ -790,7 +1228,15 @@ pub(crate) enum TokenPart {
     Literal(String),
     /// Outside any quoting — `expand_vars` runs over the content.
     Unquoted(String),
+    /// A shell operator word emitted as its own token. The
+    /// tokenizer splits on the unquoted bytes `|`, `<`, `>`,
+    /// `>>`, `&` so the parser can distinguish them from
+    /// argv words after expansion. A literal pipe character
+    /// inside quotes (`'|'` / `"|"`) stays a `Literal` /
+    /// `Unquoted` segment and is NOT an operator.
+    Operator(String),
 }
+
 
 /// Reason an unterminated quote was detected — distinguishes
 /// `'...` from `"...` so the caller can surface a kind-aware
@@ -927,6 +1373,30 @@ pub(crate) fn tokenise_with_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, Qu
                     if !current.is_empty() {
                         tokens.push(core::mem::take(&mut current));
                     }
+                } else if matches!(c, '|' | '<' | '>' | '&') {
+                    // Operator character. Close the current token
+                    // (flushing any pending bytes), then emit the
+                    // operator as its own single-part token. `>>`
+                    // is recognised as a digraph: a `>` followed
+                    // immediately by another `>` becomes one
+                    // `>>` token. All other operators are single
+                    // chars in v1; `<<` (heredoc), `||` /  `&&`
+                    // (logical operators), `2>` /  `&>` (stream-
+                    // specific redirections), and `;` (sequence)
+                    // are deferred to a future T142 partial.
+                    if !buf.is_empty() {
+                        current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
+                    }
+                    if !current.is_empty() {
+                        tokens.push(core::mem::take(&mut current));
+                    }
+                    let op_str = if c == '>' && chars.peek().copied() == Some('>') {
+                        chars.next();
+                        ">>".to_string()
+                    } else {
+                        c.to_string()
+                    };
+                    tokens.push(vec![TokenPart::Operator(op_str)]);
                 } else {
                     buf.push(c);
                 }
@@ -972,10 +1442,24 @@ pub(crate) fn assemble_token(
             TokenPart::Unquoted(s) => {
                 out.push_str(&expand_vars(s, env, last_status, flags)?);
             }
+            TokenPart::Operator(s) => out.push_str(s),
         }
     }
     Ok(out)
 }
+
+/// True iff `parts` is exactly one [`TokenPart::Operator`]
+/// segment — i.e. an operator word emitted by the tokenizer
+/// (as opposed to a regular argv word that may contain
+/// `Literal` / `Unquoted` segments). Used by the parser to
+/// distinguish operator words from argv words after
+/// expansion: a quoted `'|'` round-trips as a `Literal`
+/// segment and is NOT an operator, but a bare `|` becomes a
+/// single-part `Operator("|")` word.
+pub(crate) fn is_operator_word(parts: &[TokenPart]) -> bool {
+    parts.len() == 1 && matches!(&parts[0], TokenPart::Operator(_))
+}
+
 
 #[cfg(test)]
 mod expand_tests {

@@ -131,14 +131,14 @@ pub(crate) enum BuiltinOutcome {
 /// signature is `&mut R: BufRead` so a future builtin
 /// (e.g. `wait` for input, a hypothetical `eval`-from-stdin
 /// shape) can plug in without revisiting the signature.
-pub(crate) fn dispatch_builtin<R: BufRead, W: Write, E: Write>(
+pub(crate) fn dispatch_builtin(
     tokens: &[&str],
     cwd: &mut PathBuf,
     env: &mut BTreeMap<String, String>,
     flags: &mut ShellFlags,
-    stdin: &mut R,
-    stdout: &mut W,
-    stderr: &mut E,
+    stdin: &mut dyn BufRead,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     match tokens[0] {
         ":" => BuiltinOutcome::Continue,
@@ -159,7 +159,7 @@ pub(crate) fn dispatch_builtin<R: BufRead, W: Write, E: Write>(
     }
 }
 
-fn builtin_echo<W: Write>(args: &[&str], stdout: &mut W) -> BuiltinOutcome {
+fn builtin_echo(args: &[&str], stdout: &mut dyn Write) -> BuiltinOutcome {
     // Join args with single spaces + trailing newline.
     // `echo` with no args emits just the newline.
     let joined = args.join(" ");
@@ -172,7 +172,7 @@ fn builtin_echo<W: Write>(args: &[&str], stdout: &mut W) -> BuiltinOutcome {
     BuiltinOutcome::Continue
 }
 
-fn builtin_exit<E: Write>(args: &[&str], stderr: &mut E) -> BuiltinOutcome {
+fn builtin_exit(args: &[&str], stderr: &mut dyn Write) -> BuiltinOutcome {
     match args.first() {
         None => BuiltinOutcome::Exit(0),
         Some(arg) => match i32::from_str(arg) {
@@ -205,7 +205,7 @@ fn builtin_cd(args: &[&str], cwd: &mut PathBuf) -> BuiltinOutcome {
     BuiltinOutcome::Continue
 }
 
-fn builtin_pwd<W: Write>(cwd: &Path, stdout: &mut W) -> BuiltinOutcome {
+fn builtin_pwd(cwd: &Path, stdout: &mut dyn Write) -> BuiltinOutcome {
     let display = cwd.to_string_lossy();
     if writeln!(stdout, "{display}").is_err() {
         return BuiltinOutcome::IoError;
@@ -216,11 +216,11 @@ fn builtin_pwd<W: Write>(cwd: &Path, stdout: &mut W) -> BuiltinOutcome {
     BuiltinOutcome::Continue
 }
 
-fn builtin_env<W: Write, E: Write>(
+fn builtin_env(
     args: &[&str],
     env: &BTreeMap<String, String>,
-    stdout: &mut W,
-    stderr: &mut E,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     if !args.is_empty() {
         // Minimal v1: no `env [-i] [NAME=VALUE]... [command]`
@@ -246,11 +246,11 @@ fn builtin_env<W: Write, E: Write>(
     BuiltinOutcome::Continue
 }
 
-fn builtin_export<W: Write, E: Write>(
+fn builtin_export(
     args: &[&str],
     env: &mut BTreeMap<String, String>,
-    stdout: &mut W,
-    stderr: &mut E,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     if args.is_empty() {
         // bash convention: `export` with no args prints every
@@ -305,10 +305,10 @@ fn builtin_export<W: Write, E: Write>(
     BuiltinOutcome::Continue
 }
 
-fn builtin_unset<E: Write>(
+fn builtin_unset(
     args: &[&str],
     env: &mut BTreeMap<String, String>,
-    stderr: &mut E,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     if args.is_empty() {
         if writeln!(stderr, "sh: unset: usage: unset NAME...").is_err() {
@@ -462,11 +462,11 @@ fn builtin_unset<E: Write>(
 /// * Backslash-as-IFS-delimiter-escape (waits on IFS slice).
 /// * Heredoc / herestring interaction (those are
 ///   tokenizer-level concerns, not builtin-level).
-fn builtin_read<R: BufRead, E: Write>(
+fn builtin_read(
     args: &[&str],
     env: &mut BTreeMap<String, String>,
-    stdin: &mut R,
-    stderr: &mut E,
+    stdin: &mut dyn BufRead,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     // Flag-walk loop. Each iteration peels one recognised
     // flag off the front of `args` and updates the local
@@ -628,10 +628,10 @@ fn builtin_read<R: BufRead, E: Write>(
 /// itself — without that exemption `set +n` could never
 /// clear the flag, leaving the user permanently stuck in
 /// syntax-check mode.
-fn builtin_set<E: Write>(
+fn builtin_set(
     args: &[&str],
     flags: &mut ShellFlags,
-    stderr: &mut E,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     // No args: POSIX prints every shell variable. v1 defers
     // this — `env` already lists exported entries and there's
@@ -777,10 +777,10 @@ fn builtin_set<E: Write>(
 /// `unknown binary operator: <X>` (NOT a silent failure) so
 /// users get a clear "this slice didn't implement that yet"
 /// signal rather than mysterious wrong answers.
-fn evaluate_test<E: Write>(
+fn evaluate_test(
     raw_args: &[&str],
     for_bracket: bool,
-    stderr: &mut E,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     let command = if for_bracket { "[" } else { "test" };
 
@@ -817,10 +817,10 @@ fn evaluate_test<E: Write>(
 /// Inner evaluator without the `]`-stripping or top-level
 /// negation handling — those live in [`evaluate_test`] so
 /// negation can wrap any of the 0/1/2/3-arg forms uniformly.
-fn evaluate_test_expr<E: Write>(
+fn evaluate_test_expr(
     args: &[&str],
     command: &str,
-    stderr: &mut E,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     match args.len() {
         0 => BuiltinOutcome::Status(1),
@@ -912,11 +912,11 @@ fn bool_to_status(value: bool) -> BuiltinOutcome {
 /// Emit the POSIX-flavoured "integer expression expected"
 /// usage error and return `Status(2)`. Shared between the
 /// `lhs` / `rhs` parse-failure paths.
-fn integer_expected<E: Write>(
+fn integer_expected(
     command: &str,
     op: &str,
     arg: &str,
-    stderr: &mut E,
+    stderr: &mut dyn Write,
 ) -> BuiltinOutcome {
     let _ = writeln!(stderr, "{command}: {op}: integer expression expected: {arg}");
     let _ = stderr.flush();

@@ -72,14 +72,19 @@ fn ps4_default_is_plus_space() {
 
 #[test]
 fn ps4_custom_prefix_is_used() {
-    // `export PS4=>>>` then `set -x` then `echo hi` →
+    // `export 'PS4=>>>'` then `set -x` then `echo hi` →
     // stderr contains `>>>echo hi` (note: NO space between
     // `>>>` and `echo` — the user explicitly chose a
     // prefix without a trailing space, and PS4 is verbatim
     // so the shell must NOT add a space). Pins that the
-    // env entry IS consulted at trace time.
+    // env entry IS consulted at trace time. The single-
+    // quote form is required because T142 added operator
+    // tokenization for `>` / `>>` outside quotes — `PS4=>>>`
+    // unquoted now parses as `export PS4= >> >` (a syntax
+    // error), so the test wraps the value in quotes to
+    // preserve the byte-exact assignment.
     let (status, _stdout, stderr, _env, _flags) =
-        drive("export PS4=>>>\nset -x\necho hi\nexit\n");
+        drive("export 'PS4=>>>'\nset -x\necho hi\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains(">>>echo hi"),
@@ -123,7 +128,7 @@ fn ps4_change_takes_effect_for_next_command() {
     // Pins that PS4 changes propagate immediately to the
     // NEXT command's trace, not the same command's trace.
     let (status, _stdout, stderr, _env, _flags) =
-        drive("set -x\nexport PS4=>>\necho hi\nexit\n");
+        drive("set -x\nexport 'PS4=>>'\necho hi\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ export PS4=>>"),

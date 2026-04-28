@@ -39,6 +39,10 @@ pub mod tokenize;
 #[cfg(feature = "std")]
 mod builtin;
 #[cfg(feature = "std")]
+pub mod jobs;
+#[cfg(feature = "std")]
+pub mod parser;
+#[cfg(feature = "std")]
 pub mod run;
 
 pub use shell::{Shell, ShellOutput, BUILTINS};
@@ -46,5 +50,9 @@ pub use tokenize::tokenize;
 
 #[cfg(feature = "std")]
 pub use builtin::ShellFlags;
+#[cfg(feature = "std")]
+pub use jobs::{Job, JobStatus, JobTable};
+#[cfg(feature = "std")]
+pub use parser::{parse_pipeline, ParseError, Pipeline, RedirOp, Redirection, Stage, WordKind};
 #[cfg(feature = "std")]
 pub use run::{run, run_with_env, ExitStatus, ExpandError};
