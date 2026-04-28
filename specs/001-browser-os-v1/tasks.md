@@ -454,7 +454,7 @@ These are cross-cutting deviations that exist in the repository as of commit `cb
 - [x] T215 [P] Accessibility **non-goal** documentation: explicitly state in `CLAUDE.md` and `docs/apps.md` that v1 has no a11y claim and that the toolkit focus/event paths are a v2 amendment target (per FR-045) — **landed in 157c24b + 11bf358**: `docs/apps.md` half landed via T211 in commit `11bf358` as its own "Accessibility — a v1 non-goal" section of the developer tutorial. This commit (`157c24b`) adds the `CLAUDE.md` half: a 9-line `### Accessibility (v1 non-goal)` sub-section under "Code style and conventions" that restates FR-045, flags the toolkit's focus + event-routing surfaces as the v2 amendment target, warns against apps advertising a11y support in v1, and points at `docs/apps.md §Accessibility` for tutorial-depth guidance. Folded as a sub-section rather than a new top-level heading to preserve CLAUDE.md's existing structure.
 - [x] T216 [P] Update `CLAUDE.md`'s "Active technologies" section if anything new (e.g. the tzdata subset, the bitmap font format) has been added during implementation
 - [x] T217 Final Constitution audit: walk each of the ten principles and cite the Playwright test or isolation test that gates it; update `plan.md`'s Constitution Check section if any evidence changed
-- [ ] T218 Cut `v1.0.0` git tag, publish `dist/` to at least one target host (Cloudflare Pages is the canonical), and verify the deployed site passes `boot-to-desktop.spec.ts` against the deployed URL
+- [ ] T218 Cut `v1.0.0` git tag, publish `dist/` to a static host that serves COOP (`same-origin`) + COEP (`require-corp`) headers (self-hosted server is the canonical target; managed hosts work too), and verify the deployed site passes `boot-to-desktop.spec.ts` against the deployed URL
 
 **Post-analyze polish tasks** (appended 2026-04-13 to close carried-over MEDIUM findings U2, U3, U4, U5 from the `/speckit.analyze` pass):
 
@@ -551,7 +551,7 @@ At the end of Phase 2, the four tracks merge and isolation-test suites run — a
 2. Complete Phase 2 (Foundational) — this is the big one. No short-cutting.
 3. Complete Phase 3 (US1 — First Boot to a Usable Desktop).
 4. **STOP and VALIDATE**: run `just test`. Must pass four isolation test targets and `boot-to-desktop.spec.ts`. Open `just dev` in a fresh browser profile; confirm the desktop boots and `echo hello` in the terminal works.
-5. Deploy to Cloudflare Pages and run the deployed Playwright test. The MVP is shippable.
+5. Deploy `dist/` to your COOP/COEP-capable static host and run the deployed Playwright test. The MVP is shippable.
 
 ### Incremental Delivery (Phases 4–12)
 

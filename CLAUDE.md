@@ -68,8 +68,10 @@ Execute tasks fully. Do not narrate uncertainty about whether you can finish —
   archive in `crates/pkg`. No external `tar`/`toml` deps —
   validation is the v1 forward-compatible subset.
 - **Deploy**: any static host that supports setting COOP/COEP
-  headers (Cloudflare Pages, Netlify, GitHub Pages via CF Worker,
-  S3+CloudFront).
+  headers. Primary target is a self-hosted server; managed
+  static hosts (Netlify, Cloudflare Pages, S3+CloudFront, GitHub
+  Pages via a CF Worker) work too if their config exposes the
+  two headers.
 
 ## Project structure (intended, at feature 001)
 
