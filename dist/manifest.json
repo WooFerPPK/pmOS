@@ -1,7 +1,8 @@
 {
-  "version": 33,
+  "version": 34,
   "assets": [
     "_headers",
+    "assets/bin/alt-shell.wasm",
     "assets/bin/cat.wasm",
     "assets/bin/cp.wasm",
     "assets/bin/display-client-demo.wasm",
