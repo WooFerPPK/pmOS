@@ -59,7 +59,14 @@ Execute tasks fully. Do not narrate uncertainty about whether you can finish —
   TS drivers; Playwright for full-stack integration including the
   layering acceptance test.
 - **Build**: Justfile + cargo + esbuild + a Rust `xtask` that
-  assembles `dist/`.
+  assembles `dist/`. `xtask package <crate>` produces a
+  `.pmpkg.tar` bundle for third-party app distribution per
+  `contracts/package-manifest.md`; `xtask push-sample` stages
+  that bundle into `dist/pkgs/staging/` for the install-flow
+  integration test.
+- **Package format**: hand-rolled minimal-TOML manifest + ustar
+  archive in `crates/pkg`. No external `tar`/`toml` deps —
+  validation is the v1 forward-compatible subset.
 - **Deploy**: any static host that supports setting COOP/COEP
   headers (Cloudflare Pages, Netlify, GitHub Pages via CF Worker,
   S3+CloudFront).
@@ -113,7 +120,13 @@ then third-party app sample and layering test.
 - `just test-drivers` — Vitest for TS drivers with a mock kernel.
 - `just test-integration` — Playwright browser integration tests
   including the **layering test** (the acceptance gate for
-  Principle II).
+  Principle II). The layering test
+  (`web/tests/integration/layering-test.spec.ts`) is build-breaking:
+  if it fails, the release MUST NOT ship. Sufficient conditions are
+  also gated at the unit level
+  (`crates/display-server/tests/shell_swap.rs` for surface survival,
+  `crates/init/src/conf.rs::tests::shell_respawn_*` for the init
+  swap-binary path).
 
 ## Code style and conventions
 
