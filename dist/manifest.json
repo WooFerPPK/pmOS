@@ -1,5 +1,5 @@
 {
-  "version": 35,
+  "version": 36,
   "assets": [
     "_headers",
     "assets/CREDITS.txt",
@@ -51,8 +51,10 @@
     "assets/bin/sort.wasm",
     "assets/bin/sysmon.wasm",
     "assets/bin/tail.wasm",
+    "assets/bin/tee.wasm",
     "assets/bin/term.wasm",
     "assets/bin/toolkit-free-client.wasm",
+    "assets/bin/tr.wasm",
     "assets/bin/uniq.wasm",
     "assets/bin/wc.wasm",
     "assets/bootstrap.js",
