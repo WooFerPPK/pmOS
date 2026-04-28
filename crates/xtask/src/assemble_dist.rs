@@ -235,7 +235,7 @@ fn dst_relative(dst: &Path) -> String {
 }
 
 fn build_manifest_json(paths: &[String]) -> String {
-    let mut s = String::from("{\n  \"version\": 37,\n  \"assets\": [\n");
+    let mut s = String::from("{\n  \"version\": 38,\n  \"assets\": [\n");
     for (i, p) in paths.iter().enumerate() {
         s.push_str("    \"");
         for c in p.chars() {

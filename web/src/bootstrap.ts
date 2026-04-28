@@ -1236,35 +1236,15 @@ function runRealKernelMode(bootBinary: string): void {
     }
   });
 
-  // Wedge watchdog — if the OS goes silent (no console
-  // output, no driver activity) for too long, assume a
-  // freeze and surface a crash screen. The shell prints a
-  // heartbeat every 5000 iterations; under any normal
-  // load that's many lines per second. 8s with zero output
-  // is unambiguous.
-  if (crashScreen) {
-    let lastConsoleAt = performance.now();
-    const updateLastConsole = (): void => {
-      lastConsoleAt = performance.now();
-    };
-    consoleHost.onOutput(updateLastConsole);
-    const watchdogIntervalMs = 1000;
-    const watchdogThresholdMs = 8000;
-    let bootGraceMs = 5000;
-    const watchdog = window.setInterval(() => {
-      bootGraceMs -= watchdogIntervalMs;
-      if (bootGraceMs > 0) return;
-      const silentFor = performance.now() - lastConsoleAt;
-      if (silentFor > watchdogThresholdMs) {
-        window.clearInterval(watchdog);
-        crashScreen.show({
-          title: "PMos has stopped responding",
-          subtitle: `No kernel output for ${Math.round(silentFor)}ms — the OS is wedged.`,
-          recent: recentLines,
-        });
-      }
-    }, watchdogIntervalMs);
-  }
+  // Wedge watchdog removed: was triggering false positives now
+  // that the shell + display-server have stopped emitting periodic
+  // heartbeats during steady-state idle. A genuinely-wedged OS still
+  // surfaces a crash screen via the worker `error` / `messageerror`
+  // listeners, the `unhandledrejection` listener, the
+  // consoleHost.onLifecycle({kind:"panic"}) path, and the fatal-line
+  // scanner inside crashScreen.observeConsoleLine (which catches
+  // "init-desktop reaped child", "real kernel panic", and "dispatch
+  // error" patterns without needing a periodic-output expectation).
 
   // Keyboard input: a `keydown` on `document` so the handler fires
   // regardless of which element has focus (real-kernel mode hides the

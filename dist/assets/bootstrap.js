@@ -1128,29 +1128,6 @@ function runRealKernelMode(bootBinary) {
       });
     }
   });
-  if (crashScreen) {
-    let lastConsoleAt = performance.now();
-    const updateLastConsole = () => {
-      lastConsoleAt = performance.now();
-    };
-    consoleHost.onOutput(updateLastConsole);
-    const watchdogIntervalMs = 1e3;
-    const watchdogThresholdMs = 8e3;
-    let bootGraceMs = 5e3;
-    const watchdog = window.setInterval(() => {
-      bootGraceMs -= watchdogIntervalMs;
-      if (bootGraceMs > 0) return;
-      const silentFor = performance.now() - lastConsoleAt;
-      if (silentFor > watchdogThresholdMs) {
-        window.clearInterval(watchdog);
-        crashScreen.show({
-          title: "PMos has stopped responding",
-          subtitle: `No kernel output for ${Math.round(silentFor)}ms \u2014 the OS is wedged.`,
-          recent: recentLines
-        });
-      }
-    }, watchdogIntervalMs);
-  }
   document.addEventListener("keydown", (event) => {
     if (event.ctrlKey || event.metaKey || event.altKey) {
       return;
