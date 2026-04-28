@@ -109,28 +109,8 @@ mod wasm_main {
         }
     }
 
-    /// Best-effort snapshot of /proc. Logs what it finds so a
-    /// stuck-empty result is visible in the boot log.
-    fn collect_with_diag() -> Vec<String> {
-        let snap = sysmon::collect_snapshot(&PathBuf::from("/proc"));
-        if snap.is_empty() {
-            // Walk /proc manually so we know whether the dir is
-            // empty, unreadable, or just lacks status files.
-            match std::fs::read_dir("/proc") {
-                Ok(it) => {
-                    let mut count = 0;
-                    for e in it.flatten() {
-                        count += 1;
-                        let _ = e.file_name();
-                    }
-                    println!("sysmon: /proc readdir ok, {} entries, but collect_snapshot empty", count);
-                }
-                Err(e) => println!("sysmon: /proc read_dir err: {}", e),
-            }
-        } else {
-            println!("sysmon: collected {} processes", snap.len());
-        }
-        snap
+    fn collect() -> Vec<String> {
+        sysmon::collect_snapshot(&PathBuf::from("/proc"))
     }
 
     fn run_window<C: Connection>(connection: C) -> Result<(), toolkit::ClientError> {
@@ -148,7 +128,7 @@ mod wasm_main {
         // sysmon repaints roughly twice a second under the
         // tight inner loop.
         const REFRESH_EVERY: u32 = 5_000;
-        let mut snapshot = collect_with_diag();
+        let mut snapshot = collect();
         let mut tick: u32 = 0;
         let mut last_refresh: u32 = 0;
         let mut needs_paint = true;
@@ -167,7 +147,7 @@ mod wasm_main {
                 needs_paint = true;
             }
             if configured_once && tick.wrapping_sub(last_refresh) >= REFRESH_EVERY {
-                snapshot = collect_with_diag();
+                snapshot = collect();
                 last_refresh = tick;
                 needs_paint = true;
             }

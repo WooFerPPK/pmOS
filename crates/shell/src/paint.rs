@@ -241,44 +241,13 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     slots: &[LauncherSlot],
     mut spawner: S,
 ) -> Result<ShellExit, ClientError> {
-    println!("shell: run_desktop_shell entered");
-    let mut app = match App::connect_with_shell(connection) {
-        Ok(a) => {
-            println!(
-                "shell: App::connect_with_shell ok (seat={:?} pointer={:?} shell_manager={:?})",
-                a.seat(), a.pointer(), a.shell_manager(),
-            );
-            a
-        }
-        Err(e) => {
-            println!("shell: App::connect_with_shell failed: {:?}", e);
-            return Err(e);
-        }
-    };
-    let mut window = match Window::new(&mut app) {
-        Ok(w) => w,
-        Err(e) => {
-            println!("shell: Window::new failed: {:?}", e);
-            return Err(e);
-        }
-    };
-    if let Err(e) = window.set_title("PMos") {
-        println!("shell: set_title failed: {:?}", e);
-        return Err(e);
-    }
-    if let Err(e) = window.commit() {
-        println!("shell: commit failed: {:?}", e);
-        return Err(e);
-    }
-    println!("shell: window created + committed");
+    let mut app = App::connect_with_shell(connection)?;
+    let mut window = Window::new(&mut app)?;
+    window.set_title("PMos")?;
+    window.commit()?;
 
     if window.app_mut().shell_manager().is_some() {
-        match window.app_mut().shell_manager_subscribe_windows() {
-            Ok(_) => println!("shell: subscribed to shell_manager"),
-            Err(e) => println!("shell: subscribe failed: {:?}", e),
-        }
-    } else {
-        println!("shell: no shell_manager bound");
+        let _ = window.app_mut().shell_manager_subscribe_windows();
     }
 
     let theme = Theme::default();
@@ -291,88 +260,20 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     let mut needs_paint = false;
     let mut force_first_paint_done = false;
 
-    let mut iter_count: u32 = 0;
-    let mut total_events: u64 = 0;
-    let mut total_motion: u64 = 0;
-    let mut total_buttons: u64 = 0;
-    let mut total_paints: u64 = 0;
-    let mut stuck_acquire_count: u64 = 0;
-    let mut last_heartbeat_iter: u32 = 0;
-    // Heartbeat cadence — every N iterations. A no-events
-    // loop runs many thousands of iters/sec because each
-    // FdConnection.recv is bounded; under pure idle the
-    // heartbeat should fire in well under a second. If the
-    // watchdog (8s of zero console output) trips before any
-    // heartbeat lands, the shell is wedged inside one of
-    // the syscalls (recv, fd_write, sched_yield), not just
-    // event-starved.
-    const HEARTBEAT_EVERY: u32 = 1_000;
     for _ in 0..max_dispatch_iterations {
-        iter_count = iter_count.wrapping_add(1);
         let events = match window.dispatch() {
             Ok(e) => e,
             Err(e) => {
-                println!("shell: dispatch error at iter {}: {:?}", iter_count, e);
+                println!("shell: dispatch error: {:?}", e);
                 return Err(e);
             }
         };
 
-        if iter_count.wrapping_sub(last_heartbeat_iter) >= HEARTBEAT_EVERY {
-            println!(
-                "shell: heartbeat iter={} total_events={} motion={} buttons={} paints={} stuck_acquire={} needs_paint={} close_req={} configured={}",
-                iter_count,
-                total_events,
-                total_motion,
-                total_buttons,
-                total_paints,
-                stuck_acquire_count,
-                needs_paint,
-                window.close_requested(),
-                window.is_configured(),
-            );
-            last_heartbeat_iter = iter_count;
-        }
-
         if window.close_requested() {
-            println!("shell: close_requested at iter {}, exiting", iter_count);
             return Ok(ShellExit::CloseRequested);
         }
 
-        if !events.is_empty() {
-            total_events += events.len() as u64;
-            for ev in &events {
-                if ev.interface == Interface::Pointer && ev.opcode == 1 {
-                    total_motion += 1;
-                } else if ev.interface == Interface::Pointer && ev.opcode == 2 {
-                    total_buttons += 1;
-                }
-            }
-        }
-
-        // Only log "interesting" events — pointer motion can
-        // arrive in floods (one per pixel of mouse drag) and
-        // crowds out everything useful.
-        let interesting = events
-            .iter()
-            .any(|e| !(e.interface == Interface::Pointer && e.opcode == 1));
-        if interesting {
-            println!(
-                "shell: iter {} got {} events, configured={} size={:?}",
-                iter_count,
-                events.len(),
-                window.is_configured(),
-                window.configured_size(),
-            );
-        }
-
         for event in events {
-            let is_motion = event.interface == Interface::Pointer && event.opcode == 1;
-            if !is_motion {
-                println!(
-                    "shell:   event interface={:?} opcode={} object_id={:?} payload_len={}",
-                    event.interface, event.opcode, event.object_id, event.payload.len(),
-                );
-            }
             match (event.interface, event.opcode) {
                 (Interface::ShellManager, 1 /* window_created */) => {
                     if let Ok(decoded) = ShellWindowCreated::decode(&event.payload) {
@@ -500,41 +401,11 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
             // changes; otherwise reuse so the back/front
             // swap doesn't churn allocations.
             if last_size != (w, h) {
-                println!("shell: allocating BufferPool {}x{}", w, h);
-                pool = Some(match BufferPool::new(window.app_mut(), w, h) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("shell: BufferPool::new failed: {:?}", e);
-                        return Err(e);
-                    }
-                });
+                pool = Some(BufferPool::new(window.app_mut(), w, h)?);
                 last_size = (w, h);
             }
             let p = pool.as_mut().expect("pool initialised when w/h are set");
-            // Detect prolonged back-pressure: if every
-            // acquire returns None for many iterations the
-            // server has stopped emitting buffer-release
-            // events and we'll never paint again. Log every
-            // 100 stuck iterations so we know to investigate.
-            let acquire_attempt = p.acquire_back_canvas();
-            if acquire_attempt.is_none() {
-                stuck_acquire_count += 1;
-                if stuck_acquire_count == 1 || stuck_acquire_count % 100 == 0 {
-                    println!(
-                        "shell: acquire_back_canvas returned None at iter {} (stuck for {} attempts)",
-                        iter_count, stuck_acquire_count,
-                    );
-                }
-            } else {
-                if stuck_acquire_count > 0 {
-                    println!(
-                        "shell: acquire recovered after {} stuck attempts at iter {}",
-                        stuck_acquire_count, iter_count,
-                    );
-                    stuck_acquire_count = 0;
-                }
-            }
-            if let Some(mut canvas) = acquire_attempt {
+            if let Some(mut canvas) = p.acquire_back_canvas() {
                 canvas.fill_rect(
                     Rect { x: 0, y: 0, width: w, height: h },
                     wallpaper,
@@ -545,27 +416,12 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
                     draw_launcher_menu(&mut canvas, &taskbar, &theme, slots, menu_hover);
                 }
                 drop(canvas);
-                if let Err(e) = p.commit_and_swap(&mut window) {
-                    println!("shell: commit_and_swap failed at iter {}: {:?}", iter_count, e);
-                    return Err(e);
-                }
-                total_paints += 1;
-                // Only spam the per-paint line every 20th
-                // paint so the long-run heartbeat stays
-                // readable. Boot's first few paints still
-                // print individually.
-                if total_paints <= 5 || total_paints % 20 == 0 {
-                    println!(
-                        "shell: painted frame #{} at iter {} (taskbar={}, launcher_open={})",
-                        total_paints, iter_count, taskbar.entries().len(), launcher_open,
-                    );
-                }
+                p.commit_and_swap(&mut window)?;
                 needs_paint = false;
             }
         }
     }
 
-    println!("shell: iteration limit hit ({} iters)", iter_count);
     Ok(ShellExit::IterationLimit)
 }
 
@@ -693,17 +549,11 @@ fn handle_press<C: Connection, S: Spawner>(
     spawner: &mut S,
     app: &mut App<C>,
 ) {
-    println!(
-        "shell: handle_press at ({}, {}) launcher_open={} taskbar_bounds={:?}",
-        x, y, *launcher_open, taskbar.bounds(),
-    );
     // Menu has highest priority while open.
     if *launcher_open {
         if let Some(idx) = launcher_menu_row_at(taskbar, slots, x, y) {
             let path = slots[idx].exec;
-            println!("shell: launcher row {} ({}) clicked, spawning", idx, path);
             let rc = spawner.spawn(path);
-            println!("shell: spawn rc={}", rc);
             // We deliberately don't surface the spawn rc
             // up — a failed spawn is logged but the user's
             // click is still consumed (the menu closes).
@@ -722,11 +572,9 @@ fn handle_press<C: Connection, S: Spawner>(
     }
 
     let lb = launcher_button_bounds(taskbar);
-    println!("shell: launcher button bounds: {:?}", lb);
     if x >= lb.x && x < lb.right() && y >= lb.y && y < lb.bottom() {
         *launcher_open = !*launcher_open;
         *menu_hover = None;
-        println!("shell: launcher toggled, now open={}", *launcher_open);
         return;
     }
 
@@ -734,11 +582,8 @@ fn handle_press<C: Connection, S: Spawner>(
         match click {
             crate::taskbar::TaskbarClick::Focus { window_id }
             | crate::taskbar::TaskbarClick::Restore { window_id } => {
-                println!("shell: focus_window({})", window_id);
                 let _ = app.shell_manager_focus_window(window_id);
             }
         }
-    } else {
-        println!("shell: click missed everything");
     }
 }
