@@ -336,7 +336,7 @@ function packMouseEvent(kind, x, y, button, state) {
 
 // src/bootstrap.ts
 var BOOT_VERSION = "0.1.0-demo";
-var EXPECTED_MANIFEST_VERSION = 39;
+var EXPECTED_MANIFEST_VERSION = 40;
 async function ensureFreshBootstrap() {
   try {
     const resp = await fetch("/manifest.json", { cache: "no-store" });

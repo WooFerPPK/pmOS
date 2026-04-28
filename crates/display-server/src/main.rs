@@ -607,7 +607,19 @@ fn main() {
                     if had_commit {
                         commit_dirty = true;
                     }
-                } else if rc == 0 || rc == EAGAIN {
+                } else if rc == 0 && nread == 0 {
+                    // Peer closed (EOF). Userland process
+                    // exited without explicitly closing the
+                    // socket; the kernel's `recv_on_socket`
+                    // returns Ok(0) for this case while EAGAIN
+                    // is signalled with rc < 0. Disconnect so
+                    // the dead client doesn't accumulate in
+                    // `conns` forever.
+                    let _ = fd_close(server_fd);
+                    let _ = server.disconnect(client_id);
+                    conns.swap_remove(idx);
+                    continue;
+                } else if rc == EAGAIN {
                     // No bytes ready right now. Move on to the
                     // next client.
                 } else {

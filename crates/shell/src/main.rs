@@ -60,6 +60,32 @@ mod wasm_main {
         /// Spawn a child process. Returns a positive child
         /// pid on success, negative errno on failure.
         fn proc_spawn(path_ptr: *const u8, path_len: u32, caps: u64) -> i32;
+        /// Reap a zombie child. With WNOHANG (options=1) returns
+        /// -EAGAIN if no zombie matches the target. With
+        /// target=-1 (WAIT_ANY) reaps any child.
+        fn proc_wait(target_pid: i32, options: i32, status_out_ptr: i32) -> i32;
+    }
+
+    /// Drain every zombie child the shell can see. Called on a
+    /// schedule from the desktop event loop so that spawned
+    /// apps that exit (closed by the user, crashed, exited on
+    /// their own) don't accumulate zombie process-table
+    /// entries forever. WNOHANG = 1; -EAGAIN means "no zombies
+    /// right now"; positive return is the reaped pid.
+    pub fn shell_reap_zombies() {
+        let mut status_out: i64 = 0;
+        let status_ptr = &mut status_out as *mut i64 as i32;
+        loop {
+            let rc = unsafe { proc_wait(-1, 1, status_ptr) };
+            if rc <= 0 {
+                // Either -EAGAIN (no zombies), -ECHILD (no
+                // children at all), or some other error. Stop
+                // reaping until next tick.
+                return;
+            }
+            // Successfully reaped pid `rc`; loop again to drain
+            // any other zombies in one tick.
+        }
     }
 
     /// Closure-friendly wrapper the shell library calls when
@@ -305,6 +331,7 @@ mod wasm_main {
             taskbar,
             DEFAULT_LAUNCHER_SLOTS,
             shell_spawn,
+            shell_reap_zombies,
         ) {
             Ok(_) => unsafe { proc_exit(0) },
             Err(_) => unsafe { proc_exit(1) },

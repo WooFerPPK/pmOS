@@ -214,6 +214,25 @@ where
     }
 }
 
+/// Drain every zombie child the shell currently has. Called
+/// periodically from the desktop event loop so spawned apps
+/// that exit don't accumulate zombie proc-table entries
+/// forever. Production main supplies a closure that calls
+/// `pmos_ext.proc_wait(-1, WNOHANG)` in a loop; tests pass a
+/// no-op.
+pub trait Reaper {
+    fn reap(&mut self);
+}
+
+impl<F> Reaper for F
+where
+    F: FnMut(),
+{
+    fn reap(&mut self) {
+        (self)()
+    }
+}
+
 /// Run the desktop shell's full event-driven loop.
 ///
 /// Differences from [`run_shell_with_taskbar`]:
@@ -234,13 +253,19 @@ where
 /// * Repaints the wallpaper / taskbar / launcher only when
 ///   state actually changed, so the loop yields back to
 ///   the worker between frames.
-pub fn run_desktop_shell<C: Connection, S: Spawner>(
+pub fn run_desktop_shell<C, S, R>(
     connection: C,
     max_dispatch_iterations: u32,
     mut taskbar: Taskbar,
     slots: &[LauncherSlot],
     mut spawner: S,
-) -> Result<ShellExit, ClientError> {
+    mut reaper: R,
+) -> Result<ShellExit, ClientError>
+where
+    C: Connection,
+    S: Spawner,
+    R: Reaper,
+{
     let mut app = App::connect_with_shell(connection)?;
     let mut window = Window::new(&mut app)?;
     window.set_title("PMos")?;
@@ -249,6 +274,16 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     if window.app_mut().shell_manager().is_some() {
         let _ = window.app_mut().shell_manager_subscribe_windows();
     }
+
+    // Reap zombies every N iterations. The shell's tight
+    // event loop covers thousands of iters/sec under normal
+    // load; 5000 puts the cadence at well under a second.
+    // Every spawned app that exits without being reaped
+    // would otherwise stay as a zombie in the kernel proc
+    // table forever, accumulating until the kernel runs out
+    // of pid slots and the OS visibly freezes.
+    const REAP_EVERY: u32 = 5_000;
+    let mut iter_since_reap: u32 = 0;
 
     let theme = Theme::default();
     let wallpaper = theme.window_background;
@@ -261,6 +296,11 @@ pub fn run_desktop_shell<C: Connection, S: Spawner>(
     let mut force_first_paint_done = false;
 
     for _ in 0..max_dispatch_iterations {
+        iter_since_reap = iter_since_reap.wrapping_add(1);
+        if iter_since_reap >= REAP_EVERY {
+            reaper.reap();
+            iter_since_reap = 0;
+        }
         let events = match window.dispatch() {
             Ok(e) => e,
             Err(e) => {

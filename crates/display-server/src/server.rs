@@ -360,21 +360,29 @@ impl Server {
         }
         let hit = self.hit_test(self.pointer_x, self.pointer_y)?;
         if state == display_proto::events::pointer_button_state::PRESSED {
-            self.keyboard_focus = Some((hit.client_id, hit.surface_id));
-            // Find the toplevel id that owns the hit surface
-            // and broadcast a window_focused event so every
-            // subscribed shell repaints its taskbar.
-            let mut focused_window_id: Option<u32> = None;
-            if let Some(client) = self.clients.get(&hit.client_id) {
-                for (toplevel_id, toplevel) in client.toplevels.iter() {
-                    if toplevel.surface_id == hit.surface_id {
-                        focused_window_id = Some(toplevel_id.0);
-                        break;
+            let prev_focus = self.keyboard_focus;
+            let new_focus = (hit.client_id, hit.surface_id);
+            self.keyboard_focus = Some(new_focus);
+            // Only broadcast window_focused on a real focus
+            // change. Re-clicking the already-focused window
+            // re-emitted the same broadcast every time, which
+            // forced every subscribed shell to repaint —
+            // turning idle clicks into 3 MiB chunked
+            // shm_pool.write traffic. Suppress those.
+            let focus_changed = prev_focus != Some(new_focus);
+            if focus_changed {
+                let mut focused_window_id: Option<u32> = None;
+                if let Some(client) = self.clients.get(&hit.client_id) {
+                    for (toplevel_id, toplevel) in client.toplevels.iter() {
+                        if toplevel.surface_id == hit.surface_id {
+                            focused_window_id = Some(toplevel_id.0);
+                            break;
+                        }
                     }
                 }
-            }
-            if let Some(wid) = focused_window_id {
-                self.broadcast_window_focused(wid);
+                if let Some(wid) = focused_window_id {
+                    self.broadcast_window_focused(wid);
+                }
             }
         }
         let client = self.clients.get_mut(&hit.client_id)?;

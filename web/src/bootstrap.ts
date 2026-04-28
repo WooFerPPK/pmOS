@@ -47,7 +47,7 @@ const BOOT_VERSION = "0.1.0-demo";
  * a service-worker cache that hadn't yet swapped to the new
  * generation would keep running the old bootstrap forever.
  */
-const EXPECTED_MANIFEST_VERSION = 39;
+const EXPECTED_MANIFEST_VERSION = 40;
 
 /**
  * Fetch /manifest.json (bypassing the SW cache) and reload the
