@@ -131,8 +131,25 @@ fn run_window<C: toolkit::protocol::Connection>(
     window.commit()?;
 
     let mut painted = false;
-    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    let (entries, dirs, files) = list_dir(&cwd);
+    // Pick the first directory that actually has readable
+    // entries. /home/user is the conventional default but
+    // it's unlikely to exist on a fresh boot before
+    // anything writes there; fall back to / and /persist.
+    let candidates = [
+        std::env::var("HOME").ok(),
+        Some("/persist/home/user".to_string()),
+        Some("/persist".to_string()),
+        Some("/".to_string()),
+    ];
+    let (cwd, entries, dirs, files) = candidates
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let (entries, dirs, files) = list_dir(&c);
+            (c, entries, dirs, files)
+        })
+        .find(|(_, entries, _, _)| !entries.is_empty())
+        .unwrap_or_else(|| ("/".to_string(), Vec::new(), 0, 0));
 
     loop {
         let _ = window.dispatch()?;
@@ -172,16 +189,29 @@ fn run_window<C: toolkit::protocol::Connection>(
                 // Listing.
                 let mut y = addr_y + addr_h as i32 + 8;
                 let row_h = 16u32;
-                for (i, (name, is_dir)) in entries.iter().take(15).enumerate() {
-                    let row_color = if i % 2 == 0 { bg } else { row_alt };
-                    canvas.fill_rect(
-                        Rect { x: 0, y, width: w, height: row_h },
-                        row_color,
+                if entries.is_empty() {
+                    canvas.draw_text(
+                        12,
+                        y + 4,
+                        "(empty directory)",
+                        Color::rgb(0x80, 0x80, 0x90),
                     );
-                    let label = if *is_dir { format!("[DIR] {}", name) } else { name.clone() };
-                    let color = if *is_dir { dir_color } else { file_color };
-                    canvas.draw_text(12, y + 4, &label, color);
-                    y += row_h as i32;
+                } else {
+                    for (i, (name, is_dir)) in entries.iter().take(15).enumerate() {
+                        let row_color = if i % 2 == 0 { bg } else { row_alt };
+                        canvas.fill_rect(
+                            Rect { x: 0, y, width: w, height: row_h },
+                            row_color,
+                        );
+                        let label = if *is_dir {
+                            format!("[DIR] {}", name)
+                        } else {
+                            name.clone()
+                        };
+                        let color = if *is_dir { dir_color } else { file_color };
+                        canvas.draw_text(12, y + 4, &label, color);
+                        y += row_h as i32;
+                    }
                 }
 
                 // Status line.

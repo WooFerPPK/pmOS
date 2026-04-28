@@ -109,6 +109,30 @@ mod wasm_main {
         }
     }
 
+    /// Best-effort snapshot of /proc. Logs what it finds so a
+    /// stuck-empty result is visible in the boot log.
+    fn collect_with_diag() -> Vec<String> {
+        let snap = sysmon::collect_snapshot(&PathBuf::from("/proc"));
+        if snap.is_empty() {
+            // Walk /proc manually so we know whether the dir is
+            // empty, unreadable, or just lacks status files.
+            match std::fs::read_dir("/proc") {
+                Ok(it) => {
+                    let mut count = 0;
+                    for e in it.flatten() {
+                        count += 1;
+                        let _ = e.file_name();
+                    }
+                    println!("sysmon: /proc readdir ok, {} entries, but collect_snapshot empty", count);
+                }
+                Err(e) => println!("sysmon: /proc read_dir err: {}", e),
+            }
+        } else {
+            println!("sysmon: collected {} processes", snap.len());
+        }
+        snap
+    }
+
     fn run_window<C: Connection>(connection: C) -> Result<(), toolkit::ClientError> {
         let mut app = App::connect(connection)?;
         let mut window = Window::new(&mut app)?;
@@ -116,44 +140,104 @@ mod wasm_main {
         window.set_app_id("pmos.sysmon")?;
         window.commit()?;
 
-        let snapshot = sysmon::collect_snapshot(&PathBuf::from("/proc"));
-        let mut painted = false;
+        // Repaint cadence: collect every Nth tick + paint a
+        // fresh snapshot. The shell's chunked write path
+        // makes per-iter paints expensive (3 MiB / paint) so
+        // we throttle rather than refresh per tick. The
+        // refresh tick count is tuned so a steady-state
+        // sysmon repaints roughly twice a second under the
+        // tight inner loop.
+        const REFRESH_EVERY: u32 = 5_000;
+        let mut snapshot = collect_with_diag();
+        let mut tick: u32 = 0;
+        let mut last_refresh: u32 = 0;
+        let mut needs_paint = true;
+        let mut configured_once = false;
+        let (w, h) = (560u32, 360u32);
+        let mut pool: Option<BufferPool> = None;
         loop {
+            tick = tick.wrapping_add(1);
             let _ = window.dispatch()?;
-            if window.close_requested() { return Ok(()); }
-            if !painted && window.is_configured() {
-                let (w, h) = (480u32, 320u32);
-                let mut pool: BufferPool = BufferPool::new(window.app_mut(), w, h)?;
-                if let Some(mut canvas) = pool.acquire_back_canvas() {
+            if window.close_requested() {
+                return Ok(());
+            }
+            if !configured_once && window.is_configured() {
+                configured_once = true;
+                pool = Some(BufferPool::new(window.app_mut(), w, h)?);
+                needs_paint = true;
+            }
+            if configured_once && tick.wrapping_sub(last_refresh) >= REFRESH_EVERY {
+                snapshot = collect_with_diag();
+                last_refresh = tick;
+                needs_paint = true;
+            }
+            if needs_paint && configured_once {
+                let p = pool.as_mut().expect("pool initialised");
+                if let Some(mut canvas) = p.acquire_back_canvas() {
                     let bg = Color::rgb(0xfa, 0xfa, 0xfa);
                     let titlebar = Color::rgb(0x60, 0x40, 0x40);
                     let header_bg = Color::rgb(0xe0, 0xe0, 0xe4);
                     let row_alt = Color::rgb(0xf2, 0xf2, 0xf6);
                     let text_fg = Color::rgb(0x10, 0x10, 0x10);
+                    let muted_fg = Color::rgb(0x80, 0x80, 0x90);
 
                     canvas.fill_rect(Rect { x: 0, y: 0, width: w, height: h }, bg);
                     let titlebar_h = 22u32;
-                    canvas.fill_rect(Rect { x: 0, y: 0, width: w, height: titlebar_h }, titlebar);
-                    canvas.draw_text(8, ((titlebar_h as i32 - GLYPH_HEIGHT as i32) / 2).max(0), "System Monitor", Color::rgb(0xff, 0xff, 0xff));
+                    canvas.fill_rect(
+                        Rect { x: 0, y: 0, width: w, height: titlebar_h },
+                        titlebar,
+                    );
+                    canvas.draw_text(
+                        8,
+                        ((titlebar_h as i32 - GLYPH_HEIGHT as i32) / 2).max(0),
+                        "System Monitor",
+                        Color::rgb(0xff, 0xff, 0xff),
+                    );
 
-                    // Header.
-                    let row_h = 14;
+                    let row_h = 14_i32;
                     let header_y = titlebar_h as i32 + 4;
-                    canvas.fill_rect(Rect { x: 0, y: header_y, width: w, height: row_h as u32 }, header_bg);
-                    canvas.draw_text(8, header_y + 2, "PID    NAME              STATE       PPID", text_fg);
+                    canvas.fill_rect(
+                        Rect { x: 0, y: header_y, width: w, height: row_h as u32 },
+                        header_bg,
+                    );
+                    canvas.draw_text(
+                        8,
+                        header_y + 2,
+                        "PID    NAME              STATE       PPID",
+                        text_fg,
+                    );
 
-                    // Rows.
                     let mut y = header_y + row_h + 2;
-                    for (i, line) in snapshot.iter().take(20).enumerate() {
-                        if i % 2 == 1 {
-                            canvas.fill_rect(Rect { x: 0, y, width: w, height: row_h as u32 }, row_alt);
+                    if snapshot.is_empty() {
+                        canvas.draw_text(
+                            8,
+                            y + 2,
+                            "(no processes visible — /proc may be empty)",
+                            muted_fg,
+                        );
+                    } else {
+                        for (i, line) in snapshot.iter().take(20).enumerate() {
+                            if i % 2 == 1 {
+                                canvas.fill_rect(
+                                    Rect { x: 0, y, width: w, height: row_h as u32 },
+                                    row_alt,
+                                );
+                            }
+                            canvas.draw_text(8, y + 2, line, text_fg);
+                            y += row_h;
                         }
-                        canvas.draw_text(8, y + 2, line, text_fg);
-                        y += row_h;
                     }
+                    let footer = format!(
+                        "{} process{}   |   refresh ~ every {} ticks",
+                        snapshot.len(),
+                        if snapshot.len() == 1 { "" } else { "es" },
+                        REFRESH_EVERY,
+                    );
+                    canvas.draw_text(8, h as i32 - GLYPH_HEIGHT as i32 - 6, &footer, muted_fg);
+
                     drop(canvas);
-                    pool.commit_and_swap(&mut window)?;
-                    painted = true;
+                    p.commit_and_swap(&mut window)?;
+                    needs_paint = false;
                 }
             }
         }
