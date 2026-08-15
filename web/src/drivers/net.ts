@@ -436,7 +436,14 @@ function defaultFetcher(url: string, init?: {
   const reqInit: RequestInit = {};
   if (init?.method !== undefined) reqInit.method = init.method;
   if (init?.headers !== undefined) reqInit.headers = init.headers;
-  if (init?.body !== undefined) reqInit.body = init.body;
+  if (init?.body !== undefined) {
+    // DOM's BodyInit deliberately excludes SharedArrayBuffer-backed
+    // views. Driver callers only need the bytes, so copy them into a
+    // plain ArrayBuffer before handing the request to fetch().
+    const body = new Uint8Array(init.body.byteLength);
+    body.set(init.body);
+    reqInit.body = body.buffer;
+  }
   return globalThis.fetch(url, reqInit).then(async (r) => {
     const headers: Record<string, string> = {};
     r.headers.forEach((v, k) => {

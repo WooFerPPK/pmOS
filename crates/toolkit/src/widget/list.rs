@@ -277,8 +277,7 @@ impl List {
                 if self.scroll_offset == 0 {
                     return ListKeyOutcome::Ignored;
                 }
-                self.scroll_offset =
-                    self.scroll_offset.saturating_sub(visible_rows as usize);
+                self.scroll_offset = self.scroll_offset.saturating_sub(visible_rows as usize);
                 ListKeyOutcome::ScrolledOnly
             }
             ListKey::PageDown => {

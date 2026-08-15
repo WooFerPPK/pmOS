@@ -9,6 +9,8 @@ community. In particular:
   the baseline syscall surface PMos extends from.
 - The Linux kernel's process / VFS / IPC models, whose
   conventions PMos mirrors for userland compatibility.
+- OpenAI image generation, used to create the three original
+  abstract PMos desktop wallpapers shipped with this tree.
 
 The project constitution (see .specify/memory/constitution.md)
 codifies the ten principles that shape every design choice.

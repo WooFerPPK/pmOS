@@ -71,25 +71,27 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use abi::cap::CapSet;
 use abi::ext::Pid;
 use abi::ring::{Request, SLOT_SIZE};
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::fd::{FdFlags, FdObject};
 use crate::fs::devfs::{DevFs, DEV_CONSOLE};
 #[cfg(target_arch = "wasm32")]
-use crate::fs::opfs::{block::WasmBlockDevice, mkfs::mkfs as opfs_mkfs, OpfsFs};
+use crate::fs::opfs::{block::WasmBlockDevice, OpfsFs};
 use crate::fs::procfs::{
-    format_argv_cmdline, proc_state_to_status, ProcFdSnapshot, ProcFs, ProcFsSource,
-    ProcStatusSnapshot, StorageSnapshot,
+    classify_procfs_ino, classify_procfs_path, classify_procfs_relative, format_argv_cmdline,
+    proc_state_to_status, ProcFdSnapshot, ProcFs, ProcFsNode, ProcFsSource, ProcStatusSnapshot,
+    StorageSnapshot,
 };
 use crate::fs::tmpfs::TmpFs;
-use crate::proc::ProcState;
+use crate::proc::{ExitStatus, ProcState};
 use crate::sys::{Kernel, RegisterArgs};
 use crate::syscall::dispatch::{self, ServiceOutcome};
 
@@ -131,6 +133,12 @@ static mut HEAP_SCRATCH: [u8; HEAP_SCRATCH_SIZE] = [0u8; HEAP_SCRATCH_SIZE];
 /// called; `Some` afterwards for the lifetime of the Worker.
 static mut KERNEL: Option<Kernel> = None;
 
+/// Dispatch-scoped, owned projection used by the procfs mount. It is a
+/// separate allocation from [`KERNEL`]: snapshot preparation finishes before
+/// syscall dispatch starts, and procfs reads never reach back into the live
+/// kernel while `dispatch` holds its exclusive borrow.
+static mut LIVE_PROCFS_VIEW: Option<LiveProcFsView> = None;
+
 /// Borrow the global kernel mutably. Panics if `kernel_init`
 /// hasn't been called yet — the host side MUST call it before
 /// any other export.
@@ -142,43 +150,38 @@ fn kernel_mut() -> &'static mut Kernel {
     }
 }
 
-/// Borrow the global kernel immutably. Used by [`LiveProcFsSource`]
-/// to project read-only kernel state into `/proc` without taking
-/// a fresh `&mut` (which would alias with the dispatch's outer
-/// `kernel_mut` borrow). Panics if `kernel_init` hasn't been
-/// called yet.
-fn kernel_ref() -> &'static Kernel {
+// ---- live procfs source ------------------------------------------------
+
+#[derive(Default)]
+struct LiveProcFsView {
+    boot_time_ns: u64,
+    live_pids: Option<Vec<Pid>>,
+    meminfo: Option<String>,
+    loadavg: Option<String>,
+    storage: Option<StorageSnapshot>,
+    statuses: BTreeMap<Pid, Option<ProcStatusSnapshot>>,
+    cmdlines: BTreeMap<Pid, Option<Vec<u8>>>,
+    fds: BTreeMap<Pid, Vec<ProcFdSnapshot>>,
+}
+
+fn live_procfs_view() -> &'static LiveProcFsView {
     unsafe {
-        KERNEL
+        LIVE_PROCFS_VIEW
             .as_ref()
-            .expect("kernel_init must be called before any other kernel_* export")
+            .expect("kernel_init must prepare procfs before it can be read")
     }
 }
 
-// ---- live procfs source ------------------------------------------------
-
-/// `ProcFsSource` projecting the live kernel singleton through
-/// `/proc`. Each method call derefs `KERNEL` via `kernel_ref`,
-/// snapshots the requested data into owned values, and returns —
-/// no reference to kernel state escapes the call.
+/// `ProcFsSource` serving the independently-owned projection prepared at the
+/// syscall boundary. No method borrows [`KERNEL`], so a VFS call made through
+/// `dispatch(&mut Kernel, ..)` cannot create an aliased kernel reference.
 ///
 /// Replaces the `ProcFs::with_static()` placeholder in
 /// `kernel_init` so `/proc/<pid>/status`, `/proc/<pid>/cmdline`,
 /// and the top-level `/proc/version` reflect the running kernel
 /// instead of canned test data.
 ///
-/// Safety relies on the wasm32 single-threaded runtime: each
-/// procfs read fires inside a syscall whose outer `kernel_mut`
-/// has exclusive access; we take a fresh `&Kernel` for the
-/// duration of one method call, never store it across call
-/// boundaries, and only ever read.
 pub struct LiveProcFsSource;
-
-impl LiveProcFsSource {
-    fn with_kernel<R>(f: impl FnOnce(&Kernel) -> R) -> R {
-        f(kernel_ref())
-    }
-}
 
 impl ProcFsSource for LiveProcFsSource {
     fn version(&self) -> String {
@@ -195,12 +198,10 @@ impl ProcFsSource for LiveProcFsSource {
         // both as floats with two decimals; v1 emits integer
         // seconds because the only consumer is sysmon. Idle time
         // stays 0 until the scheduler tracks per-tick idle/busy.
-        Self::with_kernel(|k| {
-            let now = crate::platform::current().now_ns();
-            let elapsed = now.saturating_sub(k.boot_time_ns);
-            let secs = elapsed / 1_000_000_000;
-            format!("{} 0\n", secs)
-        })
+        let now = crate::platform::current().now_ns();
+        let elapsed = now.saturating_sub(live_procfs_view().boot_time_ns);
+        let secs = elapsed / 1_000_000_000;
+        format!("{} 0\n", secs)
     }
 
     fn meminfo(&self) -> String {
@@ -208,17 +209,10 @@ impl ProcFsSource for LiveProcFsSource {
         // accounting that landed in T168. Format mirrors the
         // existing placeholder shape ("total peak available")
         // in bytes, sourced from the live process table.
-        Self::with_kernel(|k| {
-            let mut total: u64 = 0;
-            let mut peak: u64 = 0;
-            for pid in k.procs.live_pids() {
-                if let Some(proc) = k.procs.get(pid) {
-                    total = total.saturating_add(proc.vm_size_bytes);
-                    peak = peak.saturating_add(proc.vm_peak_bytes);
-                }
-            }
-            format!("{} {} {}\n", total, peak, total)
-        })
+        live_procfs_view()
+            .meminfo
+            .clone()
+            .unwrap_or_else(|| String::from("0 0 0\n"))
     }
 
     fn loadavg(&self) -> String {
@@ -226,113 +220,682 @@ impl ProcFsSource for LiveProcFsSource {
         //
         // The three averages come from `Scheduler::load_averages`
         // (a Linux CALC_LOAD-style EMA over `Running + Ready`
-        // process counts; see `proc/loadavg.rs`). We tick the
-        // averages here, on every read of `/proc/loadavg`, so a
-        // long-idle kernel (no syscalls between sample windows)
-        // catches up to wall-clock time at the moment the user
-        // queries the file. Each 5-second interval that has
-        // elapsed since the last tick applies one EMA step.
+        // process counts; see `proc/loadavg.rs`). Snapshot
+        // preparation projects elapsed samples into an owned
+        // copy; dispatch commits that copy only after the syscall
+        // succeeds. This callback only reads the projection.
         //
         // `running/total` and `last_pid` project live state
         // through the process table — same as before the live
         // averaging landed.
-        let kernel = kernel_mut();
-        let live = kernel.procs.live_pids();
-        let total = live.len();
-        let mut running = 0usize;
-        let mut runnable = 0u32;
-        for pid in &live {
-            if let Some(proc) = kernel.procs.get(*pid) {
-                if proc.state == ProcState::Running {
-                    running += 1;
-                    runnable = runnable.saturating_add(1);
-                } else if proc.state == ProcState::Ready {
-                    runnable = runnable.saturating_add(1);
-                }
-            }
-        }
-        let last_pid = kernel.procs.next_pid_peek().saturating_sub(1);
-        let now = crate::platform::current().now_ns();
-        kernel.sched.load_averages.tick(now, runnable);
-        let three = kernel.sched.load_averages.format_three();
-        format!("{} {}/{} {}\n", three, running, total, last_pid)
+        live_procfs_view()
+            .loadavg
+            .clone()
+            .unwrap_or_else(|| String::from("0.00 0.00 0.00 0/0 0\n"))
     }
 
     fn pid_status(&self, pid: Pid) -> Option<ProcStatusSnapshot> {
-        Self::with_kernel(|k| {
-            let proc = k.procs.get(pid)?;
-            if proc.state == ProcState::Dead {
-                return None;
-            }
-            Some(ProcStatusSnapshot {
-                pid: proc.pid,
-                ppid: proc.ppid,
-                name: proc.name.clone(),
-                state: proc_state_to_status(proc.state),
-                vm_size_bytes: proc.vm_size_bytes,
-                vm_peak_bytes: proc.vm_peak_bytes,
-            })
-        })
+        live_procfs_view().statuses.get(&pid).cloned().flatten()
     }
 
     fn live_pids(&self) -> Vec<Pid> {
-        Self::with_kernel(|k| k.procs.live_pids())
+        live_procfs_view().live_pids.clone().unwrap_or_default()
     }
 
     fn pid_cmdline(&self, pid: Pid) -> Option<Vec<u8>> {
-        Self::with_kernel(|k| {
-            let proc = k.procs.get(pid)?;
-            if proc.state == ProcState::Dead {
-                return None;
-            }
-            Some(format_argv_cmdline(&proc.argv))
-        })
+        live_procfs_view().cmdlines.get(&pid).cloned().flatten()
     }
 
     fn pid_fds(&self, pid: Pid) -> Vec<ProcFdSnapshot> {
-        Self::with_kernel(|k| {
-            let Ok(table) = k.fds(pid) else {
-                return Vec::new();
-            };
-            let mut out = Vec::new();
-            for (fd, entry) in table.iter() {
-                let target = match entry.object {
-                    FdObject::Vnode { mount_id, ino } => {
-                        let mp = k.vfs.mountpoint_of(mount_id).unwrap_or("?");
-                        format!("{}#{}", mp, ino)
-                    }
-                    FdObject::CharDevice(devnum) => devnum_to_path(devnum),
-                    FdObject::PipeRead(id) => format!("pipe:[{}r]", id),
-                    FdObject::PipeWrite(id) => format!("pipe:[{}w]", id),
-                    FdObject::Socket(id) => format!("socket:[{}]", id),
-                    FdObject::DisplayConn(id) => format!("display:[{}]", id),
-                    FdObject::SignalChannel => String::from("signal:"),
-                    FdObject::Watch { watch_id } => format!("watch:[{}]", watch_id.0),
-                    FdObject::HostFile { token } => format!("host_file:[{}]", token),
-                };
-                out.push(ProcFdSnapshot { fd, target });
-            }
-            out
-        })
+        live_procfs_view()
+            .fds
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn storage_info(&self) -> Option<StorageSnapshot> {
-        // /proc/storage projects the OPFS quota counters that
-        // T084's block driver surfaces through `OpfsFs::
-        // storage_usage`. The kernel's boot path mounts the OPFS
-        // image at `/persist`; if that mount isn't present (no
-        // FileSystemSyncAccessHandle, jsdom, private mode) the
-        // procfs default formats `0 0 0\n` so userspace parsers
-        // don't fail.
-        Self::with_kernel(|k| {
-            let usage = k.vfs.storage_usage("/persist").ok()??;
-            Some(StorageSnapshot {
-                quota_bytes: usage.quota_bytes,
-                used_bytes: usage.used_bytes,
-                file_count: usage.file_count,
-            })
-        })
+        // /proc/storage projects the persistent root's OPFS quota
+        // counters. When boot has fallen back to a volatile tmpfs
+        // root (no FileSystemSyncAccessHandle, private mode, or an
+        // invalid existing image), the procfs default formats
+        // `0 0 0\n` so userspace parsers do not fail.
+        live_procfs_view().storage.clone()
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ProcFsAccess {
+    Metadata,
+    Readdir,
+}
+
+#[derive(Default)]
+struct ProcFsTargets {
+    nodes: Vec<(ProcFsNode, ProcFsAccess)>,
+}
+
+impl ProcFsTargets {
+    fn add(&mut self, node: ProcFsNode, access: ProcFsAccess) {
+        if let Some((_, existing)) = self.nodes.iter_mut().find(|(item, _)| *item == node) {
+            if access == ProcFsAccess::Readdir {
+                *existing = ProcFsAccess::Readdir;
+            }
+            return;
+        }
+        self.nodes.push((node, access));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+fn snapshot_pid_status(kernel: &Kernel, pid: Pid) -> Option<ProcStatusSnapshot> {
+    let process = kernel.procs.get(pid)?;
+    if process.state == ProcState::Dead {
+        return None;
+    }
+    Some(ProcStatusSnapshot {
+        pid: process.pid,
+        ppid: process.ppid,
+        name: process.name.clone(),
+        state: proc_state_to_status(process.state),
+        vm_size_bytes: process.vm_size_bytes,
+        vm_peak_bytes: process.vm_peak_bytes,
+        open_fds: Some(
+            kernel
+                .fds(pid)
+                .expect("every live process must own an fd table")
+                .open_count(),
+        ),
+    })
+}
+
+fn snapshot_pid_cmdline(kernel: &Kernel, pid: Pid) -> Option<Vec<u8>> {
+    let process = kernel.procs.get(pid)?;
+    if process.state == ProcState::Dead {
+        return None;
+    }
+    Some(format_argv_cmdline(&process.argv))
+}
+
+fn snapshot_fd(kernel: &Kernel, fd: u32, object: FdObject) -> ProcFdSnapshot {
+    let target = match object {
+        FdObject::Vnode { mount_id, ino } => {
+            let mountpoint = kernel.vfs.mountpoint_of(mount_id).unwrap_or("?");
+            format!("{}#{}", mountpoint, ino)
+        }
+        FdObject::CharDevice(devnum) => devnum_to_path(devnum),
+        FdObject::PipeRead(id) => format!("pipe:[{}r]", id),
+        FdObject::PipeWrite(id) => format!("pipe:[{}w]", id),
+        FdObject::Socket(id) => format!("socket:[{}]", id),
+        FdObject::DisplayConn(id) => format!("display:[{}]", id),
+        FdObject::SignalChannel => String::from("signal:"),
+        FdObject::Watch { watch_id } => format!("watch:[{}]", watch_id.0),
+        FdObject::HostFile { token } => format!("host_file:[{}]", token),
+        FdObject::HostDownload { id } => format!("host_download:[{}]", id),
+    };
+    ProcFdSnapshot { fd, target }
+}
+
+fn live_pid_fd_table(kernel: &Kernel, pid: Pid) -> Option<&crate::fd::FdTable> {
+    let process = kernel.procs.get(pid)?;
+    if process.state == ProcState::Dead {
+        return None;
+    }
+    Some(
+        kernel
+            .fds(pid)
+            .expect("every live process must own an fd table"),
+    )
+}
+
+fn snapshot_pid_fds(kernel: &Kernel, pid: Pid) -> Vec<ProcFdSnapshot> {
+    let Some(table) = live_pid_fd_table(kernel, pid) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .map(|(fd, entry)| snapshot_fd(kernel, fd, entry.object))
+        .collect()
+}
+
+fn snapshot_pid_fd(kernel: &Kernel, pid: Pid, fd: u32) -> Option<ProcFdSnapshot> {
+    let table = live_pid_fd_table(kernel, pid)?;
+    let entry = table.get(fd)?;
+    Some(snapshot_fd(kernel, fd, entry.object))
+}
+
+fn prepare_live_procfs_view(
+    kernel: &mut Kernel,
+    targets: &ProcFsTargets,
+) -> Option<crate::proc::loadavg::LoadAverages> {
+    if targets.is_empty() {
+        return None;
+    }
+    let mut projected_load_averages = None;
+    let mut view = LiveProcFsView {
+        boot_time_ns: kernel.boot_time_ns,
+        ..LiveProcFsView::default()
+    };
+    let mut full_fd_snapshots = BTreeSet::new();
+    for (node, access) in &targets.nodes {
+        match *node {
+            ProcFsNode::Root if *access == ProcFsAccess::Readdir => {
+                view.live_pids = Some(kernel.procs.live_pids());
+            }
+            ProcFsNode::Root | ProcFsNode::Version | ProcFsNode::Uptime => {}
+            ProcFsNode::Meminfo => {
+                if view.meminfo.is_none() {
+                    let mut total = 0u64;
+                    let mut peak = 0u64;
+                    for pid in kernel.procs.live_pids() {
+                        if let Some(process) = kernel.procs.get(pid) {
+                            total = total.saturating_add(process.vm_size_bytes);
+                            peak = peak.saturating_add(process.vm_peak_bytes);
+                        }
+                    }
+                    view.meminfo = Some(format!("{} {} {}\n", total, peak, total));
+                }
+            }
+            ProcFsNode::Loadavg => {
+                if view.loadavg.is_none() {
+                    let live = kernel.procs.live_pids();
+                    let total = live.len();
+                    let mut running = 0usize;
+                    let mut runnable = 0u32;
+                    for pid in live {
+                        if let Some(process) = kernel.procs.get(pid) {
+                            if process.state == ProcState::Running {
+                                running += 1;
+                                runnable = runnable.saturating_add(1);
+                            } else if process.state == ProcState::Ready {
+                                runnable = runnable.saturating_add(1);
+                            }
+                        }
+                    }
+                    let last_pid = kernel.procs.next_pid_peek().saturating_sub(1);
+                    let mut projected = kernel.sched.load_averages;
+                    projected.tick(crate::platform::current().now_ns(), runnable);
+                    let three = projected.format_three();
+                    view.loadavg = Some(format!("{} {}/{} {}\n", three, running, total, last_pid));
+                    projected_load_averages = Some(projected);
+                }
+            }
+            ProcFsNode::Storage => {
+                view.storage =
+                    kernel
+                        .vfs
+                        .storage_usage("/")
+                        .ok()
+                        .flatten()
+                        .map(|usage| StorageSnapshot {
+                            quota_bytes: usage.quota_bytes,
+                            used_bytes: usage.used_bytes,
+                            file_count: usage.file_count,
+                        });
+            }
+            ProcFsNode::PidDir(pid) | ProcFsNode::PidStatus(pid) | ProcFsNode::PidMaps(pid) => {
+                view.statuses
+                    .entry(pid)
+                    .or_insert_with(|| snapshot_pid_status(kernel, pid));
+                if matches!(node, ProcFsNode::PidDir(_)) && *access == ProcFsAccess::Readdir {
+                    view.cmdlines
+                        .entry(pid)
+                        .or_insert_with(|| snapshot_pid_cmdline(kernel, pid));
+                }
+            }
+            ProcFsNode::PidCmdline(pid) => {
+                view.statuses
+                    .entry(pid)
+                    .or_insert_with(|| snapshot_pid_status(kernel, pid));
+                view.cmdlines
+                    .entry(pid)
+                    .or_insert_with(|| snapshot_pid_cmdline(kernel, pid));
+            }
+            ProcFsNode::PidFdDir(pid) => {
+                view.statuses
+                    .entry(pid)
+                    .or_insert_with(|| snapshot_pid_status(kernel, pid));
+                if *access == ProcFsAccess::Readdir {
+                    view.fds.insert(pid, snapshot_pid_fds(kernel, pid));
+                    full_fd_snapshots.insert(pid);
+                }
+            }
+            ProcFsNode::PidFd(pid, fd) => {
+                view.statuses
+                    .entry(pid)
+                    .or_insert_with(|| snapshot_pid_status(kernel, pid));
+                if !full_fd_snapshots.contains(&pid) {
+                    if let Some(snapshot) = snapshot_pid_fd(kernel, pid, fd) {
+                        let snapshots = view.fds.entry(pid).or_default();
+                        if snapshots.iter().all(|candidate| candidate.fd != fd) {
+                            snapshots.push(snapshot);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unsafe {
+        LIVE_PROCFS_VIEW = Some(view);
+    }
+    projected_load_averages
+}
+
+#[inline]
+fn request_arg_u32(req: &Request, offset: usize) -> u32 {
+    u32::from_le_bytes([
+        req.args[offset],
+        req.args[offset + 1],
+        req.args[offset + 2],
+        req.args[offset + 3],
+    ])
+}
+
+fn request_heap<'a>(req: &Request, heap: &'a [u8]) -> Option<&'a [u8]> {
+    let start = req.heap_ptr as usize;
+    let end = start.checked_add(req.heap_len as usize)?;
+    heap.get(start..end)
+}
+
+fn procfs_node_for_fd(kernel: &Kernel, pid: Pid, fd: u32) -> Option<ProcFsNode> {
+    let entry = kernel.fds(pid).ok()?.get(fd)?;
+    let FdObject::Vnode { mount_id, ino } = entry.object else {
+        return None;
+    };
+    if kernel.vfs.mountpoint_of(mount_id) != Some("/proc") {
+        return None;
+    }
+    classify_procfs_ino(ino)
+}
+
+fn classify_procfs_at(base: ProcFsNode, relative: &str) -> Option<ProcFsNode> {
+    if relative.starts_with('/') {
+        return classify_procfs_path(relative);
+    }
+    if relative.split('/').any(|component| component == "..") {
+        return None;
+    }
+    if relative.is_empty() || relative == "." {
+        return Some(base);
+    }
+    let prefix = match base {
+        ProcFsNode::Root => String::new(),
+        ProcFsNode::PidDir(pid) => pid.to_string(),
+        ProcFsNode::PidFdDir(pid) => format!("{pid}/fd"),
+        other => return Some(other),
+    };
+    let joined = if prefix.is_empty() {
+        String::from(relative)
+    } else {
+        format!("{prefix}/{relative}")
+    };
+    classify_procfs_relative(&joined)
+}
+
+fn procfs_node_for_path(
+    kernel: &mut Kernel,
+    pid: Pid,
+    dir_fd: Option<u32>,
+    path: &str,
+    follow_last: bool,
+) -> Option<ProcFsNode> {
+    if path.starts_with('/') || dir_fd.is_none() {
+        if let Some(node) = classify_procfs_path(path) {
+            return Some(node);
+        }
+        let redirected = kernel
+            .vfs
+            .path_entering_mount(path, "/proc", follow_last)
+            .ok()??;
+        return classify_procfs_path(&redirected);
+    }
+    let fd = dir_fd?;
+    let entry = kernel.fds(pid).ok()?.get(fd)?;
+    let FdObject::Vnode { mount_id, ino } = entry.object else {
+        return None;
+    };
+    match kernel.vfs.mountpoint_of(mount_id)? {
+        "/proc" => classify_procfs_at(classify_procfs_ino(ino)?, path),
+        "/" if fd == abi::fd::ROOT_PREOPEN => {
+            if let Some(node) = classify_procfs_path(path) {
+                Some(node)
+            } else {
+                let redirected = kernel
+                    .vfs
+                    .path_entering_mount(path, "/proc", follow_last)
+                    .ok()??;
+                classify_procfs_path(&redirected)
+            }
+        }
+        _ => {
+            let redirected = kernel
+                .vfs
+                .path_entering_mount_at(mount_id, ino, path, "/proc", follow_last)
+                .ok()??;
+            classify_procfs_path(&redirected)
+        }
+    }
+}
+
+fn add_utf8_path(
+    targets: &mut ProcFsTargets,
+    kernel: &mut Kernel,
+    pid: Pid,
+    dir_fd: Option<u32>,
+    bytes: &[u8],
+    follow_last: bool,
+    access: ProcFsAccess,
+) {
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return;
+    };
+    if let Some(node) = procfs_node_for_path(kernel, pid, dir_fd, path, follow_last) {
+        targets.add(node, access);
+    }
+}
+
+fn collect_mount_procfs_target(
+    targets: &mut ProcFsTargets,
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) {
+    if u32::from(req.flags) & abi::ext::mount_flags::MOUNT_REMOUNT != 0
+        || !matches!(kernel.caps.check(pid, abi::cap::Cap::Mount), Ok(true))
+    {
+        return;
+    }
+
+    let path_start = request_arg_u32(req, 0) as usize;
+    let path_len = request_arg_u32(req, 4) as usize;
+    let fstype_start = request_arg_u32(req, 8) as usize;
+    let fstype_len = request_arg_u32(req, 12) as usize;
+    let Some(path) = path_start
+        .checked_add(path_len)
+        .and_then(|end| heap.get(path_start..end))
+    else {
+        return;
+    };
+    let Some(fstype) = fstype_start
+        .checked_add(fstype_len)
+        .and_then(|end| heap.get(fstype_start..end))
+    else {
+        return;
+    };
+    let (Ok(path_text), Ok(fstype_text)) =
+        (core::str::from_utf8(path), core::str::from_utf8(fstype))
+    else {
+        return;
+    };
+    if fstype_text != "tmpfs" || !path_text.starts_with('/') {
+        return;
+    }
+    let normalised = crate::vfs::path::normalize(path_text);
+    if normalised == "/"
+        || kernel
+            .vfs
+            .mountpoints()
+            .iter()
+            .any(|(_, mountpoint)| mountpoint == &normalised)
+    {
+        return;
+    }
+    add_utf8_path(
+        targets,
+        kernel,
+        pid,
+        None,
+        path,
+        true,
+        ProcFsAccess::Readdir,
+    );
+}
+
+fn collect_procfs_targets(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &[u8],
+) -> ProcFsTargets {
+    use abi::wasi as op;
+
+    let mut targets = ProcFsTargets::default();
+    match req.opcode {
+        op::FD_READDIR => {
+            if let Some(node) = procfs_node_for_fd(kernel, pid, request_arg_u32(req, 0)) {
+                // Preserve the handler's fd/type error precedence for a zero
+                // or malformed output window, but do not materialise up to a
+                // full 1,024-entry `/proc/<pid>/fd` snapshot when no dirent
+                // byte can be returned.
+                let access = if req.heap_len != 0 && request_heap(req, heap).is_some() {
+                    ProcFsAccess::Readdir
+                } else {
+                    ProcFsAccess::Metadata
+                };
+                targets.add(node, access);
+            }
+        }
+        op::FD_ALLOCATE
+        | op::FD_FDSTAT_GET
+        | op::FD_FILESTAT_GET
+        | op::FD_FILESTAT_SET_SIZE
+        | op::FD_FILESTAT_SET_TIMES
+        | op::FD_PREAD
+        | op::FD_READ
+        | op::FD_SEEK => {
+            if let Some(node) = procfs_node_for_fd(kernel, pid, request_arg_u32(req, 0)) {
+                targets.add(node, ProcFsAccess::Metadata);
+            }
+        }
+        op::POLL_ONEOFF => {
+            if let Some(payload) = request_heap(req, heap) {
+                let count = request_arg_u32(req, 0) as usize;
+                let event_cap = request_arg_u32(req, 4) as usize;
+                let Ok(admission) = kernel.poll_admission_class(pid) else {
+                    return targets;
+                };
+                let limit = admission.per_call_limit();
+                if count == 0 || count > limit || event_cap == 0 || event_cap > limit {
+                    return targets;
+                }
+                let stride = abi::wasi::poll::SUBSCRIPTION_SIZE;
+                let Some(subscriptions_len) = count.checked_mul(stride) else {
+                    return targets;
+                };
+                let Some(events_len) = event_cap.checked_mul(abi::wasi::poll::EVENT_SIZE) else {
+                    return targets;
+                };
+                if payload.len() < core::cmp::max(subscriptions_len, events_len) {
+                    return targets;
+                }
+                for index in 0..count {
+                    let subscription = &payload[index * stride..(index + 1) * stride];
+                    let tag = subscription[abi::wasi::poll::SUB_OFF_TAG];
+                    if tag != abi::wasi::eventtype::FD_READ && tag != abi::wasi::eventtype::FD_WRITE
+                    {
+                        continue;
+                    }
+                    let offset = abi::wasi::poll::SUB_FDRW_OFF_FD;
+                    let fd = u32::from_le_bytes([
+                        subscription[offset],
+                        subscription[offset + 1],
+                        subscription[offset + 2],
+                        subscription[offset + 3],
+                    ]);
+                    if let Some(node) = procfs_node_for_fd(kernel, pid, fd) {
+                        targets.add(node, ProcFsAccess::Metadata);
+                    }
+                }
+            }
+        }
+        op::PATH_OPEN => {
+            if let Some(payload) = request_heap(req, heap) {
+                add_utf8_path(
+                    &mut targets,
+                    kernel,
+                    pid,
+                    Some(request_arg_u32(req, 12)),
+                    payload,
+                    request_arg_u32(req, 8) & abi::wasi::lookupflags::SYMLINK_FOLLOW != 0,
+                    ProcFsAccess::Metadata,
+                );
+            }
+        }
+        op::PATH_FILESTAT_GET => {
+            if let Some(payload) = request_heap(req, heap) {
+                add_utf8_path(
+                    &mut targets,
+                    kernel,
+                    pid,
+                    None,
+                    payload,
+                    request_arg_u32(req, 4) & abi::wasi::lookupflags::SYMLINK_FOLLOW != 0,
+                    ProcFsAccess::Metadata,
+                );
+            }
+        }
+        op::PATH_FILESTAT_SET_TIMES => {
+            if let Some(payload) = request_heap(req, heap).and_then(|bytes| bytes.get(16..)) {
+                add_utf8_path(
+                    &mut targets,
+                    kernel,
+                    pid,
+                    None,
+                    payload,
+                    true,
+                    ProcFsAccess::Metadata,
+                );
+            }
+        }
+        op::PATH_CREATE_DIRECTORY => {
+            if let Some(payload) = request_heap(req, heap) {
+                add_utf8_path(
+                    &mut targets,
+                    kernel,
+                    pid,
+                    None,
+                    payload,
+                    false,
+                    ProcFsAccess::Metadata,
+                );
+            }
+        }
+        op::PATH_UNLINK_FILE | op::PATH_REMOVE_DIRECTORY => {
+            if let Some(payload) = request_heap(req, heap) {
+                add_utf8_path(
+                    &mut targets,
+                    kernel,
+                    pid,
+                    Some(request_arg_u32(req, 0)),
+                    payload,
+                    false,
+                    ProcFsAccess::Metadata,
+                );
+            }
+        }
+        op::PATH_RENAME | op::PATH_LINK => {
+            if let Some(payload) = request_heap(req, heap) {
+                let split = if req.opcode == op::PATH_RENAME {
+                    request_arg_u32(req, 8) as usize
+                } else {
+                    request_arg_u32(req, 12) as usize
+                };
+                if split > 0 && split < payload.len() {
+                    let (old_path, new_path) = payload.split_at(split);
+                    add_utf8_path(
+                        &mut targets,
+                        kernel,
+                        pid,
+                        None,
+                        old_path,
+                        false,
+                        ProcFsAccess::Metadata,
+                    );
+                    add_utf8_path(
+                        &mut targets,
+                        kernel,
+                        pid,
+                        None,
+                        new_path,
+                        false,
+                        ProcFsAccess::Metadata,
+                    );
+                }
+            }
+        }
+        op::PATH_SYMLINK => {
+            if let Some(payload) = request_heap(req, heap) {
+                let split = request_arg_u32(req, 0) as usize;
+                if split > 0 && split < payload.len() {
+                    add_utf8_path(
+                        &mut targets,
+                        kernel,
+                        pid,
+                        None,
+                        &payload[split..],
+                        false,
+                        ProcFsAccess::Metadata,
+                    );
+                }
+            }
+        }
+        op::PATH_READLINK => {
+            if let Some(payload) = request_heap(req, heap) {
+                let path_len = request_arg_u32(req, 4) as usize;
+                if let Some(path) = payload.get(..path_len) {
+                    add_utf8_path(
+                        &mut targets,
+                        kernel,
+                        pid,
+                        None,
+                        path,
+                        false,
+                        ProcFsAccess::Metadata,
+                    );
+                }
+            }
+        }
+        abi::ext::MOUNT => {
+            collect_mount_procfs_target(&mut targets, kernel, pid, req, heap);
+        }
+        abi::ext::UMOUNT | abi::ext::FS_WATCH => {
+            let start = request_arg_u32(req, 0) as usize;
+            let len = request_arg_u32(req, 4) as usize;
+            if let Some(path) = start.checked_add(len).and_then(|end| heap.get(start..end)) {
+                add_utf8_path(
+                    &mut targets,
+                    kernel,
+                    pid,
+                    None,
+                    path,
+                    true,
+                    ProcFsAccess::Metadata,
+                );
+            }
+        }
+        abi::ext::FS_CHMOD => {
+            if let Some(payload) = request_heap(req, heap) {
+                let path_len = request_arg_u32(req, 0) as usize;
+                if let Some(path) = payload.get(..path_len) {
+                    add_utf8_path(
+                        &mut targets,
+                        kernel,
+                        pid,
+                        None,
+                        path,
+                        true,
+                        ProcFsAccess::Metadata,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    targets
 }
 
 /// Map a device number to its canonical path for `/proc/<pid>/fd/<n>`
@@ -361,7 +924,9 @@ fn devnum_to_path(devnum: u32) -> String {
 /// Initialise the global kernel with the v1 default mount
 /// layout:
 ///
-/// * `/`     — tmpfs
+/// * `/`     — OPFS when available and valid, otherwise tmpfs
+/// * `/tmp`  — tmpfs
+/// * `/run`  — tmpfs
 /// * `/dev`  — devfs (null/zero/random/console/fb0/input_*)
 /// * `/proc` — procfs
 ///
@@ -370,10 +935,11 @@ fn devnum_to_path(devnum: u32) -> String {
 /// host side simpler (a reloaded Worker can always call init
 /// without checking whether it's already initialised).
 ///
-/// Returns `-1` if any mount step fails. That should never
-/// happen in practice: the default mounts mount empty
-/// filesystems at absolute paths, and none of the error paths
-/// in `Vfs::mount` are reachable from this call.
+/// Returns `-1` if the root or a required virtual mount cannot be
+/// installed. An unavailable or invalid persistent image is not a
+/// fatal boot error: the existing bytes are left untouched and the
+/// kernel makes the degraded tmpfs-root mode observable in the boot
+/// log and through `/proc/storage` (`0 0 0`).
 #[no_mangle]
 pub extern "C" fn kernel_init() -> i32 {
     unsafe {
@@ -381,7 +947,57 @@ pub extern "C" fn kernel_init() -> i32 {
             return 0;
         }
         let mut k = Kernel::new();
-        if k.vfs.mount("/", Box::new(TmpFs::new())).is_err() {
+
+        // T084: the browser-side block driver owns a
+        // FileSystemSyncAccessHandle over `pmos.img`. A
+        // driver-proven newly-created image may be formatted; an
+        // existing image is mount-only, and a validation failure is
+        // never treated as permission to overwrite it.
+        let mut persistent_root_mounted = false;
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(device) = WasmBlockDevice::open() {
+            let image_state = device.image_state();
+            match OpfsFs::open_image(alloc::boxed::Box::new(device), image_state) {
+                Ok(opfs) => {
+                    if k.vfs.mount("/", Box::new(opfs)).is_ok() {
+                        persistent_root_mounted = true;
+                        let _ = k
+                            .devs
+                            .write(DEV_CONSOLE, b"[pmos] persistent OPFS root mounted at /\n");
+                    } else {
+                        let _ = k.devs.write(
+                            DEV_CONSOLE,
+                            b"[pmos] persistent root unavailable; storage left untouched; using volatile tmpfs root\n",
+                        );
+                    }
+                }
+                Err(_) => {
+                    let _ = k.devs.write(
+                        DEV_CONSOLE,
+                        b"[pmos] persistent root unavailable or invalid; storage left untouched; using volatile tmpfs root\n",
+                    );
+                }
+            }
+        }
+
+        if !persistent_root_mounted && k.vfs.mount("/", Box::new(TmpFs::new())).is_err() {
+            return -1;
+        }
+        // A valid older OPFS image may predate newly bundled system files;
+        // migrate only missing defaults. The volatile fallback also needs a
+        // coherent OS tree and starter home so applications remain usable
+        // even though reload persistence is unavailable.
+        if crate::fs::seed::seed_system_defaults(&mut k.vfs).is_err() {
+            return -1;
+        }
+        if !persistent_root_mounted && crate::fs::seed::seed_volatile_user_home(&mut k.vfs).is_err()
+        {
+            return -1;
+        }
+        if k.vfs.mount("/tmp", Box::new(TmpFs::new())).is_err() {
+            return -1;
+        }
+        if k.vfs.mount("/run", Box::new(TmpFs::new())).is_err() {
             return -1;
         }
         if k.vfs.mount("/dev", Box::new(DevFs::new())).is_err() {
@@ -393,46 +1009,10 @@ pub extern "C" fn kernel_init() -> i32 {
         {
             return -1;
         }
-        // T084: mount the persistent OPFS image at /persist. The
-        // browser-side block driver (web/src/drivers/block.ts)
-        // owns a `FileSystemSyncAccessHandle` over `pmos.img` in
-        // the OPFS root and answers `driver_call(DevId::Block,
-        // ...)` requests.
-        //
-        // Boot policy: persistence is best-effort (FR-013a). Any
-        // failure along the chain — driver not ready, mount on
-        // the existing image fails, mkfs fails on the fresh image,
-        // re-mount after mkfs fails, or VFS mount(/persist) fails
-        // — falls through silently to "no /persist". The kernel
-        // boots without persistence rather than refusing to start
-        // at all; the desktop renders, apps run, only persisted
-        // state across reloads is lost. Returning -1 here would
-        // brick the kernel for any environment whose OPFS can't
-        // be used (private-mode browsers, partitioned storage,
-        // schema-incompat upgrade from a prior PMos version, etc.).
-        #[cfg(target_arch = "wasm32")]
-        if let Ok(device) = WasmBlockDevice::open() {
-            let opfs = match OpfsFs::mount(alloc::boxed::Box::new(device)) {
-                Ok(fs) => Some(fs),
-                Err(_) => {
-                    // Existing image didn't pass magic/checksum;
-                    // try mkfs on a freshly-opened device. If any
-                    // step here fails, fall through to None.
-                    match WasmBlockDevice::open() {
-                        Ok(device) => match opfs_mkfs(alloc::boxed::Box::new(device)) {
-                            Ok(fs) => Some(fs),
-                            Err(_) => None,
-                        },
-                        Err(_) => None,
-                    }
-                }
-            };
-            if let Some(opfs) = opfs {
-                // VFS mount failure here is unusual but still
-                // best-effort: drop /persist and continue.
-                let _ = k.vfs.mount("/persist", Box::new(opfs));
-            }
-        }
+        LIVE_PROCFS_VIEW = Some(LiveProcFsView {
+            boot_time_ns: k.boot_time_ns,
+            ..LiveProcFsView::default()
+        });
         KERNEL = Some(k);
     }
     0
@@ -491,15 +1071,14 @@ pub extern "C" fn kernel_heap_len() -> u32 {
 #[no_mangle]
 pub extern "C" fn kernel_register_process(caps_bits: u64) -> i32 {
     let kernel = kernel_mut();
-    match kernel.register_process(RegisterArgs {
-        name: "proc",
-        ppid: 0,
-        caps: CapSet(caps_bits),
-        cwd: "/",
-    }) {
-        Ok(pid) => pid as i32,
-        Err(_) => -1,
-    }
+    kernel
+        .register_process(RegisterArgs {
+            name: "proc",
+            ppid: 0,
+            caps: CapSet(caps_bits),
+            cwd: "/",
+        })
+        .unwrap_or(-1)
 }
 
 /// Test-only: register a child process under `parent` with the
@@ -523,22 +1102,21 @@ pub extern "C" fn kernel_register_process_for_spawn(
         Ok(s) => s,
         Err(_) => return -1,
     };
-    match kernel.proc_spawn(
-        parent,
-        crate::sys::SpawnArgs {
-            name,
-            caps: abi::cap::initial::ORDINARY_APP,
-            cwd: "/",
-            argv: alloc::vec::Vec::new(),
-            envp: alloc::collections::BTreeMap::new(),
-            stdin: FdObject::CharDevice(DEV_CONSOLE),
-            stdout: FdObject::CharDevice(DEV_CONSOLE),
-            stderr: FdObject::CharDevice(DEV_CONSOLE),
-        },
-    ) {
-        Ok(pid) => pid as i32,
-        Err(_) => -1,
-    }
+    kernel
+        .proc_spawn(
+            parent,
+            crate::sys::SpawnArgs {
+                name,
+                caps: abi::cap::initial::ORDINARY_APP,
+                cwd: "/",
+                argv: alloc::vec::Vec::new(),
+                envp: alloc::collections::BTreeMap::new(),
+                stdin: FdObject::CharDevice(DEV_CONSOLE),
+                stdout: FdObject::CharDevice(DEV_CONSOLE),
+                stderr: FdObject::CharDevice(DEV_CONSOLE),
+            },
+        )
+        .unwrap_or(-1)
 }
 
 /// Install `/dev/console` as an fd in `pid`'s fd table.
@@ -556,11 +1134,23 @@ pub extern "C" fn kernel_install_console_fd(pid: Pid, fd: u32) -> i32 {
     }
 }
 
+/// Install the WASI `/` directory preopen in a process created through the
+/// low-level [`kernel_register_process`] host path. Processes created by
+/// `proc_spawn` receive this descriptor automatically.
+#[no_mangle]
+pub extern "C" fn kernel_install_root_preopen_fd(pid: Pid, fd: u32) -> i32 {
+    let kernel = kernel_mut();
+    match kernel.install_root_preopen_fd(pid, fd) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 /// Install [`FdObject::SignalChannel`] as an fd in `pid`'s fd
 /// table. Companion to [`kernel_install_console_fd`] that gives
 /// the host a way to install the per-process signal channel
 /// without decoding `FdObject` on the TS side. Normally the
-/// kernel auto-installs SignalChannel at fd 3 on every
+/// kernel auto-installs SignalChannel at [`abi::fd::SIGNAL`] on every
 /// `proc_spawn`'d child; this export is for host-side tests
 /// that start from a `register_process` primitive and want to
 /// exercise the SignalChannel read / poll paths without
@@ -597,15 +1187,49 @@ pub extern "C" fn kernel_mark_running(pid: Pid) -> i32 {
         .get(pid)
         .map(|p| p.state == ProcState::Ready)
         .unwrap_or(false);
-    if !already_ready {
-        if kernel.mark_ready(pid).is_err() {
-            return -1;
-        }
+    if !already_ready && kernel.mark_ready(pid).is_err() {
+        return -1;
     }
     if kernel.procs.transition(pid, ProcState::Running).is_err() {
         return -1;
     }
     0
+}
+
+/// Reconcile a host-observed user Worker termination with the
+/// authoritative process table.
+///
+/// A clean WASI `proc_exit` normally transitions the pid before the
+/// Worker reports its final message, so terminal pids are accepted as
+/// an idempotent no-op. A wasm trap, Worker script error, or failure
+/// to construct/boot the Worker has no syscall path back into the
+/// kernel; those cases transition the still-live pid here and run the
+/// same cleanup, SIGCHLD, and parked-parent wake path as `proc_exit`.
+///
+/// Returns `0` when the pid is known (newly reconciled or already
+/// terminal), `1` when it is unknown/reaped, and `-1` on an unexpected
+/// transition error.
+#[no_mangle]
+pub extern "C" fn kernel_reconcile_process_exit(pid: Pid, code: i32, crashed: u32) -> i32 {
+    let kernel = kernel_mut();
+    let Some(process) = kernel.procs.get(pid) else {
+        return 1;
+    };
+    if matches!(process.state, ProcState::Zombie | ProcState::Dead) {
+        return 0;
+    }
+    let status = if crashed != 0 {
+        ExitStatus::Crashed
+    } else {
+        ExitStatus::Exited(code)
+    };
+    match kernel.proc_exit(pid, status) {
+        Ok(()) => {
+            kernel.service_poll_waiters();
+            0
+        }
+        Err(_) => -1,
+    }
 }
 
 /// Record the current wasm linear-memory size for `pid`.
@@ -626,6 +1250,132 @@ pub extern "C" fn kernel_record_process_memory(pid: Pid, bytes_lo: u32, bytes_hi
     } else {
         -1
     }
+}
+
+/// Register a host-imported file in the kernel's host-file
+/// table, keyed by `token`. The TS side has stashed the host
+/// `File` (drag-drop or `<input type="file">` source) and chosen
+/// `token` as a fresh per-tab handle; this export wires the name
+/// + mime + bytes into the kernel-side `HostFile` so a userland
+///   `host_file_recv(token)` can later consume them.
+///
+/// Layout in `HEAP_SCRATCH`:
+/// * `[0 .. name_len)`       — UTF-8 file name
+/// * `[name_len .. name_len + mime_len)` — UTF-8 mime type
+/// * `[name_len + mime_len .. name_len + mime_len + bytes_len)` — raw bytes
+///
+/// Returns `0` on success; malformed scratch/UTF-8 inputs return `-1`, while
+/// kernel policy failures (including import-count or byte-budget exhaustion)
+/// return the corresponding negative errno.
+///
+/// Backs T153 / T154: the bootstrap-side drag-drop handler posts
+/// a `host:dropped` MainToKernel message; `kernel-worker-entry.ts`
+/// copies the bytes into the kernel heap scratch and calls this
+/// export. The userland file-manager flow then calls
+/// `host_file_recv(token)` (opcode 0x1500) to obtain a read-only
+/// fd for the bytes.
+#[no_mangle]
+pub extern "C" fn kernel_host_file_dropped(
+    token: u32,
+    name_len: u32,
+    mime_len: u32,
+    bytes_len: u32,
+) -> i32 {
+    use crate::host_file::HostFile;
+    let total = (name_len as usize) + (mime_len as usize) + (bytes_len as usize);
+    if total > HEAP_SCRATCH_SIZE {
+        return -1;
+    }
+
+    // SAFETY: kernel Worker is single-threaded; the host has
+    // pre-staged the bytes into HEAP_SCRATCH before this call and
+    // does not write to it again until we return.
+    let scratch = unsafe { &HEAP_SCRATCH[..total] };
+    let name_bytes = &scratch[..name_len as usize];
+    let mime_bytes = &scratch[name_len as usize..name_len as usize + mime_len as usize];
+    let body_bytes = &scratch[name_len as usize + mime_len as usize..];
+
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let mime = match core::str::from_utf8(mime_bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let kernel = kernel_mut();
+    let mut owned = Vec::with_capacity(body_bytes.len());
+    owned.extend_from_slice(body_bytes);
+    let host_file = HostFile::new(name, mime, owned);
+    match kernel.host_file_dropped(token, host_file) {
+        Ok(()) => {
+            kernel.service_poll_waiters();
+            0
+        }
+        Err(error) => -crate::syscall::kerr_to_errno(error),
+    }
+}
+
+/// Begin a host import whose metadata is staged as `name || mime` in
+/// `HEAP_SCRATCH`. File bytes follow through repeated
+/// `kernel_host_file_drop_chunk` calls, each independently bounded by the
+/// scratch region.
+#[no_mangle]
+pub extern "C" fn kernel_host_file_drop_begin(
+    token: u32,
+    name_len: u32,
+    mime_len: u32,
+    expected_size: u32,
+) -> i32 {
+    let Some(total) = (name_len as usize).checked_add(mime_len as usize) else {
+        return -abi::errno::EINVAL;
+    };
+    if total > HEAP_SCRATCH_SIZE {
+        return -abi::errno::EINVAL;
+    }
+    // SAFETY: single-threaded kernel Worker; host staged this exact window.
+    let scratch = unsafe { &HEAP_SCRATCH[..total] };
+    let Ok(name) = core::str::from_utf8(&scratch[..name_len as usize]) else {
+        return -abi::errno::EINVAL;
+    };
+    let Ok(mime) = core::str::from_utf8(&scratch[name_len as usize..]) else {
+        return -abi::errno::EINVAL;
+    };
+    match kernel_mut().host_file_drop_begin(token, name, mime, expected_size as usize) {
+        Ok(()) => 0,
+        Err(error) => -crate::syscall::kerr_to_errno(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_host_file_drop_chunk(token: u32, bytes_len: u32) -> i32 {
+    if bytes_len as usize > HEAP_SCRATCH_SIZE {
+        return -abi::errno::EINVAL;
+    }
+    // SAFETY: single-threaded kernel Worker; host staged this exact window.
+    let bytes = unsafe { &HEAP_SCRATCH[..bytes_len as usize] };
+    match kernel_mut().host_file_drop_chunk(token, bytes) {
+        Ok(()) => 0,
+        Err(error) => -crate::syscall::kerr_to_errno(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_host_file_drop_end(token: u32) -> i32 {
+    let kernel = kernel_mut();
+    match kernel.host_file_drop_end(token) {
+        Ok(()) => {
+            kernel.service_poll_waiters();
+            0
+        }
+        Err(error) => -crate::syscall::kerr_to_errno(error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_host_file_drop_abort(token: u32) {
+    kernel_mut().host_file_drop_abort(token);
 }
 
 /// Best-effort flush of every dirty VFS mount.
@@ -651,11 +1401,7 @@ pub extern "C" fn kernel_sync_all() -> i32 {
     // last-gasp landing land here, and the policy is what tells
     // proc_exit "no flush needed, you just did one 200 ms ago".
     let now = crate::platform::current().now_realtime_ns();
-    if kernel
-        .flush_policy
-        .flush_now(&mut kernel.vfs, now)
-        .is_ok()
-    {
+    if kernel.flush_policy.flush_now(&mut kernel.vfs, now).is_ok() {
         0
     } else {
         -1
@@ -687,8 +1433,15 @@ pub extern "C" fn kernel_dispatch(pid: Pid) -> i32 {
     let kernel = kernel_mut();
     let req = unsafe { Request::from_le_bytes(&REQ_SCRATCH) };
     let heap = unsafe { &mut HEAP_SCRATCH[..] };
+    let procfs_targets = collect_procfs_targets(kernel, pid, &req, heap);
+    let projected_load_averages = prepare_live_procfs_view(kernel, &procfs_targets);
     match dispatch::dispatch(kernel, pid, &req, heap) {
         ServiceOutcome::Done(resp) => {
+            if resp.status == 0 {
+                if let Some(projected) = projected_load_averages {
+                    kernel.sched.load_averages = projected;
+                }
+            }
             unsafe {
                 RESP_SCRATCH = resp.to_le_bytes();
             }
@@ -702,6 +1455,21 @@ pub extern "C" fn kernel_dispatch(pid: Pid) -> i32 {
             1
         }
     }
+}
+
+/// Re-check bounded parked poll sets. The Worker calls this immediately before
+/// sleeping and after any timer wake, closing the final check-to-park window.
+#[no_mangle]
+pub extern "C" fn kernel_service_poll_waiters() -> u32 {
+    kernel_mut().service_poll_waiters() as u32
+}
+
+/// Nanoseconds until the nearest parked poll clock. `u64::MAX` means every
+/// parked poll is fd-only (or there are no parked polls), so the Worker may
+/// wait indefinitely for a real notification.
+#[no_mangle]
+pub extern "C" fn kernel_next_poll_timeout_ns() -> u64 {
+    kernel_mut().next_poll_timeout_ns().unwrap_or(u64::MAX)
 }
 
 /// Take the next pending wake for `pid` out of `Kernel.pending_wakes`,
@@ -778,6 +1546,7 @@ pub extern "C" fn kernel_inject_console_input(len: u32) -> i32 {
     unsafe {
         kernel.devs.inject_console_input(&HEAP_SCRATCH[..len]);
     }
+    kernel.service_poll_waiters();
     0
 }
 
@@ -797,6 +1566,7 @@ pub extern "C" fn kernel_inject_input_kbd(len: u32) -> i32 {
     unsafe {
         kernel.devs.inject_kbd_event(&HEAP_SCRATCH[..len]);
     }
+    kernel.service_poll_waiters();
     0
 }
 
@@ -814,5 +1584,6 @@ pub extern "C" fn kernel_inject_input_mouse(len: u32) -> i32 {
     unsafe {
         kernel.devs.inject_mouse_event(&HEAP_SCRATCH[..len]);
     }
+    kernel.service_poll_waiters();
     0
 }

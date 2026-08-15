@@ -21,12 +21,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-tee-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-tee-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -42,7 +37,10 @@ fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
 
-fn run_with_stdin(args: &[&std::ffi::OsStr], stdin_bytes: &[u8]) -> (Option<i32>, Vec<u8>, Vec<u8>) {
+fn run_with_stdin(
+    args: &[&std::ffi::OsStr],
+    stdin_bytes: &[u8],
+) -> (Option<i32>, Vec<u8>, Vec<u8>) {
     let mut child = Command::new(TEE)
         .args(args)
         .stdin(Stdio::piped())
@@ -78,10 +76,7 @@ fn writes_stdin_to_stdout_and_one_file() {
     let dir = scratch_dir("one");
     let out_path = dir.join("out.txt");
 
-    let (code, stdout, stderr) = run_with_stdin(
-        &[out_path.as_os_str()],
-        b"hello\n",
-    );
+    let (code, stdout, stderr) = run_with_stdin(&[out_path.as_os_str()], b"hello\n");
     assert_eq!(code, Some(0), "exit code: {code:?}");
     assert_eq!(stdout, b"hello\n");
     assert!(stderr.is_empty(), "stderr = {:?}", stderr);
@@ -97,10 +92,8 @@ fn writes_stdin_to_multiple_files() {
     let a_path = dir.join("a.txt");
     let b_path = dir.join("b.txt");
 
-    let (code, stdout, stderr) = run_with_stdin(
-        &[a_path.as_os_str(), b_path.as_os_str()],
-        b"shared bytes\n",
-    );
+    let (code, stdout, stderr) =
+        run_with_stdin(&[a_path.as_os_str(), b_path.as_os_str()], b"shared bytes\n");
     assert_eq!(code, Some(0), "exit code: {code:?}");
     assert_eq!(stdout, b"shared bytes\n");
     assert!(stderr.is_empty(), "stderr = {:?}", stderr);
@@ -115,10 +108,8 @@ fn dash_a_appends_to_existing_file() {
     let dir = scratch_dir("append");
     let path = write_file(&dir, "log.txt", b"old\n");
 
-    let (code, stdout, stderr) = run_with_stdin(
-        &[std::ffi::OsStr::new("-a"), path.as_os_str()],
-        b"new\n",
-    );
+    let (code, stdout, stderr) =
+        run_with_stdin(&[std::ffi::OsStr::new("-a"), path.as_os_str()], b"new\n");
     assert_eq!(code, Some(0), "exit code: {code:?}");
     assert_eq!(stdout, b"new\n");
     assert!(stderr.is_empty(), "stderr = {:?}", stderr);
@@ -133,10 +124,7 @@ fn default_overwrites_existing_file() {
     let dir = scratch_dir("over");
     let path = write_file(&dir, "log.txt", b"old");
 
-    let (code, stdout, stderr) = run_with_stdin(
-        &[path.as_os_str()],
-        b"new",
-    );
+    let (code, stdout, stderr) = run_with_stdin(&[path.as_os_str()], b"new");
     assert_eq!(code, Some(0), "exit code: {code:?}");
     assert_eq!(stdout, b"new");
     assert!(stderr.is_empty(), "stderr = {:?}", stderr);
@@ -152,10 +140,8 @@ fn bad_path_continues_writing_others() {
     let good_path = dir.join("good.txt");
     let bad_path = std::path::PathBuf::from("/nonexistent/foo");
 
-    let (code, stdout, stderr) = run_with_stdin(
-        &[bad_path.as_os_str(), good_path.as_os_str()],
-        b"payload\n",
-    );
+    let (code, stdout, stderr) =
+        run_with_stdin(&[bad_path.as_os_str(), good_path.as_os_str()], b"payload\n");
     assert_eq!(code, Some(1), "exit code: {code:?}");
     assert_eq!(stdout, b"payload\n");
     let stderr = String::from_utf8_lossy(&stderr);
@@ -168,10 +154,7 @@ fn bad_path_continues_writing_others() {
 
 #[test]
 fn unknown_flag_exits_one() {
-    let (code, stdout, stderr) = run_with_stdin(
-        &[std::ffi::OsStr::new("-x")],
-        b"",
-    );
+    let (code, stdout, stderr) = run_with_stdin(&[std::ffi::OsStr::new("-x")], b"");
     assert_eq!(code, Some(1), "exit code: {code:?}");
     assert!(stdout.is_empty(), "stdout = {:?}", stdout);
     let stderr = String::from_utf8_lossy(&stderr);

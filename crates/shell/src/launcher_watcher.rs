@@ -1,14 +1,9 @@
 //! `launcher_watcher` — T200.
 //!
-//! Detects new `.desktop` files under `/usr/share/applications/`
-//! within 5 seconds (poll-based for v1, per
-//! `contracts/package-manifest.md §4`).
-//!
-//! The actual poll loop lives on [`crate::launcher::Launcher`]
-//! (it owns the entry list and the 5 s clock). This module is
-//! the thin entry point + the helper that diffs two snapshots
-//! into `Added`/`Removed` events for shell taskbars and any
-//! UI that wants to react to install/uninstall.
+//! Diffs `.desktop` snapshots under `/usr/share/applications/` into
+//! `Added`/`Removed` events. Production refreshes the snapshot after
+//! filesystem-watch readiness; the explicit five-second clock remains only as
+//! a deterministic compatibility seam for native fixtures.
 
 use core::time::Duration;
 

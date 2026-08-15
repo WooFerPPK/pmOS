@@ -63,8 +63,7 @@ fn set_u_then_unset_var_terminates_with_status_one() {
     // `echo unreached` line never gets the chance to run.
     // Pins that the failing-expansion command does NOT
     // produce output and the REPL terminates immediately.
-    let (status, stdout, stderr, _flags) =
-        drive("set -u\necho $UNSET\necho unreached\n");
+    let (status, stdout, stderr, _flags) = drive("set -u\necho $UNSET\necho unreached\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("UNSET"),
@@ -87,8 +86,7 @@ fn set_u_then_set_var_does_not_terminate() {
     // runs, the REPL stays alive, the follow-up `exit`
     // runs cleanly. Pins the set-var short-circuit before
     // the nounset check.
-    let (status, stdout, stderr, _flags) =
-        drive("set -u\nexport X=hello\necho $X\nexit\n");
+    let (status, stdout, stderr, _flags) = drive("set -u\nexport X=hello\necho $X\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -103,8 +101,7 @@ fn set_u_with_long_form_o_nounset() {
     // identical to `set -u`. Same termination behavior
     // applies. Pins the `-o NAME` parser path AND the
     // shared `flags.nounset = true` mutation.
-    let (status, _stdout, stderr, flags) =
-        drive("set -o nounset\necho $UNSET\n");
+    let (status, _stdout, stderr, flags) = drive("set -o nounset\necho $UNSET\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("parameter not set"),
@@ -147,8 +144,7 @@ fn set_u_with_default_value_form_does_not_terminate() {
     // expansion produces "fallback" and the `echo` runs.
     // Pins the load-bearing semantic that lets the `:-`
     // form remain useful under `set -u`.
-    let (status, stdout, stderr, _flags) =
-        drive("set -u\necho ${UNSET:-fallback}\nexit\n");
+    let (status, stdout, stderr, _flags) = drive("set -u\necho ${UNSET:-fallback}\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -186,8 +182,7 @@ fn set_u_with_dollar_question_does_not_terminate() {
     // the follow-up `exit` runs cleanly. Pins the
     // load-bearing exemption that keeps `$?` usable under
     // every flag combination.
-    let (status, stdout, stderr, _flags) =
-        drive("set -u\necho $?\nexit\n");
+    let (status, stdout, stderr, _flags) = drive("set -u\necho $?\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -203,8 +198,7 @@ fn set_u_stderr_diagnostic_includes_var_name() {
     // of the message — the var name (so the user knows
     // WHICH var) and the "parameter not set" phrase (so the
     // user knows WHY the shell died).
-    let (_status, _stdout, stderr, _flags) =
-        drive("set -u\necho $MYVAR\n");
+    let (_status, _stdout, stderr, _flags) = drive("set -u\necho $MYVAR\n");
     assert!(
         stderr.contains("MYVAR"),
         "stderr missing var name: {stderr:?}"
@@ -227,8 +221,7 @@ fn set_u_with_braced_unset_var_terminates() {
     // the brace arm checks the flag too — a regression
     // here would let `${UNSET}` silently expand to empty
     // even with nounset on.
-    let (status, _stdout, stderr, _flags) =
-        drive("set -u\necho ${MYVAR}\n");
+    let (status, _stdout, stderr, _flags) = drive("set -u\necho ${MYVAR}\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("MYVAR"),
@@ -251,8 +244,7 @@ fn set_u_unknown_command_does_not_trigger_nounset() {
     // NOT surface "parameter not set". Pins the boundary
     // between nounset (expansion-layer) and the dispatch-
     // layer error paths.
-    let (status, _stdout, stderr, _flags) =
-        drive("set -u\nno_such_command_here\nexit\n");
+    let (status, _stdout, stderr, _flags) = drive("set -u\nno_such_command_here\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("command not found"),

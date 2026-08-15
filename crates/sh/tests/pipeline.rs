@@ -44,8 +44,7 @@ fn echo_through_read_pipeline_reads_first_line() {
     // hello`), splits on the first newline, and assigns
     // "hello" to VAR. Then `echo got=$VAR` confirms VAR was
     // set.
-    let (status, stdout, _stderr) =
-        drive("echo hello | read VAR\necho got=$VAR\nexit\n");
+    let (status, stdout, _stderr) = drive("echo hello | read VAR\necho got=$VAR\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stdout.contains("got=hello"), "stdout: {stdout:?}");
 }
@@ -56,15 +55,13 @@ fn three_stage_pipeline_exit_status_is_last_stage() {
     // the pipeline's status. POSIX-pipelines collapse to
     // the last stage; intermediate failures don't propagate
     // unless `pipefail` is set (not in v1).
-    let (_status, stdout, _stderr) =
-        drive("true | false | true\necho status=$?\nexit\n");
+    let (_status, stdout, _stderr) = drive("true | false | true\necho status=$?\nexit\n");
     assert!(stdout.contains("status=0"), "stdout: {stdout:?}");
 }
 
 #[test]
 fn last_stage_failure_propagates_to_dollar_question() {
-    let (_status, stdout, _stderr) =
-        drive("true | false\necho status=$?\nexit\n");
+    let (_status, stdout, _stderr) = drive("true | false\necho status=$?\nexit\n");
     assert!(stdout.contains("status=1"), "stdout: {stdout:?}");
 }
 

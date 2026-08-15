@@ -15,7 +15,8 @@ use abi::ext::Pid;
 
 use kernel::proc::{
     table::{ExitError, InsertError, ProcessTable, TransitionError, ZombieTarget},
-    BlockReason, ExitStatus, ProcState, Process, Scheduler,
+    BlockReason, ExitStatus, ProcState, Process, Scheduler, PROCESS_LIMIT_GLOBAL,
+    PROCESS_LIMIT_PER_PARENT,
 };
 
 fn make_process(pid: Pid, ppid: Pid, name: &str, caps: CapSet) -> Process {
@@ -122,6 +123,27 @@ fn exit_sets_zombie_and_retains_status() {
     assert_eq!(proc.state, ProcState::Zombie);
     assert_eq!(proc.exit_status, Some(ExitStatus::Exited(7)));
     assert!(table.is_alive(pid)); // Zombie counts as alive until reaped.
+}
+
+#[test]
+fn duplicate_exit_is_rejected_and_preserves_first_status() {
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    table
+        .insert(make_process(pid, 1, "child", CapSet::EMPTY))
+        .unwrap();
+    table.transition(pid, ProcState::Ready).unwrap();
+    table.transition(pid, ProcState::Running).unwrap();
+
+    table.exit(pid, ExitStatus::Exited(7)).unwrap();
+    assert_eq!(
+        table.exit(pid, ExitStatus::Crashed),
+        Err(ExitError::AlreadyDead),
+    );
+    assert_eq!(
+        table.get(pid).and_then(|process| process.exit_status),
+        Some(ExitStatus::Exited(7)),
+    );
 }
 
 #[test]
@@ -265,6 +287,39 @@ fn child_count_excludes_dead_processes() {
     table.reap(victim);
 
     assert_eq!(table.child_count(parent), 2);
+}
+
+#[test]
+fn process_capacity_counts_zombies_and_enforces_both_bounds() {
+    let mut table = ProcessTable::new();
+    let parent = 1;
+    for index in 0..PROCESS_LIMIT_PER_PARENT {
+        let pid = table.allocate_pid();
+        table
+            .insert(make_process(pid, parent, "child", CapSet::EMPTY))
+            .unwrap();
+        if index == 0 {
+            table.transition(pid, ProcState::Ready).unwrap();
+            table.transition(pid, ProcState::Running).unwrap();
+            table.exit(pid, ExitStatus::Exited(0)).unwrap();
+        }
+    }
+    assert_eq!(table.child_count(parent), PROCESS_LIMIT_PER_PARENT);
+    assert!(!table.has_spawn_capacity(parent), "zombies retain a slot");
+
+    let mut global = ProcessTable::new();
+    for index in 0..PROCESS_LIMIT_GLOBAL {
+        let pid = global.allocate_pid();
+        global
+            .insert(make_process(
+                pid,
+                index as Pid + 10_000,
+                "global",
+                CapSet::EMPTY,
+            ))
+            .unwrap();
+    }
+    assert!(!global.has_spawn_capacity(-99));
 }
 
 #[test]

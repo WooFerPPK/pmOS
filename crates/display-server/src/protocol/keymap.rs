@@ -22,6 +22,8 @@
 //! ```
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use preferences::{KeyboardLayout, Preferences};
 
 /// PMos keymap binary magic bytes.
 pub const MAGIC: &[u8; 4] = b"PMKM";
@@ -94,26 +96,26 @@ pub enum Scancode {
     Digit9 = 0x26,
     Digit0 = 0x27,
     // Control keys
-    Enter     = 0x28,
+    Enter = 0x28,
     Backspace = 0x2A,
-    Tab       = 0x2B,
-    Space     = 0x2C,
+    Tab = 0x2B,
+    Space = 0x2C,
     // Punctuation (US-QWERTY positions)
-    Minus         = 0x2D, // - / _
-    Equal         = 0x2E, // = / +
-    BracketLeft   = 0x2F, // [ / {
-    BracketRight  = 0x30, // ] / }
-    Backslash     = 0x31, // \ / |
-    Semicolon     = 0x33, // ; / :
-    Quote         = 0x34, // ' / "
-    Backquote     = 0x35, // ` / ~
-    Comma         = 0x36, // , / <
-    Period        = 0x37, // . / >
-    Slash         = 0x38, // / / ?
+    Minus = 0x2D,        // - / _
+    Equal = 0x2E,        // = / +
+    BracketLeft = 0x2F,  // [ / {
+    BracketRight = 0x30, // ] / }
+    Backslash = 0x31,    // \ / |
+    Semicolon = 0x33,    // ; / :
+    Quote = 0x34,        // ' / "
+    Backquote = 0x35,    // ` / ~
+    Comma = 0x36,        // , / <
+    Period = 0x37,       // . / >
+    Slash = 0x38,        // / / ?
     // Modifier keys (produce no codepoint; codepoints are 0)
-    ShiftLeft  = 0xE1,
+    ShiftLeft = 0xE1,
     ShiftRight = 0xE5,
-    ControlLeft  = 0xE0,
+    ControlLeft = 0xE0,
     ControlRight = 0xE4,
 }
 
@@ -198,6 +200,8 @@ pub struct KeymapEntry {
 #[derive(Debug)]
 pub struct Keymap {
     entries: BTreeMap<Scancode, KeymapEntry>,
+    unshifted_scancodes: BTreeMap<u32, Scancode>,
+    shifted_scancodes: BTreeMap<u32, Scancode>,
 }
 
 impl Keymap {
@@ -215,6 +219,47 @@ impl Keymap {
     /// True when the keymap has no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Translate a physical scancode through this layout into the equivalent
+    /// scancode in `logical_layout` for clients that consume the v1 logical
+    /// HID key field. Non-printing and unsupported keys remain unchanged.
+    pub fn map_to_logical_scancode(
+        &self,
+        physical: u32,
+        shifted: bool,
+        logical_layout: &Keymap,
+    ) -> u32 {
+        let Ok(raw) = u8::try_from(physical) else {
+            return physical;
+        };
+        let Ok(scancode) = Scancode::try_from(raw) else {
+            return physical;
+        };
+        let Some(entry) = self.get(scancode) else {
+            return physical;
+        };
+        let codepoint = if shifted {
+            entry.codepoint_shifted
+        } else {
+            entry.codepoint_unshifted
+        };
+        if codepoint == 0 {
+            return physical;
+        }
+
+        logical_layout
+            .scancode_for_codepoint(codepoint, shifted)
+            .map(|mapped| mapped as u8 as u32)
+            .unwrap_or(physical)
+    }
+
+    fn scancode_for_codepoint(&self, codepoint: u32, shifted: bool) -> Option<Scancode> {
+        if shifted {
+            self.shifted_scancodes.get(&codepoint).copied()
+        } else {
+            self.unshifted_scancodes.get(&codepoint).copied()
+        }
     }
 }
 
@@ -254,6 +299,8 @@ pub fn parse(bytes: &[u8]) -> Result<Keymap, KeymapError> {
     }
 
     let mut entries = BTreeMap::new();
+    let mut unshifted_scancodes = BTreeMap::new();
+    let mut shifted_scancodes = BTreeMap::new();
     for i in 0..count {
         let base = header_size + i * ENTRY_SIZE;
         let entry_bytes = &bytes[base..base + ENTRY_SIZE];
@@ -269,14 +316,36 @@ pub fn parse(bytes: &[u8]) -> Result<Keymap, KeymapError> {
                 modifier_mask,
             },
         );
+        if cp_unshifted != 0 {
+            unshifted_scancodes.entry(cp_unshifted).or_insert(scancode);
+        }
+        if cp_shifted != 0 {
+            shifted_scancodes.entry(cp_shifted).or_insert(scancode);
+        }
     }
 
-    Ok(Keymap { entries })
+    Ok(Keymap {
+        entries,
+        unshifted_scancodes,
+        shifted_scancodes,
+    })
 }
 
-/// The default US-QWERTY keymap embedded at compile time.
-static DEFAULT_BYTES: &[u8] =
-    include_bytes!("../../assets/keymaps/us-qwerty.bin");
+/// Bundled keymaps embedded at compile time. Selection comes from the
+/// canonical VFS preference; no runtime network or browser fetch is involved.
+static US_QWERTY_BYTES: &[u8] = include_bytes!("../../assets/keymaps/us-qwerty.bin");
+static UK_QWERTY_BYTES: &[u8] = include_bytes!("../../assets/keymaps/uk-qwerty.bin");
+static DVORAK_BYTES: &[u8] = include_bytes!("../../assets/keymaps/dvorak.bin");
+
+/// Parse one of the three keymaps bundled with PMos v1.
+pub fn load_bundled(layout: KeyboardLayout) -> Result<Keymap, KeymapError> {
+    let bytes = match layout {
+        KeyboardLayout::UsQwerty => US_QWERTY_BYTES,
+        KeyboardLayout::UkQwerty => UK_QWERTY_BYTES,
+        KeyboardLayout::Dvorak => DVORAK_BYTES,
+    };
+    parse(bytes)
+}
 
 /// Return the default US-QWERTY keymap.
 ///
@@ -284,5 +353,135 @@ static DEFAULT_BYTES: &[u8] =
 /// by the compile-time `include_bytes!` + the keymap isolation
 /// tests that run in CI.
 pub fn load_default() -> Keymap {
-    parse(DEFAULT_BYTES).expect("embedded us-qwerty keymap is valid")
+    load_bundled(KeyboardLayout::UsQwerty).expect("embedded us-qwerty keymap is valid")
+}
+
+/// Upper bound between VFS reads while the display loop is scheduled.
+pub const PREFERENCE_POLL_INTERVAL_MS: u64 = 100;
+
+/// Avoid a clock syscall on every empty display-server turn.
+pub const PREFERENCE_CLOCK_CHECK_EVERY_ITERATIONS: u32 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeymapPreferenceReadError {
+    Unavailable,
+}
+
+/// Read seam shared by the production VFS source and deterministic tests.
+pub trait KeymapPreferenceSource {
+    /// `Ok(None)` means the canonical preference file does not exist.
+    fn read(&mut self) -> Result<Option<Vec<u8>>, KeymapPreferenceReadError>;
+}
+
+/// Monotonic-clock seam for the bounded production poller.
+pub trait KeymapPreferenceClock {
+    fn monotonic_ms(&mut self) -> u64;
+}
+
+/// Last-known-good keyboard selection backed by `/etc/preferences.toml`.
+pub struct KeymapPreferenceMonitor<S> {
+    source: S,
+    current: KeyboardLayout,
+}
+
+impl<S: KeymapPreferenceSource> KeymapPreferenceMonitor<S> {
+    pub fn new(mut source: S) -> Self {
+        let current = read_preferred_layout(&mut source).unwrap_or_default();
+        Self { source, current }
+    }
+
+    pub const fn current(&self) -> KeyboardLayout {
+        self.current
+    }
+
+    /// Reload once, preserving the current layout on malformed content,
+    /// unsupported names, transient I/O, or an invalid bundled asset.
+    pub fn poll(&mut self) -> bool {
+        let Some(next) = read_preferred_layout(&mut self.source) else {
+            return false;
+        };
+        if next == self.current {
+            return false;
+        }
+        self.current = next;
+        true
+    }
+}
+
+fn read_preferred_layout(source: &mut impl KeymapPreferenceSource) -> Option<KeyboardLayout> {
+    let layout = match source.read() {
+        Ok(Some(bytes)) => {
+            let preferences = Preferences::parse(&bytes).ok()?;
+            match preferences.keyboard_layout.as_deref() {
+                Some(name) => KeyboardLayout::from_name(name)?,
+                None => KeyboardLayout::default(),
+            }
+        }
+        Ok(None) => KeyboardLayout::default(),
+        Err(_) => return None,
+    };
+
+    // Validate the selected embedded bytes before publishing the selection.
+    load_bundled(layout).ok()?;
+    Some(layout)
+}
+
+/// Preference monitor whose clock-gated path is retained for native fixtures.
+/// Production calls [`Self::refresh`] after filesystem-watch readiness.
+pub struct KeymapPreferenceRuntime<S, C> {
+    monitor: KeymapPreferenceMonitor<S>,
+    clock: C,
+    last_poll_ms: u64,
+    clock_check_every_iterations: u32,
+    iterations_until_clock_check: u32,
+}
+
+impl<S: KeymapPreferenceSource, C: KeymapPreferenceClock> KeymapPreferenceRuntime<S, C> {
+    pub fn new(source: S, mut clock: C) -> Self {
+        let monitor = KeymapPreferenceMonitor::new(source);
+        let last_poll_ms = clock.monotonic_ms();
+        Self {
+            monitor,
+            clock,
+            last_poll_ms,
+            clock_check_every_iterations: PREFERENCE_CLOCK_CHECK_EVERY_ITERATIONS,
+            iterations_until_clock_check: 0,
+        }
+    }
+
+    pub const fn current(&self) -> KeyboardLayout {
+        self.monitor.current()
+    }
+
+    /// Override the cheap iteration gate for deterministic isolation tests.
+    pub fn with_clock_check_every_iterations(mut self, iterations: u32) -> Self {
+        self.clock_check_every_iterations = iterations.max(1);
+        self.iterations_until_clock_check = 0;
+        self
+    }
+
+    /// Poll only when the 100 ms boundary is due. Errors consume the current
+    /// poll slot, bounding repeated VFS failures to ten reads per second.
+    pub fn poll(&mut self) -> bool {
+        if self.iterations_until_clock_check > 0 {
+            self.iterations_until_clock_check -= 1;
+            return false;
+        }
+        self.iterations_until_clock_check = self.clock_check_every_iterations - 1;
+
+        let now = self.clock.monotonic_ms();
+        if now.saturating_sub(self.last_poll_ms) < PREFERENCE_POLL_INTERVAL_MS {
+            return false;
+        }
+        self.last_poll_ms = now;
+        self.monitor.poll()
+    }
+
+    /// Re-read immediately after the stable-parent/current-inode filesystem
+    /// watch reports a change. Production uses this event-driven path; the
+    /// bounded clock poll remains only for injected deterministic fixtures.
+    pub fn refresh(&mut self) -> bool {
+        self.last_poll_ms = self.clock.monotonic_ms();
+        self.monitor.poll()
+    }
 }

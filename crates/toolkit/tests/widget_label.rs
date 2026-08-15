@@ -31,8 +31,7 @@ fn assert_glyph_at(canvas: &Canvas, origin_x: i32, origin_y: i32, ch: char, colo
             let y = origin_y + row as i32;
             let px = canvas.pixel(x as u32, y as u32).unwrap();
             assert_eq!(
-                px,
-                expected,
+                px, expected,
                 "glyph '{ch}' pixel at (+{col}, +{row}) from origin ({origin_x}, {origin_y})",
             );
         }
@@ -100,7 +99,7 @@ fn label_clips_text_too_wide_for_bounds() {
     label.draw(&mut canvas);
 
     let color = Theme::LIGHT.label_text;
-    let text_y = 0 + (16 - GLYPH_HEIGHT as i32) / 2;
+    let text_y = (16 - GLYPH_HEIGHT as i32) / 2;
     assert_glyph_at(&canvas, 0, text_y, 'a', color);
     assert_glyph_at(&canvas, CELL_WIDTH as i32, text_y, 'b', color);
     assert_glyph_at(&canvas, (2 * CELL_WIDTH) as i32, text_y, 'c', color);
@@ -186,9 +185,7 @@ fn label_uses_label_text_theme_color() {
                 continue;
             }
             found_on_pixel = true;
-            let px = canvas
-                .pixel(col, (text_y + row as i32) as u32)
-                .unwrap();
+            let px = canvas.pixel(col, (text_y + row as i32) as u32).unwrap();
             assert_eq!(px, expected);
         }
     }
@@ -216,9 +213,7 @@ fn label_set_color_overrides_theme_default() {
             if !on {
                 continue;
             }
-            let px = canvas
-                .pixel(col, (text_y + row as i32) as u32)
-                .unwrap();
+            let px = canvas.pixel(col, (text_y + row as i32) as u32).unwrap();
             assert_eq!(px, expected);
             return;
         }

@@ -9,9 +9,25 @@
 // syscall traffic rides on a SharedArrayBuffer ring buffer
 // defined by `../shared/sab-layout.ts`, not by these messages.
 
-import type { ConsoleInputMessage, ConsoleWriteMessage } from "../drivers/console";
-import type { FbBlitMessage, FbSetModeMessage } from "../drivers/fb";
+import type {
+  ConsoleInputMessage,
+  ConsoleWriteMessage,
+} from "../drivers/console";
+import type {
+  FbBlitMessage,
+  FbPatchBatchMessage,
+  FbPatchMessage,
+  FbPresentFenceMessage,
+  FbSetModeMessage,
+} from "../drivers/fb";
 import type { InputKbdMessage, InputMouseMessage } from "../drivers/input";
+
+/** Maximum bytes accepted for one browser-to-kernel host-file import. */
+export const HOST_FILE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
+
+/** Kernel-wide host-import limits mirrored for one browser selection batch. */
+export const HOST_FILE_IMPORT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+export const HOST_FILE_IMPORT_MAX_FILES = 64;
 
 /** Boot-time configuration forwarded from the main thread. */
 export interface BootConfig {
@@ -102,25 +118,87 @@ export type MainToKernel =
       // and never replies. Any flush failure is recorded as a panic
       // surface but does not block the page from going away.
       readonly kind: "sync:request";
+    }
+  | {
+      // The user dropped a host file onto the canvas (drag-drop) or
+      // picked one through the file-picker (Import menu). Main has
+      // assigned `token` and read an owned byte array; the kernel
+      // registers a `HostFile` entry under `token` so a userland
+      // `host_file_recv(token)` (opcode 0x1500) can later stream the
+      // bytes into a read-only fd. Browser structured clone carries
+      // the owned bytes as one message; the kernel
+      // Worker copies it into the kernel through bounded scratch-sized
+      // chunks. Files are capped by HOST_FILE_IMPORT_MAX_BYTES.
+      readonly kind: "host:dropped";
+      readonly token: number;
+      readonly name: string;
+      readonly mime: string;
+      readonly bytes: Uint8Array;
     };
 
 /** Kernel-worker → main-thread. */
 export type KernelToMain =
   | { readonly kind: "ready" }
   | { readonly kind: "panic"; readonly message: string }
+  | {
+      /**
+       * Persistent storage could not be opened or installed as `/`. The
+       * kernel may finish constructing its explicitly volatile recovery root,
+       * but main MUST block normal user interaction until the user retries or
+       * deliberately accepts a temporary session.
+       */
+      readonly kind: "storage:degraded";
+      readonly reason:
+        | "opfs-open-failed"
+        | "persistent-root-unavailable"
+        | "persistent-root-invalid";
+      readonly detail: string;
+      /** Existing image contents were not reformatted or overwritten. */
+      readonly existingImagePreserved: true;
+    }
   | ConsoleWriteMessage
   | FbSetModeMessage
   | FbBlitMessage
+  | FbPatchMessage
+  | FbPatchBatchMessage
+  | FbPresentFenceMessage
+  | {
+      // A capability-authorised user request reached the kernel's
+      // host-file bridge. Main may now expose the one-shot browser
+      // confirmation whose trusted click opens the native picker; selected
+      // files return through `host:dropped` and never bypass the kernel.
+      readonly kind: "host:pick";
+    }
+  | {
+      // A capability-authorised host-download fd was closed. The kernel
+      // owns this message and has already copied the user process's bytes;
+      // main may now turn them into a Blob-backed browser download.
+      readonly kind: "host:download";
+      readonly name: string;
+      readonly mime: string;
+      readonly bytes: Uint8Array;
+    }
   | {
       // Kernel has allocated `pid` and needs main to instantiate the
       // user Worker. Main allocates the SAB, posts `boot` to the new
-      // Worker, posts `proc:sab` back. The kernel pre-fetched
+      // Worker, then publishes `proc:sab` only after the Worker
+      // acknowledges that it accepted the boot message. The kernel pre-fetched
       // `wasmBytes` from its `binaryRegistry` so main doesn't need
       // its own copy of the binary table.
       readonly kind: "proc:spawn";
       readonly pid: number;
       readonly path: string;
       readonly wasmBytes: ArrayBufferLike;
+    }
+  | {
+      // A non-catchable kernel exit (currently SIGKILL) has made
+      // `pid` terminal. Main must terminate the corresponding user
+      // Worker and remove its routing entry. The subsequent
+      // `proc:exited` acknowledgement is idempotent against the
+      // kernel's already-terminal process state.
+      readonly kind: "proc:terminate";
+      readonly pid: number;
+      readonly signal: number;
     }
   | {
       // Kernel hands main its 32-byte wake-slot buffer so main can
@@ -170,6 +248,14 @@ export type MainToUser = {
  * error; for clean `proc_exit(code)` paths only `code` is set.
  */
 export type UserToMain =
+  | {
+      // The Worker accepted its one boot message and installed the
+      // per-process SAB backend. Main may now publish `proc:sab` to
+      // the kernel. This acknowledgement prevents a failed Worker
+      // construction/boot from leaving an unreachable live pid.
+      readonly kind: "booted";
+      readonly pid: number;
+    }
   | {
       readonly kind: "memory";
       readonly pid: number;

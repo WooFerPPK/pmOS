@@ -160,7 +160,10 @@ fn false_returns_exit_code_one_without_exiting_the_shell() {
     let mut s = Shell::new();
     let out = s.eval("false");
     assert_eq!(out.exit_code, Some(1));
-    assert!(!s.has_exited(), "`false` reports exit code but does not terminate the shell");
+    assert!(
+        !s.has_exited(),
+        "`false` reports exit code but does not terminate the shell"
+    );
 }
 
 #[test]
@@ -205,7 +208,10 @@ fn unknown_command_writes_command_not_found_to_stderr_with_no_exit_code() {
     let err = stderr_str(&out);
     assert!(err.contains("command not found"));
     assert!(err.contains("ls"));
-    assert!(out.exit_code.is_none(), "command-not-found should not terminate the shell");
+    assert!(
+        out.exit_code.is_none(),
+        "command-not-found should not terminate the shell"
+    );
 }
 
 #[test]

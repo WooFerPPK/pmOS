@@ -21,7 +21,7 @@ Both paths are supported and both MUST work — the wire protocol
 is the source of truth, the toolkit is a library wrapper. See
 `.specify/memory/constitution.md` Principle VII for the "why."
 
-This document explains *how* to write an app along either path,
+This document explains _how_ to write an app along either path,
 how to test it, how to reach the filesystem / IPC / capability
 syscalls alongside the display protocol, and how apps are
 shipped in v1. For environment setup (installing Rust targets,
@@ -71,50 +71,98 @@ Most apps do not.
 
 ### Minimal `main.rs`
 
-The toolkit exposes `App`, `Window`, `BufferPool`, and the draw
-primitives (`Canvas`, `Color`, `Rect`, `Theme`) — grep
-`crates/toolkit/src/lib.rs` for the full re-export surface. A
-minimal window that paints its background and exits cleanly on
-close looks like this:
+The toolkit exposes `App`, `Window`, `BufferPool`, its production WASI
+`FdConnection`, and the draw primitives (`Canvas`, `Color`, `Rect`, `Theme`) —
+see `crates/toolkit/src/lib.rs` for the full re-export surface. This complete,
+cfg-gated `main.rs` paints a minimal window, advances bounded buffer uploads,
+parks when idle, and exits cleanly on close:
 
 ```rust
-use toolkit::protocol::Connection;
-use toolkit::{App, BufferPool, ClientError, Window};
+#[cfg(target_arch = "wasm32")]
 use toolkit::theme::Theme;
+#[cfg(target_arch = "wasm32")]
+use toolkit::{App, BufferPool, ClientError, CommitProgress, Connection, Window};
 
-fn run<C: Connection>(connection: C) -> Result<(), ClientError> {
+#[cfg(target_arch = "wasm32")]
+mod wasm_main {
+    #[link(wasm_import_module = "wasi_snapshot_preview1")]
+    extern "C" {
+        fn proc_exit(rval: i32) -> !;
+    }
+
+    pub fn run() {
+        println!("hello: starting");
+        let connection = match toolkit::wasi::FdConnection::connect() {
+            Ok(connection) => connection,
+            Err(errno) => unsafe { proc_exit(errno) },
+        };
+        match super::run_window(connection) {
+            Ok(()) => unsafe { proc_exit(0) },
+            Err(_) => unsafe { proc_exit(1) },
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+extern crate alloc;
+
+#[cfg(target_arch = "wasm32")]
+fn run_window<C: Connection>(connection: C) -> Result<(), ClientError> {
     let mut app = App::connect(connection)?;
-
     let mut window = Window::new(&mut app)?;
     window.set_title("Hello PMos")?;
     window.set_app_id("com.example.hello")?;
     window.commit()?;
 
     let theme = Theme::LIGHT;
+    let mut painted = false;
     let mut pool: Option<BufferPool> = None;
 
     loop {
         let _events = window.dispatch()?;
-
         if window.close_requested() {
-            break;
+            return Ok(());
         }
 
-        if window.is_configured() && pool.is_none() {
-            let (w, h) = match window.configured_size() {
+        if let Some(buffers) = pool.as_mut().filter(|buffers| buffers.commit_pending()) {
+            if buffers.progress_commit(&mut window)? == CommitProgress::Committed {
+                painted = true;
+                println!("hello: ready");
+            }
+        }
+
+        if !painted && window.is_configured() {
+            let (width, height) = match window.configured_size() {
                 (0, 0) => (320, 200),
                 size => size,
             };
-            let mut fresh = BufferPool::new(window.app_mut(), w, h)?;
-            if let Some(mut canvas) = fresh.acquire_back_canvas() {
-                canvas.clear(theme.window_background);
+            if pool.is_none() {
+                pool = Some(BufferPool::new(window.app_mut(), width, height)?);
             }
-            fresh.commit_and_swap(&mut window)?;
-            pool = Some(fresh);
+            let buffers = pool.as_mut().expect("pool created above");
+            if let Some(mut canvas) = buffers.acquire_back_canvas() {
+                canvas.clear(theme.window_background);
+                drop(canvas);
+                if buffers.commit_and_swap(&mut window)? == CommitProgress::Committed {
+                    painted = true;
+                    println!("hello: ready");
+                }
+            }
         }
-    }
 
-    Ok(())
+        window.flush_outbound()?;
+        if pool.as_ref().is_some_and(BufferPool::commit_pending) && !window.outbound_pending() {
+            continue;
+        }
+        window.wait(None)?;
+    }
+}
+
+fn main() {
+    #[cfg(target_arch = "wasm32")]
+    wasm_main::run();
+    #[cfg(not(target_arch = "wasm32"))]
+    println!("hello-app (host build): build for wasm32-wasip1 to run in PMos");
 }
 ```
 
@@ -131,20 +179,19 @@ A few notes on what the snippet assumes:
   `configure` event. `Window::dispatch` internally acks
   configure and records close — the caller just checks
   `is_configured` / `configured_size` / `close_requested`.
-- `BufferPool::new` allocates a double-buffered `pmd_shm_pool`;
-  `acquire_back_canvas` hands you a `Canvas` into the back
-  buffer; `commit_and_swap` attaches, damages, commits, and
-  flips. See `crates/toolkit/src/draw/buffer.rs` for the
-  frame-callback integration hooks that a real app would plug
-  into.
-- The `Connection` generic is the toolkit's transport-abstraction
-  trait; `main` is responsible for constructing one and calling
-  `run(connection)`. In tests, `toolkit::MemoryConnection` is the
-  in-memory `Connection` implementation. In production, a thin
-  wrapper over the `display_connect` syscall fd plays that role —
-  that wrapper lands alongside the T110 display-server
-  protocol-dispatch loop. See `Using PMos syscalls` below for
-  the extern-level detail.
+- `BufferPool::new` allocates a double-buffered `pmd_shm_pool`, and
+  `acquire_back_canvas` hands you a `Canvas` into the back buffer. A frame may
+  take multiple bounded upload quanta, so `commit_and_swap` can leave staged
+  work for `progress_commit`. The loop flushes once per turn, continues locally
+  only while staged work remains and the transport has no suffix, and otherwise
+  parks in `window.wait(None)`; this prevents both an unpublished large frame
+  and an idle busy loop.
+- The `Connection` generic keeps the window logic transport-independent. Tests
+  can pass `toolkit::MemoryConnection`; production `main` uses the public
+  `toolkit::wasi::FdConnection`, which owns the `display_connect` fd and its
+  backpressure-aware WASI read/write/poll path. Keep the cfg-gated allocator,
+  WASI exit bridge, and top-level `main` shown above when creating a standalone
+  app.
 
 For a longer walk-through with more paint logic and a chromed
 window frame, see `specs/001-browser-os-v1/quickstart.md §5`.
@@ -161,45 +208,45 @@ You would reach for the raw path in three situations:
   that needs to prove the toolkit isn't privileged writes
   directly against `display-proto`. The `toolkit-free-client`
   crate is the standing example — see
-  `crates/toolkit-free-client/src/lib.rs` (276 lines,
-  dependency on `display-proto` only, no `toolkit`).
+  `crates/toolkit-free-client/src/lib.rs` (the shared
+  `display-proto` codec is its only runtime dependency; no `toolkit`).
 - **Non-Rust clients.** The wire protocol is language-neutral.
   A Zig, C, or TypeScript toolkit would speak the same wire
   format as the Rust toolkit and interoperate with everything
   else in the system. Principle VII is what makes that
   possible.
 
-The shape of a raw-protocol session is
-`display_connect → get_registry → bind compositor + shm + xdg_wm_base → allocate SAB pool → create surface + xdg_toplevel → attach + commit`.
-Each helper in `FreeClient` maps one-for-one to a spec table
-row:
+The shipped-v1 raw session is `display_connect → get_registry → discover and
+bind compositor + shm + xdg_shell + seat → create keyboard + surface +
+xdg_toplevel → configure/ack → allocate and write a bounded pool → attach +
+damage + commit → input → close cleanup`. Numeric registry names are discovered
+from events; clients must not assume the current 1–4 values. `FreeSession`
+drives those transitions, while its `FreeClient` request helpers still map
+one-for-one to contract table rows:
 
 ```rust
-use toolkit_free_client::{FreeClient, FreeClientError};
+use toolkit_free_client::{FreeSession, SessionError, SessionSignal};
 
-fn walk() -> Result<Vec<u8>, FreeClientError> {
-    let mut client = FreeClient::new();
+fn begin() -> Result<(FreeSession, Vec<u8>), SessionError> {
+    let mut session = FreeSession::new()?;
+    let get_registry = session.drain_outbound();
+    Ok((session, get_registry))
+}
 
-    let registry = client.get_registry()?;
-    let compositor = client.registry_bind(registry, 1, "pmd_compositor", 1)?;
-    let _shm = client.registry_bind(registry, 2, "pmd_shm", 1)?;
-    let _xdg_shell = client.registry_bind(registry, 3, "pmd_xdg_shell", 1)?;
-
-    let surface = client.compositor_create_surface(compositor)?;
-    // Buffer allocation + attach/damage/commit follow the same
-    // shape — see FreeClient::surface_attach / surface_damage /
-    // surface_commit, each of which maps to a §9 spec row.
-
-    client.surface_commit(surface)?;
-    Ok(client.drain_outbound())
-    // ... forward the drained bytes to /run/display via ipc_send.
+fn receive(
+    session: &mut FreeSession,
+    server_bytes: &[u8],
+) -> Result<(Vec<SessionSignal>, Vec<u8>), SessionError> {
+    let signals = session.push_server_bytes(server_bytes)?;
+    let protocol_replies = session.drain_outbound();
+    Ok((signals, protocol_replies))
 }
 ```
 
-The full surface is in `crates/toolkit-free-client/src/lib.rs`;
-the `tests/conformance.rs` integration pairs `FreeClient`
-against a real `display_server::Server` and walks the full
-request sequence.
+The production fd read/write loop is in
+`crates/toolkit-free-client/src/main.rs`. Native isolation in
+`tests/conformance.rs` pairs the same state machine with a real
+`display_server::Server`; no production code imports that server crate.
 
 For the normative reference to every wire message see
 `specs/001-browser-os-v1/contracts/display-protocol.md`; for a
@@ -256,13 +303,12 @@ scaffold that test each step of the handshake.
 
 Full browser integration (kernel spawn, real display server,
 Playwright assertions) lives under `web/tests/integration/`.
-The pattern is blocked today on T110 — the display server's
-protocol-dispatch loop is still landing, and the existing
-`real-kernel.spec.ts` fixture exercises the kernel spawn path
-rather than the wire-framed display protocol. Once T110's
-dispatch is in tree, app-level integration tests will follow
-the `boot-to-desktop.spec.ts` shape described in
-`quickstart.md §4.5`.
+`toolkit-free-client.spec.ts` is the raw-client reference: it launches the
+actual `/bin/toolkit-free-client` WASI artifact in a separate Worker, observes
+its exact framebuffer colours, routes a physical key through
+`pmd_keyboard.key`, closes it through the shell/display protocol, and requires
+the Worker to disappear. Run the focused Chromium/Firefox gate shown in
+`quickstart.md §6` after assembling `dist/`.
 
 ## Using PMos syscalls
 
@@ -296,32 +342,52 @@ minimal working example of a raw extern call.
 
 ## Packaging and distribution
 
-**In v1**, apps live inside the Rust workspace. Adding one is
-three edits:
+Built-in binaries live inside the Rust workspace. Shipping a new one requires
+four explicit registrations:
 
 1. Create `crates/<name>/` with a `Cargo.toml` and `src/main.rs`.
 2. Register `<name>` in the workspace root `Cargo.toml`
    `members` list.
-3. Add `<name>` to the `just build` invocation in the
-   `Justfile` (or let `xtask assemble-dist` pick it up via the
-   conventional crate-name lookup).
+3. Add the package to the `wasm32-wasip1` release build in the `Justfile`.
+4. Add each shipped `(crate_name, bin_name)` pair to `USERLAND_BINS` in
+   `crates/xtask/src/assemble_dist.rs`.
 
 `just build` compiles everything to `wasm32-wasip1`. The
 `xtask assemble-dist` step copies the resulting binaries to
-`dist/assets/bin/<name>.wasm`. A `/usr/share/applications/<name>.desktop`
-entry (bundled in the initramfs for built-in apps) wires the
-app into the launcher.
+`dist/assets/bin/<bin_name>.wasm`. Assembly deliberately copies only the fixed
+`USERLAND_BINS` inventory and fails when a listed artifact is missing; it does
+not discover workspace crates or binary targets by naming convention.
 
-**Coming:** third-party apps — packages written outside the
-workspace, distributed without a PMos source checkout — will
-ship as `.pmpkg.tar` bundles installed via a `pkginstall` CLI.
-The bundle format is defined in
-`specs/001-browser-os-v1/contracts/package-manifest.md`; the
-tooling is tracked in T198 (`pkginstall` bundled CLI), T203
-(`xtask package` subcommand), and T204 (`just push-sample`
-target). **None of these tasks has landed yet.** Do not plan
-your distribution flow around third-party packaging until they
-do — until then, in-workspace is the only path.
+To make a built-in GUI app visible in the launcher, also add its desktop entry
+under `crates/kernel/assets/usr/share/applications/` and register that entry in
+both the fresh-image table in `crates/kernel/src/fs/opfs/mkfs.rs` and the
+existing-image migration table in `crates/kernel/src/fs/seed.rs`.
+
+Third-party apps ship as `.pmpkg.tar` bundles. Put a `pkg.toml` next to the
+crate's `Cargo.toml`, build the WASI binary, then package it from the PMos
+checkout:
+
+```shell
+cargo build --locked --release --target wasm32-wasip1 -p sample-app
+cargo run --locked -p xtask -- package sample-app
+```
+
+`xtask package` embeds the final executable under the manifest's `exec.binary`
+path, generates a SHA-256 entry for every payload file, validates the completed
+archive, and writes `dist/pkgs/<name>-<version>.pmpkg.tar`. The user explicitly
+drops that archive into PMos, then runs:
+
+```text
+pkginstall /home/user/Downloads/<name>-<version>.pmpkg.tar
+```
+
+The installer verifies tar structure, payload integrity, WASM magic, and the
+v1 capability policy before touching the live filesystem. It publishes
+`/opt/<name>/` and `/usr/share/applications/<name>.desktop` transactionally;
+the launcher discovers the entry without a reboot. V1 third-party packages may
+require only `DISPLAY_CLIENT`. Optional privileged capabilities are retained as
+metadata but never granted. Full details are in
+`specs/001-browser-os-v1/contracts/package-manifest.md`.
 
 ## Accessibility — a v1 non-goal
 
@@ -346,7 +412,7 @@ anything in the substrate today.
   preview 1 baseline + PMos extension syscalls (opcodes,
   layouts, errnos).
 - `specs/001-browser-os-v1/contracts/package-manifest.md` —
-  the future `.pmpkg.tar` bundle format.
+  the `.pmpkg.tar` bundle format and install policy.
 - `.specify/memory/constitution.md` — the ten principles;
   Principle VII (protocol over API) and Principle VIII
   (bottom-up construction) are the ones that shape the

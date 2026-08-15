@@ -13,7 +13,7 @@
 /* eslint-disable */
 
 export const ABI_MAJOR = 0x1;
-export const ABI_MINOR = 0x1;
+export const ABI_MINOR = 0x2;
 export const ABI_VERSION: readonly [number, number] = [ABI_MAJOR, ABI_MINOR];
 
 // --- Region offsets ---------------------------------------------------

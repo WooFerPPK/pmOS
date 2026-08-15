@@ -6,3 +6,13 @@
 
 pub mod conf;
 pub mod respawn;
+pub mod spawn;
+
+/// Least-privilege grants used by the two PID-1 binaries. Keeping these in
+/// the host-testable library prevents a future boot-path edit from silently
+/// regressing to `u64::MAX` for every child.
+pub mod grants {
+    pub const ORDINARY_APP: u64 = abi::cap::initial::ORDINARY_APP.0;
+    pub const DISPLAY_SERVER: u64 = abi::cap::initial::DISPLAY_SERVER.0;
+    pub const DESKTOP_SHELL: u64 = abi::cap::initial::DESKTOP_SHELL.0;
+}

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Text Editor
-Exec=/usr/bin/edit
+Exec=/bin/edit
 Categories=Utility;
 MimeType=text/plain;text/markdown;
 X-PMos-Caps=DISPLAY_CLIENT

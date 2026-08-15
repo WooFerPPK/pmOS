@@ -43,11 +43,11 @@
 //!
 //! Exit codes:
 //!
-//!   * 0   = every applicable probe was correctly rejected
-//!   * 1..=8 = probe N succeeded when it should have failed
-//!   * 13  = `fd_write` to /dev/console failed (test-harness
-//!           failure, not an isolation breach)
-//!   * 101 = panic
+//! * 0   = every applicable probe was correctly rejected
+//! * 1..=8 = probe N succeeded when it should have failed
+//! * 13  = `fd_write` to /dev/console failed (test-harness
+//!   failure, not an isolation breach)
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 

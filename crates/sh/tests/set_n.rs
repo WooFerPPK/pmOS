@@ -91,8 +91,7 @@ fn set_n_then_export_does_not_mutate_env() {
     // insert `X=1` into the env map, but under `set -n` the
     // dispatch_builtin call is skipped so the mutation
     // never happens. Inspect the post-loop env map directly.
-    let (status, _stdout, _stderr, env, _flags) =
-        drive("set -n\nexport X=1\n");
+    let (status, _stdout, _stderr, env, _flags) = drive("set -n\nexport X=1\n");
     assert_eq!(status, ExitStatus::Eof);
     assert!(
         !env.contains_key("X"),
@@ -106,8 +105,7 @@ fn set_n_with_long_form_o_noexec() {
     // identical to `set -n`. Same skip behaviour applies.
     // Pins the `-o NAME` parser path AND the shared
     // `flags.noexec = true` mutation.
-    let (status, stdout, _stderr, _env, flags) =
-        drive("set -o noexec\necho hi\n");
+    let (status, stdout, _stderr, _env, flags) = drive("set -o noexec\necho hi\n");
     assert_eq!(status, ExitStatus::Eof);
     assert!(
         !stdout.contains("hi"),
@@ -128,8 +126,7 @@ fn set_plus_n_clears_flag_and_subsequent_commands_run() {
     // `echo hi` line should produce its normal output.
     // Pins the load-bearing exemption AND the post-clear
     // command-runs-normally property.
-    let (status, stdout, _stderr, _env, flags) =
-        drive("set -n\nset +n\necho hi\nexit\n");
+    let (status, stdout, _stderr, _env, flags) = drive("set -n\nset +n\necho hi\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stdout.contains("hi\n"),
@@ -152,8 +149,7 @@ fn set_n_set_command_itself_still_runs() {
     // setting). If the set builtin were also skipped under
     // -n then `set +n` would be silently ignored and the
     // post-loop flags would still have noexec=true.
-    let (_status, _stdout, _stderr, _env, flags) =
-        drive("set -n\nset +n\n");
+    let (_status, _stdout, _stderr, _env, flags) = drive("set -n\nset +n\n");
     assert!(
         !flags.noexec,
         "set +n under set -n must clear the flag: {flags:?}"
@@ -170,8 +166,7 @@ fn set_n_quote_error_still_surfaces() {
     // syntax-checking aspect of `set -n` actually works:
     // the whole point of "lint mode" is that syntax errors
     // are caught, even though commands don't run.
-    let (status, _stdout, stderr, _env, _flags) =
-        drive("set -n\necho 'unclosed\n");
+    let (status, _stdout, stderr, _env, _flags) = drive("set -n\necho 'unclosed\n");
     assert_eq!(status, ExitStatus::Eof);
     assert!(
         stderr.contains("unterminated single quote"),
@@ -193,8 +188,7 @@ fn set_n_with_set_u_unset_var_still_terminates() {
     // doesn't recognise clustered short flags (`set -nu`
     // would be parsed as one invalid option), so we issue
     // the two flags on separate lines.
-    let (status, _stdout, stderr, _env, _flags) =
-        drive("set -u\nset -n\necho $UNSET\n");
+    let (status, _stdout, stderr, _env, _flags) = drive("set -u\nset -n\necho $UNSET\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("parameter not set"),
@@ -213,8 +207,7 @@ fn set_n_does_not_trace_under_set_x() {
     // matching the existing trace-skip rule for blank
     // lines and expansion errors. Note: separate lines
     // because v1's `set` doesn't cluster flags.
-    let (status, stdout, stderr, _env, _flags) =
-        drive("set -n\nset -x\necho hi\n");
+    let (status, stdout, stderr, _env, _flags) = drive("set -n\nset -x\necho hi\n");
     assert_eq!(status, ExitStatus::Eof);
     assert!(
         !stdout.contains("hi"),
@@ -235,8 +228,7 @@ fn set_n_blank_line_does_not_error() {
     // lines don't accidentally trigger any error path
     // when noexec is on. Sanity test — without this the
     // existing blank-line continue arm could regress.
-    let (status, stdout, _stderr, _env, _flags) =
-        drive("set -n\n\necho hi\n");
+    let (status, stdout, _stderr, _env, _flags) = drive("set -n\n\necho hi\n");
     assert_eq!(status, ExitStatus::Eof);
     assert!(
         !stdout.contains("hi"),
@@ -257,8 +249,7 @@ fn set_n_unknown_command_does_not_warn() {
     // catches PARSE errors but does NOT catch
     // missing-command errors (those are a runtime
     // concern, not a syntax concern).
-    let (status, _stdout, stderr, _env, _flags) =
-        drive("set -n\nno_such_command_here\n");
+    let (status, _stdout, stderr, _env, _flags) = drive("set -n\nno_such_command_here\n");
     assert_eq!(status, ExitStatus::Eof);
     assert!(
         !stderr.contains("command not found"),
@@ -275,8 +266,7 @@ fn set_n_exit_is_silently_skipped() {
     // NOT via the `exit` command. Pins that `exit` does
     // NOT get an exception alongside `set` — the only
     // exempt builtin is `set` itself.
-    let (status, _stdout, _stderr, _env, _flags) =
-        drive("set -n\nexit 5\n");
+    let (status, _stdout, _stderr, _env, _flags) = drive("set -n\nexit 5\n");
     assert_eq!(
         status,
         ExitStatus::Eof,

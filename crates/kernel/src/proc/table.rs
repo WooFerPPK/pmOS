@@ -12,6 +12,16 @@ use abi::ext::Pid;
 
 use super::{BlockReason, ProcState, Process};
 
+/// Maximum number of non-reaped processes in one kernel instance.
+///
+/// Zombies count until their parent reaps them: retaining a zombie still owns
+/// process-table metadata, and excluding it would let an uncooperative parent
+/// bypass the bound by never calling `proc_wait`.
+pub const PROCESS_LIMIT_GLOBAL: usize = 256;
+
+/// Maximum number of non-reaped children owned by one parent pid.
+pub const PROCESS_LIMIT_PER_PARENT: usize = 64;
+
 /// Monotonic PID allocator.
 ///
 /// PIDs are allocated sequentially starting at 1 (init). PIDs are
@@ -144,7 +154,7 @@ impl ProcessTable {
     /// method only updates the process table.
     pub fn exit(&mut self, pid: Pid, status: super::ExitStatus) -> Result<(), ExitError> {
         let proc = self.procs.get_mut(&pid).ok_or(ExitError::NoSuchPid)?;
-        if proc.state == ProcState::Dead {
+        if matches!(proc.state, ProcState::Zombie | ProcState::Dead) {
             return Err(ExitError::AlreadyDead);
         }
         proc.exit(status);
@@ -195,6 +205,14 @@ impl ProcessTable {
             .values()
             .filter(|p| p.ppid == parent_pid && p.state != ProcState::Dead)
             .count()
+    }
+
+    /// Check whether another process may be registered under `parent_pid`.
+    /// This is side-effect free so callers can reject a spawn before consuming
+    /// a pid or allocating any per-process kernel state.
+    pub fn has_spawn_capacity(&self, parent_pid: Pid) -> bool {
+        self.live_count() < PROCESS_LIMIT_GLOBAL
+            && self.child_count(parent_pid) < PROCESS_LIMIT_PER_PARENT
     }
 
     /// Record the current virtual memory size for `pid`.

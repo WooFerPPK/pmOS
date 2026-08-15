@@ -49,6 +49,10 @@ pub enum Cap {
     /// that need to inspect neighbours' permissions — e.g.
     /// sysmon.
     ProcInspect = 11,
+    /// May ask the browser substrate to open the native file picker or
+    /// emit a host download. Held by the desktop shell for delegation
+    /// to the bundled Files app; ordinary applications do not receive it.
+    HostTransfer = 12,
 }
 
 impl Cap {
@@ -61,18 +65,19 @@ impl Cap {
     /// Attempt to decode a `u32` discriminant back into a `Cap`.
     pub const fn from_u32(v: u32) -> Option<Cap> {
         match v {
-            1  => Some(Cap::DisplayClient),
-            2  => Some(Cap::DisplayServer),
-            3  => Some(Cap::Shell),
-            4  => Some(Cap::ProcEnumerate),
-            5  => Some(Cap::ProcKillAny),
-            6  => Some(Cap::Net),
-            7  => Some(Cap::Mount),
-            8  => Some(Cap::CapGrant),
-            9  => Some(Cap::DevBlock),
+            1 => Some(Cap::DisplayClient),
+            2 => Some(Cap::DisplayServer),
+            3 => Some(Cap::Shell),
+            4 => Some(Cap::ProcEnumerate),
+            5 => Some(Cap::ProcKillAny),
+            6 => Some(Cap::Net),
+            7 => Some(Cap::Mount),
+            8 => Some(Cap::CapGrant),
+            9 => Some(Cap::DevBlock),
             10 => Some(Cap::KeymapAdmin),
             11 => Some(Cap::ProcInspect),
-            _  => None,
+            12 => Some(Cap::HostTransfer),
+            _ => None,
         }
     }
 
@@ -82,15 +87,37 @@ impl Cap {
         match self {
             Cap::DisplayClient => "DISPLAY_CLIENT",
             Cap::DisplayServer => "DISPLAY_SERVER",
-            Cap::Shell         => "SHELL",
+            Cap::Shell => "SHELL",
             Cap::ProcEnumerate => "PROC_ENUMERATE",
-            Cap::ProcKillAny   => "PROC_KILL_ANY",
-            Cap::Net           => "NET",
-            Cap::Mount         => "MOUNT",
-            Cap::CapGrant      => "CAP_GRANT",
-            Cap::DevBlock      => "DEV_BLOCK",
-            Cap::KeymapAdmin   => "KEYMAP_ADMIN",
-            Cap::ProcInspect   => "PROC_INSPECT",
+            Cap::ProcKillAny => "PROC_KILL_ANY",
+            Cap::Net => "NET",
+            Cap::Mount => "MOUNT",
+            Cap::CapGrant => "CAP_GRANT",
+            Cap::DevBlock => "DEV_BLOCK",
+            Cap::KeymapAdmin => "KEYMAP_ADMIN",
+            Cap::ProcInspect => "PROC_INSPECT",
+            Cap::HostTransfer => "HOST_TRANSFER",
+        }
+    }
+
+    /// Decode the stable manifest/init configuration spelling of a
+    /// capability. Keeping this inverse beside [`Cap::name`] prevents init,
+    /// the launcher, and package validation from growing divergent tables.
+    pub fn from_name(name: &str) -> Option<Cap> {
+        match name {
+            "DISPLAY_CLIENT" => Some(Cap::DisplayClient),
+            "DISPLAY_SERVER" => Some(Cap::DisplayServer),
+            "SHELL" => Some(Cap::Shell),
+            "PROC_ENUMERATE" => Some(Cap::ProcEnumerate),
+            "PROC_KILL_ANY" => Some(Cap::ProcKillAny),
+            "NET" => Some(Cap::Net),
+            "MOUNT" => Some(Cap::Mount),
+            "CAP_GRANT" => Some(Cap::CapGrant),
+            "DEV_BLOCK" => Some(Cap::DevBlock),
+            "KEYMAP_ADMIN" => Some(Cap::KeymapAdmin),
+            "PROC_INSPECT" => Some(Cap::ProcInspect),
+            "HOST_TRANSFER" => Some(Cap::HostTransfer),
+            _ => None,
         }
     }
 }
@@ -172,16 +199,17 @@ pub mod initial {
     pub const INIT: CapSet = CapSet::ALL;
 
     /// Display server — access to the framebuffer and input devices.
-    pub const DISPLAY_SERVER: CapSet =
-        CapSet::from_caps(&[Cap::DisplayServer, Cap::DevBlock]);
+    pub const DISPLAY_SERVER: CapSet = CapSet::from_caps(&[Cap::DisplayServer, Cap::DevBlock]);
 
-    /// Desktop shell — display client + SHELL + PROC_ENUMERATE +
-    /// KEYMAP_ADMIN (the last for delegation to settings at launch).
+    /// Desktop shell — display client + SHELL + process enumeration, plus the
+    /// privileged capabilities it delegates to Sysmon, Settings, and Files.
     pub const DESKTOP_SHELL: CapSet = CapSet::from_caps(&[
         Cap::DisplayClient,
         Cap::Shell,
         Cap::ProcEnumerate,
+        Cap::ProcKillAny,
         Cap::KeymapAdmin,
+        Cap::HostTransfer,
     ]);
 
     /// Bundled sysmon — process enumeration and termination.
@@ -190,8 +218,10 @@ pub mod initial {
 
     /// Bundled settings — display client + KEYMAP_ADMIN (granted by
     /// the launcher from its own cap set at spawn time).
-    pub const SETTINGS: CapSet =
-        CapSet::from_caps(&[Cap::DisplayClient, Cap::KeymapAdmin]);
+    pub const SETTINGS: CapSet = CapSet::from_caps(&[Cap::DisplayClient, Cap::KeymapAdmin]);
+
+    /// Bundled Files — display client plus the host picker/download bridge.
+    pub const FILES: CapSet = CapSet::from_caps(&[Cap::DisplayClient, Cap::HostTransfer]);
 
     /// Default for any other userland program — display client only.
     pub const ORDINARY_APP: CapSet = CapSet::from_caps(&[Cap::DisplayClient]);
@@ -211,6 +241,7 @@ mod tests {
     fn all_contains_everything() {
         assert!(CapSet::ALL.contains(Cap::DisplayClient));
         assert!(CapSet::ALL.contains(Cap::KeymapAdmin));
+        assert!(CapSet::ALL.contains(Cap::HostTransfer));
         assert!(CapSet::ALL.contains(Cap::CapGrant));
     }
 
@@ -222,6 +253,7 @@ mod tests {
         // app at launcher spawn time.
         assert!(initial::DESKTOP_SHELL.contains(Cap::KeymapAdmin));
         assert!(initial::DESKTOP_SHELL.contains(Cap::Shell));
+        assert!(initial::DESKTOP_SHELL.contains(Cap::ProcKillAny));
         assert!(!initial::DESKTOP_SHELL.contains(Cap::DisplayServer));
     }
 
@@ -236,13 +268,25 @@ mod tests {
     }
 
     #[test]
+    fn files_is_subset_of_desktop_shell_for_delegation_to_work() {
+        assert!(initial::FILES.is_subset_of(initial::DESKTOP_SHELL));
+        assert!(initial::FILES.contains(Cap::HostTransfer));
+        assert!(!initial::ORDINARY_APP.contains(Cap::HostTransfer));
+    }
+
+    #[test]
+    fn sysmon_is_subset_of_desktop_shell_for_delegation_to_work() {
+        assert!(initial::SYSMON.is_subset_of(initial::DESKTOP_SHELL));
+    }
+
+    #[test]
     fn from_u32_roundtrip() {
-        for v in 1..=11 {
+        for v in 1..=12 {
             let cap = Cap::from_u32(v).expect("known cap");
             assert_eq!(cap as u32, v);
         }
         assert!(Cap::from_u32(0).is_none());
-        assert!(Cap::from_u32(12).is_none());
+        assert!(Cap::from_u32(13).is_none());
     }
 
     #[test]
@@ -252,14 +296,20 @@ mod tests {
         // table and data-model.md is an ABI break.
         assert_eq!(Cap::DisplayClient.name(), "DISPLAY_CLIENT");
         assert_eq!(Cap::DisplayServer.name(), "DISPLAY_SERVER");
-        assert_eq!(Cap::Shell.name(),         "SHELL");
+        assert_eq!(Cap::Shell.name(), "SHELL");
         assert_eq!(Cap::ProcEnumerate.name(), "PROC_ENUMERATE");
-        assert_eq!(Cap::ProcKillAny.name(),   "PROC_KILL_ANY");
-        assert_eq!(Cap::Net.name(),           "NET");
-        assert_eq!(Cap::Mount.name(),         "MOUNT");
-        assert_eq!(Cap::CapGrant.name(),      "CAP_GRANT");
-        assert_eq!(Cap::DevBlock.name(),      "DEV_BLOCK");
-        assert_eq!(Cap::KeymapAdmin.name(),   "KEYMAP_ADMIN");
-        assert_eq!(Cap::ProcInspect.name(),   "PROC_INSPECT");
+        assert_eq!(Cap::ProcKillAny.name(), "PROC_KILL_ANY");
+        assert_eq!(Cap::Net.name(), "NET");
+        assert_eq!(Cap::Mount.name(), "MOUNT");
+        assert_eq!(Cap::CapGrant.name(), "CAP_GRANT");
+        assert_eq!(Cap::DevBlock.name(), "DEV_BLOCK");
+        assert_eq!(Cap::KeymapAdmin.name(), "KEYMAP_ADMIN");
+        assert_eq!(Cap::HostTransfer.name(), "HOST_TRANSFER");
+        assert_eq!(Cap::ProcInspect.name(), "PROC_INSPECT");
+        for value in 1..=12 {
+            let cap = Cap::from_u32(value).unwrap();
+            assert_eq!(Cap::from_name(cap.name()), Some(cap));
+        }
+        assert_eq!(Cap::from_name("UNKNOWN"), None);
     }
 }

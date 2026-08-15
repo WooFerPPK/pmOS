@@ -1,18 +1,20 @@
 //! Launcher content source for the desktop shell.
 //!
 //! Parses `.desktop`-format files from `/usr/share/applications/`
-//! into [`DesktopEntry`] structs and re-polls on a 5 s interval.
+//! into [`DesktopEntry`] structs and reloads after filesystem-watch events.
 //!
 //! File I/O is injected through [`DesktopEntryStore`] so production
 //! code wires real VFS reads while tests use [`MemoryStore`].
 //!
-//! What is NOT in scope here: `proc_spawn` on selection (follow-up
-//! slice), launcher popup UI (T121 follow-up), icon loading, and
-//! inotify / file-watcher (v1 is polling per §4 of
-//! `package-manifest.md`).
+//! The shell paint loop consumes this cache for popup rows and dispatches
+//! selection through its capability-aware spawner. Production scanning and
+//! parsing are bounded so catalog churn cannot monopolize the shell turn.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{File, ReadDir};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // ── Data model ──────────────────────────────────────────────────────────────
 
@@ -48,6 +50,8 @@ pub enum LauncherError {
     MissingRequiredKey(&'static str),
     /// The entry's `Type=` value was not `Application`.
     NotAnApplication,
+    /// The backing application directory could not be read.
+    StoreIo(String),
 }
 
 impl std::fmt::Display for LauncherError {
@@ -58,6 +62,7 @@ impl std::fmt::Display for LauncherError {
             }
             LauncherError::MissingRequiredKey(k) => write!(f, "missing required key: {k}"),
             LauncherError::NotAnApplication => write!(f, "Type is not Application"),
+            LauncherError::StoreIo(message) => write!(f, "application catalog I/O: {message}"),
         }
     }
 }
@@ -68,10 +73,37 @@ impl std::fmt::Display for LauncherError {
 ///
 /// Each call to [`list_entries`] returns every currently-available
 /// file as `(id, content)` pairs, where `id` is the filename stem
-/// (no `.desktop` suffix).  The launcher calls this at startup and
-/// again after each 5 s poll interval.
+/// (no `.desktop` suffix). This synchronous method is retained for
+/// injected/native fixtures; production uses [`DesktopEntryStore::begin_scan`].
 pub trait DesktopEntryStore {
     fn list_entries(&mut self) -> Result<Vec<(String, String)>, LauncherError>;
+
+    /// Start a bounded catalog scan when this store can provide one.
+    /// Injected/native stores retain the synchronous compatibility path;
+    /// production [`FilesystemStore`] overrides this method.
+    fn begin_scan(&mut self) -> Result<Option<Box<dyn DesktopEntryScan>>, LauncherError> {
+        Ok(None)
+    }
+}
+
+/// At most this many directory entries are examined in one shell turn.
+pub const CATALOG_ENTRIES_PER_STEP: usize = 16;
+/// A single `.desktop` file is bounded independently of directory size.
+pub const MAX_DESKTOP_ENTRY_BYTES: usize = 64 * 1024;
+/// Maximum number of application manifests admitted to one catalog snapshot.
+pub const MAX_CATALOG_ENTRIES: usize = 256;
+/// Maximum aggregate manifest bytes retained while one snapshot is built.
+pub const MAX_CATALOG_TOTAL_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+pub struct DesktopEntryScanBatch {
+    pub entries: Vec<(String, String)>,
+    pub complete: bool,
+}
+
+/// Incremental store scan used by the production event loop.
+pub trait DesktopEntryScan {
+    fn step(&mut self) -> Result<DesktopEntryScanBatch, LauncherError>;
 }
 
 // ── In-memory store (for tests) ─────────────────────────────────────────────
@@ -99,6 +131,128 @@ impl DesktopEntryStore for MemoryStore {
             .iter()
             .map(|(id, content)| (id.clone(), content.clone()))
             .collect())
+    }
+}
+
+/// Production application catalog backed by a directory in the
+/// PMos VFS. Only regular `*.desktop` files are considered; an
+/// unreadable individual entry is skipped so one broken package
+/// cannot hide the rest of the launcher.
+pub struct FilesystemStore {
+    directory: PathBuf,
+}
+
+impl FilesystemStore {
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: directory.into(),
+        }
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
+impl DesktopEntryStore for FilesystemStore {
+    fn list_entries(&mut self) -> Result<Vec<(String, String)>, LauncherError> {
+        let entries = std::fs::read_dir(&self.directory)
+            .map_err(|error| LauncherError::StoreIo(error.to_string()))?;
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            found.push((id.to_string(), content));
+        }
+        Ok(found)
+    }
+
+    fn begin_scan(&mut self) -> Result<Option<Box<dyn DesktopEntryScan>>, LauncherError> {
+        let entries = std::fs::read_dir(&self.directory)
+            .map_err(|error| LauncherError::StoreIo(error.to_string()))?;
+        Ok(Some(Box::new(FilesystemCatalogScan {
+            entries,
+            admitted_entries: 0,
+            admitted_bytes: 0,
+        })))
+    }
+}
+
+struct FilesystemCatalogScan {
+    entries: ReadDir,
+    admitted_entries: usize,
+    admitted_bytes: usize,
+}
+
+impl DesktopEntryScan for FilesystemCatalogScan {
+    fn step(&mut self) -> Result<DesktopEntryScanBatch, LauncherError> {
+        let mut found = Vec::new();
+        let mut examined = 0usize;
+        let mut desktop_file_read = false;
+
+        while examined < CATALOG_ENTRIES_PER_STEP && !desktop_file_read {
+            let Some(next) = self.entries.next() else {
+                return Ok(DesktopEntryScanBatch {
+                    entries: found,
+                    complete: true,
+                });
+            };
+            examined += 1;
+            let Ok(entry) = next else {
+                continue;
+            };
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            // One desktop-file read attempt per turn, successful or not.
+            // A directory full of oversized or unreadable entries must not
+            // bypass the byte-work quantum.
+            desktop_file_read = true;
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            if file
+                .take((MAX_DESKTOP_ENTRY_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() > MAX_DESKTOP_ENTRY_BYTES
+            {
+                continue;
+            }
+            let Ok(content) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let retained_bytes = id.len().saturating_add(content.len());
+            if self.admitted_entries >= MAX_CATALOG_ENTRIES
+                || self.admitted_bytes.saturating_add(retained_bytes) > MAX_CATALOG_TOTAL_BYTES
+            {
+                return Err(LauncherError::StoreIo(format!(
+                    "application catalog exceeds {} entries or {} bytes",
+                    MAX_CATALOG_ENTRIES, MAX_CATALOG_TOTAL_BYTES
+                )));
+            }
+            self.admitted_entries += 1;
+            self.admitted_bytes += retained_bytes;
+            found.push((id.to_string(), content));
+        }
+
+        Ok(DesktopEntryScanBatch {
+            entries: found,
+            complete: false,
+        })
     }
 }
 
@@ -195,6 +349,41 @@ fn split_semicolons(s: &str) -> Vec<String> {
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Avoid a clock syscall on every empty display dispatch. The shell's
+/// connection is non-blocking after bootstrap, so sixteen turns remain far
+/// below the five-second catalog freshness contract under normal load.
+pub const LAUNCHER_CLOCK_CHECK_EVERY_ITERATIONS: u32 = 16;
+
+/// Monotonic clock seam for the live launcher catalog.
+pub trait LauncherClock {
+    fn elapsed(&mut self) -> Duration;
+}
+
+/// Production monotonic clock, measured from shell startup.
+pub struct SystemLauncherClock {
+    started: Instant,
+}
+
+impl SystemLauncherClock {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemLauncherClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LauncherClock for SystemLauncherClock {
+    fn elapsed(&mut self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
 /// Desktop-shell app launcher.
 ///
 /// Owns a [`DesktopEntryStore`] + a cached entry list.  The caller
@@ -206,6 +395,26 @@ pub struct Launcher {
     store: Box<dyn DesktopEntryStore>,
     entries: Vec<DesktopEntry>,
     last_poll: Duration,
+    scan: Option<Box<dyn DesktopEntryScan>>,
+    scan_entries: VecDeque<(String, String)>,
+    parsed_entries: Vec<DesktopEntry>,
+    parsing: bool,
+    rescan_requested: bool,
+    completed_reload: Option<LauncherReloadCompletion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LauncherReloadStep {
+    Idle,
+    Pending,
+    Complete { changed: bool },
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LauncherReloadCompletion {
+    Published { changed: bool },
+    Failed,
 }
 
 impl Launcher {
@@ -219,7 +428,31 @@ impl Launcher {
             store,
             entries,
             last_poll: Duration::ZERO,
+            scan: None,
+            scan_entries: VecDeque::new(),
+            parsed_entries: Vec::new(),
+            parsing: false,
+            rescan_requested: false,
+            completed_reload: None,
         }
+    }
+
+    /// Production constructor: publish an empty stable catalog immediately and
+    /// populate it through bounded [`Self::step_reload`] calls.
+    pub fn new_stepwise(store: Box<dyn DesktopEntryStore>) -> Self {
+        let mut launcher = Launcher {
+            store,
+            entries: Vec::new(),
+            last_poll: Duration::ZERO,
+            scan: None,
+            scan_entries: VecDeque::new(),
+            parsed_entries: Vec::new(),
+            parsing: false,
+            rescan_requested: false,
+            completed_reload: None,
+        };
+        launcher.request_reload();
+        launcher
     }
 
     /// The current cached entry list.
@@ -248,6 +481,196 @@ impl Launcher {
             false
         }
     }
+
+    /// Re-read the catalog immediately after a filesystem-watch event.
+    /// Returns true only when the visible ordered entries changed.
+    pub fn reload(&mut self) -> bool {
+        let before = self.entries.clone();
+        self.entries = load_entries(self.store.as_mut());
+        before != self.entries
+    }
+
+    /// Request a catalog refresh. Multiple notifications during an active
+    /// scan coalesce into one follow-up scan so no mutation is lost and an
+    /// attacker cannot grow an unbounded work queue.
+    pub fn request_reload(&mut self) {
+        if self.scan.is_some() || self.parsing || self.completed_reload.is_some() {
+            self.rescan_requested = true;
+            return;
+        }
+        self.begin_reload();
+    }
+
+    /// Advance at most one store quantum. The visible catalog remains stable
+    /// until a complete snapshot has been parsed and sorted.
+    pub fn step_reload(&mut self) -> LauncherReloadStep {
+        if let Some(completion) = self.completed_reload.take() {
+            self.finish_or_restart_scan();
+            return match completion {
+                LauncherReloadCompletion::Published { changed } => {
+                    LauncherReloadStep::Complete { changed }
+                }
+                LauncherReloadCompletion::Failed => LauncherReloadStep::Failed,
+            };
+        }
+        if self.parsing {
+            return self.step_parse();
+        }
+        let Some(mut scan) = self.scan.take() else {
+            return LauncherReloadStep::Idle;
+        };
+        let batch = match scan.step() {
+            Ok(batch) => batch,
+            Err(error) => {
+                eprintln!("launcher: store error: {error}");
+                self.scan_entries.clear();
+                self.parsed_entries.clear();
+                self.finish_or_restart_scan();
+                return LauncherReloadStep::Failed;
+            }
+        };
+        self.scan_entries.extend(batch.entries);
+        if !batch.complete {
+            self.scan = Some(scan);
+            return LauncherReloadStep::Pending;
+        }
+
+        self.parsing = true;
+        LauncherReloadStep::Pending
+    }
+
+    pub fn reload_pending(&self) -> bool {
+        self.scan.is_some() || self.parsing || self.completed_reload.is_some()
+    }
+
+    /// Raw manifests still awaiting their one-per-turn parse quantum.
+    pub fn pending_parse_count(&self) -> usize {
+        self.scan_entries.len()
+    }
+
+    /// Successfully parsed manifests retained for the unpublished snapshot.
+    pub fn parsed_entry_count(&self) -> usize {
+        self.parsed_entries.len()
+    }
+
+    fn begin_reload(&mut self) {
+        self.scan_entries.clear();
+        self.parsed_entries.clear();
+        self.parsing = false;
+        match self.store.begin_scan() {
+            Ok(Some(scan)) => self.scan = Some(scan),
+            Ok(None) => {
+                let before = self.entries.clone();
+                self.entries = load_entries(self.store.as_mut());
+                self.completed_reload = Some(LauncherReloadCompletion::Published {
+                    changed: before != self.entries,
+                });
+            }
+            Err(error) => {
+                eprintln!("launcher: store error: {error}");
+                self.completed_reload = Some(LauncherReloadCompletion::Failed);
+            }
+        }
+    }
+
+    fn finish_or_restart_scan(&mut self) {
+        if core::mem::take(&mut self.rescan_requested) {
+            self.begin_reload();
+        }
+    }
+
+    fn step_parse(&mut self) -> LauncherReloadStep {
+        if let Some((id, content)) = self.scan_entries.pop_front() {
+            match parse_desktop_entry(&id, &content) {
+                Ok(entry) => self.parsed_entries.push(entry),
+                Err(error) => eprintln!("launcher: dropping {id}.desktop: {error}"),
+            }
+            if !self.scan_entries.is_empty() {
+                return LauncherReloadStep::Pending;
+            }
+        }
+
+        self.parsing = false;
+        let mut replacement = core::mem::take(&mut self.parsed_entries);
+        sort_entries(&mut replacement);
+        let changed = replacement != self.entries;
+        self.entries = replacement;
+        self.finish_or_restart_scan();
+        LauncherReloadStep::Complete { changed }
+    }
+}
+
+/// Time-gated launcher cache retained for injected/native desktop fixtures.
+///
+/// Production calls [`Self::reload`] after filesystem-watch readiness and does
+/// not wake every five seconds. [`Launcher`] keeps time injectable through
+/// [`Launcher::advance_poll`] so legacy isolation fixtures remain deterministic.
+pub struct LauncherRuntime<C> {
+    launcher: Launcher,
+    clock: C,
+    clock_check_every_iterations: u32,
+    iterations_until_clock_check: u32,
+}
+
+impl<C: LauncherClock> LauncherRuntime<C> {
+    pub fn new(launcher: Launcher, clock: C) -> Self {
+        Self {
+            launcher,
+            clock,
+            clock_check_every_iterations: LAUNCHER_CLOCK_CHECK_EVERY_ITERATIONS,
+            iterations_until_clock_check: 0,
+        }
+    }
+
+    /// Override the cheap iteration gate for deterministic isolation tests.
+    pub fn with_clock_check_every_iterations(mut self, iterations: u32) -> Self {
+        self.clock_check_every_iterations = iterations.max(1);
+        self.iterations_until_clock_check = 0;
+        self
+    }
+
+    pub fn entries(&self) -> &[DesktopEntry] {
+        self.launcher.entries()
+    }
+
+    /// Poll when the five-second boundary is due. Returns `true` only when the
+    /// resulting ordered entry list differs from the prior visible catalog.
+    pub fn poll(&mut self) -> bool {
+        if self.iterations_until_clock_check > 0 {
+            self.iterations_until_clock_check -= 1;
+            return false;
+        }
+        self.iterations_until_clock_check = self.clock_check_every_iterations - 1;
+
+        let now = self.clock.elapsed();
+        if now < self.launcher.last_poll() + POLL_INTERVAL {
+            return false;
+        }
+
+        // Clone only on an actual five-second rescan.  The shell loop is
+        // intentionally non-blocking, so allocating on every clock check
+        // would turn an idle desktop into a steady allocator workload.
+        let before = self.launcher.entries().to_vec();
+        let polled = self.launcher.advance_poll(now);
+        debug_assert!(polled);
+        before != self.launcher.entries()
+    }
+
+    pub fn reload(&mut self) -> bool {
+        self.launcher.reload()
+    }
+
+    pub fn request_reload(&mut self) {
+        self.launcher.request_reload();
+    }
+
+    pub fn step_reload(&mut self) -> LauncherReloadStep {
+        self.launcher.step_reload()
+    }
+
+    pub fn reload_pending(&self) -> bool {
+        self.launcher.reload_pending()
+    }
 }
 
 fn load_entries(store: &mut dyn DesktopEntryStore) -> Vec<DesktopEntry> {
@@ -256,15 +679,35 @@ fn load_entries(store: &mut dyn DesktopEntryStore) -> Vec<DesktopEntry> {
             eprintln!("launcher: store error: {e}");
             Vec::new()
         }
-        Ok(raw) => {
-            let mut out = Vec::with_capacity(raw.len());
-            for (id, content) in raw {
-                match parse_desktop_entry(&id, &content) {
-                    Ok(entry) => out.push(entry),
-                    Err(e) => eprintln!("launcher: dropping {id}.desktop: {e}"),
-                }
-            }
-            out
+        Ok(raw) => parse_entries(raw),
+    }
+}
+
+fn parse_entries(raw: Vec<(String, String)>) -> Vec<DesktopEntry> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (id, content) in raw {
+        match parse_desktop_entry(&id, &content) {
+            Ok(entry) => out.push(entry),
+            Err(e) => eprintln!("launcher: dropping {id}.desktop: {e}"),
         }
     }
+    sort_entries(&mut out);
+    out
+}
+
+fn sort_entries(out: &mut [DesktopEntry]) {
+    // Keep the bundled core workflow stable while still admitting
+    // package-installed applications. Additional entries follow
+    // alphabetically after the core set.
+    const CORE_ORDER: &[&str] = &["terminal", "files", "edit", "settings", "sysmon"];
+    out.sort_by(|a, b| {
+        let a_rank = CORE_ORDER.iter().position(|id| *id == a.id);
+        let b_rank = CORE_ORDER.iter().position(|id| *id == b.id);
+        match (a_rank, b_rank) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)),
+        }
+    });
 }

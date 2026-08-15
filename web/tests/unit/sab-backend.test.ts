@@ -32,27 +32,34 @@ import { SabBackend } from "../../src/sab-backend";
 import { Devnum } from "../../src/shared/platform-constants";
 import {
   OFF_HEAP_SCRATCH,
+  OFF_RES_HEAD,
+  OFF_RES_RING,
   OFF_USER_WAIT_SLOT,
   SAB_SIZE,
+  STATUS_READY,
   STATUS_REQUESTED,
 } from "../../src/shared/sab-layout";
 import {
   CAPSET_ALL,
-  DEV,
   ERRNO,
   OP_WASI,
   type SyscallRequest,
 } from "../../src/shared/syscall";
 import { KernelWasmHostBackend } from "../../src/user-wasm-runtime";
+import { resolveCargoTargetDirectory } from "../helpers/cargo-target";
 
 // ---- shared fixture -------------------------------------------------
 
 let wasmBytes: ArrayBuffer;
 
 beforeAll(() => {
-  const wasmPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-unknown-unknown/release/kernel.wasm",
+  const cargoTargetDirectory = resolveCargoTargetDirectory(
+    path.resolve(__dirname, "../../.."),
+    process.env.CARGO_TARGET_DIR,
+  );
+  const wasmPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-unknown-unknown/release/kernel.wasm",
   );
   if (!fs.existsSync(wasmPath)) {
     throw new Error(
@@ -265,6 +272,59 @@ describe("SabBackend: PROC_EXIT", () => {
 // ---- T234 production wake protocol --------------------------------
 
 describe("SabBackend: production wake protocol (T234)", () => {
+  it("rechecks the response ring after a stale notify from the previous syscall", () => {
+    const sab = new Uint8Array(new SharedArrayBuffer(SAB_SIZE));
+    const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
+    const wakeSlot = new Int32Array(new SharedArrayBuffer(32));
+    const request: SyscallRequest = {
+      opcode: OP_WASI.FD_WRITE,
+      requestId: 0x51,
+      arg0: 1,
+      heapPtr: 0,
+      heapLen: 0,
+    };
+    const backend = new SabBackend({ sab, pid: 17, kernelWakeSlot: wakeSlot });
+
+    type Wait = (
+      view: Int32Array,
+      index: number,
+      value: number,
+      timeout?: number,
+    ) => "ok" | "not-equal" | "timed-out";
+    const atomics = Atomics as unknown as { wait: Wait };
+    const originalWait = atomics.wait;
+    let waitCalls = 0;
+    atomics.wait = () => {
+      waitCalls += 1;
+      if (waitCalls === 1) {
+        // Kernel A's store(READY) was already observed and consumed, but its
+        // later notify arrives after syscall B has begun waiting. A single
+        // wait would return here and B would find an empty response ring.
+        return "ok";
+      }
+
+      const response = new Uint8Array(32);
+      const fields = new DataView(response.buffer);
+      fields.setUint32(0, request.requestId, true);
+      fields.setInt32(4, 0, true);
+      fields.setBigInt64(8, 9n, true);
+      fields.setUint32(16, 0, true);
+      new Uint8Array(sab.buffer, OFF_RES_RING, response.byteLength).set(response);
+      Atomics.store(header, OFF_RES_HEAD / 4, 1);
+      Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+      return "ok";
+    };
+
+    try {
+      const result = backend.dispatch(request);
+      expect(result.response?.requestId).toBe(request.requestId);
+      expect(result.response?.value).toBe(9n);
+      expect(waitCalls).toBe(2);
+    } finally {
+      atomics.wait = originalWait;
+    }
+  });
+
   it("with both kernelWakeSlot and serviceHook, the synchronous serviceHook wins (no wake-slot writes)", async () => {
     // Both options provided; serviceHook is the legacy stand-in T231
     // installed and `dispatch` must keep honouring it so vitest
@@ -426,9 +486,10 @@ describe("SabBackend: production wake protocol (T234)", () => {
 
 describe("SabBackend: heap overflow", () => {
   it("rejects payloads larger than the SAB heap-scratch capacity, like KernelWasmHostBackend rejects payloads above its own scratch capacity", async () => {
-    // 40 KiB > 32 KiB SAB heap-scratch capacity AND > 4 KiB kernel
-    // heap-scratch capacity, so both backends must throw.
-    const huge = new Uint8Array(40_000);
+    // The kernel scratch grew to 64 KiB for host-file import while
+    // the per-process SAB window remains 32 KiB. Exceed the larger
+    // boundary so this test continues to exercise both backends.
+    const huge = new Uint8Array(64 * 1024 + 1);
     huge.fill(0x41);
     const request: SyscallRequest = {
       opcode: OP_WASI.FD_WRITE,

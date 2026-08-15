@@ -36,9 +36,9 @@ jobs:
 
       - name: Install Playwright browsers
         run: |
+          just node-deps
           cd web
-          npm install
-          npx playwright install --with-deps chromium
+          npx --no-install playwright install --with-deps chromium firefox webkit
 
       - name: Cargo registry cache
         uses: actions/cache@v4
@@ -55,8 +55,5 @@ jobs:
         # failures against behaviourally-old hello-* binaries. Full
         # fresh builds are ~2 minutes and safer.
 
-      - name: Build everything
-        run: just build
-
-      - name: Run every test layer
+      - name: Run complete build and test gate
         run: just test

@@ -20,12 +20,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-cat-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-cat-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -47,10 +42,7 @@ fn cat_single_file_writes_content_to_stdout() {
     let payload: &[u8] = b"the quick brown fox\n";
     let path = write_file(&dir, "a.txt", payload);
 
-    let out = Command::new(CAT)
-        .arg(&path)
-        .output()
-        .expect("spawn cat");
+    let out = Command::new(CAT).arg(&path).output().expect("spawn cat");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(out.stdout, payload);
@@ -104,10 +96,7 @@ fn cat_missing_file_exits_one_and_stderr_has_path() {
     let dir = scratch_dir("missing");
     let missing = dir.join("does-not-exist.txt");
 
-    let out = Command::new(CAT)
-        .arg(&missing)
-        .output()
-        .expect("spawn cat");
+    let out = Command::new(CAT).arg(&missing).output().expect("spawn cat");
 
     assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
     assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
@@ -207,10 +196,7 @@ fn dash_n_in_stdin_mode_starts_from_one() {
 
 #[test]
 fn unknown_flag_exits_one_for_cat() {
-    let out = Command::new(CAT)
-        .arg("-Q")
-        .output()
-        .expect("spawn cat");
+    let out = Command::new(CAT).arg("-Q").output().expect("spawn cat");
 
     assert_eq!(out.status.code(), Some(1), "exit status: {:?}", out.status);
     assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);

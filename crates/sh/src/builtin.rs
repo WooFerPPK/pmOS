@@ -159,6 +159,31 @@ pub(crate) fn dispatch_builtin(
     }
 }
 
+/// Whether `name` is implemented in-process by this shell.
+///
+/// The pipeline planner uses the same classifier as dispatch so a builtin in
+/// a mixed pipeline can run in a child shell without maintaining a second,
+/// eventually-divergent command list.
+pub(crate) fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        ":" | "true"
+            | "false"
+            | "echo"
+            | "exit"
+            | "cd"
+            | "pwd"
+            | "env"
+            | "export"
+            | "unset"
+            | "set"
+            | "read"
+            | "test"
+            | "["
+            | "jobs"
+    )
+}
+
 fn builtin_echo(args: &[&str], stdout: &mut dyn Write) -> BuiltinOutcome {
     // Join args with single spaces + trailing newline.
     // `echo` with no args emits just the newline.
@@ -227,7 +252,7 @@ fn builtin_env(
         // form yet. Reject any positional args so a future
         // slice can implement the full POSIX shape without
         // breaking anyone who relied on the no-arg path.
-        if write!(stderr, "sh: env: too many arguments\n").is_err() {
+        if writeln!(stderr, "sh: env: too many arguments").is_err() {
             return BuiltinOutcome::IoError;
         }
         if stderr.flush().is_err() {
@@ -269,7 +294,7 @@ fn builtin_export(
         match arg.find('=') {
             Some(0) => {
                 // Empty NAME (the arg starts with `=`).
-                if write!(stderr, "sh: export: {arg}: not a valid identifier\n").is_err() {
+                if writeln!(stderr, "sh: export: {arg}: not a valid identifier").is_err() {
                     return BuiltinOutcome::IoError;
                 }
                 if stderr.flush().is_err() {
@@ -290,7 +315,7 @@ fn builtin_export(
                 // string for an absent one. Either way,
                 // post-call `env` will list NAME.
                 if arg.is_empty() {
-                    if write!(stderr, "sh: export: {arg}: not a valid identifier\n").is_err() {
+                    if writeln!(stderr, "sh: export: {arg}: not a valid identifier").is_err() {
                         return BuiltinOutcome::IoError;
                     }
                     if stderr.flush().is_err() {
@@ -489,7 +514,7 @@ fn builtin_read(
             }
             "-p" => {
                 if i + 1 >= args.len() {
-                    let _ = write!(stderr, "sh: read: -p: missing prompt\n");
+                    let _ = writeln!(stderr, "sh: read: -p: missing prompt");
                     let _ = stderr.flush();
                     return BuiltinOutcome::Status(2);
                 }
@@ -505,12 +530,12 @@ fn builtin_read(
     }
     let names = &args[i..];
     if names.is_empty() {
-        let _ = write!(stderr, "sh: read: missing variable name\n");
+        let _ = writeln!(stderr, "sh: read: missing variable name");
         let _ = stderr.flush();
         return BuiltinOutcome::Status(2);
     }
     if names[0].is_empty() {
-        let _ = write!(stderr, "sh: read: : not a valid identifier\n");
+        let _ = writeln!(stderr, "sh: read: : not a valid identifier");
         let _ = stderr.flush();
         return BuiltinOutcome::Status(2);
     }
@@ -547,9 +572,7 @@ fn builtin_read(
                 // with `\r\n` line endings; the user did NOT
                 // type the `\r` so we should not preserve it).
                 // Internal whitespace is left alone.
-                let stripped = line
-                    .trim_end_matches('\n')
-                    .trim_end_matches('\r');
+                let stripped = line.trim_end_matches('\n').trim_end_matches('\r');
                 if raw {
                     // Raw mode: backslashes are literal,
                     // no continuation, no escape handling.
@@ -562,11 +585,7 @@ fn builtin_read(
                 // and append). An EVEN count → all
                 // backslashes are paired escapes; pass them
                 // through verbatim and stop.
-                let trailing = stripped
-                    .bytes()
-                    .rev()
-                    .take_while(|b| *b == b'\\')
-                    .count();
+                let trailing = stripped.bytes().rev().take_while(|b| *b == b'\\').count();
                 if trailing % 2 == 1 {
                     accumulated.push_str(&stripped[..stripped.len() - 1]);
                     continue;
@@ -628,11 +647,7 @@ fn builtin_read(
 /// itself — without that exemption `set +n` could never
 /// clear the flag, leaving the user permanently stuck in
 /// syntax-check mode.
-fn builtin_set(
-    args: &[&str],
-    flags: &mut ShellFlags,
-    stderr: &mut dyn Write,
-) -> BuiltinOutcome {
+fn builtin_set(args: &[&str], flags: &mut ShellFlags, stderr: &mut dyn Write) -> BuiltinOutcome {
     // No args: POSIX prints every shell variable. v1 defers
     // this — `env` already lists exported entries and there's
     // no separate "shell variable" namespace yet. Return
@@ -675,10 +690,7 @@ fn builtin_set(
                     "xtrace" => flags.xtrace = on,
                     "noexec" => flags.noexec = on,
                     other => {
-                        let _ = writeln!(
-                            stderr,
-                            "sh: set: {other}: invalid option name"
-                        );
+                        let _ = writeln!(stderr, "sh: set: {other}: invalid option name");
                         let _ = stderr.flush();
                         return BuiltinOutcome::Continue;
                     }
@@ -777,11 +789,7 @@ fn builtin_set(
 /// `unknown binary operator: <X>` (NOT a silent failure) so
 /// users get a clear "this slice didn't implement that yet"
 /// signal rather than mysterious wrong answers.
-fn evaluate_test(
-    raw_args: &[&str],
-    for_bracket: bool,
-    stderr: &mut dyn Write,
-) -> BuiltinOutcome {
+fn evaluate_test(raw_args: &[&str], for_bracket: bool, stderr: &mut dyn Write) -> BuiltinOutcome {
     let command = if for_bracket { "[" } else { "test" };
 
     // Strip the trailing `]` for the `[` form; reject when
@@ -817,11 +825,7 @@ fn evaluate_test(
 /// Inner evaluator without the `]`-stripping or top-level
 /// negation handling — those live in [`evaluate_test`] so
 /// negation can wrap any of the 0/1/2/3-arg forms uniformly.
-fn evaluate_test_expr(
-    args: &[&str],
-    command: &str,
-    stderr: &mut dyn Write,
-) -> BuiltinOutcome {
+fn evaluate_test_expr(args: &[&str], command: &str, stderr: &mut dyn Write) -> BuiltinOutcome {
     match args.len() {
         0 => BuiltinOutcome::Status(1),
         1 => {
@@ -842,9 +846,7 @@ fn evaluate_test_expr(
             match op {
                 "-z" => bool_to_status(operand.is_empty()),
                 "-n" => bool_to_status(!operand.is_empty()),
-                "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" => {
-                    evaluate_file_test(op, operand)
-                }
+                "-e" | "-f" | "-d" | "-r" | "-w" | "-x" | "-s" => evaluate_file_test(op, operand),
                 other => {
                     let _ = writeln!(stderr, "{command}: unknown unary operator: {other}");
                     let _ = stderr.flush();
@@ -912,13 +914,11 @@ fn bool_to_status(value: bool) -> BuiltinOutcome {
 /// Emit the POSIX-flavoured "integer expression expected"
 /// usage error and return `Status(2)`. Shared between the
 /// `lhs` / `rhs` parse-failure paths.
-fn integer_expected(
-    command: &str,
-    op: &str,
-    arg: &str,
-    stderr: &mut dyn Write,
-) -> BuiltinOutcome {
-    let _ = writeln!(stderr, "{command}: {op}: integer expression expected: {arg}");
+fn integer_expected(command: &str, op: &str, arg: &str, stderr: &mut dyn Write) -> BuiltinOutcome {
+    let _ = writeln!(
+        stderr,
+        "{command}: {op}: integer expression expected: {arg}"
+    );
     let _ = stderr.flush();
     BuiltinOutcome::Status(2)
 }
@@ -1065,9 +1065,7 @@ fn evaluate_binary_file_test(op: &str, path1: &str, path2: &str) -> BuiltinOutco
                     // here. Real link detection lands when
                     // wasi exposes inode numbers.
                     let _ = (m1, m2);
-                    bool_to_status(
-                        m1.len() == m2.len() && m1.modified().ok() == m2.modified().ok(),
-                    )
+                    bool_to_status(m1.len() == m2.len() && m1.modified().ok() == m2.modified().ok())
                 }
             }
             _ => bool_to_status(false),

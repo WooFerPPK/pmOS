@@ -52,8 +52,7 @@ fn echo_expands_set_var_to_value() {
 fn echo_after_export_round_trips_value() {
     // `export X=1` then `echo $X` — the just-set value is
     // immediately visible to the next command's expansion.
-    let (status, stdout, stderr, env) =
-        drive("export X=1\necho $X\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, env) = drive("export X=1\necho $X\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -71,8 +70,7 @@ fn echo_unset_var_emits_just_newline() {
     // a no-arg call from its own stdout — both shapes emit
     // just `\n`. The token IS preserved, though, so the
     // `args.join(" ")` walks one element.)
-    let (status, stdout, stderr, _env) =
-        drive("echo $UNSET\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo $UNSET\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     // The prompt + expanded line + exit prompt:
@@ -117,8 +115,7 @@ fn echo_default_value_used_when_var_is_unset() {
     // `echo ${UNSET:-fallback}` with no env entry → stdout
     // contains `fallback\n`. End-to-end check that the new
     // `:-` modifier reaches the REPL dispatch path.
-    let (status, stdout, stderr, _env) =
-        drive("echo ${UNSET:-fallback}\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo ${UNSET:-fallback}\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -135,8 +132,7 @@ fn echo_default_value_skipped_when_var_is_set() {
     // surface.
     let mut seed = BTreeMap::new();
     seed.insert("X".to_string(), "hello".to_string());
-    let (status, stdout, stderr, _env) =
-        drive("echo ${X:-fallback}\nexit\n", seed);
+    let (status, stdout, stderr, _env) = drive("echo ${X:-fallback}\nexit\n", seed);
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(

@@ -4,9 +4,9 @@
 // T235 (M1.6) made it the only scheduler by deleting the preview
 // `drainPendingSpawns` in-process drain. Today vitest drives it
 // through a plain-ArrayBuffer pidMap + a `parkFn` stub that yields
-// microtasks instead of blocking on `Atomics.wait` — node under
-// vitest has no cross-origin-isolated context for a real SAB-backed
-// wait.
+// microtasks instead of blocking on `Atomics.wait`. A focused wake-race
+// regression uses the host's shared wake slot and a deterministic
+// `Atomics.waitAsync` stub to cover the production parker contract.
 //
 // What this file pins down:
 //
@@ -29,9 +29,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
-import { KernelWasmHost } from "../../src/kernel-wasm-host";
+import { KernelWasmHost, pollTimeoutMs } from "../../src/kernel-wasm-host";
+import { resolveCargoTargetDirectory } from "../helpers/cargo-target";
 import {
   HEAP_SCRATCH_BYTES,
   OFF_HEAP_SCRATCH,
@@ -40,7 +41,6 @@ import {
   OFF_REQ_TAIL,
   OFF_RES_HEAD,
   OFF_RES_RING,
-  OFF_RES_TAIL,
   OFF_USER_WAIT_SLOT,
   SAB_SIZE,
   STATUS_READY,
@@ -60,9 +60,13 @@ import {
 let wasmBytes: ArrayBuffer;
 
 beforeAll(() => {
-  const wasmPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-unknown-unknown/release/kernel.wasm",
+  const cargoTargetDirectory = resolveCargoTargetDirectory(
+    path.resolve(__dirname, "../../.."),
+    process.env.CARGO_TARGET_DIR,
+  );
+  const wasmPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-unknown-unknown/release/kernel.wasm",
   );
   if (!fs.existsSync(wasmPath)) {
     throw new Error(
@@ -92,6 +96,58 @@ async function freshHost(): Promise<FreshHostResult> {
   return { host, consoleWrites };
 }
 
+interface TrackingMessageChannelStats {
+  constructions: number;
+  postMessages: number;
+  readonly closedPorts: string[];
+}
+
+function installTrackingMessageChannel(): TrackingMessageChannelStats {
+  const RealMessageChannel = globalThis.MessageChannel;
+  const stats: TrackingMessageChannelStats = {
+    constructions: 0,
+    postMessages: 0,
+    closedPorts: [],
+  };
+  class TrackingMessageChannel {
+    readonly port1: MessagePort;
+    readonly port2: MessagePort;
+
+    constructor() {
+      stats.constructions += 1;
+      const channel = new RealMessageChannel();
+      this.port1 = channel.port1;
+      this.port2 = channel.port2;
+      const postMessage = this.port2.postMessage.bind(this.port2);
+      Object.defineProperty(this.port2, "postMessage", {
+        configurable: true,
+        value: (
+          message: unknown,
+          options?: StructuredSerializeOptions,
+        ): void => {
+          stats.postMessages += 1;
+          postMessage(message, options);
+        },
+      });
+      for (const [name, port] of [
+        ["port1", this.port1],
+        ["port2", this.port2],
+      ] as const) {
+        const close = port.close.bind(port);
+        Object.defineProperty(port, "close", {
+          configurable: true,
+          value: (): void => {
+            stats.closedPorts.push(name);
+            close();
+          },
+        });
+      }
+    }
+  }
+  vi.stubGlobal("MessageChannel", TrackingMessageChannel);
+  return stats;
+}
+
 /** Empty 64 KiB SAB stand-in backed by a plain ArrayBuffer. */
 function freshSab(): ArrayBuffer {
   return new ArrayBuffer(SAB_SIZE);
@@ -112,9 +168,11 @@ function seedRequests(
     const reqBytes = encodeRequest(item.request);
     new Uint8Array(sab, slotOffset, SLOT_SIZE).set(reqBytes);
     if (item.heap !== undefined && item.heap.length > 0) {
-      const heapOffset =
-        OFF_HEAP_SCRATCH + (item.request.heapPtr ?? 0);
-      if (heapOffset + item.heap.length > OFF_HEAP_SCRATCH + HEAP_SCRATCH_BYTES) {
+      const heapOffset = OFF_HEAP_SCRATCH + (item.request.heapPtr ?? 0);
+      if (
+        heapOffset + item.heap.length >
+        OFF_HEAP_SCRATCH + HEAP_SCRATCH_BYTES
+      ) {
         throw new Error("seedRequests: heap overflow");
       }
       new Uint8Array(sab, heapOffset, item.heap.length).set(item.heap);
@@ -127,9 +185,7 @@ function seedRequests(
 /** Read the response at slot `i` of the SAB's response ring. */
 function readResponseSlot(sab: ArrayBuffer, i: number) {
   const slotOffset = OFF_RES_RING + i * SLOT_SIZE;
-  const bytes = new Uint8Array(
-    new Uint8Array(sab, slotOffset, SLOT_SIZE),
-  );
+  const bytes = new Uint8Array(new Uint8Array(sab, slotOffset, SLOT_SIZE));
   return decodeResponse(bytes);
 }
 
@@ -216,9 +272,7 @@ describe("startDispatchLoop: round-robin", () => {
     expect(rB.status).toBe(0);
 
     // Console driver saw both messages.
-    const written = consoleWrites.map((b) =>
-      new TextDecoder().decode(b),
-    );
+    const written = consoleWrites.map((b) => new TextDecoder().decode(b));
     expect(written.sort()).toEqual(["a\n", "b\n"]);
   });
 });
@@ -312,6 +366,23 @@ describe("startDispatchLoop: 8-request-per-pid budget", () => {
 
 // ---- termination ----------------------------------------------------
 
+describe("pollTimeoutMs", () => {
+  it("preserves finite sub-millisecond deadlines and the no-timer sentinel", () => {
+    expect(pollTimeoutMs(0n)).toBe(0);
+    expect(pollTimeoutMs(250_000n)).toBe(0.25);
+    expect(pollTimeoutMs(1_500_000n)).toBe(1.5);
+    expect(pollTimeoutMs(0xffff_ffff_ffff_ffffn)).toBeUndefined();
+  });
+
+  it("normalizes the real wasm no-poll sentinel before timeout conversion", async () => {
+    const { host } = await freshHost();
+    const timeoutNs = host.nextPollTimeoutNs();
+
+    expect(timeoutNs).toBe(0xffff_ffff_ffff_ffffn);
+    expect(pollTimeoutMs(timeoutNs)).toBeUndefined();
+  });
+});
+
 describe("startDispatchLoop: termination", () => {
   it("returns promptly when halted() is true from the start", async () => {
     const { host } = await freshHost();
@@ -348,6 +419,327 @@ describe("startDispatchLoop: termination", () => {
       },
     });
     expect(parkCalls).toBe(1);
+  });
+
+  it("parks against the wake epoch from before the scan", async () => {
+    const { host } = await freshHost();
+    const wakeSlot = host.wakeSlot;
+    Atomics.store(wakeSlot, 0, 41);
+    let haltChecks = 0;
+    const observed: Array<{ expected: number; current: number }> = [];
+
+    await host.startDispatchLoop({
+      pidSource: () => new Map(),
+      halted: () => {
+        haltChecks += 1;
+        if (haltChecks === 2) {
+          // Reproduce the race: a producer publishes its wake after the
+          // empty scan but immediately before the loop enters its parker.
+          Atomics.add(wakeSlot, 0, 1);
+        }
+        return haltChecks >= 3;
+      },
+      parkFn: async (expected) => {
+        observed.push({ expected, current: Atomics.load(wakeSlot, 0) });
+      },
+    });
+
+    expect(observed).toEqual([{ expected: 41, current: 42 }]);
+  });
+
+  it("double-checks parked polls and never sleeps with a queued wake", async () => {
+    const { host } = await freshHost();
+    let serviceCalls = 0;
+    let parkCalls = 0;
+    vi.spyOn(host, "servicePollWaiters").mockImplementation(() => {
+      serviceCalls += 1;
+      return 1;
+    });
+
+    await host.startDispatchLoop({
+      pidSource: () => new Map(),
+      halted: () => serviceCalls > 0,
+      parkFn: async () => {
+        parkCalls += 1;
+      },
+    });
+
+    expect(serviceCalls).toBe(1);
+    expect(parkCalls).toBe(0);
+  });
+
+  it("repasses when a later pid parks after queuing an earlier pid's expired clock wake", async () => {
+    let nowNs = 0n;
+    const host = await KernelWasmHost.create(wasmBytes, {
+      nowNs: () => nowNs,
+    });
+    const earlier = host.registerProcess(CAPSET_ALL);
+    host.markRunning(earlier);
+    const later = host.registerProcess(CAPSET_ALL);
+    host.installSignalChannelFd(later, 3);
+    host.markRunning(later);
+    const earlierSab = freshSab();
+    const laterSab = freshSab();
+
+    const pollArgs = new Uint8Array(16);
+    new DataView(pollArgs.buffer).setUint32(0, 1, true);
+    new DataView(pollArgs.buffer).setUint32(4, 1, true);
+    const clockSub = new Uint8Array(48);
+    const clockView = new DataView(clockSub.buffer);
+    clockView.setBigUint64(0, 1n, true);
+    clockView.setUint8(8, 0); // CLOCK
+    clockView.setUint32(16, 1, true); // CLOCKID_MONOTONIC
+    clockView.setBigUint64(24, 10n, true);
+    clockView.setUint16(40, 1, true); // ABSTIME
+    seedRequests(earlierSab, [
+      {
+        request: {
+          opcode: OP_WASI.POLL_ONEOFF,
+          requestId: 700,
+          args: pollArgs,
+          heapPtr: 0,
+          heapLen: clockSub.length,
+        },
+        heap: clockSub,
+      },
+    ]);
+    expect(host.serviceSab(earlier, new Uint8Array(earlierSab))).toBe(0);
+    expect(responseRingHead(earlierSab)).toBe(0);
+
+    nowNs = 10n;
+    expect(host.nextPollTimeoutNs()).toBe(0n);
+    const fdSub = new Uint8Array(48);
+    const fdView = new DataView(fdSub.buffer);
+    fdView.setBigUint64(0, 2n, true);
+    fdView.setUint8(8, 1); // FD_READ
+    fdView.setUint32(16, 3, true);
+    seedRequests(laterSab, [
+      {
+        request: {
+          opcode: OP_WASI.POLL_ONEOFF,
+          requestId: 701,
+          args: pollArgs,
+          heapPtr: 0,
+          heapLen: fdSub.length,
+        },
+        heap: fdSub,
+      },
+    ]);
+
+    let parkCalls = 0;
+    await host.startDispatchLoop({
+      pidSource: () =>
+        new Map<number, ArrayBufferLike>([
+          [earlier, earlierSab],
+          [later, laterSab],
+        ]),
+      halted: () => responseRingHead(earlierSab) > 0,
+      parkFn: async () => {
+        parkCalls += 1;
+      },
+    });
+
+    expect(requestRingTail(laterSab)).toBe(1);
+    expect(responseRingHead(earlierSab)).toBe(1);
+    expect(responseRingHead(laterSab)).toBe(0);
+    expect(readResponseSlot(earlierSab, 0).requestId).toBe(700);
+    expect(parkCalls).toBe(0);
+  });
+
+  it("services a due clock while another pid continuously issues read-only syscalls", async () => {
+    let nowNs = 0n;
+    const host = await KernelWasmHost.create(wasmBytes, {
+      nowNs: () => nowNs,
+    });
+    const clockPid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(clockPid);
+    const busyPid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(busyPid);
+    const clockSab = freshSab();
+    const busySab = freshSab();
+
+    const pollArgs = new Uint8Array(16);
+    new DataView(pollArgs.buffer).setUint32(0, 1, true);
+    new DataView(pollArgs.buffer).setUint32(4, 1, true);
+    const clockSub = new Uint8Array(48);
+    const clockView = new DataView(clockSub.buffer);
+    clockView.setBigUint64(0, 0xcafen, true);
+    clockView.setUint8(8, 0); // CLOCK
+    clockView.setUint32(16, 1, true); // CLOCKID_MONOTONIC
+    clockView.setBigUint64(24, 10n, true);
+    clockView.setUint16(40, 1, true); // ABSTIME
+    seedRequests(clockSab, [
+      {
+        request: {
+          opcode: OP_WASI.POLL_ONEOFF,
+          requestId: 710,
+          args: pollArgs,
+          heapPtr: 0,
+          heapLen: clockSub.length,
+        },
+        heap: clockSub,
+      },
+    ]);
+    expect(host.serviceSab(clockPid, new Uint8Array(clockSab))).toBe(0);
+
+    seedRequests(
+      busySab,
+      Array.from({ length: 4 }, (_, index) => ({
+        request: {
+          opcode: OP_WASI.CLOCK_TIME_GET,
+          requestId: 720 + index,
+          arg0: 1, // CLOCKID_MONOTONIC
+        },
+      })),
+    );
+    nowNs = 10n;
+
+    let parkCalls = 0;
+    await host.startDispatchLoop({
+      pidSource: () =>
+        new Map<number, ArrayBufferLike>([
+          [clockPid, clockSab],
+          [busyPid, busySab],
+        ]),
+      halted: () => responseRingHead(clockSab) > 0,
+      budget: 1,
+      parkFn: async () => {
+        parkCalls += 1;
+      },
+    });
+
+    expect(responseRingHead(clockSab)).toBe(1);
+    expect(readResponseSlot(clockSab, 0).requestId).toBe(710);
+    expect(requestRingTail(busySab)).toBeGreaterThanOrEqual(2);
+    expect(parkCalls).toBe(0);
+  });
+
+  it("task-yields after bounded immediately-resolved idle parks", async () => {
+    const { host } = await freshHost();
+    let parkCalls = 0;
+    let taskYields = 0;
+
+    await host.startDispatchLoop({
+      pidSource: () => new Map(),
+      halted: () => taskYields > 0,
+      // Models waitAsync's synchronous `not-equal` result while producers
+      // keep changing the wake epoch. Awaiting this resolved promise alone
+      // yields only to microtasks, not to the Worker's message task queue.
+      parkFn: async () => {
+        parkCalls += 1;
+      },
+      passesBeforeTaskYield: 3,
+      taskYieldFn: async () => {
+        taskYields += 1;
+      },
+    });
+
+    expect(parkCalls).toBe(3);
+    expect(taskYields).toBe(1);
+  });
+
+  it("default waitAsync compares against the pre-scan wake epoch", async () => {
+    const { host } = await freshHost();
+    const wakeSlot = host.wakeSlot;
+    Atomics.store(wakeSlot, 0, 91);
+    type WaitResult =
+      | { readonly async: false; readonly value: "not-equal" | "timed-out" }
+      | {
+          readonly async: true;
+          readonly value: Promise<"ok" | "timed-out">;
+        };
+    type WaitAsync = (
+      view: Int32Array,
+      index: number,
+      value: number,
+      timeout?: number,
+    ) => WaitResult;
+    const atomics = Atomics as unknown as { waitAsync: WaitAsync };
+    const original = atomics.waitAsync;
+    const waits: Array<{
+      expected: number;
+      current: number;
+      timeout: number | undefined;
+    }> = [];
+    atomics.waitAsync = (view, index, expected, timeout) => {
+      waits.push({
+        expected,
+        current: Atomics.load(view, index),
+        timeout,
+      });
+      return { async: false, value: "not-equal" };
+    };
+    let haltChecks = 0;
+
+    try {
+      await host.startDispatchLoop({
+        pidSource: () => new Map(),
+        halted: () => {
+          haltChecks += 1;
+          if (haltChecks === 2) {
+            Atomics.add(wakeSlot, 0, 1);
+          }
+          return haltChecks >= 3;
+        },
+      });
+    } finally {
+      atomics.waitAsync = original;
+    }
+
+    expect(waits).toEqual([{ expected: 91, current: 92, timeout: undefined }]);
+  });
+
+  it("passes the nearest clock deadline to waitAsync without a polling cap", async () => {
+    const { host } = await freshHost();
+    vi.spyOn(host, "servicePollWaiters").mockReturnValue(0);
+    vi.spyOn(host, "nextPollTimeoutNs").mockReturnValue(1_500_000n);
+    type WaitResult = {
+      readonly async: false;
+      readonly value: "not-equal" | "timed-out";
+    };
+    type WaitAsync = (
+      view: Int32Array,
+      index: number,
+      value: number,
+      timeout?: number,
+    ) => WaitResult;
+    const atomics = Atomics as unknown as { waitAsync: WaitAsync };
+    const original = atomics.waitAsync;
+    const timeouts: Array<number | undefined> = [];
+    atomics.waitAsync = (_view, _index, _expected, timeout) => {
+      timeouts.push(timeout);
+      return { async: false, value: "timed-out" };
+    };
+
+    try {
+      await host.startDispatchLoop({
+        pidSource: () => new Map(),
+        halted: () => timeouts.length > 0,
+      });
+    } finally {
+      atomics.waitAsync = original;
+    }
+
+    expect(timeouts).toEqual([1.5]);
+  });
+
+  it("fails explicitly when waitAsync disappears instead of timer-spinning", async () => {
+    const { host } = await freshHost();
+    vi.spyOn(host, "servicePollWaiters").mockReturnValue(0);
+    vi.spyOn(host, "nextPollTimeoutNs").mockReturnValue(0xffff_ffff_ffff_ffffn);
+    const atomics = Atomics as unknown as { waitAsync: unknown };
+    const original = atomics.waitAsync;
+    atomics.waitAsync = undefined;
+    try {
+      await expect(
+        host.startDispatchLoop({
+          pidSource: () => new Map(),
+          halted: () => false,
+        }),
+      ).rejects.toThrow("requires SharedArrayBuffer and Atomics.waitAsync");
+    } finally {
+      atomics.waitAsync = original;
+    }
   });
 
   it("terminates after every pid is removed from pidSource between passes", async () => {
@@ -405,6 +797,234 @@ describe("startDispatchLoop: termination", () => {
     expect(new TextDecoder().decode(consoleWrites[0]!)).toBe("once\n");
     // No parks happened — halt fired before the first would-be park.
     expect(parkCalls).toBe(0);
+  });
+
+  it("yields to worker messages under continuously busy SAB traffic", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 1);
+    host.markRunning(pid);
+
+    const sab = freshSab();
+    const requests: Array<{ request: SyscallRequest; heap?: Uint8Array }> = [];
+    for (let index = 0; index < 8; index += 1) {
+      const heap = new TextEncoder().encode(`busy-${index}\n`);
+      requests.push({
+        request: {
+          opcode: OP_WASI.FD_WRITE,
+          requestId: 900 + index,
+          arg0: 1,
+          heapPtr: index * 16,
+          heapLen: heap.length,
+        },
+        heap,
+      });
+    }
+    seedRequests(sab, requests);
+
+    let yielded = false;
+    let parkCalls = 0;
+    await host.startDispatchLoop({
+      pidSource: () => new Map([[pid, sab]]),
+      halted: () => yielded,
+      budget: 1,
+      passesBeforeTaskYield: 2,
+      taskYieldFn: async () => {
+        // This callback stands in for the Worker's next message task. A loop
+        // that only awaits on idle can never reach it while the ring remains
+        // non-empty.
+        yielded = true;
+      },
+      parkFn: async () => {
+        parkCalls += 1;
+      },
+    });
+
+    expect(yielded).toBe(true);
+    expect(parkCalls).toBe(0);
+    expect(requestRingTail(sab)).toBe(2);
+    expect(responseRingHead(sab)).toBe(2);
+  });
+
+  it("uses a real task for the default yield instead of only a microtask", async () => {
+    const { host } = await freshHost();
+    const queuedTask = new MessageChannel();
+    let taskObserved = false;
+    queuedTask.port1.onmessage = () => {
+      taskObserved = true;
+    };
+    queuedTask.port1.start();
+    queuedTask.port2.postMessage(undefined);
+    let haltChecksWithoutTask = 0;
+
+    try {
+      await host.startDispatchLoop({
+        pidSource: () => new Map(),
+        halted: () => taskObserved || (haltChecksWithoutTask += 1) >= 12,
+        parkFn: async () => {},
+        passesBeforeTaskYield: 1,
+      });
+      expect(taskObserved).toBe(true);
+      expect(haltChecksWithoutTask).toBeLessThan(12);
+    } finally {
+      queuedTask.port1.close();
+      queuedTask.port2.close();
+    }
+  });
+
+  it("admits a queued task within two passes of continuously busy SAB work", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const sab = freshSab();
+    seedRequests(
+      sab,
+      Array.from({ length: 8 }, (_, index) => ({
+        request: {
+          opcode: OP_WASI.CLOCK_TIME_GET,
+          requestId: 950 + index,
+          arg0: 1,
+        },
+      })),
+    );
+
+    const queuedTask = new MessageChannel();
+    let servicedWhenTaskRan: number | undefined;
+    queuedTask.port1.onmessage = () => {
+      servicedWhenTaskRan = requestRingTail(sab);
+    };
+    queuedTask.port1.start();
+    queuedTask.port2.postMessage(undefined);
+
+    try {
+      await host.startDispatchLoop({
+        pidSource: () => new Map([[pid, sab]]),
+        halted: () =>
+          servicedWhenTaskRan !== undefined || requestRingTail(sab) >= 6,
+        budget: 1,
+        passesBeforeTaskYield: 2,
+        parkFn: async () => {
+          throw new Error("busy dispatch loop unexpectedly parked");
+        },
+      });
+      expect(servicedWhenTaskRan).toBe(2);
+      expect(responseRingHead(sab)).toBe(2);
+    } finally {
+      queuedTask.port1.close();
+      queuedTask.port2.close();
+    }
+  });
+
+  it("reuses one default channel across task yields and closes both ports", async () => {
+    const { host } = await freshHost();
+    const stats = installTrackingMessageChannel();
+    try {
+      await host.startDispatchLoop({
+        pidSource: () => new Map(),
+        halted: () => stats.postMessages >= 3,
+        parkFn: async () => {},
+        passesBeforeTaskYield: 1,
+      });
+      expect(stats.constructions).toBe(1);
+      expect(stats.postMessages).toBe(3);
+      expect(stats.closedPorts).toEqual(["port1", "port2"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not self-yield while genuinely parked", async () => {
+    const { host } = await freshHost();
+    const stats = installTrackingMessageChannel();
+    let halt = false;
+    let resumePark!: () => void;
+    let reportParked!: () => void;
+    const parked = new Promise<void>((resolve) => {
+      reportParked = resolve;
+    });
+    const parkGate = new Promise<void>((resolve) => {
+      resumePark = resolve;
+    });
+    let loopSettled = false;
+
+    try {
+      const loop = host
+        .startDispatchLoop({
+          pidSource: () => new Map(),
+          halted: () => halt,
+          parkFn: async () => {
+            reportParked();
+            await parkGate;
+          },
+        })
+        .finally(() => {
+          loopSettled = true;
+        });
+
+      await parked;
+      await Promise.resolve();
+      expect(loopSettled).toBe(false);
+      expect(stats.constructions).toBe(1);
+      expect(stats.postMessages).toBe(0);
+
+      halt = true;
+      resumePark();
+      await loop;
+      expect(stats.postMessages).toBe(0);
+      expect(stats.closedPorts).toEqual(["port1", "port2"]);
+    } finally {
+      resumePark();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("closes both default task-yield ports when dispatch throws", async () => {
+    const { host } = await freshHost();
+    const stats = installTrackingMessageChannel();
+    try {
+      await expect(
+        host.startDispatchLoop({
+          pidSource: () => {
+            throw new Error("synthetic dispatch failure");
+          },
+          halted: () => false,
+          parkFn: async () => {},
+        }),
+      ).rejects.toThrow("synthetic dispatch failure");
+      expect(stats.constructions).toBe(1);
+      expect(stats.postMessages).toBe(0);
+      expect(stats.closedPorts).toEqual(["port1", "port2"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("requires MessageChannel only when the default task yield is selected", async () => {
+    const { host } = await freshHost();
+    vi.stubGlobal("MessageChannel", undefined);
+    try {
+      await expect(
+        host.startDispatchLoop({
+          pidSource: () => new Map(),
+          halted: () => true,
+          parkFn: async () => {},
+        }),
+      ).rejects.toThrow("requires MessageChannel");
+
+      let injectedYields = 0;
+      await host.startDispatchLoop({
+        pidSource: () => new Map(),
+        halted: () => injectedYields > 0,
+        parkFn: async () => {},
+        passesBeforeTaskYield: 1,
+        taskYieldFn: async () => {
+          injectedYields += 1;
+        },
+      });
+      expect(injectedYields).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 
@@ -507,5 +1127,69 @@ describe("startDispatchLoop: production wake protocol", () => {
     // three iterations; equality after the last write is what the
     // protocol commits to).
     expect(Atomics.load(header, OFF_USER_WAIT_SLOT / 4)).toBe(STATUS_READY);
+  });
+});
+
+describe("startDispatchLoop: browser-substrate work", () => {
+  it("wakes a dispatcher parked with no pending user-worker syscall", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const sab = freshSab(); // no request: the dispatcher must park
+    const pidMap = new Map<number, ArrayBufferLike>([[pid, sab]]);
+    let reportPark!: (observedWake: number) => void;
+    const parked = new Promise<number>((resolve) => {
+      reportPark = resolve;
+    });
+    let reported = false;
+    let externalWorkObserved = false;
+
+    const loop = host.startDispatchLoop({
+      pidSource: () => pidMap,
+      halted: () => externalWorkObserved,
+      parkFn: async (observedWake): Promise<void> => {
+        if (!reported) {
+          reported = true;
+          reportPark(observedWake);
+        }
+        await new Promise<void>((resolve, reject) => {
+          let attempts = 0;
+          const poll = (): void => {
+            if (Atomics.load(host.wakeSlot, 0) !== observedWake) {
+              externalWorkObserved = true;
+              resolve();
+              return;
+            }
+            attempts += 1;
+            if (attempts >= 100) {
+              reject(
+                new Error("host file drop did not wake the dispatch loop"),
+              );
+              return;
+            }
+            setTimeout(poll, 0);
+          };
+          poll();
+        });
+      },
+    });
+
+    const observedWake = await parked;
+    expect(responseRingHead(sab)).toBe(0);
+    expect(Atomics.load(host.wakeSlot, 0)).toBe(observedWake);
+    expect(
+      host.hostFileDropped(
+        0x4567,
+        "dropped.txt",
+        "text/plain",
+        new TextEncoder().encode("from host"),
+      ),
+    ).toBe(true);
+
+    await loop;
+    expect(Atomics.load(host.wakeSlot, 0)).toBe(observedWake + 1);
+    expect(externalWorkObserved).toBe(true);
+    expect(requestRingTail(sab)).toBe(0);
+    expect(responseRingHead(sab)).toBe(0);
   });
 });

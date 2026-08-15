@@ -35,16 +35,47 @@
 //! (app, widget) to hand the right payload slice to the right
 //! decoder once the typed-payload layer lands.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use display_proto::ids::{IdAllocator, IdKind, ObjectId};
 use display_proto::objects::{Interface, OpcodeError};
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
+/// Additional kernel fd included alongside the display socket in one wait.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WaitFd {
+    pub fd: i32,
+    pub interest: WaitInterest,
+}
+
+impl WaitFd {
+    pub const fn readable(fd: i32) -> Self {
+        Self {
+            fd,
+            interest: WaitInterest::Read,
+        }
+    }
+
+    pub const fn writable(fd: i32) -> Self {
+        Self {
+            fd,
+            interest: WaitInterest::Write,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WaitInterest {
+    Read,
+    Write,
+}
+
 /// Opcode for `pmd_display.get_registry`. Duplicated here as a
 /// named constant so the toolkit doesn't have to look up magic
 /// numbers at call sites.
 const DISPLAY_OPCODE_GET_REGISTRY: u16 = 2;
+const DISPLAY_OPCODE_SYNC: u16 = 1;
 
 /// Transport-abstraction trait: a thing the toolkit writes
 /// outbound bytes into and reads outbound bytes out of.
@@ -62,6 +93,23 @@ pub trait Connection {
     /// does NOT look at the bytes.
     fn send(&mut self, bytes: &[u8]);
 
+    /// Advance at most one bounded transport-write quantum. In-memory
+    /// connections have no separate transport queue; production fd transport
+    /// overrides this method.
+    fn flush_outbound(&mut self) -> Result<(), i32> {
+        Ok(())
+    }
+
+    fn outbound_pending(&self) -> bool {
+        false
+    }
+
+    /// Production fd transports opt into bounded multi-turn pixel uploads.
+    /// Native/in-memory fixtures retain immediate commit behavior.
+    fn incremental_uploads(&self) -> bool {
+        false
+    }
+
     /// Remove and return all pending outbound bytes. Used by
     /// callers that want to forward the buffered bytes to a
     /// real transport (or by tests that want to assert on
@@ -74,9 +122,25 @@ pub trait Connection {
     /// default [`MemoryConnection`] used by existing tests
     /// that only drive requests) inherit the default empty
     /// implementation; bidirectional transports override to
-    /// surface server events.
+    /// surface server events. This method must not advance the
+    /// outbound queue: one explicit [`Connection::flush_outbound`]
+    /// call is the event loop's complete write quantum for a turn.
     fn recv(&mut self) -> Vec<u8> {
         Vec::new()
+    }
+
+    /// Park until inbound transport data is readable or an optional real-duty
+    /// deadline expires. In-memory/native test transports keep the default
+    /// immediate success; the production WASI fd transport overrides this
+    /// with `poll_oneoff`. Waiting selects readiness from the current queue
+    /// state but must not perform a hidden write first.
+    fn wait(&mut self, _timeout: Option<Duration>) -> Result<(), i32> {
+        Ok(())
+    }
+
+    /// Park on the display transport plus additional application-owned fds.
+    fn wait_with(&mut self, _additional: &[WaitFd], timeout: Option<Duration>) -> Result<(), i32> {
+        self.wait(timeout)
     }
 }
 
@@ -115,6 +179,39 @@ impl MemoryConnection {
 impl Connection for MemoryConnection {
     fn send(&mut self, bytes: &[u8]) {
         self.outbound.extend_from_slice(bytes);
+        // Isolation fixtures pre-stage registry globals without running a
+        // server. Still complete the real protocol ordering handshake: when
+        // the client sends display.sync, enqueue the corresponding typed
+        // callback.done marker rather than letting App infer completion from
+        // an empty in-memory queue.
+        let Ok(header) = MessageHeader::decode(bytes) else {
+            return;
+        };
+        if header.object_id != ObjectId::DISPLAY
+            || header.opcode != DISPLAY_OPCODE_SYNC
+            || header.length as usize > bytes.len()
+        {
+            return;
+        }
+        let payload = &bytes[HEADER_SIZE..header.length as usize];
+        let Some(raw_id) = payload.get(..4) else {
+            return;
+        };
+        let callback_id = ObjectId::new(u32::from_le_bytes(raw_id.try_into().unwrap()));
+        let done_payload = 0u32.to_le_bytes();
+        let Ok(done_header) = MessageHeader::try_new(callback_id, 1, done_payload.len(), 0) else {
+            return;
+        };
+        let start = self.inbound.len();
+        self.inbound.resize(start + HEADER_SIZE, 0);
+        if done_header
+            .encode(&mut self.inbound[start..start + HEADER_SIZE])
+            .is_err()
+        {
+            self.inbound.truncate(start);
+            return;
+        }
+        self.inbound.extend_from_slice(&done_payload);
     }
 
     fn drain_outbound(&mut self) -> Vec<u8> {
@@ -192,6 +289,37 @@ pub enum ClientError {
     /// handshake. Carried name is the interface wire name
     /// (e.g. `"pmd_compositor"`).
     MissingGlobal(&'static str),
+    /// A packed pool-row request had zero/overlapping geometry or its inline
+    /// bytes did not exactly match `row_bytes * rows`.
+    InvalidWriteRows {
+        row_bytes: u32,
+        rows: u32,
+        stride: u32,
+        bytes_len: usize,
+    },
+    /// A current-surface patch was empty, negative, exceeded the bounded
+    /// payload cap, or did not carry exactly `width * height * 4` pixels.
+    InvalidSurfacePatch {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        pixels_len: usize,
+    },
+    /// A buffer pool was asked to continue a surface-bound frame transaction
+    /// through a different window.
+    BufferPoolSurfaceMismatch {
+        expected_surface: ObjectId,
+        actual_surface: ObjectId,
+    },
+    /// A second frame was submitted before the staged upload completed.
+    CommitInProgress,
+    /// A damage transaction exceeded the toolkit's bounded normalization
+    /// input. Keeping this small prevents adversarial overlap patterns from
+    /// fragmenting into an unbounded number of internal rectangles.
+    TooManyDamageRegions { supplied: usize, max: usize },
+    /// Transport-level failure surfaced by an explicit blocking wait.
+    Transport(i32),
 }
 
 impl From<WireError> for ClientError {
@@ -203,7 +331,13 @@ impl From<WireError> for ClientError {
 /// Per-connection client state.
 pub struct Client<C: Connection> {
     conn: C,
+    /// Interface metadata remains available after a destroy request so events
+    /// the server queued before processing that request can still be decoded.
+    /// Entries are removed only when `display.delete_id` arrives.
     objects: BTreeMap<ObjectId, Interface>,
+    /// Objects whose destroy request was queued successfully. Retired objects
+    /// are valid inbound event targets but can no longer send requests.
+    retired_objects: BTreeSet<ObjectId>,
     ids: IdAllocator,
 }
 
@@ -218,6 +352,7 @@ impl<C: Connection> Client<C> {
         Client {
             conn,
             objects,
+            retired_objects: BTreeSet::new(),
             ids: IdAllocator::for_client(),
         }
     }
@@ -237,22 +372,58 @@ impl<C: Connection> Client<C> {
         self.conn.drain_outbound()
     }
 
-    /// Number of currently-bound objects in this client's table.
-    pub fn object_count(&self) -> usize {
-        self.objects.len()
+    pub fn flush_outbound(&mut self) -> Result<(), ClientError> {
+        self.conn.flush_outbound().map_err(ClientError::Transport)
     }
 
-    /// Borrow the interface type for an object, if any.
+    pub fn outbound_pending(&self) -> bool {
+        self.conn.outbound_pending()
+    }
+
+    /// Park the underlying transport for inbound readiness and an optional
+    /// deadline. Callers invoke this only after draining events and paint.
+    pub fn wait(&mut self, timeout: Option<Duration>) -> Result<(), ClientError> {
+        self.conn.wait(timeout).map_err(ClientError::Transport)
+    }
+
+    pub fn wait_with(
+        &mut self,
+        additional: &[WaitFd],
+        timeout: Option<Duration>,
+    ) -> Result<(), ClientError> {
+        self.conn
+            .wait_with(additional, timeout)
+            .map_err(ClientError::Transport)
+    }
+
+    /// Number of live objects that can still send requests. Tombstones kept
+    /// solely for ordered inbound dispatch are excluded.
+    pub fn object_count(&self) -> usize {
+        self.objects
+            .len()
+            .saturating_sub(self.retired_objects.len())
+    }
+
+    /// Borrow the interface type for a live object, if any. A retired object
+    /// deliberately appears absent to request-producing callers even though
+    /// its interface metadata remains available to inbound dispatch.
     pub fn get(&self, id: ObjectId) -> Option<Interface> {
+        if self.retired_objects.contains(&id) {
+            return None;
+        }
         self.objects.get(&id).copied()
+    }
+
+    /// Whether `id` is awaiting the server's `display.delete_id`
+    /// acknowledgement after local destruction.
+    pub fn is_retired(&self, id: ObjectId) -> bool {
+        self.retired_objects.contains(&id)
     }
 
     /// Allocate the next client-side ID. Returns
     /// `IdsExhausted` if the partition is full.
     pub fn allocate_id(&mut self) -> Result<ObjectId, ClientError> {
-        self.ids
-            .allocate()
-            .map_err(|_| ClientError::IdsExhausted)
+        self.ids.allocate().map_err(|_| ClientError::IdsExhausted)
     }
 
     /// Allocate a fresh client-side ID AND bind it to the
@@ -287,10 +458,31 @@ impl<C: Connection> Client<C> {
         Ok(())
     }
 
-    /// Drop an object from the client's table. Used by
-    /// `destroy` flows and on `pmd_display.delete_id` events.
-    /// Returns true iff an object was actually removed.
+    /// Unconditionally drop an object and any tombstone from the client's
+    /// table. Most protocol lifecycle code should use [`Self::retire_object`]
+    /// after destroy and [`Self::acknowledge_delete_id`] for the server's final
+    /// acknowledgement. This escape hatch remains useful for rolling back
+    /// objects that never reached the server.
     pub fn drop_object(&mut self, id: ObjectId) -> bool {
+        self.retired_objects.remove(&id);
+        self.objects.remove(&id).is_some()
+    }
+
+    /// End outbound authority for an object while retaining enough interface
+    /// metadata to decode events the server queued before processing destroy.
+    /// Returns true only for the live-to-retired transition.
+    pub fn retire_object(&mut self, id: ObjectId) -> bool {
+        id != ObjectId::DISPLAY && self.objects.contains_key(&id) && self.retired_objects.insert(id)
+    }
+
+    /// Apply `pmd_display.delete_id`: remove the event-dispatch tombstone (or
+    /// an automatically destroyed live object) from the local object table.
+    /// Returns true iff the ID was known locally.
+    pub fn acknowledge_delete_id(&mut self, id: ObjectId) -> bool {
+        if id == ObjectId::DISPLAY {
+            return false;
+        }
+        self.retired_objects.remove(&id);
         self.objects.remove(&id).is_some()
     }
 
@@ -310,6 +502,9 @@ impl<C: Connection> Client<C> {
             .get(&object_id)
             .copied()
             .ok_or(ClientError::UnknownObject { id: object_id })?;
+        if self.retired_objects.contains(&object_id) {
+            return Err(ClientError::UnknownObject { id: object_id });
+        }
         interface
             .lookup_request(opcode)
             .map_err(|e| map_opcode_error(e, Direction::Request))?;
@@ -337,6 +532,16 @@ impl<C: Connection> Client<C> {
         Ok(registry_id)
     }
 
+    /// Send `pmd_display.sync(new_id callback)`. The server emits one
+    /// `pmd_callback.done` only after all earlier requests and events have
+    /// been processed, providing an explicit registry-catalog boundary.
+    pub fn sync(&mut self) -> Result<ObjectId, ClientError> {
+        let callback_id = self.bind_new(Interface::Callback)?;
+        let payload = callback_id.raw().to_le_bytes();
+        self.send_request(ObjectId::DISPLAY, DISPLAY_OPCODE_SYNC, &payload)?;
+        Ok(callback_id)
+    }
+
     /// Send `pmd_registry.bind(name, interface, version, new_id)`.
     /// Allocates a fresh client-side id, binds it to
     /// `target` in the client's table, and sends the framed
@@ -358,7 +563,7 @@ impl<C: Connection> Client<C> {
         payload.extend_from_slice(&global_name.to_le_bytes());
         payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         payload.extend_from_slice(bytes);
-        payload.extend(core::iter::repeat(0u8).take(pad));
+        payload.extend(core::iter::repeat_n(0u8, pad));
         payload.extend_from_slice(&version.to_le_bytes());
         payload.extend_from_slice(&new_id.raw().to_le_bytes());
         self.send_request(registry_id, 1 /* bind */, &payload)?;
@@ -384,6 +589,64 @@ impl<C: Connection> Client<C> {
     /// Send `pmd_surface.commit()` — no payload.
     pub fn surface_commit(&mut self, surface_id: ObjectId) -> Result<(), ClientError> {
         self.send_request(surface_id, 7 /* commit */, &[])
+    }
+
+    /// Request a one-shot callback for the surface's next commit. The callback
+    /// is a typed protocol object immediately, so `pmd_callback.done` can be
+    /// decoded normally. If request validation fails, roll the local binding
+    /// back before returning the error.
+    pub fn surface_frame(&mut self, surface_id: ObjectId) -> Result<ObjectId, ClientError> {
+        let callback_id = self.bind_new(Interface::Callback)?;
+        let payload = callback_id.raw().to_le_bytes();
+        if let Err(error) = self.send_request(surface_id, 4 /* frame */, &payload) {
+            self.drop_object(callback_id);
+            return Err(error);
+        }
+        Ok(callback_id)
+    }
+
+    /// Atomically replace one tightly-packed rectangle in a surface's current
+    /// buffer and commit that patch as one protocol request.
+    pub fn surface_patch_current(
+        &mut self,
+        surface_id: ObjectId,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<(), ClientError> {
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|area| area.checked_mul(4));
+        if x < 0
+            || y < 0
+            || width == 0
+            || height == 0
+            || expected != Some(pixels.len() as u64)
+            || pixels.len() > display_proto::MAX_SURFACE_PATCH_BYTES
+        {
+            return Err(ClientError::InvalidSurfacePatch {
+                x,
+                y,
+                width,
+                height,
+                pixels_len: pixels.len(),
+            });
+        }
+        let payload_len = 16usize
+            .checked_add(pixels.len())
+            .ok_or(ClientError::Wire(WireError::Overflow))?;
+        if payload_len + HEADER_SIZE > display_proto::wire::MAX_MESSAGE_SIZE {
+            return Err(ClientError::Wire(WireError::Overflow));
+        }
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&x.to_le_bytes());
+        payload.extend_from_slice(&y.to_le_bytes());
+        payload.extend_from_slice(&width.to_le_bytes());
+        payload.extend_from_slice(&height.to_le_bytes());
+        payload.extend_from_slice(pixels);
+        self.send_request(surface_id, 8 /* patch_current */, &payload)
     }
 
     /// Send `pmd_shm.create_pool(new_id, size)`. Allocates a
@@ -436,9 +699,9 @@ impl<C: Connection> Client<C> {
     /// Send `pmd_shm_pool.write(offset, bytes)` — v1 affordance
     /// that copies `bytes` into the server-side pool storage at
     /// `offset`. Wayland proper shares pool memory via fd; v1
-    /// elides that, so the toolkit calls this after each paint
-    /// (before commit) so the server's compositor sees the
-    /// painted pixels.
+    /// elides that, so the toolkit calls this for changed pool
+    /// regions before commit so the server's compositor sees the
+    /// painted pixels without retransmitting unchanged regions.
     pub fn shm_pool_write(
         &mut self,
         pool_id: ObjectId,
@@ -449,6 +712,76 @@ impl<C: Connection> Client<C> {
         payload.extend_from_slice(&offset.to_le_bytes());
         payload.extend_from_slice(bytes);
         self.send_request(pool_id, 4 /* write */, &payload)
+    }
+
+    /// Send `pmd_shm_pool.write_rows(offset, row_bytes, rows, stride, bytes)`.
+    /// `bytes` stores the rows densely; the server copies each row into pool
+    /// backing separated by `stride`. This keeps a narrow damage rectangle in
+    /// one bounded request even when framebuffer scanlines are far apart.
+    pub fn shm_pool_write_rows(
+        &mut self,
+        pool_id: ObjectId,
+        offset: u32,
+        row_bytes: u32,
+        rows: u32,
+        stride: u32,
+        bytes: &[u8],
+    ) -> Result<(), ClientError> {
+        let expected = u64::from(row_bytes) * u64::from(rows);
+        if row_bytes == 0 || rows == 0 || stride < row_bytes || expected != bytes.len() as u64 {
+            return Err(ClientError::InvalidWriteRows {
+                row_bytes,
+                rows,
+                stride,
+                bytes_len: bytes.len(),
+            });
+        }
+        let payload_len = 16usize
+            .checked_add(bytes.len())
+            .ok_or(ClientError::Wire(WireError::Overflow))?;
+        if payload_len + HEADER_SIZE > display_proto::wire::MAX_MESSAGE_SIZE {
+            return Err(ClientError::Wire(WireError::Overflow));
+        }
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.extend_from_slice(&row_bytes.to_le_bytes());
+        payload.extend_from_slice(&rows.to_le_bytes());
+        payload.extend_from_slice(&stride.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        self.send_request(pool_id, 5 /* write_rows */, &payload)
+    }
+
+    /// Resize a live `pmd_shm_pool`. Server-side admission validates both the
+    /// per-connection and global byte budgets before changing backing storage.
+    pub fn shm_pool_resize(&mut self, pool_id: ObjectId, new_size: u32) -> Result<(), ClientError> {
+        self.send_request(pool_id, 2 /* resize */, &new_size.to_le_bytes())
+    }
+
+    /// Destroy a pool protocol object. Buffer resources that still reference
+    /// its backing remain valid on the server until those buffers are retired.
+    /// Locally the pool becomes an inbound-only tombstone until delete_id.
+    pub fn shm_pool_destroy(&mut self, pool_id: ObjectId) -> Result<(), ClientError> {
+        self.send_request(pool_id, 3 /* destroy */, &[])?;
+        self.retire_object(pool_id);
+        Ok(())
+    }
+
+    /// Destroy a buffer protocol object. A surface that already retained the
+    /// buffer may continue displaying it until its next attach/commit. Locally
+    /// the buffer becomes an inbound-only tombstone until delete_id.
+    pub fn buffer_destroy(&mut self, buffer_id: ObjectId) -> Result<(), ClientError> {
+        self.send_request(buffer_id, 1 /* destroy */, &[])?;
+        self.retire_object(buffer_id);
+        Ok(())
+    }
+
+    /// Destroy a roleless surface, retiring it from outbound use while keeping
+    /// inbound metadata until delete_id. A surface with a live xdg-toplevel
+    /// role must destroy that role first.
+    pub fn surface_destroy(&mut self, surface_id: ObjectId) -> Result<(), ClientError> {
+        self.send_request(surface_id, 1 /* destroy */, &[])?;
+        self.retire_object(surface_id);
+        Ok(())
     }
 
     /// Send `pmd_surface.attach(buffer_id, x, y)`. Does NOT
@@ -549,10 +882,7 @@ impl<C: Connection> Client<C> {
     /// server to maximize this toplevel. The server replies
     /// with a `configure(serial, w, h, states | MAXIMIZED)`
     /// event when it accepts.
-    pub fn xdg_toplevel_set_maximized(
-        &mut self,
-        toplevel_id: ObjectId,
-    ) -> Result<(), ClientError> {
+    pub fn xdg_toplevel_set_maximized(&mut self, toplevel_id: ObjectId) -> Result<(), ClientError> {
         self.send_request(toplevel_id, 5 /* set_maximized */, &[])
     }
 
@@ -625,8 +955,7 @@ impl<C: Connection> Client<C> {
             // `MessageHeader::decode` so a partial trailing
             // message stays in the re-assembly buffer
             // instead of triggering InvalidLength.
-            let len_field =
-                u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
+            let len_field = u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
             if len_field < HEADER_SIZE {
                 break;
             }
@@ -635,13 +964,13 @@ impl<C: Connection> Client<C> {
             }
             let header = MessageHeader::decode(remaining)?;
             let msg_len = header.length as usize;
-            let interface = self
-                .objects
-                .get(&header.object_id)
-                .copied()
-                .ok_or(ClientError::UnknownObject {
-                    id: header.object_id,
-                })?;
+            let interface =
+                self.objects
+                    .get(&header.object_id)
+                    .copied()
+                    .ok_or(ClientError::UnknownObject {
+                        id: header.object_id,
+                    })?;
             let opcode = interface
                 .lookup_event(header.opcode)
                 .map_err(|e| map_opcode_error(e, Direction::Event))?;
@@ -684,8 +1013,7 @@ impl<C: Connection> Client<C> {
             // more bytes" case for a streamed protocol. Read the
             // length manually so we can break-without-error
             // before the decoder sees it.
-            let len_field =
-                u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
+            let len_field = u16::from_le_bytes([remaining[6], remaining[7]]) as usize;
             if len_field < HEADER_SIZE {
                 // Spec violation — discard the rest as
                 // unparseable. Returning `cursor` here will
@@ -703,13 +1031,13 @@ impl<C: Connection> Client<C> {
             }
             let header = MessageHeader::decode(remaining)?;
             let msg_len = header.length as usize;
-            let interface = self
-                .objects
-                .get(&header.object_id)
-                .copied()
-                .ok_or(ClientError::UnknownObject {
-                    id: header.object_id,
-                })?;
+            let interface =
+                self.objects
+                    .get(&header.object_id)
+                    .copied()
+                    .ok_or(ClientError::UnknownObject {
+                        id: header.object_id,
+                    })?;
             let opcode = interface
                 .lookup_event(header.opcode)
                 .map_err(|e| map_opcode_error(e, Direction::Event))?;

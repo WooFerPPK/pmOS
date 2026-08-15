@@ -19,26 +19,21 @@
 //!
 //! Exit codes:
 //!
-//!   * 0   = success — wrote the 17-byte record cleanly
-//!   * 10  = first random_get returned non-zero errno
-//!   * 11  = second random_get returned non-zero errno
-//!   * 12  = both reads produced identical bytes (1 in 2^64
-//!           chance — almost certainly the random source is
-//!           broken)
-//!   * 13  = fd_write to stdout failed or short-wrote
-//!   * 101 = panic
+//! * 0   = success — wrote the 17-byte record cleanly
+//! * 10  = first random_get returned non-zero errno
+//! * 11  = second random_get returned non-zero errno
+//! * 12  = both reads produced identical bytes (1 in 2^64
+//!   chance — almost certainly the random source is
+//!   broken)
+//! * 13  = fd_write to stdout failed or short-wrote
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
     fn random_get(buf_ptr: *mut u8, buf_len: u32) -> i32;
 }

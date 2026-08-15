@@ -19,39 +19,39 @@ pub const SAB_SIZE: usize = 0x10000; // 64 KiB
 // ---- Offsets within the SAB, per contracts/driver-kernel.md §1.1 --------
 
 /// Atomic u32 — producer index into the request ring.
-pub const OFF_REQ_HEAD:            usize = 0x0000;
+pub const OFF_REQ_HEAD: usize = 0x0000;
 /// Atomic u32 — kernel's consumer index.
-pub const OFF_REQ_TAIL:            usize = 0x0004;
+pub const OFF_REQ_TAIL: usize = 0x0004;
 /// Atomic u32 — kernel's producer index into the response ring.
-pub const OFF_RES_HEAD:            usize = 0x0008;
+pub const OFF_RES_HEAD: usize = 0x0008;
 /// Atomic u32 — user's consumer index into the response ring.
-pub const OFF_RES_TAIL:            usize = 0x000C;
+pub const OFF_RES_TAIL: usize = 0x000C;
 /// Atomic u32 — user's `Atomics.wait` slot.
-pub const OFF_USER_WAIT_SLOT:      usize = 0x0010;
+pub const OFF_USER_WAIT_SLOT: usize = 0x0010;
 /// Atomic u32 — kernel's `Atomics.wait` slot (shared across processes).
-pub const OFF_KERNEL_WAIT_SLOT:    usize = 0x0014;
+pub const OFF_KERNEL_WAIT_SLOT: usize = 0x0014;
 /// Atomic u32 — diagnostic: number of times the user blocked.
-pub const OFF_USER_BLOCK_COUNT:    usize = 0x0018;
+pub const OFF_USER_BLOCK_COUNT: usize = 0x0018;
 /// Atomic u32 — diagnostic: number of times the kernel blocked.
-pub const OFF_KERNEL_BLOCK_COUNT:  usize = 0x001C;
+pub const OFF_KERNEL_BLOCK_COUNT: usize = 0x001C;
 /// 32 bytes of flags + reserved header.
-pub const OFF_HEADER_FLAGS:        usize = 0x0020;
+pub const OFF_HEADER_FLAGS: usize = 0x0020;
 
 /// Start offset of the request ring (slot storage).
-pub const OFF_REQ_RING:            usize = 0x0040;
+pub const OFF_REQ_RING: usize = 0x0040;
 /// Size of the request ring in bytes.
-pub const REQ_RING_BYTES:          usize = 0x3FC0;
+pub const REQ_RING_BYTES: usize = 0x3FC0;
 
 /// Start offset of the response ring.
-pub const OFF_RES_RING:            usize = 0x4000;
+pub const OFF_RES_RING: usize = 0x4000;
 /// Size of the response ring in bytes.
-pub const RES_RING_BYTES:          usize = 0x3FC0;
+pub const RES_RING_BYTES: usize = 0x3FC0;
 
 /// Start offset of the heap scratch region for payloads that don't
 /// fit inline in a Request/Response.
-pub const OFF_HEAP_SCRATCH:        usize = 0x8000;
+pub const OFF_HEAP_SCRATCH: usize = 0x8000;
 /// Size of the heap scratch region in bytes.
-pub const HEAP_SCRATCH_BYTES:      usize = 0x8000;
+pub const HEAP_SCRATCH_BYTES: usize = 0x8000;
 
 /// Fixed slot stride — each Request/Response record occupies this many
 /// bytes in the ring, rounded up to 32 for cache-line friendliness.
@@ -66,13 +66,13 @@ pub const RES_SLOT_COUNT: usize = RES_RING_BYTES / SLOT_SIZE;
 // The slot transitions IDLE -> REQUESTED -> SERVICING -> READY -> IDLE.
 
 /// No request in flight on this channel.
-pub const STATUS_IDLE:      u32 = 0;
+pub const STATUS_IDLE: u32 = 0;
 /// User has posted a request and is parked on Atomics.wait.
 pub const STATUS_REQUESTED: u32 = 1;
 /// Kernel has taken the request and is servicing it.
 pub const STATUS_SERVICING: u32 = 2;
 /// Kernel has written the response; user may proceed.
-pub const STATUS_READY:     u32 = 3;
+pub const STATUS_READY: u32 = 3;
 
 // ---- Request / Response records ----------------------------------------
 
@@ -212,9 +212,7 @@ impl Response {
         Response {
             request_id: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             status: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            value: i64::from_le_bytes([
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-            ]),
+            value: i64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
             extra_len: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
             _pad: pad,
         }
@@ -239,7 +237,7 @@ mod tests {
 
     #[test]
     fn slot_sizes_match() {
-        assert_eq!(size_of::<Request>(),  SLOT_SIZE);
+        assert_eq!(size_of::<Request>(), SLOT_SIZE);
         assert_eq!(size_of::<Response>(), SLOT_SIZE);
     }
 
@@ -256,13 +254,20 @@ mod tests {
         // OFF_HEAP_SCRATCH + HEAP_SCRATCH_BYTES should equal SAB_SIZE.
         assert_eq!(OFF_HEAP_SCRATCH + HEAP_SCRATCH_BYTES, SAB_SIZE);
         // Every labelled region must be inside the SAB.
-        assert!(OFF_REQ_RING + REQ_RING_BYTES <= OFF_RES_RING);
-        assert!(OFF_RES_RING + RES_RING_BYTES <= OFF_HEAP_SCRATCH);
+        const {
+            assert!(OFF_REQ_RING + REQ_RING_BYTES <= OFF_RES_RING);
+            assert!(OFF_RES_RING + RES_RING_BYTES <= OFF_HEAP_SCRATCH);
+        }
     }
 
     #[test]
     fn status_values_are_distinct() {
-        let all = [STATUS_IDLE, STATUS_REQUESTED, STATUS_SERVICING, STATUS_READY];
+        let all = [
+            STATUS_IDLE,
+            STATUS_REQUESTED,
+            STATUS_SERVICING,
+            STATUS_READY,
+        ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
                 assert_ne!(all[i], all[j]);

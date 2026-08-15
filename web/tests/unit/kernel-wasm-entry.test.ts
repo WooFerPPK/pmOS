@@ -5,18 +5,18 @@
 // These tests load the release-mode kernel.wasm built by
 // `just build` (or `cargo build --release --target
 // wasm32-unknown-unknown -p kernel --no-default-features`),
-// instantiate it with stubs for the four host imports the
+// instantiate it with stubs for the ten host imports the
 // kernel's WasmPlatform pulls in (`pmos_host_*`), then drive
 // the exports the way `kernel-worker.ts` will in production:
 // init, register process, mark running, write a Request into
 // the kernel's linear memory at the advertised scratch region,
 // call `kernel_dispatch`, and read the Response back.
 //
-// The test depends on `target/wasm32-unknown-unknown/release/
-// kernel.wasm` existing. On a clean checkout, run `just build`
-// (or the `cargo build` command above) once first. The
-// `beforeAll` hook fails loudly with a reproducible "run
-// `just build` first" hint if the file is missing.
+// The test depends on `kernel.wasm` existing under Cargo's configured
+// target directory. On a clean checkout, run `just build` (or the
+// `cargo build` command above) once first. The `beforeAll` hook fails
+// loudly with a reproducible "run `just build` first" hint if the file
+// is missing.
 //
 // Coverage matches what `crates/kernel/tests/syscall.rs`
 // already proves for the native dispatcher: the opcode handlers
@@ -30,6 +30,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import { resolveCargoTargetDirectory } from "../helpers/cargo-target";
 
 // ---- opcode + cap constants (mirror abi/src/wasi.rs + ext.rs + cap.rs) -
 
@@ -50,10 +51,25 @@ const CAPSET_DESKTOP_SHELL =
   (1n << BigInt(CAP_DISPLAY_CLIENT)) |
   (1n << 3n) | // Shell
   (1n << 4n) | // ProcEnumerate
-  (1n << 10n); // KeymapAdmin
+  (1n << 5n) | // ProcKillAny delegation to Sysmon
+  (1n << 10n) | // KeymapAdmin
+  (1n << 12n); // HostTransfer delegation
 
 // DevId::Console — matches platform/mod.rs::DevId::Console = 5.
 const DEV_CONSOLE = 5;
+
+const KERNEL_HOST_IMPORT_NAMES = [
+  "pmos_host_download_file",
+  "pmos_host_driver_call",
+  "pmos_host_file_picker",
+  "pmos_host_halt",
+  "pmos_host_now_ns",
+  "pmos_host_now_realtime_ns",
+  "pmos_host_panic",
+  "pmos_host_random_bytes",
+  "pmos_host_spawn_process",
+  "pmos_host_terminate_process",
+] as const;
 
 // errno — matches abi/src/errno.rs.
 const EBADF = 8;
@@ -88,10 +104,18 @@ interface HostState {
   panics: number;
 }
 
-async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }> {
-  const wasmPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-unknown-unknown/release/kernel.wasm",
+async function loadKernel(): Promise<{
+  kernel: KernelExports;
+  host: HostState;
+  moduleImports: WebAssembly.ModuleImportDescriptor[];
+}> {
+  const cargoTargetDirectory = resolveCargoTargetDirectory(
+    path.resolve(__dirname, "../../.."),
+    process.env.CARGO_TARGET_DIR,
+  );
+  const wasmPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-unknown-unknown/release/kernel.wasm",
   );
   if (!fs.existsSync(wasmPath)) {
     throw new Error(
@@ -99,6 +123,8 @@ async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }>
     );
   }
   const bytes = fs.readFileSync(wasmPath);
+  const module = await WebAssembly.compile(bytes);
+  const moduleImports = WebAssembly.Module.imports(module);
 
   const host: HostState = { consoleWrites: [], panics: 0 };
   let memory: WebAssembly.Memory | undefined;
@@ -158,6 +184,8 @@ async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }>
         _pid: number,
         _pathPtr: number,
         _pathLen: number,
+        _executablePtr: number,
+        _executableLen: number,
       ): number => {
         // No-op stub: this test file exercises the *direct export
         // surface* and does not issue PROC_SPAWN. The stub exists
@@ -166,13 +194,28 @@ async function loadKernel(): Promise<{ kernel: KernelExports; host: HostState }>
         // `kernel-wasm-host.test.ts`.
         return 0;
       },
+      pmos_host_terminate_process: (_pid: number): number => {
+        // No-op stub for the direct-export fixture. SIGKILL host
+        // routing is covered through KernelWasmHost + spawn-router
+        // isolation tests.
+        return 0;
+      },
+      pmos_host_file_picker: (): number => 0,
+      pmos_host_download_file: (
+        _namePtr: number,
+        _nameLen: number,
+        _mimePtr: number,
+        _mimeLen: number,
+        _bytesPtr: number,
+        _bytesLen: number,
+      ): number => 0,
     },
   };
 
-  const { instance } = await WebAssembly.instantiate(bytes, imports);
+  const instance = await WebAssembly.instantiate(module, imports);
   const exports = instance.exports as unknown as KernelExports;
   memory = exports.memory;
-  return { kernel: exports, host };
+  return { kernel: exports, host, moduleImports };
 }
 
 // ---- request / response memory helpers --------------------------------
@@ -247,15 +290,30 @@ function writeHeap(kernel: KernelExports, offset: number, bytes: Uint8Array): vo
 describe("kernel.wasm extern C entry points", () => {
   let kernel: KernelExports;
   let host: HostState;
+  let moduleImports: WebAssembly.ModuleImportDescriptor[];
 
   beforeAll(async () => {
-    ({ kernel, host } = await loadKernel());
+    ({ kernel, host, moduleImports } = await loadKernel());
     expect(kernel.kernel_init()).toBe(0);
     // Idempotent — a second call is a no-op.
     expect(kernel.kernel_init()).toBe(0);
   });
 
   // ---- module surface sanity checks -------------------------------
+
+  it("imports only the declared PMos host ABI from env", () => {
+    expect(
+      [...moduleImports].sort((left, right) =>
+        left.name.localeCompare(right.name),
+      ),
+    ).toEqual(
+      KERNEL_HOST_IMPORT_NAMES.map((name) => ({
+        module: "env",
+        name,
+        kind: "function",
+      })),
+    );
+  });
 
   it("exports point at nonzero addresses within linear memory", () => {
     const reqPtr = kernel.kernel_req_ptr();
@@ -267,7 +325,7 @@ describe("kernel.wasm extern C entry points", () => {
     expect(reqPtr).toBeGreaterThan(0);
     expect(respPtr).toBeGreaterThan(0);
     expect(heapPtr).toBeGreaterThan(0);
-    expect(heapLen).toBe(4096);
+    expect(heapLen).toBe(64 * 1024);
     // Every pointer region fits inside the current linear memory.
     expect(reqPtr + 32).toBeLessThanOrEqual(memSize);
     expect(respPtr + 32).toBeLessThanOrEqual(memSize);

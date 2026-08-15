@@ -52,12 +52,12 @@
 //! WindowFrame so the content rect tracks the configured size.
 
 use crate::draw::{Canvas, Rect};
+use crate::protocol::{ClientError, Connection};
 use crate::theme::Theme;
 use crate::widget::frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, RESIZE_HIT_MARGIN, TITLEBAR_HEIGHT,
 };
 use crate::window::Window;
-use crate::protocol::{ClientError, Connection};
 
 /// Outcome of routing a pointer-down event through a
 /// [`DecoratedWindow`]. Mirrors [`PointerOutcome`] but with
@@ -237,7 +237,11 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
         if y >= b.bottom() - m {
             edges |= edge::BOTTOM;
         }
-        if edges == 0 { None } else { Some(edges) }
+        if edges == 0 {
+            None
+        } else {
+            Some(edges)
+        }
     }
 
     /// Route a pointer-down event through the chrome.
@@ -283,11 +287,7 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
     /// Forwards to [`Window::request_resize`]. `edges` is the
     /// bitfield from [`Self::resize_edge_at`] /
     /// [`DecoratedPointerOutcome::ResizeEdge`].
-    pub fn request_resize(
-        &mut self,
-        serial: u32,
-        edges: u32,
-    ) -> Result<(), ClientError> {
+    pub fn request_resize(&mut self, serial: u32, edges: u32) -> Result<(), ClientError> {
         self.window.request_resize(serial, edges)
     }
 
@@ -366,7 +366,7 @@ mod tests {
     fn content_rect_subtracts_chrome_from_total_bounds() {
         let b = Rect::new(10, 20, 200, 100);
         let chrome_top = TITLEBAR_HEIGHT as i32;
-        let border = BORDER_WIDTH as u32;
+        let border = BORDER_WIDTH;
         // A standalone WindowFrame doesn't help test
         // DecoratedWindow's content_rect arithmetic without a
         // real Window (which needs a Connection). We test
@@ -450,7 +450,10 @@ mod tests {
         }
         assert_eq!(describe(DecoratedPointerOutcome::Close), "close");
         assert_eq!(describe(DecoratedPointerOutcome::Titlebar), "titlebar");
-        assert_eq!(describe(DecoratedPointerOutcome::ResizeEdge(0)), "resize_edge");
+        assert_eq!(
+            describe(DecoratedPointerOutcome::ResizeEdge(0)),
+            "resize_edge"
+        );
         assert_eq!(describe(DecoratedPointerOutcome::Content), "content");
         assert_eq!(describe(DecoratedPointerOutcome::Outside), "outside");
     }

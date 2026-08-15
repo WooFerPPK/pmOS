@@ -22,6 +22,7 @@
 //!
 //! * [`DisplayError`]      — `pmd_display.error(object_id, code, message)`
 //! * [`DisplayDeleteId`]   — `pmd_display.delete_id(id)`
+//! * [`CallbackDone`]      — `pmd_callback.done(callback_data)`
 //! * [`RegistryGlobal`]    — `pmd_registry.global(name, interface, version)`
 //! * [`RegistryGlobalRemove`] — `pmd_registry.global_remove(name)`
 //! * [`BufferRelease`]     — `pmd_buffer.release()` (empty payload)
@@ -32,6 +33,24 @@ use alloc::vec::Vec;
 
 use crate::decode::{read_i32, read_object_id, read_string, read_u32, DecodeError};
 use crate::ids::ObjectId;
+
+/// `pmd_callback.done(callback_data)` — one-shot ordering marker.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CallbackDone {
+    pub callback_data: u32,
+}
+
+impl CallbackDone {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            callback_data: read_u32(payload, 0)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.callback_data);
+    }
+}
 
 /// Write an `i32` to `out` in little-endian byte order.
 fn write_i32(out: &mut Vec<u8>, value: i32) {
@@ -298,6 +317,168 @@ impl ShellWindowTitleChanged {
     }
 }
 
+/// Authoritative v2 shell-window state flags. Restore flags are observable so
+/// the shell can distinguish a mapped candidate from a visible window and can
+/// prove that the candidate committed the placement's effective size before
+/// requesting the atomic reveal.
+pub mod shell_window_state_flags {
+    pub const MAPPED: u32 = 1 << 0;
+    pub const MINIMIZED: u32 = 1 << 1;
+    pub const MAXIMIZED: u32 = 1 << 2;
+    pub const FOCUSED: u32 = 1 << 3;
+    pub const HIDDEN_FOR_RESTORE: u32 = 1 << 4;
+    /// The active restore placement is causally settled: either the buffer was
+    /// already the exact effective size when placed, or a later surface commit
+    /// advanced past the placement boundary with that exact size.
+    pub const RESTORE_PLACEMENT_APPLIED: u32 = 1 << 5;
+    pub const ALL: u32 =
+        MAPPED | MINIMIZED | MAXIMIZED | FOCUSED | HIDDEN_FOR_RESTORE | RESTORE_PLACEMENT_APPLIED;
+}
+
+/// Full, server-authoritative state used by the v2 `window_created_v2` and
+/// `window_state_changed` events. `owner_pid` is the immutable kernel-
+/// authenticated peer PID captured when the owning display socket was
+/// accepted; no protocol field supplied by the application contributes to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellWindowState {
+    /// Client-chosen generation from `subscribe_window_state`.
+    pub snapshot_id: u32,
+    pub window_id: u32,
+    pub owner_pid: u32,
+    pub ordinal: u32,
+    pub current_x: i32,
+    pub current_y: i32,
+    pub current_width: u32,
+    pub current_height: u32,
+    pub normal_x: i32,
+    pub normal_y: i32,
+    pub normal_width: u32,
+    pub normal_height: u32,
+    pub flags: u32,
+    /// Bottom-to-top rank. Zero is the bottom-most live window.
+    pub z_rank: u32,
+    pub title: String,
+    pub app_id: String,
+}
+
+impl ShellWindowState {
+    pub const FIXED_PAYLOAD_BYTES: usize = 56;
+
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let (title, consumed_title) = read_string(payload, Self::FIXED_PAYLOAD_BYTES)?;
+        let app_offset = Self::FIXED_PAYLOAD_BYTES + consumed_title;
+        let (app_id, consumed_app_id) = read_string(payload, app_offset)?;
+        let expected = app_offset.saturating_add(consumed_app_id);
+        if expected != payload.len() {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: expected as u64,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            snapshot_id: read_u32(payload, 0)?,
+            window_id: read_u32(payload, 4)?,
+            owner_pid: read_u32(payload, 8)?,
+            ordinal: read_u32(payload, 12)?,
+            current_x: read_i32(payload, 16)?,
+            current_y: read_i32(payload, 20)?,
+            current_width: read_u32(payload, 24)?,
+            current_height: read_u32(payload, 28)?,
+            normal_x: read_i32(payload, 32)?,
+            normal_y: read_i32(payload, 36)?,
+            normal_width: read_u32(payload, 40)?,
+            normal_height: read_u32(payload, 44)?,
+            flags: read_u32(payload, 48)?,
+            z_rank: read_u32(payload, 52)?,
+            title: title.to_string(),
+            app_id: app_id.to_string(),
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.snapshot_id);
+        write_u32(out, self.window_id);
+        write_u32(out, self.owner_pid);
+        write_u32(out, self.ordinal);
+        write_i32(out, self.current_x);
+        write_i32(out, self.current_y);
+        write_u32(out, self.current_width);
+        write_u32(out, self.current_height);
+        write_i32(out, self.normal_x);
+        write_i32(out, self.normal_y);
+        write_u32(out, self.normal_width);
+        write_u32(out, self.normal_height);
+        write_u32(out, self.flags);
+        write_u32(out, self.z_rank);
+        write_string(out, &self.title);
+        write_string(out, &self.app_id);
+    }
+}
+
+/// Empty catch-up terminator for `subscribe_window_state`. Live events queued
+/// after it are therefore unambiguously newer than the initial snapshot.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellWindowSnapshotDone {
+    pub snapshot_id: u32,
+}
+
+impl ShellWindowSnapshotDone {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 4 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 4,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            snapshot_id: read_u32(payload, 0)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.snapshot_id);
+    }
+}
+
+/// Completion status carried by [`ShellRestoreFinished`].
+pub mod shell_restore_status {
+    pub const COMPLETED: u32 = 0;
+    pub const ABORTED: u32 = 1;
+    pub const TIMED_OUT: u32 = 2;
+    pub const BUSY: u32 = 3;
+}
+
+/// Restore transaction completion. `placed` is the number of windows whose
+/// persisted placement was accepted before the transaction finished.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellRestoreFinished {
+    pub restore_id: u32,
+    pub status: u32,
+    pub placed: u32,
+}
+
+impl ShellRestoreFinished {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 12 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 12,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            restore_id: read_u32(payload, 0)?,
+            status: read_u32(payload, 4)?,
+            placed: read_u32(payload, 8)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.restore_id);
+        write_u32(out, self.status);
+        write_u32(out, self.placed);
+    }
+}
+
 // ---- pmd_pointer / pmd_keyboard events ------------------------
 
 /// Pointer button press/release state. Matches the
@@ -345,12 +526,15 @@ impl PointerMotion {
     }
 }
 
-/// `pmd_pointer.button(surface_id, x, y, button, state)`.
+/// `pmd_pointer.button(serial, surface_id, x, y, button, state)`.
 /// `button` is a linux-input-style code (1 = left,
 /// 2 = right, 3 = middle in v1). `state` is one of
 /// [`pointer_button_state`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PointerButton {
+    /// Monotonic display-server input serial. Interactive move/resize requests
+    /// echo the serial from the press that initiated the operation.
+    pub serial: u32,
     pub surface_id: ObjectId,
     pub x: i32,
     pub y: i32,
@@ -361,15 +545,17 @@ pub struct PointerButton {
 impl PointerButton {
     pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
         Ok(PointerButton {
-            surface_id: read_object_id(payload, 0)?,
-            x: read_i32(payload, 4)?,
-            y: read_i32(payload, 8)?,
-            button: read_u32(payload, 12)?,
-            state: read_u32(payload, 16)?,
+            serial: read_u32(payload, 0)?,
+            surface_id: read_object_id(payload, 4)?,
+            x: read_i32(payload, 8)?,
+            y: read_i32(payload, 12)?,
+            button: read_u32(payload, 16)?,
+            state: read_u32(payload, 20)?,
         })
     }
 
     pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.serial);
         write_object_id(out, self.surface_id);
         write_i32(out, self.x);
         write_i32(out, self.y);
@@ -378,10 +564,10 @@ impl PointerButton {
     }
 }
 
-/// `pmd_keyboard.key(surface_id, key, state)`. `key` is a
-/// raw scancode (v1 uses the web platform's `code` values
-/// as-is; a kbd layout layer lands later). `state` is one
-/// of [`key_state`].
+/// `pmd_keyboard.key(surface_id, key, state)`. `key` is a logical
+/// USB-HID-style scancode: the display server maps the physical input through
+/// the active keyboard layout while preserving this stable v1 namespace.
+/// `state` is one of [`key_state`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct KeyboardKey {
     pub surface_id: ObjectId,

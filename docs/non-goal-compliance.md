@@ -1,174 +1,161 @@
 # Non-goal compliance audit (baseline)
 
-This file is a point-in-time audit of every match found by
-`scripts/non-goal-audit.sh` against the PMos repository, with a
-one-line classification per match. The script greps for patterns that
-would indicate accidental drift against the v1 non-goals in
-`specs/001-browser-os-v1/spec.md` (FR-040 through FR-044): cloud
-storage URLs, authentication keywords, WebGL / WebGPU use,
-raw TCP/IP socket types, and multi-user identity APIs. This is a
-non-blocking gate in v1 — every match below has been reviewed and
-classified as `false positive`, `legitimate`, or `TODO` (a real
-drift that needs a follow-up T-ID).
+This is the reviewed baseline for `scripts/non-goal-audit.sh` as of
+2026-08-11. The audit searches the active PMos source tree for terms that can
+indicate drift against FR-040 through FR-044: cloud-service URLs,
+authentication, CPU emulation, WebGL/WebGPU, raw TCP/IP, and multi-user
+identity APIs.
 
-Tracked under T222 and `/speckit.analyze` finding **U5**.
+The audit is deliberately non-blocking. Every emitted match must still be
+classified as one of:
 
-## How this is kept current
+- `false positive`: a search hit that cannot be a PMos runtime capability,
+  such as an audit self-reference, project history, generic tooling text, or
+  an adversarial path fixture;
+- `legitimate`: an intentional reference or implementation detail that stays
+  within the v1 boundary, such as a statement of the non-goal, static-host
+  deployment instructions, or fixed single-user compatibility metadata;
+- `TODO`: actual or suspected drift that needs a linked task before the
+  baseline can be accepted.
+
+The script excludes generated outputs (`target`, `node_modules`, `dist`, and
+`build`), Git metadata, repository-local `.worktrees`, and user-local `.claude`
+tooling. Those directories are not active PMos product source; scanning them
+duplicates stale source or imports generic agent examples. The audit script,
+its fixture, and this baseline are also excluded so their pattern definitions
+do not self-trigger. The fixture explicitly contaminates `.claude` and proves
+that it does not affect the live product ledger.
+
+## Reproducing the baseline
+
+Run the audit twice and compare the byte-for-byte output before reviewing any
+count change:
 
 ```bash
-bash scripts/non-goal-audit.sh > /tmp/non-goal.txt
-diff /tmp/non-goal.txt <(sed -n '/^```text/,/^```$/p' docs/non-goal-compliance.md \
-    | grep -v '^```')
+bash scripts/non-goal-audit.sh > /tmp/pmos-non-goal-first.txt
+bash scripts/non-goal-audit.sh > /tmp/pmos-non-goal-second.txt
+cmp /tmp/pmos-non-goal-first.txt /tmp/pmos-non-goal-second.txt
 ```
 
-If the diff is empty, the audit is unchanged since the last review.
-If non-empty, update the grep blocks below and add a one-line
-justification for every new match. The `just test-non-goal-audit`
-recipe runs the script and prints a one-line summary, but never
-fails the test matrix (the task brief explicitly says
-"non-blocking gate in v1").
-
-Patterns are matched case-insensitively, so `Login`, `LOGIN`, and
-`login` all produce a hit. `tasks.md:464` contains the T222 task
-description itself, which verbatim enumerates every forbidden
-pattern; every such hit is a false positive by construction.
-
----
+The 2026-08-11 baseline produced identical files on two consecutive runs. The
+ledger below records every emitted match by category and `path:line`. Because
+the script scans each pattern independently, one source line can emit several
+matches; the `Hits` column is the number of records that line contributes to
+the category total.
 
 ## Cloud service URLs (FR-040 / FR-041)
 
-```text
-./specs/001-browser-os-v1/tasks.md:464:- [ ] T222 [P] Non-goal compliance audit. ... cloud service URLs (`s3://`, `gs://`, `azure`, `supabase`, `firebase`) ... [× 4 hits, one per pattern]
-```
+| Source | Hits | Classification and reason |
+| --- | ---: | --- |
+| `SESSION-NOTES.md:318` | 4 | false positive — historical T222 audit note enumerating the patterns |
+| `docs/deploy-s3-cloudfront.md:50` | 1 | legitimate — static-site bucket setup; it adds no PMos runtime backend or per-user cloud data |
+| `docs/deploy-s3-cloudfront.md:58` | 1 | legitimate — uploads the static `dist/` artifact; it is deployment tooling, not a runtime fetch path |
+| `specs/001-browser-os-v1/analyze-findings.md:40` | 4 | false positive — U5 resolution describes the audit patterns |
+| `specs/001-browser-os-v1/tasks.md:586` | 4 | false positive — T222 defines the audit patterns |
 
-- `tasks.md:464` (all four) — false positive — the T222 task
-  description enumerates every forbidden pattern; scanning the
-  spec finds them verbatim.
-
-No real `s3://`, `gs://`, `azure.com`, `supabase`, or `firebase`
-references exist anywhere in the codebase. PMos has no backend
-and no cloud integration, as required by Principle III.
+There is no cloud-service client or hosted per-user data path in PMos. The two
+S3 URLs document one permitted way to host the static release artifact.
 
 ## Authentication keywords (FR-041)
 
-```text
-./.specify/extensions/git/commands/speckit.git.feature.md:42:- Preserve technical terms and acronyms (OAuth2, API, JWT, etc.)
-./.specify/templates/spec-template.md:95:- **FR-006**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
-./specs/001-browser-os-v1/spec.md:808:  has this browser profile; there is no login, account, or concept of
-./specs/001-browser-os-v1/tasks.md:464: ... authentication keywords (`login`, `signup`, `oauth`, `jwt`, `session_token`) ... [× 5 hits]
-```
+| Source | Hits | Classification and reason |
+| --- | ---: | --- |
+| `.specify/extensions/git/commands/speckit.git.feature.md:42` | 1 | false positive — imported template text uses JWT as an acronym example |
+| `.specify/templates/spec-template.md:95` | 1 | false positive — imported requirement-template example mentions OAuth |
+| `SESSION-NOTES.md:318` | 5 | false positive — historical T222 audit note enumerating all five patterns |
+| `specs/001-browser-os-v1/analyze-findings.md:40` | 5 | false positive — U5 resolution describes all five audit patterns |
+| `specs/001-browser-os-v1/spec.md:845` | 1 | legitimate — explicitly states that PMos has no login or other-user concept |
+| `specs/001-browser-os-v1/tasks.md:586` | 5 | false positive — T222 defines all five audit patterns |
 
-- `speckit.git.feature.md:42` — false positive — third-party
-  spec-kit tooling template lists OAuth2 / JWT as example
-  technical terms to preserve verbatim in branch names. Not a
-  PMos feature.
-- `spec-template.md:95` — false positive — generic spec-kit
-  template showing how to flag an underspecified requirement;
-  this is boilerplate imported from the spec-kit project and
-  does not describe PMos.
-- `spec.md:808` — legitimate — the PMos spec explicitly states
-  "there is no login, account, or concept of 'other users'";
-  this match is the non-goal being documented.
-- `tasks.md:464` (all five) — false positive — T222 task
-  description enumerates every forbidden keyword.
+There is no authentication flow, account model, session-token handling, OAuth
+client, JWT parser, or login UI in the product.
 
-No real authentication code, session-token handling, OAuth
-client, JWT parser, or login UI exists. PMos runs against a
-single anonymous browser profile.
+## CPU emulation (FR-042)
+
+| Source | Hits | Classification and reason |
+| --- | ---: | --- |
+| `specs/001-browser-os-v1/spec.md:721` | 1 | legitimate — FR-042 explicitly states that PMos does not emulate another processor or instruction set |
+| `specs/001-browser-os-v1/analyze-findings.md:38` | 1 | false positive — reconstructs the hypothetical drift risk that motivated this audit category |
+
+There is no processor emulator, guest ISA interpreter, or machine-emulation
+runtime in the active source tree. WebAssembly is PMos's native browser CPU
+substrate, not an emulated legacy architecture.
 
 ## WebGL / WebGPU (FR-043)
 
-```text
-./CLAUDE.md:53:  `putImageData`. No GPU / no WebGPU in v1.
-./specs/001-browser-os-v1/research.md:410:- **WebGPU is out of v1.** The future hook ("WebGPU-accelerated
-./specs/001-browser-os-v1/research.md:427:- **WebGL/WebGPU compositing**: ruled out as a v1 non-goal.
-./specs/001-browser-os-v1/tasks.md:464: ... WebGL/WebGPU imports outside the documented compositor stub (`webgl`, `webgpu`, `GPUDevice`) ... [× 3 hits]
-```
+| Source | Hits | Classification and reason |
+| --- | ---: | --- |
+| `CLAUDE.md:56` | 1 | legitimate — the project guide states that WebGPU is outside v1 |
+| `SESSION-NOTES.md:318` | 3 | false positive — historical T222 audit note enumerating all three patterns |
+| `specs/001-browser-os-v1/analyze-findings.md:38` | 1 | false positive — describes a hypothetical WebGL-import drift risk |
+| `specs/001-browser-os-v1/analyze-findings.md:40` | 2 | false positive — U5 resolution describes the WebGL and WebGPU patterns |
+| `specs/001-browser-os-v1/research.md:419` | 1 | legitimate — records WebGPU acceleration as deferred beyond v1 |
+| `specs/001-browser-os-v1/research.md:436` | 2 | legitimate — records both WebGL and WebGPU compositing as rejected v1 alternatives |
+| `specs/001-browser-os-v1/tasks.md:586` | 3 | false positive — T222 defines all three audit patterns |
 
-- `CLAUDE.md:53` — legitimate — agent-facing brief states "No
-  GPU / no WebGPU in v1"; this is the non-goal being
-  reaffirmed.
-- `research.md:410` — legitimate — research doc explains that
-  WebGPU is a deferred v2 hook.
-- `research.md:427` — legitimate — alternatives considered
-  section explicitly rules out WebGL / WebGPU compositing.
-- `tasks.md:464` (all three) — false positive — T222 task
-  description enumerates every forbidden pattern.
-
-No `GPUDevice`, `getContext('webgl')`, `WebGLRenderingContext`,
-or `navigator.gpu` call sites exist. Compositor uses
-`OffscreenCanvas` + `putImageData` only, per Principle III and
-the approved research doc.
+No `GPUDevice`, WebGL context creation, or `navigator.gpu` call site exists in
+the active source tree. The v1 compositor remains CPU-backed.
 
 ## Raw TCP/IP (FR-044)
 
-```text
-./specs/001-browser-os-v1/tasks.md:464: ... raw TCP/IP imports (`net::TcpStream`, `net::TcpListener`, `net::UdpSocket`) ... [× 3 hits]
-```
+| Source | Hits | Classification and reason |
+| --- | ---: | --- |
+| `SESSION-NOTES.md:318` | 3 | false positive — historical T222 audit note enumerating the socket types |
+| `specs/001-browser-os-v1/analyze-findings.md:40` | 1 | false positive — U5 resolution names `TcpStream` as the representative pattern |
+| `specs/001-browser-os-v1/tasks.md:586` | 3 | false positive — T222 defines all three socket patterns |
 
-- `tasks.md:464` (all three) — false positive — T222 task
-  description enumerates every forbidden pattern.
-
-No `std::net::TcpStream`, `TcpListener`, or `UdpSocket`
-imports exist in any crate. User programs get high-level
-browser-facility network access only (`fetch` via the
-`net` driver), never raw sockets.
+No crate imports `TcpStream`, `TcpListener`, or `UdpSocket`. Application
+networking remains limited to documented high-level browser facilities.
 
 ## Multi-user APIs (FR-040 / FR-041)
 
-```text
-./crates/kernel/src/vfs/mount.rs:101:    /// * `"/etc/passwd"`  → ("/" mount, "etc/passwd")
-./crates/kernel/tests/syscall.rs:9627:    // target_pid < -1 is process-group wait (POSIX waitpid(-gid, ...)).
-./specs/001-browser-os-v1/data-model.md:226:uid              u32        // reserved; single-user -> 1000
-./specs/001-browser-os-v1/data-model.md:227:gid              u32        // reserved -> 1000
-./specs/001-browser-os-v1/data-model.md:554:/proc/<pid>/status           (name, state, pid, ppid, uid, vmsize, ...)
-./specs/001-browser-os-v1/tasks.md:464: ... multi-user APIs (`uid`, `gid`, `getpwnam`, `/etc/passwd`, `/etc/shadow`) ... [× 5 hits]
-```
+| Source | Hits | Classification and reason |
+| --- | ---: | --- |
+| `SESSION-NOTES.md:318` | 5 | false positive — historical T222 audit note enumerating all five patterns |
+| `SESSION-NOTES.md:322` | 2 | false positive — implementation history discusses deferred fixed UID/GID proc fields |
+| `SESSION-NOTES.md:332` | 2 | false positive — implementation history discusses deferred fixed UID/GID proc fields |
+| `SESSION-NOTES.md:492` | 2 | false positive — implementation history records single-user proc compatibility work |
+| `SESSION-NOTES.md:504` | 2 | false positive — implementation history records fixed UID/GID proc output |
+| `SESSION-NOTES.md:506` | 2 | false positive — implementation history records fixed UID/GID proc output |
+| `SESSION-NOTES.md:508` | 2 | false positive — implementation history records fixed UID/GID proc output |
+| `SESSION-NOTES.md:510` | 2 | false positive — implementation history records fixed UID/GID proc output |
+| `crates/files/tests/files.rs:127` | 1 | false positive — adversarial filename sanitisation fixture using `/etc/passwd` |
+| `crates/kernel/src/sys.rs:2759` | 2 | legitimate — explicitly documents that v1 has no UID/GID ownership model |
+| `crates/kernel/src/vfs/mount.rs:147` | 1 | false positive — illustrative path-splitting example; no password file is accessed |
+| `crates/kernel/tests/syscall.rs:15040` | 1 | false positive — documents unsupported POSIX `waitpid(-gid, ...)` behavior in a rejection test |
+| `crates/pkg/src/lib.rs:457` | 2 | legitimate — archive UID/GID fields are written as fixed zero compatibility metadata |
+| `crates/pkg/src/lib.rs:820` | 1 | false positive — traversal-rejection fixture using `../etc/passwd` |
+| `crates/pkg/src/lib.rs:832` | 1 | false positive — absolute-path rejection assertion using `/etc/passwd` |
+| `crates/pkg/tests/validate.rs:43` | 1 | false positive — package validation fixture rejects `/etc/passwd` |
+| `crates/sh/src/builtin.rs:783` | 2 | legitimate — documents deliberately unsupported UID/GID-dependent file-test predicates |
+| `crates/sh/src/builtin.rs:959` | 1 | legitimate — explains that shell access checks do not implement effective-UID semantics |
+| `crates/sh/src/builtin.rs:969` | 1 | legitimate — states that WASI preview 1 exposes no UID ownership concept |
+| `specs/001-browser-os-v1/analyze-findings.md:38` | 1 | false positive — describes a hypothetical inherited UID-variable drift risk |
+| `specs/001-browser-os-v1/analyze-findings.md:40` | 4 | false positive — U5 resolution describes four matched multi-user patterns |
+| `specs/001-browser-os-v1/data-model.md:231` | 1 | legitimate — reserves UID as the fixed single-user value 1000 |
+| `specs/001-browser-os-v1/data-model.md:232` | 1 | legitimate — reserves GID as the fixed single-user value 1000 |
+| `specs/001-browser-os-v1/data-model.md:631` | 1 | legitimate — documents the fixed compatibility field in proc status |
+| `specs/001-browser-os-v1/tasks.md:329` | 2 | legitimate — implementation note records the omission of UID/GID-dependent shell semantics |
+| `specs/001-browser-os-v1/tasks.md:405` | 2 | legitimate — implementation note records fixed single-user proc compatibility fields |
+| `specs/001-browser-os-v1/tasks.md:586` | 5 | false positive — T222 defines all five audit patterns |
 
-- `mount.rs:101` — false positive — doc comment uses
-  `"/etc/passwd"` as an example VFS path to illustrate how
-  `longest_prefix` resolves a path string against mounts.
-  No real password file is read or created; the string is a
-  generic Unix-y path for the example.
-- `syscall.rs:9627` — false positive — inline comment in a
-  test describing POSIX `waitpid(-gid, ...)` semantics; the
-  test body then asserts PMos returns `EINVAL` because v1
-  does not implement process groups. No `gid` value is read
-  or stored.
-- `data-model.md:226` — false positive — inode record reserves
-  a `uid` field hard-wired to `1000` for single-user
-  compatibility with WASI / POSIX stat layouts. Not a
-  multi-user feature; explicitly documented as "reserved;
-  single-user".
-- `data-model.md:227` — false positive — same as above for
-  `gid`, reserved to `1000`.
-- `data-model.md:554` — false positive — `/proc/<pid>/status`
-  schema lists `uid` as one of the fields exposed, for POSIX
-  compatibility, always `1000`.
-- `tasks.md:464` (all five) — false positive — T222 task
-  description enumerates every forbidden pattern.
-
-No `getpwnam`, `/etc/shadow`, `setuid`, or multi-user
-privilege-separation code exists. The `uid` / `gid` fields are
-reserved stat struct members held at the single-user constant.
-
----
+No identity database, password or shadow file, user-switching syscall, or
+multi-user permission model exists. UID/GID references in implementation code
+are fixed compatibility metadata or explicit statements that ownership
+semantics are unavailable.
 
 ## Summary
 
-| Category                                  | Matches | False positive | Legitimate | TODO |
-| ----------------------------------------- | ------: | -------------: | ---------: | ---: |
-| Cloud service URLs (FR-040 / FR-041)      |       4 |              4 |          0 |    0 |
-| Authentication keywords (FR-041)          |       8 |              7 |          1 |    0 |
-| WebGL / WebGPU (FR-043)                   |       7 |              4 |          3 |    0 |
-| Raw TCP/IP (FR-044)                       |       3 |              3 |          0 |    0 |
-| Multi-user APIs (FR-040 / FR-041)         |      10 |             10 |          0 |    0 |
-| **Total**                                 |  **32** |         **28** |      **4** | **0** |
+| Category | Matches | False positive | Legitimate | TODO |
+| --- | ---: | ---: | ---: | ---: |
+| Cloud service URLs (FR-040 / FR-041) | 14 | 12 | 2 | 0 |
+| Authentication keywords (FR-041) | 18 | 17 | 1 | 0 |
+| CPU emulation (FR-042) | 2 | 1 | 1 | 0 |
+| WebGL / WebGPU (FR-043) | 13 | 9 | 4 | 0 |
+| Raw TCP/IP (FR-044) | 7 | 7 | 0 | 0 |
+| Multi-user APIs (FR-040 / FR-041) | 50 | 35 | 15 | 0 |
+| **Total** | **104** | **81** | **23** | **0** |
 
-No TODO items. All 32 matches are either false positives (spec
-self-references, POSIX compatibility comments, template
-boilerplate) or legitimate mentions of the non-goals being
-reaffirmed. The audit is re-runnable with
-`bash scripts/non-goal-audit.sh`; any new match that is not a
-false positive MUST be classified as a TODO with a linked
-T-ID before this baseline is updated.
+There are no TODO items or real v1 non-goal violations in this baseline. A new
+match must be reviewed and classified; suspected drift must remain visible as
+a `TODO` with a linked task rather than being excluded or described away.

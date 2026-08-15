@@ -8,9 +8,7 @@
 use toolkit::draw::font::GLYPH_HEIGHT;
 use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::theme::Theme;
-use toolkit::widget::list::{
-    List, ListKey, ListKeyOutcome, LIST_HPAD, LIST_ROW_HEIGHT,
-};
+use toolkit::widget::list::{List, ListKey, ListKeyOutcome, LIST_HPAD, LIST_ROW_HEIGHT};
 
 fn rgba(color: Color) -> [u8; 4] {
     [color.r(), color.g(), color.b(), color.a()]
@@ -142,10 +140,16 @@ fn list_key_home_end_jump_to_bounds() {
     let mut list = List::new().with_items(strings(&["a", "b", "c", "d"]));
     list.select(Some(1));
 
-    assert_eq!(list.handle_key(ListKey::End, 4), ListKeyOutcome::SelectionChanged);
+    assert_eq!(
+        list.handle_key(ListKey::End, 4),
+        ListKeyOutcome::SelectionChanged
+    );
     assert_eq!(list.selected(), Some(3));
 
-    assert_eq!(list.handle_key(ListKey::Home, 4), ListKeyOutcome::SelectionChanged);
+    assert_eq!(
+        list.handle_key(ListKey::Home, 4),
+        ListKeyOutcome::SelectionChanged
+    );
     assert_eq!(list.selected(), Some(0));
 }
 
@@ -155,7 +159,11 @@ fn list_key_enter_returns_activated() {
     list.select(Some(0));
     let out = list.handle_key(ListKey::Enter, 3);
     assert_eq!(out, ListKeyOutcome::Activated);
-    assert_eq!(list.selected(), Some(0), "Enter does not move the selection");
+    assert_eq!(
+        list.selected(),
+        Some(0),
+        "Enter does not move the selection"
+    );
 }
 
 #[test]
@@ -167,8 +175,7 @@ fn list_key_enter_without_selection_is_ignored() {
 
 #[test]
 fn list_scroll_follows_selection_out_of_visible_window() {
-    let items: Vec<String> =
-        (0..20).map(|i| format!("item{i}")).collect();
+    let items: Vec<String> = (0..20).map(|i| format!("item{i}")).collect();
     let mut list = List::new().with_items(items);
     list.select(Some(0));
     assert_eq!(list.scroll_offset(), 0);
@@ -187,16 +194,14 @@ fn list_scroll_follows_selection_out_of_visible_window() {
         "scroll_offset must advance so the selection stays visible (got {offset})"
     );
     assert!(
-        list.selected().unwrap() >= offset
-            && list.selected().unwrap() < offset + 5,
+        list.selected().unwrap() >= offset && list.selected().unwrap() < offset + 5,
         "selection must sit inside [scroll_offset, scroll_offset + visible_rows)"
     );
 }
 
 #[test]
 fn list_pageup_pagedown_scroll_only() {
-    let items: Vec<String> =
-        (0..20).map(|i| format!("item{i}")).collect();
+    let items: Vec<String> = (0..20).map(|i| format!("item{i}")).collect();
     let mut list = List::new().with_items(items);
     list.select(Some(0));
 
@@ -265,7 +270,11 @@ fn list_paint_hover_row_uses_hover_color() {
 
     // Row 2 is at y 36..54.
     let hover = rgba(theme.button_fill_hover);
-    assert_eq!(px(&canvas, 100, 45), hover, "hover row 2 must be hover colour");
+    assert_eq!(
+        px(&canvas, 100, 45),
+        hover,
+        "hover row 2 must be hover colour"
+    );
 }
 
 #[test]

@@ -1,12 +1,247 @@
-use shell::launcher::{parse_desktop_entry, LauncherError, Launcher, MemoryStore};
+use shell::launcher::{
+    parse_desktop_entry, DesktopEntryScan, DesktopEntryScanBatch, DesktopEntryStore,
+    FilesystemStore, Launcher, LauncherClock, LauncherError, LauncherReloadStep, LauncherRuntime,
+    MemoryStore, CATALOG_ENTRIES_PER_STEP, MAX_CATALOG_ENTRIES,
+};
 use std::time::Duration;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn minimal_desktop(name: &str, exec: &str) -> String {
-    format!(
-        "[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n"
+    format!("[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n")
+}
+
+struct TestCatalog(std::path::PathBuf);
+
+impl TestCatalog {
+    fn new() -> Self {
+        let unique = format!(
+            "pmos-shell-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos(),
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::create_dir(&path).expect("create isolated catalog");
+        Self(path)
+    }
+}
+
+impl Drop for TestCatalog {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn filesystem_store_reads_only_desktop_files() {
+    let catalog = TestCatalog::new();
+    std::fs::write(
+        catalog.0.join("terminal.desktop"),
+        minimal_desktop("Terminal", "/bin/term"),
     )
+    .expect("write desktop entry");
+    std::fs::write(catalog.0.join("notes.txt"), "not an application")
+        .expect("write unrelated file");
+
+    let mut store = FilesystemStore::new(catalog.0.clone());
+    let entries = store.list_entries().expect("read catalog");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "terminal");
+    assert_eq!(store.directory(), catalog.0.as_path());
+}
+
+#[test]
+fn filesystem_store_reports_missing_catalog() {
+    let catalog = TestCatalog::new();
+    let missing = catalog.0.join("missing");
+    let mut store = FilesystemStore::new(missing);
+    assert!(matches!(
+        store.list_entries(),
+        Err(LauncherError::StoreIo(_))
+    ));
+}
+
+#[test]
+fn stepwise_empty_catalog_is_a_successful_unchanged_publication() {
+    let mut launcher = Launcher::new_stepwise(Box::new(MemoryStore::new()));
+    assert_eq!(
+        launcher.step_reload(),
+        LauncherReloadStep::Complete { changed: false }
+    );
+    assert!(!launcher.reload_pending());
+    assert!(launcher.entries().is_empty());
+}
+
+#[test]
+fn stepwise_begin_and_scan_failures_are_not_reported_as_completions() {
+    let catalog = TestCatalog::new();
+    let missing = catalog.0.join("missing");
+    let mut begin_failure = Launcher::new_stepwise(Box::new(FilesystemStore::new(missing)));
+    assert_eq!(begin_failure.step_reload(), LauncherReloadStep::Failed);
+    assert!(!begin_failure.reload_pending());
+
+    struct FailingStore;
+    struct FailingScan;
+
+    impl DesktopEntryStore for FailingStore {
+        fn list_entries(&mut self) -> Result<Vec<(String, String)>, LauncherError> {
+            Ok(Vec::new())
+        }
+
+        fn begin_scan(&mut self) -> Result<Option<Box<dyn DesktopEntryScan>>, LauncherError> {
+            Ok(Some(Box::new(FailingScan)))
+        }
+    }
+
+    impl DesktopEntryScan for FailingScan {
+        fn step(&mut self) -> Result<DesktopEntryScanBatch, LauncherError> {
+            Err(LauncherError::StoreIo("forced scan failure".to_string()))
+        }
+    }
+
+    let mut scan_failure = Launcher::new_stepwise(Box::new(FailingStore));
+    assert_eq!(scan_failure.step_reload(), LauncherReloadStep::Failed);
+    assert!(!scan_failure.reload_pending());
+}
+
+#[test]
+fn filesystem_catalog_scan_reads_at_most_one_desktop_file_per_step() {
+    let catalog = TestCatalog::new();
+    for index in 0..(CATALOG_ENTRIES_PER_STEP + 3) {
+        std::fs::write(
+            catalog.0.join(format!("app-{index:02}.desktop")),
+            minimal_desktop(&format!("App {index}"), "/bin/app"),
+        )
+        .expect("write desktop entry");
+    }
+    let mut store = FilesystemStore::new(catalog.0.clone());
+    let mut scan = store.begin_scan().unwrap().expect("filesystem scan");
+    let mut total = 0usize;
+    loop {
+        let batch = scan.step().expect("bounded scan step");
+        assert!(batch.entries.len() <= 1, "one file-read quantum per turn");
+        total += batch.entries.len();
+        if batch.complete {
+            break;
+        }
+    }
+    assert_eq!(total, CATALOG_ENTRIES_PER_STEP + 3);
+}
+
+#[test]
+fn stepwise_launcher_keeps_stable_cache_until_complete_snapshot() {
+    let catalog = TestCatalog::new();
+    for index in 0..3 {
+        std::fs::write(
+            catalog.0.join(format!("app-{index}.desktop")),
+            minimal_desktop(&format!("App {index}"), "/bin/app"),
+        )
+        .expect("write desktop entry");
+    }
+    let mut launcher = Launcher::new_stepwise(Box::new(FilesystemStore::new(catalog.0.clone())));
+    assert!(launcher.entries().is_empty());
+    let mut pending_steps = 0;
+    loop {
+        match launcher.step_reload() {
+            LauncherReloadStep::Pending => {
+                pending_steps += 1;
+                assert!(launcher.entries().is_empty());
+            }
+            LauncherReloadStep::Complete { changed } => {
+                assert!(changed);
+                break;
+            }
+            LauncherReloadStep::Failed => panic!("scan failed before completion"),
+            LauncherReloadStep::Idle => panic!("scan became idle before completion"),
+        }
+    }
+    assert!(pending_steps >= 3);
+    assert_eq!(launcher.entries().len(), 3);
+}
+
+#[test]
+fn stepwise_launcher_parses_exactly_one_manifest_per_turn() {
+    let catalog = TestCatalog::new();
+    for index in 0..3 {
+        std::fs::write(
+            catalog.0.join(format!("parse-{index}.desktop")),
+            minimal_desktop(&format!("Parse {index}"), "/bin/app"),
+        )
+        .expect("write desktop entry");
+    }
+    let mut launcher = Launcher::new_stepwise(Box::new(FilesystemStore::new(catalog.0.clone())));
+    while launcher.pending_parse_count() < 3 {
+        assert_eq!(launcher.step_reload(), LauncherReloadStep::Pending);
+        assert!(launcher.entries().is_empty());
+    }
+    assert_eq!(launcher.pending_parse_count(), 3);
+    assert_eq!(launcher.parsed_entry_count(), 0);
+    assert_eq!(
+        launcher.step_reload(),
+        LauncherReloadStep::Pending,
+        "EOF detection begins the separate parse phase"
+    );
+    assert_eq!(launcher.pending_parse_count(), 3);
+    assert_eq!(launcher.parsed_entry_count(), 0);
+
+    assert_eq!(launcher.step_reload(), LauncherReloadStep::Pending);
+    assert_eq!(launcher.pending_parse_count(), 2);
+    assert_eq!(launcher.parsed_entry_count(), 1);
+    assert!(launcher.entries().is_empty());
+
+    assert_eq!(launcher.step_reload(), LauncherReloadStep::Pending);
+    assert_eq!(launcher.pending_parse_count(), 1);
+    assert_eq!(launcher.parsed_entry_count(), 2);
+    assert!(launcher.entries().is_empty());
+
+    assert_eq!(
+        launcher.step_reload(),
+        LauncherReloadStep::Complete { changed: true }
+    );
+    assert_eq!(launcher.pending_parse_count(), 0);
+    assert_eq!(launcher.parsed_entry_count(), 0);
+    assert_eq!(launcher.entries().len(), 3);
+}
+
+#[test]
+fn filesystem_catalog_admits_exact_entry_cap_and_rejects_next() {
+    let catalog = TestCatalog::new();
+    for index in 0..MAX_CATALOG_ENTRIES {
+        std::fs::write(
+            catalog.0.join(format!("bounded-{index:03}.desktop")),
+            minimal_desktop(&format!("Bounded {index}"), "/bin/app"),
+        )
+        .expect("write desktop entry");
+    }
+    let mut store = FilesystemStore::new(catalog.0.clone());
+    let mut scan = store.begin_scan().unwrap().expect("filesystem scan");
+    let mut admitted = 0usize;
+    loop {
+        let batch = scan.step().expect("catalog at exact cap is admitted");
+        admitted += batch.entries.len();
+        if batch.complete {
+            break;
+        }
+    }
+    assert_eq!(admitted, MAX_CATALOG_ENTRIES);
+
+    std::fs::write(
+        catalog.0.join("overflow.desktop"),
+        minimal_desktop("Overflow", "/bin/app"),
+    )
+    .expect("write overflow entry");
+    let mut scan = store.begin_scan().unwrap().expect("filesystem scan");
+    let error = loop {
+        match scan.step() {
+            Ok(batch) if batch.complete => panic!("N+1 catalog unexpectedly completed"),
+            Ok(_) => {}
+            Err(error) => break error,
+        }
+    };
+    assert!(matches!(error, LauncherError::StoreIo(message) if message.contains("exceeds")));
 }
 
 // ── Parser tests ─────────────────────────────────────────────────────────────
@@ -174,6 +409,23 @@ fn launcher_returns_entries_at_startup() {
 }
 
 #[test]
+fn launcher_orders_core_apps_before_installed_extras() {
+    let store = make_store(&[
+        ("zebra", "Zebra", "/bin/zebra"),
+        ("files", "Files", "/bin/files"),
+        ("terminal", "Terminal", "/bin/term"),
+        ("alpha", "Alpha", "/bin/alpha"),
+    ]);
+    let launcher = Launcher::new(Box::new(store));
+    let ids: Vec<&str> = launcher
+        .entries()
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["terminal", "files", "alpha", "zebra"]);
+}
+
+#[test]
 fn launcher_advance_poll_false_before_interval() {
     let store = make_store(&[("edit", "Text Editor", "/opt/edit/bin/edit.wasm")]);
     let mut launcher = Launcher::new(Box::new(store));
@@ -235,9 +487,7 @@ fn launcher_remove_entry_after_poll() {
 
     struct SharedStore(Rc<RefCell<MemoryStore>>);
     impl shell::launcher::DesktopEntryStore for SharedStore {
-        fn list_entries(
-            &mut self,
-        ) -> Result<Vec<(String, String)>, LauncherError> {
+        fn list_entries(&mut self) -> Result<Vec<(String, String)>, LauncherError> {
             self.0.borrow_mut().list_entries()
         }
     }
@@ -259,9 +509,7 @@ fn launcher_add_entry_after_poll() {
 
     struct SharedStore(Rc<RefCell<MemoryStore>>);
     impl shell::launcher::DesktopEntryStore for SharedStore {
-        fn list_entries(
-            &mut self,
-        ) -> Result<Vec<(String, String)>, LauncherError> {
+        fn list_entries(&mut self) -> Result<Vec<(String, String)>, LauncherError> {
             self.0.borrow_mut().list_entries()
         }
     }
@@ -301,11 +549,67 @@ fn launcher_drops_malformed_entry_silently() {
         minimal_desktop("Good App", "/opt/good/bin/good.wasm"),
     );
     // Missing Name= — will fail parse.
-    store
-        .entries
-        .insert("bad".to_string(), "[Desktop Entry]\nType=Application\nExec=/opt/bad/bin/bad.wasm\n".to_string());
+    store.entries.insert(
+        "bad".to_string(),
+        "[Desktop Entry]\nType=Application\nExec=/opt/bad/bin/bad.wasm\n".to_string(),
+    );
 
     let launcher = Launcher::new(Box::new(store));
     assert_eq!(launcher.entries().len(), 1);
     assert_eq!(launcher.entries()[0].id, "good");
+}
+
+#[test]
+fn live_runtime_refreshes_changed_catalog_at_five_seconds_only() {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    struct SharedStore(Rc<RefCell<MemoryStore>>);
+    impl DesktopEntryStore for SharedStore {
+        fn list_entries(&mut self) -> Result<Vec<(String, String)>, LauncherError> {
+            self.0.borrow_mut().list_entries()
+        }
+    }
+
+    struct StepClock(VecDeque<Duration>);
+    impl LauncherClock for StepClock {
+        fn elapsed(&mut self) -> Duration {
+            self.0.pop_front().expect("clock sample")
+        }
+    }
+
+    let mut store = MemoryStore::new();
+    store.entries.insert(
+        "terminal".to_string(),
+        minimal_desktop("Terminal", "/bin/term"),
+    );
+    let shared = Rc::new(RefCell::new(store));
+    let launcher = Launcher::new(Box::new(SharedStore(shared.clone())));
+    let clock = StepClock(VecDeque::from([
+        Duration::from_secs(4),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    ]));
+    let mut runtime = LauncherRuntime::new(launcher, clock).with_clock_check_every_iterations(1);
+
+    shared.borrow_mut().entries.insert(
+        "notes".to_string(),
+        minimal_desktop("Notes", "/opt/notes/bin/notes"),
+    );
+    assert!(
+        !runtime.poll(),
+        "catalog must not refresh before five seconds"
+    );
+    assert_eq!(runtime.entries().len(), 1);
+    assert!(
+        runtime.poll(),
+        "changed catalog must surface at five seconds"
+    );
+    assert_eq!(runtime.entries().len(), 2);
+    assert!(runtime.entries().iter().any(|entry| entry.id == "notes"));
+    assert!(
+        !runtime.poll(),
+        "an unchanged scheduled rescan must not request a desktop repaint",
+    );
 }

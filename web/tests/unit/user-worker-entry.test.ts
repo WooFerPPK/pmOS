@@ -21,14 +21,19 @@ import type { UserWorkerMessaging } from "../../src/user-worker-entry";
 import { KernelWasmHost } from "../../src/kernel-wasm-host";
 import { SAB_SIZE } from "../../src/shared/sab-layout";
 import type { MainToUser, UserToMain } from "../../src/shared/worker-proto";
+import { resolveCargoTargetDirectory } from "../helpers/cargo-target";
 
 let kernelWasmBytes: ArrayBuffer;
 let helloStdWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
-  const kPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-unknown-unknown/release/kernel.wasm",
+  const cargoTargetDirectory = resolveCargoTargetDirectory(
+    path.resolve(__dirname, "../../.."),
+    process.env.CARGO_TARGET_DIR,
+  );
+  const kPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-unknown-unknown/release/kernel.wasm",
   );
   if (!fs.existsSync(kPath)) {
     throw new Error(`kernel.wasm not found at ${kPath}. Run \`just build\` first.`);
@@ -39,9 +44,9 @@ beforeAll(() => {
     k.byteOffset + k.byteLength,
   ) as ArrayBuffer;
 
-  const hPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-wasip1/release/hello-std.wasm",
+  const hPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello-std.wasm",
   );
   if (!fs.existsSync(hPath)) {
     throw new Error(`hello-std.wasm not found at ${hPath}. Run \`just build\` first.`);
@@ -117,6 +122,7 @@ describe("installUserWorkerEntry", () => {
     });
     await entry.whenExited;
 
+    expect(msg.posted[0]).toEqual({ kind: "booted", pid });
     const memoryReports = msg.posted.filter((m) => m.kind === "memory");
     expect(memoryReports.length).toBeGreaterThan(0);
     for (const report of memoryReports) {
@@ -139,6 +145,28 @@ describe("installUserWorkerEntry", () => {
       .map((b) => new TextDecoder().decode(b))
       .join("");
     expect(concatenated).toBe("hello from std\n");
+  });
+
+  it("acknowledges boot before reporting an instantiation trap", async () => {
+    const msg = makeMessaging();
+    const entry = installUserWorkerEntry(msg);
+    msg.send({
+      kind: "boot",
+      pid: 77,
+      sab: new ArrayBuffer(SAB_SIZE),
+      wasmBytes: new Uint8Array([0x00, 0x61, 0x73]).buffer,
+    });
+
+    await entry.whenExited;
+
+    expect(msg.posted[0]).toEqual({ kind: "booted", pid: 77 });
+    const exited = msg.posted[1];
+    expect(exited?.kind).toBe("exited");
+    if (exited?.kind === "exited") {
+      expect(exited.pid).toBe(77);
+      expect(exited.code).toBe(-1);
+      expect(exited.trap).toMatch(/WebAssembly|magic|expected/i);
+    }
   });
 
   it("non-boot first message posts exited(code=-1) with a trap describing the wrong kind", async () => {

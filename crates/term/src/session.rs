@@ -40,8 +40,7 @@ use crate::terminal::{Key, KeyFeedResult, Terminal};
 /// display server advertises them. Ordered so the
 /// deterministic `SessionStep::bound` output is predictable
 /// for tests.
-pub const INTERESTING_INTERFACES: &[Interface] =
-    &[Interface::Compositor, Interface::Shm];
+pub const INTERESTING_INTERFACES: &[Interface] = &[Interface::Compositor, Interface::Shm];
 
 /// One registry global the server advertised. Mirrors
 /// `shell::session::GlobalEntry` — kept as a local type so the
@@ -273,7 +272,9 @@ impl<C: Connection> Session<C> {
     /// so the caller can hand it to
     /// [`Session::create_buffer`].
     pub fn create_pool(&mut self, size: u32) -> Result<ObjectId, SessionError> {
-        let shm_id = self.bound(Interface::Shm).ok_or(SessionError::ShmNotBound)?;
+        let shm_id = self
+            .bound(Interface::Shm)
+            .ok_or(SessionError::ShmNotBound)?;
         let pool_id = self.client.shm_create_pool(shm_id, size)?;
         Ok(pool_id)
     }
@@ -302,12 +303,7 @@ impl<C: Connection> Session<C> {
     /// Send `surface.attach(buffer_id, x, y)`. Requires
     /// that the surface has been created and that
     /// `buffer_id` is in the session's object table.
-    pub fn attach(
-        &mut self,
-        buffer_id: ObjectId,
-        x: i32,
-        y: i32,
-    ) -> Result<(), SessionError> {
+    pub fn attach(&mut self, buffer_id: ObjectId, x: i32, y: i32) -> Result<(), SessionError> {
         let surface_id = self.surface_id.ok_or(SessionError::NoSurface)?;
         if self.client.get(buffer_id) != Some(Interface::Buffer) {
             return Err(SessionError::UnknownBuffer(buffer_id));
@@ -317,15 +313,10 @@ impl<C: Connection> Session<C> {
     }
 
     /// Send `surface.damage(x, y, width, height)`.
-    pub fn damage(
-        &mut self,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    ) -> Result<(), SessionError> {
+    pub fn damage(&mut self, x: i32, y: i32, width: i32, height: i32) -> Result<(), SessionError> {
         let surface_id = self.surface_id.ok_or(SessionError::NoSurface)?;
-        self.client.surface_damage(surface_id, x, y, width, height)?;
+        self.client
+            .surface_damage(surface_id, x, y, width, height)?;
         Ok(())
     }
 
@@ -433,9 +424,12 @@ impl<C: Connection> Session<C> {
                     if INTERESTING_INTERFACES.contains(&i)
                         && !self.bound_by_interface.contains_key(&i)
                     {
-                        let bound_id = self
-                            .client
-                            .registry_bind(registry_id, parsed.name, i, parsed.version)?;
+                        let bound_id = self.client.registry_bind(
+                            registry_id,
+                            parsed.name,
+                            i,
+                            parsed.version,
+                        )?;
                         self.bound_by_interface.insert(i, bound_id);
                         step.bound.push(i);
                         if let Some(mut_entry) = self.known_globals.get_mut(&parsed.name) {

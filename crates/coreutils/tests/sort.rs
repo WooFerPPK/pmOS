@@ -1936,7 +1936,7 @@ fn dash_t_with_no_value_is_usage_error() {
 // ---------- -V version sort ----------
 
 #[test]
-fn dash_V_sorts_versions_naturally() {
+fn dash_v_sorts_versions_naturally() {
     let dir = scratch_dir("V_basic");
     let path = write_file(&dir, "in.txt", b"file1\nfile10\nfile2\n");
 
@@ -1956,7 +1956,7 @@ fn dash_V_sorts_versions_naturally() {
 }
 
 #[test]
-fn dash_V_handles_multi_segment_versions() {
+fn dash_v_handles_multi_segment_versions() {
     let dir = scratch_dir("V_multi");
     let path = write_file(&dir, "in.txt", b"1.0.10\n1.0.2\n1.0.1\n");
 
@@ -1975,7 +1975,7 @@ fn dash_V_handles_multi_segment_versions() {
 }
 
 #[test]
-fn dash_V_compares_digit_runs_numerically() {
+fn dash_v_compares_digit_runs_numerically() {
     let dir = scratch_dir("V_digits");
     let path = write_file(&dir, "in.txt", b"v1.2\nv1.10\nv1.1\n");
 
@@ -1994,7 +1994,7 @@ fn dash_V_compares_digit_runs_numerically() {
 }
 
 #[test]
-fn dash_V_leading_zero_tiebreak() {
+fn dash_v_leading_zero_tiebreak() {
     let dir = scratch_dir("V_zeros");
     let path = write_file(&dir, "in.txt", b"01\n1\n001\n");
 
@@ -2014,7 +2014,7 @@ fn dash_V_leading_zero_tiebreak() {
 }
 
 #[test]
-fn dash_V_pure_text_falls_back_to_lex() {
+fn dash_v_pure_text_falls_back_to_lex() {
     let dir = scratch_dir("V_text");
     let path = write_file(&dir, "in.txt", b"banana\napple\ncherry\n");
 
@@ -2033,7 +2033,7 @@ fn dash_V_pure_text_falls_back_to_lex() {
 }
 
 #[test]
-fn dash_V_pure_digits_compares_numerically() {
+fn dash_v_pure_digits_compares_numerically() {
     let dir = scratch_dir("V_pure_digits");
     let path = write_file(&dir, "in.txt", b"100\n2\n10\n");
 
@@ -2052,7 +2052,7 @@ fn dash_V_pure_digits_compares_numerically() {
 }
 
 #[test]
-fn dash_V_combines_with_reverse() {
+fn dash_v_combines_with_reverse() {
     let dir = scratch_dir("Vr");
     let path = write_file(&dir, "in.txt", b"file1\nfile10\nfile2\n");
 
@@ -2071,7 +2071,7 @@ fn dash_V_combines_with_reverse() {
 }
 
 #[test]
-fn dash_V_combines_with_unique() {
+fn dash_v_combines_with_unique() {
     let dir = scratch_dir("Vu");
     let path = write_file(&dir, "in.txt", b"file1\nfile1\nfile2\nfile10\n");
 
@@ -2090,7 +2090,7 @@ fn dash_V_combines_with_unique() {
 }
 
 #[test]
-fn dash_V_combines_with_check() {
+fn dash_v_combines_with_check() {
     let v_sorted_input: &[u8] = b"file1\nfile2\nfile10\n";
     let vc = run_check(&["-Vc"], v_sorted_input);
     assert!(
@@ -2112,7 +2112,7 @@ fn dash_V_combines_with_check() {
 }
 
 #[test]
-fn dash_V_with_field_key() {
+fn dash_v_with_field_key() {
     let dir = scratch_dir("V_field");
     let path = write_file(
         &dir,
@@ -2137,7 +2137,7 @@ fn dash_V_with_field_key() {
 }
 
 #[test]
-fn dash_Vn_numeric_dominates() {
+fn dash_vn_numeric_dominates() {
     let dir = scratch_dir("Vn_dominates");
     let path = write_file(&dir, "in.txt", b"file10\nfile2\nfile1\n");
 
@@ -2162,7 +2162,7 @@ fn dash_Vn_numeric_dominates() {
 }
 
 #[test]
-fn dash_V_overflow_falls_back_to_lex() {
+fn dash_v_overflow_falls_back_to_lex() {
     let dir = scratch_dir("V_overflow");
     let huge_a = "9".repeat(25);
     let huge_b = "1".repeat(25);
@@ -2191,7 +2191,7 @@ fn dash_V_overflow_falls_back_to_lex() {
 }
 
 #[test]
-fn dash_V_combines_with_fold() {
+fn dash_v_combines_with_fold() {
     let dir = scratch_dir("Vf");
     let path = write_file(&dir, "in.txt", b"FILE2\nfile10\nFile1\n");
 

@@ -18,6 +18,7 @@ use abi::ext::Pid;
 use super::{DevId, DriverError, DriverResult, Platform};
 
 #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
+#[link(wasm_import_module = "env")]
 extern "C" {
     fn pmos_host_now_ns() -> u64;
     fn pmos_host_now_realtime_ns() -> u64;
@@ -31,7 +32,23 @@ extern "C" {
     fn pmos_host_random_bytes(out_ptr: *mut u8, out_len: u32);
     fn pmos_host_halt(reason_ptr: *const u8, reason_len: u32) -> !;
     fn pmos_host_panic(message_ptr: *const u8, message_len: u32);
-    fn pmos_host_spawn_process(pid: i32, path_ptr: *const u8, path_len: u32) -> i32;
+    fn pmos_host_spawn_process(
+        pid: i32,
+        path_ptr: *const u8,
+        path_len: u32,
+        executable_ptr: *const u8,
+        executable_len: u32,
+    ) -> i32;
+    fn pmos_host_terminate_process(pid: i32) -> i32;
+    fn pmos_host_file_picker() -> i32;
+    fn pmos_host_download_file(
+        name_ptr: *const u8,
+        name_len: u32,
+        mime_ptr: *const u8,
+        mime_len: u32,
+        bytes_ptr: *const u8,
+        bytes_len: u32,
+    ) -> i32;
 }
 
 /// The singleton WasmPlatform. Zero-sized.
@@ -121,10 +138,19 @@ impl Platform for WasmPlatform {
     }
 
     #[allow(unreachable_code, unused_variables)]
-    fn spawn_process(&self, pid: Pid, path: &str) -> DriverResult<()> {
+    fn spawn_process(&self, pid: Pid, path: &str, executable: Option<&[u8]>) -> DriverResult<()> {
         #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
         unsafe {
-            let rc = pmos_host_spawn_process(pid as i32, path.as_ptr(), path.len() as u32);
+            let (executable_ptr, executable_len) = executable
+                .map(|bytes| (bytes.as_ptr(), bytes.len() as u32))
+                .unwrap_or((core::ptr::null(), 0));
+            let rc = pmos_host_spawn_process(
+                pid,
+                path.as_ptr(),
+                path.len() as u32,
+                executable_ptr,
+                executable_len,
+            );
             return if rc == 0 {
                 Ok(())
             } else if rc < 0 {
@@ -134,5 +160,57 @@ impl Platform for WasmPlatform {
             };
         }
         Err(DriverError::NotReady)
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn terminate_process(&self, pid: Pid) -> DriverResult<()> {
+        #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
+        unsafe {
+            let rc = pmos_host_terminate_process(pid);
+            return if rc == 0 {
+                Ok(())
+            } else if rc < 0 {
+                Err(DriverError::Errno(-rc))
+            } else {
+                Err(DriverError::Transport)
+            };
+        }
+        Err(DriverError::NotReady)
+    }
+
+    #[allow(unreachable_code)]
+    fn request_host_file_picker(&self) -> DriverResult<()> {
+        #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
+        unsafe {
+            return host_result(pmos_host_file_picker());
+        }
+        Err(DriverError::NotReady)
+    }
+
+    #[allow(unreachable_code, unused_variables)]
+    fn download_host_file(&self, name: &str, mime: &str, bytes: &[u8]) -> DriverResult<()> {
+        #[cfg(all(target_arch = "wasm32", not(feature = "native-platform")))]
+        unsafe {
+            return host_result(pmos_host_download_file(
+                name.as_ptr(),
+                name.len() as u32,
+                mime.as_ptr(),
+                mime.len() as u32,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+            ));
+        }
+        Err(DriverError::NotReady)
+    }
+}
+
+#[inline]
+fn host_result(rc: i32) -> DriverResult<()> {
+    if rc == 0 {
+        Ok(())
+    } else if rc < 0 {
+        Err(DriverError::Errno(-rc))
+    } else {
+        Err(DriverError::Transport)
     }
 }

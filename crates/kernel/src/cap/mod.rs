@@ -104,12 +104,7 @@ impl CapTable {
     ///
     /// On success, `target_pid`'s cap set is the union of its
     /// previous set and `caps`.
-    pub fn grant(
-        &mut self,
-        granter: Pid,
-        target: Pid,
-        caps: CapSet,
-    ) -> Result<(), CapError> {
+    pub fn grant(&mut self, granter: Pid, target: Pid, caps: CapSet) -> Result<(), CapError> {
         // Check that the granter holds CAP_GRANT.
         let granter_set = self.caps.get(&granter).ok_or(CapError::NoSuchPid)?;
         if !granter_set.contains(Cap::CapGrant) {
@@ -132,12 +127,7 @@ impl CapTable {
     /// must equal `target`). Used by the "drop privileges"
     /// idiom in userland programs. Returns `Err(NotPermitted)`
     /// if `caller != target` AND the caller lacks `CAP_GRANT`.
-    pub fn drop_caps(
-        &mut self,
-        caller: Pid,
-        target: Pid,
-        caps: CapSet,
-    ) -> Result<(), CapError> {
+    pub fn drop_caps(&mut self, caller: Pid, target: Pid, caps: CapSet) -> Result<(), CapError> {
         if caller != target {
             // Only a CAP_GRANT holder can revoke someone else's caps.
             let caller_set = self.caps.get(&caller).ok_or(CapError::NoSuchPid)?;

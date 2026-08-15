@@ -41,7 +41,7 @@ fn row_respects_spacing_between_children() {
     let a = row.next(10, 20);
     let b = row.next(10, 20);
     assert_eq!(a.x, 0);
-    assert_eq!(b.x, 0 + 10 + 7);
+    assert_eq!(b.x, 10 + 7);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn column_respects_spacing_between_children() {
     let a = col.next(10, 10);
     let b = col.next(10, 10);
     assert_eq!(a.y, 0);
-    assert_eq!(b.y, 0 + 10 + 7);
+    assert_eq!(b.y, 10 + 7);
 }
 
 #[test]
@@ -240,13 +240,7 @@ fn column_interior_matches_parent_minus_padding() {
 #[test]
 fn row_grow_single_child_claims_all_leftover() {
     // Interior = 200 wide. One Grow child → gets all 200 px.
-    let rects = row_with_grow(
-        Rect::new(0, 0, 200, 50),
-        0,
-        0,
-        &[Item::Grow(1)],
-        20,
-    );
+    let rects = row_with_grow(Rect::new(0, 0, 200, 50), 0, 0, &[Item::Grow(1)], 20);
     assert_eq!(rects.len(), 1);
     assert_eq!(rects[0].x, 0);
     assert_eq!(rects[0].width, 200);
@@ -340,13 +334,7 @@ fn row_grow_spacing_deducted_before_grow_split() {
 fn row_grow_cross_axis_height_and_centring() {
     // Interior height = 50 (parent 60, padding 5). Child height = 30.
     // y_offset = (50-30)/2 = 10. child_y = 5 + 10 = 15.
-    let rects = row_with_grow(
-        Rect::new(0, 0, 200, 60),
-        5,
-        0,
-        &[Item::Grow(1)],
-        30,
-    );
+    let rects = row_with_grow(Rect::new(0, 0, 200, 60), 5, 0, &[Item::Grow(1)], 30);
     assert_eq!(rects[0].y, 15);
     assert_eq!(rects[0].height, 30);
 }
@@ -375,13 +363,7 @@ fn row_grow_grow_weight_zero_treated_as_one() {
 
 #[test]
 fn col_grow_single_child_claims_all_leftover() {
-    let rects = col_with_grow(
-        Rect::new(0, 0, 50, 200),
-        0,
-        0,
-        &[Item::Grow(1)],
-        20,
-    );
+    let rects = col_with_grow(Rect::new(0, 0, 50, 200), 0, 0, &[Item::Grow(1)], 20);
     assert_eq!(rects.len(), 1);
     assert_eq!(rects[0].y, 0);
     assert_eq!(rects[0].height, 200);
@@ -465,13 +447,7 @@ fn col_grow_spacing_deducted_before_grow_split() {
 fn col_grow_cross_axis_width_and_centring() {
     // Interior width = 40 (parent 50, padding 5). Child width = 20.
     // x_offset = (40-20)/2 = 10. child_x = 5 + 10 = 15.
-    let rects = col_with_grow(
-        Rect::new(0, 0, 50, 200),
-        5,
-        0,
-        &[Item::Grow(1)],
-        20,
-    );
+    let rects = col_with_grow(Rect::new(0, 0, 50, 200), 5, 0, &[Item::Grow(1)], 20);
     assert_eq!(rects[0].x, 15);
     assert_eq!(rects[0].width, 20);
 }

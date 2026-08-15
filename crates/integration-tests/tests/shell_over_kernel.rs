@@ -90,11 +90,7 @@ fn read_line_from_stdin(k: &mut Kernel, pid: abi::ext::Pid) -> Vec<u8> {
 ///
 /// Returns `Some(exit_code)` if the shell requested an
 /// exit, otherwise `None`.
-fn shell_step_over_kernel(
-    k: &mut Kernel,
-    pid: abi::ext::Pid,
-    shell: &mut Shell,
-) -> Option<i32> {
+fn shell_step_over_kernel(k: &mut Kernel, pid: abi::ext::Pid, shell: &mut Shell) -> Option<i32> {
     let line_bytes = read_line_from_stdin(k, pid);
     let line = std::str::from_utf8(&line_bytes).expect("line is utf-8");
     let out = shell.eval(line);
@@ -174,9 +170,8 @@ fn real_sh_over_kernel_full_session_with_mixed_builtins() {
     // Multi-line script: set a var, print env, cd, pwd,
     // echo, exit. Each command round-trips through the
     // kernel console ring.
-    k.devs.inject_console_input(
-        b"set GREETING=hi\nenv\ncd /tmp\npwd\necho done\nexit\n",
-    );
+    k.devs
+        .inject_console_input(b"set GREETING=hi\nenv\ncd /tmp\npwd\necho done\nexit\n");
 
     let mut count = 0usize;
     loop {

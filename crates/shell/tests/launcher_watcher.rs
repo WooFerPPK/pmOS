@@ -42,8 +42,12 @@ impl DesktopEntryStore for MutableStore {
 
 #[test]
 fn watcher_emits_added_event_when_new_entry_appears_after_5s() {
-    let inner = std::sync::Arc::new(std::sync::Mutex::new(vec![entry_content("term", "Terminal")]));
-    let store = MutableStore { inner: inner.clone() };
+    let inner = std::sync::Arc::new(std::sync::Mutex::new(vec![entry_content(
+        "term", "Terminal",
+    )]));
+    let store = MutableStore {
+        inner: inner.clone(),
+    };
     let mut launcher = Launcher::new(Box::new(store));
     assert_eq!(launcher.entries().len(), 1);
 
@@ -53,10 +57,7 @@ fn watcher_emits_added_event_when_new_entry_appears_after_5s() {
     assert!(events.is_empty(), "no events at t=4s");
 
     // Mutate the underlying store to add a new entry, then tick at t=5s.
-    inner
-        .lock()
-        .unwrap()
-        .push(entry_content("hello", "Hello"));
+    inner.lock().unwrap().push(entry_content("hello", "Hello"));
     let events = tick(&mut launcher, Duration::from_secs(5));
     assert_eq!(events.len(), 1, "one Added event after store mutates");
     match &events[0] {

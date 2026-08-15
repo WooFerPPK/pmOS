@@ -4,6 +4,8 @@
 //   assemble-dist     Copy WASM + JS + HTML + headers into dist/
 //   dev-server        Serve dist/ on http://localhost:8080 with COOP/COEP
 //   gen-sab-layout    Generate web/src/shared/sab-layout.ts from abi constants
+//   gen-font-assets   Generate deterministic terminal PBM atlases
+//   gen-keymap-assets Generate deterministic PMKM v1 keymaps
 //   package <crate>   Produce dist/pkgs/<crate>-<ver>.pmpkg.tar
 //   push-sample       Push a built sample-app bundle into the running
 //                     PMos's OPFS via the test harness
@@ -16,10 +18,15 @@ use std::env;
 use std::process::ExitCode;
 
 mod assemble_dist;
+mod cargo_target;
 mod dev_server;
+mod gen_font_assets;
+mod gen_keymap_assets;
 mod gen_sab_layout;
 mod package;
 mod push_sample;
+#[cfg(test)]
+mod release_assets;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -27,7 +34,9 @@ fn main() -> ExitCode {
         Some(s) => s,
         None => {
             eprintln!("usage: xtask <subcommand> [args...]");
-            eprintln!("subcommands: assemble-dist dev-server gen-sab-layout package push-sample");
+            eprintln!(
+                "subcommands: assemble-dist dev-server gen-sab-layout gen-font-assets gen-keymap-assets package push-sample"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -37,6 +46,8 @@ fn main() -> ExitCode {
         "assemble-dist" => assemble_dist::run(&rest),
         "dev-server" => dev_server::run(&rest),
         "gen-sab-layout" => gen_sab_layout::run(&rest),
+        "gen-font-assets" => gen_font_assets::run(&rest),
+        "gen-keymap-assets" => gen_keymap_assets::run(&rest),
         "package" => package::run(&rest),
         "push-sample" => push_sample::run(&rest),
         other => {

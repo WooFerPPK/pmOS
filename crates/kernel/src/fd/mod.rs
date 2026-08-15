@@ -35,10 +35,10 @@ pub const FD_SOFT_LIMIT: usize = 1024;
 pub struct FdFlags(u32);
 
 impl FdFlags {
-    pub const EMPTY:    FdFlags = FdFlags(0);
-    pub const CLOEXEC:  FdFlags = FdFlags(0x0001);
+    pub const EMPTY: FdFlags = FdFlags(0);
+    pub const CLOEXEC: FdFlags = FdFlags(0x0001);
     pub const NONBLOCK: FdFlags = FdFlags(0x0002);
-    pub const APPEND:   FdFlags = FdFlags(0x0004);
+    pub const APPEND: FdFlags = FdFlags(0x0004);
 
     #[inline]
     pub const fn contains(self, other: FdFlags) -> bool {
@@ -121,6 +121,9 @@ impl FdFlags {
 ///   The carried `token` is the bootstrap-minted u32 the userland
 ///   caller passed to `host_file_recv`; the kernel uses it as the
 ///   key into `Kernel::host_file_fds`.
+/// * `HostDownload` — a write-only, non-inheritable stream returned by
+///   `host_file_send`. The id indexes kernel-owned staging bytes; only an
+///   explicit close finalises those bytes through the browser platform hook.
 ///
 /// The kernel's syscall dispatcher pattern-matches on this enum
 /// to route `fd_read`/`fd_write`/`ipc_send`/etc. to the right
@@ -136,6 +139,7 @@ pub enum FdObject {
     SignalChannel,
     Watch { watch_id: WatchId },
     HostFile { token: u32 },
+    HostDownload { id: u32 },
 }
 
 /// A single fd-table entry.
@@ -194,6 +198,16 @@ impl FdTable {
     /// Number of currently-open fds.
     pub fn open_count(&self) -> usize {
         self.entries.iter().filter(|e| e.is_some()).count()
+    }
+
+    /// Whether `additional` fresh descriptors can be installed without
+    /// crossing the soft limit. Callers use this before allocating an
+    /// underlying kernel object that would otherwise need rollback.
+    pub fn has_capacity(&self, additional: usize) -> bool {
+        self.open_count()
+            .checked_add(additional)
+            .map(|count| count <= self.soft_limit)
+            .unwrap_or(false)
     }
 
     /// Is this fd number currently open?
@@ -276,11 +290,7 @@ impl FdTable {
     /// verbatim — no transformations, no CLOEXEC clearing. Userland
     /// asked for this specific number; it gets exactly what `from`
     /// had.
-    pub fn renumber(
-        &mut self,
-        from: u32,
-        to: u32,
-    ) -> Result<Option<FdEntry>, FdError> {
+    pub fn renumber(&mut self, from: u32, to: u32) -> Result<Option<FdEntry>, FdError> {
         if from == to {
             // Validate from is open; otherwise EBADF.
             self.get(from).ok_or(FdError::BadFd)?;

@@ -9,7 +9,7 @@
 #![cfg(feature = "native-platform")]
 
 use abi::cap::{Cap, CapSet};
-use kernel::dev::{DevError, DeviceDispatcher};
+use kernel::dev::{DevError, DeviceDispatcher, CONSOLE_PARTIAL_LINE_CAP};
 use kernel::fs::devfs::{
     DEV_CONSOLE, DEV_FB0, DEV_INPUT_KBD, DEV_INPUT_MOUSE, DEV_NULL, DEV_RANDOM, DEV_ZERO,
 };
@@ -66,7 +66,10 @@ fn random_reads_fill_full_buffer() {
 #[test]
 fn random_writes_are_not_supported() {
     let mut d = DeviceDispatcher::new();
-    assert_eq!(d.write(DEV_RANDOM, b"no").unwrap_err(), DevError::NotSupported);
+    assert_eq!(
+        d.write(DEV_RANDOM, b"no").unwrap_err(),
+        DevError::NotSupported
+    );
 }
 
 // ---- /dev/console (T070 — the headless-shell gate primitive) ------
@@ -88,7 +91,10 @@ fn console_reads_drain_the_input_ring() {
 fn console_read_empty_is_would_block() {
     let mut d = DeviceDispatcher::new();
     let mut buf = [0u8; 4];
-    assert_eq!(d.read(DEV_CONSOLE, &mut buf).unwrap_err(), DevError::WouldBlock);
+    assert_eq!(
+        d.read(DEV_CONSOLE, &mut buf).unwrap_err(),
+        DevError::WouldBlock
+    );
 }
 
 #[test]
@@ -139,6 +145,24 @@ fn console_write_holds_partial_line_until_newline() {
     assert_eq!(drained, b"no newline here");
 }
 
+#[test]
+fn newline_free_console_writes_keep_only_the_recent_bounded_tail() {
+    let mut d = DeviceDispatcher::new();
+    let first = vec![b'a'; CONSOLE_PARTIAL_LINE_CAP];
+    let recent = vec![b'b'; CONSOLE_PARTIAL_LINE_CAP];
+
+    assert_eq!(
+        d.write(DEV_CONSOLE, &first).unwrap(),
+        CONSOLE_PARTIAL_LINE_CAP
+    );
+    assert_eq!(
+        d.write(DEV_CONSOLE, &recent).unwrap(),
+        CONSOLE_PARTIAL_LINE_CAP
+    );
+    assert_eq!(d.console_output_len(), CONSOLE_PARTIAL_LINE_CAP);
+    assert_eq!(d.drain_console_output(), recent);
+}
+
 // ---- /dev/input/kbd and /dev/input/mouse ---------------------------
 
 #[test]
@@ -164,8 +188,14 @@ fn input_mouse_read_drains_injected_events() {
 #[test]
 fn input_writes_are_not_supported() {
     let mut d = DeviceDispatcher::new();
-    assert_eq!(d.write(DEV_INPUT_KBD, b"x").unwrap_err(), DevError::NotSupported);
-    assert_eq!(d.write(DEV_INPUT_MOUSE, b"x").unwrap_err(), DevError::NotSupported);
+    assert_eq!(
+        d.write(DEV_INPUT_KBD, b"x").unwrap_err(),
+        DevError::NotSupported
+    );
+    assert_eq!(
+        d.write(DEV_INPUT_MOUSE, b"x").unwrap_err(),
+        DevError::NotSupported
+    );
 }
 
 // ---- /dev/fb0 write-path -------------------------------------------
@@ -174,7 +204,10 @@ fn input_writes_are_not_supported() {
 fn fb0_read_is_not_supported() {
     let mut d = DeviceDispatcher::new();
     let mut buf = [0u8; 4];
-    assert_eq!(d.read(DEV_FB0, &mut buf).unwrap_err(), DevError::NotSupported);
+    assert_eq!(
+        d.read(DEV_FB0, &mut buf).unwrap_err(),
+        DevError::NotSupported
+    );
 }
 
 #[test]
@@ -194,9 +227,8 @@ fn fb0_write_routes_through_platform() {
 fn check_open_allows_unprivileged_devices_for_ordinary_apps() {
     let caps = CapSet::from_caps(&[Cap::DisplayClient]);
     for dev in [DEV_NULL, DEV_ZERO, DEV_RANDOM, DEV_CONSOLE] {
-        DeviceDispatcher::check_open(dev, caps).unwrap_or_else(|e| {
-            panic!("check_open({dev}) unexpectedly failed: {e:?}")
-        });
+        DeviceDispatcher::check_open(dev, caps)
+            .unwrap_or_else(|e| panic!("check_open({dev}) unexpectedly failed: {e:?}"));
     }
 }
 

@@ -48,8 +48,7 @@ fn single_quoted_preserves_whitespace() {
     // for a 1-arg call). The key invariant is the
     // whitespace inside the quotes is preserved as part of a
     // single token, NOT split into two.
-    let (status, stdout, stderr, _env) =
-        drive("echo 'hello world'\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo 'hello world'\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -82,8 +81,7 @@ fn single_quoted_concat_with_unquoted_text() {
     // `echo a'bc'd` → tokens `["echo", "abcd"]` → stdout
     // contains `abcd\n`. Adjacency without intervening
     // whitespace concatenates the parts into a single token.
-    let (status, stdout, stderr, _env) =
-        drive("echo a'bc'd\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo a'bc'd\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -97,8 +95,7 @@ fn two_adjacent_single_quotes_concat_into_one_token() {
     // `echo 'a''b'` → tokens `["echo", "ab"]` → stdout
     // contains `ab\n`. Two literal segments with no
     // whitespace between them stick together as one token.
-    let (status, stdout, stderr, _env) =
-        drive("echo 'a''b'\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo 'a''b'\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -115,8 +112,7 @@ fn unterminated_single_quote_errors_to_stderr() {
     //   2. Skip dispatch for that line (so the bogus `echo`
     //      doesn't run).
     //   3. Stay alive — the next line's `exit` must run.
-    let (status, _stdout, stderr, _env) =
-        drive("echo 'unclosed\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("echo 'unclosed\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("unterminated single quote"),
@@ -149,8 +145,7 @@ fn double_quoted_preserves_whitespace() {
     // case, the inner space is part of one token, NOT a token
     // splitter. The key invariant is that `"..."` suppresses
     // whitespace splitting just as `'...'` does.
-    let (status, stdout, stderr, _env) =
-        drive("echo \"hello world\"\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo \"hello world\"\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -229,8 +224,7 @@ fn unterminated_double_quote_errors_to_stderr() {
     //   2. Skip dispatch for that line (so the bogus `echo`
     //      doesn't run).
     //   3. Stay alive — the next line's `exit` must run.
-    let (status, _stdout, stderr, _env) =
-        drive("echo \"unclosed\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("echo \"unclosed\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("unterminated double quote"),
@@ -284,8 +278,7 @@ fn backslash_quote_inside_double_quotes_is_literal_quote() {
     // `echo "say \"hi\""` → stdout contains `say "hi"\n` —
     // the `\"` escape emits a literal `"` segment without
     // closing the double quote, so `say "hi"` is one token.
-    let (status, stdout, stderr, _env) =
-        drive("echo \"say \\\"hi\\\"\"\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo \"say \\\"hi\\\"\"\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -299,8 +292,7 @@ fn backslash_backslash_inside_double_quotes_is_single_backslash() {
     // `echo "\\"` → stdout contains `\<newline>` (one
     // backslash byte followed by echo's trailing newline) —
     // the `\\` escape collapses to a single literal `\`.
-    let (status, stdout, stderr, _env) =
-        drive("echo \"\\\\\"\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo \"\\\\\"\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -316,8 +308,7 @@ fn unrecognized_backslash_inside_double_quotes_preserves_both_chars() {
     // newline). `\n` is NOT a recognised escape so both
     // bytes pass through verbatim — `\n` stays `\n`, NOT
     // a newline char.
-    let (status, stdout, stderr, _env) =
-        drive("echo \"\\n\"\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo \"\\n\"\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -350,8 +341,7 @@ fn backslash_outside_quotes_unchanged() {
     // `echo \X` → stdout contains `\X\n` — outside any
     // quotes the backslash is preserved as a literal byte
     // (existing behaviour, NOT processed as an escape).
-    let (status, stdout, stderr, _env) =
-        drive("echo \\X\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo \\X\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(

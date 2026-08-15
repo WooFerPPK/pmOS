@@ -16,7 +16,7 @@ use toolkit::draw::{Canvas, Rect};
 use toolkit::layout::Row;
 use toolkit::protocol::Connection;
 use toolkit::widget::text_input::{Key, KeyOutcome, TextInput};
-use toolkit::{App, HEADER_SIZE, MessageHeader, ObjectId, Window};
+use toolkit::{App, MessageHeader, ObjectId, Window, HEADER_SIZE};
 
 #[derive(Default)]
 struct LoopbackConnection {
@@ -36,6 +36,9 @@ impl LoopbackConnection {
 impl Connection for LoopbackConnection {
     fn send(&mut self, bytes: &[u8]) {
         self.outbound.extend_from_slice(bytes);
+        if let Some(done) = sync_done_for(bytes) {
+            self.inbound.push_back(done);
+        }
     }
     fn drain_outbound(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbound)
@@ -43,6 +46,24 @@ impl Connection for LoopbackConnection {
     fn recv(&mut self) -> Vec<u8> {
         self.inbound.pop_front().unwrap_or_default()
     }
+}
+
+fn sync_done_for(request: &[u8]) -> Option<Vec<u8>> {
+    let header = MessageHeader::decode(request).ok()?;
+    if header.object_id != ObjectId::DISPLAY || header.opcode != 1 {
+        return None;
+    }
+    let callback = ObjectId::new(u32::from_le_bytes(
+        request.get(HEADER_SIZE..HEADER_SIZE + 4)?.try_into().ok()?,
+    ));
+    let payload = 0u32.to_le_bytes();
+    let mut out = vec![0u8; HEADER_SIZE + payload.len()];
+    MessageHeader::try_new(callback, 1, payload.len(), 0)
+        .ok()?
+        .encode(&mut out[..HEADER_SIZE])
+        .ok()?;
+    out[HEADER_SIZE..].copy_from_slice(&payload);
+    Some(out)
 }
 
 const REGISTRY_ID: ObjectId = ObjectId::new(3);
@@ -56,8 +77,7 @@ fn build_global_event(name: u32, interface: &str, version: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut out = vec![0u8; HEADER_SIZE + payload.len()];
-    let header =
-        MessageHeader::try_new(REGISTRY_ID, 1, payload.len(), 0).expect("valid header");
+    let header = MessageHeader::try_new(REGISTRY_ID, 1, payload.len(), 0).expect("valid header");
     header.encode(&mut out[..HEADER_SIZE]).unwrap();
     out[HEADER_SIZE..].copy_from_slice(&payload);
     out
@@ -106,8 +126,14 @@ fn window_creation_dispatches_create_surface_then_get_toplevel() {
     assert!(create_surface.is_some(), "create_surface dispatched");
     assert!(get_toplevel.is_some(), "get_toplevel dispatched");
     // get_toplevel must come AFTER create_surface (the surface id it references must exist).
-    let cs_idx = ops.iter().position(|(o, p)| *o == compositor_id && *p == 1).unwrap();
-    let gt_idx = ops.iter().position(|(o, p)| *o == xdg_shell_id && *p == 1).unwrap();
+    let cs_idx = ops
+        .iter()
+        .position(|(o, p)| *o == compositor_id && *p == 1)
+        .unwrap();
+    let gt_idx = ops
+        .iter()
+        .position(|(o, p)| *o == xdg_shell_id && *p == 1)
+        .unwrap();
     assert!(cs_idx < gt_idx, "create_surface precedes get_toplevel");
 }
 

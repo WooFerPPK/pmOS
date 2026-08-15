@@ -33,9 +33,9 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use abi::ring::{
-    OFF_KERNEL_BLOCK_COUNT, OFF_KERNEL_WAIT_SLOT, OFF_REQ_HEAD, OFF_REQ_RING, OFF_REQ_TAIL,
-    OFF_RES_HEAD, OFF_RES_RING, OFF_RES_TAIL, OFF_USER_BLOCK_COUNT, OFF_USER_WAIT_SLOT,
-    REQ_SLOT_COUNT, RES_SLOT_COUNT, SAB_SIZE, SLOT_SIZE, Request, Response,
+    Request, Response, OFF_KERNEL_BLOCK_COUNT, OFF_KERNEL_WAIT_SLOT, OFF_REQ_HEAD, OFF_REQ_RING,
+    OFF_REQ_TAIL, OFF_RES_HEAD, OFF_RES_RING, OFF_RES_TAIL, OFF_USER_BLOCK_COUNT,
+    OFF_USER_WAIT_SLOT, REQ_SLOT_COUNT, RES_SLOT_COUNT, SAB_SIZE, SLOT_SIZE,
 };
 
 /// Wraps a byte slice whose layout follows `abi::ring`. The slice
@@ -60,7 +60,9 @@ impl Sab {
     /// Construct from a raw pointer + length. Caller upholds the
     /// safety contract documented on the struct.
     ///
-    /// SAFETY: see [`Sab`] docs.
+    /// # Safety
+    ///
+    /// See [`Sab`] docs.
     pub unsafe fn from_raw(base: *mut u8, len: usize) -> Self {
         debug_assert_eq!(len, SAB_SIZE);
         Sab { base, len }
@@ -156,10 +158,18 @@ impl Sab {
 
     // --- head/tail accessors -------------------------------------------
 
-    fn req_head(&self) -> &AtomicU32 { self.atomic_u32(OFF_REQ_HEAD) }
-    fn req_tail(&self) -> &AtomicU32 { self.atomic_u32(OFF_REQ_TAIL) }
-    fn res_head(&self) -> &AtomicU32 { self.atomic_u32(OFF_RES_HEAD) }
-    fn res_tail(&self) -> &AtomicU32 { self.atomic_u32(OFF_RES_TAIL) }
+    fn req_head(&self) -> &AtomicU32 {
+        self.atomic_u32(OFF_REQ_HEAD)
+    }
+    fn req_tail(&self) -> &AtomicU32 {
+        self.atomic_u32(OFF_REQ_TAIL)
+    }
+    fn res_head(&self) -> &AtomicU32 {
+        self.atomic_u32(OFF_RES_HEAD)
+    }
+    fn res_tail(&self) -> &AtomicU32 {
+        self.atomic_u32(OFF_RES_TAIL)
+    }
 
     // --- request ring --------------------------------------------------
 
@@ -279,12 +289,12 @@ fn bytes_to_req(b: &[u8; SLOT_SIZE]) -> Request {
     let mut args = [0u8; 16];
     args.copy_from_slice(&b[8..24]);
     Request {
-        opcode:     u16::from_le_bytes([b[0], b[1]]),
-        flags:      u16::from_le_bytes([b[2], b[3]]),
+        opcode: u16::from_le_bytes([b[0], b[1]]),
+        flags: u16::from_le_bytes([b[2], b[3]]),
         request_id: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
         args,
-        heap_ptr:   u32::from_le_bytes([b[24], b[25], b[26], b[27]]),
-        heap_len:   u32::from_le_bytes([b[28], b[29], b[30], b[31]]),
+        heap_ptr: u32::from_le_bytes([b[24], b[25], b[26], b[27]]),
+        heap_len: u32::from_le_bytes([b[28], b[29], b[30], b[31]]),
     }
 }
 
@@ -303,23 +313,22 @@ fn bytes_to_res(b: &[u8; SLOT_SIZE]) -> Response {
     pad.copy_from_slice(&b[20..32]);
     Response {
         request_id: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-        status:     i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-        value:      i64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
-        extra_len:  u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+        status: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+        value: i64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
+        extra_len: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
         _pad: pad,
     }
 }
 
 /// Re-export the status constants for convenience.
 pub mod status {
-    pub use abi::ring::{STATUS_IDLE, STATUS_REQUESTED, STATUS_SERVICING, STATUS_READY};
+    pub use abi::ring::{STATUS_IDLE, STATUS_READY, STATUS_REQUESTED, STATUS_SERVICING};
 }
 
 // Re-export the status consts directly too so callers can write
 // `ring::STATUS_REQUESTED` without the nested module.
 pub use abi::ring::{
-    STATUS_IDLE, STATUS_REQUESTED, STATUS_SERVICING, STATUS_READY,
-    SAB_SIZE as SAB_SIZE_BYTES,
+    SAB_SIZE as SAB_SIZE_BYTES, STATUS_IDLE, STATUS_READY, STATUS_REQUESTED, STATUS_SERVICING,
 };
 
 #[cfg(test)]

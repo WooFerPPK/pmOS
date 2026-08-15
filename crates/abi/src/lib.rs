@@ -17,9 +17,10 @@
 //! (userland) are `no_std`; `cargo test --host` pulls `std` so the
 //! default `#[test]` harness works.
 
+pub mod cap;
+pub mod errno;
+pub mod ext;
+pub mod fd;
+pub mod ring;
 pub mod version;
 pub mod wasi;
-pub mod ext;
-pub mod cap;
-pub mod ring;
-pub mod errno;

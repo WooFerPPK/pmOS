@@ -12,3 +12,4 @@ path = "src/main.rs"
 abi = { path = "../abi" }
 toolkit = { path = "../toolkit" }
 preferences = { path = "../preferences" }
+display-proto = { path = "../display-proto" }

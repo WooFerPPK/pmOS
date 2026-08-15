@@ -45,6 +45,17 @@ pub const FS_VERSION_MINOR: u16 = 0;
 /// Number of direct data-block pointers in an on-disk inode.
 pub const INODE_DIRECT_BLOCKS: usize = 12;
 
+/// Number of data-block pointers stored in the inode's single-indirect
+/// block. Indirect entries use the same 64-bit LBA representation as direct
+/// entries, so one 4 KiB block holds 512 pointers.
+pub const INODE_INDIRECT_BLOCKS: usize = BLOCK_SIZE / core::mem::size_of::<Lba>();
+
+/// Maximum number of data blocks addressable by a v1 inode.
+pub const INODE_MAX_FILE_BLOCKS: usize = INODE_DIRECT_BLOCKS + INODE_INDIRECT_BLOCKS;
+
+/// Maximum regular-file size supported by the v1 on-disk format.
+pub const MAX_FILE_BYTES: u64 = (INODE_MAX_FILE_BLOCKS * BLOCK_SIZE) as u64;
+
 /// Per-inode byte size. Chosen so that exactly 16 inodes fit in a
 /// 4 KiB block (4096 / 256 = 16).
 pub const INODE_BYTES: usize = 256;
@@ -75,9 +86,17 @@ pub const DEFAULT_JOURNAL_BLOCKS: u64 = 256;
 /// Default inode-table size in blocks for `mkfs` (= 128 * 16 inodes = 2048 inodes).
 pub const DEFAULT_INODE_TABLE_BLOCKS: u64 = 128;
 
-/// Minimum block count for a valid OPFS image: superblock + journal +
-/// inode table + at least one data block.
-pub const MIN_BLOCK_COUNT: u64 = 1 + DEFAULT_JOURNAL_BLOCKS + DEFAULT_INODE_TABLE_BLOCKS + 1;
+/// Data blocks consumed by the complete fresh-root system tree and bundled
+/// assets. This includes directory blocks, starter files, desktop entries,
+/// documentation, three PNG wallpapers (and their indirect pointer blocks),
+/// both terminal-font atlases, and the bundled timezone database.
+pub const MIN_SEEDED_DATA_BLOCKS: u64 = 1_113;
+
+/// Minimum block count that can be formatted successfully. `mkfs` is strict:
+/// a device accepted here must have enough room for the complete shipped root,
+/// not merely for an empty inode table followed by a mid-seed `ENOSPC`.
+pub const MIN_BLOCK_COUNT: u64 =
+    1 + DEFAULT_JOURNAL_BLOCKS + DEFAULT_INODE_TABLE_BLOCKS + MIN_SEEDED_DATA_BLOCKS;
 
 // --- Superblock ---------------------------------------------------------
 
@@ -282,9 +301,9 @@ impl InodeOnDisk {
         out[32..40].copy_from_slice(&self.atime_ns.to_le_bytes());
         out[40..48].copy_from_slice(&self.mtime_ns.to_le_bytes());
         out[48..56].copy_from_slice(&self.ctime_ns.to_le_bytes());
-        for i in 0..INODE_DIRECT_BLOCKS {
+        for (i, block) in self.direct.iter().enumerate() {
             let off = 56 + i * 8;
-            out[off..off + 8].copy_from_slice(&self.direct[i].to_le_bytes());
+            out[off..off + 8].copy_from_slice(&block.to_le_bytes());
         }
         // 56 + 12*8 = 152
         out[152..160].copy_from_slice(&self.indirect.to_le_bytes());
@@ -295,8 +314,8 @@ impl InodeOnDisk {
     pub fn from_bytes(b: &[u8; INODE_BYTES]) -> Result<Self, FsError> {
         let kind = InodeKind::from_u8(b[8]).ok_or(FsError::Io)?;
         let mut direct = [0u64; INODE_DIRECT_BLOCKS];
-        for i in 0..INODE_DIRECT_BLOCKS {
-            direct[i] = u64_at_slice(b, 56 + i * 8);
+        for (i, block) in direct.iter_mut().enumerate() {
+            *block = u64_at_slice(b, 56 + i * 8);
         }
         Ok(InodeOnDisk {
             ino: u64_at_slice(b, 0),

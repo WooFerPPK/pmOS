@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 abi = { path = "../abi" }
 pkg = { path = "../pkg" }
+sha2 = "0.10"

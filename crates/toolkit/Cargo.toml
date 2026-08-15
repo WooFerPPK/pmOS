@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 abi = { path = "../abi" }
 display-proto = { path = "../display-proto" }
+preferences = { path = "../preferences" }
 
 [dev-dependencies]
 display-server = { path = "../display-server" }

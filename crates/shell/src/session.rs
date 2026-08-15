@@ -311,8 +311,7 @@ impl<C: Connection> Session<C> {
             .bound(Interface::ShellManager)
             .ok_or(SessionError::ShellManagerNotBound)?;
         // No payload — opcode 1 is subscribe_windows.
-        self.client
-            .send_request(shell_manager_id, 1, &[])?;
+        self.client.send_request(shell_manager_id, 1, &[])?;
         self.windows_subscribed = true;
         Ok(())
     }
@@ -326,8 +325,7 @@ impl<C: Connection> Session<C> {
             .bound(Interface::ShellManager)
             .ok_or(SessionError::ShellManagerNotBound)?;
         let payload = window_id.to_le_bytes();
-        self.client
-            .send_request(shell_manager_id, 2, &payload)?;
+        self.client.send_request(shell_manager_id, 2, &payload)?;
         Ok(())
     }
 
@@ -337,8 +335,7 @@ impl<C: Connection> Session<C> {
             .bound(Interface::ShellManager)
             .ok_or(SessionError::ShellManagerNotBound)?;
         let payload = window_id.to_le_bytes();
-        self.client
-            .send_request(shell_manager_id, 3, &payload)?;
+        self.client.send_request(shell_manager_id, 3, &payload)?;
         Ok(())
     }
 
@@ -348,8 +345,17 @@ impl<C: Connection> Session<C> {
             .bound(Interface::ShellManager)
             .ok_or(SessionError::ShellManagerNotBound)?;
         let payload = window_id.to_le_bytes();
+        self.client.send_request(shell_manager_id, 4, &payload)?;
+        Ok(())
+    }
+
+    /// Send `pmd_shell_manager.toggle_maximized_window(window_id)`.
+    pub fn toggle_maximized_window(&mut self, window_id: u32) -> Result<(), SessionError> {
+        let shell_manager_id = self
+            .bound(Interface::ShellManager)
+            .ok_or(SessionError::ShellManagerNotBound)?;
         self.client
-            .send_request(shell_manager_id, 4, &payload)?;
+            .send_request(shell_manager_id, 7, &window_id.to_le_bytes())?;
         Ok(())
     }
 
@@ -402,9 +408,12 @@ impl<C: Connection> Session<C> {
                     if INTERESTING_INTERFACES.contains(&i)
                         && !self.bound_by_interface.contains_key(&i)
                     {
-                        let bound_id = self
-                            .client
-                            .registry_bind(registry_id, parsed.name, i, parsed.version)?;
+                        let bound_id = self.client.registry_bind(
+                            registry_id,
+                            parsed.name,
+                            i,
+                            parsed.version,
+                        )?;
                         self.bound_by_interface.insert(i, bound_id);
                         step.bound.push(i);
                         if let Some(mut_entry) = self.known_globals.get_mut(&parsed.name) {

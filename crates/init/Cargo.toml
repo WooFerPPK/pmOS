@@ -18,3 +18,5 @@ path = "src/main_desktop.rs"
 
 [dependencies]
 abi = { path = "../abi" }
+preferences = { path = "../preferences" }
+sh = { path = "../sh" }

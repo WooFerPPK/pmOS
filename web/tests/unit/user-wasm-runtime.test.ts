@@ -5,10 +5,10 @@
 // executes against the real kernel. The test loads two wasm
 // modules from disk:
 //
-//   * `target/wasm32-unknown-unknown/release/kernel.wasm` — the
-//     kernel cdylib with its 10-opcode dispatcher, already
-//     exercised in isolation by kernel-wasm-host.test.ts.
-//   * `target/wasm32-wasip1/release/hello_wasi_min.wasm` — a
+//   * `kernel.wasm` under Cargo's configured target directory — the
+//     kernel cdylib with its 10-opcode dispatcher, already exercised
+//     in isolation by kernel-wasm-host.test.ts.
+//   * `hello_wasi_min.wasm` under the same target directory — a
 //     minimum-viable WASI preview 1 binary from
 //     `crates/hello-wasi-min` (265 bytes; imports only
 //     `wasi_snapshot_preview1.fd_write` and `.proc_exit`).
@@ -46,17 +46,29 @@ import { FramebufferDriver } from "../../src/drivers/fb";
 import { Devnum } from "../../src/shared/platform-constants";
 import {
   KernelWasmHostBackend,
+  type KernelBackend,
   UserWasmRuntime,
 } from "../../src/user-wasm-runtime";
+import { SabBackend } from "../../src/sab-backend";
 import {
   CAPSET_ALL,
   CAPSET_ORDINARY_APP,
-  DEV,
   encodeSpawnManifest,
   ERRNO,
   OP_EXT,
   OP_WASI,
 } from "../../src/shared/syscall";
+import {
+  HEAP_SCRATCH_BYTES,
+  OFF_HEAP_SCRATCH,
+  OFF_REQ_RING,
+  OFF_RES_HEAD,
+  OFF_RES_RING,
+  OFF_USER_WAIT_SLOT,
+  SAB_SIZE,
+  STATUS_READY,
+} from "../../src/shared/sab-layout";
+import { resolveCargoTargetDirectory } from "../helpers/cargo-target";
 
 /**
  * Test-local replacement for the preview-era
@@ -78,6 +90,67 @@ interface CapturedSpawn {
   readonly path: string;
   readonly bytes: BufferSource;
 }
+
+interface DirectRuntimeImports {
+  readonly wasi_snapshot_preview1: {
+    fd_write(fd: number, iovsPtr: number, iovsLen: number, resultPtr: number): number;
+    fd_read(fd: number, iovsPtr: number, iovsLen: number, resultPtr: number): number;
+    sock_accept(fd: number, flags: number, resultPtr: number): number;
+    sock_send(
+      fd: number,
+      iovsPtr: number,
+      iovsLen: number,
+      flags: number,
+      resultPtr: number,
+    ): number;
+    sock_recv(
+      fd: number,
+      iovsPtr: number,
+      iovsLen: number,
+      flags: number,
+      resultPtr: number,
+      resultFlagsPtr: number,
+    ): number;
+  };
+  readonly pmos_ext: {
+    ipc_socket(ty: number): number;
+    ipc_bind(fd: number, pathPtr: number, pathLen: number): number;
+    ipc_connect(fd: number, pathPtr: number, pathLen: number): number;
+    ipc_send(
+      fd: number,
+      bufPtr: number,
+      len: number,
+      fdToPass: number,
+      flags: number,
+    ): number;
+    ipc_recv(
+      fd: number,
+      bufPtr: number,
+      len: number,
+      recvFdOutPtr: number,
+      flags: number,
+    ): number;
+    ipc_pipe(fdsPtr: number): number;
+    ipc_peer_caps(fd: number, capsOutPtr: number): number;
+    ipc_peer_pid(fd: number, pidOutPtr: number): number;
+    fs_watch(pathPtr: number, pathLen: number, mask: number, flags: number): number;
+  };
+}
+
+function directRuntimeImports(
+  backend: KernelBackend,
+  pages = 1,
+): { readonly memory: WebAssembly.Memory; readonly imports: DirectRuntimeImports } {
+  const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+  const exposed = runtime as unknown as {
+    memory: WebAssembly.Memory;
+    buildImports(): DirectRuntimeImports;
+  };
+  const memory = new WebAssembly.Memory({ initial: pages });
+  exposed.memory = memory;
+  return { memory, imports: exposed.buildImports() };
+}
+
 async function runAllSpawns(
   kernel: KernelWasmHost,
   captures: CapturedSpawn[],
@@ -147,132 +220,135 @@ let displayServerWasmBytes: ArrayBuffer;
 let displayClientDemoWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
-  const repoRoot = path.resolve(__dirname, "../../..");
+  const cargoTargetDirectory = resolveCargoTargetDirectory(
+    path.resolve(__dirname, "../../.."),
+    process.env.CARGO_TARGET_DIR,
+  );
   const kernelPath = path.join(
-    repoRoot,
-    "target/wasm32-unknown-unknown/release/kernel.wasm",
+    cargoTargetDirectory,
+    "wasm32-unknown-unknown/release/kernel.wasm",
   );
   const helloPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_wasi_min.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_wasi_min.wasm",
   );
   const spawnerPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_wasi_spawner.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_wasi_spawner.wasm",
   );
   const ipcSelfTestPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/ipc_self_test.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/ipc_self_test.wasm",
   );
   const helloFramebufferPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_framebuffer.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_framebuffer.wasm",
   );
   const displayServerLitePath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/display_server_lite.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/display_server_lite.wasm",
   );
   const helloWasiBootstrapPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_wasi_bootstrap.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_wasi_bootstrap.wasm",
   );
   const helloFbBlitPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_fb_blit.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_fb_blit.wasm",
   );
   const helloInputEchoPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_input_echo.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_input_echo.wasm",
   );
   const helloSigchldPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_sigchld.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_sigchld.wasm",
   );
   const helloKillProbePath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_kill_probe.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_kill_probe.wasm",
   );
   const helloPidPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_pid.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_pid.wasm",
   );
   const helloSelfProbePath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_self_probe.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_self_probe.wasm",
   );
   const helloPpidPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_ppid.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_ppid.wasm",
   );
   const helloCapsPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_caps.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_caps.wasm",
   );
   const helloRaisePath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_raise.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_raise.wasm",
   );
   const helloWaitNoopPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_wait_noop.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_wait_noop.wasm",
   );
   const helloCapCheckPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_cap_check.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_cap_check.wasm",
   );
   const helloRandomPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_random.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_random.wasm",
   );
   const helloFdCloseBadPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_fd_close_bad.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_fd_close_bad.wasm",
   );
   const helloFdCloseGoodPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_fd_close_good.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_fd_close_good.wasm",
   );
   const helloYieldLoopPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_yield_loop.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_yield_loop.wasm",
   );
   const helloCapListPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello_cap_list.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello_cap_list.wasm",
   );
   // `hello-std` is a bin target (not cdylib), so cargo keeps the
   // dashes in the output filename.
   const helloStdPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello-std.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello-std.wasm",
   );
   // `hello-clock` is also a bin target (dashes preserved).
   const helloClockPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/hello-clock.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello-clock.wasm",
   );
   // T172: mem-adversary is the Principle V acceptance gate —
   // a wasm32-wasip1 cdylib (so dashes → underscores in the
   // filename) that runs every probe a malicious user-wasm could
   // attempt and asserts each one is rejected by the kernel.
   const memAdversaryPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/mem_adversary.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/mem_adversary.wasm",
   );
   // `init` is also a bin target, no dash-preservation concerns.
   const initPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/init.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/init.wasm",
   );
   // `display-server` is the std bin-target; dashes preserved.
   const displayServerPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/display-server.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/display-server.wasm",
   );
   // `display-client-demo` is the std bin-target; dashes preserved.
   const displayClientDemoPath = path.join(
-    repoRoot,
-    "target/wasm32-wasip1/release/display-client-demo.wasm",
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/display-client-demo.wasm",
   );
 
   for (const p of [
@@ -868,7 +944,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     //   * environ_sizes_get → (0, 0)
     //   * environ_get     → success (nothing to write, envc=0)
     //   * fd_fdstat_get(1) → filetype byte == 2 (CharDevice)
-    //   * fd_prestat_get(3) → errno 8 (EBADF)
+    //   * fd_prestat_get(3) → `/` directory preopen
     //
     // If any of those returns something the binary doesn't expect,
     // `_start` calls proc_exit with a step-specific code (10..16)
@@ -1660,7 +1736,7 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(consoleWrites[0]![4]).toBe(0x0a); // '\n'
   });
 
-  it("hello-random calls WASI random_get twice and writes 16 distinct random bytes + newline to /dev/console", async () => {
+  it("hello-random preserves two random_get records across console line chunks", async () => {
     // End-to-end proof of the new WASI random_get shim through a
     // real wasm32-wasip1 binary. The binary calls random_get(buf,
     // 8) twice into adjacent stack buffers. If both reads return
@@ -1668,19 +1744,31 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     // real entropy source); otherwise it writes both 8-byte
     // records plus a trailing newline = 17 bytes.
     //
-    // Asserting "the bytes differ between two reads" is a much
-    // stronger sanity check than "any bytes were written" — it
-    // catches both a no-op shim (would return zeros) and a
-    // stuck-value shim (would return identical buffers). Test
-    // assertions verify the byte count + the inequality of the
-    // two halves; the actual byte values are unpredictable so
-    // we don't decode them.
+    // One record deliberately contains an embedded newline. The
+    // console contract publishes complete lines, so the single
+    // 17-byte fd_write must arrive in two host callbacks without
+    // changing the byte stream. Pinning the source also proves
+    // exactly two random_get calls and removes entropy-dependent
+    // callback boundaries from this regression.
+    const randomRecords = [
+      new Uint8Array([0x41, 0x42, 0x0a, 0x43, 0x44, 0x45, 0x46, 0x47]),
+      new Uint8Array([0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58]),
+    ] as const;
+    let randomCallCount = 0;
     const consoleWrites: Uint8Array[] = [];
     const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
       ["/bin/hello-random", helloRandomWasmBytes],
     ]);
     const kernel = await KernelWasmHost.create(kernelWasmBytes, {
+      randomBytes: (out) => {
+        const record = randomRecords[randomCallCount];
+        if (record === undefined || out.length !== record.length) {
+          throw new Error("unexpected hello-random random_get call");
+        }
+        out.set(record);
+        randomCallCount += 1;
+      },
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
@@ -1714,16 +1802,33 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(history).toHaveLength(1);
     expect(history[0]!.exitCode).toBe(0);
 
-    expect(consoleWrites).toHaveLength(1);
-    expect(consoleWrites[0]!.length).toBe(17);
-    expect(consoleWrites[0]![16]).toBe(0x0a); // '\n'
+    expect(randomCallCount).toBe(2);
+    expect(consoleWrites).toHaveLength(2);
+    expect(consoleWrites[0]).toEqual(randomRecords[0].slice(0, 3));
+    expect(consoleWrites[1]).toEqual(
+      new Uint8Array([...randomRecords[0].slice(3), ...randomRecords[1], 0x0a]),
+    );
+
+    const output = new Uint8Array(
+      consoleWrites.reduce((length, chunk) => length + chunk.length, 0),
+    );
+    let outputOffset = 0;
+    for (const chunk of consoleWrites) {
+      output.set(chunk, outputOffset);
+      outputOffset += chunk.length;
+    }
+    expect(output).toEqual(
+      new Uint8Array([...randomRecords[0], ...randomRecords[1], 0x0a]),
+    );
+    expect(output).toHaveLength(17);
+    expect(output[16]).toBe(0x0a); // '\n'
 
     // The two 8-byte halves must differ — the binary already
     // exits 12 if they match, but the assertion here is the
     // explicit form of the same invariant against console-side
     // observation.
-    const firstHalf = consoleWrites[0]!.slice(0, 8);
-    const secondHalf = consoleWrites[0]!.slice(8, 16);
+    const firstHalf = output.slice(0, 8);
+    const secondHalf = output.slice(8, 16);
     expect(firstHalf).not.toEqual(secondHalf);
   });
 
@@ -2127,47 +2232,10 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
     expect(combined).toBe("hello from std\n");
   });
 
-  it("init (std) spawns hello-std AND display-server AND display-client-demo via pmos_ext.proc_spawn, all three children run after init exits", async () => {
-    // The four-pid substrate slice: init fires four fire-and-forget
-    // `pmos_ext.proc_spawn` calls (`/bin/hello-std`,
-    // `/bin/display-server`, `/bin/display-client-demo` ×2), then
-    // enters a blocking `proc_wait` supervision loop (T095).
-    //
-    // Under `runAllSpawns` (the vitest composition helper) children
-    // run strictly sequentially AND spawned pids stay Ready (no
-    // `markRunning`). Init's first blocking `proc_wait` trips
-    // `park_on_wait`'s Running→BlockedOnWait transition check —
-    // init itself is Ready, so the transition fails with
-    // `KernelError::NoSuchPid` → shim surfaces `-ESRCH`. Init's
-    // early-exit arm prints
-    // `init proc_wait returned errno=71; exiting with 4 children
-    // unreaped` + `init exiting` and falls through. Children then
-    // run one at a time: hello-std exits 0, display-server's first
-    // `ipc_accept` trips the same Ready→BlockedOnIpc transition
-    // failure (→ `-ESRCH` → exit 12), display-client-demo's
-    // `display_connect` exhausts against the torn-down listener
-    // (→ exit 10).
-    //
-    // The vitest layer validates that:
-    //   1. init spawns all four children (three distinct paths);
-    //   2. init's proc_wait supervision loop degrades gracefully
-    //      under the sequential harness (no infinite spin);
-    //   3. hello-std still runs cleanly alongside the new siblings
-    //      (no regression in the std startup path);
-    //   4. display-server + display-client-demo both survive their
-    //      bounded loops and exit through `std::process::exit`
-    //      rather than hanging or trapping.
-    //
-    // The four-binary IPC round-trip + SIGTERM-driven
-    // display-server shutdown is validated only under Playwright,
-    // where real concurrent Workers in separate WASM linear
-    // memories give the required interleaving. See
-    // `web/tests/integration/real-kernel.spec.ts`.
+  it("real init spawns all four children before entering blocking supervision", async () => {
     const consoleWrites: Uint8Array[] = [];
-    const fbWrites: Uint8Array[] = [];
     const captures: CapturedSpawn[] = [];
     const binaryRegistry = new Map<string, BufferSource>([
-      ["/bin/init", initWasmBytes],
       ["/bin/hello-std", helloStdWasmBytes],
       ["/bin/display-server", displayServerWasmBytes],
       ["/bin/display-client-demo", displayClientDemoWasmBytes],
@@ -2176,72 +2244,57 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       onConsoleWrite: (bytes) => {
         consoleWrites.push(bytes);
       },
-      onFramebufferWrite: (bytes) => {
-        fbWrites.push(bytes);
-      },
       onSpawnProcess: captureSpawn(binaryRegistry, captures),
     });
 
-    // Kernel-side synthetic parent that dispatches PROC_SPAWN on
-    // behalf of an imaginary "boot loader" — the real boot path
-    // uses `kernel-worker-entry.ts`'s `runBootBinary`, which does
-    // the same choreography.
-    const bootLoader = kernel.registerProcess(CAPSET_ALL);
-    kernel.installConsoleFd(bootLoader, 0);
-    kernel.installConsoleFd(bootLoader, 1);
-    kernel.installConsoleFd(bootLoader, 2);
-    kernel.markRunning(bootLoader);
+    const initPid = kernel.registerProcess(CAPSET_ALL);
+    kernel.installConsoleFd(initPid, 0);
+    kernel.installConsoleFd(initPid, 1);
+    kernel.installConsoleFd(initPid, 2);
+    kernel.markRunning(initPid);
 
-    const manifest = encodeSpawnManifest({
-      path: "/bin/init",
-      caps: CAPSET_ALL,
-    });
-    const spawnResult = kernel.dispatch(
-      bootLoader,
-      {
-        opcode: OP_EXT.PROC_SPAWN,
-        requestId: 1,
-        args: manifest.args,
-        heapPtr: 0,
-        heapLen: manifest.heap.length,
-      },
-      manifest.heap,
+    // The in-process backend can execute init's non-blocking startup calls,
+    // but it cannot represent a parked PROC_WAIT. Forward every real syscall
+    // until that boundary, then unwind the wasm with an identity-checked
+    // test sentinel before the blocking request reaches the kernel.
+    const directBackend = new KernelWasmHostBackend(kernel, initPid);
+    const supervisionBoundary = new Error(
+      "test reached init's blocking supervision boundary",
     );
-    expect(spawnResult.response!.status).toBe(0);
+    const lifecycleOpcodes: number[] = [];
+    const boundedBackend: KernelBackend = {
+      dispatch(request, heapIn) {
+        if (
+          request.opcode === OP_EXT.PROC_SPAWN ||
+          request.opcode === OP_EXT.PROC_WAIT
+        ) {
+          lifecycleOpcodes.push(request.opcode);
+        }
+        if (request.opcode === OP_EXT.PROC_WAIT) {
+          throw supervisionBoundary;
+        }
+        return directBackend.dispatch(request, heapIn);
+      },
+    };
 
-    const history = await runAllSpawns(kernel, captures);
+    const runtime = new UserWasmRuntime(initWasmBytes, boundedBackend);
+    await expect(runtime.run()).rejects.toBe(supervisionBoundary);
 
-    expect(captures).toHaveLength(0);
-    expect(history).toHaveLength(5);
-    expect(history[0]!.path).toBe("/bin/init");
-    expect(history[0]!.exitCode).toBe(0);
-    expect(history[1]!.path).toBe("/bin/hello-std");
-    expect(history[1]!.exitCode).toBe(0);
-    // After T095 (init proc_wait supervision loop) + T110
-    // (display-server unbounded accept with signal-driven exit):
-    // display-server's first ipc_accept call sends flags=0
-    // (blocking by default). The kernel's park_on_accept attempts
-    // Running→BlockedOnIpc, but the sequential runAllSpawns
-    // harness leaves spawned pids in the Ready state that
-    // PROC_SPAWN installs — it doesn't call markRunning the way
-    // production (kernel-worker-entry) does. The illegal
-    // Ready→BlockedOnIpc transition produces KernelError::
-    // NoSuchPid, which the shim surfaces as errno -ESRCH. The
-    // new display-server body sees `rc < 0 && rc != -EINTR` and
-    // exits 12. In production (Playwright), the kernel-worker
-    // dispatch loop marks spawned pids Running, blocking accept
-    // parks cleanly, peer's display_connect wakes it, and
-    // SIGTERM from init drives a clean exit 0 — see
-    // real-kernel.spec.ts.
-    expect(history[2]!.path).toBe("/bin/display-server");
-    expect(history[2]!.exitCode).toBe(12);
-    // Both display-client-demo spawns run after display-server has
-    // torn down, so each `display_connect` poll exhausts
-    // -ECONNREFUSED and exits with code 10.
-    expect(history[3]!.path).toBe("/bin/display-client-demo");
-    expect(history[3]!.exitCode).toBe(10);
-    expect(history[4]!.path).toBe("/bin/display-client-demo");
-    expect(history[4]!.exitCode).toBe(10);
+    expect(lifecycleOpcodes).toEqual([
+      OP_EXT.PROC_SPAWN,
+      OP_EXT.PROC_SPAWN,
+      OP_EXT.PROC_SPAWN,
+      OP_EXT.PROC_SPAWN,
+      OP_EXT.PROC_WAIT,
+    ]);
+    expect(captures.map(({ path }) => path)).toEqual([
+      "/bin/hello-std",
+      "/bin/display-server",
+      "/bin/display-client-demo",
+      "/bin/display-client-demo",
+    ]);
+    expect(new Set(captures.map(({ pid }) => pid)).size).toBe(4);
+    expect(captures.every(({ pid }) => pid > initPid)).toBe(true);
 
     const combined = new TextDecoder().decode(
       new Uint8Array(
@@ -2251,36 +2304,13 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
         ),
       ),
     );
-    // Sequential ordering: init's 7 lines (starting, 4× spawned,
-    // proc_wait early-exit note, exiting), then hello-std's 1,
-    // then display-server's 1 ("starting" only — no "fb blit ok"
-    // because accept never succeeded), then display-client-demo's
-    // 2× "starting" (both exhaust display_connect and never print
-    // "sent pixels"). The pids the kernel allocates are dynamic
-    // so each "spawned" line matches on prefix, and the exact
-    // unreaped-count in the proc_wait note depends on how many
-    // spawns actually succeeded (expect 4).
     const lines = combined.split("\n").filter((l) => l.length > 0);
     expect(lines[0]).toBe("init starting");
     expect(lines[1]).toMatch(/^init spawned hello-std pid=\d+$/);
     expect(lines[2]).toMatch(/^init spawned display-server pid=\d+$/);
     expect(lines[3]).toMatch(/^init spawned display-client-demo pid=\d+$/);
     expect(lines[4]).toMatch(/^init spawned display-client-demo pid=\d+$/);
-    expect(lines[5]).toBe(
-      "init proc_wait returned errno=71; exiting with 4 children unreaped",
-    );
-    expect(lines[6]).toBe("init exiting");
-    expect(lines[7]).toBe("hello from std");
-    expect(lines[8]).toBe("display-server starting");
-    expect(lines[9]).toBe("display-client-demo starting");
-    expect(lines[10]).toBe("display-client-demo starting");
-    expect(lines).toHaveLength(11);
-
-    // No /dev/fb0 writes — the sequential in-process harness can't
-    // drive the IPC round-trip, so neither binary reaches its fb
-    // write step. Playwright's four-pid concurrent-Worker test is
-    // the observer that captures the framebuffer payload.
-    expect(fbWrites).toHaveLength(0);
+    expect(lines).toHaveLength(5);
   });
 
   it("hello-clock: std binary drives CLOCK_TIME_GET(MONOTONIC + REALTIME) + CLOCK_RES_GET through the WASI shim end-to-end", async () => {
@@ -2467,7 +2497,1343 @@ describe("UserWasmRuntime + KernelWasmHost end-to-end", () => {
       expect(text).toContain(name);
     }
   });
+
+  it("ipc_peer_caps import dispatches the fd-scoped query and writes the u64 result", async () => {
+    const peerCaps = 0x1234_5678n;
+    const opcodes: number[] = [];
+    const backend: KernelBackend = {
+      dispatch(request) {
+        opcodes.push(request.opcode);
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: request.opcode === OP_EXT.IPC_PEER_CAPS ? peerCaps : 0n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+
+    await expect(runtime.run()).resolves.toBe(0);
+
+    expect(opcodes).toEqual([OP_EXT.IPC_PEER_CAPS, OP_WASI.PROC_EXIT]);
+    const exposed = runtime as unknown as { memory: WebAssembly.Memory };
+    expect(new DataView(exposed.memory.buffer).getBigUint64(8, true)).toBe(
+      peerCaps,
+    );
+  });
+
+  it("ipc_peer_pid import dispatches the fd-scoped query and writes the i32 result", async () => {
+    const peerPid = 73n;
+    const opcodes: number[] = [];
+    const backend: KernelBackend = {
+      dispatch(request) {
+        opcodes.push(request.opcode);
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: request.opcode === OP_EXT.IPC_PEER_PID ? peerPid : 0n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerPidProbeWasm(), backend);
+
+    await expect(runtime.run()).resolves.toBe(0);
+
+    expect(opcodes).toEqual([OP_EXT.IPC_PEER_PID, OP_WASI.PROC_EXIT]);
+    const exposed = runtime as unknown as { memory: WebAssembly.Memory };
+    expect(new DataView(exposed.memory.buffer).getInt32(8, true)).toBe(
+      Number(peerPid),
+    );
+  });
+
+  it("ipc_peer_pid preserves the output on backend errors and invalid pid values", () => {
+    let status = -ERRNO.EBADF;
+    let value = 73n;
+    const backend: KernelBackend = {
+      dispatch(request) {
+        return {
+          response: {
+            requestId: request.requestId,
+            status,
+            value,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend);
+    const view = new DataView(memory.buffer);
+    view.setInt32(8, 0x1234_5678, true);
+
+    expect(imports.pmos_ext.ipc_peer_pid(41, 8)).toBe(-ERRNO.EBADF);
+    expect(view.getInt32(8, true)).toBe(0x1234_5678);
+
+    status = 0;
+    value = 0x8000_0000n;
+    expect(imports.pmos_ext.ipc_peer_pid(41, 8)).toBe(-ERRNO.EIO);
+    expect(view.getInt32(8, true)).toBe(0x1234_5678);
+  });
+
+  it("ipc_socket forwards reserved DGRAM type 1 and propagates ENOTSUP", () => {
+    const calls: Array<{ opcode: number; arg0: number | undefined }> = [];
+    const backend: KernelBackend = {
+      dispatch(request) {
+        calls.push({ opcode: request.opcode, arg0: request.arg0 });
+        return {
+          response: {
+            requestId: request.requestId,
+            status: -ERRNO.ENOTSUP,
+            value: 0n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const { imports } = directRuntimeImports(backend);
+
+    expect(imports.pmos_ext.ipc_socket(1)).toBe(-ERRNO.ENOTSUP);
+    expect(calls).toEqual([{ opcode: OP_EXT.IPC_SOCKET, arg0: 1 }]);
+  });
+
+  it("host transfer imports preserve metadata and fd return semantics", () => {
+    const calls: Array<{ opcode: number; args?: Uint8Array; heap?: Uint8Array }> = [];
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        calls.push({
+          opcode: request.opcode,
+          ...(request.args !== undefined ? { args: new Uint8Array(request.args) } : {}),
+          ...(heap !== undefined ? { heap: new Uint8Array(heap) } : {}),
+        });
+        const value =
+          request.opcode === OP_EXT.HOST_FILE_RECV
+            ? 41n
+            : request.opcode === OP_EXT.HOST_FILE_SEND
+              ? 42n
+              : 0n;
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        pmos_ext: {
+          fs_chmod(pathPtr: number, pathLen: number, mode: number): number;
+          host_file_recv(token: number): number;
+          host_file_pick(): number;
+          host_file_send(
+            namePtr: number,
+            nameLen: number,
+            mimePtr: number,
+            mimeLen: number,
+          ): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 1 });
+    const name = new TextEncoder().encode("notes.txt");
+    const mime = new TextEncoder().encode("text/plain");
+    const memory = new Uint8Array(exposed.memory.buffer);
+    memory.set(name, 64);
+    memory.set(mime, 96);
+    const host = exposed.buildImports().pmos_ext;
+
+    expect(host.fs_chmod(64, name.length, 0o755)).toBe(0);
+    expect(host.host_file_recv(9)).toBe(41);
+    expect(host.host_file_pick()).toBe(0);
+    expect(host.host_file_send(64, name.length, 96, mime.length)).toBe(42);
+    expect(calls.map((call) => call.opcode)).toEqual([
+      OP_EXT.FS_CHMOD,
+      OP_EXT.HOST_FILE_RECV,
+      OP_EXT.HOST_FILE_PICK,
+      OP_EXT.HOST_FILE_SEND,
+    ]);
+    const chmod = calls[0]!;
+    expect(new DataView(chmod.args!.buffer).getUint32(0, true)).toBe(name.length);
+    expect(new DataView(chmod.args!.buffer).getUint32(4, true)).toBe(0o755);
+    expect(chmod.heap).toEqual(name);
+    const send = calls[3]!;
+    expect(new DataView(send.args!.buffer).getUint32(0, true)).toBe(name.length);
+    expect(new DataView(send.args!.buffer).getUint32(4, true)).toBe(mime.length);
+    expect(send.heap).toEqual(
+      new Uint8Array([...name, ...mime]),
+    );
+  });
+
+  it("fs_watch copies a bounded path and rejects malformed calls before dispatch", () => {
+    const calls: Array<{ args: Uint8Array; heap: Uint8Array }> = [];
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        calls.push({
+          args: new Uint8Array(request.args ?? []),
+          heap: new Uint8Array(heap ?? []),
+        });
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: 37n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        pmos_ext: {
+          fs_watch(pathPtr: number, pathLen: number, mask: number, flags: number): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 1 });
+    const memory = new Uint8Array(exposed.memory.buffer);
+    const pathBytes = new TextEncoder().encode("/etc");
+    memory.set(pathBytes, 64);
+    const watch = exposed.buildImports().pmos_ext.fs_watch;
+
+    expect(watch(64, pathBytes.length, 0x0007, 0)).toBe(37);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.heap).toEqual(pathBytes);
+    const args = new DataView(calls[0]!.args.buffer);
+    expect(args.getUint32(0, true)).toBe(0);
+    expect(args.getUint32(4, true)).toBe(pathBytes.length);
+    expect(args.getUint32(8, true)).toBe(0x0007);
+    expect(args.getUint32(12, true)).toBe(0);
+
+    expect(watch(64, pathBytes.length, 0, 0)).toBe(-ERRNO.EINVAL);
+    expect(watch(64, pathBytes.length, 0x0008, 0)).toBe(-ERRNO.EINVAL);
+    expect(watch(64, pathBytes.length, 0x0001, 1)).toBe(-ERRNO.EINVAL);
+    expect(watch(-1, pathBytes.length, 0x0001, 0)).toBe(-ERRNO.EFAULT);
+    expect(watch(memory.length - 3, 4, 0x0001, 0)).toBe(-ERRNO.EFAULT);
+    expect(calls).toHaveLength(1);
+
+    // Exact-end ranges are valid; no `ptr + len` overflow arithmetic is used.
+    expect(watch(memory.length - 4, 4, 0x0001, 0)).toBe(37);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("ipc bind and connect reject invalid path ranges before dispatch", () => {
+    const calls: Array<{ opcode: number; arg0?: number; heap: Uint8Array }> = [];
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        calls.push({
+          opcode: request.opcode,
+          ...(request.arg0 !== undefined ? { arg0: request.arg0 } : {}),
+          heap: new Uint8Array(heap ?? []),
+        });
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: 0n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        pmos_ext: {
+          ipc_bind(fd: number, pathPtr: number, pathLen: number): number;
+          ipc_connect(fd: number, pathPtr: number, pathLen: number): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 1 });
+    const memory = new Uint8Array(exposed.memory.buffer);
+    const pathBytes = new TextEncoder().encode("/run/test");
+    memory.set(pathBytes, 64);
+    const { ipc_bind: bind, ipc_connect: connect } = exposed.buildImports().pmos_ext;
+
+    expect(bind(3, 64, pathBytes.length)).toBe(0);
+    expect(connect(4, 64, pathBytes.length)).toBe(0);
+    expect(calls).toEqual([
+      { opcode: OP_EXT.IPC_BIND, arg0: 3, heap: pathBytes },
+      { opcode: OP_EXT.IPC_CONNECT, arg0: 4, heap: pathBytes },
+    ]);
+
+    for (const call of [bind, connect]) {
+      expect(call(3, 64, 0)).toBe(-ERRNO.EINVAL);
+      expect(call(3, Number.NaN, 1)).toBe(-ERRNO.EINVAL);
+      expect(call(3, 64, 1.5)).toBe(-ERRNO.EINVAL);
+      expect(call(3, -1, 1)).toBe(-ERRNO.EFAULT);
+      expect(call(3, memory.length - 3, 4)).toBe(-ERRNO.EFAULT);
+      expect(call(3, memory.length + 1, 1)).toBe(-ERRNO.EFAULT);
+    }
+    expect(calls).toHaveLength(2);
+
+    memory.set(pathBytes, memory.length - pathBytes.length);
+    expect(bind(5, memory.length - pathBytes.length, pathBytes.length)).toBe(0);
+    expect(calls).toHaveLength(3);
+    expect(calls[2]).toEqual({
+      opcode: OP_EXT.IPC_BIND,
+      arg0: 5,
+      heap: pathBytes,
+    });
+  });
+
+  it("path imports preserve directory fds for nested relative removal", () => {
+    const calls: Array<{
+      opcode: number;
+      arg0?: number;
+      args?: Uint8Array;
+      heap: Uint8Array;
+    }> = [];
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        calls.push({
+          opcode: request.opcode,
+          ...(request.arg0 !== undefined ? { arg0: request.arg0 } : {}),
+          ...(request.args !== undefined
+            ? { args: new Uint8Array(request.args) }
+            : {}),
+          heap: heap === undefined ? new Uint8Array() : new Uint8Array(heap),
+        });
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: request.opcode === OP_WASI.PATH_OPEN ? 41n : 0n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        wasi_snapshot_preview1: {
+          path_open(
+            dirfd: number,
+            dirflags: number,
+            pathPtr: number,
+            pathLen: number,
+            oflags: number,
+            rightsBase: bigint,
+            rightsInheriting: bigint,
+            fdflags: number,
+            fdOutPtr: number,
+          ): number;
+          path_unlink_file(
+            dirfd: number,
+            pathPtr: number,
+            pathLen: number,
+          ): number;
+          path_remove_directory(
+            dirfd: number,
+            pathPtr: number,
+            pathLen: number,
+          ): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 1 });
+    const bytes = new Uint8Array(exposed.memory.buffer);
+    const bin = new TextEncoder().encode("bin");
+    const child = new TextEncoder().encode("hello.wasm");
+    bytes.set(bin, 64);
+    bytes.set(child, 96);
+    const wasi = exposed.buildImports().wasi_snapshot_preview1;
+
+    expect(wasi.path_open(10, 0, 64, bin.length, 2, 0n, 0n, 0, 160)).toBe(0);
+    expect(new DataView(exposed.memory.buffer).getUint32(160, true)).toBe(41);
+    expect(wasi.path_unlink_file(41, 96, child.length)).toBe(0);
+    expect(wasi.path_remove_directory(10, 64, bin.length)).toBe(0);
+
+    expect(calls.map((call) => call.opcode)).toEqual([
+      OP_WASI.PATH_OPEN,
+      OP_WASI.PATH_UNLINK_FILE,
+      OP_WASI.PATH_REMOVE_DIRECTORY,
+    ]);
+    const openArgs = new DataView(
+      calls[0]!.args!.buffer,
+      calls[0]!.args!.byteOffset,
+      calls[0]!.args!.byteLength,
+    );
+    expect(openArgs.getUint32(12, true)).toBe(10);
+    expect(calls[0]!.heap).toEqual(bin);
+    expect(calls[1]!.arg0).toBe(41);
+    expect(calls[1]!.heap).toEqual(child);
+    expect(calls[2]!.arg0).toBe(10);
+    expect(calls[2]!.heap).toEqual(bin);
+  });
+
+  it("poll_oneoff rejects a negative subscription count before allocating", () => {
+    let dispatches = 0;
+    const backend: KernelBackend = {
+      dispatch() {
+        dispatches += 1;
+        throw new Error("malformed poll must not reach the backend");
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        wasi_snapshot_preview1: {
+          poll_oneoff(
+            inPtr: number,
+            outPtr: number,
+            nsubscriptions: number,
+            neventsPtr: number,
+          ): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 1 });
+
+    const errno = exposed
+      .buildImports()
+      .wasi_snapshot_preview1.poll_oneoff(0, 64, -1, 128);
+
+    expect(errno).toBe(ERRNO.EINVAL);
+    expect(
+      exposed
+        .buildImports()
+        .wasi_snapshot_preview1.poll_oneoff(0, 64, 257, 128),
+    ).toBe(ERRNO.EINVAL);
+    expect(dispatches).toBe(0);
+  });
+
+  it("poll_oneoff validates negative, exact-end, and cross-end pointer ranges", () => {
+    let dispatches = 0;
+    const backend: KernelBackend = {
+      dispatch() {
+        dispatches += 1;
+        return {
+          response: {
+            requestId: 0,
+            status: 0,
+            value: 0n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        wasi_snapshot_preview1: {
+          poll_oneoff(
+            inPtr: number,
+            outPtr: number,
+            nsubscriptions: number,
+            neventsPtr: number,
+          ): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 1 });
+    const poll = exposed.buildImports().wasi_snapshot_preview1.poll_oneoff;
+    const end = exposed.memory.buffer.byteLength;
+
+    expect(poll(-1, end - 32, 1, end - 4)).toBe(ERRNO.EFAULT);
+    expect(poll(end - 48, end - 31, 1, end - 4)).toBe(ERRNO.EFAULT);
+    expect(dispatches).toBe(0);
+
+    expect(poll(end - 48, end - 32, 1, end - 4)).toBe(0);
+    expect(dispatches).toBe(1);
+    expect(new DataView(exposed.memory.buffer).getUint32(end - 4, true)).toBe(0);
+  });
+
+  it("poll_oneoff rejects impossible backend event counts and short output", () => {
+    let responseValue = 2n;
+    let heapOut = new Uint8Array(64);
+    const backend: KernelBackend = {
+      dispatch() {
+        return {
+          response: {
+            requestId: 0,
+            status: 0,
+            value: responseValue,
+            extraLen: heapOut.byteLength,
+          },
+          heapOut,
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        wasi_snapshot_preview1: {
+          poll_oneoff(
+            inPtr: number,
+            outPtr: number,
+            nsubscriptions: number,
+            neventsPtr: number,
+          ): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 1 });
+    const poll = exposed.buildImports().wasi_snapshot_preview1.poll_oneoff;
+
+    expect(poll(0, 128, 1, 256)).toBe(ERRNO.EIO);
+    responseValue = 1n;
+    heapOut = new Uint8Array(31);
+    expect(poll(0, 128, 1, 256)).toBe(ERRNO.EIO);
+  });
+
+  it("fd_write chunks payloads larger than the per-process syscall heap", () => {
+    const writes: Uint8Array[] = [];
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        expect(request.opcode).toBe(OP_WASI.FD_WRITE);
+        const bytes =
+          heap === undefined ? new Uint8Array() : new Uint8Array(heap);
+        writes.push(bytes);
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: BigInt(bytes.length),
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        wasi_snapshot_preview1: {
+          fd_write(
+            fd: number,
+            iovsPtr: number,
+            iovsLen: number,
+            nwrittenPtr: number,
+          ): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 2 });
+
+    const payload = Uint8Array.from(
+      { length: 65_024 },
+      (_, index) => (index * 31 + 7) & 0xff,
+    );
+    const iovsPtr = 16;
+    const nwrittenPtr = 32;
+    const payloadPtr = 256;
+    new Uint8Array(exposed.memory.buffer).set(payload, payloadPtr);
+    const view = new DataView(exposed.memory.buffer);
+    view.setUint32(iovsPtr, payloadPtr, true);
+    view.setUint32(iovsPtr + 4, payload.length, true);
+
+    const fdWrite = exposed.buildImports().wasi_snapshot_preview1.fd_write;
+    let totalWritten = 0;
+    while (totalWritten < payload.length) {
+      view.setUint32(iovsPtr, payloadPtr + totalWritten, true);
+      view.setUint32(iovsPtr + 4, payload.length - totalWritten, true);
+      expect(fdWrite(41, iovsPtr, 1, nwrittenPtr)).toBe(0);
+      const written = view.getUint32(nwrittenPtr, true);
+      expect(written).toBeGreaterThan(0);
+      totalWritten += written;
+    }
+
+    expect(totalWritten).toBe(payload.length);
+    expect(writes.map((chunk) => chunk.length)).toEqual([
+      HEAP_SCRATCH_BYTES,
+      payload.length - HEAP_SCRATCH_BYTES,
+    ]);
+    const written = new Uint8Array(payload.length);
+    let offset = 0;
+    for (const chunk of writes) {
+      written.set(chunk, offset);
+      offset += chunk.length;
+    }
+    expect(written).toEqual(payload);
+  });
+
+  it("fd_read returns a bounded short read for oversized iovecs", () => {
+    const expected = Uint8Array.from(
+      { length: HEAP_SCRATCH_BYTES },
+      (_, index) => (index * 17 + 11) & 0xff,
+    );
+    const capacities: number[] = [];
+    const backend: KernelBackend = {
+      dispatch(request) {
+        expect(request.opcode).toBe(OP_WASI.FD_READ);
+        capacities.push(request.heapLen ?? 0);
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: BigInt(expected.length),
+            extraLen: expected.length,
+          },
+          heapOut: expected,
+        };
+      },
+    };
+    const runtime = new UserWasmRuntime(buildPeerCapsProbeWasm(), backend);
+    const exposed = runtime as unknown as {
+      memory: WebAssembly.Memory;
+      buildImports(): {
+        wasi_snapshot_preview1: {
+          fd_read(
+            fd: number,
+            iovsPtr: number,
+            iovsLen: number,
+            nreadPtr: number,
+          ): number;
+        };
+      };
+    };
+    exposed.memory = new WebAssembly.Memory({ initial: 2 });
+    const iovsPtr = 16;
+    const nreadPtr = 40;
+    const firstPtr = 256;
+    const firstLen = 20_000;
+    const secondPtr = 24_000;
+    const secondLen = 45_000;
+    const bytes = new Uint8Array(exposed.memory.buffer);
+    bytes.fill(0xaa, firstPtr, firstPtr + firstLen);
+    bytes.fill(0xaa, secondPtr, secondPtr + secondLen);
+    const view = new DataView(exposed.memory.buffer);
+    view.setUint32(iovsPtr, firstPtr, true);
+    view.setUint32(iovsPtr + 4, firstLen, true);
+    view.setUint32(iovsPtr + 8, secondPtr, true);
+    view.setUint32(iovsPtr + 12, secondLen, true);
+
+    const errno = exposed
+      .buildImports()
+      .wasi_snapshot_preview1.fd_read(41, iovsPtr, 2, nreadPtr);
+
+    expect(errno).toBe(0);
+    expect(capacities).toEqual([HEAP_SCRATCH_BYTES]);
+    expect(view.getUint32(nreadPtr, true)).toBe(HEAP_SCRATCH_BYTES);
+    expect(bytes.slice(firstPtr, firstPtr + firstLen)).toEqual(
+      expected.slice(0, firstLen),
+    );
+    const secondWritten = HEAP_SCRATCH_BYTES - firstLen;
+    expect(bytes.slice(secondPtr, secondPtr + secondWritten)).toEqual(
+      expected.slice(firstLen),
+    );
+    expect(bytes[secondPtr + secondWritten]).toBe(0xaa);
+  });
+
+  it("ipc_send and ipc_recv preserve bounded payload, fd, and blocking flag wire semantics", () => {
+    expect(OP_EXT.IPC_SEND).toBe(0x1005);
+    expect(OP_EXT.IPC_RECV).toBe(0x1006);
+    const calls: Array<{ opcode: number; args: Uint8Array; heapLen: number; heap: Uint8Array }> = [];
+    let recvIndex = 0;
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        calls.push({
+          opcode: request.opcode,
+          args: new Uint8Array(request.args ?? []),
+          heapLen: request.heapLen ?? 0,
+          heap: new Uint8Array(heap ?? []),
+        });
+        if (request.opcode === OP_EXT.IPC_SEND) {
+          return {
+            response: {
+              requestId: request.requestId,
+              status: 0,
+              value: 3n,
+              extraLen: 0,
+            },
+            heapOut: new Uint8Array(),
+          };
+        }
+        recvIndex += 1;
+        if (recvIndex === 1) {
+          return {
+            response: {
+              requestId: request.requestId,
+              status: 0,
+              value: 3n,
+              extraLen: 3,
+            },
+            heapOut: new Uint8Array([6, 7, 8]),
+          };
+        }
+        const out = new Uint8Array(6);
+        new DataView(out.buffer).setUint32(0, 55, true);
+        out.set([9, 10], 4);
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: 2n,
+            extraLen: 6,
+          },
+          heapOut: out,
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend);
+    const bytes = new Uint8Array(memory.buffer);
+    bytes.set([1, 2, 3, 4, 5], 64);
+
+    expect(imports.pmos_ext.ipc_send(41, 64, 5, 17, 0)).toBe(3);
+    expect(imports.pmos_ext.ipc_recv(42, 128, 8, -1, 0)).toBe(3);
+    expect(bytes.slice(128, 131)).toEqual(new Uint8Array([6, 7, 8]));
+    expect(imports.pmos_ext.ipc_recv(42, 160, 8, 192, 1)).toBe(2);
+    expect(bytes.slice(160, 162)).toEqual(new Uint8Array([9, 10]));
+    expect(new DataView(memory.buffer).getInt32(192, true)).toBe(55);
+
+    expect(calls.map((call) => call.opcode)).toEqual([
+      OP_EXT.IPC_SEND,
+      OP_EXT.IPC_RECV,
+      OP_EXT.IPC_RECV,
+    ]);
+    const sendArgs = new DataView(calls[0]!.args.buffer);
+    expect(sendArgs.getUint32(0, true)).toBe(41);
+    expect(sendArgs.getUint32(4, true)).toBe(5);
+    expect(sendArgs.getInt32(8, true)).toBe(17);
+    expect(sendArgs.getUint32(12, true)).toBe(0);
+    expect(calls[0]!.heap).toEqual(new Uint8Array([1, 2, 3, 4, 5]));
+
+    const blockingRecv = new DataView(calls[1]!.args.buffer);
+    expect(blockingRecv.getInt32(8, true)).toBe(-1);
+    expect(blockingRecv.getUint32(12, true)).toBe(0);
+    expect(calls[1]!.heapLen).toBe(8);
+    const nonblockingRecv = new DataView(calls[2]!.args.buffer);
+    expect(nonblockingRecv.getInt32(8, true)).toBe(0);
+    expect(nonblockingRecv.getUint32(12, true)).toBe(1);
+    expect(calls[2]!.heapLen).toBe(12);
+  });
+
+  it("blocking ipc_recv crosses the production SAB park/wake bridge and decodes an fd-prefixed wake", () => {
+    const sab = new Uint8Array(new SharedArrayBuffer(SAB_SIZE));
+    const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
+    const wakeSlot = new Int32Array(new SharedArrayBuffer(32));
+    const backend = new SabBackend({ sab, pid: 7, kernelWakeSlot: wakeSlot });
+    const { memory, imports } = directRuntimeImports(backend);
+
+    type Wait = (
+      view: Int32Array,
+      index: number,
+      value: number,
+      timeout?: number,
+    ) => "ok" | "not-equal" | "timed-out";
+    const atomics = Atomics as unknown as { wait: Wait };
+    const originalWait = atomics.wait;
+    let waitCalls = 0;
+    atomics.wait = () => {
+      waitCalls += 1;
+      const heap = new Uint8Array(sab.buffer, OFF_HEAP_SCRATCH, 7);
+      new DataView(heap.buffer, heap.byteOffset, heap.byteLength).setUint32(0, 73, true);
+      heap.set([31, 32, 33], 4);
+
+      const response = new Uint8Array(32);
+      const fields = new DataView(response.buffer);
+      fields.setUint32(0, 0, true);
+      fields.setInt32(4, 0, true);
+      fields.setBigInt64(8, 3n, true);
+      fields.setUint32(16, 7, true);
+      new Uint8Array(sab.buffer, OFF_RES_RING, response.length).set(response);
+      Atomics.store(header, OFF_RES_HEAD / 4, 1);
+      Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+      return "ok";
+    };
+
+    try {
+      expect(imports.pmos_ext.ipc_recv(41, 128, 8, 160, 0)).toBe(3);
+    } finally {
+      atomics.wait = originalWait;
+    }
+
+    expect(waitCalls).toBe(1);
+    expect(new Uint8Array(memory.buffer).slice(128, 131)).toEqual(
+      new Uint8Array([31, 32, 33]),
+    );
+    expect(new DataView(memory.buffer).getInt32(160, true)).toBe(73);
+    const request = new DataView(sab.buffer, OFF_REQ_RING, 32);
+    expect(request.getUint16(0, true)).toBe(OP_EXT.IPC_RECV);
+    expect(request.getUint32(8 + 12, true)).toBe(0);
+    expect(request.getUint32(28, true)).toBe(12);
+  });
+
+  it("ipc send and recv validate every guest output before dispatch and accept exact-end ranges", () => {
+    let dispatches = 0;
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        dispatches += 1;
+        const len = request.args === undefined
+          ? 0
+          : new DataView(request.args.buffer, request.args.byteOffset).getUint32(4, true);
+        const payload = request.opcode === OP_EXT.IPC_RECV
+          ? Uint8Array.from({ length: len }, (_, index) => index + 1)
+          : new Uint8Array();
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: BigInt(request.opcode === OP_EXT.IPC_SEND ? heap?.length ?? 0 : len),
+            extraLen: payload.length,
+          },
+          heapOut: payload,
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend);
+    const end = memory.buffer.byteLength;
+    const send = imports.pmos_ext.ipc_send;
+    const recv = imports.pmos_ext.ipc_recv;
+
+    expect(send(3, end - 3, 4, -1, 0)).toBe(-ERRNO.EFAULT);
+    expect(send(3, -1, 1, -1, 0)).toBe(-ERRNO.EFAULT);
+    expect(send(3, 0, 1, -1, 1)).toBe(-ERRNO.EINVAL);
+    expect(recv(3, end - 3, 4, -1, 0)).toBe(-ERRNO.EFAULT);
+    expect(recv(3, 0, 1, end - 3, 0)).toBe(-ERRNO.EFAULT);
+    expect(recv(3, 0, 1, -1, 2)).toBe(-ERRNO.EINVAL);
+    expect(dispatches).toBe(0);
+
+    new Uint8Array(memory.buffer).set([21, 22, 23, 24], end - 4);
+    expect(send(3, end - 4, 4, -1, 0)).toBe(4);
+    expect(recv(3, end - 4, 4, -1, 0)).toBe(4);
+    expect(recv(3, end, 0, end - 4, 0)).toBe(0);
+    expect(new DataView(memory.buffer).getInt32(end - 4, true)).toBe(-1);
+    expect(dispatches).toBe(3);
+  });
+
+  it("ipc_send and ipc_recv cap transport heaps and retain owned send bytes", () => {
+    let guestBytes: Uint8Array;
+    const requests: Array<{ opcode: number; args: Uint8Array; heapLen: number }> = [];
+    let capturedSend = new Uint8Array();
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        requests.push({
+          opcode: request.opcode,
+          args: new Uint8Array(request.args ?? []),
+          heapLen: request.heapLen ?? 0,
+        });
+        if (request.opcode === OP_EXT.IPC_SEND) {
+          capturedSend = new Uint8Array(heap ?? []);
+          guestBytes[1024] = 0xff;
+          return {
+            response: {
+              requestId: request.requestId,
+              status: 0,
+              value: BigInt(capturedSend.length),
+              extraLen: 0,
+            },
+            heapOut: new Uint8Array(),
+          };
+        }
+        const len = new DataView(request.args!.buffer, request.args!.byteOffset)
+          .getUint32(4, true);
+        const out = Uint8Array.from({ length: len }, (_, index) => index & 0xff);
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: BigInt(len),
+            extraLen: len,
+          },
+          heapOut: out,
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend, 2);
+    guestBytes = new Uint8Array(memory.buffer);
+    guestBytes.fill(0x44, 1024, 41_024);
+
+    expect(imports.pmos_ext.ipc_send(3, 1024, 40_000, -1, 0)).toBe(
+      HEAP_SCRATCH_BYTES,
+    );
+    expect(capturedSend).toHaveLength(HEAP_SCRATCH_BYTES);
+    expect(capturedSend[0]).toBe(0x44);
+    expect(guestBytes[1024]).toBe(0xff);
+
+    expect(imports.pmos_ext.ipc_recv(4, 50_000, 40_000, 100_000, 1)).toBe(
+      HEAP_SCRATCH_BYTES - 4,
+    );
+    expect(requests[1]!.heapLen).toBe(HEAP_SCRATCH_BYTES);
+    const recvArgs = new DataView(requests[1]!.args.buffer);
+    expect(recvArgs.getUint32(4, true)).toBe(HEAP_SCRATCH_BYTES - 4);
+    expect(new DataView(memory.buffer).getInt32(100_000, true)).toBe(-1);
+    expect(guestBytes[50_000]).toBe(0);
+    expect(guestBytes[50_001]).toBe(1);
+  });
+
+  it("fd_read and fd_write reject malformed iovec and result ranges without dispatch", () => {
+    let dispatches = 0;
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        dispatches += 1;
+        const count = request.opcode === OP_WASI.FD_WRITE
+          ? heap?.length ?? 0
+          : request.heapLen ?? 0;
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: BigInt(count),
+            extraLen: request.opcode === OP_WASI.FD_READ ? count : 0,
+          },
+          heapOut: request.opcode === OP_WASI.FD_READ
+            ? new Uint8Array(count).fill(0x5a)
+            : new Uint8Array(),
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend);
+    const end = memory.buffer.byteLength;
+    const view = new DataView(memory.buffer);
+    const { fd_read: read, fd_write: write } = imports.wasi_snapshot_preview1;
+
+    expect(write(1, 0, -1, 32)).toBe(ERRNO.EINVAL);
+    expect(read(1, end - 7, 1, 32)).toBe(ERRNO.EFAULT);
+    expect(write(1, end, 0, end - 3)).toBe(ERRNO.EFAULT);
+    expect(read(1, end, 0, end - 3)).toBe(ERRNO.EFAULT);
+    view.setUint32(64, end - 3, true);
+    view.setUint32(68, 4, true);
+    expect(write(1, 64, 1, 80)).toBe(ERRNO.EFAULT);
+    expect(read(1, 64, 1, 80)).toBe(ERRNO.EFAULT);
+    expect(dispatches).toBe(0);
+
+    view.setUint32(64, end - 4, true);
+    view.setUint32(68, 4, true);
+    expect(write(1, 64, 1, 80)).toBe(0);
+    expect(read(1, 64, 1, 80)).toBe(0);
+    expect(view.getUint32(80, true)).toBe(4);
+    expect(new Uint8Array(memory.buffer).slice(end - 4)).toEqual(
+      new Uint8Array([0x5a, 0x5a, 0x5a, 0x5a]),
+    );
+    expect(write(1, end, 0, end - 4)).toBe(0);
+    expect(read(1, end, 0, end - 4)).toBe(0);
+    expect(dispatches).toBe(2);
+  });
+
+  it("sock_send gathers and sock_recv scatters real bounded WASI iovec arrays", () => {
+    const calls: Array<{ opcode: number; args: Uint8Array; heapLen: number; heap: Uint8Array }> = [];
+    const recvBytes = Uint8Array.from(
+      { length: 25_000 },
+      (_, index) => (index * 13 + 9) & 0xff,
+    );
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        calls.push({
+          opcode: request.opcode,
+          args: new Uint8Array(request.args ?? []),
+          heapLen: request.heapLen ?? 0,
+          heap: new Uint8Array(heap ?? []),
+        });
+        return request.opcode === OP_WASI.SOCK_SEND
+          ? {
+              response: {
+                requestId: request.requestId,
+                status: 0,
+                value: 30_000n,
+                extraLen: 0,
+              },
+              heapOut: new Uint8Array(),
+            }
+          : {
+              response: {
+                requestId: request.requestId,
+                status: 0,
+                value: BigInt(recvBytes.length),
+                extraLen: recvBytes.length,
+              },
+              heapOut: recvBytes,
+            };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend, 2);
+    const bytes = new Uint8Array(memory.buffer);
+    const view = new DataView(memory.buffer);
+    const firstSend = Uint8Array.from({ length: 20_000 }, (_, i) => i & 0xff);
+    const secondSend = Uint8Array.from({ length: 20_000 }, (_, i) => (i + 77) & 0xff);
+    bytes.set(firstSend, 1024);
+    bytes.set(secondSend, 22_000);
+    view.setUint32(64, 1024, true);
+    view.setUint32(68, firstSend.length, true);
+    view.setUint32(72, 22_000, true);
+    view.setUint32(76, secondSend.length, true);
+
+    expect(imports.wasi_snapshot_preview1.sock_send(41, 64, 2, 0, 100_000)).toBe(0);
+    expect(view.getUint32(100_000, true)).toBe(30_000);
+    expect(calls[0]!.heapLen).toBe(HEAP_SCRATCH_BYTES);
+    expect(calls[0]!.heap.slice(0, firstSend.length)).toEqual(firstSend);
+    expect(calls[0]!.heap.slice(firstSend.length)).toEqual(
+      secondSend.slice(0, HEAP_SCRATCH_BYTES - firstSend.length),
+    );
+
+    view.setUint32(64, 50_000, true);
+    view.setUint32(68, 10_000, true);
+    view.setUint32(72, 65_000, true);
+    view.setUint32(76, 30_000, true);
+    expect(imports.wasi_snapshot_preview1.sock_recv(42, 64, 2, 0, 100_000, 100_004)).toBe(0);
+    expect(calls[1]!.heapLen).toBe(HEAP_SCRATCH_BYTES);
+    expect(view.getUint32(100_000, true)).toBe(recvBytes.length);
+    expect(view.getUint16(100_004, true)).toBe(0);
+    expect(bytes.slice(50_000, 60_000)).toEqual(recvBytes.slice(0, 10_000));
+    expect(bytes.slice(65_000, 80_000)).toEqual(recvBytes.slice(10_000));
+    expect(new DataView(calls[0]!.args.buffer).getUint32(4, true)).toBe(0);
+    expect(new DataView(calls[1]!.args.buffer).getUint32(4, true)).toBe(0);
+  });
+
+  it("WASI socket and PMos fd-output imports prevalidate exact ranges before mutating backends", () => {
+    const opcodes: number[] = [];
+    const backend: KernelBackend = {
+      dispatch(request) {
+        opcodes.push(request.opcode);
+        if (request.opcode === OP_EXT.IPC_PIPE) {
+          const heapOut = new Uint8Array(8);
+          const view = new DataView(heapOut.buffer);
+          view.setUint32(0, 21, true);
+          view.setUint32(4, 22, true);
+          return {
+            response: { requestId: 0, status: 0, value: 0n, extraLen: 8 },
+            heapOut,
+          };
+        }
+        return {
+          response: {
+            requestId: request.requestId,
+            status: 0,
+            value: request.opcode === OP_WASI.SOCK_ACCEPT ? 23n : 0x1234n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend);
+    const end = memory.buffer.byteLength;
+    const wasi = imports.wasi_snapshot_preview1;
+    const ext = imports.pmos_ext;
+    const view = new DataView(memory.buffer);
+
+    expect(wasi.sock_accept(3, 0, end - 3)).toBe(ERRNO.EFAULT);
+    expect(wasi.sock_send(3, end - 7, 1, 0, 64)).toBe(ERRNO.EFAULT);
+    expect(wasi.sock_recv(3, end, 0, 0, end - 3, 64)).toBe(ERRNO.EFAULT);
+    expect(wasi.sock_recv(3, end, 0, 0, 64, end - 1)).toBe(ERRNO.EFAULT);
+    expect(ext.ipc_pipe(end - 7)).toBe(-ERRNO.EFAULT);
+    expect(ext.ipc_peer_caps(3, end - 7)).toBe(-ERRNO.EFAULT);
+    expect(ext.ipc_peer_caps(3, 0)).toBe(-ERRNO.EINVAL);
+    expect(ext.ipc_peer_pid(3, end - 3)).toBe(-ERRNO.EFAULT);
+    expect(ext.ipc_peer_pid(3, 0)).toBe(-ERRNO.EINVAL);
+    expect(opcodes).toHaveLength(0);
+
+    expect(wasi.sock_accept(3, 0, end - 4)).toBe(0);
+    expect(view.getUint32(end - 4, true)).toBe(23);
+    expect(ext.ipc_pipe(end - 8)).toBe(0);
+    expect(view.getUint32(end - 8, true)).toBe(21);
+    expect(view.getUint32(end - 4, true)).toBe(22);
+    expect(ext.ipc_peer_caps(3, end - 8)).toBe(0);
+    expect(view.getBigUint64(end - 8, true)).toBe(0x1234n);
+    expect(ext.ipc_peer_pid(3, end - 4)).toBe(0);
+    expect(view.getInt32(end - 4, true)).toBe(0x1234);
+    expect(opcodes).toEqual([
+      OP_WASI.SOCK_ACCEPT,
+      OP_EXT.IPC_PIPE,
+      OP_EXT.IPC_PEER_CAPS,
+      OP_EXT.IPC_PEER_PID,
+    ]);
+  });
+
+  it("socket flags retain their full u32 wire value and malformed wider values do not dispatch", () => {
+    const flagsSeen: number[] = [];
+    let queued = new Uint8Array([71, 72]);
+    const backend: KernelBackend = {
+      dispatch(request, heap) {
+        const flags = new DataView(
+          request.args!.buffer,
+          request.args!.byteOffset,
+        ).getUint32(4, true);
+        flagsSeen.push(flags);
+        if (flags === 0 && request.opcode === OP_WASI.SOCK_SEND) {
+          queued = new Uint8Array(heap ?? []);
+          return {
+            response: {
+              requestId: request.requestId,
+              status: 0,
+              value: BigInt(queued.length),
+              extraLen: 0,
+            },
+            heapOut: new Uint8Array(),
+          };
+        }
+        if (flags === 0 && request.opcode === OP_WASI.SOCK_RECV) {
+          const out = queued;
+          queued = new Uint8Array();
+          return {
+            response: {
+              requestId: request.requestId,
+              status: 0,
+              value: BigInt(out.length),
+              extraLen: out.length,
+            },
+            heapOut: out,
+          };
+        }
+        return {
+          response: {
+            requestId: request.requestId,
+            status: -ERRNO.EINVAL,
+            value: 0n,
+            extraLen: 0,
+          },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend);
+    const end = memory.buffer.byteLength;
+    const wasi = imports.wasi_snapshot_preview1;
+    const view = new DataView(memory.buffer);
+    view.setUint32(64, 128, true);
+    view.setUint32(68, 2, true);
+    view.setUint32(160, 0xfeed_beef, true);
+    view.setUint16(164, 0xabcd, true);
+
+    expect(wasi.sock_send(3, end, 0, 0x1_0000, end - 4)).toBe(ERRNO.EINVAL);
+    expect(wasi.sock_recv(3, 64, 1, 0x8000_0000, 160, 164)).toBe(ERRNO.EINVAL);
+    expect(flagsSeen).toEqual([0x1_0000, 0x8000_0000]);
+    expect(view.getUint32(160, true)).toBe(0xfeed_beef);
+    expect(view.getUint16(164, true)).toBe(0xabcd);
+    expect(wasi.sock_recv(3, 64, 1, 0, 160, 164)).toBe(0);
+    expect(new Uint8Array(memory.buffer).slice(128, 130)).toEqual(
+      new Uint8Array([71, 72]),
+    );
+    expect(view.getUint32(160, true)).toBe(2);
+    expect(view.getUint16(164, true)).toBe(0);
+    expect(wasi.sock_send(3, end, 0, 0x1_0000_0000, end - 4)).toBe(ERRNO.EINVAL);
+    expect(wasi.sock_recv(3, end, 0, -1, end - 4, end - 6)).toBe(ERRNO.EINVAL);
+    expect(flagsSeen).toEqual([0x1_0000, 0x8000_0000, 0]);
+  });
+
+  it("I/O shims preserve signed errno conventions and reject impossible success shapes", () => {
+    let mode: "positive-status" | "negative-status" | "oversized" | "bad-extra" =
+      "positive-status";
+    const backend: KernelBackend = {
+      dispatch(request) {
+        const status = mode === "positive-status"
+          ? ERRNO.EAGAIN
+          : mode === "negative-status"
+            ? -ERRNO.EAGAIN
+            : 0;
+        const value = mode === "oversized" ? 2n : 1n;
+        const extraLen = mode === "bad-extra" ? 2 : 0;
+        return {
+          response: { requestId: request.requestId, status, value, extraLen },
+          heapOut: mode === "bad-extra" ? new Uint8Array([99, 100]) : new Uint8Array(),
+        };
+      },
+    };
+    const { memory, imports } = directRuntimeImports(backend);
+    const bytes = new Uint8Array(memory.buffer);
+    const view = new DataView(memory.buffer);
+    bytes[128] = 7;
+    view.setUint32(64, 128, true);
+    view.setUint32(68, 1, true);
+    view.setUint32(160, 0xfeed_beef, true);
+
+    expect(imports.wasi_snapshot_preview1.fd_write(1, 64, 1, 160)).toBe(ERRNO.EIO);
+    expect(view.getUint32(160, true)).toBe(0xfeed_beef);
+    expect(imports.pmos_ext.ipc_send(3, 128, 1, -1, 0)).toBe(-ERRNO.EIO);
+
+    mode = "negative-status";
+    expect(imports.wasi_snapshot_preview1.fd_write(1, 64, 1, 160)).toBe(ERRNO.EAGAIN);
+    expect(imports.pmos_ext.ipc_send(3, 128, 1, -1, 0)).toBe(-ERRNO.EAGAIN);
+
+    mode = "oversized";
+    expect(imports.wasi_snapshot_preview1.sock_send(3, 64, 1, 0, 160)).toBe(ERRNO.EIO);
+    expect(view.getUint32(160, true)).toBe(0xfeed_beef);
+
+    mode = "bad-extra";
+    bytes[192] = 0xaa;
+    view.setInt32(196, 0x1234_5678, true);
+    expect(imports.pmos_ext.ipc_recv(3, 192, 1, 196, 0)).toBe(-ERRNO.EIO);
+    expect(bytes[192]).toBe(0xaa);
+    expect(view.getInt32(196, true)).toBe(0x1234_5678);
+  });
+
+  it("oversized bind, connect, and watch paths fail deterministically before transport dispatch", () => {
+    let dispatches = 0;
+    const backend: KernelBackend = {
+      dispatch(request) {
+        dispatches += 1;
+        return {
+          response: { requestId: request.requestId, status: 0, value: 40n, extraLen: 0 },
+          heapOut: new Uint8Array(),
+        };
+      },
+    };
+    const { imports } = directRuntimeImports(backend, 2);
+    const ext = imports.pmos_ext;
+
+    expect(ext.ipc_bind(3, 0, HEAP_SCRATCH_BYTES + 1)).toBe(-ERRNO.EINVAL);
+    expect(ext.ipc_connect(3, 0, HEAP_SCRATCH_BYTES + 1)).toBe(-ERRNO.EINVAL);
+    expect(ext.fs_watch(0, HEAP_SCRATCH_BYTES + 1, 1, 0)).toBe(-ERRNO.EINVAL);
+    expect(dispatches).toBe(0);
+
+    expect(ext.ipc_bind(3, 0, HEAP_SCRATCH_BYTES)).toBe(0);
+    expect(ext.ipc_connect(3, 0, HEAP_SCRATCH_BYTES)).toBe(0);
+    expect(ext.fs_watch(0, HEAP_SCRATCH_BYTES, 1, 0)).toBe(40);
+    expect(dispatches).toBe(3);
+  });
 });
+
+/**
+ * Build a tiny module that calls `pmos_ext.ipc_peer_caps(41, 8)`
+ * and drops the errno result. The test reads memory offset 8 after
+ * `_start` returns to verify the shim's out-pointer write.
+ */
+function buildPeerCapsProbeWasm(): ArrayBuffer {
+  const typeSection = section(1, [
+    0x02,
+    0x60,
+    0x02,
+    0x7f,
+    0x7f,
+    0x01,
+    0x7f, // (i32, i32) -> i32
+    0x60,
+    0x00,
+    0x00, // () -> ()
+  ]);
+  const importSection = section(2, [
+    0x01,
+    ...encodeString("pmos_ext"),
+    ...encodeString("ipc_peer_caps"),
+    0x00,
+    0x00,
+  ]);
+  const functionSection = section(3, [0x01, 0x01]);
+  const memorySection = section(5, [0x01, 0x00, 0x01]);
+  const exportSection = section(7, [
+    0x02,
+    ...encodeString("_start"),
+    0x00,
+    0x01,
+    ...encodeString("memory"),
+    0x02,
+    0x00,
+  ]);
+  const body = [
+    0x00, // no locals
+    0x41,
+    0x29, // i32.const 41 (fd)
+    0x41,
+    0x08, // i32.const 8 (out pointer)
+    0x10,
+    0x00, // call imported function 0
+    0x1a, // drop errno
+    0x0b,
+  ];
+  const codeSection = section(10, [0x01, body.length, ...body]);
+
+  return new Uint8Array([
+    0x00,
+    0x61,
+    0x73,
+    0x6d,
+    0x01,
+    0x00,
+    0x00,
+    0x00,
+    ...typeSection,
+    ...importSection,
+    ...functionSection,
+    ...memorySection,
+    ...exportSection,
+    ...codeSection,
+  ]).buffer as ArrayBuffer;
+}
+
+/**
+ * Build a tiny module that calls `pmos_ext.ipc_peer_pid(41, 8)`
+ * and drops the errno result. The test reads memory offset 8 after
+ * `_start` returns to verify the shim's signed i32 out-pointer write.
+ */
+function buildPeerPidProbeWasm(): ArrayBuffer {
+  const typeSection = section(1, [
+    0x02,
+    0x60,
+    0x02,
+    0x7f,
+    0x7f,
+    0x01,
+    0x7f, // (i32, i32) -> i32
+    0x60,
+    0x00,
+    0x00, // () -> ()
+  ]);
+  const importSection = section(2, [
+    0x01,
+    ...encodeString("pmos_ext"),
+    ...encodeString("ipc_peer_pid"),
+    0x00,
+    0x00,
+  ]);
+  const functionSection = section(3, [0x01, 0x01]);
+  const memorySection = section(5, [0x01, 0x00, 0x01]);
+  const exportSection = section(7, [
+    0x02,
+    ...encodeString("_start"),
+    0x00,
+    0x01,
+    ...encodeString("memory"),
+    0x02,
+    0x00,
+  ]);
+  const body = [
+    0x00, // no locals
+    0x41,
+    0x29, // i32.const 41 (fd)
+    0x41,
+    0x08, // i32.const 8 (out pointer)
+    0x10,
+    0x00, // call imported function 0
+    0x1a, // drop errno
+    0x0b,
+  ];
+  const codeSection = section(10, [0x01, body.length, ...body]);
+
+  return new Uint8Array([
+    0x00,
+    0x61,
+    0x73,
+    0x6d,
+    0x01,
+    0x00,
+    0x00,
+    0x00,
+    ...typeSection,
+    ...importSection,
+    ...functionSection,
+    ...memorySection,
+    ...exportSection,
+    ...codeSection,
+  ]).buffer as ArrayBuffer;
+}
 
 /**
  * Build a minimal wasm module whose `_start` calls

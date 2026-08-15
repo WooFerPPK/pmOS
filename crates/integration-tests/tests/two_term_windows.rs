@@ -49,14 +49,7 @@ const WIN_HEIGHT: u32 = 160;
 /// deferred until T118 follow-up slices decide on a proper
 /// bitmap source type — for the test we only need a plain
 /// byte-slice copy.
-fn blit_rgba(
-    canvas: &mut Canvas,
-    dest_x: i32,
-    dest_y: i32,
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-) {
+fn blit_rgba(canvas: &mut Canvas, dest_x: i32, dest_y: i32, src: &[u8], src_w: u32, src_h: u32) {
     assert_eq!(
         src.len(),
         (src_w as usize) * (src_h as usize) * TERM_BPP,
@@ -219,7 +212,11 @@ fn two_term_windows_compose_on_a_single_canvas() {
     // ---- wallpaper shows through the uncovered corners ----
 
     let wallpaper = [0x24, 0x26, 0x2b, 0xFF];
-    assert_eq!(px(&canvas, 0, 0), wallpaper, "top-left of canvas is wallpaper");
+    assert_eq!(
+        px(&canvas, 0, 0),
+        wallpaper,
+        "top-left of canvas is wallpaper"
+    );
     assert_eq!(
         px(&canvas, FB_WIDTH - 1, FB_HEIGHT - 1),
         wallpaper,
@@ -243,11 +240,7 @@ fn two_term_windows_compose_on_a_single_canvas() {
     // rasterizer's 4-pixel PADDING border where no glyph pixel ever
     // lands, regardless of what the scrollback contains.
     let content_a = frame_a.content_rect();
-    let sample_a = px(
-        &canvas,
-        (content_a.x + 1) as u32,
-        (content_a.y + 1) as u32,
-    );
+    let sample_a = px(&canvas, (content_a.x + 1) as u32, (content_a.y + 1) as u32);
     assert_eq!(
         sample_a, TERM_BG_BGRA,
         "window A terminal background bleeds through in the PADDING corner",
@@ -255,11 +248,7 @@ fn two_term_windows_compose_on_a_single_canvas() {
 
     // Same check on B's content rect, near its upper-left interior.
     let content_b = frame_b.content_rect();
-    let sample_b = px(
-        &canvas,
-        (content_b.x + 1) as u32,
-        (content_b.y + 1) as u32,
-    );
+    let sample_b = px(&canvas, (content_b.x + 1) as u32, (content_b.y + 1) as u32);
     assert_eq!(
         sample_b, TERM_BG_BGRA,
         "window B terminal background bleeds through in the PADDING corner",

@@ -18,18 +18,12 @@ pub fn run(_args: &[String]) -> Result<(), String> {
     let workspace = workspace_root();
     let pkgs = workspace.join("dist/pkgs");
     let staging = pkgs.join("staging");
-    fs::create_dir_all(&staging)
-        .map_err(|e| format!("mkdir {}: {}", staging.display(), e))?;
+    fs::create_dir_all(&staging).map_err(|e| format!("mkdir {}: {}", staging.display(), e))?;
     let mut copied = 0u32;
-    for entry in fs::read_dir(&pkgs)
-        .map_err(|e| format!("read_dir {}: {}", pkgs.display(), e))?
-    {
+    for entry in fs::read_dir(&pkgs).map_err(|e| format!("read_dir {}: {}", pkgs.display(), e))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if path
-            .extension()
-            .and_then(|s| s.to_str())
-            == Some("tar")
+        if path.extension().and_then(|s| s.to_str()) == Some("tar")
             && path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -37,9 +31,8 @@ pub fn run(_args: &[String]) -> Result<(), String> {
                 .unwrap_or(false)
         {
             let dest = staging.join(path.file_name().unwrap());
-            fs::copy(&path, &dest).map_err(|e| {
-                format!("cp {} -> {}: {}", path.display(), dest.display(), e)
-            })?;
+            fs::copy(&path, &dest)
+                .map_err(|e| format!("cp {} -> {}: {}", path.display(), dest.display(), e))?;
             copied += 1;
             println!("[xtask] push-sample: staged {}", dest.display());
         }

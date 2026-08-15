@@ -20,12 +20,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-grep-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-grep-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -214,7 +209,11 @@ fn without_dash_i_case_sensitive_still_holds() {
     let dir = scratch_dir("cs");
     let path = write_file(&dir, "a.txt", b"FOO\nfoo\n");
 
-    let out = Command::new(GREP).arg("foo").arg(&path).output().expect("spawn grep");
+    let out = Command::new(GREP)
+        .arg("foo")
+        .arg(&path)
+        .output()
+        .expect("spawn grep");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert_eq!(out.stdout, b"foo\n");

@@ -31,6 +31,10 @@ waitpid, signal-equivalent), display server connection, and capability
 management. No `fork()` — it does not map cleanly onto the Worker model
 and is explicitly out of scope.
 
+The v1 AF_UNIX-equivalent is STREAM-only. The DGRAM wire discriminant is
+reserved and rejected atomically with `ENOTSUP`; message-oriented IPC needs a
+separately versioned source/destination and record-semantics contract.
+
 **Persistence**: root filesystem is backed by OPFS via
 `FileSystemSyncAccessHandle` (the only browser-local storage API that
 gives synchronous access, which is required to implement blocking
@@ -63,6 +67,12 @@ built from the same Cargo workspace.
 **Build**: a single Cargo workspace for Rust, a tiny TypeScript source
 tree for the JS bootstrap / drivers / service worker, orchestrated by
 a Justfile that produces a static deploy directory.
+
+**Milestone nomenclature**: the repository defines M1.1 through M1.6 only for
+the multi-process substrate in `tasks.md`. It has no normative global M0–M4
+roadmap; M3 labels elsewhere are historical prose. The operative final
+validation sequence is T238 through T241, while T218 separately owns tagging
+and deployment.
 
 ## Technical Context
 
@@ -156,7 +166,8 @@ is its own category and the directory layout reflects that.
 - No multi-window-per-app. One top-level surface per app; popups are
   fine.
 - English only; UTF-8 everywhere.
-- No package signing or verification in v1 (documented non-goal).
+- No package signing or author authentication in v1. The installer does verify
+  tar headers and manifest-declared SHA-256 payload integrity before mutation.
 
 **Scale/Scope**:
 - Bundled v1 consists of: kernel, init, display server, toolkit
@@ -203,8 +214,8 @@ under **Known Deviations** with justification.
 | III | Browser-only, zero backend | **PASS** | Deploy is a static file directory. No backend, no accounts, no telemetry, no origin-side dynamic behaviour. Net stack for user programs is `fetch()`+WebSocket, invoked only by user code. |
 | IV | Offline-first and persistent | **PASS** | Service worker caches the entire OS bundle; OPFS holds the root filesystem. Subsequent loads require no network. |
 | V | Process isolation is mandatory | **PASS** | Each userland process is a distinct WASM instance in its own Worker. WASM linear memory is physically separate — this is **stronger** than conventional OS process isolation because it is enforced at the execution-substrate level, not by MMU page tables a compromised kernel could tamper with. All IPC goes through the kernel ring-buffer transport and through kernel-owned pipe/socket buffers. |
-| VI | Standard syscall surface (WASI-based) | **PASS** | WASI preview 1 is the baseline. Extension syscalls are limited to: IPC endpoint/connect/send/recv with fd passing; `spawn`/`waitpid`/signal-equivalent (no `fork`); display server connect; capability query/grant; `mount`/`umount` (new-filesystem registration); `fs_watch` (preferences-change delivery — the settings app writes `/etc/preferences.toml`, the toolkit and desktop shell watch it, per `contracts/syscalls.md §3.7`); `host_file_recv` (the bootstrap's drag-drop / file-picker handler surfaces a host `File` to the file-manager process as a read-only fd — a JS-to-kernel driver channel, opcode 0x1500, documented in `contracts/syscalls.md §3.6`). Each extension is documented in `contracts/syscalls.md` with an explicit "why WASI does not cover this" justification. |
-| VII | Protocol over API for the display server | **PASS** | Clients connect to `/run/display` (a Unix-socket-equivalent IPC endpoint) and speak a Wayland-inspired wire protocol. The toolkit is a convenience library that speaks the same protocol. A hand-written toolkit-free client is explicitly scheduled as a v1 integration test to prove the protocol is the source of truth. |
+| VI | Standard syscall surface (WASI-based) | **PASS** | WASI preview 1 is the baseline. Extension syscalls are limited to: IPC endpoint/connect/send/recv with fd passing and fd-scoped `SO_PEERCRED`-equivalent capability/pid queries; `spawn`/`waitpid`/signal-equivalent (no `fork`); display server connect; capability query/grant; `mount`/`umount`; `fs_watch` (used by production preference consumers through the stable-parent/current-inode path in `contracts/preferences.md`); and `host_file_recv` for capability-scoped host-file import. WASI has no AF_UNIX peer-credential query; `ipc_peer_caps`/`ipc_peer_pid` are necessary so IPC services authenticate the connected process without trusting protocol claims or exposing arbitrary process inspection. Each extension is documented in `contracts/syscalls.md` with an explicit "why WASI does not cover this" justification. |
+| VII | Protocol over API for the display server | **PASS** | Clients connect to `/run/display` and speak the documented Wayland-inspired protocol. The toolkit is a convenience library over those bytes. The hand-written `toolkit-free-client` now drives the shipped collapsed-v1 protocol through a real WASI fd; native server isolation covers the state machine and a recorded separately isolated Chromium/Firefox Worker run is the required production qualification. |
 | VIII | Bottom-up construction | **PASS** | Task graph (built in `/speckit.tasks`) will order: kernel (tested headless) → drivers (tested with mock kernel) → display server (tested with mock client + mock framebuffer) → toolkit (tested against mock display server) → desktop shell → bundled apps. No layer starts before the layer below it is demonstrably working and covered by isolation tests. |
 | IX | Performance budget | **PASS (monitored)** | Cold < 10 s, warm < 3 s, input < 100 ms are the plan's budgets. Design choices that respect the budget: main thread reserved for driver event loop and framebuffer `putImageData` (kernel in its own Worker); SAB + Atomics.wait avoids postMessage overhead on hot syscall paths; OPFS SyncAccessHandle avoids the async overhead of IndexedDB; service worker makes warm load cache-only. Each task MUST state its expected budget impact. |
 | X | Testability at every layer | **PASS** | Kernel compiles to the host target via a `Platform` abstraction for `cargo test`. Display server has mock-client + mock-framebuffer test mode. Toolkit has mock-display-server test mode. Drivers have Vitest + mock kernel. Playwright integration covers the full stack, including the layering test. A change that breaks isolation tests is rejected before integration. |
@@ -228,7 +239,8 @@ specs/001-browser-os-v1/
 │   ├── display-protocol.md   # wire protocol (objects, opcodes, events)
 │   ├── driver-kernel.md      # driver ↔ kernel postMessage + SAB contract
 │   ├── package-manifest.md   # manifest.toml schema + bundle layout
-│   └── init-conf.md          # /etc/init.conf schema
+│   ├── init-conf.md          # /etc/init.conf schema
+│   └── preferences.md        # /etc/preferences.toml + live reader semantics
 ├── checklists/
 │   └── requirements.md  # Spec quality checklist (already written)
 └── tasks.md             # Phase 2 output — NOT created by /speckit.plan
@@ -387,10 +399,10 @@ GitHub Pages via CF Worker / S3+CloudFront), integration tooling
   `mount`/`umount`), each with a request/response signature and a
   "why WASI doesn't cover this" paragraph.
 - [`contracts/display-protocol.md`](./contracts/display-protocol.md)
-  — wire framing, object-ID allocation, the thirteen core object
-  types (display, registry, compositor, shm, shm_pool, buffer,
-  surface, xdg_wm_base, xdg_surface, xdg_toplevel, xdg_popup,
-  seat, pointer, keyboard, callback), the `pmd_shell_manager`
+  — wire framing, object-ID allocation, the shipped display,
+  registry, compositor, shm/pool/buffer, surface, collapsed
+  `pmd_xdg_shell`/toplevel, seat, pointer, keyboard, and callback
+  objects; explicitly reserved post-v1 xdg/output/keymap objects; the `pmd_shell_manager`
   extension for the desktop shell (with the `window_added` replay
   semantics that make the layering test pass), the error-code
   table, and the toolkit-free conformance client.
@@ -407,6 +419,13 @@ GitHub Pages via CF Worker / S3+CloudFront), integration tooling
   `/etc/init.conf` schema, boot sequence, shell respawn policy,
   and the documented path by which a replacement shell binary
   reattaches to the running system.
+- [`contracts/preferences.md`](./contracts/preferences.md) —
+  canonical preference schema, atomic Settings writes, safe fallback,
+  and the desktop shell's bounded live-reload and clock semantics.
+- [`contracts/session-state.md`](./contracts/session-state.md) —
+  bounded catalog-backed session capture, authenticated window identity,
+  atomic shell-owned persistence, the display restore transaction, and the
+  tab-reopen acceptance boundary required by Constitution Principle IV.
 - [`quickstart.md`](./quickstart.md) — developer onboarding:
   prerequisites, `just build` / `just dev` / `just test`,
   worked example of a "hello" toolkit app, the same app written
@@ -430,30 +449,41 @@ principles during research.
 | I | Real OS, not a simulation | **PASS** | `data-model.md` defines `Process`, `FdTable`, `Vnode`, `Mount`, `Pipe`, `Socket`, `CapSet`, and `/proc` — the textbook inventory. `syscalls.md` exposes them through a POSIX-style surface. The kernel module tree in plan.md has no UI directories: `proc/`, `fd/`, `vfs/`, `fs/`, `ipc/`, `syscall/`, `cap/`, `dev/`. No window, no button, no DOM. |
 | II | Strict layering, no shortcuts | **PASS** | Enforced at three distinct levels: (a) **module tree** — kernel has no display concerns, display server has no toolkit import, toolkit is a library with no privileged access; (b) **capability check** — only `DISPLAY_SERVER` may open `/dev/fb0` and `/dev/input/*`; only `SHELL` may bind `pmd_shell_manager`; (c) **protocol replay** — `display-protocol.md §15` specifies that a subscriber replays `window_added` for every live top-level on subscribe, which is precisely what makes the shell-replacement layering test pass. The test is cited as a first-class Playwright integration test in `quickstart.md §4.5` and is wired into the `just test-integration` target. |
 | III | Browser-only, zero backend | **PASS** | `quickstart.md §8` documents static-only deployment on four hosts. No contract, no data model, and no driver references a backend or an account system. The net driver uses `fetch()` and WebSocket, both initiated only by user programs that hold `NET` capability. |
-| IV | Offline-first and persistent | **PASS** | `research.md` decision on the service worker (versioned precache, cache-first) + OPFS root filesystem with journaling for abrupt-close consistency. `data-model.md §3.3` specifies the OPFS layout with a journal for crash consistency (FR-014). Integration test `offline-boot.spec.ts` is on the scheduled test list. |
+| IV | Offline-first and persistent | **PASS** | The service worker installs a content-addressed generation by verifying and caching one asset at a time, then writes its ready marker last; fetches ignore partial generations. OPFS provides the root filesystem with journaling for abrupt-close consistency, and the browser gates perform real guest write/remount/read and forced-kernel-termination workflows. `contracts/session-state.md`, display-server restore-transaction isolation, and `session-restore.spec.ts` additionally prove that six durable application windows, geometry/state, stacking, and focus restore before warm readiness. |
 | V | Process isolation is mandatory | **PASS** | `research.md` decision on WASM-in-Workers: each process is a distinct WASM Instance in a distinct Worker with a distinct linear memory. Isolation is physical and enforced by the execution substrate. The `process-isolation.spec.ts` integration test (in `quickstart.md §4.5`) runs an adversarial test program that attempts to read foreign memory through every non-IPC channel; every attempt must fail. All IPC is kernel-mediated through kernel-owned `Pipe` and `Socket` structures. |
-| VI | Standard syscall surface | **PASS** | `syscalls.md` pins WASI preview 1 as the baseline and enumerates every extension syscall with an explicit "why WASI doesn't cover this" paragraph. A single `ABI_VERSION` constant in the `abi` crate gates process spawn; mismatched versions fail with `ENOABIVER`. The extension set is deliberately minimal: IPC (AF_UNIX + fd passing), `proc_spawn`/`proc_wait`/`proc_kill`, `display_connect` (for the capability short-circuit), and `cap_*`. |
-| VII | Protocol over API for the display server | **PASS** | `display-protocol.md` is the source of truth. The toolkit is a library (see project structure), not a process, and statically linked. §18 specifies the toolkit-free conformance client and requires it to be an integration-test fixture that runs in every build. `quickstart.md §6` shows the worked example of writing an app with no toolkit at all. If the toolkit-free client ever stops working, the integration suite fails before any tagged release. |
-| VIII | Bottom-up construction | **PASS** | Confirmed in `plan.md` "Project Structure" (crates listed from infrastructure up), in `research.md` (kernel `Platform` trait lets `cargo test` exercise the kernel before any display code exists), in `quickstart.md §4` (four distinct test layers, run in order), and in the forthcoming task-graph ordering. The "kernel testable with no graphics" gate is explicitly `just test-kernel`. |
-| IX | Performance budget | **PASS (monitored)** | Budgets remain cold < 10 s, warm < 3 s, input < 100 ms. Design decisions that support them: (a) kernel in its own Worker so the main thread is free for compositor presentation; (b) SAB + `Atomics.wait` avoids `postMessage` overhead on hot syscall paths; (c) OPFS `SyncAccessHandle` avoids IndexedDB async overhead for file I/O; (d) software compositor's worst case (1920×1080 ARGB blit) stays inside one frame on the target machine class; (e) service worker precache makes warm load local-only. **Task-graph obligation**: every task MUST state its expected performance impact. Any task whose estimate blows a budget is rejected or must be accompanied by an approved deviation. |
-| X | Testability at every layer | **PASS** | Four isolation test layers are named in `quickstart.md §4` and each has a `just` target. The kernel builds for the host target via its `Platform` trait. The display server runs its tests against a mock client and mock framebuffer. The toolkit runs its tests against a mock display server. Drivers run with a mock kernel ring. Integration (Playwright) is additional, never a substitute. The `layering-test.spec.ts` is called out as the Principle II acceptance gate and is part of `just test-integration`. |
+| VI | Standard syscall surface | **PASS** | `syscalls.md` pins WASI preview 1 as the baseline and enumerates every extension syscall with an explicit "why WASI doesn't cover this" paragraph. A single `ABI_VERSION` constant in the `abi` crate gates process spawn; mismatched versions fail with `ENOABIVER`. The documented extension set is deliberately scoped to IPC/process/display/capability operations, privileged mount/watch/metadata operations, and capability-scoped host-file transfer. WASI cannot express Unix peer credentials; the added pid query names no arbitrary process and only reads the immutable credentials of a connected fd. |
+| VII | Protocol over API for the display server | **PASS** | `display-protocol.md` records the shipped display interfaces and v2 authoritative restore transaction. `toolkit-free-client` has only the shared protocol codec as a runtime dependency. Its native test drives a real `display_server::Server`; `toolkit-free-client.spec.ts` launches `/bin/toolkit-free-client` in its own Worker and requires registry discovery, configure, pixels, keyboard input, close cleanup, and Worker exit. The canonical and exact-source Ubuntu Chromium/Firefox runs pass; source presence is not substituted for browser evidence. |
+| VIII | Bottom-up construction | **PASS** | Confirmed in `plan.md` "Project Structure" (crates listed from infrastructure up), in `research.md` (kernel `Platform` trait lets `cargo test` exercise the kernel before any display code exists), in `quickstart.md §4` (four distinct test layers, run in order), and in `tasks.md`'s bottom-up task-graph ordering. The "kernel testable with no graphics" gate is explicitly `just test-kernel`. |
+| IX | Performance budget | **PASS (continuously gated)** | The canonical local record measured cold desktop at 2029/2119 ms, offline warm at 611/1488 ms, standard input p95 at 3.3/33.7 ms, typical six-app p95 at 17.8/55.3 ms, and restored warm/input p95 at 504.5 ms/3.8 ms and 1105.4 ms/36.1 ms (Chromium/Firefox). All are inside the hard budgets. Four idle runs completed all 12 comparisons at `<= 2%` of one core. The native 2 us sink remains supplemental. Exact values and methodology live in `perf-results.md`. |
+| X | Testability at every layer | **PASS** | `just test` gates formatting, strict workspace Clippy, every Rust workspace test, strict TypeScript compilation, dependency audit, Vitest, Playwright, idle CPU, and the supplemental perf harness. The source-bound local log (SHA-256 `956653f04b70ff44c28c028a6334d18bdf9acb9632ab3bb2e2667de4eaa8d713`) and Ubuntu log (SHA-256 `358a80a829abc7d1a05c98907d2e1ce87d947361593f64037a4fde5e59c2cbb3`) record complete passes, including 34/767 Vitest and 63/63 Playwright. Browser integration remains additional evidence rather than a substitute for layer isolation. |
+
+**V1 IPC scope clarification**: Principle VI remains PASS with STREAM-only
+AF_UNIX-equivalent IPC. Rejecting the reserved DGRAM value is allocation-free
+and avoids exposing undocumented pseudo-datagram semantics through the stream
+listen/accept and byte-queue model.
 
 **Result**: all ten principles PASS on the post-design check. The
 plan is internally consistent, and each Phase 1 artefact reinforces
 (rather than relaxes) the gates from the pre-Phase-0 check.
 
-### Known Deviations (Phase 2 implementation drift)
+**Principle IX impact of this reconciliation**: zero. These are documentation
+updates made after executable validation; they introduce no runtime work.
 
-All ten principles still PASS. The deviations below are not
-principle violations — they are places where the Phase 2
-implementation's module layout drifted from the `plan.md`
-"Project Structure" section during bottom-up construction. They
-are recorded here (per the constitution's "Deviation log"
-requirement: deviations MUST live in the plan that introduced
-them) so that a future reader looking for the originally-planned
-structure understands where the code actually lives and why.
-Tasks.md Phase 2 carries per-T-ID deviation notes; this block
-is the deviation **register** the constitution refers to.
+### Known Deviations (implementation drift and release blockers)
+
+Principles I–X PASS for the declared release substrates. Chromium and
+Firefox expose the synchronous OPFS primitives PMos requires and run the
+canonical persistent-root gate. A browser that does not expose those
+primitives is rejected by the pre-boot capability probe with a visible
+unsupported-browser screen; it is not allowed to boot a desktop that can
+silently lose user data. Item 7 records that resolved scope decision and the
+separate future work required before Safari/WebKit can be claimed. The earlier
+entries are module-layout drift from the `plan.md` "Project Structure" section.
+They are recorded here (per the constitution's "Deviation log"
+requirement: deviations MUST live in the plan that introduced them)
+so that a future reader can distinguish deliberate structure from an
+unresolved product gap. Tasks.md carries matching per-task notes;
+this block is the deviation **register** the constitution refers to.
 
 1. **`crates/display-proto/` crate extraction** — a shared
    protocol codec crate was extracted out of `display-server/`
@@ -464,10 +494,10 @@ is the deviation **register** the constitution refers to.
    (object-ID allocator) + the message-layout work implicit in
    T100–T105. Tests at `crates/display-proto/tests/`. **Future
    protocol work belongs in `display-proto`.** `display-proto/`
-   is implicitly in the layer catalogue at "display server"
-   since it is just an internal split of that layer — nothing
-   above the display server may depend on it except via the
-   toolkit (which already may, per the layer catalogue).
+   is the shared codec and type vocabulary at the documented display-protocol
+   boundary, not a server-internal API. Any client may use that codec or
+   implement the wire format directly; clients still reach the display server
+   only through IPC and cannot call its implementation internals.
 
 2. **`crates/kernel/src/sys.rs` + the `Kernel` struct** —
    rather than building the syscall dispatcher first (T071 /
@@ -488,30 +518,22 @@ is the deviation **register** the constitution refers to.
    ~620 lines) that speaks directly to `display-proto`,
    independent of T114's `App::connect`. T114 is now framed as
    a thin facade extraction over `protocol.rs`, not a
-   reimplementation. `theme.rs` ships ahead of its nominal home
-   (T184, the settings app) because `WindowFrame` needs theme
-   colours to paint chrome — the theme struct + default
-   light/dark palettes live there now. Settings-app integration
-   remains T184; `theme.rs` today is just the data model +
-   defaults.
+   reimplementation. `theme.rs` originally shipped ahead of its
+   nominal home because `WindowFrame` needed theme colours. That
+   staging gap is now closed: Settings persists the selected
+   palette and toolkit applications can opt into the bounded VFS
+   `ThemeWatcher`; Sysmon is the release reference that repaints
+   the same running process after a change.
 
-4. **`crates/term/` + the TypeScript preview slice** —
-   `crates/term/` and the TS files
-   `web/src/{terminal,mock-kernel,console-host,console-check,fb-host}.ts`
-   + `web/src/shared/{rasterizer,font,worker-proto,input-proto}.ts`
-   are a visible-progress demo slice built before real kernel
-   IPC (T072) and the real `/run/display` accept loop (T110)
-   exist. The code is real and tested but the wiring is
-   **preview-only**: the TS rasterizer paints directly into
-   `fb.ts` instead of going through a
-   `display-server`→`fb` path, `mock-kernel.ts` stands in for a
-   real kernel Worker, and `term::Session` paints through a
-   bespoke `rasterize_snapshot` rather than through
-   `toolkit::draw::Canvas`. **Reconciliation required** when
-   T091 (real kernel Worker) and T110 (`/run/display` accept
-   loop) land. The T091 arm has landed via T230–T235 (see
-   deviation #5 below); the T110 arm + the `term` → `Canvas`
-   migration remain.
+4. **Retired terminal preview wiring** — the early browser-side
+   terminal and mock-kernel path has been removed from production.
+   `/bin/term` now runs in its own user Worker, connects through
+   kernel-mediated `/run/display`, paints with the Rust toolkit
+   rasterizer and buffer pool, and delegates committed command
+   lines to a persistent isolated `/bin/sh` over real kernel pipes.
+   Only the display server touches `/dev/fb0`. This historical item
+   remains solely to explain why older task notes name deleted
+   TypeScript terminal modules; it is no longer a release deviation.
 
 5. **Multi-process substrate (M1) sub-slices T230–T235** —
    an earlier Phase 2 implementation ran every user wasm
@@ -565,7 +587,31 @@ is the deviation **register** the constitution refers to.
    drivers (`console.ts`, `fb.ts`, `input.ts`) to import from
    `common.ts` is a separate follow-up slice.
 
+7. **Resolved release scope / future Safari-WebKit support (Principle IV)** —
+   Chromium and Firefox expose `FileSystemSyncAccessHandle` in the
+   dedicated storage Worker and pass the production OPFS-at-`/`
+   fresh-kernel restart gate. The Playwright WebKit runtime exposes no OPFS API
+   at all, so it cannot satisfy the v1 persistent-root contract. PMos now
+   detects that missing substrate before starting the kernel and displays a
+   stable unsupported-browser screen. The WebKit Playwright project gates that
+   stop screen; it does not run or count desktop workflows as passes. This
+   closes the v1 release blocker without weakening Principle IV: every browser
+   PMos labels supported must pass the same `/home/user` write/restart/read
+   acceptance test. T236 remains a post-v1 compatibility enhancement: add an
+   async-OPFS bridge (or another safe persistent design) and only then add
+   Safari/WebKit to the supported matrix.
+
+8. **Retired historical preference-poll deviation** — Settings still writes
+   `/etc/preferences.toml` through staged atomic rename and durability sync,
+   but production consumers no longer use the former 100 ms preference poll.
+   Shell, display-server, and opted-in toolkit paths use `fs_watch` on both the
+   stable parent and current inode, bounded ready-event drains, rename re-arming,
+   and last-good retention. Deterministic native fixture/fallback seams may
+   advance an injected poll clock, but no production preference timer or
+   preference value over the display protocol remains. This item is retained
+   only to explain the historical landing notes; it is not a current deviation.
+
 ### Planning Complete
 
-`/speckit.plan` is finished. The feature is ready for
-`/speckit.tasks` to generate the bottom-up task graph.
+`/speckit.plan` is finished. The generated bottom-up task graph and its release
+evidence are tracked in `tasks.md`; T218 remains the separate tag/deploy step.

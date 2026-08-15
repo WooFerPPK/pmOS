@@ -21,7 +21,6 @@ name = "toolkit-free-client"
 path = "src/main.rs"
 
 [dependencies]
-abi = { path = "../abi" }
 display-proto = { path = "../display-proto" }
 
 [dev-dependencies]

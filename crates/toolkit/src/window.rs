@@ -36,9 +36,10 @@ use display_proto::events::{XdgToplevelClose, XdgToplevelConfigure};
 use display_proto::ids::ObjectId;
 use display_proto::objects::Interface;
 use display_proto::wire::WireError;
+use std::time::Duration;
 
 use crate::app::App;
-use crate::protocol::{ClientError, ClientEventWithPayload, Connection};
+use crate::protocol::{ClientError, ClientEventWithPayload, Connection, WaitFd};
 
 /// A top-level application window.
 ///
@@ -85,6 +86,10 @@ pub struct Window<'a, C: Connection> {
     /// configure(... states)`. Decoded against
     /// [`display_proto::xdg_toplevel_state`] bits.
     states: u32,
+    /// Whether the most recent dispatch batch contained a configure with the
+    /// `RESIZING` bit. A final configure in the same batch can clear that bit,
+    /// while clients still need to recognize the resize transition.
+    resizing_seen_in_last_dispatch: bool,
     /// `true` iff the server has emitted
     /// `xdg_toplevel::close`.
     close_requested: bool,
@@ -124,6 +129,7 @@ impl<'a, C: Connection> Window<'a, C> {
             configured_size: (0, 0),
             configured: false,
             states: 0,
+            resizing_seen_in_last_dispatch: false,
             close_requested: false,
         })
     }
@@ -176,11 +182,10 @@ impl<'a, C: Connection> Window<'a, C> {
     ///   callbacks + input events (future slices).
     pub fn dispatch(&mut self) -> Result<Vec<ClientEventWithPayload>, ClientError> {
         let events = self.app.dispatch()?;
+        self.resizing_seen_in_last_dispatch = false;
         let mut passthrough = Vec::with_capacity(events.len());
         for event in events {
-            if event.object_id == self.xdg_toplevel
-                && event.interface == Interface::XdgToplevel
-            {
+            if event.object_id == self.xdg_toplevel && event.interface == Interface::XdgToplevel {
                 match event.opcode {
                     1 /* configure */ => {
                         let decoded = XdgToplevelConfigure::decode(&event.payload)
@@ -190,6 +195,8 @@ impl<'a, C: Connection> Window<'a, C> {
                         self.configured_size = (width, height);
                         self.configured = true;
                         self.states = decoded.states;
+                        self.resizing_seen_in_last_dispatch |=
+                            decoded.states & display_proto::xdg_toplevel_state::RESIZING != 0;
                         self.app
                             .client_mut()
                             .xdg_toplevel_ack_configure(self.xdg_toplevel, decoded.serial)?;
@@ -207,6 +214,30 @@ impl<'a, C: Connection> Window<'a, C> {
             passthrough.push(event);
         }
         Ok(passthrough)
+    }
+
+    pub fn flush_outbound(&mut self) -> Result<(), ClientError> {
+        self.app.flush_outbound()
+    }
+
+    pub fn outbound_pending(&self) -> bool {
+        self.app.outbound_pending()
+    }
+
+    /// Park until a display event is readable or `timeout` expires. Call only
+    /// after the current iteration has completed all queued work and paint.
+    pub fn wait(&mut self, timeout: Option<Duration>) -> Result<(), ClientError> {
+        self.app.wait(timeout)
+    }
+
+    /// Park on display readability, application-owned descriptors, and an
+    /// optional real-duty timer after all queued work has been drained.
+    pub fn wait_with(
+        &mut self,
+        additional: &[WaitFd],
+        timeout: Option<Duration>,
+    ) -> Result<(), ClientError> {
+        self.app.wait_with(additional, timeout)
     }
 
     /// True iff the server has sent at least one
@@ -229,6 +260,13 @@ impl<'a, C: Connection> Window<'a, C> {
     /// app wants before destroying the `Window`.
     pub fn close_requested(&self) -> bool {
         self.close_requested
+    }
+
+    /// Consume one pending close request. Applications with an unsaved-work
+    /// prompt use this edge-triggered form so cancelling the prompt does not
+    /// immediately observe the same server event again.
+    pub fn take_close_requested(&mut self) -> bool {
+        core::mem::take(&mut self.close_requested)
     }
 
     /// The most-recent state bitfield from
@@ -255,6 +293,18 @@ impl<'a, C: Connection> Window<'a, C> {
     /// included the `ACTIVATED` state bit (keyboard focus).
     pub fn is_activated(&self) -> bool {
         (self.states & display_proto::xdg_toplevel_state::ACTIVATED) != 0
+    }
+
+    /// True iff the most-recent configure included the `RESIZING` state bit.
+    pub fn is_resizing(&self) -> bool {
+        (self.states & display_proto::xdg_toplevel_state::RESIZING) != 0
+    }
+
+    /// True iff any configure consumed by the most recent [`Window::dispatch`]
+    /// included `RESIZING`, even if the batch ended with a configure that
+    /// cleared it.
+    pub fn resizing_seen_in_last_dispatch(&self) -> bool {
+        self.resizing_seen_in_last_dispatch
     }
 
     /// Send `pmd_xdg_toplevel.set_maximized()` — ask the
@@ -300,11 +350,7 @@ impl<'a, C: Connection> Window<'a, C> {
     /// `RIGHT`) or one of the four corner combinations
     /// (`TOP_LEFT` / `TOP_RIGHT` / `BOTTOM_LEFT` /
     /// `BOTTOM_RIGHT`).
-    pub fn request_resize(
-        &mut self,
-        serial: u32,
-        edges: u32,
-    ) -> Result<(), ClientError> {
+    pub fn request_resize(&mut self, serial: u32, edges: u32) -> Result<(), ClientError> {
         self.app
             .client_mut()
             .xdg_toplevel_resize(self.xdg_toplevel, serial, edges)

@@ -4,7 +4,8 @@
 //! `/proc/meminfo`, `/proc/loadavg`, `/proc/storage` — plus a
 //! per-pid subtree under `/proc/<pid>/` that surfaces live
 //! process-table fields. Populated in this slice:
-//! `/proc/<pid>/status` (Name / State / Pid / PPid / VmSize / VmPeak),
+//! `/proc/<pid>/status` (Name / State / Pid / PPid / VmSize / VmPeak /
+//! optional FDCount),
 //! `/proc/<pid>/fd/<n>` symlinks describing each open file
 //! descriptor, and `/proc/<pid>/cmdline` with the process's
 //! NUL-separated argv. Follow-up slices add `stat`, `maps`,
@@ -351,6 +352,7 @@ impl<'a> ProcFsSource for KernelProcFsSource<'a> {
             state: proc_state_to_status(proc.state),
             vm_size_bytes: proc.vm_size_bytes,
             vm_peak_bytes: proc.vm_peak_bytes,
+            open_fds: None,
         })
     }
 
@@ -426,6 +428,10 @@ pub struct ProcStatusSnapshot {
     pub state: ProcStatusState,
     pub vm_size_bytes: u64,
     pub vm_peak_bytes: u64,
+    /// Exact number of open descriptors when the source can project it
+    /// without enumerating `/proc/<pid>/fd`. Static and process-table-only
+    /// sources may omit this field; the live kernel source always supplies it.
+    pub open_fds: Option<usize>,
 }
 
 /// A snapshot of one open file descriptor in a process, as
@@ -483,6 +489,26 @@ pub const FD_INO_BASE: Ino = 100_000_000;
 /// WASI-facing cap we plan to ship in v1 (RLIMIT_NOFILE default is
 /// 256, so 1024 is 4× headroom).
 pub const FD_PID_STRIDE: Ino = 1024;
+
+/// Logical procfs node identified by one procfs-local inode or canonical
+/// `/proc` path. The wasm entry seam uses this classification before syscall
+/// dispatch so it can snapshot only the kernel fields that the impending VFS
+/// operation may consult.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProcFsNode {
+    Root,
+    Version,
+    Uptime,
+    Meminfo,
+    Loadavg,
+    Storage,
+    PidDir(Pid),
+    PidStatus(Pid),
+    PidFdDir(Pid),
+    PidCmdline(Pid),
+    PidMaps(Pid),
+    PidFd(Pid, u32),
+}
 
 /// Map a pid to its directory ino (slot 0 within its stride).
 #[inline]
@@ -543,11 +569,86 @@ fn decode_fd_ino(ino: Ino) -> Option<(Pid, u32)> {
     Some((pid, fd))
 }
 
+/// Classify a procfs-local inode without consulting the source or mutating the
+/// VFS. Reserved per-pid slots deliberately return `None`.
+pub fn classify_procfs_ino(ino: Ino) -> Option<ProcFsNode> {
+    match ino {
+        INO_ROOT => return Some(ProcFsNode::Root),
+        INO_VERSION => return Some(ProcFsNode::Version),
+        INO_UPTIME => return Some(ProcFsNode::Uptime),
+        INO_MEMINFO => return Some(ProcFsNode::Meminfo),
+        INO_LOADAVG => return Some(ProcFsNode::Loadavg),
+        INO_STORAGE => return Some(ProcFsNode::Storage),
+        _ => {}
+    }
+    if let Some((pid, fd)) = decode_fd_ino(ino) {
+        return Some(ProcFsNode::PidFd(pid, fd));
+    }
+    let (pid, slot) = decode_pid_ino(ino)?;
+    match slot {
+        0 => Some(ProcFsNode::PidDir(pid)),
+        PID_OFFSET_STATUS => Some(ProcFsNode::PidStatus(pid)),
+        PID_OFFSET_FD_DIR => Some(ProcFsNode::PidFdDir(pid)),
+        PID_OFFSET_CMDLINE => Some(ProcFsNode::PidCmdline(pid)),
+        PID_OFFSET_MAPS => Some(ProcFsNode::PidMaps(pid)),
+        _ => None,
+    }
+}
+
+/// Classify a canonical or non-canonical absolute `/proc` path using lexical
+/// normalization only. This does not walk the VFS and therefore cannot invoke
+/// procfs while the live snapshot is being prepared.
+pub fn classify_procfs_path(path: &str) -> Option<ProcFsNode> {
+    let canonical = crate::vfs::path::normalize(path);
+    let relative = if canonical == "/proc" {
+        ""
+    } else {
+        canonical.strip_prefix("/proc/")?
+    };
+    classify_procfs_relative(relative)
+}
+
+/// Classify a path relative to the procfs root. For an invalid child beneath
+/// a valid pid/file prefix, return the deepest source-backed node traversed by
+/// VFS resolution so callers prepare the data needed to produce the correct
+/// `NotFound`/`NotADirectory` result.
+pub fn classify_procfs_relative(relative: &str) -> Option<ProcFsNode> {
+    let components: Vec<&str> = crate::vfs::path::components(relative).collect();
+    let Some(first) = components.first().copied() else {
+        return Some(ProcFsNode::Root);
+    };
+    let top = match first {
+        "version" => Some(ProcFsNode::Version),
+        "uptime" => Some(ProcFsNode::Uptime),
+        "meminfo" => Some(ProcFsNode::Meminfo),
+        "loadavg" => Some(ProcFsNode::Loadavg),
+        "storage" => Some(ProcFsNode::Storage),
+        _ => None,
+    };
+    if let Some(node) = top {
+        return Some(node);
+    }
+    let pid = first.parse::<Pid>().ok()?;
+    let Some(second) = components.get(1).copied() else {
+        return Some(ProcFsNode::PidDir(pid));
+    };
+    match second {
+        "status" => Some(ProcFsNode::PidStatus(pid)),
+        "cmdline" => Some(ProcFsNode::PidCmdline(pid)),
+        "maps" => Some(ProcFsNode::PidMaps(pid)),
+        "fd" => match components.get(2).and_then(|fd| fd.parse::<u32>().ok()) {
+            Some(fd) => Some(ProcFsNode::PidFd(pid, fd)),
+            None => Some(ProcFsNode::PidFdDir(pid)),
+        },
+        _ => Some(ProcFsNode::PidDir(pid)),
+    }
+}
+
 /// Inverse of `pid_dir_ino` + `pid_status_ino`. Returns the pid
 /// and the slot within its stride, or `None` if `ino` is not in
 /// the per-pid range.
 fn decode_pid_ino(ino: Ino) -> Option<(Pid, Ino)> {
-    if ino < PID_DIR_BASE || ino >= FD_INO_BASE {
+    if !(PID_DIR_BASE..FD_INO_BASE).contains(&ino) {
         return None;
     }
     let rel = ino - PID_DIR_BASE;
@@ -567,7 +668,7 @@ fn decode_pid_ino(ino: Ino) -> Option<(Pid, Ino)> {
 /// with Linux `/proc/<pid>/status` parsers (sysmon, htop, etc.)
 /// that expect them.
 fn format_pid_status(snap: &ProcStatusSnapshot) -> Vec<u8> {
-    let text = format!(
+    let mut text = format!(
         "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nVmSize:\t{} kB\nVmPeak:\t{} kB\nThreads:\t1\n",
         snap.name,
         snap.state.letter(),
@@ -578,6 +679,9 @@ fn format_pid_status(snap: &ProcStatusSnapshot) -> Vec<u8> {
         bytes_to_status_kib(snap.vm_size_bytes),
         bytes_to_status_kib(snap.vm_peak_bytes),
     );
+    if let Some(open_fds) = snap.open_fds {
+        text.push_str(&format!("FDCount:\t{open_fds}\n"));
+    }
     text.into_bytes()
 }
 
@@ -737,6 +841,10 @@ impl ProcFs {
 }
 
 impl Filesystem for ProcFs {
+    fn supports_watches(&self) -> bool {
+        false
+    }
+
     fn root(&self) -> Ino {
         INO_ROOT
     }
@@ -962,10 +1070,7 @@ impl Filesystem for ProcFs {
         }
         // Per-pid regular files: recognise the stride offset.
         if let Some((_pid, slot)) = decode_pid_ino(ino) {
-            if slot == PID_OFFSET_STATUS
-                || slot == PID_OFFSET_CMDLINE
-                || slot == PID_OFFSET_MAPS
-            {
+            if slot == PID_OFFSET_STATUS || slot == PID_OFFSET_CMDLINE || slot == PID_OFFSET_MAPS {
                 let content = self.contents_for(ino).ok_or(FsError::NotFound)?;
                 return Ok(FileStat {
                     ino,

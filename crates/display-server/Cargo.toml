@@ -16,3 +16,4 @@ path = "src/main.rs"
 abi = { path = "../abi" }
 ring = { path = "../ring" }
 display-proto = { path = "../display-proto" }
+preferences = { path = "../preferences" }

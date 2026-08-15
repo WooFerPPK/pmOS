@@ -2,7 +2,7 @@
 //!
 //! v1 shape (T095 progress — the proc_wait supervision loop slice):
 //! init announces itself, spawns four fire-and-forget demo children
-//! via `pmos_ext.proc_spawn` — `/bin/hello-std`, `/bin/display-server`,
+//! via `pmos_ext.proc_spawn_manifest` — `/bin/hello-std`, `/bin/display-server`,
 //! `/bin/display-client-demo` (twice) — then enters a blocking
 //! `proc_wait` supervision loop. Each loop iteration reaps one
 //! zombie child and prints `init reaped child pid={N}`. When both
@@ -26,18 +26,14 @@
 //! unreaped` then `init exiting` and falls through. Both harnesses
 //! produce a finite, observable termination.
 //!
-//! A real OS init would additionally parse `/etc/init.conf`,
-//! respawn children per policy, load `/etc/preferences.toml` env
-//! vars, and manage a shell-respawn cadence. Those remain deferred
-//! within T095 (see tasks.md partial note). This slice's scope is
-//! the supervision loop + graceful display-server shutdown — the
-//! leg that closes the long-running-display-server accept-loop
-//! arc.
+//! Every spawn reads `/etc/preferences.toml` at that moment and overlays its
+//! validated timezone on `/etc/init.conf`'s static environment. Running
+//! children keep the environment they received at launch.
 //!
 //! The crate is a `std` binary: we lean on `println!` for output
 //! and on Rust's normal libc/WASI startup path for argv/environ
 //! discovery + stdio. The only things the crate owns itself are
-//! the `extern "C"` imports of `pmos_ext.proc_spawn`,
+//! the `extern "C"` imports of `pmos_ext.proc_spawn_manifest`,
 //! `pmos_ext.proc_wait`, and `pmos_ext.proc_kill`; everything
 //! else a conventional Rust program uses Just Works because the
 //! PMos WASI shim covers the std startup quartet
@@ -47,7 +43,7 @@
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "pmos_ext")]
 extern "C" {
-    fn proc_spawn(path_ptr: *const u8, path_len: u32, caps: u64) -> i32;
+    fn proc_spawn_manifest(manifest_ptr: *const u8, manifest_len: u32) -> i32;
     fn proc_wait(target_pid: i32, options: i32, status_out_ptr: i32) -> i32;
     fn proc_kill(target_pid: i32, signum: i32) -> i32;
 }
@@ -57,7 +53,7 @@ extern "C" {
 // the symbols have to resolve even when nothing on the native side
 // ever calls them. The wasm build is what matters in production.
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn proc_spawn(_path_ptr: *const u8, _path_len: u32, _caps: u64) -> i32 {
+unsafe fn proc_spawn_manifest(_manifest_ptr: *const u8, _manifest_len: u32) -> i32 {
     0
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -74,27 +70,41 @@ unsafe fn proc_kill(_target_pid: i32, _signum: i32) -> i32 {
 // forms inline.
 const ECHILD: i32 = 9;
 const ESRCH: i32 = 71;
+const EINVAL: i32 = 28;
 
 // wait target: -1 means "any child" (same as POSIX waitpid).
 const WAIT_ANY: i32 = -1;
 // SIGTERM.
 const SIGTERM: i32 = 15;
 
+fn spawn_child(
+    preferences: &mut init::spawn::FilesystemPreferenceSource,
+    static_env: &[(String, String)],
+    path: &str,
+    caps: u64,
+) -> i32 {
+    let argv = Vec::new();
+    let manifest = sh::SpawnWireManifest {
+        path,
+        argv: &argv,
+        env: static_env,
+        stdin_fd: None,
+        stdout_fd: None,
+        stderr_fd: None,
+        extra_fds: &[],
+        cwd: None,
+        caps: Some(caps),
+    };
+    match init::spawn::encode_with_spawn_timezone(preferences, &manifest) {
+        Ok(blob) => unsafe { proc_spawn_manifest(blob.as_ptr(), blob.len() as u32) },
+        Err(_) => -EINVAL,
+    }
+}
+
 fn main() {
     println!("init starting");
 
-    // T095: read /etc/init.conf if present. The parser lives in
-    // `init::conf` and is exhaustively tested in `crates/init/
-    // tests/init.rs`. The current demo-spawn flow below ignores
-    // the parsed config (the v1 boot path runs a hardcoded set
-    // of demo children that the Playwright + vitest harnesses
-    // pin); the read happens for two reasons: (1) it exercises
-    // the parser end-to-end on the wasm32-wasip1 target so a
-    // regression in `read_to_string` / TOML decoding surfaces in
-    // the boot log, (2) future shell-respawn work can switch
-    // the spawn loop to config-driven without touching the
-    // read path.
-    match std::fs::read_to_string("/etc/init.conf") {
+    let config = match std::fs::read_to_string("/etc/init.conf") {
         Ok(text) => match init::conf::InitConfig::parse(&text) {
             Ok(cfg) => {
                 println!(
@@ -103,20 +113,20 @@ fn main() {
                     cfg.boot.display_server,
                     cfg.boot.autostart.len(),
                 );
+                cfg
             }
             Err(err) => {
                 println!(
                     "init: /etc/init.conf parse failed: {} (using built-in defaults)",
                     err,
                 );
+                init::conf::InitConfig::builtin_defaults()
             }
         },
-        Err(_) => {
-            // Common in v1 — `/etc` is on tmpfs and nothing
-            // populates it at boot. Silent fall-through to the
-            // demo flow below.
-        }
-    }
+        Err(_) => init::conf::InitConfig::builtin_defaults(),
+    };
+    let static_env = config.env.into_iter().collect::<Vec<_>>();
+    let mut preferences = init::spawn::FilesystemPreferenceSource::canonical();
 
     // Track spawned pids so the reap loop can distinguish which
     // child just exited and drive the delayed SIGTERM to
@@ -126,10 +136,13 @@ fn main() {
     let mut dc1_pid: i32 = -1;
     let mut dc2_pid: i32 = -1;
 
-    const HELLO_STD: &[u8] = b"/bin/hello-std";
-    let rc = unsafe {
-        proc_spawn(HELLO_STD.as_ptr(), HELLO_STD.len() as u32, u64::MAX)
-    };
+    const HELLO_STD: &str = "/bin/hello-std";
+    let rc = spawn_child(
+        &mut preferences,
+        &static_env,
+        HELLO_STD,
+        init::grants::ORDINARY_APP,
+    );
     if rc < 0 {
         println!("init: proc_spawn /bin/hello-std failed errno={}", -rc);
     } else {
@@ -137,10 +150,13 @@ fn main() {
         println!("init spawned hello-std pid={}", rc);
     }
 
-    const DISPLAY_SERVER: &[u8] = b"/bin/display-server";
-    let rc = unsafe {
-        proc_spawn(DISPLAY_SERVER.as_ptr(), DISPLAY_SERVER.len() as u32, u64::MAX)
-    };
+    const DISPLAY_SERVER: &str = "/bin/display-server";
+    let rc = spawn_child(
+        &mut preferences,
+        &static_env,
+        DISPLAY_SERVER,
+        init::grants::DISPLAY_SERVER,
+    );
     if rc < 0 {
         println!("init: proc_spawn /bin/display-server failed errno={}", -rc);
     } else {
@@ -148,14 +164,13 @@ fn main() {
         println!("init spawned display-server pid={}", rc);
     }
 
-    const DISPLAY_CLIENT_DEMO: &[u8] = b"/bin/display-client-demo";
-    let rc = unsafe {
-        proc_spawn(
-            DISPLAY_CLIENT_DEMO.as_ptr(),
-            DISPLAY_CLIENT_DEMO.len() as u32,
-            u64::MAX,
-        )
-    };
+    const DISPLAY_CLIENT_DEMO: &str = "/bin/display-client-demo";
+    let rc = spawn_child(
+        &mut preferences,
+        &static_env,
+        DISPLAY_CLIENT_DEMO,
+        init::grants::ORDINARY_APP,
+    );
     if rc < 0 {
         println!(
             "init: proc_spawn /bin/display-client-demo failed errno={}",
@@ -166,13 +181,12 @@ fn main() {
         println!("init spawned display-client-demo pid={}", rc);
     }
 
-    let rc = unsafe {
-        proc_spawn(
-            DISPLAY_CLIENT_DEMO.as_ptr(),
-            DISPLAY_CLIENT_DEMO.len() as u32,
-            u64::MAX,
-        )
-    };
+    let rc = spawn_child(
+        &mut preferences,
+        &static_env,
+        DISPLAY_CLIENT_DEMO,
+        init::grants::ORDINARY_APP,
+    );
     if rc < 0 {
         println!(
             "init: proc_spawn /bin/display-client-demo failed errno={}",
@@ -187,17 +201,29 @@ fn main() {
     // failure above means the child never existed, so don't wait
     // for it.
     let mut remaining: u32 = 0;
-    if hello_std_pid > 0 { remaining += 1; }
-    if ds_pid > 0 { remaining += 1; }
-    if dc1_pid > 0 { remaining += 1; }
-    if dc2_pid > 0 { remaining += 1; }
+    if hello_std_pid > 0 {
+        remaining += 1;
+    }
+    if ds_pid > 0 {
+        remaining += 1;
+    }
+    if dc1_pid > 0 {
+        remaining += 1;
+    }
+    if dc2_pid > 0 {
+        remaining += 1;
+    }
 
     // Count of display-client-demo pids still alive. When this
     // drops to zero AND ds_pid is still live AND sigterm hasn't
     // fired yet, signal display-server so its accept loop exits.
     let mut clients_remaining: u32 = 0;
-    if dc1_pid > 0 { clients_remaining += 1; }
-    if dc2_pid > 0 { clients_remaining += 1; }
+    if dc1_pid > 0 {
+        clients_remaining += 1;
+    }
+    if dc2_pid > 0 {
+        clients_remaining += 1;
+    }
     let mut sigterm_sent = false;
 
     let mut status_out: i64 = 0;
@@ -236,20 +262,13 @@ fn main() {
 
         // Both clients done + server still in the unreaped set +
         // SIGTERM not yet sent → signal display-server to exit.
-        if clients_remaining == 0
-            && !sigterm_sent
-            && ds_pid > 0
-            && reaped_pid != ds_pid
-        {
+        if clients_remaining == 0 && !sigterm_sent && ds_pid > 0 && reaped_pid != ds_pid {
             let krc = unsafe { proc_kill(ds_pid, SIGTERM) };
             if krc < 0 {
                 // -ESRCH means display-server already exited (e.g.
                 // under the bounded outer-loop legacy path). Log
                 // and continue reaping either way.
-                println!(
-                    "init: proc_kill(ds, SIGTERM) failed errno={}",
-                    -krc
-                );
+                println!("init: proc_kill(ds, SIGTERM) failed errno={}", -krc);
             } else {
                 println!("init sent SIGTERM to display-server pid={}", ds_pid);
             }

@@ -19,6 +19,7 @@
 
 import { ConsoleHost } from "./console-host";
 import type { ConsoleLifecycleEvent } from "./console-host";
+import { ConsoleTranscript } from "./console-transcript";
 import { runEchoCheck } from "./console-check";
 import { FbHost } from "./fb-host";
 import type { FbFrame } from "./fb-host";
@@ -26,6 +27,7 @@ import { FbRenderer } from "./fb-renderer";
 import { SAB_SIZE } from "./shared/sab-layout";
 import {
   KbdKeyState,
+  type KbdKeyStateValue,
   MouseButton,
   MouseButtonState,
   packKbdEvent,
@@ -38,54 +40,14 @@ import type {
   MainToUser,
   UserToMain,
 } from "./shared/worker-proto";
+import {
+  HOST_FILE_IMPORT_MAX_BYTES,
+  HOST_FILE_IMPORT_MAX_FILES,
+  HOST_FILE_IMPORT_MAX_TOTAL_BYTES,
+} from "./shared/worker-proto";
+import { showStorageRecoveryGate } from "./storage-recovery";
 
 const BOOT_VERSION = "0.1.0-demo";
-
-/**
- * Manifest version this bundle expects to match. Bumped in lock
- * step with `xtask assemble-dist`'s manifest.json `version` field
- * so a stale-cached bootstrap.js can detect that the deployed
- * dist/ has moved past it and force a fresh load. Without this,
- * a service-worker cache that hadn't yet swapped to the new
- * generation would keep running the old bootstrap forever.
- */
-const EXPECTED_MANIFEST_VERSION = 40;
-
-/**
- * Fetch /manifest.json (bypassing the SW cache) and reload the
- * page if the deployed manifest has moved past the version this
- * bundle was built against. Best-effort: any failure (offline,
- * non-2xx, malformed) skips the reload silently and lets the
- * normal boot continue.
- */
-async function ensureFreshBootstrap(): Promise<void> {
-  try {
-    const resp = await fetch("/manifest.json", { cache: "no-store" });
-    if (!resp.ok) return;
-    const json = (await resp.json()) as { version?: number };
-    if (typeof json.version !== "number") return;
-    if (json.version > EXPECTED_MANIFEST_VERSION) {
-      console.log(
-        `[pmos-bootstrap] cached bootstrap is stale (built for v${EXPECTED_MANIFEST_VERSION}, deployed v${json.version}); reloading`,
-      );
-      // Wipe every pmos-* SW cache so the fresh bootstrap.js is
-      // fetched from the network on the reload, then reload.
-      if ("caches" in self) {
-        try {
-          const names = await caches.keys();
-          await Promise.all(
-            names.filter((n) => n.startsWith("pmos-")).map((n) => caches.delete(n)),
-          );
-        } catch {
-          // best-effort
-        }
-      }
-      window.location.reload();
-    }
-  } catch {
-    // best-effort
-  }
-}
 
 type CheckStatus = "pending" | "running" | "ok" | "fail" | "warn" | "stalled";
 
@@ -102,11 +64,49 @@ function hasSharedArrayBuffer(): boolean {
 }
 
 /**
+ * Return the browser capabilities that make the real OS unsafe to start.
+ * PMos must not present a volatile filesystem as a usable desktop when the
+ * browser has no persistent-storage API at all. A runtime permission or quota
+ * failure after these APIs are present is handled separately by the kernel's
+ * explicit volatile-recovery path.
+ */
+export function unsupportedBrowserReasons(): string[] {
+  const reasons: string[] = [];
+  if (!isCrossOriginIsolated())
+    reasons.push("cross-origin isolation (COOP/COEP)");
+  if (!hasSharedArrayBuffer()) reasons.push("SharedArrayBuffer");
+  if (!hasAtomicsWait()) reasons.push("Atomics.wait");
+  if (!hasAtomicsWaitAsync()) reasons.push("Atomics.waitAsync");
+  if (typeof Worker === "undefined") reasons.push("dedicated Workers");
+  if (!hasOpfs()) reasons.push("Origin Private File System (OPFS)");
+  if (
+    typeof navigator === "undefined" ||
+    typeof navigator.serviceWorker === "undefined"
+  ) {
+    reasons.push("service workers");
+  }
+  return reasons;
+}
+
+/**
  * Probe for `Atomics.wait`. Required for the SAB-backed syscall
  * transport; absent in non-cross-origin-isolated contexts.
  */
 export function hasAtomicsWait(): boolean {
   return typeof Atomics !== "undefined" && typeof Atomics.wait === "function";
+}
+
+/**
+ * Probe for `Atomics.waitAsync`. The kernel Worker must remain able to handle
+ * browser messages while sleeping, so synchronous `Atomics.wait` is not a
+ * valid fallback for its dispatcher.
+ */
+export function hasAtomicsWaitAsync(): boolean {
+  return (
+    typeof Atomics !== "undefined" &&
+    typeof (Atomics as unknown as { waitAsync?: unknown }).waitAsync ===
+      "function"
+  );
 }
 
 /**
@@ -127,7 +127,8 @@ export function hasOpfs(): boolean {
   return (
     typeof navigator !== "undefined" &&
     typeof navigator.storage !== "undefined" &&
-    typeof (navigator.storage as unknown as { getDirectory?: unknown }).getDirectory === "function"
+    typeof (navigator.storage as unknown as { getDirectory?: unknown })
+      .getDirectory === "function"
   );
 }
 
@@ -143,6 +144,18 @@ export interface ServiceWorkerContainerLike {
   ): Promise<unknown>;
 }
 
+/** Resolve the root-emitted service worker relative to the deployed page. */
+export function serviceWorkerScriptUrl(baseUrl?: string): string {
+  const baseHref =
+    baseUrl ?? (typeof document !== "undefined" ? document.baseURI : undefined);
+  if (baseHref === undefined) {
+    return "/sw.js";
+  }
+  const base = new URL(baseHref);
+  const script = new URL("./sw.js", base);
+  return `${script.pathname}${script.search}`;
+}
+
 /**
  * Register the bootstrap's service worker. Returns the
  * `Promise<unknown>` from `register()`, or `Promise.resolve(null)`
@@ -151,7 +164,7 @@ export interface ServiceWorkerContainerLike {
  * `navigator.serviceWorker`.
  */
 export function registerServiceWorker(
-  scriptURL = "/assets/sw.js",
+  scriptURL = serviceWorkerScriptUrl(),
   options: { scope?: string; type?: "classic" | "module" } = { type: "module" },
   container?: ServiceWorkerContainerLike,
 ): Promise<unknown> {
@@ -227,7 +240,11 @@ function setupCanvas(): Canvas2D {
   return { canvas, ctx, dpr };
 }
 
-function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void {
+function paintBoot(
+  c: Canvas2D,
+  rows: CheckRow[],
+  animationFrame: number,
+): void {
   const { ctx, canvas, dpr } = c;
   const W = canvas.width;
   const H = canvas.height;
@@ -348,14 +365,19 @@ function paintBoot(c: Canvas2D, rows: CheckRow[], animationFrame: number): void 
 function main(): void {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
 
-  // Stale-cache guard: if the SW served an older bootstrap.js
-  // than what's currently deployed, reload immediately so we
-  // don't run code the dist has moved past. Fires before any
-  // user-visible boot work so the reload feels instantaneous.
-  // Async + fire-and-forget; the normal boot continues in
-  // parallel and either completes (versions match) or gets
-  // pre-empted by the reload.
-  void ensureFreshBootstrap();
+  const unsupported = unsupportedBrowserReasons();
+  if (unsupported.length > 0) {
+    const detail = `Missing required browser capabilities: ${unsupported.join(", ")}`;
+    console.error(`[pmos-bootstrap] unsupported browser: ${detail}`);
+    showUnsupportedBrowserMessage(detail);
+    return;
+  }
+
+  void registerServiceWorker().catch((error: unknown) => {
+    console.warn(
+      `[pmos-bootstrap] service-worker registration failed: ${String(error)}`,
+    );
+  });
 
   // Boot-to-desktop is the default boot path: bare URL spawns
   // `/bin/init-desktop`, which spawns the real display-server +
@@ -370,6 +392,9 @@ function main(): void {
   //   * `#input-echo` → `/bin/hello_input_echo` (no_std cdylib
   //     that polls `/dev/input_kbd` + echoes to stdout — the
   //     browser-side proof of the input round-trip).
+  //   * `#process-trap` / `#process-sigkill` → dedicated lifecycle
+  //     fixtures used to prove trap reconciliation and forced Worker
+  //     teardown in a real browser.
   //   * `#mock-kernel` → fall through to the legacy MockKernel
   //     boot-screen check rows below (faux shell + live
   //     terminal + capability checks).
@@ -379,6 +404,10 @@ function main(): void {
     let bootBinary: string;
     if (hash.includes("input-echo")) {
       bootBinary = "/bin/hello_input_echo";
+    } else if (hash.includes("process-trap")) {
+      bootBinary = "/bin/hello_trap";
+    } else if (hash.includes("process-sigkill")) {
+      bootBinary = "/bin/hello_self_kill";
     } else if (hash.includes("real-kernel")) {
       bootBinary = "/bin/init";
     } else {
@@ -389,13 +418,25 @@ function main(): void {
   }
 
   const rows: CheckRow[] = [
-    { label: "Cross-origin isolation (COOP/COEP)", status: "pending", detail: "" },
+    {
+      label: "Cross-origin isolation (COOP/COEP)",
+      status: "pending",
+      detail: "",
+    },
     { label: "SharedArrayBuffer", status: "pending", detail: "" },
-    { label: "Atomics.wait", status: "pending", detail: "" },
-    { label: "Origin Private Filesystem (OPFS)", status: "pending", detail: "" },
+    { label: "Atomics.wait / waitAsync", status: "pending", detail: "" },
+    {
+      label: "Origin Private Filesystem (OPFS)",
+      status: "pending",
+      detail: "",
+    },
     { label: "Service worker", status: "pending", detail: "" },
     { label: "OffscreenCanvas", status: "pending", detail: "" },
-    { label: "Kernel WASM load (/assets/kernel.wasm)", status: "pending", detail: "" },
+    {
+      label: "Kernel WASM load (/assets/kernel.wasm)",
+      status: "pending",
+      detail: "",
+    },
     { label: "Kernel worker + console echo", status: "pending", detail: "" },
     { label: "Display server", status: "pending", detail: "" },
     { label: "Desktop shell", status: "pending", detail: "" },
@@ -456,12 +497,12 @@ function main(): void {
   });
 
   step(2, 900, () => {
-    if (hasAtomicsWait()) {
+    if (hasAtomicsWait() && hasAtomicsWaitAsync()) {
       rows[2].status = "ok";
-      rows[2].detail = "Atomics.wait available";
+      rows[2].detail = "blocking user + async kernel waits available";
     } else {
       rows[2].status = "fail";
-      rows[2].detail = "Atomics.wait missing";
+      rows[2].detail = "Atomics.wait or Atomics.waitAsync missing";
     }
   });
 
@@ -781,7 +822,9 @@ function main(): void {
   );
 }
 
-async function attemptKernelFetch(): Promise<{ ok: true; size: number } | { ok: false; reason: string }> {
+async function attemptKernelFetch(): Promise<
+  { ok: true; size: number } | { ok: false; reason: string }
+> {
   try {
     const res = await fetch("/assets/kernel.wasm", { method: "HEAD" });
     if (!res.ok) {
@@ -868,7 +911,7 @@ function createKernelSession(): KernelSession {
  * scancode — the same `display_server::Scancode` enum the
  * display-server's `inject_keyboard_key` and the term's
  * `term::keymap::translate` both speak. Returns null for
- * unmapped codes (F-keys, arrows, IME composition keys, etc.)
+ * unmapped codes (F-keys, IME composition keys, etc.)
  * so the caller can fall through to the browser's default
  * handling.
  */
@@ -887,27 +930,160 @@ function domCodeToScancode(code: string): number | null {
     }
   }
   switch (code) {
-    case "Enter": return 0x28;
-    case "Backspace": return 0x2a;
-    case "Tab": return 0x2b;
-    case "Space": return 0x2c;
-    case "Minus": return 0x2d;
-    case "Equal": return 0x2e;
-    case "BracketLeft": return 0x2f;
-    case "BracketRight": return 0x30;
-    case "Backslash": return 0x31;
-    case "Semicolon": return 0x33;
-    case "Quote": return 0x34;
-    case "Backquote": return 0x35;
-    case "Comma": return 0x36;
-    case "Period": return 0x37;
-    case "Slash": return 0x38;
-    case "ShiftLeft": return 0xe1;
-    case "ShiftRight": return 0xe5;
-    case "ControlLeft": return 0xe0;
-    case "ControlRight": return 0xe4;
-    default: return null;
+    case "Enter":
+      return 0x28;
+    case "Escape":
+      return 0x29;
+    case "Backspace":
+      return 0x2a;
+    case "Tab":
+      return 0x2b;
+    case "Space":
+      return 0x2c;
+    case "Minus":
+      return 0x2d;
+    case "Equal":
+      return 0x2e;
+    case "BracketLeft":
+      return 0x2f;
+    case "BracketRight":
+      return 0x30;
+    case "Backslash":
+      return 0x31;
+    case "Semicolon":
+      return 0x33;
+    case "Quote":
+      return 0x34;
+    case "Backquote":
+      return 0x35;
+    case "Comma":
+      return 0x36;
+    case "Period":
+      return 0x37;
+    case "Slash":
+      return 0x38;
+    case "Insert":
+      return 0x49;
+    case "Home":
+      return 0x4a;
+    case "PageUp":
+      return 0x4b;
+    case "Delete":
+      return 0x4c;
+    case "End":
+      return 0x4d;
+    case "PageDown":
+      return 0x4e;
+    case "ArrowRight":
+      return 0x4f;
+    case "ArrowLeft":
+      return 0x50;
+    case "ArrowDown":
+      return 0x51;
+    case "ArrowUp":
+      return 0x52;
+    case "ShiftLeft":
+      return 0xe1;
+    case "ShiftRight":
+      return 0xe5;
+    case "ControlLeft":
+      return 0xe0;
+    case "ControlRight":
+      return 0xe4;
+    case "AltLeft":
+      return 0xe2;
+    case "AltRight":
+      return 0xe6;
+    default:
+      return null;
   }
+}
+
+/** Keyboard-event surface used by the graphical desktop input bridge. */
+export interface GuiKeyboardEvent {
+  readonly code: string;
+  readonly metaKey: boolean;
+  readonly repeat?: boolean;
+  readonly target?: EventTarget | null;
+  preventDefault(): void;
+}
+
+/** True when a keyboard event belongs to a privileged browser-substrate
+ * control rather than the guest desktop. `closest()` also works after a
+ * one-shot control removes itself during Enter's default click, so keyup does
+ * not leak an unmatched release into PMos. */
+export function targetsBrowserSubstrateControl(event: {
+  readonly target?: EventTarget | null;
+}): boolean {
+  const target = event.target as
+    { closest?: (selector: string) => unknown } | null | undefined;
+  if (typeof target?.closest !== "function") return false;
+  const recovery = target.closest("#pmos-storage-recovery");
+  const hostPicker = target.closest(`#${HOST_FILE_PICKER_CONFIRM_ID}`);
+  return (
+    (recovery !== null && recovery !== undefined) ||
+    (hostPicker !== null && hostPicker !== undefined)
+  );
+}
+
+/** Keep every key transition with the destination selected on its first
+ * keydown. A browser control may disappear before keyup, and a guest shortcut
+ * may mount and focus one before keyup; neither focus change may split the
+ * press/release pair across the browser and guest. `true` routes to the guest. */
+export function createBrowserControlKeyRouter(
+  targetsControl: (
+    event: GuiKeyboardEvent,
+  ) => boolean = targetsBrowserSubstrateControl,
+): {
+  keydown(event: GuiKeyboardEvent): boolean;
+  keyup(event: GuiKeyboardEvent): boolean;
+} {
+  const routeToGuest = new Map<string, boolean>();
+  return {
+    keydown(event): boolean {
+      const existingRoute = routeToGuest.get(event.code);
+      if (existingRoute !== undefined) {
+        if (event.repeat === true) return existingRoute;
+        // A new non-repeat press means the old release was lost while a modal
+        // control held focus. Discard the stale route before classifying this
+        // new physical transition.
+        routeToGuest.delete(event.code);
+      }
+      const guest = !targetsControl(event);
+      routeToGuest.set(event.code, guest);
+      return guest;
+    },
+    keyup(event): boolean {
+      const existingRoute = routeToGuest.get(event.code);
+      if (existingRoute !== undefined) {
+        routeToGuest.delete(event.code);
+        return existingRoute;
+      }
+      return !targetsControl(event);
+    },
+  };
+}
+
+/**
+ * Build one half of the graphical keyboard bridge. Ctrl and Alt are operating
+ * system input, including shortcuts such as Ctrl+C and Ctrl+S, so their own
+ * key transitions and the modified key are forwarded. The host Meta key stays
+ * reserved for browser/desktop shortcuts.
+ */
+export function createGuiKeyboardInputHandler(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  state: KbdKeyStateValue,
+): (event: GuiKeyboardEvent) => void {
+  return (event: GuiKeyboardEvent): void => {
+    if (event.metaKey) return;
+    const scancode = domCodeToScancode(event.code);
+    if (scancode === null) return;
+    event.preventDefault();
+    kernelWorker.postMessage({
+      kind: "input:kbd",
+      bytes: packKbdEvent(scancode, state),
+    });
+  };
 }
 
 function keyToBytes(key: string): Uint8Array | null {
@@ -924,6 +1100,81 @@ function keyToBytes(key: string): Uint8Array | null {
     }
   }
   return null;
+}
+
+/** Minimal keyboard-event surface used by the text-only boot input bridge. */
+export interface LegacyKeyboardEvent {
+  readonly key: string;
+  readonly ctrlKey: boolean;
+  readonly metaKey: boolean;
+  readonly altKey: boolean;
+  preventDefault(): void;
+}
+
+/**
+ * Build the canonical input handler used by text-only real-kernel boots.
+ * Printable keys are accumulated until Enter, then delivered to the kernel as
+ * one line-atomic input message. GUI boots do not use this path: they continue
+ * to send packed press/release scancodes immediately.
+ *
+ * The distinction matters because `/dev/console` is line-buffered while the
+ * diagnostic input reader may legally receive a short read. Sending `x` and
+ * the following newline as unrelated worker messages allowed the reader to
+ * consume and echo bare `x`, exit, and leave it permanently buffered before
+ * the newline reached `/dev/input_kbd`.
+ */
+export function createLegacyKeyboardInputHandler(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  maxLineBytes: number = 4096,
+): (event: LegacyKeyboardEvent) => void {
+  if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) {
+    throw new Error(
+      `createLegacyKeyboardInputHandler: maxLineBytes must be a positive integer, got ${maxLineBytes}`,
+    );
+  }
+
+  const chunks: Uint8Array[] = [];
+  let bufferedBytes = 0;
+
+  return (event: LegacyKeyboardEvent): void => {
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      return;
+    }
+
+    if (event.key === "Backspace") {
+      if (chunks.length > 0) {
+        const removed = chunks.pop();
+        bufferedBytes -= removed?.byteLength ?? 0;
+      }
+      event.preventDefault();
+      return;
+    }
+
+    const bytes = keyToBytes(event.key);
+    if (bytes === null) {
+      return;
+    }
+    event.preventDefault();
+
+    if (event.key !== "Enter") {
+      if (bufferedBytes + bytes.byteLength <= maxLineBytes) {
+        chunks.push(bytes);
+        bufferedBytes += bytes.byteLength;
+      }
+      return;
+    }
+
+    const line = new Uint8Array(bufferedBytes + bytes.byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      line.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    line.set(bytes, offset);
+    chunks.length = 0;
+    bufferedBytes = 0;
+    kernelWorker.postMessage({ kind: "input:kbd", bytes: line });
+  };
 }
 
 /**
@@ -1037,6 +1288,133 @@ function paintBlitToCanvasFullscreen(c: Canvas2D, frame_: FbFrame): void {
   ctx.drawImage(tmp, dx, dy, dw, dh);
 }
 
+/** DOM surface observed by framebuffer presentation tests and telemetry. */
+export interface FramebufferPresentationTarget {
+  readonly dataset: { pmosFrameSequence?: string };
+  dispatchEvent(event: Event): boolean;
+}
+
+export interface FramebufferPresentationOptions {
+  readonly host: Pick<FbHost, "onFrame" | "onPatch" | "onPatchBatch">;
+  readonly renderer: Pick<
+    FbRenderer,
+    "onPresentComplete" | "paintFrame" | "paintPatch" | "paintPatchBatch"
+  >;
+  readonly target: FramebufferPresentationTarget;
+  /** Compatibility hook for one-time first-frame milestones. */
+  readonly onFirstPresent?: () => void;
+  readonly now?: () => number;
+  readonly makeFrameEvent?: (detail: {
+    readonly sequence: number;
+    /** Main thread received the framebuffer update and began painting. */
+    readonly receivedAt: number;
+    readonly paintedAt: number;
+  }) => Event;
+}
+
+/** One-shot GUI readiness latch shared by splash dismissal and input gating. */
+export interface GuiDesktopReadyLatch {
+  readonly ready: boolean;
+  notePresentFence(serial: number): void;
+}
+
+/**
+ * Interpret the first valid display-server presentation fence as the GUI's
+ * trusted desktop-ready boundary. The framebuffer driver owns the typed route,
+ * so ordinary console output cannot spoof readiness. Standard and alternate
+ * shells share this layer-neutral fence.
+ */
+export function createGuiDesktopReadyLatch(
+  onReady: () => void,
+): GuiDesktopReadyLatch {
+  let ready = false;
+
+  return {
+    get ready(): boolean {
+      return ready;
+    },
+    notePresentFence(serial: number): void {
+      if (
+        ready ||
+        !Number.isInteger(serial) ||
+        serial <= 0 ||
+        serial > 0xffff_ffff
+      ) {
+        return;
+      }
+      ready = true;
+      onReady();
+    },
+  };
+}
+
+export interface BootInteractionGateState {
+  readonly kernelReady: boolean;
+  readonly storageDegraded: boolean;
+  readonly temporaryStorageAccepted: boolean;
+  /** `null` identifies a non-GUI boot with no desktop-ready handshake. */
+  readonly guiDesktopReady: boolean | null;
+}
+
+/** Keep GUI input outside the OS until the fully presented desktop is ready. */
+export function isBootInteractionAllowed(
+  state: BootInteractionGateState,
+): boolean {
+  return (
+    state.kernelReady &&
+    (!state.storageDegraded || state.temporaryStorageAccepted) &&
+    (state.guiDesktopReady === null || state.guiDesktopReady)
+  );
+}
+
+/**
+ * Connect full blits and rectangular patches to one renderer completion
+ * stream. Both presentation forms advance the same observable sequence and
+ * emit the same `pmos:frame` event only after the renderer completes a paint.
+ */
+export function wireFramebufferPresentations(
+  options: FramebufferPresentationOptions,
+): void {
+  const now = options.now ?? (() => performance.now());
+  const makeFrameEvent =
+    options.makeFrameEvent ??
+    ((detail) => new CustomEvent("pmos:frame", { detail }));
+  let sequence = 0;
+  let firstPresentSeen = false;
+  let receivedAt: number | null = null;
+
+  options.renderer.onPresentComplete(() => {
+    sequence += 1;
+    const presentationReceivedAt = receivedAt ?? now();
+    receivedAt = null;
+    const paintedAt = now();
+    options.target.dataset.pmosFrameSequence = String(sequence);
+    options.target.dispatchEvent(
+      makeFrameEvent({
+        sequence,
+        receivedAt: presentationReceivedAt,
+        paintedAt,
+      }),
+    );
+    if (!firstPresentSeen) {
+      firstPresentSeen = true;
+      options.onFirstPresent?.();
+    }
+  });
+  options.host.onFrame((frame) => {
+    receivedAt = now();
+    options.renderer.paintFrame(frame);
+  });
+  options.host.onPatch((patch) => {
+    receivedAt = now();
+    options.renderer.paintPatch(patch);
+  });
+  options.host.onPatchBatch((batch) => {
+    receivedAt = now();
+    options.renderer.paintPatchBatch(batch.patches);
+  });
+}
+
 /**
  * Real-kernel boot path: spawns the kernel Worker with
  * `useRealKernel: true` + the caller-chosen `bootBinary`, then
@@ -1071,21 +1449,35 @@ function runRealKernelMode(bootBinary: string): void {
   // legacy demo flow) get the console-pre overlay.
   const isGuiBoot = bootBinary === "/bin/init-desktop";
   const consoleEl = mountRealKernelConsole(isGuiBoot);
-  // Boot splash — fullscreen progress overlay covering the page
-  // while the kernel + display server + shell come up. Each
-  // milestone (browser env checks, kernel module mounted,
-  // userland processes started, wallpaper painted) lights up a
-  // line. The splash dismisses itself once the desktop's first
-  // frame lands.
+  // Boot splash — fullscreen progress overlay covering the page while the
+  // kernel, display server, and shell come up. It remains until the active
+  // shell publishes a trusted framebuffer presentation fence after its initial
+  // work has settled.
   const splash = isGuiBoot ? mountBootSplash() : null;
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  let kernelReady = false;
+  let storageDegraded = false;
+  let temporaryStorageAccepted = false;
+  const guiDesktopReady = isGuiBoot
+    ? createGuiDesktopReadyLatch(() => {
+        splash?.markStarted("Desktop ready");
+        splash?.dismiss();
+      })
+    : null;
+  const userInteractionAllowed = (): boolean =>
+    isBootInteractionAllowed({
+      kernelReady,
+      storageDegraded,
+      temporaryStorageAccepted,
+      guiDesktopReady: guiDesktopReady?.ready ?? null,
+    });
   if (splash) {
     splash.markStarted("Browser environment ready");
     splash.markStarted("Kernel worker spawned");
   }
 
-  // GUI boot: wire the FbHost → FbRenderer pair so `fb:set-mode` /
-  // `fb:blit` messages from the kernel Worker actually paint pixels
+  // GUI boot: wire the FbHost → FbRenderer pair so `fb:set-mode`,
+  // `fb:blit`, and `fb:patch` messages from the kernel Worker paint pixels
   // onto the visible canvas. Without this, the display-server's
   // wallpaper paint reaches the kernel host but stops there — the
   // canvas stays black. Text-only boots skip this entirely (no
@@ -1110,19 +1502,23 @@ function runRealKernelMode(bootBinary: string): void {
         canvas.style.width = `${mode.width}px`;
         canvas.style.height = `${mode.height}px`;
         if (splash) {
-          splash.markStarted(`Framebuffer mode set ${mode.width}×${mode.height}`);
+          splash.markStarted(
+            `Framebuffer mode set ${mode.width}×${mode.height}`,
+          );
         }
       });
-      let firstFrameSeen = false;
-      fbHost.onFrame((frame) => {
-        renderer.paintFrame(frame);
-        if (!firstFrameSeen) {
-          firstFrameSeen = true;
+      wireFramebufferPresentations({
+        host: fbHost,
+        renderer,
+        target: canvas,
+        onFirstPresent: () => {
           if (splash) {
-            splash.markStarted("Desktop wallpaper rendered");
-            splash.dismiss();
+            splash.markStarted("Framebuffer presentation completed");
           }
-        }
+        },
+      });
+      fbHost.onPresentFence((serial) => {
+        guiDesktopReady?.notePresentFence(serial);
       });
 
       // Pointer + keyboard input for the GUI desktop. Each
@@ -1136,27 +1532,31 @@ function runRealKernelMode(bootBinary: string): void {
       // `drain_input_events` path then injects each event
       // into `Server::inject_pointer_*` and the click
       // ultimately reaches the shell's pointer object.
-      const toFbCoords = (
-        event: PointerEvent,
-      ): [number, number] | null => {
+      const toFbCoords = (event: PointerEvent): [number, number] | null => {
         if (!guiFbMode) return null;
         const rect = canvas.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return null;
         const fx = ((event.clientX - rect.left) / rect.width) * guiFbMode.width;
-        const fy = ((event.clientY - rect.top) / rect.height) * guiFbMode.height;
+        const fy =
+          ((event.clientY - rect.top) / rect.height) * guiFbMode.height;
         const x = Math.max(0, Math.min(guiFbMode.width - 1, Math.floor(fx)));
         const y = Math.max(0, Math.min(guiFbMode.height - 1, Math.floor(fy)));
         return [x, y];
       };
       const domButtonToProtoButton = (domButton: number): number => {
         switch (domButton) {
-          case 0: return MouseButton.Left;
-          case 1: return MouseButton.Middle;
-          case 2: return MouseButton.Right;
-          default: return domButton;
+          case 0:
+            return MouseButton.Left;
+          case 1:
+            return MouseButton.Middle;
+          case 2:
+            return MouseButton.Right;
+          default:
+            return domButton;
         }
       };
       canvas.addEventListener("pointermove", (event) => {
+        if (!userInteractionAllowed()) return;
         const coords = toFbCoords(event);
         if (!coords) return;
         const [x, y] = coords;
@@ -1166,6 +1566,10 @@ function runRealKernelMode(bootBinary: string): void {
         } satisfies MainToKernel);
       });
       canvas.addEventListener("pointerdown", (event) => {
+        if (!userInteractionAllowed()) {
+          event.preventDefault();
+          return;
+        }
         const coords = toFbCoords(event);
         if (!coords) return;
         const [x, y] = coords;
@@ -1176,6 +1580,10 @@ function runRealKernelMode(bootBinary: string): void {
         } satisfies MainToKernel);
       });
       canvas.addEventListener("pointerup", (event) => {
+        if (!userInteractionAllowed()) {
+          event.preventDefault();
+          return;
+        }
         const coords = toFbCoords(event);
         if (!coords) return;
         const [x, y] = coords;
@@ -1199,27 +1607,30 @@ function runRealKernelMode(bootBinary: string): void {
       // HID scancode (matching `display_server::Scancode`),
       // pack via `packKbdEvent`, and post on both keydown +
       // keyup so modifier transitions track on the term side.
+      const guiKeyDown = createGuiKeyboardInputHandler(
+        worker,
+        KbdKeyState.Pressed,
+      );
+      const guiKeyUp = createGuiKeyboardInputHandler(
+        worker,
+        KbdKeyState.Released,
+      );
+      const browserControlKeys = createBrowserControlKeyRouter();
       window.addEventListener("keydown", (event) => {
-        const sc = domCodeToScancode(event.code);
-        if (sc === null) return;
-        // Ctrl/Meta/Alt chords stay with the browser (refresh,
-        // devtools, etc.); Shift is a real modifier the term
-        // tracks itself, so we let it pass through.
-        if (event.ctrlKey || event.metaKey || event.altKey) return;
-        event.preventDefault();
-        worker.postMessage({
-          kind: "input:kbd",
-          bytes: packKbdEvent(sc, KbdKeyState.Pressed),
-        } satisfies MainToKernel);
+        if (!browserControlKeys.keydown(event)) return;
+        if (!userInteractionAllowed()) {
+          event.preventDefault();
+          return;
+        }
+        guiKeyDown(event);
       });
       window.addEventListener("keyup", (event) => {
-        const sc = domCodeToScancode(event.code);
-        if (sc === null) return;
-        if (event.ctrlKey || event.metaKey || event.altKey) return;
-        worker.postMessage({
-          kind: "input:kbd",
-          bytes: packKbdEvent(sc, KbdKeyState.Released),
-        } satisfies MainToKernel);
+        if (!browserControlKeys.keyup(event)) return;
+        if (!userInteractionAllowed()) {
+          event.preventDefault();
+          return;
+        }
+        guiKeyUp(event);
       });
     }
   }
@@ -1249,6 +1660,9 @@ function runRealKernelMode(bootBinary: string): void {
       }
     },
     getKernelWakeSlot: () => kernelWakeSlot,
+    onLiveWorkersChanged: (count) => {
+      document.body.dataset["pmosLiveWorkers"] = String(count);
+    },
   });
 
   // Listen for kernel-Worker messages alongside ConsoleHost. ConsoleHost
@@ -1267,7 +1681,32 @@ function runRealKernelMode(bootBinary: string): void {
       document.body.dataset["pmosWakeSlotReady"] = "1";
       return;
     }
+    if (msg.kind === "host:pick") {
+      requestHostFilePicker(worker, undefined, userInteractionAllowed);
+      return;
+    }
+    if (msg.kind === "host:download") {
+      saveHostDownload(msg.name, msg.mime, msg.bytes);
+      return;
+    }
+    if (msg.kind === "storage:degraded") {
+      storageDegraded = true;
+      showStorageRecoveryGate(msg, {
+        onRetry: () => window.location.reload(),
+        onContinueTemporary: () => {
+          temporaryStorageAccepted = true;
+          console.warn(
+            "[pmos-bootstrap] temporary storage session explicitly accepted; files will be lost on reload",
+          );
+        },
+      });
+      return;
+    }
     router.handleKernelMessage(msg);
+    if (msg.kind === "proc:terminate") {
+      document.body.dataset["pmosLastTerminatedPid"] = String(msg.pid);
+      document.body.dataset["pmosLastTerminatedSignal"] = String(msg.signal);
+    }
     // Track peak after the router applied any state change.
     if (router.liveWorkers.size > peakLiveWorkers) {
       peakLiveWorkers = router.liveWorkers.size;
@@ -1299,9 +1738,10 @@ function runRealKernelMode(bootBinary: string): void {
   const crashScreen = isGuiBoot ? mountCrashScreen() : null;
   const recentLines: string[] = [];
   const RECENT_LINES_CAP = 80;
+  const transcript = new ConsoleTranscript(consoleEl);
   consoleHost.onOutput((bytes: Uint8Array) => {
     const text = new TextDecoder().decode(bytes);
-    consoleEl.textContent += text;
+    transcript.append(text);
     console.log(`[real-kernel] ${text.replace(/\n$/, "")}`);
     if (splash) {
       splash.observeConsoleLine(text);
@@ -1312,13 +1752,14 @@ function runRealKernelMode(bootBinary: string): void {
   });
   consoleHost.onLifecycle((event: ConsoleLifecycleEvent) => {
     if (event.kind === "ready") {
+      kernelReady = true;
       console.log("[pmos-bootstrap] real kernel ready");
       if (splash) {
         splash.markStarted("Kernel ready");
       }
     } else if (event.kind === "panic") {
       console.error(`[pmos-bootstrap] real kernel panic: ${event.message}`);
-      consoleEl.textContent += `\n[panic] ${event.message}\n`;
+      transcript.append(`\n[panic] ${event.message}\n`);
       if (splash) {
         splash.markFailed(`Kernel panic: ${event.message}`);
       }
@@ -1377,16 +1818,17 @@ function runRealKernelMode(bootBinary: string): void {
   // surfaces a crash screen via the worker `error` / `messageerror`
   // listeners, the `unhandledrejection` listener, the
   // consoleHost.onLifecycle({kind:"panic"}) path, and the fatal-line
-  // scanner inside crashScreen.observeConsoleLine (which catches
-  // "init-desktop reaped child", "real kernel panic", and "dispatch
-  // error" patterns without needing a periodic-output expectation).
+  // scanner inside crashScreen.observeConsoleLine (which catches a dead
+  // display server, a real kernel panic, and dispatch errors without needing
+  // a periodic-output expectation). Shell exits are supervised by PID 1 and
+  // are therefore not terminal browser-substrate failures.
 
   // Keyboard input: a `keydown` on `document` so the handler fires
   // regardless of which element has focus (real-kernel mode hides the
   // canvas and the DOM console pre-element is non-interactive by
-  // default). Each keydown is converted to the raw bytes the kernel's
-  // input ring expects and posted as an `input:kbd` message on the
-  // kernel Worker channel. The kernel worker's scaffold routes these
+  // default). Text bytes are held in canonical mode until Enter and posted
+  // as one line-atomic `input:kbd` message on the kernel Worker channel. The
+  // kernel worker's scaffold routes it
   // through `InputDriver.onHostMessage` into
   // `KernelWasmHost.injectInput(Devnum.InputKbd, bytes)`, which lands
   // the bytes in `/dev/input_kbd`. A user process polling `fd_read` on
@@ -1401,21 +1843,13 @@ function runRealKernelMode(bootBinary: string): void {
   // running both at once would interleave incompatible
   // records in the ring buffer.
   if (!isGuiBoot) {
-    document.addEventListener("keydown", (event: KeyboardEvent) => {
-      // Ignore modifier-heavy chords (Ctrl+R, Cmd+S, etc.) so
-      // the browser shortcut path still works. F-keys and
-      // similar non-printable keys fall through `keyToBytes`
-      // as `null` too.
-      if (event.ctrlKey || event.metaKey || event.altKey) {
+    const legacyKeyDown = createLegacyKeyboardInputHandler(worker);
+    document.addEventListener("keydown", (event) => {
+      if (!userInteractionAllowed()) {
+        if (!targetsBrowserSubstrateControl(event)) event.preventDefault();
         return;
       }
-      const bytes = keyToBytes(event.key);
-      if (bytes === null) {
-        return;
-      }
-      event.preventDefault();
-      const msg: MainToKernel = { kind: "input:kbd", bytes };
-      worker.postMessage(msg);
+      legacyKeyDown(event);
     });
   }
 
@@ -1433,6 +1867,15 @@ function runRealKernelMode(bootBinary: string): void {
   // trades I/O frequency against window-of-loss size — a hard browser
   // crash loses at most one minute of writes.
   installPeriodicSync(worker);
+  // T154: bootstrap-side drag-drop import. Each file the user drops
+  // onto the canvas turns into a `host:dropped` MainToKernel
+  // message; the kernel registers the bytes under the supplied
+  // token and a userland `host_file_recv(token)` consumes them.
+  installHostFileDropHandler(
+    worker,
+    window as unknown as DropTarget,
+    userInteractionAllowed,
+  );
 }
 
 /**
@@ -1467,7 +1910,7 @@ function mountRealKernelConsole(gui: boolean = false): HTMLPreElement {
       "max-height: 40vh",
       "margin: 0",
       "padding: 0.5rem 0.75rem",
-      "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+      'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
       "font-size: 11px",
       "line-height: 1.3",
       "color: #e6e6e6",
@@ -1482,7 +1925,7 @@ function mountRealKernelConsole(gui: boolean = false): HTMLPreElement {
     pre.style.cssText = [
       "margin: 0",
       "padding: 1.5rem",
-      "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+      'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
       "font-size: 14px",
       "line-height: 1.5",
       "color: #e6e6e6",
@@ -1500,9 +1943,9 @@ function mountRealKernelConsole(gui: boolean = false): HTMLPreElement {
  * Boot-splash overlay. Paints a fullscreen progress screen
  * during the kernel + display server + shell startup. Each
  * milestone (env checks, kernel spawn, init-desktop spawn,
- * display-server bind, shell connect, wallpaper paint) lights
- * up a row. The splash dismisses itself when the desktop's
- * first frame lands.
+ * display-server bind, shell connect, framebuffer presentation,
+ * interactive readiness) lights up a row. The bootstrap dismisses
+ * it only after the standard shell and framebuffer readiness latch fires.
  *
  * Designed to be observable: every line carries a status icon
  * and a short timestamp so the user can see the OS coming up
@@ -1520,9 +1963,7 @@ interface BootSplash {
    *  display-server`, `shell: connected to /run/display`, …)
    *  and updates the corresponding step. */
   observeConsoleLine(text: string): void;
-  /** Animate-out and remove the overlay. Called after the
-   *  first wallpaper blit lands so the user sees the desktop
-   *  immediately. */
+  /** Remove the overlay when the desktop-ready latch fires. */
   dismiss(): void;
 }
 
@@ -1552,15 +1993,11 @@ function mountBootSplash(): BootSplash {
     "justify-content: center",
     "background: radial-gradient(circle at 50% 35%, #1a2638 0%, #060a12 100%)",
     "color: #e6e6e6",
-    "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+    'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
     "z-index: 1000",
-    "transition: opacity 350ms ease-out",
     "opacity: 1",
-    // Don't intercept clicks; once the canvas is alive the
-    // user's clicks need to reach it. (The splash dismiss
-    // animation overlaps for ~350ms; pointer-events:none
-    // makes the splash transparent to input during that
-    // window.)
+    // The bootstrap's explicit input gate discards canvas input until desktop
+    // readiness. The overlay never owns pointer input, including while booting.
     "pointer-events: none",
   ].join("; ");
 
@@ -1606,18 +2043,97 @@ function mountBootSplash(): BootSplash {
   document.body.appendChild(overlay);
 
   const steps: BootStep[] = [
-    { label: "Browser environment ready",     consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
-    { label: "Kernel worker spawned",         consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
-    { label: "Kernel ready",                  consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
-    { label: "init (PID 1) running",          consoleHints: ["init-desktop starting"],                      startedAt: null, failed: false, failureMessage: null },
-    { label: "display-server spawned",        consoleHints: ["init-desktop spawned display-server"],        startedAt: null, failed: false, failureMessage: null },
-    { label: "shell spawned",                 consoleHints: ["init-desktop spawned shell"],                 startedAt: null, failed: false, failureMessage: null },
-    { label: "init supervising children",     consoleHints: ["init-desktop entering supervision loop"],     startedAt: null, failed: false, failureMessage: null },
-    { label: "display-server bound /run/display", consoleHints: ["display-server starting"],                startedAt: null, failed: false, failureMessage: null },
-    { label: "shell connected to display",    consoleHints: ["shell: connected to /run/display"],           startedAt: null, failed: false, failureMessage: null },
-    { label: "shell handshake complete",      consoleHints: ["display-server served client 0"],             startedAt: null, failed: false, failureMessage: null },
-    { label: "Framebuffer mode set 1024×768", consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
-    { label: "Desktop wallpaper rendered",    consoleHints: [],                                             startedAt: null, failed: false, failureMessage: null },
+    {
+      label: "Browser environment ready",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "Kernel worker spawned",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "Kernel ready",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "init (PID 1) running",
+      consoleHints: ["init-desktop starting"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "display-server spawned",
+      consoleHints: ["init-desktop spawned display-server"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "shell spawned",
+      consoleHints: ["init-desktop spawned shell"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "init supervising children",
+      consoleHints: ["init-desktop entering supervision loop"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "display-server bound /run/display",
+      consoleHints: ["display-server starting"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "shell connected to display",
+      consoleHints: ["shell: connected to /run/display"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "shell handshake complete",
+      consoleHints: ["display-server served client 0"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "Framebuffer mode set 1024×768",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "Framebuffer presentation completed",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
+    {
+      label: "Desktop ready",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null,
+    },
   ];
 
   const rows: HTMLDivElement[] = steps.map((step) => {
@@ -1636,7 +2152,8 @@ function mountBootSplash(): BootSplash {
     label.textContent = step.label;
     label.style.cssText = "flex: 1;";
     const elapsed = document.createElement("span");
-    elapsed.style.cssText = "color: #4a5f7a; font-size: 11px; min-width: 4.5rem; text-align: right;";
+    elapsed.style.cssText =
+      "color: #4a5f7a; font-size: 11px; min-width: 4.5rem; text-align: right;";
     row.appendChild(icon);
     row.appendChild(label);
     row.appendChild(elapsed);
@@ -1739,10 +2256,7 @@ function mountBootSplash(): BootSplash {
   }
 
   function dismiss(): void {
-    overlay.style.opacity = "0";
-    window.setTimeout(() => {
-      overlay.remove();
-    }, 400);
+    overlay.remove();
   }
 
   return { markStarted, markFailed, observeConsoleLine, dismiss };
@@ -1761,20 +2275,43 @@ function mountBootSplash(): BootSplash {
  *   * unhandledrejection / window error
  *   * `consoleHost.onLifecycle({kind:"panic"})`
  *   * 8-second console-silence watchdog
- *   * `init-desktop reaped child pid=N` (any tracked
- *     userland process exiting)
+ *   * the unsupervised display-server exit marker
  */
 interface CrashScreen {
-  observeConsoleLine(
-    text: string,
-    recentSink: string[],
-    cap: number,
-  ): void;
-  show(args: {
-    title: string;
-    subtitle: string;
-    recent: string[];
-  }): void;
+  observeConsoleLine(text: string, recentSink: string[], cap: number): void;
+  show(args: { title: string; subtitle: string; recent: string[] }): void;
+}
+
+export interface FatalConsoleDiagnosis {
+  readonly title: string;
+  readonly subtitle: string;
+}
+
+/**
+ * Classify only console evidence that means the running browser substrate can
+ * no longer provide a desktop. PID 1 deliberately supervises and respawns the
+ * shell, so its reap marker is not fatal and must not cover the replacement
+ * shell with a blocking crash screen.
+ */
+export function classifyFatalConsoleText(
+  text: string,
+): FatalConsoleDiagnosis | null {
+  const lower = text.toLowerCase();
+  const lastLine = text.trim().split("\n").slice(-1)[0] ?? "";
+  if (lower.includes("real kernel panic")) {
+    return { title: "Kernel panic", subtitle: lastLine };
+  }
+  if (lower.includes("dispatch error")) {
+    return { title: "Shell dispatch error", subtitle: lastLine };
+  }
+  if (lower.includes("init-desktop reaped child pid=3")) {
+    return {
+      title: "Display server died",
+      subtitle:
+        "init-desktop reaped the display-server. The desktop cannot run without it.",
+    };
+  }
+  return null;
 }
 
 function mountCrashScreen(): CrashScreen {
@@ -1789,7 +2326,7 @@ function mountCrashScreen(): CrashScreen {
     "justify-content: center",
     "background: linear-gradient(180deg, #1a0606 0%, #0a0202 100%)",
     "color: #ffd0d0",
-    "font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace",
+    'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
     "z-index: 10000",
     "padding: 2rem",
     "box-sizing: border-box",
@@ -1797,10 +2334,7 @@ function mountCrashScreen(): CrashScreen {
   ].join("; ");
 
   const container = document.createElement("div");
-  container.style.cssText = [
-    "max-width: 880px",
-    "width: 100%",
-  ].join("; ");
+  container.style.cssText = ["max-width: 880px", "width: 100%"].join("; ");
 
   const banner = document.createElement("div");
   banner.style.cssText = [
@@ -1861,10 +2395,7 @@ function mountCrashScreen(): CrashScreen {
   ].join("; ");
 
   const buttons = document.createElement("div");
-  buttons.style.cssText = [
-    "display: flex",
-    "gap: 0.75rem",
-  ].join("; ");
+  buttons.style.cssText = ["display: flex", "gap: 0.75rem"].join("; ");
 
   const reload = document.createElement("button");
   reload.textContent = "Reload";
@@ -1929,36 +2460,15 @@ function mountCrashScreen(): CrashScreen {
     // Auto-trigger on a few well-known fatal patterns the
     // kernel can't surface as a panic event (because the
     // panicking pid is userland, not the kernel itself).
-    const lower = text.toLowerCase();
-    if (
-      !shown &&
-      (
-        lower.includes("dispatch error") ||
-        lower.includes("real kernel panic") ||
-        lower.includes("init-desktop reaped child pid=4") ||
-        lower.includes("init-desktop reaped child pid=3")
-      )
-    ) {
+    const diagnosis = classifyFatalConsoleText(text);
+    if (!shown && diagnosis !== null) {
       // Defer slightly so the offending line lands in
       // recentSink before the screen renders.
       window.setTimeout(() => {
         if (shown) return;
-        let title = "Userland process crashed";
-        let subtitle = text.trim().split("\n").slice(-1)[0] ?? "";
-        if (lower.includes("real kernel panic")) {
-          title = "Kernel panic";
-        } else if (lower.includes("dispatch error")) {
-          title = "Shell dispatch error";
-        } else if (lower.includes("init-desktop reaped child pid=3")) {
-          title = "Display server died";
-          subtitle = "init-desktop reaped the display-server. The desktop cannot run without it.";
-        } else if (lower.includes("init-desktop reaped child pid=4")) {
-          title = "Shell died";
-          subtitle = "init-desktop reaped the shell. The desktop cannot run without it.";
-        }
         show({
-          title,
-          subtitle,
+          title: diagnosis.title,
+          subtitle: diagnosis.subtitle,
           recent: recentSink,
         });
       }, 50);
@@ -1991,6 +2501,16 @@ function showFallbackMessage(error: string): void {
       <p>${escapeHtml(error)}</p>
       <p style="color:#808591">See devtools console for details.</p>
     </div>`;
+}
+
+function showUnsupportedBrowserMessage(detail: string): void {
+  document.body.innerHTML = `
+    <main id="pmos-unsupported-browser" style="box-sizing:border-box;padding:2rem;font-family:ui-monospace,monospace;color:#e6e6e6;background:#0a0e14;min-height:100vh">
+      <h1 style="color:#ffb454">PMos cannot start in this browser</h1>
+      <p>${escapeHtml(detail)}</p>
+      <p>PMos requires persistent browser-local storage so it never presents a desktop that silently loses your files.</p>
+      <p style="color:#a8adb7">Use a current browser with OPFS, service workers, cross-origin isolation, SharedArrayBuffer, Atomics.wait, Atomics.waitAsync, and dedicated Workers.</p>
+    </main>`;
 }
 
 export function showPanic(message: string): void {
@@ -2028,18 +2548,14 @@ function escapeHtml(s: string): string {
 // When the kernel Worker posts `proc:spawn`, main allocates a
 // per-pid SAB, spawns a dedicated user Worker from
 // `/assets/user-worker.js`, posts a `boot {pid, sab, wasmBytes}` to
-// the new Worker, and posts `proc:sab` back to the kernel so the
-// kernel's dispatch loop adds the pid to its pidMap. When the user
+// the new Worker, and waits for its `booted` acknowledgement before
+// posting `proc:sab` back to the kernel so the kernel's dispatch
+// loop adds the pid to its pidMap. When the user
 // Worker posts `exited` (or fires an `error` event), main posts
 // `proc:exited` to the kernel and terminates the Worker.
 //
-// T232 lands the router as test-callable plumbing only. The
-// production `runRealKernelMode()` path above is untouched and still
-// uses the kernel's in-process drain. T234 swaps the bootstrap
-// production wiring onto this router and drops the in-process drain
-// for spawned children. The split keeps `real-kernel.spec.ts` green
-// across the M1 sub-slices instead of waiting on the full Worker
-// path to land before any tests can run.
+// Production and tests share this router so process publication,
+// rollback, and host teardown have one lifecycle implementation.
 
 /**
  * Minimal user-Worker interface — the subset of the dedicated
@@ -2104,6 +2620,29 @@ export interface SpawnRouterDeps {
    * `serviceHook` path.
    */
   readonly getKernelWakeSlot?: () => ArrayBufferLike | null;
+  /** Called after the router adds or removes a host Worker route. */
+  readonly onLiveWorkersChanged?: (count: number) => void;
+  /**
+   * Defense-in-depth cap for live user Workers. Production uses the kernel's
+   * global process limit; tests may lower it to exercise the rejection path.
+   */
+  readonly maxLiveWorkers?: number;
+}
+
+/** Must match `kernel::proc::PROCESS_LIMIT_GLOBAL`. */
+export const MAX_LIVE_USER_WORKERS = 256;
+
+const USER_WORKER_TRAP_LOG_MAX = 240;
+
+function sanitizeUserWorkerTrap(trap: string): string {
+  const singleLine = trap
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const visible = singleLine === "" ? "(empty trap)" : singleLine;
+  return visible.length <= USER_WORKER_TRAP_LOG_MAX
+    ? visible
+    : `${visible.slice(0, USER_WORKER_TRAP_LOG_MAX - 3)}...`;
 }
 
 /** A live entry in the router's pid → user-Worker map. */
@@ -2145,16 +2684,424 @@ export function installPagehideSync(
 }
 
 /**
+ * Subset of an `EventTarget` needed by
+ * [`installHostFileDropHandler`]. Production passes `window` (so
+ * drops anywhere in the page land); tests pass a stub that
+ * records the listeners and lets the test fire them.
+ */
+export interface DropTarget {
+  addEventListener(
+    type: "dragover" | "drop",
+    listener: (event: HostDragEvent) => void,
+  ): void;
+}
+
+/**
+ * The drop-event surface this module reaches into. A subset of
+ * the DOM `DragEvent` so tests can synthesise a value without
+ * faking the entire DOM. The two real fields we touch are
+ * `dataTransfer.files` (a list of host `File` objects) and
+ * `preventDefault()` (so the browser doesn't try to navigate to
+ * the dropped resource).
+ */
+export interface HostDragEvent {
+  preventDefault(): void;
+  readonly dataTransfer: {
+    readonly files: ArrayLike<HostDragFile>;
+  } | null;
+}
+
+/**
+ * The file surface — `name`, optional `type`, and an
+ * `arrayBuffer()` reader. Real `File` instances satisfy this
+ * directly; tests pass a literal.
+ */
+export interface HostDragFile {
+  readonly name: string;
+  readonly type?: string;
+  /** Browser-owned immutable byte length, available before reading the file. */
+  readonly size: number;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+/** Browser picker seam. Production creates a transient `<input type=file>`;
+ * unit tests inject a deterministic implementation with no DOM dependency. */
+export interface HostFilePicker {
+  pick(
+    onFiles: (files: ArrayLike<HostDragFile>) => void,
+    interactionAllowed?: () => boolean,
+  ): void;
+}
+
+/** A browser-substrate confirmation surface. The kernel has already
+ * authorised the request before this prompt is mounted; its trusted click is
+ * the user activation that opens the native picker. */
+export interface HostFilePickerConfirmation {
+  request(onConfirm: () => void): void;
+}
+
+export const HOST_FILE_PICKER_CONFIRM_ID = "pmos-host-file-picker-confirm";
+
+/** Compose an authorised confirmation prompt with the native picker. Keeping
+ * the picker open in the confirmation callback avoids relying on transient
+ * activation surviving a kernel and two Worker message turns. */
+export function confirmedHostFilePicker(
+  picker: HostFilePicker,
+  confirmation: HostFilePickerConfirmation,
+): HostFilePicker {
+  return {
+    pick(onFiles, interactionAllowed = () => true): void {
+      let consumed = false;
+      confirmation.request(() => {
+        if (consumed) return;
+        consumed = true;
+        if (!interactionAllowed()) {
+          console.warn(
+            "[pmos-bootstrap] host file picker blocked while storage recovery is active",
+          );
+          return;
+        }
+        picker.pick(onFiles, interactionAllowed);
+      });
+    },
+  };
+}
+
+function browserNativeHostFilePicker(): HostFilePicker {
+  return {
+    pick(onFiles): void {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.multiple = true;
+      input.hidden = true;
+      input.addEventListener(
+        "change",
+        () => {
+          if (input.files !== null) onFiles(input.files);
+          input.remove();
+        },
+        { once: true },
+      );
+      input.addEventListener("cancel", () => input.remove(), { once: true });
+      document.body.append(input);
+      // This call runs synchronously inside the trusted confirmation click.
+      input.click();
+    },
+  };
+}
+
+function browserHostFilePickerConfirmation(): HostFilePickerConfirmation {
+  return {
+    request(onConfirm): void {
+      const existing = document.getElementById(HOST_FILE_PICKER_CONFIRM_ID);
+      if (existing instanceof HTMLButtonElement) {
+        existing.focus();
+        return;
+      }
+      existing?.remove();
+
+      const button = document.createElement("button");
+      button.id = HOST_FILE_PICKER_CONFIRM_ID;
+      button.type = "button";
+      button.textContent = "Choose files for PMos";
+      button.style.cssText =
+        "position:fixed;left:50%;top:16px;transform:translateX(-50%);" +
+        "z-index:2147483647;padding:10px 16px;border:1px solid #365f84;" +
+        "border-radius:4px;background:#f4f5f7;color:#161b20;" +
+        "font:600 14px system-ui,sans-serif;box-shadow:0 3px 12px #0005;";
+      button.addEventListener(
+        "click",
+        () => {
+          button.remove();
+          onConfirm();
+        },
+        { once: true },
+      );
+      document.body.append(button);
+      button.focus();
+    },
+  };
+}
+
+function browserHostFilePicker(): HostFilePicker {
+  return confirmedHostFilePicker(
+    browserNativeHostFilePicker(),
+    browserHostFilePickerConfirmation(),
+  );
+}
+
+/** Open the host picker and route every chosen file through the same
+ * tokenised, kernel-mediated import path used by drag-and-drop. */
+export function requestHostFilePicker(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  picker: HostFilePicker = browserHostFilePicker(),
+  interactionAllowed: () => boolean = () => true,
+): void {
+  if (!interactionAllowed()) {
+    console.warn(
+      "[pmos-bootstrap] host file picker blocked while storage recovery is active",
+    );
+    return;
+  }
+  picker.pick((files) => {
+    // The user may leave the picker open while storage enters degraded mode.
+    // Re-check at delivery time so selection cannot bypass the recovery gate.
+    if (!interactionAllowed()) {
+      console.warn(
+        "[pmos-bootstrap] host file selection ignored while storage recovery is active",
+      );
+      return;
+    }
+    enqueueHostFileBatch(kernelWorker, files, interactionAllowed);
+  }, interactionAllowed);
+}
+
+/** Injectable browser-download seam used to keep Blob/DOM behavior testable. */
+export interface HostDownloadTarget {
+  save(name: string, mime: string, bytes: Uint8Array): void;
+}
+
+function browserHostDownloadTarget(): HostDownloadTarget {
+  return {
+    save(name, mime, bytes): void {
+      const owned = new Uint8Array(bytes.byteLength);
+      owned.set(bytes);
+      const blob = new Blob([owned], {
+        type: mime || "application/octet-stream",
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      anchor.hidden = true;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    },
+  };
+}
+
+function safeHostDownloadName(name: string): string {
+  const normalised = name.replaceAll("\\", "/");
+  const leaf = normalised.split("/").pop()?.trim() ?? "";
+  return leaf === "" || leaf === "." || leaf === ".." ? "download" : leaf;
+}
+
+/** Save kernel-owned bytes through the browser download surface. A defensive
+ * owned copy prevents later mutation of a transferred worker buffer. */
+export function saveHostDownload(
+  name: string,
+  mime: string,
+  bytes: Uint8Array,
+  target: HostDownloadTarget = browserHostDownloadTarget(),
+): void {
+  const owned = new Uint8Array(bytes.byteLength);
+  owned.set(bytes);
+  target.save(
+    safeHostDownloadName(name),
+    mime || "application/octet-stream",
+    owned,
+  );
+}
+
+/**
+ * Per-tab token allocator for host-file drops. Bumps a counter
+ * starting at 1; the 0 token is reserved as "no token" so a
+ * userland `host_file_recv(0)` always fails. Counter wraps at
+ * `0xFFFFFFFF` — never expected to wrap in practice (drag-drop
+ * is a human-pace event), but the mod keeps the export's u32
+ * argument well-defined under perversely-long sessions.
+ */
+let nextHostFileToken = 1;
+function allocateHostFileToken(): number {
+  const token = nextHostFileToken;
+  nextHostFileToken =
+    nextHostFileToken === 0xffffffff ? 1 : nextHostFileToken + 1;
+  return token;
+}
+
+/**
+ * T154: install the bootstrap-side drag-drop handler that turns
+ * each dropped host file into a `host:dropped` MainToKernel
+ * message. v1 caps each import at 16 MiB; the Worker copies accepted
+ * bytes into the kernel through bounded heap-scratch chunks. Larger
+ * drops are skipped with a console warning. Returns the registered
+ * listeners so tests can fire them directly without a real DOM.
+ */
+export function installHostFileDropHandler(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  target: DropTarget = window as unknown as DropTarget,
+  interactionAllowed: () => boolean = () => true,
+): {
+  dragover: (e: HostDragEvent) => void;
+  drop: (e: HostDragEvent) => void;
+} {
+  const dragover = (e: HostDragEvent): void => {
+    // preventDefault on dragover is required by the DnD spec
+    // for the subsequent drop event to fire on the same target.
+    e.preventDefault();
+  };
+  const drop = (e: HostDragEvent): void => {
+    e.preventDefault();
+    if (!interactionAllowed()) {
+      console.warn(
+        "[pmos-bootstrap] host file drop ignored while storage recovery is active",
+      );
+      return;
+    }
+    const dt = e.dataTransfer;
+    if (!dt || !dt.files) {
+      return;
+    }
+    enqueueHostFileBatch(kernelWorker, dt.files, interactionAllowed);
+  };
+  target.addEventListener("dragover", dragover);
+  target.addEventListener("drop", drop);
+  return { dragover, drop };
+}
+
+function preadmitHostFileBatch(
+  files: ArrayLike<HostDragFile>,
+): { readonly files: HostDragFile[]; readonly bytes: number } | null {
+  if (
+    !Number.isSafeInteger(files.length) ||
+    files.length < 0 ||
+    files.length > HOST_FILE_IMPORT_MAX_FILES
+  ) {
+    console.warn(
+      `[pmos-bootstrap] host import batch contains ${files.length} files; cap is ${HOST_FILE_IMPORT_MAX_FILES}; ignored`,
+    );
+    return null;
+  }
+
+  const admitted: HostDragFile[] = [];
+  let aggregateBytes = 0;
+  for (let i = 0; i < files.length; i += 1) {
+    const file = files[i];
+    if (!file) continue;
+    if (!Number.isSafeInteger(file.size) || file.size < 0) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: invalid browser File.size; ignored`,
+      );
+      continue;
+    }
+    if (file.size > HOST_FILE_IMPORT_MAX_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: ${file.size} bytes exceeds v1 cap of ${HOST_FILE_IMPORT_MAX_BYTES}; ignored`,
+      );
+      continue;
+    }
+    aggregateBytes += file.size;
+    if (aggregateBytes > HOST_FILE_IMPORT_MAX_TOTAL_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host import batch exceeds v1 aggregate cap of ${HOST_FILE_IMPORT_MAX_TOTAL_BYTES} bytes; ignored`,
+      );
+      return null;
+    }
+    admitted.push(file);
+  }
+  return { files: admitted, bytes: aggregateBytes };
+}
+
+let pendingHostFileCount = 0;
+let pendingHostFileBytes = 0;
+let hostFileReadTail: Promise<void> = Promise.resolve();
+
+function enqueueHostFileBatch(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  files: ArrayLike<HostDragFile>,
+  interactionAllowed: () => boolean,
+): void {
+  const admitted = preadmitHostFileBatch(files);
+  if (admitted === null) return;
+  const nextCount = pendingHostFileCount + admitted.files.length;
+  const nextBytes = pendingHostFileBytes + admitted.bytes;
+  if (
+    nextCount > HOST_FILE_IMPORT_MAX_FILES ||
+    nextBytes > HOST_FILE_IMPORT_MAX_TOTAL_BYTES
+  ) {
+    console.warn(
+      "[pmos-bootstrap] host import queue is at the v1 live-import limit; selection ignored",
+    );
+    return;
+  }
+  pendingHostFileCount = nextCount;
+  pendingHostFileBytes = nextBytes;
+
+  hostFileReadTail = hostFileReadTail
+    .then(async () => {
+      try {
+        // File.arrayBuffer() materialises the whole browser File. One shared
+        // queue covers picker and drop batches, so overlapping user gestures can
+        // never allocate their file bodies concurrently on main.
+        for (const file of admitted.files) {
+          if (!interactionAllowed()) {
+            console.warn(
+              "[pmos-bootstrap] queued host import cancelled while storage recovery is active",
+            );
+            return;
+          }
+          await deliverDropFile(kernelWorker, file);
+        }
+      } finally {
+        pendingHostFileCount -= admitted.files.length;
+        pendingHostFileBytes -= admitted.bytes;
+      }
+    })
+    .catch((error: unknown) => {
+      console.warn(
+        `[pmos-bootstrap] host import queue failed: ${String(error)}`,
+      );
+    });
+}
+
+async function deliverDropFile(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  file: HostDragFile,
+): Promise<void> {
+  try {
+    if (file.size > HOST_FILE_IMPORT_MAX_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: ${file.size} bytes exceeds v1 cap of ${HOST_FILE_IMPORT_MAX_BYTES}; ignored`,
+      );
+      return;
+    }
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    if (bytes.length > HOST_FILE_IMPORT_MAX_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host drop ${file.name}: ${bytes.length} bytes exceeds v1 cap of ${HOST_FILE_IMPORT_MAX_BYTES}; ignored`,
+      );
+      return;
+    }
+    if (bytes.length !== file.size) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: browser size changed from ${file.size} to ${bytes.length}; ignored`,
+      );
+      return;
+    }
+    const token = allocateHostFileToken();
+    kernelWorker.postMessage({
+      kind: "host:dropped",
+      token,
+      name: file.name,
+      mime: file.type ?? "application/octet-stream",
+      bytes,
+    });
+  } catch (e) {
+    console.warn(`[pmos-bootstrap] host drop failed: ${(e as Error).message}`);
+  }
+}
+
+/**
  * Subset of `EventTarget` needed by
  * [`installBeforeUnloadSync`] — production code passes `window`,
  * tests pass a stub that captures the listener and fires it on
  * demand.
  */
 export interface BeforeUnloadTarget {
-  addEventListener(
-    type: "beforeunload",
-    listener: () => void,
-  ): void;
+  addEventListener(type: "beforeunload", listener: () => void): void;
 }
 
 /**
@@ -2256,7 +3203,14 @@ export interface SpawnRouter {
 }
 
 export function createSpawnRouter(deps: SpawnRouterDeps): SpawnRouter {
-  const live = new Map<number, SpawnedEntry>();
+  interface RoutedEntry extends SpawnedEntry {
+    sabPublished: boolean;
+    readonly onMessage: (ev: { data: UserToMain }) => void;
+    readonly onError: (ev: { message?: string }) => void;
+  }
+
+  const live = new Map<number, RoutedEntry>();
+  const maxLiveWorkers = deps.maxLiveWorkers ?? MAX_LIVE_USER_WORKERS;
 
   function recordMemory(pid: number, bytes: number): void {
     if (!live.has(pid)) {
@@ -2273,7 +3227,15 @@ export function createSpawnRouter(deps: SpawnRouterDeps): SpawnRouter {
       // AND fires error on the same trap; main side reaps once).
       return;
     }
+    if (trap !== undefined) {
+      console.error(
+        `[pmos-bootstrap] user worker crashed pid=${pid}: ${sanitizeUserWorkerTrap(trap)}`,
+      );
+    }
     live.delete(pid);
+    deps.onLiveWorkersChanged?.(live.size);
+    entry.worker.removeEventListener("message", entry.onMessage);
+    entry.worker.removeEventListener("error", entry.onError);
     entry.worker.terminate();
     deps.kernelWorker.postMessage(
       trap !== undefined
@@ -2285,64 +3247,138 @@ export function createSpawnRouter(deps: SpawnRouterDeps): SpawnRouter {
   return {
     liveWorkers: live,
     handleKernelMessage(msg: KernelToMain): void {
+      if (msg.kind === "proc:terminate") {
+        // The kernel has already made the pid terminal. This host
+        // acknowledgement releases the Worker and routing entry;
+        // its proc:exited reply is deliberately idempotent against
+        // the kernel-side SIGKILL transition.
+        reap(msg.pid, 128 + msg.signal, undefined);
+        return;
+      }
       if (msg.kind !== "proc:spawn") {
         return;
       }
-      const sab = deps.allocSab();
-      const worker = deps.workerFactory();
-      live.set(msg.pid, { worker, sab });
-      worker.addEventListener("message", (ev) => {
-        const m = ev.data;
-        if (m.pid !== msg.pid) {
-          return;
-        }
-        if (m.kind === "memory") {
-          recordMemory(msg.pid, m.bytes);
-          return;
-        }
-        if (m.memoryBytes !== undefined) {
-          recordMemory(msg.pid, m.memoryBytes);
-        }
-        if (m.kind === "exited") {
-          reap(msg.pid, m.code, m.trap);
-        }
-      });
-      worker.addEventListener("error", (ev) => {
-        reap(msg.pid, -1, ev.message ?? "user worker error");
-      });
-      // T234: forward the kernel's wake-slot buffer when the host
-      // exposed one. The user-worker entry constructs an
-      // `Int32Array` view and hands it to `SabBackend`; the
-      // production wake protocol lights up. When `getKernelWakeSlot`
-      // is unset (T232 unit tests) or returns `null` (production
-      // raced ahead of the kernel:wake-slot arrival, which our
-      // protocol prevents by posting wake-slot before the first
-      // proc:spawn — but defensive), the boot message omits the
-      // field and `SabBackend` stays on the legacy path.
-      const kernelWakeSlot = deps.getKernelWakeSlot?.() ?? null;
-      worker.postMessage(
-        kernelWakeSlot !== null
-          ? {
-              kind: "boot",
-              pid: msg.pid,
-              sab,
-              wasmBytes: msg.wasmBytes,
-              kernelWakeSlot,
+      // A repeated publication for one pid is never legitimate. Do
+      // not replace the existing Worker — doing so would orphan the
+      // first instance and split one kernel identity across workers.
+      if (live.has(msg.pid)) {
+        return;
+      }
+      // The kernel rejects the corresponding proc_spawn before allocating a
+      // pid, so production should never reach this branch. Keep the browser
+      // substrate independently bounded in case of a corrupt or mismatched
+      // kernel image. Crucially, reject before allocating either the SAB or
+      // the Worker.
+      if (live.size >= maxLiveWorkers) {
+        deps.kernelWorker.postMessage({
+          kind: "proc:exited",
+          pid: msg.pid,
+          code: -1,
+          trap: `user worker limit exceeded (${maxLiveWorkers})`,
+        });
+        return;
+      }
+
+      let worker: UserWorkerLike | undefined;
+      try {
+        const sab = deps.allocSab();
+        worker = deps.workerFactory();
+        const onMessage = (ev: { data: UserToMain }): void => {
+          const m = ev.data;
+          if (m.pid !== msg.pid) {
+            return;
+          }
+          if (m.kind === "booted") {
+            const entry = live.get(msg.pid);
+            if (!entry || entry.sabPublished) {
+              return;
             }
-          : {
-              kind: "boot",
+            entry.sabPublished = true;
+            deps.kernelWorker.postMessage({
+              kind: "proc:sab",
               pid: msg.pid,
               sab,
-              wasmBytes: msg.wasmBytes,
-            },
-      );
-      deps.kernelWorker.postMessage({ kind: "proc:sab", pid: msg.pid, sab });
+            });
+            return;
+          }
+          if (m.kind === "memory") {
+            recordMemory(msg.pid, m.bytes);
+            return;
+          }
+          if (m.kind === "exited" && m.memoryBytes !== undefined) {
+            recordMemory(msg.pid, m.memoryBytes);
+          }
+          if (m.kind === "exited") {
+            reap(msg.pid, m.code, m.trap);
+          }
+        };
+        const onError = (ev: { message?: string }): void => {
+          reap(msg.pid, -1, ev.message ?? "user worker error");
+        };
+        live.set(msg.pid, {
+          worker,
+          sab,
+          sabPublished: false,
+          onMessage,
+          onError,
+        });
+        deps.onLiveWorkersChanged?.(live.size);
+        worker.addEventListener("message", onMessage);
+        worker.addEventListener("error", onError);
+        // T234: forward the kernel's wake-slot buffer when the host
+        // exposed one. The user-worker entry constructs an
+        // `Int32Array` view and hands it to `SabBackend`; the
+        // production wake protocol lights up. When `getKernelWakeSlot`
+        // is unset (T232 unit tests) or returns `null` (production
+        // raced ahead of the kernel:wake-slot arrival, which our
+        // protocol prevents by posting wake-slot before the first
+        // proc:spawn — but defensive), the boot message omits the
+        // field and `SabBackend` stays on the legacy path.
+        const kernelWakeSlot = deps.getKernelWakeSlot?.() ?? null;
+        worker.postMessage(
+          kernelWakeSlot !== null
+            ? {
+                kind: "boot",
+                pid: msg.pid,
+                sab,
+                wasmBytes: msg.wasmBytes,
+                kernelWakeSlot,
+              }
+            : {
+                kind: "boot",
+                pid: msg.pid,
+                sab,
+                wasmBytes: msg.wasmBytes,
+              },
+        );
+      } catch (error) {
+        const entry = live.get(msg.pid);
+        if (entry) {
+          live.delete(msg.pid);
+          deps.onLiveWorkersChanged?.(live.size);
+          entry.worker.removeEventListener("message", entry.onMessage);
+          entry.worker.removeEventListener("error", entry.onError);
+          entry.worker.terminate();
+        } else {
+          worker?.terminate();
+        }
+        const trap = error instanceof Error ? error.message : String(error);
+        deps.kernelWorker.postMessage({
+          kind: "proc:exited",
+          pid: msg.pid,
+          code: -1,
+          trap: `user worker boot failed: ${trap}`,
+        });
+      }
     },
     terminateAll(): void {
       for (const [pid, entry] of live) {
+        entry.worker.removeEventListener("message", entry.onMessage);
+        entry.worker.removeEventListener("error", entry.onError);
         entry.worker.terminate();
         live.delete(pid);
       }
+      deps.onLiveWorkersChanged?.(live.size);
     },
   };
 }

@@ -137,10 +137,7 @@ impl JobTable {
     /// `proc_wait` reports a zombie pid, this maps it back
     /// to a job id so we can flip its status.
     pub fn find_by_pid(&self, pid: i32) -> Option<u32> {
-        self.jobs
-            .values()
-            .find(|j| j.pid == pid)
-            .map(|j| j.id)
+        self.jobs.values().find(|j| j.pid == pid).map(|j| j.id)
     }
 }
 
@@ -207,10 +204,7 @@ mod tests {
         let mut table = JobTable::new();
         let id = table.add(100, "x".to_string());
         table.set_status(id, JobStatus::Exited { code: 0 });
-        assert_eq!(
-            table.get(id).unwrap().status,
-            JobStatus::Exited { code: 0 }
-        );
+        assert_eq!(table.get(id).unwrap().status, JobStatus::Exited { code: 0 });
     }
 
     #[test]

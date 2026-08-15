@@ -62,8 +62,5 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!(
-        "usage: pkginstall [--opt-root DIR] [--app-dir DIR] [--upgrade] <bundle.pmpkg.tar>"
-    );
+    eprintln!("usage: pkginstall [--opt-root DIR] [--app-dir DIR] [--upgrade] <bundle.pmpkg.tar>");
 }
-

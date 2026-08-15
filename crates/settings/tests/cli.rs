@@ -104,15 +104,36 @@ fn empty_config_prints_six_unset_lines() {
     assert_eq!(out.status.code(), Some(0), "exit status: {:?}", out.status);
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
 
-    assert!(stdout.contains("theme.name      = (unset)"), "stdout = {stdout:?}");
-    assert!(stdout.contains("theme.fit       = (unset)"), "stdout = {stdout:?}");
-    assert!(stdout.contains("wallpaper.name  = (unset)"), "stdout = {stdout:?}");
-    assert!(stdout.contains("keyboard.layout = (unset)"), "stdout = {stdout:?}");
-    assert!(stdout.contains("timezone.iana   = (unset)"), "stdout = {stdout:?}");
-    assert!(stdout.contains("terminal.font   = (unset)"), "stdout = {stdout:?}");
+    assert!(
+        stdout.contains("theme.name      = (unset)"),
+        "stdout = {stdout:?}"
+    );
+    assert!(
+        stdout.contains("theme.fit       = (unset)"),
+        "stdout = {stdout:?}"
+    );
+    assert!(
+        stdout.contains("wallpaper.name  = (unset)"),
+        "stdout = {stdout:?}"
+    );
+    assert!(
+        stdout.contains("keyboard.layout = (unset)"),
+        "stdout = {stdout:?}"
+    );
+    assert!(
+        stdout.contains("timezone.iana   = (unset)"),
+        "stdout = {stdout:?}"
+    );
+    assert!(
+        stdout.contains("terminal.font   = (unset)"),
+        "stdout = {stdout:?}"
+    );
 
     let line_count = stdout.matches('\n').count();
-    assert_eq!(line_count, 6, "expected 6 newline-terminated lines, got {line_count}: {stdout:?}");
+    assert_eq!(
+        line_count, 6,
+        "expected 6 newline-terminated lines, got {line_count}: {stdout:?}"
+    );
 
     let _ = fs::remove_file(&path);
 }
@@ -143,8 +164,11 @@ fn about_prints_version_abi_license_credits() {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&dir).expect("mkdir about doc-root");
-    fs::write(dir.join("LICENSE.txt"), b"MIT-licensed. See full text in repo root.\n")
-        .expect("write LICENSE fixture");
+    fs::write(
+        dir.join("LICENSE.txt"),
+        b"MIT-licensed. See full text in repo root.\n",
+    )
+    .expect("write LICENSE fixture");
     fs::write(dir.join("CREDITS.txt"), b"PMos contributors.\n").expect("write CREDITS fixture");
 
     let out = Command::new(SETTINGS)
@@ -157,10 +181,12 @@ fn about_prints_version_abi_license_credits() {
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
 
     assert!(stdout.contains("PMos v0.1.0-alpha"), "stdout = {stdout:?}");
-    assert!(
-        stdout.contains("Kernel ABI version: 1.1"),
-        "stdout = {stdout:?}"
+    let expected_abi = format!(
+        "Kernel ABI version: {}.{}",
+        abi::version::ABI_MAJOR,
+        abi::version::ABI_MINOR,
     );
+    assert!(stdout.contains(&expected_abi), "stdout = {stdout:?}");
     assert!(stdout.contains("License:"), "stdout = {stdout:?}");
     assert!(
         stdout.contains("MIT-licensed. See full text in repo root."),
@@ -476,8 +502,7 @@ fn set_theme_writes_new_theme_name_to_fresh_config() {
 
     let written = fs::read_to_string(&path).expect("read written config");
     assert!(
-        written.contains("theme.name = \"dark\"")
-            || written.contains("[theme]\nname = \"dark\""),
+        written.contains("theme.name = \"dark\"") || written.contains("[theme]\nname = \"dark\""),
         "written config should contain theme.name = dark: {written:?}"
     );
 
@@ -527,10 +552,7 @@ fn set_theme_preserves_other_fields() {
 
 #[test]
 fn set_theme_overwrites_existing_theme_name() {
-    let path = write_temp(
-        "set-theme-overwrite",
-        b"[theme]\nname = \"light\"\n",
-    );
+    let path = write_temp("set-theme-overwrite", b"[theme]\nname = \"light\"\n");
 
     let out = Command::new(SETTINGS)
         .args(["set-theme", "dark", "--config"])
@@ -552,8 +574,8 @@ fn set_theme_overwrites_existing_theme_name() {
         "old theme.name = light should be gone: {written:?}"
     );
 
-    let prefs = preferences::Preferences::parse(written.as_bytes())
-        .expect("written config round-trips");
+    let prefs =
+        preferences::Preferences::parse(written.as_bytes()).expect("written config round-trips");
     assert_eq!(prefs.theme_name.as_deref(), Some("dark"));
 
     let _ = fs::remove_file(&path);
@@ -597,10 +619,7 @@ fn set_theme_missing_name_arg_exits_one_with_usage() {
 
 #[test]
 fn set_theme_invalid_toml_exits_one() {
-    let path = write_temp(
-        "set-theme-garbage",
-        b"garbage bytes without any section\n",
-    );
+    let path = write_temp("set-theme-garbage", b"garbage bytes without any section\n");
 
     let out = Command::new(SETTINGS)
         .args(["set-theme", "dark", "--config"])
@@ -714,8 +733,8 @@ fn set_wallpaper_overwrites_existing_value() {
         "[wallpaper] section should appear exactly once: {written:?}"
     );
 
-    let prefs = preferences::Preferences::parse(written.as_bytes())
-        .expect("written config round-trips");
+    let prefs =
+        preferences::Preferences::parse(written.as_bytes()).expect("written config round-trips");
     assert_eq!(prefs.wallpaper_name.as_deref(), Some("mountains.png"));
 
     let _ = fs::remove_file(&path);
@@ -877,8 +896,8 @@ fn set_keyboard_overwrites_existing_value() {
         "[keyboard] section should appear exactly once: {written:?}"
     );
 
-    let prefs = preferences::Preferences::parse(written.as_bytes())
-        .expect("written config round-trips");
+    let prefs =
+        preferences::Preferences::parse(written.as_bytes()).expect("written config round-trips");
     assert_eq!(prefs.keyboard_layout.as_deref(), Some("us-qwerty"));
 
     let _ = fs::remove_file(&path);
@@ -1067,8 +1086,8 @@ fn set_timezone_overwrites_existing_value() {
         "[timezone] section should appear exactly once: {written:?}"
     );
 
-    let prefs = preferences::Preferences::parse(written.as_bytes())
-        .expect("written config round-trips");
+    let prefs =
+        preferences::Preferences::parse(written.as_bytes()).expect("written config round-trips");
     assert_eq!(prefs.timezone_iana.as_deref(), Some("America/New_York"));
 
     let _ = fs::remove_file(&path);

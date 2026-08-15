@@ -127,8 +127,7 @@ fn ps4_change_takes_effect_for_next_command() {
     //     this trace point)
     // Pins that PS4 changes propagate immediately to the
     // NEXT command's trace, not the same command's trace.
-    let (status, _stdout, stderr, _env, _flags) =
-        drive("set -x\nexport 'PS4=>>'\necho hi\nexit\n");
+    let (status, _stdout, stderr, _env, _flags) = drive("set -x\nexport 'PS4=>>'\necho hi\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ export PS4=>>"),
@@ -151,8 +150,7 @@ fn ps4_empty_string_produces_bare_command() {
     // implementation that defaulted on empty string would
     // make `export PS4=` indistinguishable from "PS4 unset"
     // and the user would be unable to suppress the prefix.
-    let (status, _stdout, stderr, _env, _flags) =
-        drive("export PS4=\nset -x\necho hi\nexit\n");
+    let (status, _stdout, stderr, _env, _flags) = drive("export PS4=\nset -x\necho hi\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     // The trace line should be exactly `echo hi\n` — the
     // empty PS4 produces no prefix bytes, so the command
@@ -195,8 +193,7 @@ fn ps4_unset_falls_back_to_default() {
     // `echo hi`. Without this redundancy a regression that
     // accidentally echo-special-cased the default could
     // pass the first test.
-    let (status, _stdout, stderr, _env, _flags) =
-        drive("set -x\nexport X=val\nexit\n");
+    let (status, _stdout, stderr, _env, _flags) = drive("set -x\nexport X=val\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ export X=val"),

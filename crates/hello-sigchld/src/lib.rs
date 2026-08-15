@@ -1,20 +1,20 @@
-//! Reads one signal record from fd 3 (the auto-installed
+//! Reads one signal record from fd 4 (the auto-installed
 //! `FdObject::SignalChannel`) and echoes the two bytes to
 //! `/dev/console`. Proves the signal-delivery pipeline end-to-end
 //! through a real user wasm binary:
 //!
 //!   parent `PROC_KILL(child, SIGTERM)` → child's `SignalInbox`
-//!   gains one `Signal::Term` → child `fd_read(3, buf)` drains
+//!   gains one `Signal::Term` → child `fd_read(4, buf)` drains
 //!   it as a u16 LE signum → `fd_write(1, buf)` echoes to
 //!   `/dev/console` → `onConsoleWrite` observes bytes.
 //!
-//! fd 3 is installed automatically by `proc_spawn` (9fbe708) as
+//! fd 4 is installed automatically by `proc_spawn` as
 //! the per-process signal channel — no explicit `path_open` is
-//! needed. The polling loop on EAGAIN handles the race where a
+//! needed. A WASI `poll_oneoff` FD_READ wait on EAGAIN handles the race where a
 //! parent's PROC_KILL hasn't yet landed on the child's inbox
 //! when the child's first `fd_read` fires. Composition tests
 //! stage the signal BEFORE drain, so the first read finds it and
-//! returns immediately; the loop is a no-op in that path.
+//! returns immediately; the readiness wait is a no-op in that path.
 //!
 //! The 2-byte u16 LE record plus a trailing newline byte is what
 //! the binary writes to stdout — the `/dev/console` driver is
@@ -24,31 +24,40 @@
 //!
 //! Exit codes:
 //!
-//!   * 0   = success — drained 2 bytes, echoed + newline
-//!   * 11  = fd_read returned a non-EAGAIN, non-zero errno
-//!   * 12  = fd_read returned 0 bytes (unexpected — signal record
-//!           is always 2 bytes)
-//!   * 13  = fd_write to stdout failed or short-wrote
-//!   * 101 = panic
+//! * 0   = success — drained 2 bytes, echoed + newline
+//! * 11  = fd_read returned a non-EAGAIN, non-zero errno
+//! * 12  = fd_read returned 0 bytes (unexpected — signal record
+//!   is always 2 bytes)
+//! * 13  = fd_write to stdout failed or short-wrote
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
-    fn fd_read(
-        fd: i32,
-        iovs_ptr: *const Iovec,
-        iovs_len: i32,
-        nread_ptr: *mut u32,
-    ) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
+    fn fd_read(fd: i32, iovs_ptr: *const Iovec, iovs_len: i32, nread_ptr: *mut u32) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
+    fn poll_oneoff(
+        subscriptions: *const u8,
+        events: *mut u8,
+        nsubscriptions: u32,
+        nevents: *mut u32,
     ) -> i32;
     fn proc_exit(rval: i32) -> !;
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const SUBSCRIPTION_SIZE: usize = 48;
+#[cfg(target_arch = "wasm32")]
+const EVENT_SIZE: usize = 32;
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn readable_subscription(fd: i32) -> [u8; SUBSCRIPTION_SIZE] {
+    let mut subscription = [0u8; SUBSCRIPTION_SIZE];
+    subscription[8] = 1;
+    subscription[16..20].copy_from_slice(&(fd as u32).to_le_bytes());
+    subscription
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -66,10 +75,35 @@ struct Iovec {
 }
 
 #[cfg(target_arch = "wasm32")]
+unsafe fn wait_readable(fd: i32) -> Result<(), i32> {
+    const EIO: i32 = 29;
+    const EPIPE: i32 = 64;
+    let subscription = readable_subscription(fd);
+    let mut event = [0u8; EVENT_SIZE];
+    let mut nevents = 0u32;
+    let errno = poll_oneoff(subscription.as_ptr(), event.as_mut_ptr(), 1, &mut nevents);
+    if errno != 0 {
+        return Err(errno);
+    }
+    if nevents != 1 {
+        return Err(EIO);
+    }
+    let event_errno = u16::from_le_bytes([event[8], event[9]]) as i32;
+    if event_errno != 0 {
+        return Err(event_errno);
+    }
+    let flags = u16::from_le_bytes([event[24], event[25]]);
+    if flags & 1 != 0 {
+        return Err(EPIPE);
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 #[no_mangle]
 pub extern "C" fn _start() {
     unsafe {
-        // fd 3 is the auto-installed SignalChannel (proc_spawn
+        // fd 4 is the auto-installed SignalChannel (proc_spawn
         // installs it alongside stdio 0/1/2 — see 9fbe708).
         let mut buf = [0u8; 4];
         let read_iov = Iovec {
@@ -81,7 +115,7 @@ pub extern "C" fn _start() {
         const EAGAIN: i32 = 6;
         let mut nread: u32 = 0;
         loop {
-            let rc = fd_read(3, &read_iov, 1, &mut nread);
+            let rc = fd_read(4, &read_iov, 1, &mut nread);
             if rc == 0 && nread > 0 {
                 break;
             }
@@ -94,6 +128,9 @@ pub extern "C" fn _start() {
             }
             if rc == EAGAIN {
                 nread = 0;
+                if wait_readable(4).is_err() {
+                    proc_exit(11);
+                }
                 continue;
             }
             proc_exit(11);
@@ -122,6 +159,23 @@ pub extern "C" fn _start() {
         }
 
         proc_exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readable_subscription;
+
+    #[test]
+    fn signal_wait_uses_one_exact_fd_read_subscription() {
+        let subscription = readable_subscription(4);
+        assert_eq!(subscription[8], 1);
+        assert_eq!(
+            u32::from_le_bytes(subscription[16..20].try_into().unwrap()),
+            4,
+        );
+        assert!(subscription[..8].iter().all(|byte| *byte == 0));
+        assert!(subscription[20..].iter().all(|byte| *byte == 0));
     }
 }
 

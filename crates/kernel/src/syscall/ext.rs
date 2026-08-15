@@ -12,7 +12,8 @@
 //! As of the HOST_FILE_RECV slice, the dispatcher routes every
 //! extension opcode (`contracts/syscalls.md §3`):
 //! `IPC_SOCKET`, `IPC_BIND`, `IPC_LISTEN`, `IPC_CONNECT`,
-//! `IPC_ACCEPT`, `IPC_SEND`, `IPC_RECV`, `IPC_PIPE`, `PROC_SELF`,
+//! `IPC_ACCEPT`, `IPC_SEND`, `IPC_RECV`, `IPC_PIPE`, `IPC_PEER_CAPS`,
+//! `IPC_PEER_PID`, `PROC_SELF`,
 //! `PROC_PARENT`, `PROC_SPAWN`, `PROC_WAIT`, `PROC_KILL`,
 //! `PROC_CAPS_GET`, `DISPLAY_CONNECT`, `DISPLAY_BIND`,
 //! `CAP_CHECK`, `CAP_LIST`, `CAP_GRANT`, `MOUNT`, `UMOUNT`,
@@ -21,31 +22,33 @@
 //! Every opcode in `abi::ext::FIRST..LAST_EXCL` now has a
 //! handler — the `_ =>` arm exists only to catch reserved-but-
 //! unallocated opcode numbers in the gaps between the subsystem
-//! groups (e.g. `0x1008` between `IPC_PIPE` and `PROC_SPAWN`,
+//! groups (e.g. `0x100a` between `IPC_PEER_PID` and `PROC_SPAWN`,
 //! `0x1106..0x11ff` between the last `proc_*` opcode and
 //! `DISPLAY_CONNECT`, etc.). The
 //! `known_ext_opcode_without_handler_returns_enosys` test was
 //! rotated to a synthetic unallocated extension-range opcode
-//! (`0x1008`) so the `_ =>` arm stays covered against future
+//! (`0x100a`) so the `_ =>` arm stays covered against future
 //! regressions; once a future opcode lands at any unallocated
 //! number, that test should be re-rotated to a still-unused
 //! number in `FIRST..LAST_EXCL`.
 
 extern crate alloc;
 
-use alloc::string::ToString;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use abi::cap::{Cap, CapSet};
-use abi::errno::{EAGAIN, EBADF, EBUSY, ECHILD, EINVAL, ENOSYS, ESRCH};
+use abi::errno::{EAGAIN, EBADF, EBUSY, ECHILD, EINVAL, ENOSYS, ENOTCONN, ENOTSOCK, ESRCH};
 use abi::ext::WATCH_MASK_ALL;
 use abi::ext::{self as op, Pid};
 use abi::ring::{Request, Response};
 
+use crate::fd::{FdObject, FdTable, FD_SOFT_LIMIT};
 use crate::ipc::SocketType;
 use crate::platform;
 use crate::proc::{ExitStatus, Signal};
-use crate::sys::{Kernel, SpawnArgs, WaitOutcome, WaitTarget};
+use crate::sys::{Kernel, RecvParkRequest, SpawnArgs, WaitOutcome, WaitTarget};
 
 use super::dispatch::{
     args_u16, args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno, ServiceOutcome,
@@ -68,6 +71,8 @@ pub fn dispatch_ext(
         op::IPC_SEND => ServiceOutcome::Done(handle_ipc_send(kernel, pid, req, heap)),
         op::IPC_RECV => handle_ipc_recv(kernel, pid, req, heap),
         op::IPC_PIPE => ServiceOutcome::Done(handle_ipc_pipe(kernel, pid, req, heap)),
+        op::IPC_PEER_CAPS => ServiceOutcome::Done(handle_ipc_peer_caps(kernel, pid, req)),
+        op::IPC_PEER_PID => ServiceOutcome::Done(handle_ipc_peer_pid(kernel, pid, req)),
         op::PROC_SELF => ServiceOutcome::Done(handle_proc_self(pid, req)),
         op::PROC_PARENT => ServiceOutcome::Done(handle_proc_parent(kernel, pid, req)),
         op::CAP_CHECK => ServiceOutcome::Done(handle_cap_check(kernel, pid, req)),
@@ -82,7 +87,10 @@ pub fn dispatch_ext(
         op::MOUNT => ServiceOutcome::Done(handle_mount(kernel, pid, req, heap)),
         op::UMOUNT => ServiceOutcome::Done(handle_umount(kernel, pid, req, heap)),
         op::FS_WATCH => ServiceOutcome::Done(handle_fs_watch(kernel, pid, req, heap)),
+        op::FS_CHMOD => ServiceOutcome::Done(handle_fs_chmod(kernel, pid, req, heap)),
         op::HOST_FILE_RECV => ServiceOutcome::Done(handle_host_file_recv(kernel, pid, req)),
+        op::HOST_FILE_PICK => ServiceOutcome::Done(handle_host_file_pick(kernel, pid, req)),
+        op::HOST_FILE_SEND => ServiceOutcome::Done(handle_host_file_send(kernel, pid, req, heap)),
         _ => ServiceOutcome::Done(Response::err(req.request_id, ENOSYS)),
     }
 }
@@ -213,8 +221,8 @@ fn handle_cap_grant(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 // ---- ipc_socket --------------------------------------------------------
 //
 // Layout:
-//   args[0..4] = socket type (u32): 0 = Stream, 1 = Dgram
-//                (matches `abi::ext::SocketType` discriminants)
+//   args[0..4] = socket type (u32): 0 = Stream; 1 is the reserved Dgram
+//                discriminant and returns ENOTSUP in v1
 // Response:
 //   value = fresh socket fd
 //
@@ -264,8 +272,8 @@ fn handle_ipc_bind(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) ->
 // Layout:
 //   args[0..4] = fd (u32) referring to a bound socket
 //   args[4..8] = backlog (u32) — number of pending connections the
-//                 listener can queue before a connect is refused.
-//                 Ignored for dgram sockets (they don't listen).
+//                 listener can queue before a connect is refused. v1 admits
+//                 only stream sockets; Dgram creation returns ENOTSUP.
 // Response:
 //   value = 0 on success
 
@@ -290,12 +298,7 @@ fn handle_ipc_listen(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 // existing FD_READ / FD_WRITE opcodes; those already handle
 // FdObject::Socket correctly.
 
-fn handle_ipc_connect(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_ipc_connect(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let fd = args_u32(req, 0);
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
@@ -331,6 +334,9 @@ fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> ServiceOut
     use abi::ext::accept_flags;
     let listener_fd = args_u32(req, 0);
     let flags = args_u16(req, 4);
+    if flags & !accept_flags::NONBLOCK != 0 {
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
+    }
     let nonblock = (flags & accept_flags::NONBLOCK) != 0;
 
     match kernel.accept_socket(pid, listener_fd) {
@@ -344,13 +350,53 @@ fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> ServiceOut
                 Err(crate::sys::KernelError::WouldBlock) => {
                     ServiceOutcome::Done(Response::err(req.request_id, EAGAIN))
                 }
-                Err(e) => ServiceOutcome::Done(Response::err(
-                    req.request_id,
-                    kerr_to_errno(e),
-                )),
+                Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
             }
         }
         Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
+    }
+}
+
+// ---- ipc_peer_caps ----------------------------------------------------
+//
+// Layout:
+//   args[0..4] = connected socket fd (u32)
+// Response:
+//   value = the peer's kernel-captured CapSet bitmask as i64.
+//
+// This is intentionally fd-scoped rather than pid-scoped. The caller
+// may inspect only the authenticated identity on an IPC connection it
+// already possesses; no `PROC_INSPECT` authority and no client claim
+// are involved.
+
+fn handle_ipc_peer_caps(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    match kernel.ipc_peer_caps(pid, fd) {
+        Ok(caps) => Response::ok(req.request_id, caps.0 as i64),
+        Err(crate::sys::KernelError::NotSupportedOnFd) => Response::err(req.request_id, ENOTSOCK),
+        Err(crate::sys::KernelError::InvalidArgument) => Response::err(req.request_id, ENOTCONN),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- ipc_peer_pid -----------------------------------------------------
+//
+// Layout:
+//   args[0..4] = connected socket fd (u32)
+// Response:
+//   value = the peer's kernel-captured pid, widened to i64.
+//
+// Error semantics deliberately match `ipc_peer_caps`: the query is
+// fd-scoped, pointer-free, and reads the same immutable credential
+// snapshot without accepting any identity bytes from the peer.
+
+fn handle_ipc_peer_pid(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    match kernel.ipc_peer_pid(pid, fd) {
+        Ok(peer_pid) => Response::ok(req.request_id, peer_pid as i64),
+        Err(crate::sys::KernelError::NotSupportedOnFd) => Response::err(req.request_id, ENOTSOCK),
+        Err(crate::sys::KernelError::InvalidArgument) => Response::err(req.request_id, ENOTCONN),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 
@@ -402,12 +448,7 @@ fn handle_ipc_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> ServiceOut
 // generic FD_WRITE arm that uses EINVAL — so the wire surface
 // matches `send(2)` / `sendmsg(2)`'s documented contract.
 
-fn handle_ipc_send(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_ipc_send(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let fd = args_u32(req, 0);
     let len = args_u32(req, 4) as usize;
     let fd_to_pass_raw = args_u32(req, 8) as i32;
@@ -430,9 +471,7 @@ fn handle_ipc_send(
 
     match kernel.ipc_send(pid, fd, buf, fd_to_pass) {
         Ok(n) => Response::ok(req.request_id, n as i64),
-        Err(crate::sys::KernelError::NotSupportedOnFd) => {
-            Response::err(req.request_id, EBADF)
-        }
+        Err(crate::sys::KernelError::NotSupportedOnFd) => Response::err(req.request_id, EBADF),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
@@ -549,6 +588,14 @@ fn handle_ipc_recv(
     if (req.heap_len as usize) < needed {
         return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
+    // Validate the concrete scratch-memory range before touching socket or fd
+    // state. `heap_len` is guest-provided capacity metadata; it does not prove
+    // that `heap_ptr..heap_ptr + needed` exists in this request's heap.
+    // Receiving may drain bytes and install an ancillary fd, so discovering an
+    // invalid pointer after `Kernel::ipc_recv` would make EINVAL non-atomic.
+    if heap_out_mut(req, heap, needed).is_none() {
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
+    }
 
     let (bytes, new_fd) = match kernel.ipc_recv(pid, fd, len, want_fd) {
         Ok(pair) => pair,
@@ -569,41 +616,29 @@ fn handle_ipc_recv(
             return match kernel.park_on_recv(
                 pid,
                 fd,
-                req.request_id,
-                len as u32,
-                recv_fd_slot,
-                req.heap_ptr,
-                req.heap_len,
+                RecvParkRequest {
+                    request_id: req.request_id,
+                    max_len: len as u32,
+                    recv_fd_slot,
+                    heap_ptr: req.heap_ptr,
+                    heap_len: req.heap_len,
+                },
             ) {
                 Ok(()) => ServiceOutcome::Parked,
                 Err(crate::sys::KernelError::NotSupportedOnFd) => {
                     ServiceOutcome::Done(Response::err(req.request_id, EBADF))
                 }
-                Err(e) => {
-                    ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e)))
-                }
+                Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
             };
         }
-        Err(e) => {
-            return ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e)))
-        }
+        Err(e) => return ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
     };
 
     let installed = new_fd.is_some();
     let payload_offset = if installed { 4 } else { 0 };
     let total = payload_offset + bytes.len();
-    let Some(out) = heap_out_mut(req, heap, total) else {
-        // The caller's heap window suddenly disappeared between the
-        // up-front bounds check and this write — shouldn't happen in
-        // a well-behaved dispatcher, but guard anyway. The ipc_recv
-        // side effects (drained bytes + dequeued + installed fd) have
-        // already committed; surface EINVAL but the receiver's table
-        // now holds the new fd. A cleaner rollback would re-queue the
-        // bytes / un-install the fd — both are awkward inversions that
-        // belong on a future hardening pass once a real heap-aliasing
-        // failure mode shows up in practice.
-        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
-    };
+    let out = heap_out_mut(req, heap, total)
+        .expect("ipc_recv output range was validated before committing receive state");
     if let Some(new_fd_num) = new_fd {
         out[0..4].copy_from_slice(&new_fd_num.to_le_bytes());
     }
@@ -637,29 +672,19 @@ fn handle_ipc_recv(
 // fails mid-call (fd-limit exhaustion), Kernel::create_pipe_fds
 // rolls back the first install and drops both pipe refs.
 
-fn handle_ipc_pipe(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_ipc_pipe(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     if (req.heap_len as usize) < 8 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if heap_out_mut(req, heap, 8).is_none() {
         return Response::err(req.request_id, EINVAL);
     }
     let (read_fd, write_fd) = match kernel.create_pipe_fds(pid) {
         Ok(pair) => pair,
         Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
-    let Some(out) = heap_out_mut(req, heap, 8) else {
-        // Roll back if heap is out of range post-alloc. In practice
-        // the earlier heap_len check should've caught this, but
-        // heap_out_mut also guards heap_ptr + len <= heap.len().
-        if let Ok(table) = kernel.fds_mut(pid) {
-            let _ = table.close(read_fd);
-            let _ = table.close(write_fd);
-        }
-        return Response::err(req.request_id, EINVAL);
-    };
+    let out = heap_out_mut(req, heap, 8)
+        .expect("ipc_pipe output range was validated before allocating the pipe");
     out[0..4].copy_from_slice(&read_fd.to_le_bytes());
     out[4..8].copy_from_slice(&write_fd.to_le_bytes());
     Response {
@@ -786,80 +811,285 @@ fn parse_envp(
     Some(out)
 }
 
-fn handle_proc_spawn(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+struct DecodedSpawn {
+    path: String,
+    argv: Vec<String>,
+    envp: BTreeMap<String, String>,
+    stdin_fd: Option<u32>,
+    stdout_fd: Option<u32>,
+    stderr_fd: Option<u32>,
+    extra_fds: Vec<(u32, u32)>,
+    cwd: Option<String>,
+    caps: Option<CapSet>,
+}
+
+struct BlobCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> BlobCursor<'a> {
+    fn new(bytes: &'a [u8], offset: usize) -> Self {
+        Self { bytes, offset }
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.offset.checked_add(len)?;
+        let out = self.bytes.get(self.offset..end)?;
+        self.offset = end;
+        Some(out)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn text(&mut self, len: usize, allow_empty: bool) -> Option<String> {
+        let bytes = self.take(len)?;
+        if (!allow_empty && bytes.is_empty()) || bytes.contains(&0) {
+            return None;
+        }
+        Some(core::str::from_utf8(bytes).ok()?.to_string())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn read_u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_i32_at(bytes: &[u8], offset: usize) -> Option<i32> {
+    Some(i32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+fn decode_optional_fd(raw: i32) -> Option<Option<u32>> {
+    match raw {
+        op::spawn_v1::INHERIT_FD => Some(None),
+        0..=i32::MAX => Some(Some(raw as u32)),
+        _ => None,
+    }
+}
+
+fn decode_spawn_v1(req: &Request, payload: &[u8]) -> Option<DecodedSpawn> {
+    use op::spawn_v1 as wire;
+
+    if args_u32(req, 4) as usize != payload.len()
+        || args_u16(req, 8) != wire::VERSION
+        || req.args[10..].iter().any(|byte| *byte != 0)
+        || payload.len() < wire::HEADER_LEN
+        || payload.len() > abi::ring::HEAP_SCRATCH_BYTES
+        || read_u32_at(payload, wire::OFF_MAGIC)? != wire::MAGIC
+        || read_u16_at(payload, wire::OFF_VERSION)? != wire::VERSION
+        || read_u32_at(payload, wire::OFF_TOTAL_LEN)? as usize != payload.len()
+        || read_u16_at(payload, wire::OFF_RESERVED_U16)? != 0
+        || read_u32_at(payload, wire::OFF_RESERVED_U32)? != 0
+    {
+        return None;
+    }
+
+    let flags = read_u16_at(payload, wire::OFF_FLAGS)?;
+    if flags & !wire::KNOWN_FLAGS != 0 {
+        return None;
+    }
+    let path_len = read_u16_at(payload, wire::OFF_PATH_LEN)? as usize;
+    let cwd_len = read_u16_at(payload, wire::OFF_CWD_LEN)? as usize;
+    let argc = read_u16_at(payload, wire::OFF_ARGC)? as usize;
+    let envc = read_u16_at(payload, wire::OFF_ENVC)? as usize;
+    let extra_count = read_u16_at(payload, wire::OFF_EXTRA_FD_COUNT)? as usize;
+    let stdin_fd = decode_optional_fd(read_i32_at(payload, wire::OFF_STDIN_FD)?)?;
+    let stdout_fd = decode_optional_fd(read_i32_at(payload, wire::OFF_STDOUT_FD)?)?;
+    let stderr_fd = decode_optional_fd(read_i32_at(payload, wire::OFF_STDERR_FD)?)?;
+    let raw_caps = read_u64_at(payload, wire::OFF_CAPS)?;
+    let caps = if flags & wire::FLAG_CAPS != 0 {
+        Some(CapSet(raw_caps))
+    } else {
+        if raw_caps != 0 {
+            return None;
+        }
+        None
+    };
+    if (flags & wire::FLAG_CWD == 0 && cwd_len != 0)
+        || (flags & wire::FLAG_CWD != 0 && cwd_len == 0)
+    {
+        return None;
+    }
+
+    let mut cursor = BlobCursor::new(payload, wire::HEADER_LEN);
+    let path = cursor.text(path_len, false)?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let cwd = if flags & wire::FLAG_CWD != 0 {
+        let cwd = cursor.text(cwd_len, false)?;
+        if !cwd.starts_with('/') {
+            return None;
+        }
+        Some(cwd)
+    } else {
+        None
+    };
+
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        let len = cursor.u16()? as usize;
+        argv.push(cursor.text(len, true)?);
+    }
+
+    let mut envp = BTreeMap::new();
+    for _ in 0..envc {
+        let key_len = cursor.u16()? as usize;
+        let value_len = cursor.u16()? as usize;
+        let key = cursor.text(key_len, false)?;
+        let value = cursor.text(value_len, true)?;
+        if key.contains('=') || envp.insert(key, value).is_some() {
+            return None;
+        }
+    }
+
+    let mut extra_fds = Vec::with_capacity(extra_count);
+    for _ in 0..extra_count {
+        let parent_fd = cursor.u32()?;
+        let child_fd = cursor.u32()?;
+        if child_fd < abi::fd::FIRST_DYNAMIC
+            || child_fd as usize >= FD_SOFT_LIMIT
+            || extra_fds
+                .iter()
+                .any(|(_, existing_child)| *existing_child == child_fd)
+        {
+            return None;
+        }
+        extra_fds.push((parent_fd, child_fd));
+    }
+    if !cursor.is_finished() {
+        return None;
+    }
+
+    Some(DecodedSpawn {
+        path,
+        argv,
+        envp,
+        stdin_fd,
+        stdout_fd,
+        stderr_fd,
+        extra_fds,
+        cwd,
+        caps,
+    })
+}
+
+fn decode_spawn_legacy(req: &Request, payload: &[u8]) -> Option<DecodedSpawn> {
     let path_len = args_u32(req, 0) as usize;
     let caps = CapSet(args_u64(req, 4));
-    // args[12..14] = argv_buf_len (u16 LE), args[14..16] = envp_buf_len (u16 LE).
-    // Tightly packed so the existing path_len + caps fit in the same
-    // 16-byte args window. Both default to zero for callers that
-    // don't pass argv/envp (the pre-T084-followups wire format).
     let argv_buf_len = u16::from_le_bytes([req.args[12], req.args[13]]) as usize;
     let envp_buf_len = u16::from_le_bytes([req.args[14], req.args[15]]) as usize;
-    let total_heap = path_len + argv_buf_len + envp_buf_len;
-
-    let Some(payload) = heap_in(req, heap) else {
-        return Response::err(req.request_id, EINVAL);
-    };
+    let total_heap = path_len
+        .checked_add(argv_buf_len)?
+        .checked_add(envp_buf_len)?;
     if payload.len() != total_heap {
-        return Response::err(req.request_id, EINVAL);
+        return None;
     }
     let path_bytes = &payload[..path_len];
     let argv_bytes = &payload[path_len..path_len + argv_buf_len];
     let envp_bytes = &payload[path_len + argv_buf_len..];
+    let path = core::str::from_utf8(path_bytes).ok()?.to_string();
+    let argv = parse_nul_separated(argv_bytes)?;
+    let envp = parse_envp(envp_bytes)?;
+    Some(DecodedSpawn {
+        path,
+        argv,
+        envp,
+        stdin_fd: None,
+        stdout_fd: None,
+        stderr_fd: None,
+        extra_fds: Vec::new(),
+        cwd: None,
+        caps: Some(caps),
+    })
+}
 
-    let Ok(path) = core::str::from_utf8(path_bytes) else {
+fn selected_fd(table: &FdTable, requested: Option<u32>, inherited: u32) -> Option<FdObject> {
+    table
+        .get(requested.unwrap_or(inherited))
+        .map(|entry| entry.object)
+}
+
+fn handle_proc_spawn(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
+    let Some(payload) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let decoded = if args_u32(req, 0) == op::spawn_v1::MAGIC {
+        decode_spawn_v1(req, payload)
+    } else {
+        decode_spawn_legacy(req, payload)
+    };
+    let Some(decoded) = decoded else {
         return Response::err(req.request_id, EINVAL);
     };
 
-    // Parse argv: NUL-terminated UTF-8 strings concatenated. An
-    // empty `argv_bytes` yields an empty Vec.
-    let argv = match parse_nul_separated(argv_bytes) {
-        Some(v) => v,
-        None => return Response::err(req.request_id, EINVAL),
+    let parent_caps = match kernel.caps.list(pid) {
+        Ok(caps) => caps,
+        Err(_) => return Response::err(req.request_id, ESRCH),
     };
-
-    // Parse envp: same NUL-terminated layout, but each entry is
-    // `KEY=VALUE`. Entries without `=` are rejected (invalid
-    // shape). Empty `envp_bytes` yields an empty BTreeMap.
-    let envp = match parse_envp(envp_bytes) {
-        Some(m) => m,
-        None => return Response::err(req.request_id, EINVAL),
+    let parent_cwd = match kernel.procs.get(pid) {
+        Some(process) => process.cwd.clone(),
+        None => return Response::err(req.request_id, ESRCH),
     };
-
-    // Inherit the parent's stdin/stdout/stderr by cloning its fd
-    // objects. If the parent doesn't have one of those slots, the
-    // child gets nothing installed there — the `SpawnArgs` contract
-    // requires explicit fd objects, so we have to fabricate a
-    // sentinel in the "parent doesn't have fd X" case. For this
-    // slice we refuse to spawn when stdio is missing so the
-    // opcode-level API stays strict; apps that want to inherit
-    // partial stdio can install the missing slots on themselves
-    // first.
     let parent_fds = match kernel.fds(pid) {
         Ok(t) => t,
         Err(_) => return Response::err(req.request_id, ESRCH),
     };
-    let Some(stdin) = parent_fds.get(0).map(|e| e.object) else {
+    let Some(stdin) = selected_fd(parent_fds, decoded.stdin_fd, abi::fd::STDIN) else {
         return Response::err(req.request_id, EINVAL);
     };
-    let Some(stdout) = parent_fds.get(1).map(|e| e.object) else {
+    let Some(stdout) = selected_fd(parent_fds, decoded.stdout_fd, abi::fd::STDOUT) else {
         return Response::err(req.request_id, EINVAL);
     };
-    let Some(stderr) = parent_fds.get(2).map(|e| e.object) else {
+    let Some(stderr) = selected_fd(parent_fds, decoded.stderr_fd, abi::fd::STDERR) else {
         return Response::err(req.request_id, EINVAL);
     };
+    let mut extra_objects = Vec::with_capacity(decoded.extra_fds.len());
+    for (parent_fd, child_fd) in &decoded.extra_fds {
+        let Some(object) = parent_fds.get(*parent_fd).map(|entry| entry.object) else {
+            return Response::err(req.request_id, EBADF);
+        };
+        extra_objects.push((*child_fd, object));
+    }
+    if extra_objects
+        .iter()
+        .any(|(_, object)| matches!(object, FdObject::Socket(_)))
+    {
+        return Response::err(req.request_id, abi::errno::ENOTSUP);
+    }
 
     let spawn_args = SpawnArgs {
-        name: path,
-        caps,
-        cwd: "/",
-        argv,
-        envp,
+        name: &decoded.path,
+        caps: decoded.caps.unwrap_or(parent_caps),
+        cwd: decoded.cwd.as_deref().unwrap_or(&parent_cwd),
+        argv: decoded.argv,
+        envp: decoded.envp,
         stdin,
         stdout,
         stderr,
@@ -869,13 +1099,38 @@ fn handle_proc_spawn(
         Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
 
+    for (child_fd, object) in extra_objects {
+        if let Err(error) = kernel.install_spawn_extra_fd(new_pid, child_fd, object) {
+            let _ = kernel.proc_exit(new_pid, ExitStatus::Exited(-1));
+            let _ = kernel.reap(new_pid);
+            return Response::err(req.request_id, kerr_to_errno(error));
+        }
+    }
+
+    let executable = match kernel.load_vfs_executable(&decoded.path) {
+        Ok(executable) => executable,
+        Err(error) => {
+            let _ = kernel.proc_exit(new_pid, ExitStatus::Exited(-1));
+            let _ = kernel.reap(new_pid);
+            return Response::err(req.request_id, kerr_to_errno(error));
+        }
+    };
+
     // Ask the host to actually spawn a Worker for `new_pid`. On
     // failure, roll back by marking the process `Zombie` and
     // reaping it so no pid is leaked on a half-done spawn.
-    if platform::current().spawn_process(new_pid, path).is_err() {
+    if let Err(error) =
+        platform::current().spawn_process(new_pid, &decoded.path, executable.as_deref())
+    {
         let _ = kernel.proc_exit(new_pid, ExitStatus::Exited(-1));
         let _ = kernel.reap(new_pid);
-        return Response::err(req.request_id, abi::errno::EIO);
+        let errno = match error {
+            crate::platform::DriverError::Errno(errno) if errno > 0 => errno,
+            crate::platform::DriverError::Errno(_)
+            | crate::platform::DriverError::NotReady
+            | crate::platform::DriverError::Transport => abi::errno::EIO,
+        };
+        return Response::err(req.request_id, errno);
     }
 
     Response::ok(req.request_id, new_pid as i64)
@@ -898,8 +1153,8 @@ fn handle_proc_spawn(
 //   extra_len  = 4 when the caller requested the pid readback, 0
 //                otherwise.
 // Errors:
-//   EAGAIN     = live children exist but none are zombies. v1 always
-//                returns non-blocking — the caller retries.
+//   EAGAIN     = live children exist but none are zombies and WNOHANG
+//                was requested. With options=0 the caller parks.
 //   ECHILD     = no child matching the target, or target == sender pid.
 //   EINVAL     = malformed target or unknown options bits.
 //
@@ -913,7 +1168,7 @@ pub(crate) fn pack_exit_status(status: ExitStatus) -> i64 {
     match status {
         ExitStatus::Exited(code) => {
             let low = (code as u32) as u64;
-            ((0x01_u64) << 40) | low as u64
+            ((0x01_u64) << 40) | low
         }
         ExitStatus::Signaled(sig) => {
             // Signum lives in bits 32..40; flags 0x02 in 40..48.
@@ -975,15 +1230,10 @@ fn handle_proc_wait(
                 Err(crate::sys::KernelError::WouldBlock) => {
                     ServiceOutcome::Done(Response::err(req.request_id, EAGAIN))
                 }
-                Err(e) => ServiceOutcome::Done(Response::err(
-                    req.request_id,
-                    kerr_to_errno(e),
-                )),
+                Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
             }
         }
-        Ok(WaitOutcome::NoChildren) => {
-            ServiceOutcome::Done(Response::err(req.request_id, ECHILD))
-        }
+        Ok(WaitOutcome::NoChildren) => ServiceOutcome::Done(Response::err(req.request_id, ECHILD)),
         Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
     }
 }
@@ -992,15 +1242,15 @@ fn handle_proc_wait(
 //
 // Layout:
 //   args[0..4] = target_pid (i32).
-//   args[4..6] = signum (u16). v1 accepts {0, 2, 9, 13, 15, 17}:
+//   args[4..6] = signum (u16). v1 accepts
+//                {0, 2, 9, 10, 12, 13, 15, 17}:
 //                0 = POSIX kill(pid, 0) existence + permission
 //                    probe — runs every precondition proc_kill
 //                    would run but delivers no signal.
-//                2 = SIGINT, 9 = SIGKILL, 13 = SIGPIPE,
-//                15 = SIGTERM, 17 = SIGCHLD. Any other number →
-//                EINVAL before the kernel is touched (a future
-//                SIGHUP / SIGQUIT wiring extends this match
-//                without a wire-format break).
+//                2 = SIGINT, 9 = SIGKILL, 10 = SIGUSR1,
+//                12 = SIGUSR2, 13 = SIGPIPE, 15 = SIGTERM,
+//                17 = SIGCHLD. Any other number, including SIGHUP
+//                and SIGQUIT, → EINVAL before the kernel is touched.
 //
 // Response: value = 0 on success; negative errno on failure.
 //
@@ -1065,6 +1315,8 @@ fn handle_proc_kill(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
                 let _ = kernel.interrupt_parked_accept(target_pid);
                 let _ = kernel.interrupt_parked_wait(target_pid);
                 let _ = kernel.interrupt_parked_recv(target_pid);
+                let _ = kernel.interrupt_parked_pipe_read(target_pid);
+                let _ = kernel.interrupt_parked_poll(target_pid);
             }
             Response::ok(req.request_id, 0)
         }
@@ -1141,12 +1393,7 @@ fn handle_proc_caps_get(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
 // payload. Heap-pointing both strings keeps the wire format
 // stable as the fstype factory grows.
 
-fn handle_mount(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_mount(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let path_ptr = args_u32(req, 0) as usize;
     let path_len = args_u32(req, 4) as usize;
     let fstype_ptr = args_u32(req, 8) as usize;
@@ -1214,12 +1461,7 @@ fn handle_mount(
 // Same translation rationale as the mount handler's
 // `AlreadyExists → EBUSY` map.
 
-fn handle_umount(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_umount(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let path_ptr = args_u32(req, 0) as usize;
     let path_len = args_u32(req, 4) as usize;
 
@@ -1237,6 +1479,38 @@ fn handle_umount(
         Ok(()) => Response::ok(req.request_id, 0),
         Err(crate::sys::KernelError::WouldBlock) => Response::err(req.request_id, EBUSY),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+// ---- fs_chmod ---------------------------------------------------------
+//
+// Layout:
+//   args[0..4]  = path_len (u32)
+//   args[4..8]  = replacement permission bits (u32, 0..=0o777)
+//   args[8..16] = zero
+//   heap input  = exact UTF-8 path bytes
+
+fn handle_fs_chmod(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
+    let path_len = args_u32(req, 0) as usize;
+    let mode = args_u32(req, 4);
+    if args_u32(req, 8) != 0 || args_u32(req, 12) != 0 || mode & !0o777 != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Some(payload) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if payload.len() != path_len {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Ok(path) = core::str::from_utf8(payload) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if !path.starts_with('/') {
+        return Response::err(req.request_id, EINVAL);
+    }
+    match kernel.fs_chmod(pid, path, mode) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(error) => Response::err(req.request_id, kerr_to_errno(error)),
     }
 }
 
@@ -1269,6 +1543,9 @@ fn handle_umount(
 //                  OR flags != 0.
 //            -ENOENT if `path` doesn't resolve through the VFS.
 //            -EMFILE if the caller's fd table is full.
+//            -ENOSPC if the per-process, per-target, or kernel-wide
+//                  watch admission budget is full.
+//            -ENOTSUP if the resolved filesystem cannot emit watches.
 //
 // No capability check in v1. The §3.7 spec doesn't gate `fs_watch`
 // on a cap; a future slice may add `Cap::FsWatch` for paths that
@@ -1284,12 +1561,7 @@ fn handle_umount(
 // `Vfs::unregister_watch`, so a process exit (which drains every
 // fd) cleans up watches automatically.
 
-fn handle_fs_watch(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &[u8],
-) -> Response {
+fn handle_fs_watch(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let path_ptr = args_u32(req, 0) as usize;
     let path_len = args_u32(req, 4) as usize;
     let mask = args_u32(req, 8);
@@ -1388,5 +1660,38 @@ fn handle_host_file_recv(kernel: &mut Kernel, pid: Pid, req: &Request) -> Respon
     match kernel.host_file_recv(pid, token) {
         Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+    }
+}
+
+fn handle_host_file_pick(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
+    match kernel.host_file_pick(pid) {
+        Ok(()) => Response::ok(req.request_id, 0),
+        Err(error) => Response::err(req.request_id, kerr_to_errno(error)),
+    }
+}
+
+// args[0..4] = name_len, args[4..8] = mime_len; heap is the exact
+// concatenation `name || mime`. Bulk file bytes subsequently use FD_WRITE.
+fn handle_host_file_send(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
+    let name_len = args_u32(req, 0) as usize;
+    let mime_len = args_u32(req, 4) as usize;
+    let Some(expected_len) = name_len.checked_add(mime_len) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Some(input) = heap_in(req, heap) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    if input.len() != expected_len {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let Ok(name) = core::str::from_utf8(&input[..name_len]) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    let Ok(mime) = core::str::from_utf8(&input[name_len..]) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    match kernel.host_file_send(pid, name, mime) {
+        Ok(fd) => Response::ok(req.request_id, fd as i64),
+        Err(error) => Response::err(req.request_id, kerr_to_errno(error)),
     }
 }

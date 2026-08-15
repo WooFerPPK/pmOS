@@ -199,8 +199,7 @@ fn bracket_string_equal_unequal_returns_one() {
 #[test]
 fn bracket_string_not_equal_returns_zero() {
     // `STR1 != STR2` is true when strings differ.
-    let (status, stdout, stderr, _env) =
-        drive("[ foo != bar ]\necho $?\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("[ foo != bar ]\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -248,10 +247,7 @@ fn bracket_lt_works() {
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     let zero_pos = stdout.find("0\n").expect("missing first 0 status");
     let one_pos = stdout.find("1\n").expect("missing second 1 status");
-    assert!(
-        zero_pos < one_pos,
-        "expected `0` before `1` in {stdout:?}"
-    );
+    assert!(zero_pos < one_pos, "expected `0` before `1` in {stdout:?}");
 }
 
 #[test]
@@ -307,8 +303,7 @@ fn bracket_eq_with_non_integer_returns_two_with_diagnostic() {
     // `[ foo -eq 5 ]` → Status(2) usage error because `foo`
     // doesn't parse as `i64`. Diagnostic shape: `[: -eq:
     // integer expression expected: foo`.
-    let (status, _stdout, stderr, _env) =
-        drive("[ foo -eq 5 ]\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("[ foo -eq 5 ]\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("integer expression expected: foo"),
@@ -351,8 +346,7 @@ fn bracket_negate_propagates_usage_error_status() {
     // negation does NOT invert Status(2) into anything else.
     // The outer expression remains Status(2). Pins POSIX
     // semantics where syntax errors are not boolean values.
-    let (status, _stdout, stderr, _env) =
-        drive("[ ! foo -eq bar ]\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("[ ! foo -eq bar ]\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("integer expression expected"),
@@ -367,8 +361,7 @@ fn test_command_works_without_close_bracket() {
     // `test foo = foo` — no trailing `]` because this is
     // the `test` form, not `[`. Should evaluate exactly the
     // same as `[ foo = foo ]` → Status(0).
-    let (status, stdout, stderr, _env) =
-        drive("test foo = foo\necho $?\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("test foo = foo\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -399,8 +392,7 @@ fn bracket_too_many_arguments() {
     // branch only matches a leading `!`; without it, this
     // is "too many arguments" → Status(2) with the
     // `[: too many arguments` diagnostic.
-    let (status, _stdout, stderr, _env) =
-        drive("[ a b c d ]\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("[ a b c d ]\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("too many arguments"),
@@ -416,8 +408,7 @@ fn bracket_unknown_unary_operator() {
     // unrecognised operators (deferred file-test ops, etc.)
     // surface a clear "not implemented" message rather than
     // silently failing.
-    let (status, _stdout, stderr, _env) =
-        drive("[ -X foo ]\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("[ -X foo ]\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("unknown unary operator: -X"),
@@ -431,8 +422,7 @@ fn bracket_unknown_binary_operator() {
     // isn't a known binary op → Status(2) with the
     // `unknown binary operator: -X` diagnostic. Same
     // "deferred-op signal" property as the unary case.
-    let (status, _stdout, stderr, _env) =
-        drive("[ foo -X bar ]\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("[ foo -X bar ]\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("unknown binary operator: -X"),
@@ -543,8 +533,7 @@ fn bracket_dash_e_empty_path_returns_one() {
     // empty-string operand goes through the metadata path
     // and returns `false` rather than triggering a panic
     // or odd diagnostic.
-    let (status, stdout, stderr, _env) =
-        drive("[ -e '' ]\necho $?\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("[ -e '' ]\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -850,8 +839,7 @@ fn bracket_dash_l_still_unknown_unary_operator() {
     // silent wrong answer. Pins the deferred-op
     // discoverability property for the remaining file-test
     // operators.
-    let (status, _stdout, stderr, _env) =
-        drive("[ -L /tmp ]\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive("[ -L /tmp ]\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("unknown unary operator: -L"),
@@ -1143,11 +1131,7 @@ fn bracket_dash_ef_different_files_returns_one() {
     let dir = scratch_dir("dash-ef-different");
     let a = write_file(&dir, "a", b"a");
     let b = write_file(&dir, "b", b"b");
-    let script = format!(
-        "[ {} -ef {} ]\necho $?\nexit\n",
-        a.display(),
-        b.display()
-    );
+    let script = format!("[ {} -ef {} ]\necho $?\nexit\n", a.display(), b.display());
     let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
@@ -1231,11 +1215,7 @@ fn bracket_negate_dash_ef_works() {
     let dir = scratch_dir("negate-dash-ef");
     let a = write_file(&dir, "a", b"a");
     let b = write_file(&dir, "b", b"b");
-    let script = format!(
-        "[ ! {} -ef {} ]\necho $?\nexit\n",
-        a.display(),
-        b.display()
-    );
+    let script = format!("[ ! {} -ef {} ]\necho $?\nexit\n", a.display(), b.display());
     let (status, stdout, stderr, _env) = drive(&script, BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
@@ -1290,8 +1270,7 @@ fn read_strips_trailing_newline_only() {
     // does NOT split or trim the line body, only its
     // trailing newline. `LINE="foo bar"` after `read LINE`
     // against `"foo bar\n"`.
-    let (status, _stdout, stderr, env) =
-        drive("read LINE\nfoo bar\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read LINE\nfoo bar\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("LINE").map(String::as_str), Some("foo bar"));
@@ -1303,8 +1282,7 @@ fn read_strips_crlf() {
     // value with neither `\r` nor `\n`. The defensive
     // strip-`\n`-then-strip-`\r` shape produces `foo` from
     // `"foo\r\n"`.
-    let (status, _stdout, stderr, env) =
-        drive("read X\nfoo\r\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read X\nfoo\r\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("foo"));
@@ -1330,7 +1308,7 @@ fn read_returns_one_on_eof() {
     // errexit trips on the `read X` Status(1) → REPL exits
     // with the same byte. NO `X` entry should exist post-loop.
     assert_eq!(status, ExitStatus::Exit(1));
-    assert!(env.get("X").is_none(), "unexpected X entry: {env:?}");
+    assert!(!env.contains_key("X"), "unexpected X entry: {env:?}");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
 }
 
@@ -1349,9 +1327,7 @@ fn read_returns_one_after_last_line() {
     // iteration also hits EOF, returning ExitStatus::Eof.
     use std::io::BufReader;
     use std::io::Cursor;
-    let stdin = BufReader::new(Cursor::new(
-        b"read X\na\nread X\nb\nread X\n".to_vec(),
-    ));
+    let stdin = BufReader::new(Cursor::new(b"read X\na\nread X\nb\nread X\n".to_vec()));
     let mut stdout = Vec::<u8>::new();
     let mut stderr = Vec::<u8>::new();
     let mut env = BTreeMap::<String, String>::new();
@@ -1373,8 +1349,7 @@ fn read_no_args_is_usage_error() {
     // Bare `read` (no var name) → stderr diagnostic plus
     // Status(2). The REPL stays alive so the trailing
     // `exit` runs.
-    let (status, _stdout, stderr, env) =
-        drive("read\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("sh: read: missing variable name"),
@@ -1389,8 +1364,7 @@ fn read_empty_name_is_invalid_identifier() {
     // `read ""` (empty-string var name from a quoted empty
     // arg) → stderr diagnostic plus Status(2). Mirrors the
     // existing `export` empty-name handling.
-    let (status, _stdout, stderr, env) =
-        drive("read \"\"\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read \"\"\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("sh: read: : not a valid identifier"),
@@ -1409,8 +1383,7 @@ fn read_multi_var_first_gets_line_rest_empty() {
     // IFS-splitting slice has a clear regression target
     // (this test will be UPDATED, not deleted, when the
     // real splitting lands).
-    let (status, _stdout, stderr, env) =
-        drive("read A B C\nx y z\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read A B C\nx y z\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("A").map(String::as_str), Some("x y z"));
@@ -1426,8 +1399,7 @@ fn read_overwrites_existing_var() {
     // matches the user's mental model for `read`.
     let mut seed = BTreeMap::new();
     seed.insert("X".to_string(), "old".to_string());
-    let (status, _stdout, stderr, env) =
-        drive("read X\nnew\nexit\n", seed);
+    let (status, _stdout, stderr, env) = drive("read X\nnew\nexit\n", seed);
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("new"));
@@ -1441,8 +1413,7 @@ fn read_handles_unicode_line() {
     // logic doesn't accidentally trim a multibyte tail
     // byte (the `\n` / `\r` matchers are single-byte ASCII
     // chars, so they cannot match inside a utf-8 sequence).
-    let (status, _stdout, stderr, env) =
-        drive("read X\nh\u{00e9}llo\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read X\nh\u{00e9}llo\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("h\u{00e9}llo"));
@@ -1478,8 +1449,7 @@ fn read_r_treats_trailing_backslash_as_literal() {
     // `read -r X` against `"foo\\\n"` reads ONE line and
     // assigns `X=foo\\` — the backslash is preserved
     // because raw mode disables continuation handling.
-    let (status, _stdout, stderr, env) =
-        drive("read -r X\nfoo\\\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -r X\nfoo\\\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("foo\\"));
@@ -1490,8 +1460,7 @@ fn read_default_treats_trailing_backslash_as_continuation() {
     // Without `-r`, `"foo\\\nbar\n"` is a continuation:
     // the backslash + newline are stripped, the second
     // line is appended → `X=foobar`.
-    let (status, _stdout, stderr, env) =
-        drive("read X\nfoo\\\nbar\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read X\nfoo\\\nbar\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("foobar"));
@@ -1503,8 +1472,7 @@ fn read_default_handles_multiple_continuations() {
     // → `"a\\\nb\\\nc\n"` → `X=abc`. Pins that the
     // continuation loop runs until a non-continuation
     // line is reached.
-    let (status, _stdout, stderr, env) =
-        drive("read X\na\\\nb\\\nc\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read X\na\\\nb\\\nc\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("abc"));
@@ -1516,8 +1484,7 @@ fn read_default_double_backslash_is_not_continuation() {
     // count) — the second-to-last escapes the last, so
     // there's no continuation. Both backslashes are
     // preserved verbatim → `X=foo\\\\`.
-    let (status, _stdout, stderr, env) =
-        drive("read X\nfoo\\\\\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read X\nfoo\\\\\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("foo\\\\"));
@@ -1530,8 +1497,7 @@ fn read_r_passes_through_double_backslash() {
     // mode also preserves all backslashes — but the path
     // through the code differs (the trailing-count check
     // is bypassed entirely in raw mode).
-    let (status, _stdout, stderr, env) =
-        drive("read -r X\nfoo\\\\\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -r X\nfoo\\\\\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("foo\\\\"));
@@ -1543,8 +1509,7 @@ fn read_r_with_multi_var_works() {
     // remaining args are var names. The v1 multi-VAR
     // simplification still applies — first var gets the
     // whole line, the rest get the empty string.
-    let (status, _stdout, stderr, env) =
-        drive("read -r A B C\nx y z\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -r A B C\nx y z\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("A").map(String::as_str), Some("x y z"));
@@ -1557,8 +1522,7 @@ fn read_r_with_no_var_names_is_usage_error() {
     // `read -r` with no var names after the flag → same
     // diagnostic as bare `read`. The flag is consumed but
     // the missing-name check fires before any read.
-    let (status, _stdout, stderr, env) =
-        drive("read -r\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -r\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("sh: read: missing variable name"),
@@ -1603,8 +1567,7 @@ fn read_r_preserves_backslash_in_middle_of_line() {
     // Backslash in the MIDDLE of the line — `-r` mode has
     // no escape interpretation anywhere, so `"foo\\bar\n"`
     // reads as `X=foo\\bar` verbatim.
-    let (status, _stdout, stderr, env) =
-        drive("read -r X\nfoo\\bar\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -r X\nfoo\\bar\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(env.get("X").map(String::as_str), Some("foo\\bar"));
@@ -1685,8 +1648,7 @@ fn read_p_with_no_value_is_usage_error() {
     // REPL untouched, so the script terminates via the
     // `exit` command rather than via EOF or via a
     // misinterpreted read.
-    let (status, _stdout, stderr, env) =
-        drive("read -p\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -p\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("sh: read: -p: missing prompt"),
@@ -1702,18 +1664,14 @@ fn read_p_compose_with_r_flag_either_order() {
     // raw mode active (so a trailing backslash is LITERAL,
     // no continuation), value `foo\\` (Rust escape: one
     // backslash) preserved verbatim from `foo\\\n` input.
-    let (status_a, _stdout_a, stderr_a, env_a) = drive(
-        "read -r -p \"Hi: \" X\nfoo\\\nexit\n",
-        BTreeMap::new(),
-    );
+    let (status_a, _stdout_a, stderr_a, env_a) =
+        drive("read -r -p \"Hi: \" X\nfoo\\\nexit\n", BTreeMap::new());
     assert_eq!(status_a, ExitStatus::Exit(0));
     assert_eq!(env_a.get("X").map(String::as_str), Some("foo\\"));
     assert!(stderr_a.contains("Hi: "), "order A stderr: {stderr_a:?}");
 
-    let (status_b, _stdout_b, stderr_b, env_b) = drive(
-        "read -p \"Hi: \" -r X\nfoo\\\nexit\n",
-        BTreeMap::new(),
-    );
+    let (status_b, _stdout_b, stderr_b, env_b) =
+        drive("read -p \"Hi: \" -r X\nfoo\\\nexit\n", BTreeMap::new());
     assert_eq!(status_b, ExitStatus::Exit(0));
     assert_eq!(env_b.get("X").map(String::as_str), Some("foo\\"));
     assert!(stderr_b.contains("Hi: "), "order B stderr: {stderr_b:?}");
@@ -1732,10 +1690,8 @@ fn read_p_does_not_rewrite_prompt_on_continuation() {
     // prompt is written EXACTLY ONCE — the continuation
     // iteration does NOT re-prompt (v1 has no PS2 yet, so
     // there's no continuation prompt to write).
-    let (status, _stdout, stderr, env) = drive(
-        "read -p \"Q: \" X\na\\\nb\nexit\n",
-        BTreeMap::new(),
-    );
+    let (status, _stdout, stderr, env) =
+        drive("read -p \"Q: \" X\na\\\nb\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert_eq!(env.get("X").map(String::as_str), Some("ab"));
     assert_eq!(
@@ -1752,8 +1708,7 @@ fn read_p_empty_prompt_writes_nothing_visible() {
     // and the read proceeds normally. Pin that the empty
     // prompt does not accidentally leak into stderr or
     // alter the env mutation.
-    let (status, _stdout, stderr, env) =
-        drive("read -p \"\" X\nhello\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -p \"\" X\nhello\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert_eq!(env.get("X").map(String::as_str), Some("hello"));
     assert!(stderr.is_empty(), "stderr should be empty: {stderr:?}");
@@ -1768,8 +1723,7 @@ fn read_p_with_quirky_value_dash_r() {
     // proceeds in NON-raw mode against `X`. This matches
     // bash's behaviour and pins the v1 "consume next slot
     // verbatim" rule.
-    let (status, _stdout, stderr, env) =
-        drive("read -p -r X\nfoo\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("read -p -r X\nfoo\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert_eq!(env.get("X").map(String::as_str), Some("foo"));
     assert!(
@@ -1789,8 +1743,7 @@ fn read_p_does_not_pollute_stdout() {
     // be empty (the REPL's per-line `$ ` prompt is not
     // emitted in the run_with_env shape; see existing
     // tests).
-    let (status, stdout, _stderr, env) =
-        drive("read -p \"Q: \" X\nhello\nexit\n", BTreeMap::new());
+    let (status, stdout, _stderr, env) = drive("read -p \"Q: \" X\nhello\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert_eq!(env.get("X").map(String::as_str), Some("hello"));
     assert!(
@@ -1815,8 +1768,10 @@ fn read_p_ascii_prompt_with_punctuation() {
     // brackets) which IS preserved cleanly through the
     // tokeniser today, demonstrating the builtin's
     // pass-through behaviour for the prompt arg.
-    let (status, _stdout, stderr, env) =
-        drive("read -p \"What's your name? \" NAME\nalice\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive(
+        "read -p \"What's your name? \" NAME\nalice\nexit\n",
+        BTreeMap::new(),
+    );
     assert_eq!(status, ExitStatus::Exit(0));
     assert_eq!(env.get("NAME").map(String::as_str), Some("alice"));
     assert!(

@@ -24,11 +24,12 @@
 //!
 //! Simplifications from data-model.md §3.3:
 //!
-//! * **Direct blocks only.** The inode holds 12 direct pointers
-//!   and an indirect-block pointer, but in v1 we only use the
-//!   direct table. Max file size: 12 * 4 KiB = 48 KiB. The
-//!   bundled apps all write well under that; larger files are
-//!   a follow-up when OPFS-hosted documents start growing.
+//! * **Direct + single-indirect regular files.** The inode holds
+//!   12 direct pointers plus a 512-entry indirect block, for a
+//!   maximum regular-file size of 2,146,304 bytes. Directory
+//!   records remain direct-only in v1; the 48 KiB directory cap
+//!   is enough for more entries than the fixed inode table can
+//!   currently allocate.
 //! * **Next-free cursor allocator.** Inodes and data blocks
 //!   are allocated sequentially from a cursor in the superblock.
 //!   Freed inodes and data blocks are NOT reused in v1. A
@@ -54,11 +55,11 @@ pub mod mkfs;
 #[cfg(test)]
 mod journal_test;
 
-use block::{BlockDevice, DynBlockDevice};
+use block::{BlockDevice, BlockImageState, DynBlockDevice};
 use journal::{Journal, Transaction};
 use layout::{
     DirEntryOnDisk, InodeKind, InodeOnDisk, Lba, Superblock, BLOCK_SIZE, INODES_PER_BLOCK,
-    INODE_BYTES, INODE_DIRECT_BLOCKS, ROOT_INO,
+    INODE_BYTES, INODE_DIRECT_BLOCKS, INODE_INDIRECT_BLOCKS, INODE_MAX_FILE_BLOCKS, ROOT_INO,
 };
 
 /// The OPFS filesystem.
@@ -69,6 +70,20 @@ pub struct OpfsFs {
 }
 
 impl OpfsFs {
+    /// Open a browser-backed image according to provenance reported by the
+    /// block driver. A newly-created image is formatted; an existing image is
+    /// only mounted. In particular, an existing image that fails validation is
+    /// returned as an error and is never reformatted.
+    pub fn open_image(
+        device: DynBlockDevice,
+        image_state: BlockImageState,
+    ) -> Result<Self, FsError> {
+        match image_state {
+            BlockImageState::Existing => Self::mount(device),
+            BlockImageState::NewlyCreated => mkfs::mkfs(device),
+        }
+    }
+
     /// Mount an existing OPFS image. Reads and validates the
     /// superblock, restores journal cursors, and replays any
     /// committed-but-not-applied transactions.
@@ -401,6 +416,54 @@ impl OpfsFs {
 
     // --- File content reading / writing -------------------------------
 
+    fn read_indirect_entries(
+        &mut self,
+        indirect_lba: Lba,
+    ) -> Result<[Lba; INODE_INDIRECT_BLOCKS], FsError> {
+        let mut block = [0u8; BLOCK_SIZE];
+        self.device.read(indirect_lba, &mut block)?;
+        let mut entries = [0; INODE_INDIRECT_BLOCKS];
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let offset = index * core::mem::size_of::<Lba>();
+            *entry = Lba::from_le_bytes(
+                block[offset..offset + core::mem::size_of::<Lba>()]
+                    .try_into()
+                    .map_err(|_| FsError::Io)?,
+            );
+        }
+        Ok(entries)
+    }
+
+    fn encode_indirect_entries(entries: &[Lba; INODE_INDIRECT_BLOCKS]) -> [u8; BLOCK_SIZE] {
+        let mut block = [0u8; BLOCK_SIZE];
+        for (index, entry) in entries.iter().enumerate() {
+            let offset = index * core::mem::size_of::<Lba>();
+            block[offset..offset + core::mem::size_of::<Lba>()]
+                .copy_from_slice(&entry.to_le_bytes());
+        }
+        block
+    }
+
+    fn file_block_lba(
+        file: &InodeOnDisk,
+        indirect: Option<&[Lba; INODE_INDIRECT_BLOCKS]>,
+        block_ix: usize,
+    ) -> Result<Lba, FsError> {
+        let lba = if block_ix < INODE_DIRECT_BLOCKS {
+            file.direct[block_ix]
+        } else {
+            let indirect_ix = block_ix - INODE_DIRECT_BLOCKS;
+            if indirect_ix >= INODE_INDIRECT_BLOCKS {
+                return Err(FsError::NoSpace);
+            }
+            indirect.ok_or(FsError::Io)?[indirect_ix]
+        };
+        if lba == 0 {
+            return Err(FsError::Io);
+        }
+        Ok(lba)
+    }
+
     fn file_read(
         &mut self,
         file: &InodeOnDisk,
@@ -415,17 +478,22 @@ impl OpfsFs {
             return Ok(0);
         }
         let end = core::cmp::min(file.size, start + buf.len() as u64);
+        let first_block = (start / BLOCK_SIZE as u64) as usize;
+        let last_block = ((end - 1) / BLOCK_SIZE as u64) as usize;
+        let indirect = if last_block >= INODE_DIRECT_BLOCKS {
+            if file.indirect == 0 {
+                return Err(FsError::Io);
+            }
+            Some(self.read_indirect_entries(file.indirect)?)
+        } else {
+            None
+        };
+        debug_assert!(first_block <= last_block);
         let mut written = 0usize;
         let mut cursor = start;
         while cursor < end {
             let block_ix = (cursor / BLOCK_SIZE as u64) as usize;
-            if block_ix >= INODE_DIRECT_BLOCKS {
-                return Err(FsError::Io);
-            }
-            let lba = file.direct[block_ix];
-            if lba == 0 {
-                return Err(FsError::Io);
-            }
+            let lba = Self::file_block_lba(file, indirect.as_ref(), block_ix)?;
             let offset_in_block = (cursor % BLOCK_SIZE as u64) as usize;
             let chunk =
                 core::cmp::min((BLOCK_SIZE - offset_in_block) as u64, end - cursor) as usize;
@@ -452,15 +520,42 @@ impl OpfsFs {
         if data.is_empty() {
             return Ok(0);
         }
-        let end = offset + data.len() as u64;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(FsError::NoSpace)?;
         let blocks_needed = end.div_ceil(BLOCK_SIZE as u64) as usize;
-        if blocks_needed > INODE_DIRECT_BLOCKS {
+        if blocks_needed > INODE_MAX_FILE_BLOCKS {
             return Err(FsError::NoSpace);
         }
-        // Ensure direct blocks are allocated for the whole range.
+
+        let mut indirect_dirty = false;
+        let mut indirect = if blocks_needed > INODE_DIRECT_BLOCKS {
+            if file.indirect == 0 {
+                file.indirect = self.alloc_data_block()?;
+                indirect_dirty = true;
+                Some([0; INODE_INDIRECT_BLOCKS])
+            } else {
+                Some(self.read_indirect_entries(file.indirect)?)
+            }
+        } else {
+            None
+        };
+
+        // Ensure blocks are allocated for the whole range. The filesystem's
+        // next-free allocator guarantees newly allocated LBAs have never held
+        // prior file data and therefore read as zero until first written.
         for i in 0..blocks_needed {
-            if file.direct[i] == 0 {
-                file.direct[i] = self.alloc_data_block()?;
+            if i < INODE_DIRECT_BLOCKS {
+                if file.direct[i] == 0 {
+                    file.direct[i] = self.alloc_data_block()?;
+                }
+            } else {
+                let indirect_ix = i - INODE_DIRECT_BLOCKS;
+                let entries = indirect.as_mut().ok_or(FsError::Io)?;
+                if entries[indirect_ix] == 0 {
+                    entries[indirect_ix] = self.alloc_data_block()?;
+                    indirect_dirty = true;
+                }
             }
         }
         // Write affected blocks. For each block we read the old
@@ -469,7 +564,7 @@ impl OpfsFs {
         let mut cursor = offset;
         while cursor < end {
             let block_ix = (cursor / BLOCK_SIZE as u64) as usize;
-            let lba = file.direct[block_ix];
+            let lba = Self::file_block_lba(file, indirect.as_ref(), block_ix)?;
             let offset_in_block = (cursor % BLOCK_SIZE as u64) as usize;
             let chunk =
                 core::cmp::min((BLOCK_SIZE - offset_in_block) as u64, end - cursor) as usize;
@@ -483,6 +578,10 @@ impl OpfsFs {
             txn.add_write(lba, block)?;
             written += chunk;
             cursor += chunk as u64;
+        }
+        if indirect_dirty {
+            let entries = indirect.as_ref().ok_or(FsError::Io)?;
+            txn.add_write(file.indirect, Self::encode_indirect_entries(entries))?;
         }
         if end > file.size {
             file.size = end;
@@ -500,9 +599,20 @@ impl OpfsFs {
             return Err(FsError::IsADirectory);
         }
         let blocks_needed = new_size.div_ceil(BLOCK_SIZE as u64) as usize;
-        if blocks_needed > INODE_DIRECT_BLOCKS {
+        if blocks_needed > INODE_MAX_FILE_BLOCKS {
             return Err(FsError::NoSpace);
         }
+
+        let mut indirect_dirty = false;
+        let mut indirect = if file.indirect != 0 {
+            Some(self.read_indirect_entries(file.indirect)?)
+        } else if blocks_needed > INODE_DIRECT_BLOCKS {
+            file.indirect = self.alloc_data_block()?;
+            indirect_dirty = true;
+            Some([0; INODE_INDIRECT_BLOCKS])
+        } else {
+            None
+        };
 
         if new_size < file.size {
             // Shrinking. If `new_size` falls inside a retained
@@ -514,8 +624,8 @@ impl OpfsFs {
             if new_size > 0 && blocks_needed > 0 {
                 let last_ix = blocks_needed - 1;
                 let offset_in_last = (new_size % BLOCK_SIZE as u64) as usize;
-                if offset_in_last != 0 && file.direct[last_ix] != 0 {
-                    let lba = file.direct[last_ix];
+                if offset_in_last != 0 {
+                    let lba = Self::file_block_lba(file, indirect.as_ref(), last_ix)?;
                     let initial = if let Some(pending) = txn.pending_block(lba) {
                         *pending
                     } else {
@@ -536,6 +646,24 @@ impl OpfsFs {
             for i in blocks_needed..INODE_DIRECT_BLOCKS {
                 file.direct[i] = 0;
             }
+            if let Some(entries) = indirect.as_mut() {
+                if blocks_needed <= INODE_DIRECT_BLOCKS {
+                    // The next-free allocator does not reclaim the pointer or
+                    // data blocks, but dropping the inode reference makes the
+                    // truncated region unreachable immediately and atomically.
+                    file.indirect = 0;
+                    indirect = None;
+                    indirect_dirty = false;
+                } else {
+                    let retained = blocks_needed - INODE_DIRECT_BLOCKS;
+                    for entry in &mut entries[retained..] {
+                        if *entry != 0 {
+                            *entry = 0;
+                            indirect_dirty = true;
+                        }
+                    }
+                }
+            }
         } else if new_size > file.size {
             // Extending. Allocate new blocks; they come from
             // the MockBlockDevice's sparse-read-returns-zeros
@@ -544,11 +672,26 @@ impl OpfsFs {
             // surprised.
             let zero_block = [0u8; BLOCK_SIZE];
             for i in 0..blocks_needed {
-                if file.direct[i] == 0 {
-                    file.direct[i] = self.alloc_data_block()?;
-                    txn.add_write(file.direct[i], zero_block)?;
+                if i < INODE_DIRECT_BLOCKS {
+                    if file.direct[i] == 0 {
+                        file.direct[i] = self.alloc_data_block()?;
+                        txn.add_write(file.direct[i], zero_block)?;
+                    }
+                } else {
+                    let indirect_ix = i - INODE_DIRECT_BLOCKS;
+                    let entries = indirect.as_mut().ok_or(FsError::Io)?;
+                    if entries[indirect_ix] == 0 {
+                        entries[indirect_ix] = self.alloc_data_block()?;
+                        txn.add_write(entries[indirect_ix], zero_block)?;
+                        indirect_dirty = true;
+                    }
                 }
             }
+        }
+
+        if indirect_dirty {
+            let entries = indirect.as_ref().ok_or(FsError::Io)?;
+            txn.add_write(file.indirect, Self::encode_indirect_entries(entries))?;
         }
 
         file.size = new_size;
@@ -586,6 +729,9 @@ impl Filesystem for OpfsFs {
         let mut file_ino = self.read_inode(ino)?;
         let mut txn = Transaction::new();
         let n = self.stage_file_write(&mut file_ino, offset, buf, &mut txn)?;
+        if n == 0 {
+            return Ok(0);
+        }
         file_ino.mtime_ns = now;
         file_ino.ctime_ns = now;
         self.stage_inode_write(&file_ino, &mut txn)?;
@@ -864,13 +1010,29 @@ impl Filesystem for OpfsFs {
     }
 
     fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), FsError> {
-        let now = now_ns();
         let mut file = self.read_inode(ino)?;
+        if file.kind != InodeKind::RegularFile {
+            return Err(FsError::IsADirectory);
+        }
+        if file.size == new_size {
+            return Ok(());
+        }
+        let now = now_ns();
         let mut txn = Transaction::new();
         self.stage_file_truncate(&mut file, new_size, &mut txn)?;
         file.mtime_ns = now;
         file.ctime_ns = now;
         self.stage_inode_write(&file, &mut txn)?;
+        self.commit_and_apply(&txn)?;
+        Ok(())
+    }
+
+    fn set_mode(&mut self, ino: Ino, mode: Mode) -> Result<(), FsError> {
+        let mut inode = self.read_inode(ino)?;
+        inode.mode = mode;
+        inode.ctime_ns = now_ns();
+        let mut txn = Transaction::new();
+        self.stage_inode_write(&inode, &mut txn)?;
         self.commit_and_apply(&txn)?;
         Ok(())
     }

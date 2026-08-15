@@ -92,10 +92,7 @@ fn export_sets_named_value() {
     let (status, stdout, stderr, env) = drive("export X=1\nenv\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
-    assert!(
-        stdout.contains("X=1\n"),
-        "stdout missing X=1: {stdout:?}"
-    );
+    assert!(stdout.contains("X=1\n"), "stdout missing X=1: {stdout:?}");
     // The mutation is also visible on the post-loop env map.
     assert_eq!(env.get("X"), Some(&"1".to_string()));
 }
@@ -141,8 +138,11 @@ fn unset_removes_named_entry() {
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(stdout.contains("Y=2\n"), "stdout = {stdout:?}");
-    assert!(!stdout.contains("X="), "stdout should not contain X=: {stdout:?}");
-    assert!(env.get("X").is_none());
+    assert!(
+        !stdout.contains("X="),
+        "stdout should not contain X=: {stdout:?}"
+    );
+    assert!(!env.contains_key("X"));
     assert_eq!(env.get("Y"), Some(&"2".to_string()));
 }
 
@@ -158,15 +158,14 @@ fn unset_multiple_args_removes_all() {
     assert!(stdout.contains("B=2\n"), "stdout = {stdout:?}");
     assert!(!stdout.contains("A="));
     assert!(!stdout.contains("C="));
-    assert!(env.get("A").is_none());
+    assert!(!env.contains_key("A"));
     assert_eq!(env.get("B"), Some(&"2".to_string()));
-    assert!(env.get("C").is_none());
+    assert!(!env.contains_key("C"));
 }
 
 #[test]
 fn unset_nonexistent_is_silent_ok() {
-    let (status, _stdout, stderr, env) =
-        drive("unset MISSING\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, env) = drive("unset MISSING\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(env.is_empty());

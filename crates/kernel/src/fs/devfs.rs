@@ -123,15 +123,19 @@ impl Default for DevFs {
 // Device numbers — returned inside `NodeType::CharDevice(u32)` and
 // used by the device-dispatch layer (T067) to route fd_read/fd_write
 // on an open device fd to the right driver.
-pub const DEV_NULL:        u32 = 1;
-pub const DEV_ZERO:        u32 = 2;
-pub const DEV_RANDOM:      u32 = 3;
-pub const DEV_CONSOLE:     u32 = 4;
-pub const DEV_FB0:         u32 = 10;
-pub const DEV_INPUT_KBD:   u32 = 20;
+pub const DEV_NULL: u32 = 1;
+pub const DEV_ZERO: u32 = 2;
+pub const DEV_RANDOM: u32 = 3;
+pub const DEV_CONSOLE: u32 = 4;
+pub const DEV_FB0: u32 = 10;
+pub const DEV_INPUT_KBD: u32 = 20;
 pub const DEV_INPUT_MOUSE: u32 = 21;
 
 impl Filesystem for DevFs {
+    fn supports_watches(&self) -> bool {
+        false
+    }
+
     fn root(&self) -> Ino {
         1
     }

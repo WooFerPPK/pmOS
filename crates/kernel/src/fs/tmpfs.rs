@@ -106,10 +106,7 @@ impl TmpFs {
                 ctime_ns: now,
             },
         );
-        TmpFs {
-            nodes,
-            next_ino: 2,
-        }
+        TmpFs { nodes, next_ino: 2 }
     }
 
     fn alloc_ino(&mut self) -> Ino {
@@ -177,13 +174,16 @@ impl Filesystem for TmpFs {
     }
 
     fn write(&mut self, ino: Ino, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let now = now_ns();
         let entry = self.entry_mut(ino)?;
         let bytes = match &mut entry.node {
             TmpNode::File(b) => b,
             TmpNode::Directory(_) => return Err(FsError::IsADirectory),
             TmpNode::SymLink(_) => return Err(FsError::InvalidArgument),
         };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let now = now_ns();
         let start = offset as usize;
         let needed = start + buf.len();
         if bytes.len() < needed {
@@ -328,12 +328,24 @@ impl Filesystem for TmpFs {
             let dst_children = self.dir_children(to_dir)?;
             dst_children.get(to_name).copied()
         };
+        // POSIX rename is a no-op when both names refer to the same inode,
+        // including two distinct hardlinks.
+        if replaced == Some(child_ino) {
+            return Ok(());
+        }
         // Remove from source first.
         self.dir_children_mut(from_dir)?.remove(from_name);
-        // If we had a replacement, drop its node.
+        // If we had a replacement, release only this directory entry's link.
         if let Some(replaced_ino) = replaced {
             self.dir_children_mut(to_dir)?.remove(to_name);
-            self.nodes.remove(&replaced_ino);
+            let remove_node = {
+                let entry = self.entry_mut(replaced_ino)?;
+                entry.nlink = entry.nlink.saturating_sub(1);
+                entry.nlink == 0
+            };
+            if remove_node {
+                self.nodes.remove(&replaced_ino);
+            }
         }
         // Install at destination.
         self.dir_children_mut(to_dir)?
@@ -356,16 +368,26 @@ impl Filesystem for TmpFs {
     }
 
     fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), FsError> {
-        let now = now_ns();
         let entry = self.entry_mut(ino)?;
         let bytes = match &mut entry.node {
             TmpNode::File(b) => b,
             TmpNode::Directory(_) => return Err(FsError::IsADirectory),
             TmpNode::SymLink(_) => return Err(FsError::InvalidArgument),
         };
+        if bytes.len() as u64 == new_size {
+            return Ok(());
+        }
+        let now = now_ns();
         bytes.resize(new_size as usize, 0);
         entry.mtime_ns = now;
         entry.ctime_ns = now;
+        Ok(())
+    }
+
+    fn set_mode(&mut self, ino: Ino, mode: Mode) -> Result<(), FsError> {
+        let entry = self.entry_mut(ino)?;
+        entry.mode = mode;
+        entry.ctime_ns = now_ns();
         Ok(())
     }
 
@@ -380,12 +402,7 @@ impl Filesystem for TmpFs {
         Ok(n)
     }
 
-    fn symlink(
-        &mut self,
-        dir: Ino,
-        name: &str,
-        target: &str,
-    ) -> Result<Ino, FsError> {
+    fn symlink(&mut self, dir: Ino, name: &str, target: &str) -> Result<Ino, FsError> {
         check_name(name)?;
         {
             let children = self.dir_children(dir)?;

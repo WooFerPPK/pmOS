@@ -106,11 +106,7 @@ fn fd_write_all(
 
 /// Read every byte currently buffered on a socket fd.
 /// Returns an empty vec on `WouldBlock`.
-fn fd_read_available(
-    k: &mut Kernel,
-    pid: abi::ext::Pid,
-    fd: u32,
-) -> Vec<u8> {
+fn fd_read_available(k: &mut Kernel, pid: abi::ext::Pid, fd: u32) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -180,9 +176,7 @@ fn free_client_bytes_reach_display_server_through_kernel_socket() {
     // Build a full protocol walk as bytes.
     let mut fc = FreeClient::new();
     let registry = fc.get_registry().unwrap();
-    let compositor = fc
-        .registry_bind(registry, 1, "pmd_compositor", 1)
-        .unwrap();
+    let compositor = fc.registry_bind(registry, 1, "pmd_compositor", 1).unwrap();
     let surface = fc.compositor_create_surface(compositor).unwrap();
     fc.surface_commit(surface).unwrap();
     let wire_bytes = fc.drain_outbound();
@@ -207,8 +201,10 @@ fn free_client_bytes_reach_display_server_through_kernel_socket() {
     // Server's journal matches the client's request sequence.
     let server_client = server.client_mut(server_client_id).unwrap();
     let journal = server_client.drain_journal();
-    let names: Vec<(Interface, &str)> =
-        journal.iter().map(|r| (r.interface, r.opcode_name)).collect();
+    let names: Vec<(Interface, &str)> = journal
+        .iter()
+        .map(|r| (r.interface, r.opcode_name))
+        .collect();
     assert_eq!(
         names,
         vec![
@@ -222,7 +218,10 @@ fn free_client_bytes_reach_display_server_through_kernel_socket() {
     // Every client-allocated object is bound in the
     // display-server's per-client table at the exact ID
     // the free client chose.
-    assert_eq!(server_client.get(ObjectId::DISPLAY), Some(Interface::Display));
+    assert_eq!(
+        server_client.get(ObjectId::DISPLAY),
+        Some(Interface::Display)
+    );
     assert_eq!(server_client.get(registry), Some(Interface::Registry));
     assert_eq!(server_client.get(compositor), Some(Interface::Compositor));
     assert_eq!(server_client.get(surface), Some(Interface::Surface));
@@ -259,12 +258,11 @@ fn toolkit_client_bytes_reach_display_server_through_kernel_socket() {
     let server_client_id = server.accept();
     let dispatched = pump_into_display_server(&mut server, server_client_id, received);
     assert_eq!(dispatched, 4);
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
-    let names: Vec<(Interface, &str)> =
-        journal.iter().map(|r| (r.interface, r.opcode_name)).collect();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
+    let names: Vec<(Interface, &str)> = journal
+        .iter()
+        .map(|r| (r.interface, r.opcode_name))
+        .collect();
     assert_eq!(
         names,
         vec![
@@ -288,9 +286,7 @@ fn toolkit_and_free_client_produce_identical_bytes() {
     // easy to localise.
     let mut fc = FreeClient::new();
     let registry = fc.get_registry().unwrap();
-    let compositor = fc
-        .registry_bind(registry, 1, "pmd_compositor", 1)
-        .unwrap();
+    let compositor = fc.registry_bind(registry, 1, "pmd_compositor", 1).unwrap();
     let surface = fc.compositor_create_surface(compositor).unwrap();
     fc.surface_commit(surface).unwrap();
     let fc_bytes = fc.drain_outbound();
@@ -346,11 +342,14 @@ fn display_server_rejects_malformed_client_bytes_without_tearing_down_the_kernel
     let server_client_id = server.accept();
     // Dispatch this one message directly (don't use the
     // pump helper, which asserts success).
-    let err = server.dispatch_request(server_client_id, &bytes).unwrap_err();
+    let err = server
+        .dispatch_request(server_client_id, &bytes)
+        .unwrap_err();
     match err {
-        display_server::ServerError::Client(
-            display_server::ClientError::UnknownOpcode { interface, opcode },
-        ) => {
+        display_server::ServerError::Client(display_server::ClientError::UnknownOpcode {
+            interface,
+            opcode,
+        }) => {
             assert_eq!(interface, Interface::Display);
             assert_eq!(opcode, 0xff);
         }
@@ -443,9 +442,7 @@ fn multiple_writes_are_streamed_on_the_same_socket() {
     let registry = fc.get_registry().unwrap();
     fd_write_all(&mut k, app_pid, client_fd, &fc.drain_outbound()).unwrap();
 
-    let compositor = fc
-        .registry_bind(registry, 1, "pmd_compositor", 1)
-        .unwrap();
+    let compositor = fc.registry_bind(registry, 1, "pmd_compositor", 1).unwrap();
     fd_write_all(&mut k, app_pid, client_fd, &fc.drain_outbound()).unwrap();
 
     let surface = fc.compositor_create_surface(compositor).unwrap();

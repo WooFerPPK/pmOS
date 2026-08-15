@@ -78,10 +78,14 @@ export function encodeRequest(req: SyscallRequest): Uint8Array {
   view.setUint32(4, req.requestId, true);
   if (req.args !== undefined) {
     if (req.args.length !== 16) {
-      throw new Error(`syscall.encodeRequest: args must be 16 bytes, got ${req.args.length}`);
+      throw new Error(
+        `syscall.encodeRequest: args must be 16 bytes, got ${req.args.length}`,
+      );
     }
     if (req.arg0 !== undefined) {
-      throw new Error("syscall.encodeRequest: pass either args or arg0, not both");
+      throw new Error(
+        "syscall.encodeRequest: pass either args or arg0, not both",
+      );
     }
     buf.set(req.args, 8);
   } else if (req.arg0 !== undefined) {
@@ -100,7 +104,9 @@ export function encodeRequest(req: SyscallRequest): Uint8Array {
  */
 export function decodeResponse(bytes: Uint8Array): SyscallResponse {
   if (bytes.length !== SLOT_SIZE) {
-    throw new Error(`syscall.decodeResponse: expected ${SLOT_SIZE} bytes, got ${bytes.length}`);
+    throw new Error(
+      `syscall.decodeResponse: expected ${SLOT_SIZE} bytes, got ${bytes.length}`,
+    );
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, SLOT_SIZE);
   return {
@@ -152,7 +158,9 @@ export interface DecodedRequest {
  */
 export function decodeRequest(bytes: Uint8Array): DecodedRequest {
   if (bytes.length !== SLOT_SIZE) {
-    throw new Error(`syscall.decodeRequest: expected ${SLOT_SIZE} bytes, got ${bytes.length}`);
+    throw new Error(
+      `syscall.decodeRequest: expected ${SLOT_SIZE} bytes, got ${bytes.length}`,
+    );
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, SLOT_SIZE);
   return {
@@ -388,12 +396,9 @@ export const OP_WASI = {
    * opfs inherit the trait default (NotSupported → ENOTSUP). */
   PATH_READLINK: 0x0045,
   /** Wire-format identity for `fd_prestat_dir_name`. Preopen-name
-   * companion to fd_prestat_get. Wire: args[0..4] = fd (ignored).
-   * v1 has no preopens so the honest answer for every fd is EBADF;
-   * post-slice both fd_prestat_get and fd_prestat_dir_name agree on
-   * EBADF so userland's libc-style preopen-discovery loops terminate
-   * cleanly (pre-slice dir_name returned ENOSYS, which broke the
-   * loop). */
+   * companion to fd_prestat_get. Wire: args[0..4] = fd and heap is
+   * the caller-sized output buffer. PMos exposes `/` at fd 3; success
+   * returns one byte in heapOut and response.value/extraLen = 1. */
   FD_PRESTAT_DIR_NAME: 0x002c,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
@@ -432,6 +437,10 @@ export const OP_EXT = {
   IPC_LISTEN: 0x1002,
   IPC_CONNECT: 0x1003,
   IPC_ACCEPT: 0x1004,
+  /** Send a bounded byte payload and, optionally, one duplicated fd. */
+  IPC_SEND: 0x1005,
+  /** Receive a bounded byte payload and, optionally, one installed fd. */
+  IPC_RECV: 0x1006,
   /** Wire-format identity for `ipc_pipe`. Create a pipe pair: the
    * kernel allocates two fds on the caller — a PipeRead at
    * heap[0..4] and a PipeWrite at heap[4..8] — and returns success
@@ -445,6 +454,12 @@ export const OP_EXT = {
    * propagates to the other (reader closed → subsequent writes
    * EPIPE; writer closed → subsequent reads see (0, []) EOF). */
   IPC_PIPE: 0x1007,
+  /** Kernel-authenticated capability snapshot for the process on the
+   * other end of a connected IPC socket (`SO_PEERCRED` equivalent). */
+  IPC_PEER_CAPS: 0x1008,
+  /** Kernel-authenticated pid snapshot for the process on the other
+   * end of a connected IPC socket (`SO_PEERCRED` equivalent). */
+  IPC_PEER_PID: 0x1009,
   PROC_SPAWN: 0x1100,
   PROC_SELF: 0x1103,
   PROC_PARENT: 0x1104,
@@ -455,6 +470,13 @@ export const OP_EXT = {
   DISPLAY_BIND: 0x1201,
   CAP_CHECK: 0x1300,
   CAP_LIST: 0x1301,
+  MOUNT: 0x1400,
+  UMOUNT: 0x1401,
+  FS_WATCH: 0x1402,
+  FS_CHMOD: 0x1403,
+  HOST_FILE_RECV: 0x1500,
+  HOST_FILE_PICK: 0x1501,
+  HOST_FILE_SEND: 0x1502,
 } as const;
 
 // ---- Errno constants -------------------------------------------------
@@ -463,6 +485,8 @@ export const OP_EXT = {
 // form (`-errno`), so a test asserts `response.status === -ERRNO.EBADF`.
 
 export const ERRNO = {
+  /** Permission denied. */
+  EACCES: 2,
   EAGAIN: 6,
   EBADF: 8,
   /** No child processes. Returned by `proc_wait` when the caller
@@ -472,11 +496,16 @@ export const ERRNO = {
   ECHILD: 9,
   ECONNREFUSED: 14,
   EEXIST: 20,
+  /** Bad address: a user pointer range crosses linear-memory bounds. */
+  EFAULT: 21,
   /** Interrupted function. Surfaced on a blocking syscall
    * (currently only `ipc_accept` with `flags=0`) when a signal
    * interrupts the park. Mirrors `abi::errno::EINTR`. */
   EINTR: 27,
   EINVAL: 28,
+  /** I/O error. Used when a transport/backend violates an I/O byte-count
+   * contract. Mirrors `abi::errno::EIO`. */
+  EIO: 29,
   EISDIR: 31,
   /** Too many levels of symbolic links. Returned from path
    * resolution when a symlink chain exceeds SYMLOOP_MAX (40).
@@ -607,10 +636,10 @@ export const POLL_DIRENT_HEADER_SIZE = 24;
 
 /** Dirent_t header field offsets. */
 export const DIRENT_OFF = {
-  D_NEXT:   0,  // u64 — resumption cookie after this entry
-  D_INO:    8,  // u64
+  D_NEXT: 0, // u64 — resumption cookie after this entry
+  D_INO: 8, // u64
   D_NAMLEN: 16, // u32
-  D_TYPE:   20, // u8 (filetype)
+  D_TYPE: 20, // u8 (filetype)
 } as const;
 
 // ---- WASI poll_oneoff wire layout + flag tables --------------------
@@ -700,6 +729,8 @@ export const CAP = {
   CAP_GRANT: 8,
   DEV_BLOCK: 9,
   KEYMAP_ADMIN: 10,
+  PROC_INSPECT: 11,
+  HOST_TRANSFER: 12,
 } as const;
 
 /** Bit for a cap, as a bigint (matches `CapSet::0` layout). */
@@ -709,135 +740,318 @@ export function capBit(cap: number): bigint {
 
 // ---- proc_spawn manifest encoding -----------------------------------
 //
-// Mirror of the [`abi::ext::SpawnManifest`] Rust type + the args /
-// heap layout `crates/kernel/src/syscall/ext.rs`'s `handle_proc_spawn`
-// parses. The current wire format is minimal: path string + caps
-// bitset, with stdio inherited implicitly from the parent's fd table.
-// Richer fields (argv, envp, cwd, extra fd dups) will be appended to
-// the heap payload in future slices; this helper will grow
-// correspondingly.
+// Mirror of `abi::ext::spawn_v1`. The versioned blob covers the complete
+// documented SpawnManifest while the kernel continues to accept the legacy
+// path+caps wire used by already-built fixtures.
+
+export const SPAWN_V1_MAGIC = 0x314e_5053; // little-endian "SPN1"
+export const SPAWN_V1_VERSION = 1;
+export const SPAWN_V1_HEADER_LEN = 48;
+export const SPAWN_V1_MAX_BYTES = 0x8000;
+const SPAWN_FLAG_CWD = 0x0001;
+const SPAWN_FLAG_CAPS = 0x0002;
+const SPAWN_KNOWN_FLAGS = SPAWN_FLAG_CWD | SPAWN_FLAG_CAPS;
+const SPAWN_INHERIT_FD = -1;
+const SPAWN_FIRST_DYNAMIC_FD = 5;
+const SPAWN_FD_SOFT_LIMIT = 1024;
 
 /** Arguments to a `PROC_SPAWN` syscall. */
 export interface SpawnManifest {
   /** Absolute path of the binary to spawn. */
   readonly path: string;
-  /** Capability bitset the child should hold. Must be a subset of the caller's own caps. */
-  readonly caps: bigint;
-  /**
-   * Optional argv passed to the child as `proc.argv`. Recoverable
-   * via the WASI `args_sizes_get` / `args_get` syscalls. Empty
-   * when omitted.
-   *
-   * Combined byte length (sum of `arg.length + 1` per entry) MUST
-   * fit in u16 (≤ 65535 bytes); larger argvs are rejected with
-   * `RangeError` at encode time. This is a wire-format limit, not
-   * a kernel one — the limit comes from the two u16 fields packed
-   * into the syscall args window.
-   */
+  /** Capability subset for the child. Omission inherits the caller's caps. */
+  readonly caps?: bigint;
+  /** Child argv, including argv[0]. */
   readonly argv?: readonly string[];
-  /**
-   * Optional envp passed to the child as `proc.envp`. Each entry
-   * is a `[key, value]` pair; the kernel stores them in a
-   * `BTreeMap<String, String>` (sorted by key) and returns them
-   * via `environ_sizes_get` / `environ_get` as
-   * `KEY=VALUE\0` byte stream.
-   *
-   * Combined byte length (sum of `key.length + 1 + value.length +
-   * 1` per entry) MUST fit in u16. Keys with `=` in them are
-   * rejected by the kernel parser.
-   */
+  /** Child environment entries. Duplicate keys are rejected by the kernel. */
   readonly envp?: readonly (readonly [string, string])[];
+  /** Parent descriptors to duplicate as child stdin/stdout/stderr. */
+  readonly stdinFd?: number;
+  readonly stdoutFd?: number;
+  readonly stderrFd?: number;
+  /** Additional `[parent_fd, child_fd]` descriptor mappings. */
+  readonly extraFds?: readonly (readonly [number, number])[];
+  /** Absolute child cwd. Omission inherits the caller's cwd. */
+  readonly cwd?: string;
 }
 
 /**
  * Build the `(args, heap)` pair for a [`PROC_SPAWN`] syscall from a
  * typed manifest.
  *
- * Wire format:
- *   args[0..4]   = path_len (u32 LE)
- *   args[4..12]  = caps bitset (u64 LE)
- *   args[12..14] = argv_buf_len (u16 LE) — bytes the argv part of
- *                  the heap occupies; 0 when manifest.argv is empty
- *   args[14..16] = envp_buf_len (u16 LE)
- *   heap         = path_bytes ++ argv_bytes ++ envp_bytes
- *
- *   argv_bytes = arg0\0arg1\0arg2\0...      (NUL-terminated)
- *   envp_bytes = KEY0=VAL0\0KEY1=VAL1\0...  (NUL-terminated)
+ * args[0..4] is `SPAWN_V1_MAGIC`, args[4..8] is the blob length, and
+ * args[8..10] is the version. The heap is one canonical packed blob with a
+ * fixed 48-byte header followed by length-delimited strings and fd pairs.
  */
-export function encodeSpawnManifest(
-  manifest: SpawnManifest,
-): { args: Uint8Array; heap: Uint8Array } {
+export function encodeSpawnManifest(manifest: SpawnManifest): {
+  args: Uint8Array;
+  heap: Uint8Array;
+} {
   const enc = new TextEncoder();
-  const pathBytes = enc.encode(manifest.path);
+  const encodeText = (
+    label: string,
+    value: string,
+    allowEmpty: boolean,
+  ): Uint8Array => {
+    if ((!allowEmpty && value.length === 0) || value.includes("\0")) {
+      throw new RangeError(`encodeSpawnManifest: invalid ${label}`);
+    }
+    const bytes = enc.encode(value);
+    if (bytes.length > 0xffff) {
+      throw new RangeError(`encodeSpawnManifest: ${label} exceeds u16 length`);
+    }
+    return bytes;
+  };
+  const validateFd = (label: string, fd: number | undefined): number => {
+    if (fd === undefined) return SPAWN_INHERIT_FD;
+    if (!Number.isSafeInteger(fd) || fd < 0 || fd > 0x7fff_ffff) {
+      throw new RangeError(`encodeSpawnManifest: invalid ${label} ${fd}`);
+    }
+    return fd;
+  };
 
-  // Build argv buffer: NUL-terminated strings concatenated.
-  let argvBytes = new Uint8Array(0);
-  if (manifest.argv !== undefined && manifest.argv.length > 0) {
-    const parts = manifest.argv.map((s) => enc.encode(s));
-    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
-    if (totalLen > 0xffff) {
+  if (!manifest.path.startsWith("/")) {
+    throw new RangeError("encodeSpawnManifest: path must be absolute");
+  }
+  if (manifest.cwd !== undefined && !manifest.cwd.startsWith("/")) {
+    throw new RangeError("encodeSpawnManifest: cwd must be absolute");
+  }
+  const path = encodeText("path", manifest.path, false);
+  const cwd =
+    manifest.cwd === undefined
+      ? new Uint8Array(0)
+      : encodeText("cwd", manifest.cwd, false);
+  const argv = (manifest.argv ?? []).map((arg, index) =>
+    encodeText(`argv[${index}]`, arg, true),
+  );
+  const envp = (manifest.envp ?? []).map(([key, value], index) => {
+    if (key.includes("=")) {
       throw new RangeError(
-        `encodeSpawnManifest: argv buf size ${totalLen} exceeds u16 max (65535)`,
+        `encodeSpawnManifest: envp[${index}] key contains '='`,
       );
     }
-    argvBytes = new Uint8Array(totalLen);
-    let off = 0;
-    for (const part of parts) {
-      argvBytes.set(part, off);
-      argvBytes[off + part.length] = 0;
-      off += part.length + 1;
-    }
+    return [
+      encodeText(`envp[${index}] key`, key, false),
+      encodeText(`envp[${index}] value`, value, true),
+    ] as const;
+  });
+  const extraFds = manifest.extraFds ?? [];
+  if (
+    argv.length > 0xffff ||
+    envp.length > 0xffff ||
+    extraFds.length > 0xffff
+  ) {
+    throw new RangeError("encodeSpawnManifest: entry count exceeds u16");
   }
-
-  // Build envp buffer: KEY=VAL\0KEY=VAL\0...
-  let envpBytes = new Uint8Array(0);
-  if (manifest.envp !== undefined && manifest.envp.length > 0) {
-    const parts = manifest.envp.map(([k, v]) => {
-      if (k.includes("=")) {
-        throw new RangeError(
-          `encodeSpawnManifest: envp key ${JSON.stringify(k)} contains '=' (forbidden by the wire format)`,
-        );
-      }
-      return enc.encode(`${k}=${v}`);
-    });
-    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
-    if (totalLen > 0xffff) {
+  const childFds = new Set<number>();
+  for (const [parentFd, childFd] of extraFds) {
+    validateFd("extra parent fd", parentFd);
+    validateFd("extra child fd", childFd);
+    if (childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT) {
       throw new RangeError(
-        `encodeSpawnManifest: envp buf size ${totalLen} exceeds u16 max (65535)`,
+        `encodeSpawnManifest: reserved/out-of-range child fd ${childFd}`,
       );
     }
-    envpBytes = new Uint8Array(totalLen);
-    let off = 0;
-    for (const part of parts) {
-      envpBytes.set(part, off);
-      envpBytes[off + part.length] = 0;
-      off += part.length + 1;
+    if (childFds.has(childFd)) {
+      throw new RangeError(
+        `encodeSpawnManifest: duplicate child fd ${childFd}`,
+      );
     }
+    childFds.add(childFd);
   }
 
+  const bodyLen =
+    path.length +
+    cwd.length +
+    argv.reduce((sum, arg) => sum + 2 + arg.length, 0) +
+    envp.reduce((sum, [key, value]) => sum + 4 + key.length + value.length, 0) +
+    extraFds.length * 8;
+  const totalLen = SPAWN_V1_HEADER_LEN + bodyLen;
+  if (totalLen > SPAWN_V1_MAX_BYTES) {
+    throw new RangeError(
+      `encodeSpawnManifest: blob size ${totalLen} exceeds ${SPAWN_V1_MAX_BYTES}`,
+    );
+  }
+
+  const heap = new Uint8Array(totalLen);
+  const header = new DataView(heap.buffer);
+  const flags =
+    (manifest.cwd === undefined ? 0 : SPAWN_FLAG_CWD) |
+    (manifest.caps === undefined ? 0 : SPAWN_FLAG_CAPS);
+  header.setUint32(0, SPAWN_V1_MAGIC, true);
+  header.setUint16(4, SPAWN_V1_VERSION, true);
+  header.setUint16(6, flags, true);
+  header.setUint32(8, totalLen, true);
+  header.setUint16(12, path.length, true);
+  header.setUint16(14, cwd.length, true);
+  header.setUint16(16, argv.length, true);
+  header.setUint16(18, envp.length, true);
+  header.setUint16(20, extraFds.length, true);
+  header.setInt32(24, validateFd("stdin fd", manifest.stdinFd), true);
+  header.setInt32(28, validateFd("stdout fd", manifest.stdoutFd), true);
+  header.setInt32(32, validateFd("stderr fd", manifest.stderrFd), true);
+  header.setBigUint64(40, manifest.caps ?? 0n, true);
+
+  let offset = SPAWN_V1_HEADER_LEN;
+  const put = (bytes: Uint8Array): void => {
+    heap.set(bytes, offset);
+    offset += bytes.length;
+  };
+  const putU16 = (value: number): void => {
+    new DataView(heap.buffer).setUint16(offset, value, true);
+    offset += 2;
+  };
+  const putU32 = (value: number): void => {
+    new DataView(heap.buffer).setUint32(offset, value, true);
+    offset += 4;
+  };
+  put(path);
+  put(cwd);
+  for (const arg of argv) {
+    putU16(arg.length);
+    put(arg);
+  }
+  for (const [key, value] of envp) {
+    putU16(key.length);
+    putU16(value.length);
+    put(key);
+    put(value);
+  }
+  for (const [parentFd, childFd] of extraFds) {
+    putU32(parentFd);
+    putU32(childFd);
+  }
+  if (offset !== totalLen) {
+    throw new Error("encodeSpawnManifest: internal length mismatch");
+  }
+  return encodeSpawnManifestBlob(heap);
+}
+
+/** Validate and wrap a caller-supplied canonical v1 blob for PROC_SPAWN. */
+export function encodeSpawnManifestBlob(blob: Uint8Array): {
+  args: Uint8Array;
+  heap: Uint8Array;
+} {
+  if (!isValidSpawnManifestBlob(blob)) {
+    throw new RangeError("encodeSpawnManifestBlob: malformed spawn manifest");
+  }
   const args = new Uint8Array(16);
   const view = new DataView(args.buffer);
-  view.setUint32(0, pathBytes.length, true);
-  view.setBigUint64(4, manifest.caps, true);
-  view.setUint16(12, argvBytes.length, true);
-  view.setUint16(14, envpBytes.length, true);
+  view.setUint32(0, SPAWN_V1_MAGIC, true);
+  view.setUint32(4, blob.length, true);
+  view.setUint16(8, SPAWN_V1_VERSION, true);
+  return { args, heap: blob.slice() };
+}
 
-  const heap = new Uint8Array(pathBytes.length + argvBytes.length + envpBytes.length);
-  heap.set(pathBytes, 0);
-  heap.set(argvBytes, pathBytes.length);
-  heap.set(envpBytes, pathBytes.length + argvBytes.length);
-  return { args, heap };
+/** Strict structural validation used at the user-memory host boundary. */
+export function isValidSpawnManifestBlob(blob: Uint8Array): boolean {
+  if (blob.length < SPAWN_V1_HEADER_LEN || blob.length > SPAWN_V1_MAX_BYTES)
+    return false;
+  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  if (
+    view.getUint32(0, true) !== SPAWN_V1_MAGIC ||
+    view.getUint16(4, true) !== SPAWN_V1_VERSION ||
+    view.getUint32(8, true) !== blob.length ||
+    view.getUint16(22, true) !== 0 ||
+    view.getUint32(36, true) !== 0
+  )
+    return false;
+  const flags = view.getUint16(6, true);
+  if ((flags & ~SPAWN_KNOWN_FLAGS) !== 0) return false;
+  const pathLen = view.getUint16(12, true);
+  const cwdLen = view.getUint16(14, true);
+  const argc = view.getUint16(16, true);
+  const envc = view.getUint16(18, true);
+  const extraCount = view.getUint16(20, true);
+  if (((flags & SPAWN_FLAG_CWD) === 0) !== (cwdLen === 0)) return false;
+  if ((flags & SPAWN_FLAG_CAPS) === 0 && view.getBigUint64(40, true) !== 0n)
+    return false;
+  for (const offset of [24, 28, 32]) {
+    if (view.getInt32(offset, true) < SPAWN_INHERIT_FD) return false;
+  }
+
+  const utf8 = new TextDecoder("utf-8", { fatal: true });
+  let offset = SPAWN_V1_HEADER_LEN;
+  const take = (length: number, allowEmpty: boolean): Uint8Array | null => {
+    if ((!allowEmpty && length === 0) || offset + length > blob.length)
+      return null;
+    const bytes = blob.subarray(offset, offset + length);
+    offset += length;
+    if (bytes.includes(0)) return null;
+    try {
+      utf8.decode(bytes);
+    } catch {
+      return null;
+    }
+    return bytes;
+  };
+  const readU16 = (): number | null => {
+    if (offset + 2 > blob.length) return null;
+    const value = view.getUint16(offset, true);
+    offset += 2;
+    return value;
+  };
+  const readU32 = (): number | null => {
+    if (offset + 4 > blob.length) return null;
+    const value = view.getUint32(offset, true);
+    offset += 4;
+    return value;
+  };
+  const path = take(pathLen, false);
+  if (path === null || utf8.decode(path)[0] !== "/") return false;
+  if (cwdLen > 0) {
+    const cwd = take(cwdLen, false);
+    if (cwd === null || utf8.decode(cwd)[0] !== "/") return false;
+  }
+  for (let i = 0; i < argc; i++) {
+    const len = readU16();
+    if (len === null || take(len, true) === null) return false;
+  }
+  const envKeys = new Set<string>();
+  for (let i = 0; i < envc; i++) {
+    const keyLen = readU16();
+    const valueLen = readU16();
+    if (keyLen === null || valueLen === null) return false;
+    const key = take(keyLen, false);
+    const value = take(valueLen, true);
+    if (key === null || value === null) return false;
+    const decoded = utf8.decode(key);
+    if (decoded.includes("=") || envKeys.has(decoded)) return false;
+    envKeys.add(decoded);
+  }
+  const childFds = new Set<number>();
+  for (let i = 0; i < extraCount; i++) {
+    const parentFd = readU32();
+    const childFd = readU32();
+    if (
+      parentFd === null ||
+      childFd === null ||
+      childFd < SPAWN_FIRST_DYNAMIC_FD ||
+      childFd >= SPAWN_FD_SOFT_LIMIT ||
+      childFds.has(childFd)
+    )
+      return false;
+    childFds.add(childFd);
+  }
+  return offset === blob.length;
 }
 
 /** `abi::cap::CapSet::ALL` — every bit set. */
 export const CAPSET_ALL = 0xffff_ffff_ffff_ffffn;
 
-/** `abi::cap::initial::DESKTOP_SHELL` — DisplayClient + Shell + ProcEnumerate + KeymapAdmin. */
+/** `abi::cap::initial::DESKTOP_SHELL` — display/window authority plus
+ * delegable Sysmon, Settings, and Files capabilities. */
 export const CAPSET_DESKTOP_SHELL =
   capBit(CAP.DISPLAY_CLIENT) |
   capBit(CAP.SHELL) |
   capBit(CAP.PROC_ENUMERATE) |
-  capBit(CAP.KEYMAP_ADMIN);
+  capBit(CAP.PROC_KILL_ANY) |
+  capBit(CAP.KEYMAP_ADMIN) |
+  capBit(CAP.HOST_TRANSFER);
 
 /** `abi::cap::initial::ORDINARY_APP` — just DisplayClient. */
 export const CAPSET_ORDINARY_APP = capBit(CAP.DISPLAY_CLIENT);
+
+/** `abi::cap::initial::FILES` — DisplayClient + HostTransfer. */
+export const CAPSET_FILES =
+  capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.HOST_TRANSFER);

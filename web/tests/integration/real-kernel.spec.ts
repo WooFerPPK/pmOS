@@ -53,8 +53,8 @@
 // `/index.html#input-echo` the bootstrap swaps its boot binary
 // to `/bin/hello_input_echo`, which polls `/dev/input_kbd` in a
 // tight EAGAIN loop. The test drives `page.keyboard.press(...)`
-// to synthesise keydown events, the bootstrap's DOM keydown
-// handler posts `input:kbd` messages to the kernel Worker, the
+// to synthesise keydown events, the bootstrap's canonical text
+// handler posts one line-atomic `input:kbd` message to the kernel Worker, the
 // kernel worker's InputDriver calls `KernelWasmHost.injectInput`
 // to deposit the bytes into the kbd ring, and the user Worker's
 // next `fd_read` iteration picks them up and echoes them to
@@ -190,15 +190,17 @@ test("real kernel is the default boot path and runs init -> hello-std + display-
   // server's iteration counter — the order relative to client
   // pids is not pinned because the clients run concurrently).
   expect(displayServerServedIndices).toHaveLength(2);
-  // T095: init's SIGTERM to display-server fires after both
-  // clients have been reaped — therefore AFTER both `sent pixels`
-  // AND AFTER at least the first `served client` line (the
-  // servers serve before the clients exit). Asserting `>` both
-  // `sent pixels` indices and the first `served client` index
-  // pins the ordering.
+  expect(displayServerServedIndices[1]!).toBeGreaterThan(
+    displayClientSentIndices[1]!,
+  );
+  // T095: init's SIGTERM to display-server fires after both clients
+  // have been reaped, so it must follow both `sent pixels` lines.
+  // `ipc_send` enqueues into the peer's stream buffer; process exit
+  // closes the sender but deliberately leaves those bytes readable
+  // before EOF. The server may therefore log `served client` either
+  // before or after init logs SIGTERM, depending on Worker scheduling.
   expect(initSigtermIdx).toBeGreaterThanOrEqual(0);
   expect(initSigtermIdx).toBeGreaterThan(displayClientSentIndices[1]!);
-  expect(initSigtermIdx).toBeGreaterThan(displayServerServedIndices[0]!);
   // T110: display-server's "fb blit ok" prints only after SIGTERM
   // breaks the accept loop. Restored observable (deferred in
   // slice 2a/2b).
@@ -321,11 +323,11 @@ test("input round-trip: keydown in real-kernel mode echoes to console", async ({
     )
     .toBeGreaterThanOrEqual(1);
 
-  // Press "x" then Enter. The bootstrap's keydown listener converts each key
-  // to a byte (via the existing `keyToBytes` helper: printable ASCII → UTF-8,
-  // Enter → 0x0a) and posts an `input:kbd` message on each. The kernel's
-  // console driver line-buffers, so the newline is what forces a flush of the
-  // full "x\n" payload to `onConsoleWrite`.
+  // Press "x" then Enter. The bootstrap's text-only canonical handler turns
+  // that completed line into one `input:kbd` message containing "x\n". This
+  // preserves the line as one device-ring write even if the reader is already
+  // polling, so a legal short read cannot strand bare "x" in the kernel's
+  // line-buffered console before the newline arrives.
   await page.keyboard.press("x");
   await page.keyboard.press("Enter");
 

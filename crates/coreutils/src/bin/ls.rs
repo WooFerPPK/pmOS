@@ -85,7 +85,11 @@ fn main() -> ExitCode {
         }
     }
 
-    if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
 }
 
 fn list_one<W: Write>(

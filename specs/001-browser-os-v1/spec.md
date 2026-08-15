@@ -20,7 +20,11 @@ private to each browser profile.
 - Q: What happens when the kernel itself panics? → A: The bootstrap displays a distinct kernel-panic overlay with a short diagnostic, then automatically reloads the tab after a short delay; the filesystem recovers from the journal on the next boot.
 - Q: What does the v1 Settings app expose beyond wallpaper/theme? → A: Full preference pane — wallpaper + wallpaper-fit mode, theme (light/dark), keyboard layout, timezone, default terminal font, and an about-this-system pane.
 
-## User Scenarios & Testing *(mandatory)*
+### Session 2026-08-09
+
+- Q: Does FR-007's unix-socket-equivalent IPC require local datagrams in v1? → A: No. V1 requires reliable bidirectional STREAM endpoints with path bind/listen/connect/accept, byte-stream send/recv, and documented fd passing. Datagram/message-oriented local IPC is post-v1 work.
+
+## User Scenarios & Testing _(mandatory)_
 
 ### User Story 1 — First Boot to a Usable Desktop (Priority: P1)
 
@@ -90,17 +94,22 @@ reachable from the taskbar. Click it in the taskbar; it returns.
 ### User Story 3 — Persistent Filesystem (Priority: P1)
 
 Files and directories the user creates persist across tab close, browser
-restart, and machine reboot. On return, the filesystem is exactly as it
-was left, stored in the user's own private browser storage. No other
-visitor can see it, and the site operator cannot see it.
+restart, and machine reboot. Catalog-backed open applications and their
+window layout return with them. On return, the filesystem and bounded
+desktop session are as they were left, stored in the user's own private
+browser storage. No other visitor can see them, and the site operator
+cannot see them.
 
 **Why this priority**: Without persistence, the product is a toy. Every
 later story that writes to disk depends on this working. It is also the
 core of the "private OS we cannot take down" product promise.
 
-**Independent Test**: Open the terminal. Create `/home/user/notes/hi.txt`
-with content "hello". Close the tab. Reopen the URL. Read
-`/home/user/notes/hi.txt`. See "hello".
+**Independent Test**: Open Files and Terminal, move and change the state
+of their windows, focus Terminal, and create `/home/user/notes/hi.txt`
+with content "hello". Wait for the session revision to be durable, close
+the tab, and reopen the URL. Before the desktop becomes interactive,
+observe the same applications, geometry/state/stacking/focus, then read
+the same file and see "hello".
 
 **Acceptance Scenarios**:
 
@@ -117,6 +126,10 @@ with content "hello". Close the tab. Reopen the URL. Read
 4. **Given** an in-progress write, **When** the tab is closed abruptly,
    **Then** on next load the filesystem is consistent: fully-flushed
    writes are present and the filesystem is not corrupted.
+5. **Given** catalog-backed applications with changed geometry, window
+   state, stacking, and focus, **When** the tab is closed after a durable
+   session revision and reopened, **Then** the same bounded desktop state
+   is restored before the authenticated interactive-ready fence.
 
 ---
 
@@ -298,10 +311,11 @@ corresponding window.
    **When** the user kills the desktop shell, **Then** the kernel, the
    display server, the toolkit, and the running apps all continue to
    run, and the apps' windows remain on screen and interactive.
-2. **Given** the desktop shell has been killed, **When** the user
-   launches a different program that holds the "shell" capability,
-   **Then** the new shell starts, draws its own taskbar and launcher,
-   and enumerates the already-running apps in its taskbar.
+2. **Given** the desktop shell has been killed, **When** PID 1 launches the
+   independently compiled, trusted alternate shell with the bounded `SHELL`
+   role grant, **Then** the new shell starts, draws its own taskbar and
+   launcher, and enumerates the already-running apps in its taskbar. Mutable
+   boot policy MUST NOT grant that role to arbitrary VFS executable bytes.
 3. **Given** the replacement shell is active, **When** the user clicks
    a taskbar entry for an app that was launched before the original
    shell was killed, **Then** the corresponding window is raised and
@@ -383,10 +397,12 @@ declared name and icon. Launch it. See it run in its own window.
 ### Edge Cases
 
 - **Storage denied or private-mode eviction**: when the browser
-  refuses persistent local storage, the system shows a clear "cannot
-  persist" warning and runs on an in-memory filesystem that will be
-  lost on tab close. It does not pretend to have persisted data that
-  it has not.
+  refuses persistent local storage at runtime, the system shows a blocking
+  "cannot persist" recovery screen before an ordinary desktop can accept
+  input. Retry is the safe default. Running on an in-memory filesystem requires
+  the user's explicit `Continue temporary session — files will be lost on
+reload` choice. It does not pretend to have persisted data that it has not,
+  and an existing image is not reformatted or overwritten.
 - **Process crash**: the kernel reaps the crashed process, closes its
   file descriptors and IPC endpoints, releases its display-server
   surfaces, and updates the system monitor. Other processes are
@@ -417,7 +433,7 @@ declared name and icon. Launch it. See it run in its own window.
 - **Corrupt app bundle in `/apps`**: the launcher refuses to list it
   and surfaces a diagnostic; other apps continue to work.
 
-## Requirements *(mandatory)*
+## Requirements _(mandatory)_
 
 ### Functional Requirements
 
@@ -451,6 +467,12 @@ declared name and icon. Launch it. See it run in its own window.
   terminate themselves or (subject to capability checks) their
   children, and communicate with other processes via kernel-mediated
   pipes and unix-socket-equivalent IPC.
+- **FR-007a**: For v1, unix-socket-equivalent IPC MUST provide reliable
+  bidirectional STREAM endpoints with path bind/listen/connect/accept,
+  byte-stream send/recv, and documented file-descriptor passing. The
+  wire socket-type value `1` is reserved for future DGRAM support;
+  `ipc_socket(1)` MUST return `ENOTSUP` without consuming a socket id,
+  live object, fd slot, admission quota, or namespace state.
 - **FR-008**: The kernel MUST expose a POSIX-style syscall surface
   covering file open/read/write/close, directory traversal, process
   spawn and wait, pipe creation, IPC, time, and environment.
@@ -465,15 +487,15 @@ declared name and icon. Launch it. See it run in its own window.
   or any other condition the kernel cannot recover from in
   place), the system MUST:
   (a) display a distinct full-screen "kernel panic" overlay
-      containing a short human-readable diagnostic (panic
-      message, timestamp, a hint to open the browser devtools
-      console for the full trace);
+  containing a short human-readable diagnostic (panic
+  message, timestamp, a hint to open the browser devtools
+  console for the full trace);
   (b) automatically reload the browser tab after a bounded
-      short delay (target: ~5 seconds, long enough to read the
-      diagnostic, short enough to feel automatic);
+  short delay (target: ~5 seconds, long enough to read the
+  diagnostic, short enough to feel automatic);
   (c) on the subsequent boot, recover the filesystem from its
-      journal (cf. FR-014) so no user-level data is lost for
-      writes that had been flushed prior to the panic.
+  journal (cf. FR-014) so no user-level data is lost for
+  writes that had been flushed prior to the panic.
   In-place kernel restart (resuming existing user processes
   without reloading the tab) is an explicit v1 non-goal.
 - **FR-010**: Privilege in the system MUST be expressed as
@@ -488,7 +510,11 @@ declared name and icon. Launch it. See it run in its own window.
   move, delete, list directory, stat.
 - **FR-012**: The filesystem MUST persist across tab close, browser
   restart, and machine reboot, stored entirely in the user's
-  browser-local persistent storage.
+  browser-local persistent storage. If that guarantee cannot be established
+  during boot, normal keyboard, pointer, and host-file interaction MUST remain
+  blocked. The recovery surface MUST offer Retry and MAY offer an explicitly
+  lossy temporary session; it MUST NOT select the temporary session by timeout,
+  default action, or failure fall-through.
 - **FR-013**: The filesystem MUST include a home directory for the
   local user and a documented location from which the launcher
   enumerates installed application bundles.
@@ -509,11 +535,11 @@ declared name and icon. Launch it. See it run in its own window.
     (`welcome.txt`) and one markdown (`editing.md`).
   - `/home/user/Pictures/` — empty directory; reserved for
     user-imported images.
-  After first boot, these files and directories are ordinary
-  user content: the user may rename, move, modify, or delete any
-  of them, and the system MUST NOT restore them on subsequent
-  boots. The starter content is a first-run convenience, not a
-  protected set.
+    After first boot, these files and directories are ordinary
+    user content: the user may rename, move, modify, or delete any
+    of them, and the system MUST NOT restore them on subsequent
+    boots. The starter content is a first-run convenience, not a
+    protected set.
 - **FR-014**: The filesystem MUST remain consistent under abrupt tab
   close: on the next load, fully-flushed writes MUST be present, and
   in-flight writes MUST NOT corrupt unrelated data.
@@ -609,7 +635,9 @@ declared name and icon. Launch it. See it run in its own window.
   the user's host operating system into the current directory via
   BOTH (a) drag-and-drop of one or more files onto the file
   manager window, AND (b) an explicit `Import…` menu item that
-  opens the browser's native file picker. Both paths MUST copy
+  requests a kernel-authorized, one-shot browser-substrate confirmation and
+  then opens the browser's native file picker synchronously from that trusted
+  confirmation click. Both paths MUST copy
   each chosen host file into the PMos filesystem as an ordinary
   file at a non-colliding name in the current directory.
 - **FR-032b**: The file manager MUST support exporting a selected
@@ -622,7 +650,8 @@ declared name and icon. Launch it. See it run in its own window.
 - **FR-034**: The settings application MUST provide a preference
   pane covering the following controls. Every change MUST be
   persisted to a file under `/etc/` and MUST survive across
-  sessions:
+  sessions. The canonical file, atomic writer, fallback, and live
+  shell-reader semantics are defined in `contracts/preferences.md`:
   1. **Wallpaper** — chosen from several built-in options; the
      desktop shell updates immediately (within one frame) when
      the selection changes.
@@ -743,11 +772,13 @@ declared name and icon. Launch it. See it run in its own window.
   capability that provides wallpaper, launcher, taskbar, and window
   chrome. Replaceable without modifying any other component.
 - **Session**: the per-visit state of the running system — which
-  apps are open, UI preferences, focus, window positions. Distinct
-  from the filesystem, which always persists; session state MAY
-  optionally be restored on next visit.
+  apps are open, focus, and window positions/state. Distinct from
+  the filesystem, which always persists, and from preferences,
+  whose canonical file is `/etc/preferences.toml`. The bounded,
+  catalog-backed session state MUST be restored on the next visit
+  as defined by `contracts/session-state.md`.
 
-## Success Criteria *(mandatory)*
+## Success Criteria _(mandatory)_
 
 ### Measurable Outcomes
 
@@ -801,15 +832,25 @@ declared name and icon. Launch it. See it run in its own window.
   server protocol with no toolkit linked can create a window, draw
   into it, and receive input events — proving the toolkit is not
   privileged.
+- **SC-014**: After a tab is closed and reopened in the same browser
+  profile, catalog-backed application instances and their window
+  positions, minimized/maximized state, stacking, and keyboard focus
+  are restored together with the persistent filesystem. Restoration
+  completes before the authenticated interactive-desktop fence and
+  preserves the SC-002/SC-003 performance budgets.
 
 ## Assumptions
 
 - **One anonymous user per browser profile**: the "user" is whoever
   has this browser profile; there is no login, account, or concept of
   "other users." The home directory belongs to that anonymous user.
-- **Session restore scope for v1**: the filesystem always persists;
-  restoring open windows to their previous positions on next visit is
-  a stretch goal, not an acceptance requirement.
+- **Session restore scope for v1**: the filesystem and the bounded
+  catalog-backed desktop session both persist. The session restores
+  application instances, window normal geometry, minimized/maximized
+  state, stacking, and focus. It deliberately excludes arbitrary
+  commands, environment/capability replay, document contents, and
+  preference duplication; those remain governed by their canonical
+  filesystem and policy sources.
 - **Launcher UI style**: "a launcher for installed applications"
   permits any discoverable list of installed apps (start-menu, dock,
   spotlight-style). The exact UI form is a plan-level decision.

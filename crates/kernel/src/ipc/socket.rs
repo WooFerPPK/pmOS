@@ -24,7 +24,10 @@
 use alloc::collections::VecDeque;
 use alloc::string::String;
 
+use abi::cap::CapSet;
 use abi::ext::Pid;
+
+use crate::fd::FdObject;
 
 /// Per-socket identifier handed out by the kernel's IPC table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -33,15 +36,22 @@ pub struct SocketId(pub u32);
 /// Default per-socket receive buffer capacity in bytes.
 pub const SOCKET_BUF_CAP: usize = 64 * 1024;
 
-/// Socket type (corresponds to the `type` argument of POSIX
-/// `socket()`).
+/// Maximum ancillary descriptors queued on one receive endpoint.
+/// Byte capacity cannot bound zero-byte SCM_RIGHTS-style sends, so the fd
+/// channel needs its own explicit limit.
+pub const SOCKET_FD_QUEUE_CAP: usize = 64;
+
+/// Socket type discriminants accepted by the syscall ABI. Only [`Stream`](Self::Stream)
+/// is implemented in v1; creating [`Dgram`](Self::Dgram) fails with `ENOTSUP`
+/// before an id or object is consumed.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SocketType {
-    /// Bidirectional, reliable, byte-stream. v1 only supports
-    /// this variant.
+    /// Bidirectional, reliable byte stream.
     Stream = 0,
-    /// Datagram. Reserved for v2.
+    /// Datagram ABI reservation. A future implementation needs record
+    /// boundaries plus source/destination addressing rather than stream
+    /// connect/accept semantics.
     Dgram = 1,
 }
 
@@ -54,6 +64,15 @@ pub enum SocketState {
     Connecting,
     Connected,
     Closed,
+}
+
+/// Kernel-authenticated identity snapshot for one side of an IPC
+/// connection. The kernel records it at connect/accept time; peer
+/// processes cannot write or replace it through the byte stream.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SocketCredentials {
+    pub pid: Pid,
+    pub capabilities: CapSet,
 }
 
 /// A unix-domain-socket-equivalent.
@@ -71,12 +90,16 @@ pub struct Socket {
     pub backlog: VecDeque<SocketId>,
     /// Peer socket id, set once this socket is paired.
     pub peer: Option<SocketId>,
+    /// Identity of the process that established this endpoint,
+    /// captured by the kernel at connect/accept time. A connected
+    /// peer may query this through `ipc_peer_caps`.
+    pub credentials: Option<SocketCredentials>,
     /// Received bytes waiting for the process to `recv`.
     pub rx_buf: VecDeque<u8>,
     pub rx_cap: usize,
     /// Received file descriptors waiting to be consumed by
     /// `ipc_recv`.
-    pub rx_fds: VecDeque<u32>,
+    pub rx_fds: VecDeque<FdObject>,
     /// True once [`IpcTable::close_socket`](super::IpcTable::close_socket)
     /// has been called on this socket. A closed socket's peer
     /// observes EOF on the next `recv`.
@@ -119,6 +142,7 @@ impl Socket {
             backlog_cap: 1,
             backlog: VecDeque::new(),
             peer: None,
+            credentials: None,
             rx_buf: VecDeque::new(),
             rx_cap: SOCKET_BUF_CAP,
             rx_fds: VecDeque::new(),

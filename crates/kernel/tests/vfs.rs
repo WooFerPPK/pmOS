@@ -75,15 +75,13 @@ fn successful_mutations_mark_mount_dirty_until_sync() {
 
 #[test]
 fn storage_usage_projects_exact_mount_counters() {
-    let mut vfs = fresh_vfs_with_root_tmpfs();
-    assert_eq!(vfs.storage_usage("/").unwrap(), None);
-
     let blocks = 4096;
+    let mut vfs = Vfs::new();
     let opfs = mkfs(Box::new(MockBlockDevice::new(blocks))).expect("mkfs");
-    vfs.mount("/persist", Box::new(opfs)).unwrap();
+    vfs.mount("/", Box::new(opfs)).unwrap();
 
     let usage = vfs
-        .storage_usage("/persist")
+        .storage_usage("/")
         .unwrap()
         .expect("opfs reports storage usage");
     assert_eq!(usage.quota_bytes, blocks * BLOCK_SIZE as u64);
@@ -894,4 +892,42 @@ fn stat_follows_intermediate_symlink_to_target() {
     let st = vfs.stat("/linkdir/file").unwrap();
     assert_eq!(st.ty, NodeType::RegularFile);
     assert_eq!(st.size, 5);
+}
+
+#[test]
+fn path_entering_mount_stops_before_procfs_after_absolute_symlink() {
+    let mut vfs = fresh_vfs_full();
+    vfs.mkdir("/tmp/base", 0o755).unwrap();
+    vfs.symlink("/proc", "/tmp/base/p").unwrap();
+
+    assert_eq!(
+        vfs.path_entering_mount("/tmp/base/p/77/status", "/proc", true)
+            .unwrap(),
+        Some("/proc/77/status".to_string())
+    );
+    assert_eq!(
+        vfs.path_entering_mount("/tmp/base/p", "/proc", false)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        vfs.path_entering_mount("/tmp/base/p", "/proc", true)
+            .unwrap(),
+        Some("/proc".to_string())
+    );
+}
+
+#[test]
+fn path_entering_mount_at_follows_arbitrary_dirfd_symlink() {
+    let mut vfs = fresh_vfs_full();
+    vfs.mkdir("/tmp/base", 0o755).unwrap();
+    vfs.symlink("/proc", "/tmp/base/p").unwrap();
+    let (mount_id, dir_ino, ty) = vfs.open("/tmp/base").unwrap();
+    assert_eq!(ty, NodeType::Directory);
+
+    assert_eq!(
+        vfs.path_entering_mount_at(mount_id, dir_ino, "p/88/fd/4", "/proc", true,)
+            .unwrap(),
+        Some("/proc/88/fd/4".to_string())
+    );
 }

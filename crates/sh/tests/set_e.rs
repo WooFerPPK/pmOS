@@ -88,8 +88,7 @@ fn set_e_then_true_does_not_terminate() {
     // on non-zero status, so the REPL continues past `true`
     // and the follow-up `echo` runs normally. Pins the
     // status==0 short-circuit in the post-dispatch check.
-    let (status, stdout, stderr, _flags) =
-        drive("set -e\ntrue\necho still here\nexit\n");
+    let (status, stdout, stderr, _flags) = drive("set -e\ntrue\necho still here\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -104,8 +103,7 @@ fn set_e_with_long_form_o_errexit() {
     // identical to `set -e`. Same termination behaviour
     // applies. Pins the `-o NAME` parser path AND the
     // shared `flags.errexit = true` mutation.
-    let (status, stdout, stderr, _flags) =
-        drive("set -o errexit\nfalse\necho unreached\n");
+    let (status, stdout, stderr, _flags) = drive("set -o errexit\nfalse\necho unreached\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -121,8 +119,7 @@ fn set_plus_e_clears_flag() {
     // run `false`, then `echo`. The `false` no longer
     // triggers termination because errexit was cleared
     // before it ran. Pins both polarities of the toggle.
-    let (status, stdout, stderr, flags) =
-        drive("set -e\nset +e\nfalse\necho still here\nexit\n");
+    let (status, stdout, stderr, flags) = drive("set -e\nset +e\nfalse\necho still here\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -144,8 +141,7 @@ fn set_e_then_unknown_command_terminates_with_127() {
     // same way it handles Status(N), AND that 127 (not a
     // generic 1) is what surfaces — the shell's exit byte
     // identifies WHY it died.
-    let (status, stdout, stderr, _flags) =
-        drive("set -e\nno_such_command_here\necho unreached\n");
+    let (status, stdout, stderr, _flags) = drive("set -e\nno_such_command_here\necho unreached\n");
     assert_eq!(status, ExitStatus::Exit(127));
     assert!(
         stderr.contains("command not found"),

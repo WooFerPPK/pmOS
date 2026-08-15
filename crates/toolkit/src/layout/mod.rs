@@ -257,7 +257,13 @@ pub fn row_with_grow(
     // Total grow weight (treat weight=0 as 1 per item).
     let total_weight: u32 = items
         .iter()
-        .map(|it| if let Item::Grow(w) = it { (*w).max(1) } else { 0 })
+        .map(|it| {
+            if let Item::Grow(w) = it {
+                (*w).max(1)
+            } else {
+                0
+            }
+        })
         .fold(0u32, |acc, w| acc.saturating_add(w));
 
     let clipped_h = height.min(interior_h);
@@ -329,7 +335,13 @@ pub fn col_with_grow(
 
     let total_weight: u32 = items
         .iter()
-        .map(|it| if let Item::Grow(w) = it { (*w).max(1) } else { 0 })
+        .map(|it| {
+            if let Item::Grow(w) = it {
+                (*w).max(1)
+            } else {
+                0
+            }
+        })
         .fold(0u32, |acc, w| acc.saturating_add(w));
 
     let clipped_w = width.min(interior_w);

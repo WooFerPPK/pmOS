@@ -11,7 +11,8 @@
 //!   used for `/proc`.
 //! * [`opfs`] — OPFS-backed persistent filesystem, used for `/`.
 
-pub mod tmpfs;
 pub mod devfs;
-pub mod procfs;
 pub mod opfs;
+pub mod procfs;
+pub mod seed;
+pub mod tmpfs;

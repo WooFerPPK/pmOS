@@ -7,9 +7,12 @@
 use display_proto::wire::{MessageHeader, HEADER_SIZE};
 use display_proto::ObjectId;
 use toolkit_free_client::{
-    append_wire_string, FreeClient, FreeClientError, OP_COMPOSITOR_CREATE_SURFACE,
-    OP_DISPLAY_GET_REGISTRY, OP_REGISTRY_BIND, OP_SURFACE_ATTACH, OP_SURFACE_COMMIT,
-    OP_SURFACE_DAMAGE,
+    append_wire_string, conformance_frame, FreeClient, FreeClientError, FRAME_ACCENT_RGBA,
+    FRAME_BYTES, FRAME_HEIGHT, FRAME_WIDTH, INITIAL_FRAME_RGBA, INPUT_FRAME_RGBA,
+    OP_COMPOSITOR_CREATE_SURFACE, OP_DISPLAY_GET_REGISTRY, OP_REGISTRY_BIND, OP_SEAT_GET_KEYBOARD,
+    OP_SHM_CREATE_POOL, OP_SHM_POOL_CREATE_BUFFER, OP_SHM_POOL_WRITE, OP_SURFACE_ATTACH,
+    OP_SURFACE_COMMIT, OP_SURFACE_DAMAGE, OP_XDG_SHELL_GET_TOPLEVEL, OP_XDG_TOPLEVEL_ACK_CONFIGURE,
+    OP_XDG_TOPLEVEL_SET_APP_ID, OP_XDG_TOPLEVEL_SET_TITLE,
 };
 
 fn decode_front(bytes: &[u8]) -> (MessageHeader, &[u8], usize) {
@@ -59,9 +62,7 @@ fn get_registry_emits_display_opcode_2_with_a_4_byte_new_id_payload() {
 fn registry_bind_frames_a_u32_string_u32_u32_payload() {
     let mut c = FreeClient::new();
     let registry = c.get_registry().unwrap();
-    let compositor = c
-        .registry_bind(registry, 7, "pmd_compositor", 1)
-        .unwrap();
+    let compositor = c.registry_bind(registry, 7, "pmd_compositor", 1).unwrap();
     assert_eq!(compositor.raw(), 5);
 
     let bytes = c.drain_outbound();
@@ -90,9 +91,7 @@ fn registry_bind_frames_a_u32_string_u32_u32_payload() {
 fn compositor_create_surface_payload_is_a_single_new_id() {
     let mut c = FreeClient::new();
     let registry = c.get_registry().unwrap();
-    let compositor = c
-        .registry_bind(registry, 1, "pmd_compositor", 1)
-        .unwrap();
+    let compositor = c.registry_bind(registry, 1, "pmd_compositor", 1).unwrap();
     let surface = c.compositor_create_surface(compositor).unwrap();
 
     // Third message on the queue is create_surface.
@@ -106,7 +105,10 @@ fn compositor_create_surface_payload_is_a_single_new_id() {
     assert_eq!(header.object_id, compositor);
     assert_eq!(header.opcode, OP_COMPOSITOR_CREATE_SURFACE);
     assert_eq!(header.payload_len(), 4);
-    assert_eq!(u32::from_le_bytes(payload.try_into().unwrap()), surface.raw());
+    assert_eq!(
+        u32::from_le_bytes(payload.try_into().unwrap()),
+        surface.raw()
+    );
 }
 
 #[test]
@@ -167,9 +169,7 @@ fn encode_request_on_oversized_payload_returns_wire_error() {
     // The header's `length` field is u16, so a payload that
     // would push the total over u16::MAX is rejected.
     let big = vec![0u8; u16::MAX as usize];
-    let err = c
-        .encode_request(ObjectId::DISPLAY, 1, &big)
-        .unwrap_err();
+    let err = c.encode_request(ObjectId::DISPLAY, 1, &big).unwrap_err();
     match err {
         FreeClientError::Wire(_) => {}
         FreeClientError::IdsExhausted => {
@@ -226,4 +226,82 @@ fn append_wire_string_pads_to_four_byte_boundary() {
         out,
         vec![8, 0, 0, 0, b'h', b'e', b'l', b'l', b'o', b'h', b'i', b'!']
     );
+}
+
+#[test]
+fn raw_window_pool_role_and_keyboard_helpers_emit_the_shipped_v1_opcodes() {
+    let mut client = FreeClient::new();
+    let shm = client.allocate_id().unwrap();
+    let pool = client.shm_create_pool(shm, 512_000).unwrap();
+    let buffer = client
+        .shm_pool_create_buffer(pool, 0, 320, 200, 1_280, 0)
+        .unwrap();
+    client.shm_pool_write(pool, 0, &[1, 2, 3, 4]).unwrap();
+    let xdg_shell = client.allocate_id().unwrap();
+    let surface = client.allocate_id().unwrap();
+    let toplevel = client.xdg_shell_get_toplevel(xdg_shell, surface).unwrap();
+    client
+        .xdg_toplevel_set_title(toplevel, "Raw Protocol Window")
+        .unwrap();
+    client
+        .xdg_toplevel_set_app_id(toplevel, "pmos.toolkit-free-client")
+        .unwrap();
+    client.xdg_toplevel_ack_configure(toplevel, 41).unwrap();
+    let seat = client.allocate_id().unwrap();
+    let keyboard = client.seat_get_keyboard(seat).unwrap();
+
+    let bytes = client.drain_outbound();
+    let mut cursor = 0usize;
+    let mut messages = Vec::new();
+    while cursor < bytes.len() {
+        let (header, payload, consumed) = decode_front(&bytes[cursor..]);
+        messages.push((header.object_id, header.opcode, payload.to_vec()));
+        cursor += consumed;
+    }
+    assert_eq!(messages[0].0, shm);
+    assert_eq!(messages[0].1, OP_SHM_CREATE_POOL);
+    assert_eq!(messages[1].0, pool);
+    assert_eq!(messages[1].1, OP_SHM_POOL_CREATE_BUFFER);
+    assert_eq!(messages[2].1, OP_SHM_POOL_WRITE);
+    assert_eq!(messages[3].0, xdg_shell);
+    assert_eq!(messages[3].1, OP_XDG_SHELL_GET_TOPLEVEL);
+    assert_eq!(messages[4].1, OP_XDG_TOPLEVEL_SET_TITLE);
+    assert_eq!(messages[5].1, OP_XDG_TOPLEVEL_SET_APP_ID);
+    assert_eq!(messages[6].1, OP_XDG_TOPLEVEL_ACK_CONFIGURE);
+    assert_eq!(messages[7].0, seat);
+    assert_eq!(messages[7].1, OP_SEAT_GET_KEYBOARD);
+    assert_eq!(
+        u32::from_le_bytes(messages[7].2.as_slice().try_into().unwrap()),
+        keyboard.raw()
+    );
+    assert_ne!(buffer, toplevel);
+}
+
+#[test]
+fn conformance_frames_are_bounded_distinct_and_have_a_large_exact_colour_field() {
+    let initial = conformance_frame(false);
+    let input = conformance_frame(true);
+    assert_eq!(initial.len(), FRAME_BYTES);
+    assert_eq!(input.len(), FRAME_BYTES);
+    assert_eq!(
+        FRAME_BYTES,
+        FRAME_WIDTH as usize * FRAME_HEIGHT as usize * 4
+    );
+    assert_ne!(initial, input);
+
+    let initial_fill = initial
+        .chunks_exact(4)
+        .filter(|pixel| *pixel == INITIAL_FRAME_RGBA)
+        .count();
+    let input_fill = input
+        .chunks_exact(4)
+        .filter(|pixel| *pixel == INPUT_FRAME_RGBA)
+        .count();
+    let accents = initial
+        .chunks_exact(4)
+        .filter(|pixel| *pixel == FRAME_ACCENT_RGBA)
+        .count();
+    assert!(initial_fill > 45_000);
+    assert_eq!(initial_fill, input_fill);
+    assert!(accents > 5_000);
 }

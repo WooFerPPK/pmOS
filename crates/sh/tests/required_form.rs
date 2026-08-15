@@ -8,7 +8,7 @@
 //! writes `sh: <name>: <error>\n` (or `sh: <name>:
 //! parameter null or not set\n` when no error message was
 //! provided) to stderr and TERMINATES the REPL with status
-//! 1. The failing-expansion command never runs (the
+//! one. The failing-expansion command never runs (the
 //! dispatch_builtin call is skipped). Critically — this
 //! fires REGARDLESS of `set -u`. The `:?` form is its own
 //! diagnostic mechanism; it doesn't depend on the nounset
@@ -60,8 +60,7 @@ fn required_form_with_set_var_expands_to_value() {
     // follow-up `exit` runs cleanly. Pins the set-var short-
     // circuit before the error path. The `echo` line writes
     // `hello\n` to stdout because that's the expanded value.
-    let (status, stdout, stderr) =
-        drive("export X=hello\necho ${X:?error}\nexit\n");
+    let (status, stdout, stderr) = drive("export X=hello\necho ${X:?error}\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -78,8 +77,7 @@ fn required_form_with_unset_var_terminates_with_default_message() {
     // Exit(1) immediately; the second `echo unreached` line
     // never runs. Pins both the default-message substitution
     // AND the failing-expansion-skips-dispatch semantic.
-    let (status, stdout, stderr) =
-        drive("echo ${UNSET:?}\necho unreached\n");
+    let (status, stdout, stderr) = drive("echo ${UNSET:?}\necho unreached\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("sh: UNSET: parameter null or not set"),
@@ -103,8 +101,7 @@ fn required_form_with_unset_var_uses_custom_message() {
     // multiple tokens — the same workaround the
     // `default_value_can_contain_spaces` inline test
     // documents for `:-` defaults.
-    let (status, _stdout, stderr) =
-        drive("echo \"${UNSET:?my custom error}\"\n");
+    let (status, _stdout, stderr) = drive("echo \"${UNSET:?my custom error}\"\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("sh: UNSET: my custom error"),
@@ -124,8 +121,7 @@ fn required_form_with_empty_var_terminates_like_unset() {
     // Pins the empty-equals-unset semantic that
     // distinguishes `:?` from a future no-colon `${X?}`
     // form (which would treat empty as set).
-    let (status, _stdout, stderr) =
-        drive("export X=\necho ${X:?empty}\n");
+    let (status, _stdout, stderr) = drive("export X=\necho ${X:?empty}\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("sh: X: empty"),
@@ -145,8 +141,7 @@ fn required_form_message_can_have_spaces_and_punctuation() {
     // is wrapped in double quotes so the unquoted-
     // tokeniser's whitespace split does NOT cut the brace
     // region across multiple tokens.
-    let (status, _stdout, stderr) =
-        drive("echo \"${UNSET:?cannot run: missing var}\"\n");
+    let (status, _stdout, stderr) = drive("echo \"${UNSET:?cannot run: missing var}\"\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("sh: UNSET: cannot run: missing var"),
@@ -163,8 +158,7 @@ fn required_form_fires_independently_of_set_u() {
     // brace arm might gate `:?` on the nounset flag and
     // accidentally swallow the diagnostic when nounset is
     // off.
-    let (status, _stdout, stderr) =
-        drive("echo ${UNSET:?required}\n");
+    let (status, _stdout, stderr) = drive("echo ${UNSET:?required}\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("sh: UNSET: required"),
@@ -183,8 +177,7 @@ fn required_form_does_not_fire_when_set_var_used_with_set_u() {
     // pins the cleanly-terminated REPL via Exit(0) rather
     // than relying on the EOF code which is a different
     // ExitStatus variant.
-    let (status, stdout, stderr) =
-        drive("set -u\nexport X=value\necho ${X:?required}\nexit\n");
+    let (status, stdout, stderr) = drive("set -u\nexport X=value\necho ${X:?required}\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -205,8 +198,7 @@ fn required_form_with_set_u_and_unset_var_fires_required_first() {
     // recognising the `:?` modifier — semantically wrong
     // because the user explicitly asked for a custom
     // diagnostic.
-    let (status, _stdout, stderr) =
-        drive("set -u\necho ${UNSET:?required}\n");
+    let (status, _stdout, stderr) = drive("set -u\necho ${UNSET:?required}\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("sh: UNSET: required"),
@@ -230,8 +222,7 @@ fn required_form_braced_form_only() {
     // tail remains as-is). Pins that the modifier scan is
     // brace-scoped only — a regression here would mean the
     // bare `$VAR` scanner accidentally honoured `:?`.
-    let (status, _stdout, stderr) =
-        drive("echo $UNSET:?error\nexit\n");
+    let (status, _stdout, stderr) = drive("echo $UNSET:?error\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
 }
@@ -249,8 +240,7 @@ fn required_form_unterminated_brace_does_not_error() {
     // The `echo` itself runs (with a literal-preserving
     // arg) and produces stdout; the REPL stays alive; the
     // `exit` runs cleanly.
-    let (status, stdout, stderr) =
-        drive("echo ${UNSET:?no_close\nexit\n");
+    let (status, stdout, stderr) = drive("echo ${UNSET:?no_close\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.is_empty(),

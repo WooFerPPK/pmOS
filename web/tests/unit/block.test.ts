@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   BlockDriver,
+  BlockImageState,
   BLOCK_SIZE,
   DEFAULT_BLOCK_COUNT,
   EINVAL,
@@ -26,6 +27,7 @@ import {
   ENOSPC,
   OP_BLOCK_COUNT,
   OP_FLUSH,
+  OP_IMAGE_STATE,
   OP_READ,
   OP_WRITE,
   PMOS_IMG_FILENAME,
@@ -269,6 +271,36 @@ describe("BlockDriver quota mapping", () => {
     expect(r).toEqual({ ok: false, error: DriverErrorCode.Errno, errno: EIO });
   });
 
+  it("a short write surfaces as EIO and does not touch an unrelated block", () => {
+    const backing = freshHandle();
+    const sentinel = blockBytes(77);
+    backing.write(sentinel, { at: BLOCK_SIZE });
+    const handle: SyncAccessHandle = {
+      read: (buffer, options) => backing.read(buffer, options),
+      write: (buffer, options) => {
+        const short = buffer.subarray(0, 128);
+        backing.write(short, options);
+        return short.byteLength;
+      },
+      flush: () => backing.flush(),
+      getSize: () => backing.getSize(),
+      truncate: (size) => backing.truncate(size),
+      close: () => backing.close(),
+    };
+    const driver = BlockDriver.withHandle(handle, 16);
+
+    const result = driver.call(OP_WRITE, makeWritePayload(0, blockBytes(1)));
+    expect(result).toEqual({
+      ok: false,
+      error: DriverErrorCode.Errno,
+      errno: EIO,
+    });
+
+    const untouched = makeReadPayload(1);
+    expect(driver.call(OP_READ, untouched).ok).toBe(true);
+    expect(untouched.subarray(8)).toEqual(sentinel);
+  });
+
   it("a read throw surfaces as Errno(EIO)", () => {
     const handle = freshHandle({ throwIoOnEveryRead: true });
     const driver = BlockDriver.withHandle(handle, 16);
@@ -311,13 +343,30 @@ describe("BlockDriver argument validation", () => {
   });
 });
 
-// ---- OP_BLOCK_COUNT + OP_FLUSH ---------------------------------------
+// ---- control opcodes -------------------------------------------------
 
 describe("BlockDriver control opcodes", () => {
   it("OP_BLOCK_COUNT returns the configured block count", () => {
     const driver = BlockDriver.withHandle(freshHandle(), 4096);
     const r = driver.call(OP_BLOCK_COUNT, new Uint8Array(0));
     expect(r).toEqual({ ok: true, value: 4096 });
+  });
+
+  it("OP_IMAGE_STATE returns the explicit image provenance", () => {
+    const fresh = BlockDriver.withHandle(
+      freshHandle(),
+      16,
+      BlockImageState.NewlyCreated,
+    );
+    const existing = BlockDriver.withHandle(freshHandle(), 16);
+    expect(fresh.call(OP_IMAGE_STATE, new Uint8Array(0))).toEqual({
+      ok: true,
+      value: BlockImageState.NewlyCreated,
+    });
+    expect(existing.call(OP_IMAGE_STATE, new Uint8Array(0))).toEqual({
+      ok: true,
+      value: BlockImageState.Existing,
+    });
   });
 
   it("OP_FLUSH calls handle.flush() exactly once per call", () => {
@@ -372,7 +421,9 @@ describe("BlockDriver.openInOpfs", () => {
         let h = handles.get(name);
         if (h === undefined) {
           if (!options?.create) {
-            throw new Error(`getFileHandle: ${name} not found`);
+            const error = new Error(`getFileHandle: ${name} not found`);
+            error.name = "NotFoundError";
+            throw error;
           }
           h = new MemSyncAccessHandle();
           handles.set(name, h);
@@ -394,6 +445,7 @@ describe("BlockDriver.openInOpfs", () => {
     expect(handles.has(PMOS_IMG_FILENAME)).toBe(true);
     expect(handles.get(PMOS_IMG_FILENAME)!.getSize()).toBe(64 * BLOCK_SIZE);
     expect(driver.blockCount).toBe(64);
+    expect(driver.imageState).toBe(BlockImageState.NewlyCreated);
   });
 
   it("re-opens an existing pmos.img and preserves its bytes (FR-013a persistence)", async () => {
@@ -407,9 +459,40 @@ describe("BlockDriver.openInOpfs", () => {
     // Second boot: re-open. Same backing handle map, so the
     // previously-written block must read back.
     const session2 = await BlockDriver.openInOpfs(64, makeFakeRoot(handles));
+    expect(session2.imageState).toBe(BlockImageState.Existing);
     const payload = makeReadPayload(0);
     session2.call(OP_READ, payload);
     expect(payload.subarray(8)).toEqual(data);
+  });
+
+  it("reports a pre-existing empty image as existing, never newly created", async () => {
+    const handles = new Map<string, MemSyncAccessHandle>();
+    handles.set(PMOS_IMG_FILENAME, new MemSyncAccessHandle());
+
+    const driver = await BlockDriver.openInOpfs(64, makeFakeRoot(handles));
+
+    expect(driver.imageState).toBe(BlockImageState.Existing);
+    expect(driver.call(OP_IMAGE_STATE, new Uint8Array(0))).toEqual({
+      ok: true,
+      value: BlockImageState.Existing,
+    });
+  });
+
+  it("does not turn a non-NotFound open failure into create permission", async () => {
+    let createAttempted = false;
+    const root: OpfsRoot = {
+      async getFileHandle(_name, options) {
+        if (options?.create) createAttempted = true;
+        const error = new Error("permission denied");
+        error.name = "NotAllowedError";
+        throw error;
+      },
+    };
+
+    await expect(BlockDriver.openInOpfs(64, root)).rejects.toMatchObject({
+      name: "NotAllowedError",
+    });
+    expect(createAttempted).toBe(false);
   });
 
   it("uses the default block count when none is provided", async () => {

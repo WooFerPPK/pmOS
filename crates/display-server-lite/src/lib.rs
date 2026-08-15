@@ -50,20 +50,20 @@
 //!
 //! ## Exit codes
 //!
-//!   * 0  = success
-//!   * 10 = `display_bind` failed (missing DISPLAY_SERVER cap,
-//!          address already in use, internal error)
-//!   * 11 = `display_connect` failed (missing DISPLAY_CLIENT
-//!          cap, connection refused, backlog full)
-//!   * 12 = `ipc_accept` failed (no pending client, bad fd,
-//!          listener not in Listening state)
-//!   * 13 = `fd_write` on the client fd failed (short write,
-//!          closed peer, etc.)
-//!   * 14 = `fd_read` on the server fd failed or short-read
-//!   * 15 = `path_open("/dev/fb0")` failed (missing cap, no
-//!          such device)
-//!   * 16 = `fd_write` on the framebuffer fd failed
-//!   * 101 = panic
+//! * 0  = success
+//! * 10 = `display_bind` failed (missing DISPLAY_SERVER cap,
+//!   address already in use, internal error)
+//! * 11 = `display_connect` failed (missing DISPLAY_CLIENT
+//!   cap, connection refused, backlog full)
+//! * 12 = `ipc_accept` failed (no pending client, bad fd,
+//!   listener not in Listening state)
+//! * 13 = `fd_write` on the client fd failed (short write,
+//!   closed peer, etc.)
+//! * 14 = `fd_read` on the server fd failed or short-read
+//! * 15 = `path_open("/dev/fb0")` failed (missing cap, no
+//!   such device)
+//! * 16 = `fd_write` on the framebuffer fd failed
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
@@ -81,18 +81,8 @@ extern "C" {
         fdflags: i32,
         fd_out_ptr: *mut u32,
     ) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
-    fn fd_read(
-        fd: i32,
-        iovs_ptr: *const Iovec,
-        iovs_len: i32,
-        nread_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
+    fn fd_read(fd: i32, iovs_ptr: *const Iovec, iovs_len: i32, nread_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
 }
 

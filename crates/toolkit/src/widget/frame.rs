@@ -101,13 +101,11 @@ pub enum PointerOutcome {
 /// so [`WindowFrame::new`] can call it before the struct is
 /// built.
 fn compute_close_button_rect(bounds: Rect) -> Rect {
-    if bounds.width < CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN
-        || bounds.height < TITLEBAR_HEIGHT
+    if bounds.width < CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN || bounds.height < TITLEBAR_HEIGHT
     {
         return Rect::new(bounds.x, bounds.y, 0, 0);
     }
-    let x = bounds.x
-        + (bounds.width as i32)
+    let x = bounds.x + (bounds.width as i32)
         - (CLOSE_BUTTON_MARGIN as i32)
         - (CLOSE_BUTTON_SIZE as i32);
     let y = bounds.y + CLOSE_BUTTON_MARGIN as i32;
@@ -238,7 +236,8 @@ impl WindowFrame {
         self.close_button.set_fill(theme.close_button);
         self.close_button.set_fill_hover(theme.close_button_hover);
         self.close_button.set_fill_pressed(theme.close_button_hover);
-        self.close_button.set_caption_color(theme.close_button_glyph);
+        self.close_button
+            .set_caption_color(theme.close_button_glyph);
         self.close_button.set_border(self.border_color());
     }
 

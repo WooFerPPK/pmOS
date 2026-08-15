@@ -1,19 +1,15 @@
 //! `/usr/bin/sh` — thin driver that wires real stdin /
 //! stdout / stderr into the [`sh::run`] REPL loop.
 //!
-//! Every interesting decision lives in [`sh::run`]; this
-//! file just locks the real fds, hands them in as
-//! `BufRead` / `Write` impls, and translates the returned
-//! [`sh::ExitStatus`] into a process exit code.
+//! This file selects the PMos process backend, seeds the inherited
+//! environment, supports `-c`, wires real stdio into the shell loop, and
+//! translates [`sh::ExitStatus`] into a process exit code.
 //!
 //! Distinct from `/usr/bin/shell` (the desktop shell).
-//! Populated in Phase 3 T123 (this slice — `echo`, `exit`,
-//! `cd`, `pwd`). Phase 6 T142..T145 expands the binary with
-//! pipes / redirection / job control; until then the
-//! REPL's tokenizer is a whitespace split and external
-//! commands fall through to "command not found".
 
+use std::collections::BTreeMap;
 use std::io::{self, BufReader};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -21,8 +17,47 @@ fn main() -> ExitCode {
     let stdout = io::stdout();
     let stderr = io::stderr();
 
-    let reader = BufReader::new(stdin.lock());
-    let status = sh::run(reader, stdout.lock(), stderr.lock());
+    let mut env: BTreeMap<String, String> = std::env::vars().collect();
+    env.entry("PATH".to_string())
+        .or_insert_with(|| sh::DEFAULT_PATH.to_string());
+    let cwd = env
+        .get("PWD")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut flags = sh::ShellFlags::default();
+    let args: Vec<String> = std::env::args().collect();
+
+    #[cfg(target_arch = "wasm32")]
+    let mut backend = sh::PmosProcessBackend::new(sh::WasmPmosSyscalls::default());
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut backend = sh::NoProcessBackend;
+
+    let status = if args.get(1).map(String::as_str) == Some("-c") {
+        let Some(command) = args.get(2) else {
+            eprintln!("sh: -c requires an argument");
+            return ExitCode::from(2);
+        };
+        sh::run_command_with_env_and_backend(
+            command,
+            stdout.lock(),
+            stderr.lock(),
+            &mut env,
+            &mut flags,
+            &mut backend,
+            cwd,
+        )
+    } else {
+        let reader = BufReader::new(stdin.lock());
+        sh::run_with_env_and_backend(
+            reader,
+            stdout.lock(),
+            stderr.lock(),
+            &mut env,
+            &mut flags,
+            &mut backend,
+        )
+    };
 
     let code = status.code();
     // `ExitCode::from(u8)` clamps: treat negative /

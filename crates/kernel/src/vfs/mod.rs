@@ -43,7 +43,10 @@ pub mod path;
 pub mod watch;
 
 pub use mount::{Mount, MountId, MountTable};
-pub use watch::{Watch, WatchEvent, WatchId, WatchTable};
+pub use watch::{
+    Watch, WatchEvent, WatchId, WatchTable, MAX_WATCHES, MAX_WATCHES_PER_PID,
+    MAX_WATCHES_PER_TARGET, WATCH_EVENT_QUEUE_CAP,
+};
 
 /// Per-filesystem inode identifier. Meaning depends on the
 /// concrete [`Filesystem`]; the VFS treats it as opaque.
@@ -195,6 +198,13 @@ pub enum FsError {
 /// `OpfsFs`. `Send` is kept so tests can move a boxed filesystem
 /// across thread boundaries.
 pub trait Filesystem: Send {
+    /// Whether this filesystem exposes stable mutation targets for
+    /// `fs_watch`. Synthetic filesystems override this to reject unwakeable
+    /// registrations explicitly.
+    fn supports_watches(&self) -> bool {
+        true
+    }
+
     /// Return the root inode number of this filesystem.
     fn root(&self) -> Ino;
 
@@ -242,6 +252,12 @@ pub trait Filesystem: Send {
 
     /// Truncate a regular file to `new_size` bytes.
     fn truncate(&mut self, ino: Ino, new_size: u64) -> Result<(), FsError>;
+
+    /// Replace the low nine POSIX permission bits on `ino`.
+    /// Read-only and synthetic filesystems inherit this default.
+    fn set_mode(&mut self, _ino: Ino, _mode: Mode) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
 
     /// Set the `atime_ns` and / or `mtime_ns` on `ino`. Either
     /// argument being `None` means "leave this field unchanged".
@@ -371,7 +387,17 @@ impl Vfs {
     /// the wire-level validation invariants.
     pub fn register_watch(&mut self, abs_path: &str, mask: u32) -> Result<WatchId, FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
-        Ok(self.watches.register(mount_id, ino, mask))
+        if !self
+            .mounts
+            .fs(mount_id)
+            .ok_or(FsError::NotFound)?
+            .supports_watches()
+        {
+            return Err(FsError::NotSupported);
+        }
+        self.watches
+            .register(mount_id, ino, mask)
+            .map_err(|_| FsError::NoSpace)
     }
 
     /// Remove a watch by id. Returns `true` iff the id named a
@@ -470,9 +496,9 @@ impl Vfs {
     /// Return structured storage counters for an exact mountpoint.
     /// Filesystems without quota-backed storage return `Ok(None)`.
     /// Read-only — the trait method `Filesystem::storage_usage`
-    /// takes `&self`, so the procfs projection can call this
-    /// through a `&Kernel` reborrow without disturbing the outer
-    /// `&mut Kernel` borrow held by the syscall dispatcher.
+    /// takes `&self`, so the wasm entry seam can copy the value
+    /// into its independent procfs projection before syscall
+    /// dispatch begins.
     pub fn storage_usage(&self, mountpoint: &str) -> Result<Option<StorageUsage>, FsError> {
         let normalised = path::normalize(mountpoint);
         let mount_id = self.mounts.id_of(&normalised).ok_or(FsError::NotFound)?;
@@ -514,7 +540,24 @@ impl Vfs {
     /// Bounded by [`Vfs::SYMLOOP_MAX`]; exceeds the budget →
     /// `FsError::SymLoop` (→ `ELOOP` at the syscall layer).
     pub fn resolve(&mut self, abs_path: &str) -> Result<(MountId, Ino), FsError> {
-        self.resolve_inner(abs_path, true, Self::SYMLOOP_MAX)
+        self.resolve_inner(abs_path, true, Self::SYMLOOP_MAX, None)
+    }
+
+    /// Resolve an absolute path while requiring every symlink expansion to
+    /// remain beneath `root`. Both arguments are normalised before the check,
+    /// and an absolute or relative symlink that escapes the root fails with
+    /// [`FsError::PermissionDenied`].
+    ///
+    /// This is intentionally narrower than a lexical prefix check: executable
+    /// loading uses it to ensure `/opt/link -> /home/program.wasm` cannot turn
+    /// writable data outside the package namespace into executable code.
+    pub fn resolve_beneath(
+        &mut self,
+        abs_path: &str,
+        root: &str,
+    ) -> Result<(MountId, Ino), FsError> {
+        let root = path::normalize(root);
+        self.resolve_inner(abs_path, true, Self::SYMLOOP_MAX, Some(&root))
     }
 
     /// Resolve an absolute path to `(mount_id, ino)` without
@@ -526,7 +569,318 @@ impl Vfs {
     /// symlink stays addressable through its own ino without
     /// requiring callers to hand-walk their paths.
     pub fn resolve_nofollow(&mut self, abs_path: &str) -> Result<(MountId, Ino), FsError> {
-        self.resolve_inner(abs_path, false, Self::SYMLOOP_MAX)
+        self.resolve_inner(abs_path, false, Self::SYMLOOP_MAX, None)
+    }
+
+    /// Follow symlinks through mounts other than `stop_mountpoint` and return
+    /// the canonical path at the first point resolution would enter that
+    /// mount. The stop mount itself is never consulted.
+    pub fn path_entering_mount(
+        &mut self,
+        abs_path: &str,
+        stop_mountpoint: &str,
+        follow_last: bool,
+    ) -> Result<Option<String>, FsError> {
+        self.path_entering_mount_inner(abs_path, stop_mountpoint, follow_last, Self::SYMLOOP_MAX)
+    }
+
+    fn path_entering_mount_inner(
+        &mut self,
+        abs_path: &str,
+        stop_mountpoint: &str,
+        follow_last: bool,
+        follows_left: u32,
+    ) -> Result<Option<String>, FsError> {
+        let canonical = path::normalize(abs_path);
+        let (mount_id, relative) = self
+            .mounts
+            .longest_prefix(&canonical)
+            .ok_or(FsError::NotFound)?;
+        if self.mounts.mountpoint_of(mount_id) == Some(stop_mountpoint) {
+            return Ok(Some(canonical));
+        }
+
+        let components: Vec<&str> = path::components(&relative).collect();
+        let mut ino = self
+            .mounts
+            .fs_mut(mount_id)
+            .ok_or(FsError::NotFound)?
+            .root();
+        for (index, component) in components.iter().enumerate() {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            ino = fs.lookup(ino, component)?;
+            if fs.stat(ino)?.ty != NodeType::SymLink {
+                continue;
+            }
+            if index + 1 == components.len() && !follow_last {
+                continue;
+            }
+            if follows_left == 0 {
+                return Err(FsError::SymLoop);
+            }
+            let mut target_buf = [0u8; 4096];
+            let target_len = fs.readlink(ino, &mut target_buf)?;
+            let target = core::str::from_utf8(&target_buf[..target_len])
+                .map_err(|_| FsError::InvalidArgument)?;
+
+            let mut redirected = String::new();
+            if target.starts_with('/') {
+                redirected.push_str(target);
+            } else {
+                let mountpoint = self
+                    .mounts
+                    .mountpoint_of(mount_id)
+                    .ok_or(FsError::NotFound)?;
+                redirected.push_str(mountpoint);
+                for prefix_component in &components[..index] {
+                    if !redirected.ends_with('/') {
+                        redirected.push('/');
+                    }
+                    redirected.push_str(prefix_component);
+                }
+                if !redirected.ends_with('/') {
+                    redirected.push('/');
+                }
+                redirected.push_str(target);
+            }
+            for tail in &components[index + 1..] {
+                if !redirected.ends_with('/') {
+                    redirected.push('/');
+                }
+                redirected.push_str(tail);
+            }
+            return self.path_entering_mount_inner(
+                &redirected,
+                stop_mountpoint,
+                follow_last,
+                follows_left - 1,
+            );
+        }
+        Ok(None)
+    }
+
+    /// Resolve `relative_path` from an already-open directory vnode.
+    ///
+    /// WASI path syscalls carry a directory fd rather than a process cwd.
+    /// Once the fd has been translated to `(mount_id, dir_ino)`, this is the
+    /// inode-relative counterpart to [`Vfs::resolve`]. `..` is rejected: v1
+    /// filesystems do not retain parent-inode links, so accepting it would
+    /// either escape the fd's directory or silently resolve against `/`.
+    pub fn resolve_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<(MountId, Ino), FsError> {
+        self.resolve_at_inner(mount_id, dir_ino, relative_path, true, Self::SYMLOOP_MAX)
+    }
+
+    /// [`Vfs::resolve_at`] without following the final symlink component.
+    pub fn resolve_at_nofollow(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<(MountId, Ino), FsError> {
+        self.resolve_at_inner(mount_id, dir_ino, relative_path, false, Self::SYMLOOP_MAX)
+    }
+
+    /// Inode-relative counterpart to [`Vfs::path_entering_mount`]. Relative
+    /// symlinks remain rooted at their containing directory; absolute targets
+    /// re-enter ordinary namespace resolution.
+    pub fn path_entering_mount_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+        stop_mountpoint: &str,
+        follow_last: bool,
+    ) -> Result<Option<String>, FsError> {
+        self.path_entering_mount_at_inner(
+            mount_id,
+            dir_ino,
+            relative_path,
+            stop_mountpoint,
+            follow_last,
+            Self::SYMLOOP_MAX,
+        )
+    }
+
+    fn path_entering_mount_at_inner(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+        stop_mountpoint: &str,
+        follow_last: bool,
+        follows_left: u32,
+    ) -> Result<Option<String>, FsError> {
+        if let Some(absolute) = self.mount_root_relative_path(mount_id, dir_ino, relative_path)? {
+            return self.path_entering_mount_inner(
+                &absolute,
+                stop_mountpoint,
+                follow_last,
+                follows_left,
+            );
+        }
+        let components = Self::checked_relative_components(relative_path)?;
+        let mut ino = dir_ino;
+        for (index, component) in components.iter().enumerate() {
+            let parent_ino = ino;
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            ino = fs.lookup(parent_ino, component)?;
+            if fs.stat(ino)?.ty != NodeType::SymLink {
+                continue;
+            }
+            if index + 1 == components.len() && !follow_last {
+                continue;
+            }
+            if follows_left == 0 {
+                return Err(FsError::SymLoop);
+            }
+            let mut target_buf = [0u8; 4096];
+            let target_len = fs.readlink(ino, &mut target_buf)?;
+            let target = core::str::from_utf8(&target_buf[..target_len])
+                .map_err(|_| FsError::InvalidArgument)?;
+            let mut redirected = String::from(target);
+            for tail in &components[index + 1..] {
+                if !redirected.ends_with('/') {
+                    redirected.push('/');
+                }
+                redirected.push_str(tail);
+            }
+            if target.starts_with('/') {
+                return self.path_entering_mount_inner(
+                    &redirected,
+                    stop_mountpoint,
+                    follow_last,
+                    follows_left - 1,
+                );
+            }
+            return self.path_entering_mount_at_inner(
+                mount_id,
+                parent_ino,
+                &redirected,
+                stop_mountpoint,
+                follow_last,
+                follows_left - 1,
+            );
+        }
+        Ok(None)
+    }
+
+    fn checked_relative_components(relative_path: &str) -> Result<Vec<&str>, FsError> {
+        if relative_path.is_empty() || relative_path.starts_with('/') {
+            return Err(FsError::InvalidArgument);
+        }
+        let mut components = Vec::new();
+        for component in relative_path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => return Err(FsError::InvalidArgument),
+                name => components.push(name),
+            }
+        }
+        Ok(components)
+    }
+
+    /// When a dirfd names a filesystem root, recover its namespace path so
+    /// ordinary absolute VFS resolution can still cross a nested mount (the
+    /// `/` preopen reaching `/dev` and `/proc` is the important v1 case).
+    fn mount_root_relative_path(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<Option<String>, FsError> {
+        let _ = Self::checked_relative_components(relative_path)?;
+        let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+        if fs.root() != dir_ino {
+            return Ok(None);
+        }
+        let mountpoint = self
+            .mounts
+            .mountpoint_of(mount_id)
+            .ok_or(FsError::NotFound)?;
+        let mut absolute = String::from(mountpoint);
+        if relative_path != "." {
+            if !absolute.ends_with('/') {
+                absolute.push('/');
+            }
+            absolute.push_str(relative_path);
+        }
+        Ok(Some(absolute))
+    }
+
+    fn resolve_at_inner(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+        follow_last: bool,
+        follows_left: u32,
+    ) -> Result<(MountId, Ino), FsError> {
+        if let Some(absolute) = self.mount_root_relative_path(mount_id, dir_ino, relative_path)? {
+            return self.resolve_inner(&absolute, follow_last, follows_left, None);
+        }
+
+        let components = Self::checked_relative_components(relative_path)?;
+        let base_stat = {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            fs.stat(dir_ino)?
+        };
+        if base_stat.ty != NodeType::Directory {
+            return Err(FsError::NotADirectory);
+        }
+
+        let mut ino = dir_ino;
+        for (index, component) in components.iter().enumerate() {
+            let parent_ino = ino;
+            ino = {
+                let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+                fs.lookup(parent_ino, component)?
+            };
+            let is_last = index + 1 == components.len();
+            if is_last && !follow_last {
+                continue;
+            }
+            let stat = {
+                let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+                fs.stat(ino)?
+            };
+            if stat.ty != NodeType::SymLink {
+                continue;
+            }
+            if follows_left == 0 {
+                return Err(FsError::SymLoop);
+            }
+
+            let mut target_buf = [0u8; 4096];
+            let target_len = {
+                let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+                fs.readlink(ino, &mut target_buf)?
+            };
+            let target = core::str::from_utf8(&target_buf[..target_len])
+                .map_err(|_| FsError::InvalidArgument)?;
+            let mut redirected = String::from(target);
+            for tail in &components[index + 1..] {
+                if !redirected.ends_with('/') {
+                    redirected.push('/');
+                }
+                redirected.push_str(tail);
+            }
+            if target.starts_with('/') {
+                return self.resolve_inner(&redirected, follow_last, follows_left - 1, None);
+            }
+            return self.resolve_at_inner(
+                mount_id,
+                parent_ino,
+                &redirected,
+                follow_last,
+                follows_left - 1,
+            );
+        }
+        Ok((mount_id, ino))
     }
 
     fn resolve_inner(
@@ -534,8 +888,19 @@ impl Vfs {
         abs_path: &str,
         follow_last: bool,
         follows_left: u32,
+        confined_root: Option<&str>,
     ) -> Result<(MountId, Ino), FsError> {
         let canon = path::normalize(abs_path);
+        if let Some(root) = confined_root {
+            let beneath = root == "/"
+                || canon == root
+                || canon
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with('/'));
+            if !beneath {
+                return Err(FsError::PermissionDenied);
+            }
+        }
         let (mount_id, rel) = self
             .mounts
             .longest_prefix(&canon)
@@ -606,7 +971,7 @@ impl Vfs {
                 }
                 new_path.push_str(tail);
             }
-            return self.resolve_inner(&new_path, follow_last, follows_left - 1);
+            return self.resolve_inner(&new_path, follow_last, follows_left - 1, confined_root);
         }
         Ok((mount_id, ino))
     }
@@ -614,10 +979,7 @@ impl Vfs {
     /// Resolve a path to its parent directory and the final
     /// component name. Used by create/mkdir/unlink/rmdir to
     /// find the target directory before performing the op.
-    pub fn resolve_parent<'a>(
-        &mut self,
-        abs_path: &'a str,
-    ) -> Result<(MountId, Ino, String), FsError> {
+    pub fn resolve_parent(&mut self, abs_path: &str) -> Result<(MountId, Ino, String), FsError> {
         let canon = path::normalize(abs_path);
         let (parent_path, name) = path::split_last(&canon).ok_or(FsError::InvalidArgument)?;
         if name.is_empty() {
@@ -625,6 +987,39 @@ impl Vfs {
         }
         let (mount_id, parent_ino) = self.resolve(&parent_path)?;
         Ok((mount_id, parent_ino, name))
+    }
+
+    /// Resolve a relative path's parent from an open directory vnode.
+    pub fn resolve_parent_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<(MountId, Ino, String), FsError> {
+        if let Some(absolute) = self.mount_root_relative_path(mount_id, dir_ino, relative_path)? {
+            return self.resolve_parent(&absolute);
+        }
+        let components = Self::checked_relative_components(relative_path)?;
+        let (name, parents) = components.split_last().ok_or(FsError::InvalidArgument)?;
+        if parents.is_empty() {
+            let stat = {
+                let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+                fs.stat(dir_ino)?
+            };
+            if stat.ty != NodeType::Directory {
+                return Err(FsError::NotADirectory);
+            }
+            return Ok((mount_id, dir_ino, String::from(*name)));
+        }
+        let mut parent_path = String::new();
+        for component in parents {
+            if !parent_path.is_empty() {
+                parent_path.push('/');
+            }
+            parent_path.push_str(component);
+        }
+        let (resolved_mount, parent_ino) = self.resolve_at(mount_id, dir_ino, &parent_path)?;
+        Ok((resolved_mount, parent_ino, String::from(*name)))
     }
 
     /// Open an absolute path. Returns `(mount_id, ino, ty)` on
@@ -656,6 +1051,38 @@ impl Vfs {
         let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
         let st = fs.stat(ino)?;
         Ok((mount_id, ino, st.ty))
+    }
+
+    /// Open a relative path from an already-open directory vnode.
+    pub fn open_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<(MountId, Ino, NodeType), FsError> {
+        let (resolved_mount, ino) = self.resolve_at(mount_id, dir_ino, relative_path)?;
+        let fs = self
+            .mounts
+            .fs_mut(resolved_mount)
+            .ok_or(FsError::NotFound)?;
+        let stat = fs.stat(ino)?;
+        Ok((resolved_mount, ino, stat.ty))
+    }
+
+    /// [`Vfs::open_at`] without dereferencing the final symlink.
+    pub fn open_at_nofollow(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<(MountId, Ino, NodeType), FsError> {
+        let (resolved_mount, ino) = self.resolve_at_nofollow(mount_id, dir_ino, relative_path)?;
+        let fs = self
+            .mounts
+            .fs_mut(resolved_mount)
+            .ok_or(FsError::NotFound)?;
+        let stat = fs.stat(ino)?;
+        Ok((resolved_mount, ino, stat.ty))
     }
 
     /// Read from a regular file at an absolute path.
@@ -733,6 +1160,24 @@ impl Vfs {
         Ok(ino)
     }
 
+    /// Create a regular file relative to an open directory vnode.
+    pub fn create_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+        mode: Mode,
+    ) -> Result<Ino, FsError> {
+        let (target_mount, parent_ino, name) =
+            self.resolve_parent_at(mount_id, dir_ino, relative_path)?;
+        let ino = {
+            let fs = self.mounts.fs_mut(target_mount).ok_or(FsError::NotFound)?;
+            fs.create(parent_ino, &name, mode)?
+        };
+        self.mark_dirty(target_mount);
+        Ok(ino)
+    }
+
     /// Create a directory at an absolute path.
     pub fn mkdir(&mut self, abs_path: &str, mode: Mode) -> Result<Ino, FsError> {
         let (mount_id, parent_ino, name) = self.resolve_parent(abs_path)?;
@@ -755,6 +1200,23 @@ impl Vfs {
         Ok(())
     }
 
+    /// Unlink a regular file relative to an open directory vnode.
+    pub fn unlink_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<(), FsError> {
+        let (target_mount, parent_ino, name) =
+            self.resolve_parent_at(mount_id, dir_ino, relative_path)?;
+        {
+            let fs = self.mounts.fs_mut(target_mount).ok_or(FsError::NotFound)?;
+            fs.unlink(parent_ino, &name)?;
+        }
+        self.mark_dirty(target_mount);
+        Ok(())
+    }
+
     /// Remove an empty directory at an absolute path.
     pub fn rmdir(&mut self, abs_path: &str) -> Result<(), FsError> {
         let (mount_id, parent_ino, name) = self.resolve_parent(abs_path)?;
@@ -763,6 +1225,23 @@ impl Vfs {
             fs.rmdir(parent_ino, &name)?;
         }
         self.mark_dirty(mount_id);
+        Ok(())
+    }
+
+    /// Remove an empty directory relative to an open directory vnode.
+    pub fn rmdir_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+    ) -> Result<(), FsError> {
+        let (target_mount, parent_ino, name) =
+            self.resolve_parent_at(mount_id, dir_ino, relative_path)?;
+        {
+            let fs = self.mounts.fs_mut(target_mount).ok_or(FsError::NotFound)?;
+            fs.rmdir(parent_ino, &name)?;
+        }
+        self.mark_dirty(target_mount);
         Ok(())
     }
 
@@ -857,7 +1336,7 @@ impl Vfs {
     /// Truncate a regular file to `new_size` bytes.
     pub fn truncate(&mut self, abs_path: &str, new_size: u64) -> Result<(), FsError> {
         let (mount_id, ino) = self.resolve(abs_path)?;
-        self.truncate_ino(mount_id, ino, new_size)
+        self.truncate_ino(mount_id, ino, new_size).map(|_| ())
     }
 
     /// Truncate `(mount_id, ino)` directly. Mirrors [`Vfs::stat_ino`] /
@@ -869,10 +1348,25 @@ impl Vfs {
         mount_id: MountId,
         ino: Ino,
         new_size: u64,
-    ) -> Result<(), FsError> {
+    ) -> Result<bool, FsError> {
+        let changed = {
+            let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
+            let stat = fs.stat(ino)?;
+            fs.truncate(ino, new_size)?;
+            stat.ty == NodeType::RegularFile && stat.size != new_size
+        };
+        if changed {
+            self.mark_dirty(mount_id);
+        }
+        Ok(changed)
+    }
+
+    /// Replace an existing path's low nine POSIX permission bits.
+    pub fn set_mode(&mut self, abs_path: &str, mode: Mode) -> Result<(), FsError> {
+        let (mount_id, ino) = self.resolve(abs_path)?;
         {
             let fs = self.mounts.fs_mut(mount_id).ok_or(FsError::NotFound)?;
-            fs.truncate(ino, new_size)?;
+            fs.set_mode(ino, mode)?;
         }
         self.mark_dirty(mount_id);
         Ok(())

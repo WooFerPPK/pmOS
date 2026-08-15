@@ -14,8 +14,8 @@
 //!   [`Signal::User1`] (10), and [`Signal::User2`] (12) are
 //!   "catchable": `proc_kill` buffers them in the target's
 //!   [`SignalInbox`]. With the `FdObject::SignalChannel` fd
-//!   variant auto-installed at fd 3 on every proc_spawn'd
-//!   child, `fd_read` on fd 3 drains pending signals as u16 LE
+//!   variant auto-installed at [`abi::fd::SIGNAL`] on every
+//!   proc_spawn'd child, `fd_read` there drains pending signals as u16 LE
 //!   pairs; tests can also observe delivery via
 //!   `Kernel::drain_signals`. SIGPIPE is kernel-generated on
 //!   broken-pipe writes (matches POSIX `write(2)`'s SIGPIPE +

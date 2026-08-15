@@ -153,10 +153,10 @@ fn interleaved_push_pop_respects_bounds() {
 
 #[test]
 fn status_constants_are_the_expected_values() {
-    assert_eq!(STATUS_IDLE,      0);
+    assert_eq!(STATUS_IDLE, 0);
     assert_eq!(STATUS_REQUESTED, 1);
     assert_eq!(STATUS_SERVICING, 2);
-    assert_eq!(STATUS_READY,     3);
+    assert_eq!(STATUS_READY, 3);
 }
 
 #[test]

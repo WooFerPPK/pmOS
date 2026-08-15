@@ -264,12 +264,9 @@ var OP_WASI = {
    * opfs inherit the trait default (NotSupported → ENOTSUP). */
   PATH_READLINK: 69,
   /** Wire-format identity for `fd_prestat_dir_name`. Preopen-name
-   * companion to fd_prestat_get. Wire: args[0..4] = fd (ignored).
-   * v1 has no preopens so the honest answer for every fd is EBADF;
-   * post-slice both fd_prestat_get and fd_prestat_dir_name agree on
-   * EBADF so userland's libc-style preopen-discovery loops terminate
-   * cleanly (pre-slice dir_name returned ENOSYS, which broke the
-   * loop). */
+   * companion to fd_prestat_get. Wire: args[0..4] = fd and heap is
+   * the caller-sized output buffer. PMos exposes `/` at fd 3; success
+   * returns one byte in heapOut and response.value/extraLen = 1. */
   FD_PRESTAT_DIR_NAME: 44,
   /** Unused by the WASI shim today; the tests probe it to verify
    * the dispatcher's `ENOSYS` path still fires for opcodes the
@@ -306,6 +303,10 @@ var OP_EXT = {
   IPC_LISTEN: 4098,
   IPC_CONNECT: 4099,
   IPC_ACCEPT: 4100,
+  /** Send a bounded byte payload and, optionally, one duplicated fd. */
+  IPC_SEND: 4101,
+  /** Receive a bounded byte payload and, optionally, one installed fd. */
+  IPC_RECV: 4102,
   /** Wire-format identity for `ipc_pipe`. Create a pipe pair: the
    * kernel allocates two fds on the caller — a PipeRead at
    * heap[0..4] and a PipeWrite at heap[4..8] — and returns success
@@ -319,6 +320,9 @@ var OP_EXT = {
    * propagates to the other (reader closed → subsequent writes
    * EPIPE; writer closed → subsequent reads see (0, []) EOF). */
   IPC_PIPE: 4103,
+  /** Kernel-authenticated capability snapshot for the process on the
+   * other end of a connected IPC socket (`SO_PEERCRED` equivalent). */
+  IPC_PEER_CAPS: 4104,
   PROC_SPAWN: 4352,
   PROC_SELF: 4355,
   PROC_PARENT: 4356,
@@ -328,7 +332,12 @@ var OP_EXT = {
   DISPLAY_CONNECT: 4608,
   DISPLAY_BIND: 4609,
   CAP_CHECK: 4864,
-  CAP_LIST: 4865
+  CAP_LIST: 4865,
+  FS_WATCH: 5122,
+  FS_CHMOD: 5123,
+  HOST_FILE_RECV: 5376,
+  HOST_FILE_PICK: 5377,
+  HOST_FILE_SEND: 5378
 };
 var ERRNO = {
   EAGAIN: 6,
@@ -340,11 +349,16 @@ var ERRNO = {
   ECHILD: 9,
   ECONNREFUSED: 14,
   EEXIST: 20,
+  /** Bad address: a user pointer range crosses linear-memory bounds. */
+  EFAULT: 21,
   /** Interrupted function. Surfaced on a blocking syscall
    * (currently only `ipc_accept` with `flags=0`) when a signal
    * interrupts the park. Mirrors `abi::errno::EINTR`. */
   EINTR: 27,
   EINVAL: 28,
+  /** I/O error. Used when a transport/backend violates an I/O byte-count
+   * contract. Mirrors `abi::errno::EIO`. */
+  EIO: 29,
   EISDIR: 31,
   /** Too many levels of symbolic links. Returned from path
    * resolution when a symlink chain exceeds SYMLOOP_MAX (40).
@@ -385,69 +399,220 @@ var CAP = {
   MOUNT: 7,
   CAP_GRANT: 8,
   DEV_BLOCK: 9,
-  KEYMAP_ADMIN: 10
+  KEYMAP_ADMIN: 10,
+  PROC_INSPECT: 11,
+  HOST_TRANSFER: 12
 };
 function capBit(cap) {
   return 1n << BigInt(cap);
 }
+var SPAWN_V1_MAGIC = 827215955;
+var SPAWN_V1_VERSION = 1;
+var SPAWN_V1_HEADER_LEN = 48;
+var SPAWN_V1_MAX_BYTES = 32768;
+var SPAWN_FLAG_CWD = 1;
+var SPAWN_FLAG_CAPS = 2;
+var SPAWN_KNOWN_FLAGS = SPAWN_FLAG_CWD | SPAWN_FLAG_CAPS;
+var SPAWN_INHERIT_FD = -1;
+var SPAWN_FIRST_DYNAMIC_FD = 5;
+var SPAWN_FD_SOFT_LIMIT = 1024;
 function encodeSpawnManifest(manifest) {
   const enc = new TextEncoder();
-  const pathBytes = enc.encode(manifest.path);
-  let argvBytes = new Uint8Array(0);
-  if (manifest.argv !== void 0 && manifest.argv.length > 0) {
-    const parts = manifest.argv.map((s) => enc.encode(s));
-    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
-    if (totalLen > 65535) {
-      throw new RangeError(
-        `encodeSpawnManifest: argv buf size ${totalLen} exceeds u16 max (65535)`
-      );
+  const encodeText = (label, value, allowEmpty) => {
+    if (!allowEmpty && value.length === 0 || value.includes("\0")) {
+      throw new RangeError(`encodeSpawnManifest: invalid ${label}`);
     }
-    argvBytes = new Uint8Array(totalLen);
-    let off = 0;
-    for (const part of parts) {
-      argvBytes.set(part, off);
-      argvBytes[off + part.length] = 0;
-      off += part.length + 1;
+    const bytes = enc.encode(value);
+    if (bytes.length > 65535) {
+      throw new RangeError(`encodeSpawnManifest: ${label} exceeds u16 length`);
     }
+    return bytes;
+  };
+  const validateFd = (label, fd) => {
+    if (fd === void 0) return SPAWN_INHERIT_FD;
+    if (!Number.isSafeInteger(fd) || fd < 0 || fd > 2147483647) {
+      throw new RangeError(`encodeSpawnManifest: invalid ${label} ${fd}`);
+    }
+    return fd;
+  };
+  if (!manifest.path.startsWith("/")) {
+    throw new RangeError("encodeSpawnManifest: path must be absolute");
   }
-  let envpBytes = new Uint8Array(0);
-  if (manifest.envp !== void 0 && manifest.envp.length > 0) {
-    const parts = manifest.envp.map(([k, v]) => {
-      if (k.includes("=")) {
-        throw new RangeError(
-          `encodeSpawnManifest: envp key ${JSON.stringify(k)} contains '=' (forbidden by the wire format)`
-        );
-      }
-      return enc.encode(`${k}=${v}`);
-    });
-    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
-    if (totalLen > 65535) {
-      throw new RangeError(
-        `encodeSpawnManifest: envp buf size ${totalLen} exceeds u16 max (65535)`
-      );
+  if (manifest.cwd !== void 0 && !manifest.cwd.startsWith("/")) {
+    throw new RangeError("encodeSpawnManifest: cwd must be absolute");
+  }
+  const path = encodeText("path", manifest.path, false);
+  const cwd = manifest.cwd === void 0 ? new Uint8Array(0) : encodeText("cwd", manifest.cwd, false);
+  const argv = (manifest.argv ?? []).map(
+    (arg, index) => encodeText(`argv[${index}]`, arg, true)
+  );
+  const envp = (manifest.envp ?? []).map(([key, value], index) => {
+    if (key.includes("=")) {
+      throw new RangeError(`encodeSpawnManifest: envp[${index}] key contains '='`);
     }
-    envpBytes = new Uint8Array(totalLen);
-    let off = 0;
-    for (const part of parts) {
-      envpBytes.set(part, off);
-      envpBytes[off + part.length] = 0;
-      off += part.length + 1;
+    return [
+      encodeText(`envp[${index}] key`, key, false),
+      encodeText(`envp[${index}] value`, value, true)
+    ];
+  });
+  const extraFds = manifest.extraFds ?? [];
+  if (argv.length > 65535 || envp.length > 65535 || extraFds.length > 65535) {
+    throw new RangeError("encodeSpawnManifest: entry count exceeds u16");
+  }
+  const childFds = /* @__PURE__ */ new Set();
+  for (const [parentFd, childFd] of extraFds) {
+    validateFd("extra parent fd", parentFd);
+    validateFd("extra child fd", childFd);
+    if (childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT) {
+      throw new RangeError(`encodeSpawnManifest: reserved/out-of-range child fd ${childFd}`);
     }
+    if (childFds.has(childFd)) {
+      throw new RangeError(`encodeSpawnManifest: duplicate child fd ${childFd}`);
+    }
+    childFds.add(childFd);
+  }
+  const bodyLen = path.length + cwd.length + argv.reduce((sum, arg) => sum + 2 + arg.length, 0) + envp.reduce((sum, [key, value]) => sum + 4 + key.length + value.length, 0) + extraFds.length * 8;
+  const totalLen = SPAWN_V1_HEADER_LEN + bodyLen;
+  if (totalLen > SPAWN_V1_MAX_BYTES) {
+    throw new RangeError(`encodeSpawnManifest: blob size ${totalLen} exceeds ${SPAWN_V1_MAX_BYTES}`);
+  }
+  const heap = new Uint8Array(totalLen);
+  const header = new DataView(heap.buffer);
+  const flags = (manifest.cwd === void 0 ? 0 : SPAWN_FLAG_CWD) | (manifest.caps === void 0 ? 0 : SPAWN_FLAG_CAPS);
+  header.setUint32(0, SPAWN_V1_MAGIC, true);
+  header.setUint16(4, SPAWN_V1_VERSION, true);
+  header.setUint16(6, flags, true);
+  header.setUint32(8, totalLen, true);
+  header.setUint16(12, path.length, true);
+  header.setUint16(14, cwd.length, true);
+  header.setUint16(16, argv.length, true);
+  header.setUint16(18, envp.length, true);
+  header.setUint16(20, extraFds.length, true);
+  header.setInt32(24, validateFd("stdin fd", manifest.stdinFd), true);
+  header.setInt32(28, validateFd("stdout fd", manifest.stdoutFd), true);
+  header.setInt32(32, validateFd("stderr fd", manifest.stderrFd), true);
+  header.setBigUint64(40, manifest.caps ?? 0n, true);
+  let offset = SPAWN_V1_HEADER_LEN;
+  const put = (bytes) => {
+    heap.set(bytes, offset);
+    offset += bytes.length;
+  };
+  const putU16 = (value) => {
+    new DataView(heap.buffer).setUint16(offset, value, true);
+    offset += 2;
+  };
+  const putU32 = (value) => {
+    new DataView(heap.buffer).setUint32(offset, value, true);
+    offset += 4;
+  };
+  put(path);
+  put(cwd);
+  for (const arg of argv) {
+    putU16(arg.length);
+    put(arg);
+  }
+  for (const [key, value] of envp) {
+    putU16(key.length);
+    putU16(value.length);
+    put(key);
+    put(value);
+  }
+  for (const [parentFd, childFd] of extraFds) {
+    putU32(parentFd);
+    putU32(childFd);
+  }
+  if (offset !== totalLen) {
+    throw new Error("encodeSpawnManifest: internal length mismatch");
+  }
+  return encodeSpawnManifestBlob(heap);
+}
+function encodeSpawnManifestBlob(blob) {
+  if (!isValidSpawnManifestBlob(blob)) {
+    throw new RangeError("encodeSpawnManifestBlob: malformed spawn manifest");
   }
   const args = new Uint8Array(16);
   const view = new DataView(args.buffer);
-  view.setUint32(0, pathBytes.length, true);
-  view.setBigUint64(4, manifest.caps, true);
-  view.setUint16(12, argvBytes.length, true);
-  view.setUint16(14, envpBytes.length, true);
-  const heap = new Uint8Array(pathBytes.length + argvBytes.length + envpBytes.length);
-  heap.set(pathBytes, 0);
-  heap.set(argvBytes, pathBytes.length);
-  heap.set(envpBytes, pathBytes.length + argvBytes.length);
-  return { args, heap };
+  view.setUint32(0, SPAWN_V1_MAGIC, true);
+  view.setUint32(4, blob.length, true);
+  view.setUint16(8, SPAWN_V1_VERSION, true);
+  return { args, heap: blob.slice() };
 }
-var CAPSET_DESKTOP_SHELL = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.SHELL) | capBit(CAP.PROC_ENUMERATE) | capBit(CAP.KEYMAP_ADMIN);
+function isValidSpawnManifestBlob(blob) {
+  if (blob.length < SPAWN_V1_HEADER_LEN || blob.length > SPAWN_V1_MAX_BYTES) return false;
+  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  if (view.getUint32(0, true) !== SPAWN_V1_MAGIC || view.getUint16(4, true) !== SPAWN_V1_VERSION || view.getUint32(8, true) !== blob.length || view.getUint16(22, true) !== 0 || view.getUint32(36, true) !== 0) return false;
+  const flags = view.getUint16(6, true);
+  if ((flags & ~SPAWN_KNOWN_FLAGS) !== 0) return false;
+  const pathLen = view.getUint16(12, true);
+  const cwdLen = view.getUint16(14, true);
+  const argc = view.getUint16(16, true);
+  const envc = view.getUint16(18, true);
+  const extraCount = view.getUint16(20, true);
+  if ((flags & SPAWN_FLAG_CWD) === 0 !== (cwdLen === 0)) return false;
+  if ((flags & SPAWN_FLAG_CAPS) === 0 && view.getBigUint64(40, true) !== 0n) return false;
+  for (const offset2 of [24, 28, 32]) {
+    if (view.getInt32(offset2, true) < SPAWN_INHERIT_FD) return false;
+  }
+  const utf8 = new TextDecoder("utf-8", { fatal: true });
+  let offset = SPAWN_V1_HEADER_LEN;
+  const take = (length, allowEmpty) => {
+    if (!allowEmpty && length === 0 || offset + length > blob.length) return null;
+    const bytes = blob.subarray(offset, offset + length);
+    offset += length;
+    if (bytes.includes(0)) return null;
+    try {
+      utf8.decode(bytes);
+    } catch {
+      return null;
+    }
+    return bytes;
+  };
+  const readU16 = () => {
+    if (offset + 2 > blob.length) return null;
+    const value = view.getUint16(offset, true);
+    offset += 2;
+    return value;
+  };
+  const readU32 = () => {
+    if (offset + 4 > blob.length) return null;
+    const value = view.getUint32(offset, true);
+    offset += 4;
+    return value;
+  };
+  const path = take(pathLen, false);
+  if (path === null || utf8.decode(path)[0] !== "/") return false;
+  if (cwdLen > 0) {
+    const cwd = take(cwdLen, false);
+    if (cwd === null || utf8.decode(cwd)[0] !== "/") return false;
+  }
+  for (let i = 0; i < argc; i++) {
+    const len = readU16();
+    if (len === null || take(len, true) === null) return false;
+  }
+  const envKeys = /* @__PURE__ */ new Set();
+  for (let i = 0; i < envc; i++) {
+    const keyLen = readU16();
+    const valueLen = readU16();
+    if (keyLen === null || valueLen === null) return false;
+    const key = take(keyLen, false);
+    const value = take(valueLen, true);
+    if (key === null || value === null) return false;
+    const decoded = utf8.decode(key);
+    if (decoded.includes("=") || envKeys.has(decoded)) return false;
+    envKeys.add(decoded);
+  }
+  const childFds = /* @__PURE__ */ new Set();
+  for (let i = 0; i < extraCount; i++) {
+    const parentFd = readU32();
+    const childFd = readU32();
+    if (parentFd === null || childFd === null || childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT || childFds.has(childFd)) return false;
+    childFds.add(childFd);
+  }
+  return offset === blob.length;
+}
+var CAPSET_DESKTOP_SHELL = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.SHELL) | capBit(CAP.PROC_ENUMERATE) | capBit(CAP.PROC_KILL_ANY) | capBit(CAP.KEYMAP_ADMIN) | capBit(CAP.HOST_TRANSFER);
 var CAPSET_ORDINARY_APP = capBit(CAP.DISPLAY_CLIENT);
+var CAPSET_FILES = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.HOST_TRANSFER);
 
 // src/sab-backend.ts
 var SabBackend = class {
@@ -470,6 +635,29 @@ var SabBackend = class {
    * `KernelWasmHost.create` and the per-pid SAB by the main-thread
    * router, so a partial fallback is possible. */
   wakeSlotIsShared;
+  responseRingIsEmpty() {
+    return Atomics.load(this.header, OFF_RES_HEAD / 4) === Atomics.load(this.header, OFF_RES_TAIL / 4);
+  }
+  /**
+   * Park until this process's response ring contains an entry.
+   *
+   * `OFF_USER_WAIT_SLOT` is one reusable futex rather than a generation
+   * counter. The kernel publishes in the required order (response, READY,
+   * notify), but the user can observe READY and start its next syscall in
+   * the small interval before the previous notify executes. That stale
+   * notify is allowed to wake the new wait even though its response is not
+   * ready. Treating the ring state as the condition and waiting in a loop
+   * makes that ABA harmless.
+   */
+  waitForResponse() {
+    while (this.responseRingIsEmpty()) {
+      Atomics.store(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+      if (!this.responseRingIsEmpty()) {
+        return;
+      }
+      Atomics.wait(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+    }
+  }
   constructor(options) {
     if (options.sab.byteLength < SAB_SIZE) {
       throw new Error(
@@ -539,7 +727,7 @@ var SabBackend = class {
         Atomics.notify(this.kernelWakeSlot, 0);
       }
       if (this.headerIsShared) {
-        Atomics.wait(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+        this.waitForResponse();
       }
     }
     const resHead = Atomics.load(this.header, OFF_RES_HEAD / 4);
@@ -569,12 +757,61 @@ var SabBackend = class {
 };
 
 // src/user-wasm-runtime.ts
+var WASI_IOVEC_BYTES = 8;
+var MAX_GUEST_IOVECS = HEAP_SCRATCH_BYTES / WASI_IOVEC_BYTES;
+var I32_MIN = -2147483648;
+var I32_MAX = 2147483647;
+var U32_MAX = 4294967295;
+function isGuestRange(memory, ptr, length) {
+  if (!Number.isSafeInteger(ptr) || !Number.isSafeInteger(length) || ptr < 0 || length < 0) {
+    return false;
+  }
+  const memoryLength = memory.buffer.byteLength;
+  return ptr <= memoryLength && length <= memoryLength - ptr;
+}
+function readGuestIovecs(memory, iovsPtr, iovsLen) {
+  if (!Number.isSafeInteger(iovsLen) || iovsLen < 0 || iovsLen > MAX_GUEST_IOVECS) {
+    return { ok: false, errno: ERRNO.EINVAL };
+  }
+  const tableBytes = iovsLen * WASI_IOVEC_BYTES;
+  if (!isGuestRange(memory, iovsPtr, tableBytes)) {
+    return { ok: false, errno: ERRNO.EFAULT };
+  }
+  const view = new DataView(memory.buffer);
+  const iovecs = [];
+  let boundedBytes = 0;
+  for (let i = 0; i < iovsLen; i += 1) {
+    const base = iovsPtr + i * WASI_IOVEC_BYTES;
+    const ptr = view.getUint32(base, true);
+    const len = view.getUint32(base + 4, true);
+    if (!isGuestRange(memory, ptr, len)) {
+      return { ok: false, errno: ERRNO.EFAULT };
+    }
+    iovecs.push({ ptr, len });
+    boundedBytes = Math.min(
+      HEAP_SCRATCH_BYTES,
+      boundedBytes + Math.min(len, HEAP_SCRATCH_BYTES)
+    );
+  }
+  return { ok: true, iovecs, boundedBytes };
+}
+function wasiErrno(status) {
+  return Number.isSafeInteger(status) && status >= I32_MIN && status < 0 ? -status : ERRNO.EIO;
+}
+function pmosError(status) {
+  return Number.isSafeInteger(status) && status >= I32_MIN && status < 0 ? status : -ERRNO.EIO;
+}
+function boundedResponseCount(value, maximum) {
+  if (value < 0n || value > BigInt(maximum)) return void 0;
+  return Number(value);
+}
 var UserProcessExited = class extends Error {
   constructor(exitCode) {
     super(`user process exited with code ${exitCode}`);
     this.exitCode = exitCode;
     this.name = "UserProcessExited";
   }
+  exitCode;
 };
 var UserWasmRuntime = class {
   constructor(wasmBytes, backend, options = {}) {
@@ -582,6 +819,9 @@ var UserWasmRuntime = class {
     this.backend = backend;
     this.options = options;
   }
+  wasmBytes;
+  backend;
+  options;
   /** Populated when `run()` begins instantiation. */
   memory;
   memorySizeBytes() {
@@ -739,11 +979,11 @@ var UserWasmRuntime = class {
       //   [0..4]  = buf (i32 pointer into user memory)
       //   [4..8]  = buf_len (u32)
       //
-      // We concatenate every iov's bytes into one flat Uint8Array
-      // and submit as a single PMos `FD_WRITE` syscall. The kernel
-      // can't see the gather list because the PMos opcode API
-      // carries a single contiguous heap payload per request; the
-      // shim absorbs the scatter-gather complexity on this side.
+      // We gather at most the transport's 32 KiB heap window and
+      // submit it as one PMos `FD_WRITE` syscall. Larger WASI writes
+      // complete as an ordinary short write; libc/write_all retries
+      // the remainder in a later call. This keeps every request in
+      // bounds without changing WASI's partial-I/O semantics.
       //
       // Errno mapping: PMos `Response.status` is the negated
       // errno (-EBADF, -EINVAL, ...). WASI expects the positive
@@ -752,24 +992,26 @@ var UserWasmRuntime = class {
         if (this.memory === void 0) {
           return ERRNO.EINVAL;
         }
-        const readView = new DataView(this.memory.buffer);
-        const gathered = [];
-        let total = 0;
-        for (let i = 0; i < iovsLen; i += 1) {
-          const iovBase = iovsPtr + i * 8;
-          const bufPtr = readView.getUint32(iovBase, true);
-          const bufLen = readView.getUint32(iovBase + 4, true);
-          const src = new Uint8Array(this.memory.buffer, bufPtr, bufLen);
-          gathered.push(new Uint8Array(src));
-          total += bufLen;
+        const parsed = readGuestIovecs(this.memory, iovsPtr, iovsLen);
+        if (!parsed.ok) return parsed.errno;
+        if (!isGuestRange(this.memory, nwrittenPtr, 4)) {
+          return ERRNO.EFAULT;
         }
-        const payload = new Uint8Array(total);
-        {
-          let offset = 0;
-          for (const buf of gathered) {
-            payload.set(buf, offset);
-            offset += buf.length;
-          }
+        if (parsed.boundedBytes === 0) {
+          new DataView(this.memory.buffer).setUint32(nwrittenPtr, 0, true);
+          return 0;
+        }
+        const payload = new Uint8Array(parsed.boundedBytes);
+        let payloadOffset = 0;
+        for (const iov of parsed.iovecs) {
+          if (payloadOffset >= payload.length) break;
+          const chunkLength = Math.min(iov.len, payload.length - payloadOffset);
+          if (chunkLength === 0) continue;
+          payload.set(
+            new Uint8Array(this.memory.buffer, iov.ptr, chunkLength),
+            payloadOffset
+          );
+          payloadOffset += chunkLength;
         }
         const request = {
           opcode: OP_WASI.FD_WRITE,
@@ -779,14 +1021,18 @@ var UserWasmRuntime = class {
           requestId: 0,
           arg0: fd,
           heapPtr: 0,
-          heapLen: total
+          heapLen: payload.length
         };
         const { response } = this.backend.dispatch(request, payload);
         if (response.status !== 0) {
-          return -response.status;
+          return wasiErrno(response.status);
+        }
+        const written = boundedResponseCount(response.value, payload.length);
+        if (written === void 0) {
+          return ERRNO.EIO;
         }
         const writeView = new DataView(this.memory.buffer);
-        writeView.setUint32(nwrittenPtr, Number(response.value), true);
+        writeView.setUint32(nwrittenPtr, written, true);
         return 0;
       },
       // WASI `fd_read`.
@@ -799,15 +1045,13 @@ var UserWasmRuntime = class {
       //                  destination for this iovec's slice)
       //   [4..8]  = buf_len (u32, capacity)
       //
-      // Strategy: sum every iovec's `buf_len` into a single total
-      // capacity, dispatch ONE `FD_READ` syscall with that
-      // capacity, and then distribute the returned bytes across
-      // the iovecs in order (filling each up to its own capacity
-      // before moving to the next). This mirrors the `fd_write`
-      // path that gather-concatenates user buffers into one
-      // payload — the PMos opcode API carries a single contiguous
-      // heap window per request, so scatter-gather lives entirely
-      // on this side.
+      // Strategy: sum every iovec's `buf_len`, cap the request at
+      // the transport's 32 KiB heap window, then distribute the
+      // returned bytes across iovecs in order. A larger requested
+      // capacity therefore produces a valid WASI short read; callers
+      // such as read_to_end issue the next read themselves. Issuing
+      // only one kernel read here also avoids blocking a pipe/socket
+      // after an already-successful partial read.
       //
       // Zero-length reads (iovs_len == 0 or every buf_len == 0)
       // short-circuit to `nread = 0` without calling the kernel,
@@ -817,34 +1061,33 @@ var UserWasmRuntime = class {
         if (this.memory === void 0) {
           return ERRNO.EINVAL;
         }
-        let view = new DataView(this.memory.buffer);
-        const iovecs = [];
-        let totalCapacity = 0;
-        for (let i = 0; i < iovsLen; i += 1) {
-          const iovBase = iovsPtr + i * 8;
-          const bufPtr = view.getUint32(iovBase, true);
-          const bufLen = view.getUint32(iovBase + 4, true);
-          iovecs.push({ ptr: bufPtr, len: bufLen });
-          totalCapacity += bufLen;
+        const parsed = readGuestIovecs(this.memory, iovsPtr, iovsLen);
+        if (!parsed.ok) return parsed.errno;
+        if (!isGuestRange(this.memory, nreadPtr, 4)) {
+          return ERRNO.EFAULT;
         }
-        if (totalCapacity === 0) {
-          view.setUint32(nreadPtr, 0, true);
+        if (parsed.boundedBytes === 0) {
+          new DataView(this.memory.buffer).setUint32(nreadPtr, 0, true);
           return 0;
         }
+        const requestCapacity = parsed.boundedBytes;
         const { response, heapOut } = this.backend.dispatch({
           opcode: OP_WASI.FD_READ,
           requestId: 0,
           arg0: fd,
           heapPtr: 0,
-          heapLen: totalCapacity
+          heapLen: requestCapacity
         });
         if (response.status !== 0) {
-          return -response.status;
+          return wasiErrno(response.status);
         }
-        const nread = Number(response.value);
+        const nread = boundedResponseCount(response.value, requestCapacity);
+        if (nread === void 0 || response.extraLen !== nread || heapOut.length < nread) {
+          return ERRNO.EIO;
+        }
         let offset = 0;
         const writeBuf = new Uint8Array(this.memory.buffer);
-        for (const iov of iovecs) {
+        for (const iov of parsed.iovecs) {
           if (offset >= nread) break;
           const chunk = Math.min(iov.len, nread - offset);
           if (chunk === 0) continue;
@@ -854,8 +1097,7 @@ var UserWasmRuntime = class {
           );
           offset += chunk;
         }
-        view = new DataView(this.memory.buffer);
-        view.setUint32(nreadPtr, nread, true);
+        new DataView(this.memory.buffer).setUint32(nreadPtr, nread, true);
         return 0;
       },
       // WASI `fd_seek`.
@@ -1018,9 +1260,7 @@ var UserWasmRuntime = class {
       //
       // Signature (lowered):
       //   path_open(
-      //     dirfd:     i32,  // directory fd (ignored — we don't
-      //                      //   do preopens; every path is
-      //                      //   absolute)
+      //     dirfd:     i32,  // base directory fd for relative paths
       //     dirflags:  i32,  // lookup flags (u32). Bit 0 =
       //                      //   SYMLINK_FOLLOW. Threaded through
       //                      //   to Kernel::path_open's
@@ -1042,11 +1282,11 @@ var UserWasmRuntime = class {
       //   ) -> errno: i32
       //
       // The PMos `PATH_OPEN` opcode packs (fdflags u32, oflags u16,
-      // mode u16, lookup_flags u32) into the 16-byte inline args
-      // window. `mode` is 0 because WASI's signature does not carry
-      // a mode field — the kernel substitutes the default `0o644`
-      // when CREAT fires with mode=0.
-      path_open: (_dirfd, dirflags, pathPtr, pathLen, oflags, _rightsBase, _rightsInheriting, _fdflags, fdOutPtr) => {
+      // mode u16, lookup_flags u32, dirfd u32) into the 16-byte
+      // inline args window. `mode` is 0 because WASI's signature
+      // does not carry a mode field — the kernel substitutes the
+      // default `0o644` when CREAT fires with mode=0.
+      path_open: (dirfd, dirflags, pathPtr, pathLen, oflags, _rightsBase, _rightsInheriting, _fdflags, fdOutPtr) => {
         if (this.memory === void 0) {
           return ERRNO.EINVAL;
         }
@@ -1062,6 +1302,7 @@ var UserWasmRuntime = class {
         argsView.setUint16(4, oflags & 65535, true);
         argsView.setUint16(6, 0, true);
         argsView.setUint32(8, dirflags >>> 0, true);
+        argsView.setUint32(12, dirfd >>> 0, true);
         const { response } = this.backend.dispatch(
           {
             opcode: OP_WASI.PATH_OPEN,
@@ -1387,7 +1628,7 @@ var UserWasmRuntime = class {
       // Strictly for regular files — unlinking a directory returns
       // EISDIR (WASI callers should use path_remove_directory).
       // Threads through Vfs::unlink on the owning mount.
-      path_unlink_file: (_dirfd, pathPtr, pathLen) => {
+      path_unlink_file: (dirfd, pathPtr, pathLen) => {
         if (this.memory === void 0) return ERRNO.EINVAL;
         const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
         const heap = new Uint8Array(pathLen);
@@ -1396,8 +1637,7 @@ var UserWasmRuntime = class {
           {
             opcode: OP_WASI.PATH_UNLINK_FILE,
             requestId: 0,
-            arg0: 0,
-            // dir_fd ignored in v1
+            arg0: dirfd,
             heapPtr: 0,
             heapLen: heap.length
           },
@@ -1630,7 +1870,7 @@ var UserWasmRuntime = class {
       // (tmpfs.rmdir returns NotADirectory for non-dir targets), and
       // rmdir on a non-empty directory returns ENOTEMPTY. Callers
       // must unlink file children first, then rmdir the container.
-      path_remove_directory: (_dirfd, pathPtr, pathLen) => {
+      path_remove_directory: (dirfd, pathPtr, pathLen) => {
         if (this.memory === void 0) return ERRNO.EINVAL;
         const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
         const heap = new Uint8Array(pathLen);
@@ -1639,8 +1879,7 @@ var UserWasmRuntime = class {
           {
             opcode: OP_WASI.PATH_REMOVE_DIRECTORY,
             requestId: 0,
-            arg0: 0,
-            // dir_fd ignored in v1
+            arg0: dirfd,
             heapPtr: 0,
             heapLen: heap.length
           },
@@ -1682,9 +1921,9 @@ var UserWasmRuntime = class {
       // Signature (lowered):
       //   (fd: i32, how: i32) -> errno: i32
       //
-      // Shutdown one or both directions of a socket. v1 only
-      // supports full close (how = RD | WR); half-close returns
-      // -ENOTSUP. Zero how or reserved bits return -EINVAL.
+      // Shutdown one or both directions of a socket. RD and WR are
+      // independent, and RD | WR shuts down both. Zero how or
+      // reserved bits return -EINVAL.
       // Non-Socket fd returns -EINVAL; unopened fd returns -EBADF.
       sock_shutdown: (fd, how) => {
         const args = new Uint8Array(16);
@@ -1715,6 +1954,9 @@ var UserWasmRuntime = class {
       // unopened fd returns -EBADF.
       sock_accept: (fd, flags, roFdPtr) => {
         if (this.memory === void 0) return ERRNO.EINVAL;
+        if (!isGuestRange(this.memory, roFdPtr, 4)) {
+          return ERRNO.EFAULT;
+        }
         const args = new Uint8Array(16);
         const argsView = new DataView(args.buffer);
         argsView.setUint32(0, fd, true);
@@ -1726,8 +1968,9 @@ var UserWasmRuntime = class {
           heapPtr: 0,
           heapLen: 0
         });
-        if (response.status !== 0) return -response.status;
-        const newFd = Number(response.value);
+        if (response.status !== 0) return wasiErrno(response.status);
+        const newFd = boundedResponseCount(response.value, U32_MAX);
+        if (newFd === void 0) return ERRNO.EIO;
         const memView = new DataView(this.memory.buffer);
         memView.setUint32(roFdPtr, newFd, true);
         return 0;
@@ -1738,34 +1981,49 @@ var UserWasmRuntime = class {
       //   (fd: i32, si_data_ptr: i32, si_data_len: i32,
       //    si_flags: i32, so_datalen_ptr: i32) -> errno: i32
       //
-      // WASI socket-alias of fd_write on Socket fds. Copies the
-      // (si_data_ptr, si_data_len) buffer into the dispatch heap
+      // WASI socket-alias of fd_write on Socket fds. Gathers the
+      // ciovec array at (si_data_ptr, si_data_len) into the dispatch heap
       // and dispatches SOCK_SEND with (fd, si_flags) packed into
       // the inline args window. On success writes bytes_sent as a
       // u32 at so_datalen_ptr. Non-Socket fds reject with -EINVAL.
-      // v1 ignores si_flags entirely — the kernel accepts whatever
-      // low 16 bits are supplied and discards them.
+      // Flags are forwarded as the full u32 so the kernel can reject
+      // unsupported or reserved bits without them being masked away.
       sock_send: (fd, siDataPtr, siDataLen, siFlags, soDatalenPtr) => {
         if (this.memory === void 0) return ERRNO.EINVAL;
-        const bytes = new Uint8Array(this.memory.buffer, siDataPtr, siDataLen);
-        const heap = new Uint8Array(siDataLen);
-        heap.set(bytes, 0);
+        if (!Number.isSafeInteger(siFlags) || siFlags < 0 || siFlags > U32_MAX) {
+          return ERRNO.EINVAL;
+        }
+        const parsed = readGuestIovecs(this.memory, siDataPtr, siDataLen);
+        if (!parsed.ok) return parsed.errno;
+        if (!isGuestRange(this.memory, soDatalenPtr, 4)) {
+          return ERRNO.EFAULT;
+        }
+        const heap = new Uint8Array(parsed.boundedBytes);
+        let offset = 0;
+        for (const iov of parsed.iovecs) {
+          if (offset >= heap.length) break;
+          const chunk = Math.min(iov.len, heap.length - offset);
+          if (chunk === 0) continue;
+          heap.set(new Uint8Array(this.memory.buffer, iov.ptr, chunk), offset);
+          offset += chunk;
+        }
         const args = new Uint8Array(16);
         const argsView = new DataView(args.buffer);
         argsView.setUint32(0, fd, true);
-        argsView.setUint32(4, siFlags & 65535, true);
+        argsView.setUint32(4, siFlags, true);
         const { response } = this.backend.dispatch(
           {
             opcode: OP_WASI.SOCK_SEND,
             requestId: 0,
             args,
             heapPtr: 0,
-            heapLen: siDataLen
+            heapLen: heap.length
           },
           heap
         );
-        if (response.status !== 0) return -response.status;
-        const sent = Number(response.value);
+        if (response.status !== 0) return wasiErrno(response.status);
+        const sent = boundedResponseCount(response.value, heap.length);
+        if (sent === void 0) return ERRNO.EIO;
         const memView = new DataView(this.memory.buffer);
         memView.setUint32(soDatalenPtr, sent, true);
         return 0;
@@ -1780,32 +2038,46 @@ var UserWasmRuntime = class {
       // WASI socket-alias of fd_read on Socket fds. Dispatches
       // SOCK_RECV with (fd, ri_flags) packed into the inline args
       // window; the response carries bytes_read in value + extraLen.
-      // Copies the read bytes back into user memory at
+      // Scatters the read bytes into the iovec array at
       // ri_data_ptr, writes bytes_read as a u32 at ro_datalen_ptr,
       // and writes 0 as a u16 at ro_flags_ptr (v1 has no
       // out-of-band data, no PEEK, no message truncation — every
       // recv yields ro_flags = 0).
       sock_recv: (fd, riDataPtr, riDataLen, riFlags, roDatalenPtr, roFlagsPtr) => {
         if (this.memory === void 0) return ERRNO.EINVAL;
+        if (!Number.isSafeInteger(riFlags) || riFlags < 0 || riFlags > U32_MAX) {
+          return ERRNO.EINVAL;
+        }
+        const parsed = readGuestIovecs(this.memory, riDataPtr, riDataLen);
+        if (!parsed.ok) return parsed.errno;
+        if (!isGuestRange(this.memory, roDatalenPtr, 4) || !isGuestRange(this.memory, roFlagsPtr, 2)) {
+          return ERRNO.EFAULT;
+        }
         const args = new Uint8Array(16);
         const argsView = new DataView(args.buffer);
         argsView.setUint32(0, fd, true);
-        argsView.setUint32(4, riFlags & 65535, true);
-        const heapOut = new Uint8Array(riDataLen);
-        const { response } = this.backend.dispatch(
-          {
-            opcode: OP_WASI.SOCK_RECV,
-            requestId: 0,
-            args,
-            heapPtr: 0,
-            heapLen: riDataLen
-          },
-          heapOut
-        );
-        if (response.status !== 0) return -response.status;
-        const read = Number(response.value);
+        argsView.setUint32(4, riFlags, true);
+        const { response, heapOut } = this.backend.dispatch({
+          opcode: OP_WASI.SOCK_RECV,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: parsed.boundedBytes
+        });
+        if (response.status !== 0) return wasiErrno(response.status);
+        const read = boundedResponseCount(response.value, parsed.boundedBytes);
+        if (read === void 0 || response.extraLen !== read || heapOut.length < read) {
+          return ERRNO.EIO;
+        }
+        let offset = 0;
         const memBytes = new Uint8Array(this.memory.buffer);
-        memBytes.set(heapOut.subarray(0, read), riDataPtr);
+        for (const iov of parsed.iovecs) {
+          if (offset >= read) break;
+          const chunk = Math.min(iov.len, read - offset);
+          if (chunk === 0) continue;
+          memBytes.set(heapOut.subarray(offset, offset + chunk), iov.ptr);
+          offset += chunk;
+        }
         const memView = new DataView(this.memory.buffer);
         memView.setUint32(roDatalenPtr, read, true);
         memView.setUint16(roFlagsPtr, 0, true);
@@ -1985,17 +2257,13 @@ var UserWasmRuntime = class {
       // Signature (lowered):
       //   (in: i32, out: i32, nsubscriptions: i32, nevents: i32) -> errno: i32
       //
-      // Multi-subscription readiness check. `in` points at an array
+      // Multi-subscription blocking wait. `in` points at an array
       // of `nsubscriptions` subscription_t records (48 bytes each)
       // and `out` points at an array of up to `nsubscriptions`
       // event_t records (32 bytes each); the kernel fills in
-      // events for every subscription that is ready right now and
-      // writes the actual event count through `nevents`.
-      //
-      // v1 kernel is non-blocking: CLOCK fires only if the target
-      // time is already past; FD_READ / FD_WRITE fire only if the
-      // op would make progress without waiting. A caller that
-      // expects to block walks a spin loop at the WASI-call layer.
+      // events for every subscription ready at return and writes the actual
+      // event count through `nevents`. The SAB backend sleeps the user Worker
+      // while the kernel has parked a not-yet-ready set.
       //
       // Wire layout: args pack (n_subs, n_events_cap) as two u32s
       // at offsets 0 and 4. The heap is a single buffer with subs
@@ -2007,8 +2275,16 @@ var UserWasmRuntime = class {
       // memory after dispatch.
       poll_oneoff: (inPtr, outPtr, nsubscriptions, neventsPtr) => {
         if (this.memory === void 0) return ERRNO.EINVAL;
-        if (nsubscriptions === 0) return ERRNO.EINVAL;
+        if (!Number.isInteger(nsubscriptions) || nsubscriptions <= 0 || nsubscriptions > 256) {
+          return ERRNO.EINVAL;
+        }
         const subsBytes = nsubscriptions * POLL_SUBSCRIPTION_SIZE;
+        const eventsBytes = nsubscriptions * POLL_EVENT_SIZE;
+        const memoryLength = this.memory.buffer.byteLength;
+        const validRange = (ptr, length) => Number.isInteger(ptr) && ptr >= 0 && ptr <= memoryLength && length <= memoryLength - ptr;
+        if (!validRange(inPtr, subsBytes) || !validRange(outPtr, eventsBytes) || !validRange(neventsPtr, 4)) {
+          return ERRNO.EFAULT;
+        }
         const heap = new Uint8Array(subsBytes);
         heap.set(
           new Uint8Array(this.memory.buffer, inPtr, subsBytes),
@@ -2029,9 +2305,16 @@ var UserWasmRuntime = class {
           heap
         );
         if (response.status !== 0) return -response.status;
+        if (response.value < 0n || response.value > BigInt(nsubscriptions)) {
+          return ERRNO.EIO;
+        }
         const nEvents = Number(response.value);
+        const emittedBytes = nEvents * POLL_EVENT_SIZE;
+        if (heapOut.byteLength < emittedBytes) {
+          return ERRNO.EIO;
+        }
         const memBytes = new Uint8Array(this.memory.buffer);
-        memBytes.set(heapOut.subarray(0, nEvents * POLL_EVENT_SIZE), outPtr);
+        memBytes.set(heapOut.subarray(0, emittedBytes), outPtr);
         const memView = new DataView(this.memory.buffer);
         memView.setUint32(neventsPtr, nEvents, true);
         return 0;
@@ -2102,11 +2385,11 @@ var UserWasmRuntime = class {
       //
       // Signature: (fd: i32, buf_ptr: i32) -> errno.
       //
-      // The kernel always returns -EBADF (no preopens in v1). The
-      // shim doesn't touch user memory — `buf_ptr` would only be
-      // written on success. WASI's preopen-discovery loop sees
-      // EBADF at the first probe and terminates.
-      fd_prestat_get: (fd, _bufPtr) => {
+      // PMos exposes the VFS root as a directory preopen at fd 3.
+      // On success the kernel returns its name length and this shim
+      // materialises WASI's 8-byte prestat_t in user memory.
+      fd_prestat_get: (fd, bufPtr) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
         const { response } = this.backend.dispatch({
           opcode: OP_WASI.FD_PRESTAT_GET,
           requestId: 0,
@@ -2114,26 +2397,41 @@ var UserWasmRuntime = class {
           heapPtr: 0,
           heapLen: 0
         });
-        return -response.status;
+        if (response.status !== 0) return -response.status;
+        const view = new DataView(this.memory.buffer);
+        view.setUint8(bufPtr, 0);
+        view.setUint8(bufPtr + 1, 0);
+        view.setUint8(bufPtr + 2, 0);
+        view.setUint8(bufPtr + 3, 0);
+        view.setUint32(bufPtr + 4, Number(response.value), true);
+        return 0;
       },
       // WASI `fd_prestat_dir_name`.
       //
       // Signature: (fd: i32, path_ptr: i32, path_len: i32) -> errno.
       //
-      // Companion to fd_prestat_get. The kernel always returns EBADF
-      // (no preopens in v1). The shim doesn't touch user memory —
-      // path_ptr / path_len would only be consulted on success.
-      // Matching EBADF-from-both-syscalls is what terminates the
-      // libc preopen-discovery loop cleanly.
-      fd_prestat_dir_name: (fd, _pathPtr, _pathLen) => {
-        const { response } = this.backend.dispatch({
-          opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
-          requestId: 0,
-          arg0: fd,
-          heapPtr: 0,
-          heapLen: 0
-        });
-        return -response.status;
+      // Companion to fd_prestat_get. The kernel writes the preopen
+      // name into heap scratch and the shim copies it to user memory.
+      fd_prestat_dir_name: (fd, pathPtr, pathLen) => {
+        if (this.memory === void 0) return ERRNO.EINVAL;
+        const heap = new Uint8Array(pathLen);
+        const { response, heapOut } = this.backend.dispatch(
+          {
+            opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
+            requestId: 0,
+            arg0: fd,
+            heapPtr: 0,
+            heapLen: pathLen
+          },
+          heap
+        );
+        if (response.status !== 0) return -response.status;
+        const written = Number(response.value);
+        new Uint8Array(this.memory.buffer).set(
+          heapOut.subarray(0, written),
+          pathPtr
+        );
+        return 0;
       },
       // WASI `fd_close(fd: i32) -> errno`.
       //
@@ -2237,13 +2535,18 @@ var UserWasmRuntime = class {
         if (this.memory === void 0) {
           return -ERRNO.EINVAL;
         }
-        const pathBytes = new Uint8Array(
-          this.memory.buffer,
-          pathPtr,
-          pathLen
-        );
-        const path = new TextDecoder().decode(pathBytes);
-        const manifest = encodeSpawnManifest({ path, caps });
+        let manifest;
+        try {
+          const pathBytes = new Uint8Array(
+            this.memory.buffer,
+            pathPtr,
+            pathLen
+          );
+          const path = new TextDecoder("utf-8", { fatal: true }).decode(pathBytes);
+          manifest = encodeSpawnManifest({ path, caps });
+        } catch {
+          return -ERRNO.EINVAL;
+        }
         const { response } = this.backend.dispatch(
           {
             opcode: OP_EXT.PROC_SPAWN,
@@ -2258,6 +2561,40 @@ var UserWasmRuntime = class {
           return response.status;
         }
         return Number(response.value);
+      },
+      // `proc_spawn_manifest(manifest_ptr, manifest_len) -> i32`
+      //
+      // Additive full-manifest entry point used by the shell. The caller
+      // supplies the canonical versioned blob from `abi::ext::spawn_v1`;
+      // this boundary validates it, takes an owned copy, and forwards those
+      // exact bytes through opcode 0x1100. The legacy three-argument
+      // `proc_spawn` import above remains callable by existing binaries.
+      proc_spawn_manifest: (manifestPtr, manifestLen) => {
+        if (this.memory === void 0 || !Number.isSafeInteger(manifestPtr) || !Number.isSafeInteger(manifestLen) || manifestPtr < 0 || manifestLen < 0) {
+          return -ERRNO.EINVAL;
+        }
+        let manifest;
+        try {
+          const callerBytes = new Uint8Array(
+            this.memory.buffer,
+            manifestPtr,
+            manifestLen
+          );
+          manifest = encodeSpawnManifestBlob(callerBytes);
+        } catch {
+          return -ERRNO.EINVAL;
+        }
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.PROC_SPAWN,
+            requestId: 0,
+            args: manifest.args,
+            heapPtr: 0,
+            heapLen: manifest.heap.length
+          },
+          manifest.heap
+        );
+        return response.status === 0 ? Number(response.value) : response.status;
       },
       // `proc_wait(target_pid: i32, options: i32, status_out_ptr: i32) -> i32`
       //
@@ -2476,8 +2813,9 @@ var UserWasmRuntime = class {
       // `ipc_socket(ty: i32) -> i32`
       //
       // Create an unbound socket. Returns the new fd (positive)
-      // or negative errno. `ty` is 0 = Stream, 1 = Dgram; any
-      // other value returns -EINVAL.
+      // or negative errno. `ty` is 0 = Stream; 1 is the ABI-reserved
+      // Dgram value and the v1 kernel returns -ENOTSUP atomically.
+      // Any other value returns -EINVAL.
       ipc_socket: (ty) => {
         const { response } = this.backend.dispatch({
           opcode: OP_EXT.IPC_SOCKET,
@@ -2496,12 +2834,14 @@ var UserWasmRuntime = class {
       // path_len). Returns 0 on success, negative errno on
       // failure (EADDRINUSE, EBADF, EINVAL for bad fd/path/state).
       ipc_bind: (fd, pathPtr, pathLen) => {
-        if (this.memory === void 0) return -ERRNO.EINVAL;
-        const pathBytes = new Uint8Array(
-          this.memory.buffer,
-          pathPtr,
-          pathLen
-        );
+        if (this.memory === void 0 || !Number.isSafeInteger(pathPtr) || !Number.isSafeInteger(pathLen) || pathLen <= 0 || pathLen > HEAP_SCRATCH_BYTES) {
+          return -ERRNO.EINVAL;
+        }
+        const memoryLength = this.memory.buffer.byteLength;
+        if (pathPtr < 0 || pathPtr > memoryLength || pathLen > memoryLength - pathPtr) {
+          return -ERRNO.EFAULT;
+        }
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
         const pathCopy = new Uint8Array(pathBytes);
         const { response } = this.backend.dispatch(
           {
@@ -2541,12 +2881,14 @@ var UserWasmRuntime = class {
       // (ECONNREFUSED for unbound path, EBADF for bad fd,
       // EINVAL for bad state).
       ipc_connect: (fd, pathPtr, pathLen) => {
-        if (this.memory === void 0) return -ERRNO.EINVAL;
-        const pathBytes = new Uint8Array(
-          this.memory.buffer,
-          pathPtr,
-          pathLen
-        );
+        if (this.memory === void 0 || !Number.isSafeInteger(pathPtr) || !Number.isSafeInteger(pathLen) || pathLen <= 0 || pathLen > HEAP_SCRATCH_BYTES) {
+          return -ERRNO.EINVAL;
+        }
+        const memoryLength = this.memory.buffer.byteLength;
+        if (pathPtr < 0 || pathPtr > memoryLength || pathLen > memoryLength - pathPtr) {
+          return -ERRNO.EFAULT;
+        }
+        const pathBytes = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
         const pathCopy = new Uint8Array(pathBytes);
         const { response } = this.backend.dispatch(
           {
@@ -2560,6 +2902,101 @@ var UserWasmRuntime = class {
         );
         return response.status;
       },
+      // `ipc_send(fd, buf_ptr, len, fd_to_pass, flags) -> n|-errno`
+      //
+      // Copies an owned, transport-bounded prefix from guest memory and
+      // optionally attaches one fd. A negative `fd_to_pass` means no
+      // ancillary descriptor. v1 accepts only flags=0.
+      ipc_send: (fd, bufPtr, len, fdToPass, flags) => {
+        if (this.memory === void 0) return -ERRNO.EINVAL;
+        if (!Number.isSafeInteger(fd) || fd < I32_MIN || fd > I32_MAX || !Number.isSafeInteger(len) || len < 0 || !Number.isSafeInteger(fdToPass) || fdToPass < I32_MIN || fdToPass > I32_MAX || !Number.isSafeInteger(flags) || flags !== 0) {
+          return -ERRNO.EINVAL;
+        }
+        if (!isGuestRange(this.memory, bufPtr, len)) {
+          return -ERRNO.EFAULT;
+        }
+        const boundedLen = Math.min(len, HEAP_SCRATCH_BYTES);
+        const payload = new Uint8Array(
+          new Uint8Array(this.memory.buffer, bufPtr, boundedLen)
+        );
+        const args = new Uint8Array(16);
+        const view = new DataView(args.buffer);
+        view.setUint32(0, fd, true);
+        view.setUint32(4, boundedLen, true);
+        view.setInt32(8, fdToPass, true);
+        view.setUint32(12, flags, true);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.IPC_SEND,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: boundedLen
+          },
+          payload
+        );
+        if (response.status !== 0) return pmosError(response.status);
+        const sent = boundedResponseCount(response.value, boundedLen);
+        return sent === void 0 ? -ERRNO.EIO : sent;
+      },
+      // `ipc_recv(fd, buf_ptr, len, recv_fd_out_ptr, flags) -> n|-errno`
+      //
+      // A negative fd-output pointer requests bytes only. A non-negative
+      // pointer opts into one passed descriptor and must name a writable
+      // four-byte guest range. flags=0 preserves blocking kernel semantics;
+      // flags=1 requests the documented non-blocking EAGAIN path.
+      ipc_recv: (fd, bufPtr, len, recvFdOutPtr, flags) => {
+        if (this.memory === void 0) return -ERRNO.EINVAL;
+        if (!Number.isSafeInteger(fd) || fd < I32_MIN || fd > I32_MAX || !Number.isSafeInteger(len) || len < 0 || !Number.isSafeInteger(recvFdOutPtr) || recvFdOutPtr < I32_MIN || recvFdOutPtr > I32_MAX || !Number.isSafeInteger(flags) || flags !== 0 && flags !== 1) {
+          return -ERRNO.EINVAL;
+        }
+        if (!isGuestRange(this.memory, bufPtr, len)) {
+          return -ERRNO.EFAULT;
+        }
+        const wantFd = recvFdOutPtr >= 0;
+        if (wantFd && !isGuestRange(this.memory, recvFdOutPtr, 4)) {
+          return -ERRNO.EFAULT;
+        }
+        const fdPrefix = wantFd ? 4 : 0;
+        const boundedLen = Math.min(len, HEAP_SCRATCH_BYTES - fdPrefix);
+        const args = new Uint8Array(16);
+        const view = new DataView(args.buffer);
+        view.setUint32(0, fd, true);
+        view.setUint32(4, boundedLen, true);
+        view.setInt32(8, wantFd ? 0 : -1, true);
+        view.setUint32(12, flags, true);
+        const { response, heapOut } = this.backend.dispatch({
+          opcode: OP_EXT.IPC_RECV,
+          requestId: 0,
+          args,
+          heapPtr: 0,
+          heapLen: boundedLen + fdPrefix
+        });
+        if (response.status !== 0) return pmosError(response.status);
+        const received = boundedResponseCount(response.value, boundedLen);
+        if (received === void 0) return -ERRNO.EIO;
+        let payloadOffset = 0;
+        let receivedFd = -1;
+        if (wantFd && response.extraLen === received + 4) {
+          if (heapOut.length < received + 4) return -ERRNO.EIO;
+          receivedFd = new DataView(
+            heapOut.buffer,
+            heapOut.byteOffset,
+            heapOut.byteLength
+          ).getUint32(0, true);
+          if (receivedFd > I32_MAX) return -ERRNO.EIO;
+          payloadOffset = 4;
+        } else if (response.extraLen !== received || heapOut.length < received) {
+          return -ERRNO.EIO;
+        }
+        new Uint8Array(this.memory.buffer, bufPtr, received).set(
+          heapOut.subarray(payloadOffset, payloadOffset + received)
+        );
+        if (wantFd) {
+          new DataView(this.memory.buffer).setInt32(recvFdOutPtr, receivedFd, true);
+        }
+        return received;
+      },
       // `ipc_pipe(fds_ptr: i32) -> i32`
       //
       // Create a pipe pair; the kernel writes `[read_fd, write_fd]`
@@ -2570,6 +3007,9 @@ var UserWasmRuntime = class {
       // scratch, and the shim copies them out to `fds_ptr`.
       ipc_pipe: (fdsPtr) => {
         if (this.memory === void 0) return -ERRNO.EINVAL;
+        if (!isGuestRange(this.memory, fdsPtr, 8)) {
+          return -ERRNO.EFAULT;
+        }
         const heap = new Uint8Array(8);
         const { response, heapOut } = this.backend.dispatch(
           {
@@ -2581,7 +3021,10 @@ var UserWasmRuntime = class {
           },
           heap
         );
-        if (response.status !== 0) return response.status;
+        if (response.status !== 0) return pmosError(response.status);
+        if (response.extraLen !== 8 || heapOut.length < 8) {
+          return -ERRNO.EIO;
+        }
         const userFds = new Uint8Array(this.memory.buffer, fdsPtr, 8);
         userFds.set(heapOut.subarray(0, 8));
         return 0;
@@ -2628,6 +3071,153 @@ var UserWasmRuntime = class {
         });
         if (response.status !== 0) return response.status;
         return Number(response.value);
+      },
+      // `ipc_peer_caps(fd: i32, caps_out_ptr: i32) -> i32`
+      //
+      // Fetch the kernel-authenticated connection-time capability
+      // snapshot for the process on the other end of `fd`. This is
+      // fd-scoped (`SO_PEERCRED`-style), so it does not require
+      // PROC_INSPECT and cannot be influenced by protocol payloads.
+      ipc_peer_caps: (fd, capsOutPtr) => {
+        if (capsOutPtr === 0 || this.memory === void 0) {
+          return -ERRNO.EINVAL;
+        }
+        if (!isGuestRange(this.memory, capsOutPtr, 8)) {
+          return -ERRNO.EFAULT;
+        }
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.IPC_PEER_CAPS,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        if (response.status !== 0) {
+          return pmosError(response.status);
+        }
+        const memView = new DataView(this.memory.buffer);
+        memView.setBigUint64(
+          capsOutPtr,
+          BigInt.asUintN(64, response.value),
+          true
+        );
+        return 0;
+      },
+      // `fs_chmod(path_ptr, path_len, mode) -> i32`.
+      // WASI preview 1 has no chmod operation, so package installation uses
+      // this documented PMos extension to preserve executable archive modes.
+      fs_chmod: (pathPtr, pathLen, mode) => {
+        if (this.memory === void 0 || pathLen <= 0 || (mode & ~511) !== 0) {
+          return -ERRNO.EINVAL;
+        }
+        try {
+          const path = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+          const pathCopy = new Uint8Array(path);
+          const args = new Uint8Array(16);
+          const view = new DataView(args.buffer);
+          view.setUint32(0, pathLen, true);
+          view.setUint32(4, mode, true);
+          const { response } = this.backend.dispatch(
+            {
+              opcode: OP_EXT.FS_CHMOD,
+              requestId: 0,
+              args,
+              heapPtr: 0,
+              heapLen: pathCopy.length
+            },
+            pathCopy
+          );
+          return response.status;
+        } catch {
+          return -ERRNO.EINVAL;
+        }
+      },
+      // `fs_watch(path_ptr, path_len, mask, flags) -> fd`. Copy the
+      // caller's path into bounded syscall scratch and express its offset as
+      // zero in the kernel's inline args. Invalid caller pointers never reach
+      // the backend; unsupported masks/flags are rejected atomically here and
+      // again by the kernel.
+      fs_watch: (pathPtr, pathLen, mask, flags) => {
+        if (this.memory === void 0 || !Number.isSafeInteger(pathPtr) || !Number.isSafeInteger(pathLen) || !Number.isSafeInteger(mask) || !Number.isSafeInteger(flags) || pathLen <= 0 || pathLen > HEAP_SCRATCH_BYTES || mask <= 0 || mask > 7 || flags !== 0) {
+          return -ERRNO.EINVAL;
+        }
+        const memoryLength = this.memory.buffer.byteLength;
+        if (pathPtr < 0 || pathPtr > memoryLength || pathLen > memoryLength - pathPtr) {
+          return -ERRNO.EFAULT;
+        }
+        const path = new Uint8Array(this.memory.buffer, pathPtr, pathLen);
+        const pathCopy = new Uint8Array(path);
+        const args = new Uint8Array(16);
+        const view = new DataView(args.buffer);
+        view.setUint32(0, 0, true);
+        view.setUint32(4, pathCopy.length, true);
+        view.setUint32(8, mask, true);
+        view.setUint32(12, flags, true);
+        const { response } = this.backend.dispatch(
+          {
+            opcode: OP_EXT.FS_WATCH,
+            requestId: 0,
+            args,
+            heapPtr: 0,
+            heapLen: pathCopy.length
+          },
+          pathCopy
+        );
+        return response.status === 0 ? Number(response.value) : response.status;
+      },
+      // `host_file_recv(token: u32) -> fd`
+      host_file_recv: (token) => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.HOST_FILE_RECV,
+          requestId: 0,
+          arg0: token,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status === 0 ? Number(response.value) : response.status;
+      },
+      // `host_file_pick() -> i32`. Selection completes asynchronously on the
+      // kernel-owned `/run/host-files` stream.
+      host_file_pick: () => {
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.HOST_FILE_PICK,
+          requestId: 0,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        return response.status;
+      },
+      // `host_file_send(name_ptr, name_len, mime_ptr, mime_len) -> fd`.
+      // Metadata is copied into one bounded heap request; file bytes use
+      // ordinary fd_write calls on the returned descriptor.
+      host_file_send: (namePtr, nameLen, mimePtr, mimeLen) => {
+        if (this.memory === void 0 || nameLen <= 0 || nameLen > 255 || mimeLen < 0 || mimeLen > 127) {
+          return -ERRNO.EINVAL;
+        }
+        try {
+          const name = new Uint8Array(this.memory.buffer, namePtr, nameLen);
+          const mime = new Uint8Array(this.memory.buffer, mimePtr, mimeLen);
+          const heap = new Uint8Array(nameLen + mimeLen);
+          heap.set(name, 0);
+          heap.set(mime, nameLen);
+          const args = new Uint8Array(16);
+          const view = new DataView(args.buffer);
+          view.setUint32(0, nameLen, true);
+          view.setUint32(4, mimeLen, true);
+          const { response } = this.backend.dispatch(
+            {
+              opcode: OP_EXT.HOST_FILE_SEND,
+              requestId: 0,
+              args,
+              heapPtr: 0,
+              heapLen: heap.length
+            },
+            heap
+          );
+          return response.status === 0 ? Number(response.value) : response.status;
+        } catch {
+          return -ERRNO.EINVAL;
+        }
       },
       // `display_bind() -> i32`
       //
@@ -2709,11 +3299,14 @@ async function runOnce(messaging, boot, options) {
     ...options.serviceHook ? { serviceHook: options.serviceHook } : {},
     ...kernelWakeSlot !== void 0 ? { kernelWakeSlot } : {}
   });
-  const runtime = new UserWasmRuntime(boot.wasmBytes, backend, {
+  const wasmBytes = new Uint8Array(boot.wasmBytes.byteLength);
+  wasmBytes.set(new Uint8Array(boot.wasmBytes));
+  const runtime = new UserWasmRuntime(wasmBytes.buffer, backend, {
     onMemorySizeBytes: (bytes) => {
       messaging.postMessage({ kind: "memory", pid: boot.pid, bytes });
     }
   });
+  messaging.postMessage({ kind: "booted", pid: boot.pid });
   try {
     const code = await runtime.run();
     const memoryBytes = runtime.memorySizeBytes();

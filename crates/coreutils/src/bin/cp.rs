@@ -68,7 +68,10 @@ fn main() -> ExitCode {
     let [src, dst] = match paths.as_slice() {
         [a, b] => [a.clone(), b.clone()],
         _ => {
-            let _ = writeln!(io::stderr(), "cp: usage: cp <src> <dst> (or `cp -r <src> <dst>` for recursive)");
+            let _ = writeln!(
+                io::stderr(),
+                "cp: usage: cp <src> <dst> (or `cp -r <src> <dst>` for recursive)"
+            );
             return ExitCode::from(1);
         }
     };
@@ -148,15 +151,17 @@ fn copy_tree(src: &Path, dst: &Path, no_clobber: bool) -> io::Result<()> {
             ));
         }
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(dst).map_err(|e| {
-                io::Error::new(e.kind(), format!("{}: {e}", dst.display()))
-            })?;
+            fs::create_dir(dst)
+                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dst.display())))?;
         }
         Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", dst.display()))),
     }
 
-    for entry in fs::read_dir(src).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", src.display())))? {
-        let entry = entry.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", src.display())))?;
+    for entry in fs::read_dir(src)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", src.display())))?
+    {
+        let entry =
+            entry.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", src.display())))?;
         let entry_meta = fs::symlink_metadata(entry.path())
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", entry.path().display())))?;
         let entry_dst = dst.join(entry.file_name());
@@ -166,9 +171,8 @@ fn copy_tree(src: &Path, dst: &Path, no_clobber: bool) -> io::Result<()> {
             if no_clobber && fs::symlink_metadata(&entry_dst).is_ok() {
                 continue;
             }
-            fs::copy(entry.path(), &entry_dst).map_err(|e| {
-                io::Error::new(e.kind(), format!("{}: {e}", entry_dst.display()))
-            })?;
+            fs::copy(entry.path(), &entry_dst)
+                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", entry_dst.display())))?;
         }
     }
     Ok(())

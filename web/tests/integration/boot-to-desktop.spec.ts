@@ -18,25 +18,25 @@
 //   1. init-desktop reaches its supervision loop (so it
 //      successfully spawned both children).
 //   2. display-server starts (the binary's startup banner).
-//   3. SC-001: a desktop-rendered observable arrives within
-//      10 s of the `goto`. The "desktop rendered" proxy is
-//      the display-server emitting its first `served client`
-//      log line for the shell — that means the shell
-//      connected, sent the bind requests, and the server
-//      processed them. Since the shell's run_shell loop
-//      paints the wallpaper on the first configure event,
-//      seeing the served-client line means the wallpaper
-//      paint has reached the framebuffer.
+//   3. SC-001: the boot splash disappears and a launcher click
+//      produces a causally presented menu pixel within 10 s.
 //
-// Performance budget (T128): the elapsed wall-clock from
-// `page.goto` to the served-client line is the cold-load
-// time per Constitution Principle IX. The spec uses the
-// 10 s timeout as the SC-001 threshold; the timeout firing
-// is the failure mode.
+// Performance budget (T128): the elapsed wall-clock starts
+// before `page.goto` and ends only after that interactive
+// desktop response. The strict 10 s SC-001 threshold includes
+// navigation, boot, first paint, input routing, and menu paint.
 
 import { expect, test } from "@playwright/test";
+import {
+  launchTerminal,
+  runEchoHelloAndWaitForOutput,
+} from "./guest-terminal";
+import { openLauncherBefore } from "./launcher-interaction";
 
-test("boot-to-desktop: init-desktop spawns display-server + shell, shell paints wallpaper within 10s", async ({
+test.use({ viewport: { width: 1280, height: 900 } });
+
+test("boot-to-desktop: cold boot reaches an interactive desktop within 10s", async ({
+  browserName,
   page,
 }) => {
   const consoleLines: string[] = [];
@@ -48,6 +48,7 @@ test("boot-to-desktop: init-desktop spawns display-server + shell, shell paints 
   });
 
   const t0 = Date.now();
+  const deadline = t0 + 10_000;
   // The bare URL now boots /bin/init-desktop (wallpaper + shell)
   // by default; the `#boot-to-desktop` hash is an explicit alias
   // for the same path. Target the bare URL so the spec doubles as
@@ -81,26 +82,25 @@ test("boot-to-desktop: init-desktop spawns display-server + shell, shell paints 
     .poll(displayServerStartingLine, { timeout: 10_000 })
     .not.toBeNull();
 
-  // Phase 3 (SC-001 + T128 cold-load budget): the shell
-  // connected, the server dispatched its registry walk and
-  // bind sequence, and the framebuffer received its first
-  // composed pixel write. The display-server prints a
-  // `served client {i}` line on every successful client
-  // turn; the very first one is the proof that the shell's
-  // `run_shell_with_taskbar` reached its paint pass.
-  const servedClientLine = () =>
-    consoleLines.find((l) =>
-      /display-server served client \d+/.test(l),
-    ) ?? null;
-  await expect
-    .poll(servedClientLine, { timeout: 10_000 })
-    .not.toBeNull();
+  // Phase 3 (SC-001 + T128 cold-load budget): prove both visible boot and
+  // interactivity. The launcher helper accepts only a menu-pixel change on a
+  // framebuffer presentation causally following the physical click.
+  await expect(page.locator("#pmos-boot-splash")).toHaveCount(0, {
+    timeout: Math.max(1, deadline - Date.now()),
+  });
+  await openLauncherBefore(page, deadline);
 
   const elapsed_ms = Date.now() - t0;
-  // The 10s timeout is itself the SC-001 / T128 gate: if
-  // the served-client line fails to arrive within 10s the
-  // expect.poll above fails the test. This logs the actual
-  // wall-clock for the visible record.
-  console.log(`[boot-to-desktop] elapsed_ms=${elapsed_ms}`);
+  // Preserve this marker for the canonical performance artifact.
+  console.log(`[boot-to-desktop] elapsed_ms=${elapsed_ms} engine=${browserName}`);
   expect(elapsed_ms).toBeLessThan(10_000);
+
+  // T127 continues beyond the performance endpoint: use the launcher that the
+  // timed interaction left open, establish real Terminal keyboard focus, then
+  // require literal shell stdout to appear in the guest framebuffer.
+  await launchTerminal(page, consoleLines, { launcherAlreadyOpen: true });
+  await runEchoHelloAndWaitForOutput(page);
+  expect(consoleLines.filter((line) => line.startsWith("[pageerror]"))).toEqual(
+    [],
+  );
 });

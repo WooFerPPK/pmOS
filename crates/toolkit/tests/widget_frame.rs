@@ -14,7 +14,7 @@ use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::theme::Theme;
 use toolkit::widget::frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
-    TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, TITLEBAR_HEIGHT,
+    TITLEBAR_HEIGHT, TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP,
 };
 
 fn rgba(color: Color) -> [u8; 4] {
@@ -301,6 +301,8 @@ fn titlebar_text_fully_fits_when_app_id_is_short() {
 fn close_button_fits_inside_titlebar() {
     // Validates the chosen dimensions without relying on a specific
     // numeric answer.
-    assert!(CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN <= TITLEBAR_HEIGHT + CLOSE_BUTTON_SIZE);
-    assert!(CLOSE_BUTTON_SIZE + 2 * BORDER_WIDTH <= TITLEBAR_HEIGHT);
+    const {
+        assert!(CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN <= TITLEBAR_HEIGHT + CLOSE_BUTTON_SIZE);
+        assert!(CLOSE_BUTTON_SIZE + 2 * BORDER_WIDTH <= TITLEBAR_HEIGHT);
+    }
 }

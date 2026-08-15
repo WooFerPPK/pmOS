@@ -16,7 +16,10 @@ use kernel::vfs::MountId;
 /// distinct `ino` values produce distinct fd-objects that compare
 /// correctly.
 const fn vn(ino: u64) -> FdObject {
-    FdObject::Vnode { mount_id: MountId(1), ino }
+    FdObject::Vnode {
+        mount_id: MountId(1),
+        ino,
+    }
 }
 
 // ---- Allocation + lookup --------------------------------------------
@@ -72,7 +75,10 @@ fn default_soft_limit_matches_constant() {
 fn close_returns_the_removed_entry() {
     let mut t = FdTable::new();
     let fd = t
-        .alloc(FdEntry::with_flags(FdObject::PipeRead(77), FdFlags::NONBLOCK))
+        .alloc(FdEntry::with_flags(
+            FdObject::PipeRead(77),
+            FdFlags::NONBLOCK,
+        ))
         .unwrap();
     let removed = t.close(fd).unwrap();
     assert_eq!(removed.object, FdObject::PipeRead(77));
@@ -149,9 +155,7 @@ fn install_at_to_unopen_slot_grows_table_and_returns_none() {
 #[test]
 fn install_at_past_soft_limit_is_out_of_fds() {
     let mut t = FdTable::with_limit(2);
-    let err = t
-        .install_at(5, FdEntry::new(vn(1)))
-        .unwrap_err();
+    let err = t.install_at(5, FdEntry::new(vn(1))).unwrap_err();
     assert_eq!(err, FdError::OutOfFds);
 }
 

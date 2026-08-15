@@ -30,11 +30,7 @@ import { bootKernelWorker } from "./kernel-worker";
 import type { KernelWorker } from "./kernel-worker";
 import { KernelWasmHost } from "./kernel-wasm-host";
 import { MockKernel } from "./mock-kernel";
-import {
-  CAPSET_ALL,
-  encodeSpawnManifest,
-  OP_EXT,
-} from "./shared/syscall";
+import { CAPSET_ALL, encodeSpawnManifest, OP_EXT } from "./shared/syscall";
 import type { KernelToMain, MainToKernel } from "./shared/worker-proto";
 
 /**
@@ -132,6 +128,12 @@ export interface WorkerEntryOptions {
    */
   readonly blockDriver?: import("./drivers/types").Driver;
   /**
+   * Test seam for the production OPFS open. When omitted, the Worker imports
+   * `BlockDriver` and calls `openInOpfs()`. A rejection is reported through
+   * the typed degraded-storage channel before volatile recovery continues.
+   */
+  readonly openBlockDriver?: () => Promise<import("./drivers/types").Driver>;
+  /**
    * Optional pre-built [`NetDriver`] (T086). When unset
    * (production), `bootRealKernel` constructs a default
    * `new NetDriver()` that wraps `globalThis.fetch` +
@@ -140,6 +142,69 @@ export interface WorkerEntryOptions {
    * the real network.
    */
   readonly netDriver?: import("./drivers/types").Driver;
+}
+
+type StorageDegradedMessage = Extract<
+  KernelToMain,
+  { readonly kind: "storage:degraded" }
+>;
+
+const STORAGE_DETAIL_MAX_CHARS = 512;
+
+function boundedStorageDetail(detail: string): string {
+  return detail.length <= STORAGE_DETAIL_MAX_CHARS
+    ? detail
+    : `${detail.slice(0, STORAGE_DETAIL_MAX_CHARS - 1)}…`;
+}
+
+/** Convert the kernel's preserved-image fallback line into a typed event. */
+export function storageDegradedMessageFromConsoleLine(
+  line: string,
+): StorageDegradedMessage | null {
+  if (
+    line.includes(
+      "[pmos] persistent root unavailable or invalid; storage left untouched; using volatile tmpfs root",
+    )
+  ) {
+    return {
+      kind: "storage:degraded",
+      reason: "persistent-root-invalid",
+      detail:
+        "The existing filesystem image failed validation or mount; volatile recovery was prepared without rewriting it.",
+      existingImagePreserved: true,
+    };
+  }
+  if (
+    line.includes(
+      "[pmos] persistent root unavailable; storage left untouched; using volatile tmpfs root",
+    )
+  ) {
+    return {
+      kind: "storage:degraded",
+      reason: "persistent-root-unavailable",
+      detail:
+        "The persistent filesystem could not be installed at /; volatile recovery was prepared without rewriting storage.",
+      existingImagePreserved: true,
+    };
+  }
+  return null;
+}
+
+type DeferredInputMessage = Extract<
+  MainToKernel,
+  { readonly kind: "console:input" | "input:kbd" | "input:mouse" }
+>;
+
+const MAX_DEFERRED_INPUT_BYTES = 64 * 1024;
+
+function isDeferredInputMessage(
+  msg: MainToKernel,
+): msg is DeferredInputMessage {
+  return (
+    msg.kind === "console:input" ||
+    msg.kind === "input:kbd" ||
+    msg.kind === "input:mouse"
+  );
 }
 
 /**
@@ -165,14 +230,41 @@ export function installWorkerEntry(
   // The dispatch loop re-reads this map on every pass so lifecycle
   // changes are picked up without restarting the loop.
   //
-  // `lifecycle.hasEverSpawned` flips to true on the first `proc:sab`
-  // — the dispatch loop's halt predicate uses it to distinguish "no
-  // pid has landed yet" (wait longer) from "every pid has exited"
-  // (halt). Tracking the flip at message-receipt time (rather than
-  // inside the halt check) closes a race where a pid arrives and
-  // exits between halt probes.
+  // `lifecycle.hasEverSpawned` flips on the first `proc:sab`, or on
+  // a known `proc:exited` that rolls back a Worker which failed
+  // before SAB publication. The dispatch loop's halt predicate uses
+  // it to distinguish "no pid has landed yet" (wait longer) from
+  // "every pid has exited" (halt).
   const pidMap = new Map<number, ArrayBufferLike>();
   const lifecycle = { hasEverSpawned: false };
+  let bootRequested = false;
+  const deferredInput: DeferredInputMessage[] = [];
+  let deferredInputBytes = 0;
+
+  const deferInput = (msg: DeferredInputMessage): void => {
+    if (msg.bytes.byteLength > MAX_DEFERRED_INPUT_BYTES) {
+      return;
+    }
+    while (
+      deferredInput.length > 0 &&
+      deferredInputBytes + msg.bytes.byteLength > MAX_DEFERRED_INPUT_BYTES
+    ) {
+      const dropped = deferredInput.shift();
+      deferredInputBytes -= dropped?.bytes.byteLength ?? 0;
+    }
+    const bytes = new Uint8Array(msg.bytes.byteLength);
+    bytes.set(msg.bytes);
+    deferredInput.push({ ...msg, bytes } as DeferredInputMessage);
+    deferredInputBytes += bytes.byteLength;
+  };
+
+  const replayDeferredInput = (target: KernelWorker): void => {
+    for (const msg of deferredInput) {
+      target.handleMainMessage(msg);
+    }
+    deferredInput.length = 0;
+    deferredInputBytes = 0;
+  };
 
   messaging.onmessage = (ev: { data: MainToKernel }): void => {
     const msg = ev.data;
@@ -203,6 +295,10 @@ export function installWorkerEntry(
           // ignore. The kernel's transition check is the source of
           // truth.
         }
+        // Publishing a new syscall ring is external work. The dispatch loop
+        // may be parked indefinitely against an older wake epoch, so publish
+        // the map insertion by incrementing and notifying that epoch.
+        realKernel.notifyDispatchLoop();
       }
       return;
     }
@@ -230,6 +326,7 @@ export function installWorkerEntry(
       return;
     }
     if (msg.kind === "proc:exited") {
+      let reconciledKnownProcess = false;
       if (msg.memoryBytes !== undefined && realKernel !== undefined) {
         try {
           realKernel.recordProcessMemory(msg.pid, msg.memoryBytes);
@@ -237,10 +334,61 @@ export function installWorkerEntry(
           // Stale exit for a pid the kernel no longer knows about.
         }
       }
-      pidMap.delete(msg.pid);
+      if (realKernel !== undefined) {
+        try {
+          const known = realKernel.reconcileProcessExit(
+            msg.pid,
+            msg.code,
+            msg.trap !== undefined,
+          );
+          // A Worker may fail before its boot acknowledgement, so
+          // no proc:sab ever arrives. A known pid here is sufficient
+          // evidence that spawn occurred and lets the now-empty boot
+          // dispatch loop terminate instead of waiting forever.
+          if (known) {
+            lifecycle.hasEverSpawned = true;
+            reconciledKnownProcess = true;
+          }
+        } catch (error) {
+          messaging.postMessage({
+            kind: "panic",
+            message: `kernel-worker: failed to reconcile pid ${msg.pid} exit: ${String(error)}`,
+          });
+        }
+      }
+      const removedSab = pidMap.delete(msg.pid);
+      if (realKernel !== undefined && (reconciledKnownProcess || removedSab)) {
+        // Reconciliation can queue a delayed proc_wait response for the
+        // parent while the dispatcher is asleep, and deleting the final SAB
+        // can satisfy the loop's halt predicate. Both state changes require a
+        // real wake rather than a best-effort timeout.
+        realKernel.notifyDispatchLoop();
+      }
+      return;
+    }
+    if (msg.kind === "host:dropped") {
+      if (realKernel !== undefined) {
+        try {
+          realKernel.hostFileDropped(msg.token, msg.name, msg.mime, msg.bytes);
+        } catch (e) {
+          messaging.postMessage({
+            kind: "panic",
+            message: `kernel-worker: host:dropped failed: ${(e as Error).message}`,
+          });
+        }
+      }
       return;
     }
     if (scaffold === undefined) {
+      // Real-kernel boot is asynchronous. Host input can arrive after main
+      // posted `boot` but before WebAssembly instantiation has published the
+      // scaffold; treating that normal startup race as a kernel panic made a
+      // key pressed during the splash crash the session. Retain a bounded,
+      // defensive copy and replay it in order once the input drivers exist.
+      if (bootRequested && isDeferredInputMessage(msg)) {
+        deferInput(msg);
+        return;
+      }
       // Pre-boot: the only message we accept is a boot.
       if (msg.kind !== "boot") {
         messaging.postMessage({
@@ -249,6 +397,15 @@ export function installWorkerEntry(
         });
         return;
       }
+      if (bootRequested) {
+        messaging.postMessage({
+          kind: "panic",
+          message:
+            "kernel-worker: duplicate boot received before boot completed",
+        });
+        return;
+      }
+      bootRequested = true;
       if (msg.config.useRealKernel === true) {
         void bootRealKernel(
           messaging,
@@ -264,11 +421,13 @@ export function installWorkerEntry(
             // instead of hitting the pre-boot panic branch.
             scaffold = s;
             realKernel = h;
+            replayDeferredInput(s);
           },
         ).then(() => resolveReady());
         return;
       }
       scaffold = bootMockKernel(messaging, msg.config);
+      replayDeferredInput(scaffold);
       resolveReady();
       return;
     }
@@ -312,17 +471,16 @@ function bootMockKernel(
   // config; we map them 1:1 to `banner`-kind scrollback
   // entries so the first rendered frame already has
   // text.
-  const liveTerminal =
-    config.liveTerminal === true && config.enableFramebuffer;
+  const liveTerminal = config.liveTerminal === true && config.enableFramebuffer;
   const initialScrollback = liveTerminal
-    ? (config.terminalBanner ?? []).map(
-        (text) => ({ text, kind: "banner" as const }),
-      )
+    ? (config.terminalBanner ?? []).map((text) => ({
+        text,
+        kind: "banner" as const,
+      }))
     : undefined;
   const mock = new MockKernel({
     policy: { kind: "faux-shell" },
-    emitSplashOnFirstInput:
-      config.enableFramebuffer && !liveTerminal,
+    emitSplashOnFirstInput: config.enableFramebuffer && !liveTerminal,
     liveTerminal,
     ...(initialScrollback ? { initialScrollback } : {}),
     panicEmit: (message: string) => {
@@ -360,6 +518,12 @@ async function bootRealKernel(
   lifecycle: { hasEverSpawned: boolean },
   onScaffoldReady: (scaffold: KernelWorker, host: KernelWasmHost) => void,
 ): Promise<void> {
+  let storageDegradedPosted = false;
+  const reportStorageDegraded = (message: StorageDegradedMessage): void => {
+    if (storageDegradedPosted) return;
+    storageDegradedPosted = true;
+    messaging.postMessage(message);
+  };
   const fetcher = options.fetcher ?? defaultFetcher;
   let bytes: BufferSource;
   try {
@@ -380,22 +544,32 @@ async function bootRealKernel(
     }
   }
   // T084: open the OPFS-backed block driver before instantiating
-  // the kernel so `kernel_init` finds it ready when it queries
-  // OP_BLOCK_COUNT to decide whether to mount /persist. If the
-  // browser lacks `FileSystemSyncAccessHandle` (private mode,
-  // older browsers, jsdom), the open() rejects and we let the
-  // kernel skip the /persist mount cleanly — it's best-effort
-  // persistence, not a hard requirement for boot.
+  // the kernel so `kernel_init` can use it as the root filesystem.
+  // If the browser lacks FileSystemSyncAccessHandle (private mode,
+  // older browsers, jsdom), boot continues with a volatile tmpfs
+  // root, but the degraded mode must remain visible to operators.
   let blockDriver: import("./drivers/types").Driver | undefined;
   if (options.blockDriver !== undefined) {
     blockDriver = options.blockDriver;
   } else {
     try {
-      const { BlockDriver } = await import("./drivers/block");
-      blockDriver = await BlockDriver.openInOpfs();
-    } catch {
-      // OPFS unavailable; proceed with no block driver. /persist
-      // simply won't appear in the kernel's mount table.
+      if (options.openBlockDriver !== undefined) {
+        blockDriver = await options.openBlockDriver();
+      } else {
+        const { BlockDriver } = await import("./drivers/block");
+        blockDriver = await BlockDriver.openInOpfs();
+      }
+    } catch (error) {
+      const detail = boundedStorageDetail(String(error));
+      console.warn(
+        `[pmos] persistent storage unavailable; volatile recovery prepared: ${detail}`,
+      );
+      reportStorageDegraded({
+        kind: "storage:degraded",
+        reason: "opfs-open-failed",
+        detail: `OPFS block driver open failed: ${detail}`,
+        existingImagePreserved: true,
+      });
       blockDriver = undefined;
     }
   }
@@ -418,7 +592,7 @@ async function bootRealKernel(
   }
 
   // Framebuffer driver — translates /dev/fb0 byte writes into
-  // `fb:set-mode` / `fb:blit` postMessage envelopes via the
+  // `fb:set-mode`, `fb:blit`, and `fb:patch` postMessage envelopes via the
   // KernelWasmHost's `onFramebufferMessage` hook. The actual
   // canvas paint happens on the main thread (FbHost +
   // FbRenderer in bootstrap.ts).
@@ -436,6 +610,10 @@ async function bootRealKernel(
     // so the boot screen + live terminal don't need to know whether
     // the source was MockKernel or KernelWasmHost.
     onConsoleWrite: (bytes: Uint8Array) => {
+      const degraded = storageDegradedMessageFromConsoleLine(
+        new TextDecoder().decode(bytes),
+      );
+      if (degraded !== null) reportStorageDegraded(degraded);
       messaging.postMessage({ kind: "console:write", bytes });
     },
     onPanic: (message: string) => {
@@ -447,7 +625,7 @@ async function bootRealKernel(
     ...(framebufferDriver !== undefined ? { framebufferDriver } : {}),
     onFramebufferMessage: (msg: unknown) => {
       // The framebuffer driver decodes write payloads into
-      // {kind: "fb:set-mode" | "fb:blit", ...} envelopes; forward
+      // {kind: "fb:set-mode" | "fb:blit" | "fb:patch", ...} envelopes; forward
       // each one to main where FbHost + FbRenderer paint the
       // canvas (see web/src/bootstrap.ts runRealKernelMode's
       // GUI-boot branch).
@@ -503,18 +681,15 @@ async function defaultFetcher(url: string): Promise<ArrayBuffer> {
 
 /**
  * Fetch `/manifest.json`, walk every `assets/bin/*.wasm` entry, and
- * return a registry mapping `/bin/<stem>` → fetched bytes. Each
+ * return a registry mapping both `/bin/<stem>` and `/usr/bin/<stem>` to the
+ * same fetched bytes. Each
  * binary is fetched in parallel; the registry is built only after
  * all finish so a missing binary fails cleanly with the URL in the
  * error.
  *
- * The path key uses the bare basename (with extension stripped) and
- * a `/bin/` prefix — matching the convention the kernel side
- * already uses for spawn paths (e.g. `/bin/hello-std`,
- * `/bin/hello_wasi_min`). The Rust side does not yet care about
- * leading-slash normalization; the convention is kept consistent
- * here so callers can predict the lookup key from the on-disk
- * filename.
+ * `/bin` is the runtime convention used by bundled desktop entries; `/usr/bin`
+ * is the documented init.conf spelling. Installed VFS executables remain exact
+ * paths and bypass this immutable registry through kernel-owned bytes.
  */
 async function fetchBinaryRegistry(
   fetcher: (url: string) => Promise<ArrayBuffer>,
@@ -525,13 +700,17 @@ async function fetchBinaryRegistry(
   const binAssets = manifest.assets.filter(
     (a) => a.startsWith("assets/bin/") && a.endsWith(".wasm"),
   );
-  const entries = await Promise.all(
+  const assets = await Promise.all(
     binAssets.map(async (asset): Promise<[string, ArrayBuffer]> => {
       const stem = asset.slice("assets/bin/".length, -".wasm".length);
       const bytes = await fetcher(`/${asset}`);
-      return [`/bin/${stem}`, bytes];
+      return [stem, bytes];
     }),
   );
+  const entries: Array<[string, ArrayBuffer]> = [];
+  for (const [stem, bytes] of assets) {
+    entries.push([`/bin/${stem}`, bytes], [`/usr/bin/${stem}`, bytes]);
+  }
   return new Map(entries);
 }
 
@@ -577,6 +756,7 @@ async function runBootBinary(
   host.installConsoleFd(bootstrapPid, 0);
   host.installConsoleFd(bootstrapPid, 1);
   host.installConsoleFd(bootstrapPid, 2);
+  host.installRootPreopenFd(bootstrapPid, 3);
   host.markRunning(bootstrapPid);
 
   const manifest = encodeSpawnManifest({
@@ -617,13 +797,12 @@ async function runBootBinary(
   //
   // The halt predicate uses `lifecycle.hasEverSpawned` tracked at
   // message-receipt time rather than inside the predicate itself to
-  // close a race where a pid arrives and exits between halt probes
-  // (the parker's 50 ms timeout is longer than a typical short-lived
-  // child's lifetime under vitest).
+  // close a race where a pid arrives and exits between halt probes.
+  // Lifecycle handlers notify the indefinite park, but the pidMap may be
+  // empty again by the time the resumed loop evaluates its predicate.
   await host.startDispatchLoop({
     pidSource: () => pidMap,
-    halted: (): boolean =>
-      lifecycle.hasEverSpawned && pidMap.size === 0,
+    halted: (): boolean => lifecycle.hasEverSpawned && pidMap.size === 0,
   });
 }
 

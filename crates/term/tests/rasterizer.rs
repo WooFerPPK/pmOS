@@ -4,13 +4,18 @@
 //! the pixel layout `rasterize_snapshot` produces for a
 //! handful of representative terminal states.
 
-use toolkit::draw::font::{
-    glyph_for, glyph_pixel, CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH,
+use std::cell::RefCell;
+
+use term::rasterizer::{
+    colors, default_font, load_startup_font_with, rasterize_snapshot, rasterize_snapshot_with_font,
+    BitmapFont, FontError, Palette, DEFAULT_FONT_NAME, FONT_DIR, MAX_FONT_BYTES,
+    MAX_PREFERENCES_BYTES, PADDING, VGA_FONT_NAME,
 };
-use term::rasterizer::{colors, rasterize_snapshot, Palette, PADDING};
-use term::{
-    Key, LineKind, Terminal, TerminalLine, TerminalOptions, TerminalSnapshot,
-};
+use term::{Key, LineKind, Terminal, TerminalLine, TerminalOptions, TerminalSnapshot};
+use toolkit::draw::font::{glyph_for, glyph_pixel};
+
+const COMPACT_FONT: &[u8] = include_bytes!("../assets/fonts/unifont-mono-14.pbm");
+const VGA_FONT: &[u8] = include_bytes!("../assets/fonts/pc-vga-16.pbm");
 
 fn bg_pixel() -> [u8; 4] {
     // 0xFF0A0E14 → (B=14, G=0E, R=0A, A=FF).
@@ -123,15 +128,16 @@ fn rasterize_with_prompt_draws_cursor_block_at_the_expected_origin() {
     let text_origin_x = PADDING;
     let text_origin_y = PADDING;
     let text_height = height - 2 * PADDING;
-    let rows_total = text_height / CELL_HEIGHT;
+    let font = default_font();
+    let rows_total = text_height / font.cell_height();
     let scrollback_rows = rows_total - 1;
-    let input_row_y = text_origin_y + scrollback_rows * CELL_HEIGHT;
-    let cursor_x = text_origin_x + 2 * CELL_WIDTH;
+    let input_row_y = text_origin_y + scrollback_rows * font.cell_height();
+    let cursor_x = text_origin_x + 2 * font.cell_width();
 
     // Check one pixel in the middle of the cursor block
     // is the cursor colour (0xFFFFFFFF → [FF,FF,FF,FF]).
-    let cx = cursor_x + GLYPH_WIDTH / 2;
-    let cy = input_row_y + GLYPH_HEIGHT / 2;
+    let cx = cursor_x + font.glyph_width() / 2;
+    let cy = input_row_y + font.glyph_height() / 2;
     assert_eq!(pixel(&pixels, width, cx, cy), [0xFF, 0xFF, 0xFF, 0xFF]);
 }
 
@@ -157,12 +163,12 @@ fn rasterize_scrollback_line_paints_foreground_pixels_at_expected_cell() {
     let base_x = PADDING;
     let base_y = PADDING;
 
-    // Scan the entire 5x7 cell at (base_x, base_y). At
+    // Scan the entire selected-font cell at (base_x, base_y). At
     // least one pixel should be the output foreground
     // colour because the 'o' glyph has non-zero rows.
     let mut found = false;
-    for row in 0..GLYPH_HEIGHT {
-        for col in 0..GLYPH_WIDTH {
+    for row in 0..default_font().glyph_height() {
+        for col in 0..default_font().glyph_width() {
             let px = pixel(&pixels, width, base_x + col, base_y + row);
             if px == fg {
                 found = true;
@@ -213,7 +219,7 @@ fn rasterize_paints_different_line_kinds_with_different_colours() {
 
     for (row_idx, (_kind, argb)) in expected.iter().enumerate() {
         let base_x = PADDING;
-        let base_y = PADDING + (row_idx as u32) * CELL_HEIGHT;
+        let base_y = PADDING + (row_idx as u32) * default_font().cell_height();
         let (b, g, r, a) = (
             (*argb & 0xff) as u8,
             ((*argb >> 8) & 0xff) as u8,
@@ -222,8 +228,8 @@ fn rasterize_paints_different_line_kinds_with_different_colours() {
         );
         let expected_px = [b, g, r, a];
         let mut found = false;
-        for row in 0..GLYPH_HEIGHT {
-            for col in 0..GLYPH_WIDTH {
+        for row in 0..default_font().glyph_height() {
+            for col in 0..default_font().glyph_width() {
                 let px = pixel(&pixels, width, base_x + col, base_y + row);
                 if px == expected_px {
                     found = true;
@@ -240,7 +246,7 @@ fn rasterize_paints_different_line_kinds_with_different_colours() {
 #[test]
 fn rasterize_clips_line_longer_than_the_column_count() {
     // With a 16-pixel-wide text area and PADDING=4, we
-    // have width = 16 and cols = 16/CELL_WIDTH = 16/6 = 2
+    // have exactly two 8-pixel cells
     // visible columns. A line of "aaaa" should clip to
     // 2 characters without panicking.
     let snap = TerminalSnapshot {
@@ -318,4 +324,89 @@ fn palette_fg_for_returns_different_colours_per_line_kind() {
     assert_ne!(b, o);
     assert_ne!(i, o);
     assert_ne!(o, e);
+}
+
+#[test]
+fn shipped_p1_atlases_have_distinct_dynamic_metrics_and_frames() {
+    let compact = BitmapFont::parse_p1(COMPACT_FONT).expect("compact font parses");
+    let vga = BitmapFont::parse_p1(VGA_FONT).expect("VGA font parses");
+    assert_eq!((compact.cell_width(), compact.cell_height()), (8, 14));
+    assert_eq!((vga.cell_width(), vga.cell_height()), (8, 16));
+    assert_eq!((term::CELL_WIDTH, term::CELL_HEIGHT), (8, 14));
+    assert_eq!((term::GLYPH_WIDTH, term::GLYPH_HEIGHT), (8, 14));
+
+    let snapshot = TerminalSnapshot {
+        lines: vec![TerminalLine {
+            text: "PMos Aa0?".to_string(),
+            kind: LineKind::Output,
+        }],
+        input_buffer: "font".to_string(),
+        prompt: "$ ".to_string(),
+    };
+    let compact_frame = rasterize_snapshot_with_font(&snapshot, 160, 80, &compact);
+    let vga_frame = rasterize_snapshot_with_font(&snapshot, 160, 80, &vga);
+    assert_ne!(compact_frame, vga_frame);
+}
+
+#[test]
+fn p1_parser_rejects_malformed_and_oversized_assets() {
+    assert_eq!(
+        BitmapFont::parse_p1(b"P4\n128 224\n0"),
+        Err(FontError::InvalidMagic)
+    );
+    assert_eq!(
+        BitmapFont::parse_p1(b"P1\n128 224\n0"),
+        Err(FontError::InvalidPixelCount)
+    );
+    assert_eq!(
+        BitmapFont::parse_p1(&vec![b'0'; MAX_FONT_BYTES + 1]),
+        Err(FontError::TooLarge)
+    );
+}
+
+#[test]
+fn startup_loader_selects_vga_from_the_shared_preference() {
+    let preferences = b"[terminal]\nfont = \"pc-vga-16.pbm\"\n";
+    let requested = RefCell::new(Vec::new());
+    let font = load_startup_font_with(Some(preferences), |path| {
+        requested.borrow_mut().push(path.to_string());
+        (path == format!("{FONT_DIR}/{VGA_FONT_NAME}")).then(|| VGA_FONT.to_vec())
+    });
+    assert_eq!(font.cell_width(), 8);
+    assert_eq!(font.cell_height(), 16);
+    assert_eq!(
+        requested.into_inner(),
+        vec![format!("{FONT_DIR}/{VGA_FONT_NAME}")]
+    );
+}
+
+#[test]
+fn malformed_or_oversized_startup_inputs_fall_back_safely() {
+    let malformed_preferences = b"[terminal\nfont = \"pc-vga-16.pbm\"\n";
+    let malformed = load_startup_font_with(Some(malformed_preferences), |_| {
+        Some(b"P1\n128 224\nnot-pixels".to_vec())
+    });
+    assert_eq!(malformed, default_font().clone());
+
+    let oversized_preferences = vec![b'x'; MAX_PREFERENCES_BYTES + 1];
+    let oversized_font = vec![b'0'; MAX_FONT_BYTES + 1];
+    let oversized = load_startup_font_with(Some(&oversized_preferences), |_| {
+        Some(oversized_font.clone())
+    });
+    assert_eq!(oversized, default_font().clone());
+}
+
+#[test]
+fn unsupported_font_name_cannot_escape_the_bundled_allow_list() {
+    let preferences = b"[terminal]\nfont = \"../../host-file.pbm\"\n";
+    let requested = RefCell::new(Vec::new());
+    let font = load_startup_font_with(Some(preferences), |path| {
+        requested.borrow_mut().push(path.to_string());
+        Some(COMPACT_FONT.to_vec())
+    });
+    assert_eq!(font.cell_height(), 14);
+    assert_eq!(
+        requested.into_inner(),
+        vec![format!("{FONT_DIR}/{DEFAULT_FONT_NAME}")]
+    );
 }

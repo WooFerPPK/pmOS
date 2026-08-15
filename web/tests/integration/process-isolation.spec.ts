@@ -1,39 +1,69 @@
-// T175 — Principle V gate: an adversarial process MUST NOT be
-// able to read another process's memory. The mem-adversary binary
-// (`/bin/mem-adversary`) attempts that and exits non-zero on any
-// kind of cross-process read. The kernel's process-isolation
-// guarantee is enforced by WASM linear memory partitioning, not
-// by convention. The test boots the adversary via `#real-kernel`
-// (the demo init's autostart) and asserts no `[pageerror]` line
-// fires AND the kernel reaps the adversary cleanly.
+// T175 — Principle V browser gate. Launch the shipped adversarial program as
+// an ordinary app through the real desktop shell. The probe runs in its own
+// Worker/WASM instance and exercises eight cross-process/capability escape
+// attempts; every one must be rejected by the production kernel boundary.
 
 import { expect, test } from "@playwright/test";
 
-test("boot completes without process-isolation violations", async ({
+import {
+  bootDesktop,
+  launchTerminal,
+  runTerminalCommand,
+  submitTerminalCommand,
+} from "./guest-terminal";
+
+test.use({ viewport: { width: 1280, height: 900 } });
+
+test("an ordinary isolated Worker rejects every adversarial memory probe", async ({
   page,
+  browserName,
 }) => {
-  const consoleLines: string[] = [];
-  page.on("console", (msg) => consoleLines.push(msg.text()));
-  page.on("pageerror", (err) => consoleLines.push(`[pageerror] ${err.message}`));
+  test.skip(
+    browserName === "webkit",
+    "WebKit lacks the persistent OPFS substrate required by the supported desktop boot.",
+  );
 
-  await page.goto("/index.html#real-kernel");
+  const lines: string[] = [];
+  page.on("console", (message) => lines.push(message.text()));
+  page.on("pageerror", (error) => lines.push(`[pageerror] ${error.message}`));
 
-  // The real-kernel demo finishes when init prints `init exiting`.
-  // mem-adversary in the autostart list cannot escape its memory
-  // — if it did, the kernel would trap and emit a panic line.
+  await bootDesktop(page, lines);
+  await launchTerminal(page, lines);
+
+  const steadyWorkers = Number(
+    (await page.locator("body").getAttribute("data-pmos-live-workers")) ?? "0",
+  );
+  const evidenceStart = lines.length;
+  await submitTerminalCommand(page, "/bin/mem_adversary > /dev/console");
+  const status = await runTerminalCommand(
+    page,
+    lines,
+    "echo mem-adversary-status-$? > /dev/console",
+    (line) => line.includes("mem-adversary-status-"),
+  );
+
+  const evidence = lines.slice(evidenceStart);
+  expect(status).toContain("mem-adversary-status-0");
+  expect(
+    evidence.some((line) => line.includes("mem-adversary OK")),
+    `adversary did not report success:\n${evidence.join("\n")}`,
+  ).toBe(true);
+  expect(evidence.filter((line) => line.includes("PASS "))).toHaveLength(8);
+  expect(evidence.some((line) => line.includes("BREACH"))).toBe(false);
   await expect
     .poll(
-      () => consoleLines.find((l) => l.includes("init exiting")) ?? null,
-      { timeout: 30_000 },
+      async () =>
+        Number(
+          (await page
+            .locator("body")
+            .getAttribute("data-pmos-live-workers")) ?? "0",
+        ),
+      { timeout: 10_000 },
     )
-    .not.toBeNull();
-
-  // No isolation violation observable.
-  const violations = consoleLines.filter(
-    (l) =>
-      l.includes("isolation violation") ||
-      l.includes("cross-process read") ||
-      l.startsWith("[pageerror]"),
+    .toBe(steadyWorkers);
+  expect(lines.some((line) => line.includes("real kernel panic"))).toBe(false);
+  expect(lines.some((line) => line.includes("user worker crashed pid="))).toBe(
+    false,
   );
-  expect(violations).toEqual([]);
+  expect(lines.some((line) => line.startsWith("[pageerror]"))).toBe(false);
 });

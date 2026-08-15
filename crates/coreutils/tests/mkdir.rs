@@ -19,12 +19,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-mkdir-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-mkdir-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -46,7 +41,11 @@ fn creates_a_directory() {
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert!(out.stdout.is_empty(), "stdout = {:?}", out.stdout);
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
-    assert!(target.is_dir(), "{} should exist and be a dir", target.display());
+    assert!(
+        target.is_dir(),
+        "{} should exist and be a dir",
+        target.display()
+    );
     cleanup(&dir);
 }
 

@@ -68,20 +68,22 @@ fn get_toplevel(
 /// Each client uses an id base offset to avoid id collisions
 /// across the test (every client has its own object table, but
 /// using distinct ids per client makes the test easier to read).
-fn bind_registry(
-    s: &mut Server,
-    c: display_server::ClientId,
-    base: u32,
-) -> (ObjectId, ObjectId) {
+fn bind_registry(s: &mut Server, c: display_server::ClientId, base: u32) -> (ObjectId, ObjectId) {
     let registry = ObjectId::new(base);
     s.dispatch_request(c, &get_registry(ObjectId::DISPLAY, registry))
         .unwrap();
     let compositor = ObjectId::new(base + 2);
     let xdg_shell = ObjectId::new(base + 4);
-    s.dispatch_request(c, &registry_bind(registry, 1, "pmd_compositor", 1, compositor))
-        .unwrap();
-    s.dispatch_request(c, &registry_bind(registry, 3, "pmd_xdg_shell", 1, xdg_shell))
-        .unwrap();
+    s.dispatch_request(
+        c,
+        &registry_bind(registry, 1, "pmd_compositor", 1, compositor),
+    )
+    .unwrap();
+    s.dispatch_request(
+        c,
+        &registry_bind(registry, 3, "pmd_xdg_shell", 1, xdg_shell),
+    )
+    .unwrap();
     (compositor, xdg_shell)
 }
 
@@ -97,8 +99,11 @@ fn shell_disconnect_does_not_destroy_app_surfaces() {
     // Each client creates its own surface + toplevel.
     let shell_surface = ObjectId::new(111);
     let shell_toplevel = ObjectId::new(113);
-    s.dispatch_request(shell_client, &create_surface(shell_compositor, shell_surface))
-        .unwrap();
+    s.dispatch_request(
+        shell_client,
+        &create_surface(shell_compositor, shell_surface),
+    )
+    .unwrap();
     s.dispatch_request(
         shell_client,
         &get_toplevel(shell_xdg, shell_toplevel, shell_surface),

@@ -75,12 +75,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    if delete {
-        if sets.len() != 1 {
-            let _ = writeln!(io::stderr(), "{usage}");
-            return ExitCode::from(1);
-        }
-    } else if squeeze {
+    if delete || squeeze {
         if sets.len() != 1 {
             let _ = writeln!(io::stderr(), "{usage}");
             return ExitCode::from(1);

@@ -1,7 +1,12 @@
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
-var __esm = (fn, res) => function __init() {
-  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+var __esm = (fn, res, err) => function __init() {
+  if (err) throw err[0];
+  try {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  } catch (e) {
+    throw err = [e], e;
+  }
 };
 var __export = (target, all) => {
   for (var name in all)
@@ -49,30 +54,78 @@ var init_platform_constants = __esm({
   }
 });
 
+// src/shared/sab-layout.ts
+var SAB_SIZE, OFF_REQ_HEAD, OFF_REQ_TAIL, OFF_RES_HEAD, OFF_RES_TAIL, OFF_USER_WAIT_SLOT, OFF_REQ_RING, OFF_RES_RING, OFF_HEAP_SCRATCH, HEAP_SCRATCH_BYTES, REQ_SLOT_COUNT, RES_SLOT_COUNT, STATUS_READY;
+var init_sab_layout = __esm({
+  "src/shared/sab-layout.ts"() {
+    "use strict";
+    SAB_SIZE = 65536;
+    OFF_REQ_HEAD = 0;
+    OFF_REQ_TAIL = 4;
+    OFF_RES_HEAD = 8;
+    OFF_RES_TAIL = 12;
+    OFF_USER_WAIT_SLOT = 16;
+    OFF_REQ_RING = 64;
+    OFF_RES_RING = 16384;
+    OFF_HEAP_SCRATCH = 32768;
+    HEAP_SCRATCH_BYTES = 32768;
+    REQ_SLOT_COUNT = 510;
+    RES_SLOT_COUNT = 510;
+    STATUS_READY = 3;
+  }
+});
+
 // src/drivers/fb.ts
 var fb_exports = {};
 __export(fb_exports, {
   DEV_FB0_NODE: () => DEV_FB0_NODE,
   FB_DRIVER_ID: () => FB_DRIVER_ID,
+  FB_PATCH_BATCH_MAX_RECTS: () => FB_PATCH_BATCH_MAX_RECTS,
+  FB_PATCH_HEADER_BYTES: () => FB_PATCH_HEADER_BYTES,
+  FB_PATCH_MAX_PAYLOAD_BYTES: () => FB_PATCH_MAX_PAYLOAD_BYTES,
+  FB_PATCH_MAX_RGBA_BYTES: () => FB_PATCH_MAX_RGBA_BYTES,
   FramebufferDriver: () => FramebufferDriver,
   OP_BLIT: () => OP_BLIT,
   OP_BLIT_BEGIN: () => OP_BLIT_BEGIN,
   OP_BLIT_CHUNK: () => OP_BLIT_CHUNK,
   OP_BLIT_END: () => OP_BLIT_END,
+  OP_PATCH: () => OP_PATCH,
+  OP_PATCH_PALETTE_RLE_BATCH: () => OP_PATCH_PALETTE_RLE_BATCH,
+  OP_PATCH_RLE: () => OP_PATCH_RLE,
+  OP_PRESENT_FENCE: () => OP_PRESENT_FENCE,
   OP_SET_MODE: () => OP_SET_MODE
 });
 function rgbaByteCount(width, height) {
   return width * height * 4;
 }
 function readU32LE(bytes, offset) {
-  return (bytes[offset] ?? 0) | (bytes[offset + 1] ?? 0) << 8 | (bytes[offset + 2] ?? 0) << 16 | (bytes[offset + 3] ?? 0) * 16777216;
+  return ((bytes[offset] ?? 0) | (bytes[offset + 1] ?? 0) << 8 | (bytes[offset + 2] ?? 0) << 16 | (bytes[offset + 3] ?? 0) * 16777216) >>> 0;
 }
-var FB_DRIVER_ID, DEV_FB0_NODE, OP_SET_MODE, OP_BLIT, OP_BLIT_BEGIN, OP_BLIT_CHUNK, OP_BLIT_END, FramebufferDriver;
+function readU16LE(bytes, offset) {
+  return (bytes[offset] ?? 0) | (bytes[offset + 1] ?? 0) << 8;
+}
+function patchRgbaByteCount(width, height) {
+  if (width === 0 || height === 0) {
+    return null;
+  }
+  const pixels = width * height;
+  if (!Number.isSafeInteger(pixels)) {
+    return null;
+  }
+  const bytes = pixels * 4;
+  return bytes <= FB_PATCH_MAX_RGBA_BYTES ? bytes : null;
+}
+function patchGeometryDoesNotOverflow(x, y, width, height) {
+  const maxU32 = 4294967295;
+  return x + width <= maxU32 && y + height <= maxU32;
+}
+var FB_DRIVER_ID, DEV_FB0_NODE, OP_SET_MODE, OP_BLIT, OP_BLIT_BEGIN, OP_BLIT_CHUNK, OP_BLIT_END, OP_PATCH, OP_PATCH_RLE, OP_PATCH_PALETTE_RLE_BATCH, OP_PRESENT_FENCE, FB_PATCH_HEADER_BYTES, FB_PATCH_MAX_PAYLOAD_BYTES, FB_PATCH_MAX_RGBA_BYTES, FB_PATCH_BATCH_MAX_RECTS, FramebufferDriver;
 var init_fb = __esm({
   "src/drivers/fb.ts"() {
     "use strict";
     init_types();
     init_platform_constants();
+    init_sab_layout();
     FB_DRIVER_ID = DriverId.Framebuffer;
     DEV_FB0_NODE = Devnum.Fb0;
     OP_SET_MODE = 1;
@@ -80,6 +133,14 @@ var init_fb = __esm({
     OP_BLIT_BEGIN = 3;
     OP_BLIT_CHUNK = 4;
     OP_BLIT_END = 5;
+    OP_PATCH = 6;
+    OP_PATCH_RLE = 7;
+    OP_PATCH_PALETTE_RLE_BATCH = 8;
+    OP_PRESENT_FENCE = 9;
+    FB_PATCH_HEADER_BYTES = 16;
+    FB_PATCH_MAX_PAYLOAD_BYTES = HEAP_SCRATCH_BYTES - 1;
+    FB_PATCH_MAX_RGBA_BYTES = FB_PATCH_MAX_PAYLOAD_BYTES - FB_PATCH_HEADER_BYTES;
+    FB_PATCH_BATCH_MAX_RECTS = 8;
     FramebufferDriver = class {
       driverId = FB_DRIVER_ID;
       name = "framebuffer";
@@ -89,6 +150,8 @@ var init_fb = __esm({
       blitBuffer = null;
       blitWidth = 0;
       blitHeight = 0;
+      modeWidth = 0;
+      modeHeight = 0;
       init(host) {
         this.host = host;
       }
@@ -108,9 +171,32 @@ var init_fb = __esm({
             return this.handleBlitChunk(payload);
           case OP_BLIT_END:
             return this.handleBlitEnd(host);
+          case OP_PATCH:
+            return this.handlePatch(host, payload);
+          case OP_PATCH_RLE:
+            return this.handleRlePatch(host, payload);
+          case OP_PATCH_PALETTE_RLE_BATCH:
+            return this.handlePaletteRlePatchBatch(host, payload);
+          case OP_PRESENT_FENCE:
+            return this.handlePresentFence(host, payload);
           default:
             return { ok: false, error: DriverErrorCode.Transport };
         }
+      }
+      handlePresentFence(host, payload) {
+        if (payload.byteLength !== 4) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const serial = readU32LE(payload, 0);
+        if (serial === 0) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const message = {
+          kind: "fb:present-fence",
+          serial
+        };
+        host.postToMain(message);
+        return { ok: true, value: payload.byteLength };
       }
       handleBlitBegin(payload) {
         if (payload.byteLength < 8) {
@@ -159,6 +245,8 @@ var init_fb = __esm({
         }
         const width = readU32LE(payload, 0);
         const height = readU32LE(payload, 4);
+        this.modeWidth = width;
+        this.modeHeight = height;
         const message = { kind: "fb:set-mode", width, height };
         host.postToMain(message);
         return { ok: true, value: 8 };
@@ -180,6 +268,185 @@ var init_fb = __esm({
         host.postToMain(message);
         return { ok: true, value: payload.byteLength };
       }
+      handlePatch(host, payload) {
+        if (payload.byteLength < FB_PATCH_HEADER_BYTES || payload.byteLength > FB_PATCH_MAX_PAYLOAD_BYTES) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const x = readU32LE(payload, 0);
+        const y = readU32LE(payload, 4);
+        const width = readU32LE(payload, 8);
+        const height = readU32LE(payload, 12);
+        const needed = patchRgbaByteCount(width, height);
+        if (needed === null || !patchGeometryDoesNotOverflow(x, y, width, height) || payload.byteLength !== FB_PATCH_HEADER_BYTES + needed) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const rgba = new Uint8Array(needed);
+        rgba.set(payload.subarray(FB_PATCH_HEADER_BYTES));
+        const message = {
+          kind: "fb:patch",
+          x,
+          y,
+          width,
+          height,
+          rgba
+        };
+        host.postToMain(message);
+        return { ok: true, value: payload.byteLength };
+      }
+      handleRlePatch(host, payload) {
+        if (payload.byteLength < FB_PATCH_HEADER_BYTES + 8 || payload.byteLength > FB_PATCH_MAX_PAYLOAD_BYTES || (payload.byteLength - FB_PATCH_HEADER_BYTES) % 8 !== 0) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const x = readU32LE(payload, 0);
+        const y = readU32LE(payload, 4);
+        const width = readU32LE(payload, 8);
+        const height = readU32LE(payload, 12);
+        const patchPixels = width * height;
+        const modePixels = this.modeWidth * this.modeHeight;
+        if (width === 0 || height === 0 || !Number.isSafeInteger(patchPixels) || !Number.isSafeInteger(modePixels) || patchPixels > Math.floor(Number.MAX_SAFE_INTEGER / 4) || modePixels > Math.floor(Number.MAX_SAFE_INTEGER / 4) || x + width > this.modeWidth || y + height > this.modeHeight) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        let encodedOffset = FB_PATCH_HEADER_BYTES;
+        let decodedPixels = 0;
+        while (encodedOffset < payload.byteLength) {
+          const count = readU32LE(payload, encodedOffset);
+          if (count === 0 || count > patchPixels - decodedPixels) {
+            return { ok: false, error: DriverErrorCode.Transport };
+          }
+          decodedPixels += count;
+          encodedOffset += 8;
+        }
+        if (decodedPixels !== patchPixels) {
+          return { ok: false, error: DriverErrorCode.Transport };
+        }
+        const rgba = new Uint8Array(patchPixels * 4);
+        encodedOffset = FB_PATCH_HEADER_BYTES;
+        let destination = 0;
+        while (encodedOffset < payload.byteLength) {
+          const count = readU32LE(payload, encodedOffset);
+          const red = payload[encodedOffset + 4] ?? 0;
+          const green = payload[encodedOffset + 5] ?? 0;
+          const blue = payload[encodedOffset + 6] ?? 0;
+          const alpha = payload[encodedOffset + 7] ?? 0;
+          for (let pixel = 0; pixel < count; pixel += 1) {
+            rgba[destination] = red;
+            rgba[destination + 1] = green;
+            rgba[destination + 2] = blue;
+            rgba[destination + 3] = alpha;
+            destination += 4;
+          }
+          encodedOffset += 8;
+        }
+        const message = {
+          kind: "fb:patch",
+          x,
+          y,
+          width,
+          height,
+          rgba
+        };
+        host.postToMain(message);
+        return { ok: true, value: payload.byteLength };
+      }
+      handlePaletteRlePatchBatch(host, payload) {
+        const reject = () => ({
+          ok: false,
+          error: DriverErrorCode.Transport
+        });
+        if (payload.byteLength < 2 || payload.byteLength > FB_PATCH_MAX_PAYLOAD_BYTES) {
+          return reject();
+        }
+        const rectCount = payload[0] ?? 0;
+        const paletteCount = (payload[1] ?? 0) + 1;
+        if (rectCount < 2 || rectCount > FB_PATCH_BATCH_MAX_RECTS) {
+          return reject();
+        }
+        const paletteStart = 2;
+        const paletteEnd = paletteStart + paletteCount * 4;
+        const modePixels = this.modeWidth * this.modeHeight;
+        if (paletteEnd > payload.byteLength || this.modeWidth === 0 || this.modeHeight === 0 || !Number.isSafeInteger(modePixels) || modePixels > Math.floor(Number.MAX_SAFE_INTEGER / 4)) {
+          return reject();
+        }
+        const encodedPatches = [];
+        let encodedOffset = paletteEnd;
+        let totalPixels = 0;
+        for (let rect = 0; rect < rectCount; rect += 1) {
+          if (encodedOffset + FB_PATCH_HEADER_BYTES > payload.byteLength) {
+            return reject();
+          }
+          const x = readU32LE(payload, encodedOffset);
+          const y = readU32LE(payload, encodedOffset + 4);
+          const width = readU32LE(payload, encodedOffset + 8);
+          const height = readU32LE(payload, encodedOffset + 12);
+          encodedOffset += FB_PATCH_HEADER_BYTES;
+          const pixelCount = width * height;
+          if (width === 0 || height === 0 || !Number.isSafeInteger(pixelCount) || pixelCount > Math.floor(Number.MAX_SAFE_INTEGER / 4) || x + width > this.modeWidth || y + height > this.modeHeight) {
+            return reject();
+          }
+          totalPixels += pixelCount;
+          if (!Number.isSafeInteger(totalPixels) || totalPixels > modePixels) {
+            return reject();
+          }
+          const runsStart = encodedOffset;
+          let decodedPixels = 0;
+          while (decodedPixels < pixelCount) {
+            if (encodedOffset + 3 > payload.byteLength) {
+              return reject();
+            }
+            const count = readU16LE(payload, encodedOffset);
+            const paletteIndex = payload[encodedOffset + 2] ?? paletteCount;
+            if (count === 0 || paletteIndex >= paletteCount || count > pixelCount - decodedPixels) {
+              return reject();
+            }
+            decodedPixels += count;
+            encodedOffset += 3;
+          }
+          encodedPatches.push({
+            x,
+            y,
+            width,
+            height,
+            pixelCount,
+            runsStart,
+            runsEnd: encodedOffset
+          });
+        }
+        if (encodedOffset !== payload.byteLength) {
+          return reject();
+        }
+        const patches = encodedPatches.map((encoded) => {
+          const rgba = new Uint8Array(encoded.pixelCount * 4);
+          let runOffset = encoded.runsStart;
+          let destination = 0;
+          while (runOffset < encoded.runsEnd) {
+            const count = readU16LE(payload, runOffset);
+            const paletteIndex = payload[runOffset + 2] ?? 0;
+            const colorOffset = paletteStart + paletteIndex * 4;
+            const red = payload[colorOffset] ?? 0;
+            const green = payload[colorOffset + 1] ?? 0;
+            const blue = payload[colorOffset + 2] ?? 0;
+            const alpha = payload[colorOffset + 3] ?? 0;
+            for (let pixel = 0; pixel < count; pixel += 1) {
+              rgba[destination] = red;
+              rgba[destination + 1] = green;
+              rgba[destination + 2] = blue;
+              rgba[destination + 3] = alpha;
+              destination += 4;
+            }
+            runOffset += 3;
+          }
+          return {
+            x: encoded.x,
+            y: encoded.y,
+            width: encoded.width,
+            height: encoded.height,
+            rgba
+          };
+        });
+        const message = { kind: "fb:patch-batch", patches };
+        host.postToMain(message);
+        return { ok: true, value: payload.byteLength };
+      }
     };
   }
 });
@@ -190,12 +457,14 @@ __export(block_exports, {
   BLOCK_DRIVER_ID: () => BLOCK_DRIVER_ID,
   BLOCK_SIZE: () => BLOCK_SIZE,
   BlockDriver: () => BlockDriver,
+  BlockImageState: () => BlockImageState,
   DEFAULT_BLOCK_COUNT: () => DEFAULT_BLOCK_COUNT,
   EINVAL: () => EINVAL,
   EIO: () => EIO,
   ENOSPC: () => ENOSPC,
   OP_BLOCK_COUNT: () => OP_BLOCK_COUNT,
   OP_FLUSH: () => OP_FLUSH,
+  OP_IMAGE_STATE: () => OP_IMAGE_STATE,
   OP_READ: () => OP_READ,
   OP_WRITE: () => OP_WRITE,
   PMOS_IMG_FILENAME: () => PMOS_IMG_FILENAME
@@ -216,7 +485,12 @@ function isQuotaExceeded(e) {
   const cand = e;
   return cand.name === "QuotaExceededError";
 }
-var BLOCK_DRIVER_ID, BLOCK_SIZE, ENOSPC, EIO, EINVAL, DEFAULT_BLOCK_COUNT, OP_BLOCK_COUNT, OP_READ, OP_WRITE, OP_FLUSH, PMOS_IMG_FILENAME, BlockDriver;
+function isNotFound(e) {
+  if (typeof e !== "object" || e === null) return false;
+  const cand = e;
+  return cand.name === "NotFoundError";
+}
+var BLOCK_DRIVER_ID, BLOCK_SIZE, ENOSPC, EIO, EINVAL, DEFAULT_BLOCK_COUNT, OP_BLOCK_COUNT, OP_READ, OP_WRITE, OP_FLUSH, OP_IMAGE_STATE, BlockImageState, PMOS_IMG_FILENAME, BlockDriver;
 var init_block = __esm({
   "src/drivers/block.ts"() {
     "use strict";
@@ -232,12 +506,21 @@ var init_block = __esm({
     OP_READ = 2;
     OP_WRITE = 3;
     OP_FLUSH = 4;
+    OP_IMAGE_STATE = 5;
+    BlockImageState = {
+      Existing: 0,
+      NewlyCreated: 1
+    };
     PMOS_IMG_FILENAME = "pmos.img";
     BlockDriver = class _BlockDriver {
-      constructor(handle, blockCount) {
+      constructor(handle, blockCount, imageState) {
         this.handle = handle;
         this.blockCount = blockCount;
+        this.imageState = imageState;
       }
+      handle;
+      blockCount;
+      imageState;
       driverId = BLOCK_DRIVER_ID;
       name = "block";
       /**
@@ -245,36 +528,49 @@ var init_block = __esm({
        * Creates `pmos.img` if it doesn't exist; pre-sizes it to
        * `blockCount * BLOCK_SIZE` bytes so the kernel sees a
        * fixed-size device. Idempotent: reopening an existing
-       * `pmos.img` keeps its contents (the kernel reads the
-       * superblock and either mounts the existing FS or runs mkfs
-       * if the image is freshly zeroed).
+       * `pmos.img` keeps its contents and reports `Existing`; only
+       * creating the file in this call reports `NewlyCreated`.
        *
        * In tests, `rootOverride` lets a fake `OpfsRoot` stand in
        * for `navigator.storage.getDirectory()`.
        */
       static async openInOpfs(blockCount = DEFAULT_BLOCK_COUNT, rootOverride) {
         const root = rootOverride ?? await navigator.storage.getDirectory();
-        const file = await root.getFileHandle(PMOS_IMG_FILENAME, { create: true });
+        let file;
+        let imageState;
+        try {
+          file = await root.getFileHandle(PMOS_IMG_FILENAME);
+          imageState = BlockImageState.Existing;
+        } catch (e) {
+          if (!isNotFound(e)) throw e;
+          file = await root.getFileHandle(PMOS_IMG_FILENAME, { create: true });
+          imageState = BlockImageState.NewlyCreated;
+        }
         const handle = await file.createSyncAccessHandle();
+        if (imageState === BlockImageState.NewlyCreated && handle.getSize() !== 0) {
+          imageState = BlockImageState.Existing;
+        }
         const expectedSize = blockCount * BLOCK_SIZE;
         if (handle.getSize() < expectedSize) {
           handle.truncate(expectedSize);
         }
-        return new _BlockDriver(handle, blockCount);
+        return new _BlockDriver(handle, blockCount, imageState);
       }
       /**
        * Test seam: construct a `BlockDriver` with a pre-built
        * `SyncAccessHandle`. Tests use this with the in-memory
        * `MemSyncAccessHandle` from `web/tests/unit/block.test.ts` so
        * the driver behaviour can be exercised without touching the
-       * real OPFS surface (which jsdom doesn't expose).
+       * real OPFS surface (which jsdom doesn't expose). The safe
+       * default is `Existing`; first-boot tests must opt into
+       * `NewlyCreated` explicitly.
        */
-      static withHandle(handle, blockCount = DEFAULT_BLOCK_COUNT) {
+      static withHandle(handle, blockCount = DEFAULT_BLOCK_COUNT, imageState = BlockImageState.Existing) {
         const expectedSize = blockCount * BLOCK_SIZE;
         if (handle.getSize() < expectedSize) {
           handle.truncate(expectedSize);
         }
-        return new _BlockDriver(handle, blockCount);
+        return new _BlockDriver(handle, blockCount, imageState);
       }
       init(_host) {
       }
@@ -288,6 +584,8 @@ var init_block = __esm({
             return this.write(payload);
           case OP_FLUSH:
             return this.flushOp();
+          case OP_IMAGE_STATE:
+            return { ok: true, value: this.imageState };
           default:
             return { ok: false, error: DriverErrorCode.Transport };
         }
@@ -341,7 +639,10 @@ var init_block = __esm({
         const offset = lba * BLOCK_SIZE;
         const src = new Uint8Array(payload.buffer, payload.byteOffset + 8, BLOCK_SIZE);
         try {
-          this.handle.write(src, { at: offset });
+          const n = this.handle.write(src, { at: offset });
+          if (n !== BLOCK_SIZE) {
+            return { ok: false, error: DriverErrorCode.Errno, errno: EIO };
+          }
           return { ok: true, value: BLOCK_SIZE };
         } catch (e) {
           const errno = isQuotaExceeded(e) ? ENOSPC : EIO;
@@ -382,7 +683,11 @@ function defaultFetcher(url, init) {
   const reqInit = {};
   if (init?.method !== void 0) reqInit.method = init.method;
   if (init?.headers !== void 0) reqInit.headers = init.headers;
-  if (init?.body !== void 0) reqInit.body = init.body;
+  if (init?.body !== void 0) {
+    const body = new Uint8Array(init.body.byteLength);
+    body.set(init.body);
+    reqInit.body = body.buffer;
+  }
   return globalThis.fetch(url, reqInit).then(async (r) => {
     const headers = {};
     r.headers.forEach((v, k) => {
@@ -429,6 +734,8 @@ var init_net = __esm({
         this.fetcher = fetcher;
         this.wsFactory = wsFactory;
       }
+      fetcher;
+      wsFactory;
       driverId = NET_DRIVER_ID;
       name = "net";
       fetches = /* @__PURE__ */ new Map();
@@ -885,21 +1192,11 @@ function bootKernelWorker(options) {
 
 // src/kernel-wasm-host.ts
 init_platform_constants();
+init_sab_layout();
 
-// src/shared/sab-layout.ts
-var SAB_SIZE = 65536;
-var OFF_REQ_HEAD = 0;
-var OFF_REQ_TAIL = 4;
-var OFF_RES_HEAD = 8;
-var OFF_RES_TAIL = 12;
-var OFF_USER_WAIT_SLOT = 16;
-var OFF_REQ_RING = 64;
-var OFF_RES_RING = 16384;
-var OFF_HEAP_SCRATCH = 32768;
-var HEAP_SCRATCH_BYTES = 32768;
-var REQ_SLOT_COUNT = 510;
-var RES_SLOT_COUNT = 510;
-var STATUS_READY = 3;
+// src/shared/worker-proto.ts
+var HOST_FILE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
+var HOST_FILE_IMPORT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 
 // src/shared/syscall.ts
 var SLOT_SIZE = 32;
@@ -965,6 +1262,10 @@ var OP_EXT = {
   IPC_LISTEN: 4098,
   IPC_CONNECT: 4099,
   IPC_ACCEPT: 4100,
+  /** Send a bounded byte payload and, optionally, one duplicated fd. */
+  IPC_SEND: 4101,
+  /** Receive a bounded byte payload and, optionally, one installed fd. */
+  IPC_RECV: 4102,
   /** Wire-format identity for `ipc_pipe`. Create a pipe pair: the
    * kernel allocates two fds on the caller — a PipeRead at
    * heap[0..4] and a PipeWrite at heap[4..8] — and returns success
@@ -978,6 +1279,9 @@ var OP_EXT = {
    * propagates to the other (reader closed → subsequent writes
    * EPIPE; writer closed → subsequent reads see (0, []) EOF). */
   IPC_PIPE: 4103,
+  /** Kernel-authenticated capability snapshot for the process on the
+   * other end of a connected IPC socket (`SO_PEERCRED` equivalent). */
+  IPC_PEER_CAPS: 4104,
   PROC_SPAWN: 4352,
   PROC_SELF: 4355,
   PROC_PARENT: 4356,
@@ -987,7 +1291,12 @@ var OP_EXT = {
   DISPLAY_CONNECT: 4608,
   DISPLAY_BIND: 4609,
   CAP_CHECK: 4864,
-  CAP_LIST: 4865
+  CAP_LIST: 4865,
+  FS_WATCH: 5122,
+  FS_CHMOD: 5123,
+  HOST_FILE_RECV: 5376,
+  HOST_FILE_PICK: 5377,
+  HOST_FILE_SEND: 5378
 };
 var ERRNO = {
   EAGAIN: 6,
@@ -999,11 +1308,16 @@ var ERRNO = {
   ECHILD: 9,
   ECONNREFUSED: 14,
   EEXIST: 20,
+  /** Bad address: a user pointer range crosses linear-memory bounds. */
+  EFAULT: 21,
   /** Interrupted function. Surfaced on a blocking syscall
    * (currently only `ipc_accept` with `flags=0`) when a signal
    * interrupts the park. Mirrors `abi::errno::EINTR`. */
   EINTR: 27,
   EINVAL: 28,
+  /** I/O error. Used when a transport/backend violates an I/O byte-count
+   * contract. Mirrors `abi::errno::EIO`. */
+  EIO: 29,
   EISDIR: 31,
   /** Too many levels of symbolic links. Returned from path
    * resolution when a symlink chain exceeds SYMLOOP_MAX (40).
@@ -1050,72 +1364,228 @@ var CAP = {
   MOUNT: 7,
   CAP_GRANT: 8,
   DEV_BLOCK: 9,
-  KEYMAP_ADMIN: 10
+  KEYMAP_ADMIN: 10,
+  PROC_INSPECT: 11,
+  HOST_TRANSFER: 12
 };
 function capBit(cap) {
   return 1n << BigInt(cap);
 }
+var SPAWN_V1_MAGIC = 827215955;
+var SPAWN_V1_VERSION = 1;
+var SPAWN_V1_HEADER_LEN = 48;
+var SPAWN_V1_MAX_BYTES = 32768;
+var SPAWN_FLAG_CWD = 1;
+var SPAWN_FLAG_CAPS = 2;
+var SPAWN_KNOWN_FLAGS = SPAWN_FLAG_CWD | SPAWN_FLAG_CAPS;
+var SPAWN_INHERIT_FD = -1;
+var SPAWN_FIRST_DYNAMIC_FD = 5;
+var SPAWN_FD_SOFT_LIMIT = 1024;
 function encodeSpawnManifest(manifest) {
   const enc = new TextEncoder();
-  const pathBytes = enc.encode(manifest.path);
-  let argvBytes = new Uint8Array(0);
-  if (manifest.argv !== void 0 && manifest.argv.length > 0) {
-    const parts = manifest.argv.map((s) => enc.encode(s));
-    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
-    if (totalLen > 65535) {
-      throw new RangeError(
-        `encodeSpawnManifest: argv buf size ${totalLen} exceeds u16 max (65535)`
-      );
+  const encodeText = (label, value, allowEmpty) => {
+    if (!allowEmpty && value.length === 0 || value.includes("\0")) {
+      throw new RangeError(`encodeSpawnManifest: invalid ${label}`);
     }
-    argvBytes = new Uint8Array(totalLen);
-    let off = 0;
-    for (const part of parts) {
-      argvBytes.set(part, off);
-      argvBytes[off + part.length] = 0;
-      off += part.length + 1;
+    const bytes = enc.encode(value);
+    if (bytes.length > 65535) {
+      throw new RangeError(`encodeSpawnManifest: ${label} exceeds u16 length`);
     }
+    return bytes;
+  };
+  const validateFd = (label, fd) => {
+    if (fd === void 0) return SPAWN_INHERIT_FD;
+    if (!Number.isSafeInteger(fd) || fd < 0 || fd > 2147483647) {
+      throw new RangeError(`encodeSpawnManifest: invalid ${label} ${fd}`);
+    }
+    return fd;
+  };
+  if (!manifest.path.startsWith("/")) {
+    throw new RangeError("encodeSpawnManifest: path must be absolute");
   }
-  let envpBytes = new Uint8Array(0);
-  if (manifest.envp !== void 0 && manifest.envp.length > 0) {
-    const parts = manifest.envp.map(([k, v]) => {
-      if (k.includes("=")) {
-        throw new RangeError(
-          `encodeSpawnManifest: envp key ${JSON.stringify(k)} contains '=' (forbidden by the wire format)`
-        );
-      }
-      return enc.encode(`${k}=${v}`);
-    });
-    const totalLen = parts.reduce((sum, p) => sum + p.length + 1, 0);
-    if (totalLen > 65535) {
-      throw new RangeError(
-        `encodeSpawnManifest: envp buf size ${totalLen} exceeds u16 max (65535)`
-      );
+  if (manifest.cwd !== void 0 && !manifest.cwd.startsWith("/")) {
+    throw new RangeError("encodeSpawnManifest: cwd must be absolute");
+  }
+  const path = encodeText("path", manifest.path, false);
+  const cwd = manifest.cwd === void 0 ? new Uint8Array(0) : encodeText("cwd", manifest.cwd, false);
+  const argv = (manifest.argv ?? []).map(
+    (arg, index) => encodeText(`argv[${index}]`, arg, true)
+  );
+  const envp = (manifest.envp ?? []).map(([key, value], index) => {
+    if (key.includes("=")) {
+      throw new RangeError(`encodeSpawnManifest: envp[${index}] key contains '='`);
     }
-    envpBytes = new Uint8Array(totalLen);
-    let off = 0;
-    for (const part of parts) {
-      envpBytes.set(part, off);
-      envpBytes[off + part.length] = 0;
-      off += part.length + 1;
+    return [
+      encodeText(`envp[${index}] key`, key, false),
+      encodeText(`envp[${index}] value`, value, true)
+    ];
+  });
+  const extraFds = manifest.extraFds ?? [];
+  if (argv.length > 65535 || envp.length > 65535 || extraFds.length > 65535) {
+    throw new RangeError("encodeSpawnManifest: entry count exceeds u16");
+  }
+  const childFds = /* @__PURE__ */ new Set();
+  for (const [parentFd, childFd] of extraFds) {
+    validateFd("extra parent fd", parentFd);
+    validateFd("extra child fd", childFd);
+    if (childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT) {
+      throw new RangeError(`encodeSpawnManifest: reserved/out-of-range child fd ${childFd}`);
     }
+    if (childFds.has(childFd)) {
+      throw new RangeError(`encodeSpawnManifest: duplicate child fd ${childFd}`);
+    }
+    childFds.add(childFd);
+  }
+  const bodyLen = path.length + cwd.length + argv.reduce((sum, arg) => sum + 2 + arg.length, 0) + envp.reduce((sum, [key, value]) => sum + 4 + key.length + value.length, 0) + extraFds.length * 8;
+  const totalLen = SPAWN_V1_HEADER_LEN + bodyLen;
+  if (totalLen > SPAWN_V1_MAX_BYTES) {
+    throw new RangeError(`encodeSpawnManifest: blob size ${totalLen} exceeds ${SPAWN_V1_MAX_BYTES}`);
+  }
+  const heap = new Uint8Array(totalLen);
+  const header = new DataView(heap.buffer);
+  const flags = (manifest.cwd === void 0 ? 0 : SPAWN_FLAG_CWD) | (manifest.caps === void 0 ? 0 : SPAWN_FLAG_CAPS);
+  header.setUint32(0, SPAWN_V1_MAGIC, true);
+  header.setUint16(4, SPAWN_V1_VERSION, true);
+  header.setUint16(6, flags, true);
+  header.setUint32(8, totalLen, true);
+  header.setUint16(12, path.length, true);
+  header.setUint16(14, cwd.length, true);
+  header.setUint16(16, argv.length, true);
+  header.setUint16(18, envp.length, true);
+  header.setUint16(20, extraFds.length, true);
+  header.setInt32(24, validateFd("stdin fd", manifest.stdinFd), true);
+  header.setInt32(28, validateFd("stdout fd", manifest.stdoutFd), true);
+  header.setInt32(32, validateFd("stderr fd", manifest.stderrFd), true);
+  header.setBigUint64(40, manifest.caps ?? 0n, true);
+  let offset = SPAWN_V1_HEADER_LEN;
+  const put = (bytes) => {
+    heap.set(bytes, offset);
+    offset += bytes.length;
+  };
+  const putU16 = (value) => {
+    new DataView(heap.buffer).setUint16(offset, value, true);
+    offset += 2;
+  };
+  const putU32 = (value) => {
+    new DataView(heap.buffer).setUint32(offset, value, true);
+    offset += 4;
+  };
+  put(path);
+  put(cwd);
+  for (const arg of argv) {
+    putU16(arg.length);
+    put(arg);
+  }
+  for (const [key, value] of envp) {
+    putU16(key.length);
+    putU16(value.length);
+    put(key);
+    put(value);
+  }
+  for (const [parentFd, childFd] of extraFds) {
+    putU32(parentFd);
+    putU32(childFd);
+  }
+  if (offset !== totalLen) {
+    throw new Error("encodeSpawnManifest: internal length mismatch");
+  }
+  return encodeSpawnManifestBlob(heap);
+}
+function encodeSpawnManifestBlob(blob) {
+  if (!isValidSpawnManifestBlob(blob)) {
+    throw new RangeError("encodeSpawnManifestBlob: malformed spawn manifest");
   }
   const args = new Uint8Array(16);
   const view = new DataView(args.buffer);
-  view.setUint32(0, pathBytes.length, true);
-  view.setBigUint64(4, manifest.caps, true);
-  view.setUint16(12, argvBytes.length, true);
-  view.setUint16(14, envpBytes.length, true);
-  const heap = new Uint8Array(pathBytes.length + argvBytes.length + envpBytes.length);
-  heap.set(pathBytes, 0);
-  heap.set(argvBytes, pathBytes.length);
-  heap.set(envpBytes, pathBytes.length + argvBytes.length);
-  return { args, heap };
+  view.setUint32(0, SPAWN_V1_MAGIC, true);
+  view.setUint32(4, blob.length, true);
+  view.setUint16(8, SPAWN_V1_VERSION, true);
+  return { args, heap: blob.slice() };
+}
+function isValidSpawnManifestBlob(blob) {
+  if (blob.length < SPAWN_V1_HEADER_LEN || blob.length > SPAWN_V1_MAX_BYTES) return false;
+  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  if (view.getUint32(0, true) !== SPAWN_V1_MAGIC || view.getUint16(4, true) !== SPAWN_V1_VERSION || view.getUint32(8, true) !== blob.length || view.getUint16(22, true) !== 0 || view.getUint32(36, true) !== 0) return false;
+  const flags = view.getUint16(6, true);
+  if ((flags & ~SPAWN_KNOWN_FLAGS) !== 0) return false;
+  const pathLen = view.getUint16(12, true);
+  const cwdLen = view.getUint16(14, true);
+  const argc = view.getUint16(16, true);
+  const envc = view.getUint16(18, true);
+  const extraCount = view.getUint16(20, true);
+  if ((flags & SPAWN_FLAG_CWD) === 0 !== (cwdLen === 0)) return false;
+  if ((flags & SPAWN_FLAG_CAPS) === 0 && view.getBigUint64(40, true) !== 0n) return false;
+  for (const offset2 of [24, 28, 32]) {
+    if (view.getInt32(offset2, true) < SPAWN_INHERIT_FD) return false;
+  }
+  const utf8 = new TextDecoder("utf-8", { fatal: true });
+  let offset = SPAWN_V1_HEADER_LEN;
+  const take = (length, allowEmpty) => {
+    if (!allowEmpty && length === 0 || offset + length > blob.length) return null;
+    const bytes = blob.subarray(offset, offset + length);
+    offset += length;
+    if (bytes.includes(0)) return null;
+    try {
+      utf8.decode(bytes);
+    } catch {
+      return null;
+    }
+    return bytes;
+  };
+  const readU16 = () => {
+    if (offset + 2 > blob.length) return null;
+    const value = view.getUint16(offset, true);
+    offset += 2;
+    return value;
+  };
+  const readU32 = () => {
+    if (offset + 4 > blob.length) return null;
+    const value = view.getUint32(offset, true);
+    offset += 4;
+    return value;
+  };
+  const path = take(pathLen, false);
+  if (path === null || utf8.decode(path)[0] !== "/") return false;
+  if (cwdLen > 0) {
+    const cwd = take(cwdLen, false);
+    if (cwd === null || utf8.decode(cwd)[0] !== "/") return false;
+  }
+  for (let i = 0; i < argc; i++) {
+    const len = readU16();
+    if (len === null || take(len, true) === null) return false;
+  }
+  const envKeys = /* @__PURE__ */ new Set();
+  for (let i = 0; i < envc; i++) {
+    const keyLen = readU16();
+    const valueLen = readU16();
+    if (keyLen === null || valueLen === null) return false;
+    const key = take(keyLen, false);
+    const value = take(valueLen, true);
+    if (key === null || value === null) return false;
+    const decoded = utf8.decode(key);
+    if (decoded.includes("=") || envKeys.has(decoded)) return false;
+    envKeys.add(decoded);
+  }
+  const childFds = /* @__PURE__ */ new Set();
+  for (let i = 0; i < extraCount; i++) {
+    const parentFd = readU32();
+    const childFd = readU32();
+    if (parentFd === null || childFd === null || childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT || childFds.has(childFd)) return false;
+    childFds.add(childFd);
+  }
+  return offset === blob.length;
 }
 var CAPSET_ALL = 0xffffffffffffffffn;
-var CAPSET_DESKTOP_SHELL = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.SHELL) | capBit(CAP.PROC_ENUMERATE) | capBit(CAP.KEYMAP_ADMIN);
+var CAPSET_DESKTOP_SHELL = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.SHELL) | capBit(CAP.PROC_ENUMERATE) | capBit(CAP.PROC_KILL_ANY) | capBit(CAP.KEYMAP_ADMIN) | capBit(CAP.HOST_TRANSFER);
 var CAPSET_ORDINARY_APP = capBit(CAP.DISPLAY_CLIENT);
+var CAPSET_FILES = capBit(CAP.DISPLAY_CLIENT) | capBit(CAP.HOST_TRANSFER);
 
 // src/kernel-wasm-host.ts
+var NO_POLL_TIMEOUT_NS = 0xffffffffffffffffn;
+function pollTimeoutMs(timeoutNs) {
+  if (timeoutNs === NO_POLL_TIMEOUT_NS) return void 0;
+  return Math.max(0, Number(timeoutNs) / 1e6);
+}
 var KernelWasmHost = class _KernelWasmHost {
   // Note: the class deliberately does NOT retain the caller's
   // `KernelWasmHostOptions` past construction. Every field of that
@@ -1129,6 +1599,8 @@ var KernelWasmHost = class _KernelWasmHost {
     this.wakeBuffer = wakeBuffer;
     this.wakeView = new Int32Array(wakeBuffer, 0, 8);
   }
+  exports;
+  wakeBuffer;
   /** `Int32Array` view over [`wakeBuffer`]; index 0 is the wake slot. */
   wakeView;
   /**
@@ -1142,8 +1614,8 @@ var KernelWasmHost = class _KernelWasmHost {
     let memory;
     const binaryRegistry = options.binaryRegistry;
     const kernelWorkerChannel = options.kernelWorkerChannel;
-    const resolvedOnSpawnProcess = options.onSpawnProcess ?? (binaryRegistry !== void 0 && kernelWorkerChannel !== void 0 ? (pid, path) => {
-      const bytes = binaryRegistry.get(path);
+    const resolvedOnSpawnProcess = options.onSpawnProcess ?? (binaryRegistry !== void 0 && kernelWorkerChannel !== void 0 ? (pid, path, executable) => {
+      const bytes = executable ?? binaryRegistry.get(path);
       if (bytes === void 0) {
         return { ok: false, errno: ERRNO.ENOENT };
       }
@@ -1158,6 +1630,24 @@ var KernelWasmHost = class _KernelWasmHost {
         wasmBytes: wasmBytes2
       });
       return { ok: true };
+    } : void 0);
+    const resolvedOnTerminateProcess = options.onTerminateProcess ?? (kernelWorkerChannel !== void 0 ? (pid) => {
+      kernelWorkerChannel.postMessage({
+        kind: "proc:terminate",
+        pid,
+        signal: 9
+      });
+    } : void 0);
+    const resolvedOnHostFilePicker = options.onHostFilePicker ?? (kernelWorkerChannel !== void 0 ? () => {
+      kernelWorkerChannel.postMessage({ kind: "host:pick" });
+    } : void 0);
+    const resolvedOnHostDownload = options.onHostDownload ?? (kernelWorkerChannel !== void 0 ? (name, mime, bytes) => {
+      kernelWorkerChannel.postMessage({
+        kind: "host:download",
+        name,
+        mime,
+        bytes
+      });
     } : void 0);
     const randomBytes = options.randomBytes ?? ((out) => {
       crypto.getRandomValues(out);
@@ -1283,14 +1773,64 @@ var KernelWasmHost = class _KernelWasmHost {
           const message = new TextDecoder().decode(bytes);
           onPanic(message);
         },
-        pmos_host_spawn_process: (pid, pathPtr, pathLen) => {
+        pmos_host_spawn_process: (pid, pathPtr, pathLen, executablePtr, executableLen) => {
           if (memory === void 0) return 0;
+          if (pathPtr < 0 || pathLen < 0 || pathPtr + pathLen > memory.buffer.byteLength || executablePtr < 0 || executableLen < 0 || executablePtr + executableLen > memory.buffer.byteLength) {
+            return 1;
+          }
           const pathBytes = new Uint8Array(memory.buffer, pathPtr, pathLen);
           const path = new TextDecoder().decode(pathBytes);
+          const executable = executablePtr === 0 ? void 0 : new Uint8Array(
+            memory.buffer,
+            executablePtr,
+            executableLen
+          ).slice();
           if (resolvedOnSpawnProcess === void 0) return 0;
-          const outcome = resolvedOnSpawnProcess(pid, path);
+          let outcome;
+          try {
+            outcome = resolvedOnSpawnProcess(pid, path, executable);
+          } catch {
+            return 1;
+          }
           if (outcome.ok) return 0;
           return -outcome.errno;
+        },
+        pmos_host_terminate_process: (pid) => {
+          if (resolvedOnTerminateProcess === void 0) return 1;
+          try {
+            resolvedOnTerminateProcess(pid);
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        pmos_host_file_picker: () => {
+          if (resolvedOnHostFilePicker === void 0) return 1;
+          try {
+            resolvedOnHostFilePicker();
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+        pmos_host_download_file: (namePtr, nameLen, mimePtr, mimeLen, bytesPtr, bytesLen) => {
+          if (memory === void 0 || resolvedOnHostDownload === void 0) return 1;
+          try {
+            const decoder = new TextDecoder("utf-8", { fatal: true });
+            const name = decoder.decode(
+              new Uint8Array(memory.buffer, namePtr, nameLen)
+            );
+            const mime = decoder.decode(
+              new Uint8Array(memory.buffer, mimePtr, mimeLen)
+            );
+            const bytes = new Uint8Array(
+              new Uint8Array(memory.buffer, bytesPtr, bytesLen)
+            );
+            resolvedOnHostDownload(name, mime, bytes);
+            return 0;
+          } catch {
+            return 1;
+          }
         }
       }
     };
@@ -1333,13 +1873,20 @@ var KernelWasmHost = class _KernelWasmHost {
       throw new Error(`KernelWasmHost.installConsoleFd(${pid}, ${fd}): rc=${rc}`);
     }
   }
+  /** Install the WASI `/` directory preopen at `fd`. */
+  installRootPreopenFd(pid, fd) {
+    const rc = this.exports.kernel_install_root_preopen_fd(pid, fd);
+    if (rc !== 0) {
+      throw new Error(`KernelWasmHost.installRootPreopenFd(${pid}, ${fd}): rc=${rc}`);
+    }
+  }
   /**
    * Install `FdObject::SignalChannel` at `fd` in `pid`'s fd table.
    * Companion to {@link installConsoleFd}; gives host-side tests
    * a way to stage the per-process signal channel on a pid
    * that was created via `registerProcess` (which deliberately
    * does not auto-install, unlike proc_spawn'd children which
-   * get fd 3 = SignalChannel for free).
+   * get fd 4 = SignalChannel for free).
    */
   installSignalChannelFd(pid, fd) {
     const rc = this.exports.kernel_install_signal_channel_fd(pid, fd);
@@ -1360,6 +1907,25 @@ var KernelWasmHost = class _KernelWasmHost {
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.markRunning(${pid}): rc=${rc}`);
     }
+  }
+  /**
+   * Make a host-observed Worker return/trap authoritative in the
+   * kernel. Returns `true` when the pid was known (including an
+   * idempotent acknowledgement of an already-terminal process) and
+   * `false` for a stale/unknown pid.
+   */
+  reconcileProcessExit(pid, code, crashed) {
+    const rc = this.exports.kernel_reconcile_process_exit(
+      pid,
+      code,
+      crashed ? 1 : 0
+    );
+    if (rc < 0) {
+      throw new Error(
+        `KernelWasmHost.reconcileProcessExit(${pid}, ${code}): rc=${rc}`
+      );
+    }
+    return rc === 0;
   }
   recordProcessMemory(pid, bytes) {
     if (!Number.isFinite(bytes) || bytes < 0 || !Number.isSafeInteger(bytes)) {
@@ -1388,6 +1954,81 @@ var KernelWasmHost = class _KernelWasmHost {
    */
   syncAll() {
     return this.exports.kernel_sync_all() === 0;
+  }
+  /**
+   * Register a host-imported file in the kernel's host-file table.
+   * The bootstrap-side drag-drop / file-picker handler calls this
+   * with the token it has assigned to the host `File`, the file's
+   * name + mime, and the raw bytes the user dropped. A subsequent
+   * userland `host_file_recv(token)` (extension opcode 0x1500)
+   * consumes the entry and hands the bytes to the calling process
+   * as a read-only fd.
+   *
+   * Metadata is copied once, then bytes are copied through repeated bounded
+   * scratch windows. The kernel reserves the declared size before accepting
+   * chunks, so files up to the shared 16 MiB import limit do not depend on
+   * the 64 KiB syscall scratch size.
+   */
+  hostFileDropped(token, name, mime, bytes) {
+    const enc = new TextEncoder();
+    const nameBytes = enc.encode(name);
+    const mimeBytes = enc.encode(mime);
+    const heapLen = this.exports.kernel_heap_len();
+    if (nameBytes.length + mimeBytes.length > heapLen || bytes.length > HOST_FILE_IMPORT_MAX_BYTES) {
+      console.warn(
+        `[pmos-kernel-worker] rejected host import token=${token}: metadata=${nameBytes.length + mimeBytes.length}, bytes=${bytes.length}`
+      );
+      return false;
+    }
+    const heapPtr = this.exports.kernel_heap_ptr();
+    let view = new Uint8Array(
+      this.exports.memory.buffer,
+      heapPtr,
+      nameBytes.length + mimeBytes.length
+    );
+    view.set(nameBytes, 0);
+    view.set(mimeBytes, nameBytes.length);
+    const begin = this.exports.kernel_host_file_drop_begin(
+      token,
+      nameBytes.length,
+      mimeBytes.length,
+      bytes.length
+    );
+    if (begin !== 0) {
+      console.warn(
+        `[pmos-kernel-worker] rejected host import token=${token} at begin: rc=${begin}`
+      );
+      return false;
+    }
+    for (let offset = 0; offset < bytes.length; offset += heapLen) {
+      const chunk = bytes.subarray(offset, Math.min(offset + heapLen, bytes.length));
+      view = new Uint8Array(this.exports.memory.buffer, heapPtr, chunk.length);
+      view.set(chunk);
+      const chunkRc = this.exports.kernel_host_file_drop_chunk(
+        token,
+        chunk.length
+      );
+      if (chunkRc !== 0) {
+        this.exports.kernel_host_file_drop_abort(token);
+        console.warn(
+          `[pmos-kernel-worker] rejected host import token=${token} at offset=${offset}: rc=${chunkRc}`
+        );
+        return false;
+      }
+    }
+    const end = this.exports.kernel_host_file_drop_end(token);
+    if (end !== 0) {
+      this.exports.kernel_host_file_drop_abort(token);
+      console.warn(
+        `[pmos-kernel-worker] rejected host import token=${token} at end: rc=${end}`
+      );
+      return false;
+    }
+    console.info(
+      `[pmos-kernel-worker] accepted host import token=${token} bytes=${bytes.length}`
+    );
+    this.notifyDispatchLoop();
+    return true;
   }
   /**
    * Test-only: spawn a child process of `parent` with
@@ -1664,7 +2305,7 @@ var KernelWasmHost = class _KernelWasmHost {
         flags: decoded.flags,
         requestId: decoded.requestId,
         args: decoded.args,
-        heapPtr: 0,
+        heapPtr: decoded.heapPtr,
         heapLen: decoded.heapLen
       },
       heapIn
@@ -1740,24 +2381,54 @@ var KernelWasmHost = class _KernelWasmHost {
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.injectInput: ${fnName} returned ${rc}`);
     }
+    this.notifyDispatchLoop();
+  }
+  /**
+   * Publish browser-substrate work to the kernel dispatch loop. Host input
+   * and completed file imports both mutate kernel queues outside a user
+   * process's SAB request path, so neither has a user Worker available to
+   * bump the shared wake counter on its behalf.
+   */
+  /**
+   * Notify the steady-state dispatcher after work arrives outside a user
+   * process's syscall ring. Kernel-worker lifecycle messages use this for
+   * newly published SABs and host-reconciled exits; both can otherwise leave
+   * runnable work or a parked parent's completion behind an existing
+   * `Atomics.waitAsync` epoch.
+   */
+  notifyDispatchLoop() {
+    if (typeof SharedArrayBuffer !== "undefined" && this.wakeBuffer instanceof SharedArrayBuffer) {
+      Atomics.add(this.wakeView, 0, 1);
+      Atomics.notify(this.wakeView, 0);
+    } else {
+      this.wakeView[0] = this.wakeView[0] + 1 | 0;
+    }
   }
   // ---- dispatch loop -------------------------------------------------
   /**
    * Shared kernel wake slot. 32 bytes backed by a `SharedArrayBuffer`
    * when the environment allows; a plain `ArrayBuffer` otherwise
    * (vitest under node). Every user Worker's `SabBackend` and the
-   * main thread's `injectInput` routing bumps `index 0` via
-   * `Atomics.add` + `Atomics.notify` so the kernel's dispatch loop
-   * wakes from its `Atomics.waitAsync` park.
+   * browser-substrate event routing bumps `index 0` via `Atomics.add` +
+   * `Atomics.notify` so the kernel's dispatch loop wakes from its
+   * `Atomics.waitAsync` park.
    *
    * The slot is semantically "wake counter": notifiers increment it,
    * the parker reads it before waiting, and a spurious-wake-free
    * park returns as soon as the counter changes. Production code
-   * should NEVER mutate the counter directly — use `Atomics.add` +
-   * `Atomics.notify` via a helper when that helper lands in T234.
+   * should NEVER mutate the counter directly — use
+   * [`notifyDispatchLoop`] for host-side work.
    */
   get wakeSlot() {
     return this.wakeView;
+  }
+  /** Re-check the kernel's bounded parked `poll_oneoff` sets. */
+  servicePollWaiters() {
+    return this.exports.kernel_service_poll_waiters();
+  }
+  /** Nanoseconds to the nearest poll clock, or `u64::MAX` for fd-only waits. */
+  nextPollTimeoutNs() {
+    return BigInt.asUintN(64, this.exports.kernel_next_poll_timeout_ns());
   }
   /**
    * Round-robin dispatch loop. Services every live pid's SAB ring up
@@ -1774,7 +2445,12 @@ var KernelWasmHost = class _KernelWasmHost {
    * lifecycle change at the start of the next pass.
    *
    * `parkFn` defaults to a `SharedArrayBuffer`-backed
-   * `Atomics.waitAsync` on the shared wake slot with a 50 ms timeout.
+   * `Atomics.waitAsync` on the shared wake slot. Fd-only waits are indefinite;
+   * a poll clock supplies the nearest real deadline.
+   * The loop snapshots the wake counter before scanning any rings and
+   * passes that epoch to the parker. A notifier racing with the scan then
+   * makes the wait return `not-equal` instead of being hidden by a fresh
+   * post-scan load and sleeping until the timeout.
    * Under vitest (no cross-origin-isolated context), tests pass a
    * microtask-yield stub so the loop never actually blocks — the
    * test seeds the rings synchronously anyway.
@@ -1785,9 +2461,16 @@ var KernelWasmHost = class _KernelWasmHost {
    */
   async startDispatchLoop(args) {
     const budget = args.budget ?? 8;
-    const parkFn = args.parkFn ?? (() => this.defaultPark());
+    const passesBeforeTaskYield = Math.max(
+      1,
+      Math.trunc(args.passesBeforeTaskYield ?? 4)
+    );
+    const parkFn = args.parkFn ?? ((observedWake, timeoutMs) => this.defaultPark(observedWake, timeoutMs));
+    const taskYieldFn = args.taskYieldFn ?? (() => this.yieldToWorkerMessages());
     const haveSharedArrayBuffer = typeof SharedArrayBuffer !== "undefined";
+    let passesSinceTaskYield = 0;
     while (!args.halted()) {
+      const observedWake = Atomics.load(this.wakeView, 0);
       let anyServiced = false;
       const pids = args.pidSource();
       for (const [pid, sab] of pids) {
@@ -1804,6 +2487,9 @@ var KernelWasmHost = class _KernelWasmHost {
             }
           }
           const rc = this.serviceSab(pid, view);
+          if (rc === 0) {
+            anyServiced = true;
+          }
           const resHeadAfter = Atomics.load(header, OFF_RES_HEAD / 4);
           const responsePushed = resHeadAfter !== resHeadBefore;
           if (responsePushed) {
@@ -1819,36 +2505,46 @@ var KernelWasmHost = class _KernelWasmHost {
         }
       }
       if (args.halted()) return;
+      if (this.nextPollTimeoutNs() === 0n && this.servicePollWaiters() > 0) {
+        anyServiced = true;
+      }
       if (!anyServiced) {
-        await parkFn();
+        if (this.servicePollWaiters() > 0) {
+          anyServiced = true;
+        } else {
+          const timeoutNs = this.nextPollTimeoutNs();
+          const timeoutMs = pollTimeoutMs(timeoutNs);
+          await parkFn(observedWake, timeoutMs);
+        }
+      }
+      passesSinceTaskYield += 1;
+      if (passesSinceTaskYield >= passesBeforeTaskYield) {
+        passesSinceTaskYield = 0;
+        await taskYieldFn();
       }
     }
   }
-  /**
-   * Default [`startDispatchLoop`] park. `Atomics.waitAsync` on the
-   * shared wake slot with a 50 ms timeout when the wake buffer is a
-   * real `SharedArrayBuffer` and `Atomics.waitAsync` is available;
-   * otherwise a microtask yield (`setTimeout(0)`) so the event loop
-   * still gets a chance to drain messages between busy-spin passes.
-   *
-   * The 50 ms timeout exists as a belt-and-suspenders against lost
-   * notifications; `Atomics.notify` never drops under contention, but
-   * a caller that writes the wake slot before the kernel parks would
-   * be a lost wake if the kernel waited forever. The plan §10 notes
-   * 50 ms keeps well below the Principle IX 100 ms input budget.
-   */
-  async defaultPark() {
-    if (typeof SharedArrayBuffer !== "undefined" && this.wakeBuffer instanceof SharedArrayBuffer && typeof Atomics.waitAsync === "function") {
-      const last = Atomics.load(this.wakeView, 0);
-      const r = Atomics.waitAsync(this.wakeView, 0, last, 50);
-      if (r.async) {
-        await r.value;
-      }
-      return;
-    }
+  async yieldToWorkerMessages() {
     await new Promise((resolve) => {
       setTimeout(resolve, 0);
     });
+  }
+  /**
+   * Default [`startDispatchLoop`] park. Fd-only waits have no timeout;
+   * clock-backed waits use exactly the nearest kernel deadline. Unsupported
+   * runtimes fail explicitly instead of falling back to a polling timer.
+   */
+  async defaultPark(observedWake, timeoutMs) {
+    const waitAsync = Atomics.waitAsync;
+    if (typeof SharedArrayBuffer === "undefined" || !(this.wakeBuffer instanceof SharedArrayBuffer) || waitAsync === void 0) {
+      throw new Error(
+        "KernelWasmHost: blocking dispatcher requires SharedArrayBuffer and Atomics.waitAsync"
+      );
+    }
+    const r = waitAsync(this.wakeView, 0, observedWake, timeoutMs);
+    if (r.async) {
+      await r.value;
+    }
   }
 };
 
@@ -2519,6 +3215,7 @@ var MockKernel = class {
     if (output.byteLength === 0) {
       return;
     }
+    void devnum;
     scaffold.callDriver(CONSOLE_DRIVER_ID, OP_WRITE_LINE, output);
   }
   /**
@@ -2645,6 +3342,37 @@ function packFbBlit(width, height, pixels) {
 }
 
 // src/kernel-worker-entry.ts
+var STORAGE_DETAIL_MAX_CHARS = 512;
+function boundedStorageDetail(detail) {
+  return detail.length <= STORAGE_DETAIL_MAX_CHARS ? detail : `${detail.slice(0, STORAGE_DETAIL_MAX_CHARS - 1)}\u2026`;
+}
+function storageDegradedMessageFromConsoleLine(line) {
+  if (line.includes(
+    "[pmos] persistent root unavailable or invalid; storage left untouched; using volatile tmpfs root"
+  )) {
+    return {
+      kind: "storage:degraded",
+      reason: "persistent-root-invalid",
+      detail: "The existing filesystem image failed validation or mount; volatile recovery was prepared without rewriting it.",
+      existingImagePreserved: true
+    };
+  }
+  if (line.includes(
+    "[pmos] persistent root unavailable; storage left untouched; using volatile tmpfs root"
+  )) {
+    return {
+      kind: "storage:degraded",
+      reason: "persistent-root-unavailable",
+      detail: "The persistent filesystem could not be installed at /; volatile recovery was prepared without rewriting storage.",
+      existingImagePreserved: true
+    };
+  }
+  return null;
+}
+var MAX_DEFERRED_INPUT_BYTES = 64 * 1024;
+function isDeferredInputMessage(msg) {
+  return msg.kind === "console:input" || msg.kind === "input:kbd" || msg.kind === "input:mouse";
+}
 function installWorkerEntry(messaging, options = {}) {
   let scaffold;
   let realKernel;
@@ -2654,6 +3382,29 @@ function installWorkerEntry(messaging, options = {}) {
   });
   const pidMap = /* @__PURE__ */ new Map();
   const lifecycle = { hasEverSpawned: false };
+  let bootRequested = false;
+  const deferredInput = [];
+  let deferredInputBytes = 0;
+  const deferInput = (msg) => {
+    if (msg.bytes.byteLength > MAX_DEFERRED_INPUT_BYTES) {
+      return;
+    }
+    while (deferredInput.length > 0 && deferredInputBytes + msg.bytes.byteLength > MAX_DEFERRED_INPUT_BYTES) {
+      const dropped = deferredInput.shift();
+      deferredInputBytes -= dropped?.bytes.byteLength ?? 0;
+    }
+    const bytes = new Uint8Array(msg.bytes.byteLength);
+    bytes.set(msg.bytes);
+    deferredInput.push({ ...msg, bytes });
+    deferredInputBytes += bytes.byteLength;
+  };
+  const replayDeferredInput = (target) => {
+    for (const msg of deferredInput) {
+      target.handleMainMessage(msg);
+    }
+    deferredInput.length = 0;
+    deferredInputBytes = 0;
+  };
   messaging.onmessage = (ev) => {
     const msg = ev.data;
     if (msg.kind === "proc:sab") {
@@ -2664,6 +3415,7 @@ function installWorkerEntry(messaging, options = {}) {
           realKernel.markRunning(msg.pid);
         } catch {
         }
+        realKernel.notifyDispatchLoop();
       }
       return;
     }
@@ -2686,16 +3438,55 @@ function installWorkerEntry(messaging, options = {}) {
       return;
     }
     if (msg.kind === "proc:exited") {
+      let reconciledKnownProcess = false;
       if (msg.memoryBytes !== void 0 && realKernel !== void 0) {
         try {
           realKernel.recordProcessMemory(msg.pid, msg.memoryBytes);
         } catch {
         }
       }
-      pidMap.delete(msg.pid);
+      if (realKernel !== void 0) {
+        try {
+          const known = realKernel.reconcileProcessExit(
+            msg.pid,
+            msg.code,
+            msg.trap !== void 0
+          );
+          if (known) {
+            lifecycle.hasEverSpawned = true;
+            reconciledKnownProcess = true;
+          }
+        } catch (error) {
+          messaging.postMessage({
+            kind: "panic",
+            message: `kernel-worker: failed to reconcile pid ${msg.pid} exit: ${String(error)}`
+          });
+        }
+      }
+      const removedSab = pidMap.delete(msg.pid);
+      if (realKernel !== void 0 && (reconciledKnownProcess || removedSab)) {
+        realKernel.notifyDispatchLoop();
+      }
+      return;
+    }
+    if (msg.kind === "host:dropped") {
+      if (realKernel !== void 0) {
+        try {
+          realKernel.hostFileDropped(msg.token, msg.name, msg.mime, msg.bytes);
+        } catch (e) {
+          messaging.postMessage({
+            kind: "panic",
+            message: `kernel-worker: host:dropped failed: ${e.message}`
+          });
+        }
+      }
       return;
     }
     if (scaffold === void 0) {
+      if (bootRequested && isDeferredInputMessage(msg)) {
+        deferInput(msg);
+        return;
+      }
       if (msg.kind !== "boot") {
         messaging.postMessage({
           kind: "panic",
@@ -2703,6 +3494,14 @@ function installWorkerEntry(messaging, options = {}) {
         });
         return;
       }
+      if (bootRequested) {
+        messaging.postMessage({
+          kind: "panic",
+          message: "kernel-worker: duplicate boot received before boot completed"
+        });
+        return;
+      }
+      bootRequested = true;
       if (msg.config.useRealKernel === true) {
         void bootRealKernel(
           messaging,
@@ -2713,11 +3512,13 @@ function installWorkerEntry(messaging, options = {}) {
           (s, h) => {
             scaffold = s;
             realKernel = h;
+            replayDeferredInput(s);
           }
         ).then(() => resolveReady());
         return;
       }
       scaffold = bootMockKernel(messaging, msg.config);
+      replayDeferredInput(scaffold);
       resolveReady();
       return;
     }
@@ -2758,6 +3559,12 @@ function bootMockKernel(messaging, config) {
   return scaffold;
 }
 async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onScaffoldReady) {
+  let storageDegradedPosted = false;
+  const reportStorageDegraded = (message) => {
+    if (storageDegradedPosted) return;
+    storageDegradedPosted = true;
+    messaging.postMessage(message);
+  };
   const fetcher = options.fetcher ?? defaultFetcher2;
   let bytes;
   try {
@@ -2782,9 +3589,23 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onS
     blockDriver = options.blockDriver;
   } else {
     try {
-      const { BlockDriver: BlockDriver2 } = await Promise.resolve().then(() => (init_block(), block_exports));
-      blockDriver = await BlockDriver2.openInOpfs();
-    } catch {
+      if (options.openBlockDriver !== void 0) {
+        blockDriver = await options.openBlockDriver();
+      } else {
+        const { BlockDriver: BlockDriver2 } = await Promise.resolve().then(() => (init_block(), block_exports));
+        blockDriver = await BlockDriver2.openInOpfs();
+      }
+    } catch (error) {
+      const detail = boundedStorageDetail(String(error));
+      console.warn(
+        `[pmos] persistent storage unavailable; volatile recovery prepared: ${detail}`
+      );
+      reportStorageDegraded({
+        kind: "storage:degraded",
+        reason: "opfs-open-failed",
+        detail: `OPFS block driver open failed: ${detail}`,
+        existingImagePreserved: true
+      });
       blockDriver = void 0;
     }
   }
@@ -2812,6 +3633,10 @@ async function bootRealKernel(messaging, config, options, pidMap, lifecycle, onS
     // so the boot screen + live terminal don't need to know whether
     // the source was MockKernel or KernelWasmHost.
     onConsoleWrite: (bytes2) => {
+      const degraded = storageDegradedMessageFromConsoleLine(
+        new TextDecoder().decode(bytes2)
+      );
+      if (degraded !== null) reportStorageDegraded(degraded);
       messaging.postMessage({ kind: "console:write", bytes: bytes2 });
     },
     onPanic: (message) => {
@@ -2860,13 +3685,17 @@ async function fetchBinaryRegistry(fetcher) {
   const binAssets = manifest.assets.filter(
     (a) => a.startsWith("assets/bin/") && a.endsWith(".wasm")
   );
-  const entries = await Promise.all(
+  const assets = await Promise.all(
     binAssets.map(async (asset) => {
       const stem = asset.slice("assets/bin/".length, -".wasm".length);
       const bytes = await fetcher(`/${asset}`);
-      return [`/bin/${stem}`, bytes];
+      return [stem, bytes];
     })
   );
+  const entries = [];
+  for (const [stem, bytes] of assets) {
+    entries.push([`/bin/${stem}`, bytes], [`/usr/bin/${stem}`, bytes]);
+  }
   return new Map(entries);
 }
 async function runBootBinary(host, bootBinary, pidMap, lifecycle) {
@@ -2874,6 +3703,7 @@ async function runBootBinary(host, bootBinary, pidMap, lifecycle) {
   host.installConsoleFd(bootstrapPid, 0);
   host.installConsoleFd(bootstrapPid, 1);
   host.installConsoleFd(bootstrapPid, 2);
+  host.installRootPreopenFd(bootstrapPid, 3);
   host.markRunning(bootstrapPid);
   const manifest = encodeSpawnManifest({
     path: bootBinary,
@@ -2909,5 +3739,6 @@ if (typeof DedicatedWorkerGlobalScope !== "undefined" && typeof self !== "undefi
   installWorkerEntry(self);
 }
 export {
-  installWorkerEntry
+  installWorkerEntry,
+  storageDegradedMessageFromConsoleLine
 };

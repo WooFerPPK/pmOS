@@ -52,6 +52,16 @@ fn build_window_title_changed(window_id: u32, new_title: &str) -> Vec<u8> {
 fn taskbar_starts_with_no_entries() {
     let tb = Taskbar::new(800, 600);
     assert!(tb.entries().is_empty());
+    assert_eq!(tb.clock_text(), "");
+}
+
+#[test]
+fn clock_label_reports_visual_changes_only() {
+    let mut tb = Taskbar::new(800, 600);
+    assert!(tb.set_clock_text("14:05 UTC"));
+    assert!(!tb.set_clock_text("14:05 UTC"));
+    assert_eq!(tb.clock_text(), "14:05 UTC");
+    assert!(tb.set_clock_text("09:05 EST"));
 }
 
 #[test]
@@ -85,7 +95,8 @@ fn handle_event_window_destroyed_removes_entry() {
     tb.handle_event_bytes(1, &build_window_created(8, "Files", "pmos.files"))
         .unwrap();
     assert_eq!(tb.entries().len(), 2);
-    tb.handle_event_bytes(2, &build_window_destroyed(7)).unwrap();
+    tb.handle_event_bytes(2, &build_window_destroyed(7))
+        .unwrap();
     assert_eq!(tb.entries().len(), 1);
     assert_eq!(tb.entries()[0].window_id, 8);
 }
@@ -148,10 +159,47 @@ fn entry_rect_lays_entries_left_to_right_with_gap() {
     tb.add_window(8, "B", "");
     let r0 = tb.entry_rect(0).unwrap();
     let r1 = tb.entry_rect(1).unwrap();
-    assert_eq!(r0.x, shell::TASKBAR_LEFT_MARGIN as i32);
+    assert_eq!(
+        r0.x,
+        (shell::TASKBAR_LEFT_MARGIN + shell::TASKBAR_LAUNCHER_RESERVED_WIDTH) as i32
+    );
     assert_eq!(r0.width, shell::TASKBAR_ENTRY_WIDTH);
     let stride = (shell::TASKBAR_ENTRY_WIDTH + shell::TASKBAR_ENTRY_GAP) as i32;
     assert_eq!(r1.x, r0.x + stride);
+}
+
+#[test]
+fn many_entries_page_between_launcher_and_clock_without_overlap() {
+    let mut tb = Taskbar::new(800, 600);
+    for id in 1..=10 {
+        tb.add_window(id, format!("Window {id}"), format!("pmos.app{id}"));
+    }
+
+    let first = tb.entry_rect(0).expect("first visible entry");
+    let first_page = tb.visible_range();
+    let last = tb
+        .entry_rect(first_page.end - 1)
+        .expect("last visible entry");
+    assert_eq!(
+        first.x,
+        (shell::TASKBAR_LEFT_MARGIN + shell::TASKBAR_LAUNCHER_RESERVED_WIDTH) as i32
+    );
+    assert!(
+        first.x >= 90,
+        "entries must not overlap the launcher button"
+    );
+    assert!(
+        last.right() <= 800 - shell::TASKBAR_CLOCK_RESERVED_WIDTH as i32,
+        "last entry must leave the clock reservation visible"
+    );
+    assert!(last.width >= shell::TASKBAR_MIN_ENTRY_WIDTH);
+    assert!(tb.has_overflow());
+    assert!(tb.entry_rect(first_page.end).is_none());
+
+    let old_page = tb.visible_range();
+    tb.cycle_overflow();
+    assert_ne!(tb.visible_range(), old_page);
+    assert!(tb.entry_rect(9).is_some());
 }
 
 #[test]
@@ -203,6 +251,63 @@ fn handle_pointer_down_restore_for_minimized_entry() {
     let r = tb.entry_rect(0).unwrap();
     let outcome = tb.handle_pointer_down(r.x + 5, r.y + 5);
     assert_eq!(outcome, Some(TaskbarClick::Restore { window_id: 7 }));
+}
+
+#[test]
+fn explicit_minimize_maximize_and_close_controls_have_distinct_hit_targets() {
+    let mut tb = Taskbar::new(800, 600);
+    tb.add_window(7, "A", "pmos.a");
+    let minimize = tb.minimize_rect(0).expect("minimize control");
+    let maximize = tb.maximize_rect(0).expect("maximize control");
+    let close = tb.close_rect(0).expect("close control");
+    assert!(minimize.right() <= maximize.x);
+    assert!(maximize.right() <= close.x);
+
+    assert_eq!(
+        tb.handle_pointer_down(minimize.x + 1, minimize.y + 1),
+        Some(TaskbarClick::Minimize { window_id: 7 }),
+    );
+    assert_eq!(
+        tb.handle_pointer_down(maximize.x + 1, maximize.y + 1),
+        Some(TaskbarClick::ToggleMaximize { window_id: 7 }),
+    );
+    assert_eq!(
+        tb.handle_pointer_down(close.x + 1, close.y + 1),
+        Some(TaskbarClick::Close { window_id: 7 }),
+    );
+}
+
+#[test]
+fn overflow_control_cycles_pages_and_never_overlaps_entries() {
+    let mut tb = Taskbar::new(420, 300);
+    for id in 1..=8 {
+        tb.add_window(id, format!("Window {id}"), format!("pmos.app{id}"));
+    }
+    let overflow = tb.overflow_rect().expect("overflow control");
+    for idx in tb.visible_range() {
+        assert!(tb.entry_rect(idx).unwrap().right() <= overflow.x);
+    }
+    assert_eq!(
+        tb.handle_pointer_down(overflow.x + 1, overflow.y + 1),
+        Some(TaskbarClick::CycleOverflow),
+    );
+    let first_page = tb.visible_range();
+    tb.cycle_overflow();
+    assert_ne!(tb.visible_range(), first_page);
+}
+
+#[test]
+fn focus_event_restores_and_reveals_window_on_an_overflow_page() {
+    let mut tb = Taskbar::new(420, 300);
+    for id in 1..=8 {
+        tb.add_window(id, format!("Window {id}"), format!("pmos.app{id}"));
+    }
+    tb.set_window_minimized(8, true);
+    assert!(tb.entry_rect(7).is_none());
+    tb.set_focused_window(8);
+    assert!(tb.entry_rect(7).is_some());
+    assert!(tb.entries()[7].focused);
+    assert!(!tb.entries()[7].minimized);
 }
 
 #[test]

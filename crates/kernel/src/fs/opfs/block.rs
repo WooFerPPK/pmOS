@@ -22,6 +22,15 @@ use super::layout::{Lba, BLOCK_SIZE};
 /// Every block I/O is exactly this many bytes.
 pub type Block = [u8; BLOCK_SIZE];
 
+/// Provenance of the browser-backed image at the time the block driver opened
+/// it. Formatting is safe only for [`NewlyCreated`](Self::NewlyCreated);
+/// filesystem contents are never used to infer this state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlockImageState {
+    Existing,
+    NewlyCreated,
+}
+
 /// The interface OPFS uses to talk to whatever backs the disk.
 pub trait BlockDevice: Send {
     /// Read one block at `lba` into `out`.
@@ -187,6 +196,9 @@ pub const OP_READ: u32 = 0x02;
 pub const OP_WRITE: u32 = 0x03;
 /// Flush in-flight writes to the persistence backing store.
 pub const OP_FLUSH: u32 = 0x04;
+/// Report whether the browser driver created the image during this open.
+/// Returns `0` for an existing image and `1` for a newly-created image.
+pub const OP_IMAGE_STATE: u32 = 0x05;
 
 // --- WasmBlockDevice (browser-side OPFS) ------------------------------
 
@@ -219,6 +231,7 @@ use alloc::vec::Vec;
 #[cfg(target_arch = "wasm32")]
 pub struct WasmBlockDevice {
     block_count: u64,
+    image_state: BlockImageState,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -235,7 +248,20 @@ impl WasmBlockDevice {
             Ok(c) => c as u64,
             Err(_) => return Err(FsError::Io),
         };
-        Ok(Self { block_count: count })
+        let image_state = match platform::current().driver_call(DevId::Block, OP_IMAGE_STATE, &[]) {
+            Ok(0) => BlockImageState::Existing,
+            Ok(1) => BlockImageState::NewlyCreated,
+            Ok(_) | Err(_) => return Err(FsError::Io),
+        };
+        Ok(Self {
+            block_count: count,
+            image_state,
+        })
+    }
+
+    /// Return the image provenance reported by the browser block driver.
+    pub fn image_state(&self) -> BlockImageState {
+        self.image_state
     }
 }
 
@@ -258,7 +284,8 @@ impl BlockDevice for WasmBlockDevice {
         buf.extend_from_slice(&lba.to_le_bytes());
         buf.extend_from_slice(data);
         match platform::current().driver_call(DevId::Block, OP_WRITE, &buf) {
-            Ok(_) => Ok(()),
+            Ok(n) if n as usize == BLOCK_SIZE => Ok(()),
+            Ok(_) => Err(FsError::Io),
             Err(DriverError::Errno(e)) if e == ENOSPC => Err(FsError::NoSpace),
             Err(_) => Err(FsError::Io),
         }

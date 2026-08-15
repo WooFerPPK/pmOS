@@ -89,7 +89,11 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         }
-        return if had_error { ExitCode::from(1) } else { ExitCode::from(0) };
+        return if had_error {
+            ExitCode::from(1)
+        } else {
+            ExitCode::from(0)
+        };
     }
 
     for path in &paths {
@@ -129,7 +133,11 @@ fn main() -> ExitCode {
         }
     }
 
-    if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
 }
 
 fn format_reader<R: BufRead, W: Write>(
@@ -151,7 +159,11 @@ fn format_reader<R: BufRead, W: Write>(
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                let _ = writeln!(io::stderr(), "cat: {label}: invalid utf-8 at line {}", *lineno);
+                let _ = writeln!(
+                    io::stderr(),
+                    "cat: {label}: invalid utf-8 at line {}",
+                    *lineno
+                );
             }
             Err(e) => return Err(e),
         }

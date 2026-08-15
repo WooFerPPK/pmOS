@@ -9,7 +9,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,23 +19,19 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = env::temp_dir().join(format!(
-        "pmos-sysmon-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let path = env::temp_dir().join(format!("pmos-sysmon-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&path).expect("create temp dir");
     path
 }
 
-fn write_pid_status(root: &PathBuf, pid: u32, body: &[u8]) {
+fn write_pid_status(root: &Path, pid: u32, body: &[u8]) {
     let dir = root.join(pid.to_string());
     fs::create_dir_all(&dir).expect("mkdir pid dir");
     fs::write(dir.join("status"), body).expect("write status");
+    fs::create_dir_all(dir.join("fd")).expect("mkdir fd dir");
 }
 
-fn run(proc_root: &PathBuf) -> std::process::Output {
+fn run(proc_root: &Path) -> std::process::Output {
     Command::new(SYSMON)
         .arg("--proc-root")
         .arg(proc_root)
@@ -55,6 +51,8 @@ fn empty_proc_root_prints_header_only() {
     assert!(stdout.contains("NAME"), "stdout = {stdout:?}");
     assert!(stdout.contains("STATE"), "stdout = {stdout:?}");
     assert!(stdout.contains("PPID"), "stdout = {stdout:?}");
+    assert!(stdout.contains("VM KiB"), "stdout = {stdout:?}");
+    assert!(stdout.contains("FDS"), "stdout = {stdout:?}");
 
     for line in stdout.lines().skip(2) {
         assert!(
@@ -72,8 +70,12 @@ fn single_pid_table_row_correct() {
     write_pid_status(
         &root,
         1,
-        b"Name:\tinit\nState:\tR (Running)\nPid:\t1\nPPid:\t0\n",
+        b"Name:\tinit\nState:\tR (Running)\nPid:\t1\nPPid:\t0\nVmSize:\t4096 kB\nVmPeak:\t8192 kB\n",
     );
+    let fd_dir = root.join("1/fd");
+    fs::create_dir_all(&fd_dir).expect("mkdir fd dir");
+    fs::write(fd_dir.join("0"), b"/dev/console").expect("write fd 0 fixture");
+    fs::write(fd_dir.join("1"), b"/dev/console").expect("write fd 1 fixture");
 
     let out = run(&root);
     assert_eq!(out.status.code(), Some(0), "exit: {:?}", out.status);
@@ -85,7 +87,8 @@ fn single_pid_table_row_correct() {
         .unwrap_or_else(|| panic!("no pid 1 row: {stdout:?}"));
     assert!(row.contains("init"), "row = {row:?}");
     assert!(row.contains("R (Running)"), "row = {row:?}");
-    assert!(row.trim_end().ends_with(" 0"), "row = {row:?}");
+    assert!(row.contains("4096"), "row = {row:?}");
+    assert!(row.trim_end().ends_with("2"), "row = {row:?}");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -118,7 +121,10 @@ fn multiple_pids_sorted_ascending() {
     let idx_100 = stdout.find("\n100 ").expect("pid 100 not found");
 
     assert!(idx_1 < idx_42, "pid 1 must precede pid 42 in {stdout:?}");
-    assert!(idx_42 < idx_100, "pid 42 must precede pid 100 in {stdout:?}");
+    assert!(
+        idx_42 < idx_100,
+        "pid 42 must precede pid 100 in {stdout:?}"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -138,10 +144,7 @@ fn malformed_status_skipped_with_stderr_warning() {
         "pid 5 must not appear as a table row: {stdout:?}"
     );
     assert!(stderr.contains("pid 5"), "stderr = {stderr:?}");
-    assert!(
-        stderr.contains("failed to parse"),
-        "stderr = {stderr:?}"
-    );
+    assert!(stderr.contains("failed to parse"), "stderr = {stderr:?}");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -149,11 +152,7 @@ fn malformed_status_skipped_with_stderr_warning() {
 #[test]
 fn nonexistent_proc_root_exits_one() {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let missing = env::temp_dir().join(format!(
-        "pmos-sysmon-missing-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let missing = env::temp_dir().join(format!("pmos-sysmon-missing-{}-{}", std::process::id(), n));
 
     let out = run(&missing);
     assert_eq!(out.status.code(), Some(1), "exit: {:?}", out.status);

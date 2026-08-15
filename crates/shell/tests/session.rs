@@ -182,7 +182,8 @@ fn pump_is_ready_only_after_every_interesting_interface_is_bound() {
         interface: "pmd_compositor".to_string(),
         version: 1,
     };
-    s.pump(&global_event(registry_id, &compositor_event)).unwrap();
+    s.pump(&global_event(registry_id, &compositor_event))
+        .unwrap();
     assert!(!s.is_ready(), "shm + shell_manager not yet bound");
 
     // Shm next.
@@ -320,11 +321,7 @@ fn pump_surfaces_a_client_error_for_unknown_object_id() {
     let (mut s, _) = boot_started_session();
     // Build an event targeting object id 99 which the
     // session's client has never bound.
-    let stray = frame_event(
-        ObjectId::new(99),
-        1, /* any event opcode */
-        &[],
-    );
+    let stray = frame_event(ObjectId::new(99), 1 /* any event opcode */, &[]);
     let err = s.pump(&stray).unwrap_err();
     match err {
         SessionError::Client(_) => {}
@@ -365,8 +362,7 @@ use display_proto::{
 /// Walk the whole bind dance to get a session with
 /// shell_manager bound. Returns the session and the
 /// shell_manager id.
-fn shell_manager_bound(
-) -> (Session<MemoryConnection>, ObjectId) {
+fn shell_manager_bound() -> (Session<MemoryConnection>, ObjectId) {
     let (mut s, registry_id) = boot_started_session();
     let sm_event = RegistryGlobal {
         name: 1,
@@ -379,10 +375,7 @@ fn shell_manager_bound(
     (s, sm_id)
 }
 
-fn window_created_event(
-    shell_manager_id: ObjectId,
-    event: &ShellWindowCreated,
-) -> Vec<u8> {
+fn window_created_event(shell_manager_id: ObjectId, event: &ShellWindowCreated) -> Vec<u8> {
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
@@ -392,10 +385,7 @@ fn window_created_event(
     buf
 }
 
-fn window_destroyed_event(
-    shell_manager_id: ObjectId,
-    event: &ShellWindowDestroyed,
-) -> Vec<u8> {
+fn window_destroyed_event(shell_manager_id: ObjectId, event: &ShellWindowDestroyed) -> Vec<u8> {
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
@@ -405,10 +395,7 @@ fn window_destroyed_event(
     buf
 }
 
-fn window_focused_event(
-    shell_manager_id: ObjectId,
-    event: &ShellWindowFocused,
-) -> Vec<u8> {
+fn window_focused_event(shell_manager_id: ObjectId, event: &ShellWindowFocused) -> Vec<u8> {
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut buf = vec![0u8; HEADER_SIZE + payload.len()];
@@ -494,6 +481,20 @@ fn close_and_minimize_window_use_distinct_opcodes() {
     let min_h = MessageHeader::decode(&bytes[close_end..]).unwrap();
     assert_eq!(min_h.object_id, sm_id);
     assert_eq!(min_h.opcode, 4 /* minimize_window */);
+}
+
+#[test]
+fn toggle_maximized_window_carries_the_global_id() {
+    let (mut s, sm_id) = shell_manager_bound();
+    s.toggle_maximized_window(17).unwrap();
+    let bytes = s.drain_outbound();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, sm_id);
+    assert_eq!(header.opcode, 7 /* toggle_maximized_window */);
+    assert_eq!(
+        &bytes[HEADER_SIZE..header.length as usize],
+        &17u32.to_le_bytes()
+    );
 }
 
 #[test]
@@ -617,8 +618,7 @@ fn pump_display_error_for_a_bound_object_drops_the_stale_binding() {
     let err = DisplayError {
         object_id: sm_id,
         code: display_proto::error_code::PERMISSION_DENIED,
-        message: "permission denied: pmd_shell_manager requires Cap::Shell"
-            .to_string(),
+        message: "permission denied: pmd_shell_manager requires Cap::Shell".to_string(),
     };
     let bytes = display_error_event(&err);
     let (step, _) = s.pump(&bytes).unwrap();

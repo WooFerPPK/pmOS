@@ -19,13 +19,14 @@
 //!
 //! Plus the system directories `/bin`, `/etc`, `/dev`, `/proc`,
 //! `/run`, `/tmp`, `/home`, `/opt`, `/usr`, `/usr/bin`,
-//! `/usr/share`, `/usr/share/applications`. These are created
+//! `/usr/share`, `/usr/share/applications`, `/usr/share/wallpapers`,
+//! and `/usr/share/fonts`. These are created
 //! at mkfs time because the VFS mounts tmpfs / devfs / procfs
 //! over `/dev`, `/proc`, `/run`, `/tmp` at boot — having the
 //! persistent mount points present means recovery-mode boots
 //! (without those mounts) still find a coherent tree.
 
-use crate::vfs::{Filesystem, FsError};
+use crate::vfs::{Filesystem, FsError, Ino};
 
 use super::block::DynBlockDevice;
 use super::journal::Journal;
@@ -148,7 +149,10 @@ pub fn mkfs(mut device: DynBlockDevice) -> Result<OpfsFs, FsError> {
     create_system_tree(&mut fs)?;
     create_starter_kit(&mut fs)?;
     create_etc_defaults(&mut fs)?;
+    create_etc_zoneinfo(&mut fs)?;
     create_usr_share_applications(&mut fs)?;
+    create_usr_share_wallpapers(&mut fs)?;
+    create_usr_share_fonts(&mut fs)?;
     create_usr_share_doc_pmos(&mut fs)?;
 
     // Step 8: final flush so everything is durable before we
@@ -283,6 +287,45 @@ pub fn default_init_conf() -> &'static [u8] {
     INIT_CONF
 }
 
+// --- /etc/zoneinfo defaults -----------------------------------------
+
+const ZONEINFO_UTC: &[u8] = include_bytes!("../../../assets/etc/zoneinfo/UTC");
+const ZONEINFO_AMERICA_NEW_YORK: &[u8] =
+    include_bytes!("../../../assets/etc/zoneinfo/America_New_York");
+const ZONEINFO_EUROPE_LONDON: &[u8] = include_bytes!("../../../assets/etc/zoneinfo/Europe_London");
+const ZONEINFO_ASIA_TOKYO: &[u8] = include_bytes!("../../../assets/etc/zoneinfo/Asia_Tokyo");
+
+fn create_etc_zoneinfo(fs: &mut OpfsFs) -> Result<(), FsError> {
+    let etc_ino = fs.lookup(ROOT_INO, "etc")?;
+    let zoneinfo_ino = fs.mkdir(etc_ino, "zoneinfo", 0o755)?;
+    for (name, content) in [
+        ("UTC", ZONEINFO_UTC),
+        ("America_New_York", ZONEINFO_AMERICA_NEW_YORK),
+        ("Europe_London", ZONEINFO_EUROPE_LONDON),
+        ("Asia_Tokyo", ZONEINFO_ASIA_TOKYO),
+    ] {
+        let ino = fs.create(zoneinfo_ino, name, 0o644)?;
+        fs.write(ino, 0, content)?;
+    }
+    Ok(())
+}
+
+pub fn default_zoneinfo_utc() -> &'static [u8] {
+    ZONEINFO_UTC
+}
+
+pub fn default_zoneinfo_america_new_york() -> &'static [u8] {
+    ZONEINFO_AMERICA_NEW_YORK
+}
+
+pub fn default_zoneinfo_europe_london() -> &'static [u8] {
+    ZONEINFO_EUROPE_LONDON
+}
+
+pub fn default_zoneinfo_asia_tokyo() -> &'static [u8] {
+    ZONEINFO_ASIA_TOKYO
+}
+
 // --- /usr/share/applications defaults --------------------------------
 
 const TERMINAL_DESKTOP: &[u8] =
@@ -327,6 +370,83 @@ pub fn default_settings_desktop() -> &'static [u8] {
 }
 pub fn default_sysmon_desktop() -> &'static [u8] {
     SYSMON_DESKTOP
+}
+
+// --- /usr/share/wallpapers defaults ----------------------------------
+
+const BLUE_WALLPAPER: &[u8] = include_bytes!("../../../assets/usr/share/wallpapers/blue.png");
+const GREEN_WALLPAPER: &[u8] = include_bytes!("../../../assets/usr/share/wallpapers/green.png");
+const DARK_WALLPAPER: &[u8] = include_bytes!("../../../assets/usr/share/wallpapers/dark.png");
+
+/// Keep each journal transaction comfortably below its block-op ceiling. A
+/// wallpaper spans hundreds of blocks, while an individual chunk spans at most
+/// 128 data blocks plus inode, superblock, and indirect-pointer metadata.
+const ASSET_WRITE_CHUNK_BYTES: usize = 512 * 1024;
+
+fn create_usr_share_wallpapers(fs: &mut OpfsFs) -> Result<(), FsError> {
+    let usr_ino = fs.lookup(ROOT_INO, "usr")?;
+    let share_ino = fs.lookup(usr_ino, "share")?;
+    let wallpapers_ino = fs.mkdir(share_ino, "wallpapers", 0o755)?;
+
+    for (name, content) in [
+        ("blue.png", BLUE_WALLPAPER),
+        ("green.png", GREEN_WALLPAPER),
+        ("dark.png", DARK_WALLPAPER),
+    ] {
+        let ino = fs.create(wallpapers_ino, name, 0o644)?;
+        write_asset_in_chunks(fs, ino, content)?;
+    }
+    Ok(())
+}
+
+fn write_asset_in_chunks(fs: &mut OpfsFs, ino: Ino, content: &[u8]) -> Result<(), FsError> {
+    for (index, chunk) in content.chunks(ASSET_WRITE_CHUNK_BYTES).enumerate() {
+        let offset = (index * ASSET_WRITE_CHUNK_BYTES) as u64;
+        if fs.write(ino, offset, chunk)? != chunk.len() {
+            return Err(FsError::Io);
+        }
+    }
+    Ok(())
+}
+
+pub fn default_blue_wallpaper() -> &'static [u8] {
+    BLUE_WALLPAPER
+}
+
+pub fn default_green_wallpaper() -> &'static [u8] {
+    GREEN_WALLPAPER
+}
+
+pub fn default_dark_wallpaper() -> &'static [u8] {
+    DARK_WALLPAPER
+}
+
+// --- /usr/share/fonts defaults ---------------------------------------
+
+const UNIFONT_MONO_14: &[u8] = include_bytes!("../../../../term/assets/fonts/unifont-mono-14.pbm");
+const PC_VGA_16: &[u8] = include_bytes!("../../../../term/assets/fonts/pc-vga-16.pbm");
+
+fn create_usr_share_fonts(fs: &mut OpfsFs) -> Result<(), FsError> {
+    let usr_ino = fs.lookup(ROOT_INO, "usr")?;
+    let share_ino = fs.lookup(usr_ino, "share")?;
+    let fonts_ino = fs.mkdir(share_ino, "fonts", 0o755)?;
+
+    for (name, content) in [
+        ("unifont-mono-14.pbm", UNIFONT_MONO_14),
+        ("pc-vga-16.pbm", PC_VGA_16),
+    ] {
+        let ino = fs.create(fonts_ino, name, 0o644)?;
+        fs.write(ino, 0, content)?;
+    }
+    Ok(())
+}
+
+pub fn default_unifont_mono_14() -> &'static [u8] {
+    UNIFONT_MONO_14
+}
+
+pub fn default_pc_vga_16() -> &'static [u8] {
+    PC_VGA_16
 }
 
 // --- Starter-kit content accessors (used by T061 tests) --------------

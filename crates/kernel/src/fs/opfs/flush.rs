@@ -175,11 +175,7 @@ impl FlushPolicy {
     /// and `Err(_)` propagating any sync error from the VFS layer.
     /// On error the policy state is NOT updated, so a subsequent
     /// call retries the flush.
-    pub fn flush_if_due(
-        &mut self,
-        vfs: &mut Vfs,
-        now_ns: u64,
-    ) -> Result<bool, FsError> {
+    pub fn flush_if_due(&mut self, vfs: &mut Vfs, now_ns: u64) -> Result<bool, FsError> {
         if !self.should_flush(now_ns) {
             return Ok(false);
         }
@@ -194,11 +190,7 @@ impl FlushPolicy {
     /// [`Vfs::sync_dirty`] semantics: returns `Err(_)` if any
     /// dirty mount's `sync` hook errored. On success, the policy
     /// state is reset.
-    pub fn flush_now(
-        &mut self,
-        vfs: &mut Vfs,
-        now_ns: u64,
-    ) -> Result<(), FsError> {
+    pub fn flush_now(&mut self, vfs: &mut Vfs, now_ns: u64) -> Result<(), FsError> {
         vfs.sync_dirty()?;
         self.mark_flushed(now_ns);
         Ok(())

@@ -39,22 +39,12 @@ impl Color {
 
     /// Construct an opaque colour from three channel bytes.
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Color(
-            0xff00_0000
-                | ((r as u32) << 16)
-                | ((g as u32) << 8)
-                | (b as u32),
-        )
+        Color(0xff00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
     }
 
     /// Construct from four channel bytes.
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Color(
-            ((a as u32) << 24)
-                | ((r as u32) << 16)
-                | ((g as u32) << 8)
-                | (b as u32),
-        )
+        Color(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
     }
 
     /// Fully transparent. Every channel is zero.
@@ -89,7 +79,12 @@ pub struct Rect {
 
 impl Rect {
     pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Rect { x, y, width, height }
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Right edge (exclusive).

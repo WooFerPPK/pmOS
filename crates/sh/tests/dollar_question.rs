@@ -50,8 +50,7 @@ fn drive(
 fn dollar_question_expands_to_zero_initially() {
     // No prior command ran: `echo $?` on the first line
     // expands to `0`. Pins the initial-state seed.
-    let (status, stdout, stderr, _env) =
-        drive("echo $?\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("echo $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -65,8 +64,7 @@ fn dollar_question_after_true_is_zero() {
     // `true` returns `Continue` → status 0; the next line's
     // `$?` expands to `0`. Pins the Continue arm of the
     // status-stashing match.
-    let (status, stdout, stderr, _env) =
-        drive("true\necho $?\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("true\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -81,8 +79,7 @@ fn dollar_question_after_false_is_one() {
     // line's `$?` expands to `1`. Pins the Status(N) arm of
     // the status-stashing match — the central case `$?`
     // exists to surface.
-    let (status, stdout, stderr, _env) =
-        drive("false\necho $?\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("false\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -97,10 +94,8 @@ fn dollar_question_after_unknown_command_is_127() {
     // stderr and the REPL stays alive; the new
     // last_status is the POSIX-mandated `127`. Next line's
     // `$?` expands to `127`.
-    let (status, stdout, stderr, _env) = drive(
-        "no_such_command_here\necho $?\nexit\n",
-        BTreeMap::new(),
-    );
+    let (status, stdout, stderr, _env) =
+        drive("no_such_command_here\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("command not found"),
@@ -117,8 +112,7 @@ fn dollar_question_via_braced_form_works() {
     // `${?}` is the explicit braced form of `$?`. After
     // `false`, both shapes resolve to `"1"`. Pin the
     // brace-arm short-circuit on `region == "?"`.
-    let (status, stdout, stderr, _env) =
-        drive("false\necho ${?}\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("false\necho ${?}\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -134,8 +128,7 @@ fn dollar_question_followed_by_literal_chars() {
     // is a single-byte parameter and the scanner resumes
     // literal copying after the digits — no need for braces
     // to disambiguate trailing chars.
-    let (status, stdout, stderr, _env) =
-        drive("false\necho $?bar\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("false\necho $?bar\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -151,8 +144,7 @@ fn blank_line_does_not_update_dollar_question() {
     // `1`. Pin that the `parts.is_empty() { continue; }`
     // path skips the dispatch arm AND the status stash, so
     // the prior status persists. POSIX requires this.
-    let (status, stdout, stderr, _env) =
-        drive("false\n\necho $?\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("false\n\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -167,10 +159,7 @@ fn dollar_question_resets_to_zero_after_successful_command() {
     // resets the stash; `$?` then expands to `0`. Pin that
     // the `Continue` arm OVERWRITES the prior `Status(N)`
     // — it doesn't only update on transitions.
-    let (status, stdout, stderr, _env) = drive(
-        "false\ntrue\necho $?\nexit\n",
-        BTreeMap::new(),
-    );
+    let (status, stdout, stderr, _env) = drive("false\ntrue\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -187,10 +176,7 @@ fn dollar_question_persists_across_multiple_lines() {
     // overwrite the value `$?` is reading. The stash
     // updates from `1` to `0` only after the first `echo`
     // dispatch finishes.
-    let (status, stdout, stderr, _env) = drive(
-        "false\necho $?\necho $?\nexit\n",
-        BTreeMap::new(),
-    );
+    let (status, stdout, stderr, _env) = drive("false\necho $?\necho $?\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     // First `echo $?` after `false` sees `1`. Second

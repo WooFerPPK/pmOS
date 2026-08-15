@@ -13,8 +13,8 @@
 //! 5. `fd_fdstat_get(1)` → expects success + filetype byte 2
 //!    (CHARACTER_DEVICE for stdout, which is
 //!    `FdObject::CharDevice(DEV_CONSOLE)`). Exits 14 on mismatch.
-//! 6. `fd_prestat_get(3)` → expects `-EBADF` (errno 8). Exits 15
-//!    on anything else.
+//! 6. `fd_prestat_get(3)` → expects the `/` directory preopen.
+//!    Exits 15 on anything else.
 //!
 //! On success writes `"bootstrap ok\n"` to stdout and exits 0.
 
@@ -23,12 +23,7 @@
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
     fn args_sizes_get(argc: *mut u32, buf_size: *mut u32) -> i32;
     fn args_get(argv: *mut *mut u8, argv_buf: *mut u8) -> i32;
@@ -102,13 +97,12 @@ pub extern "C" fn _start() {
             proc_exit(14);
         }
 
-        // 6. fd_prestat_get(3). Always -EBADF on PMos (no preopen
-        //    dirs). EBADF = 8. The WASI shim returns errno as a
-        //    positive value (matching WASI's
-        //    `errno: i32` convention).
+        // 6. fd_prestat_get(3). PMos exposes `/` as a directory
+        //    preopen: tag byte 0 and name length 1 at offset 4.
         let mut pre = [0u8; 8];
         let rc = fd_prestat_get(3, pre.as_mut_ptr());
-        if rc != 8 {
+        let name_len = u32::from_le_bytes([pre[4], pre[5], pre[6], pre[7]]);
+        if rc != 0 || pre[0] != 0 || name_len != 1 {
             proc_exit(15);
         }
 

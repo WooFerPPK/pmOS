@@ -245,8 +245,10 @@ extension syscalls. Each one is documented in
 a "why WASI doesn't cover this" paragraph. The extensions are:
 
 1. **IPC**:
-   - `ipc_socket(type, flags) -> fd`: create a unix-socket-equivalent
-     endpoint (STREAM or DGRAM-ish).
+   - `ipc_socket(type) -> fd`: create a unix-socket-equivalent
+     STREAM endpoint. The DGRAM type value is ABI-reserved and returns
+     `ENOTSUP` in v1 until source/destination and record semantics are
+     specified.
    - `ipc_bind(fd, path)`: bind to a path in the VFS.
    - `ipc_listen(fd, backlog)`: server-side listen.
    - `ipc_connect(fd, path)`: client-side connect to a bound socket.
@@ -255,6 +257,13 @@ a "why WASI doesn't cover this" paragraph. The extensions are:
      (optionally) an array of file descriptors to pass.
    - `ipc_recv(fd, buf, fds_out) -> (n, fds_received)`: receive
      bytes plus any passed fds.
+
+   **V1 scope rationale**: every load-bearing v1 caller uses a reliable byte
+   stream. The v1 send/recv ABI permits stream short writes and exposes neither
+   a destination on send nor a source on receive; its byte and ancillary-fd
+   queues also do not preserve message records. Treating that surface as DGRAM
+   would be observably false. Future datagram work therefore needs a separate
+   contract and MUST NOT reuse stream listen/accept semantics.
 
    **Why WASI doesn't cover this**: WASI `sock_*` models
    network sockets, not AF_UNIX; it has no `bind(path)` and no file-

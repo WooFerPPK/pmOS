@@ -3,7 +3,7 @@
 //! Build a `.pmpkg.tar` for a crate's bundled wasm. The crate must
 //! have:
 //!  * a built `wasm32-wasip1` artefact at
-//!    `target/wasm32-wasip1/release/<bin>.wasm` (or `<bin>` =
+//!    `<cargo-target-dir>/wasm32-wasip1/release/<bin>.wasm` (or `<bin>` =
 //!    crate-name; we accept both),
 //!  * a `pkg.toml` next to its `Cargo.toml` describing the
 //!    manifest fields (or a default-derived manifest from the crate
@@ -19,22 +19,51 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .first()
         .ok_or_else(|| "usage: xtask package <crate>".to_string())?;
     let workspace_root = workspace_root();
+    let target_dir = crate::cargo_target::resolve(&workspace_root)
+        .map_err(|error| format!("resolve Cargo target directory: {error}"))?;
+    println!(
+        "[xtask] package: Cargo artifacts = {}",
+        target_dir.display()
+    );
+    let package = build_bundle_at(&workspace_root, &target_dir, crate_name)?;
+    let dist_pkgs = workspace_root.join("dist/pkgs");
+    fs::create_dir_all(&dist_pkgs).map_err(|e| format!("mkdir {}: {}", dist_pkgs.display(), e))?;
+    let out = dist_pkgs.join(&package.filename);
+    fs::write(&out, &package.bytes).map_err(|e| format!("write {}: {}", out.display(), e))?;
+    println!(
+        "[xtask] package: wrote {} ({} bytes)",
+        out.display(),
+        package.bytes.len()
+    );
+    Ok(())
+}
+
+pub(crate) struct BuiltPackage {
+    pub(crate) filename: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) fn build_bundle_at(
+    workspace_root: &Path,
+    target_dir: &Path,
+    crate_name: &str,
+) -> Result<BuiltPackage, String> {
     let crate_dir = workspace_root.join("crates").join(crate_name);
     if !crate_dir.exists() {
         return Err(format!("crate not found: {}", crate_dir.display()));
     }
     let manifest_text = build_manifest(crate_name, &crate_dir)?;
     let bin_name = derive_bin_name(crate_name, &crate_dir);
-    let wasm_path = workspace_root
-        .join("target/wasm32-wasip1/release")
+    let wasm_path = target_dir
+        .join("wasm32-wasip1/release")
         .join(format!("{bin_name}.wasm"));
     if !wasm_path.exists() {
         // Try debug profile as fallback.
-        let alt = workspace_root
-            .join("target/wasm32-wasip1/debug")
+        let alt = target_dir
+            .join("wasm32-wasip1/debug")
             .join(format!("{bin_name}.wasm"));
         if alt.exists() {
-            return package_from(&manifest_text, &alt, crate_name, &workspace_root);
+            return build_package(&manifest_text, &alt);
         }
         return Err(format!(
             "wasm artefact not built: {} (run `cargo build --release --target wasm32-wasip1 -p {}`)",
@@ -42,35 +71,36 @@ pub fn run(args: &[String]) -> Result<(), String> {
             crate_name
         ));
     }
-    package_from(&manifest_text, &wasm_path, crate_name, &workspace_root)
+    build_package(&manifest_text, &wasm_path)
 }
 
-fn package_from(
-    manifest_text: &str,
-    wasm_path: &Path,
-    _crate_name: &str,
-    workspace_root: &Path,
-) -> Result<(), String> {
-    let manifest = pkg::parse_manifest(manifest_text.as_bytes())
-        .map_err(|e| format!("manifest: {e}"))?;
-    let wasm_bytes = fs::read(wasm_path)
-        .map_err(|e| format!("read {}: {}", wasm_path.display(), e))?;
+fn build_package(manifest_text: &str, wasm_path: &Path) -> Result<BuiltPackage, String> {
+    let manifest =
+        pkg::parse_manifest(manifest_text.as_bytes()).map_err(|e| format!("manifest: {e}"))?;
+    if !manifest.integrity_sha256.is_empty() {
+        return Err(
+            "pkg.toml must not contain generated [integrity] hashes; remove that section"
+                .to_string(),
+        );
+    }
+    let wasm_bytes =
+        fs::read(wasm_path).map_err(|e| format!("read {}: {}", wasm_path.display(), e))?;
+    let mut packaged_manifest = manifest_text.trim_end().to_string();
+    packaged_manifest.push_str("\n\n[integrity]\nsha256 = { \"");
+    packaged_manifest.push_str(&manifest.binary);
+    packaged_manifest.push_str("\" = \"");
+    packaged_manifest.push_str(&pkg::sha256_hex(&wasm_bytes));
+    packaged_manifest.push_str("\" }\n");
     let entries: Vec<(&str, &[u8])> = vec![
-        ("manifest.toml", manifest_text.as_bytes()),
+        ("manifest.toml", packaged_manifest.as_bytes()),
         (manifest.binary.as_str(), wasm_bytes.as_slice()),
     ];
     let tar = pkg::build_tar(&entries);
-    let dist_pkgs = workspace_root.join("dist/pkgs");
-    fs::create_dir_all(&dist_pkgs)
-        .map_err(|e| format!("mkdir {}: {}", dist_pkgs.display(), e))?;
-    let out = dist_pkgs.join(format!("{}-{}.pmpkg.tar", manifest.name, manifest.version));
-    fs::write(&out, &tar).map_err(|e| format!("write {}: {}", out.display(), e))?;
-    println!(
-        "[xtask] package: wrote {} ({} bytes)",
-        out.display(),
-        tar.len()
-    );
-    Ok(())
+    pkg::validate_bundle(&tar).map_err(|error| format!("built bundle is invalid: {error}"))?;
+    Ok(BuiltPackage {
+        filename: format!("{}-{}.pmpkg.tar", manifest.name, manifest.version),
+        bytes: tar,
+    })
 }
 
 fn build_manifest(crate_name: &str, crate_dir: &Path) -> Result<String, String> {

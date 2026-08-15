@@ -44,8 +44,7 @@ fn background_pipeline_runs_to_completion() {
 #[test]
 fn jobs_purges_completed_after_listing() {
     // Run `jobs` once → list completed; run again → empty.
-    let (_status, stdout, _stderr) =
-        drive("echo a &\njobs\njobs\nexit\n");
+    let (_status, stdout, _stderr) = drive("echo a &\njobs\njobs\nexit\n");
     let occurrences = stdout.matches("[1]").count();
     assert_eq!(
         occurrences, 1,

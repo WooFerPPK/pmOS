@@ -6,9 +6,10 @@
 
 #![cfg(feature = "native-platform")]
 
+use kernel::fd::FdObject;
 use kernel::ipc::{
-    IpcError, IpcTable, PipeReadResult, PipeWriteResult, SocketState, SocketType,
-    PIPE_BUF_CAP,
+    IpcError, IpcLimits, IpcTable, PipeReadResult, PipeWriteResult, SocketState, SocketType,
+    PIPE_BUF_CAP, SOCKET_FD_QUEUE_CAP,
 };
 
 // ---- Pipes ---------------------------------------------------------
@@ -16,7 +17,7 @@ use kernel::ipc::{
 #[test]
 fn pipe_round_trip_single_write_and_read() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
 
     let pipe = ipc.pipe_mut(pid).unwrap();
     assert_eq!(pipe.try_write(b"hello"), PipeWriteResult::Wrote(5));
@@ -28,7 +29,7 @@ fn pipe_round_trip_single_write_and_read() {
 #[test]
 fn pipe_read_empty_returns_would_block_while_writer_open() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
     let pipe = ipc.pipe_mut(pid).unwrap();
     let mut buf = [0u8; 4];
     assert_eq!(pipe.try_read(&mut buf), PipeReadResult::WouldBlock);
@@ -37,7 +38,7 @@ fn pipe_read_empty_returns_would_block_while_writer_open() {
 #[test]
 fn pipe_write_to_closed_reader_is_broken() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
     // Drop the reader reference.
     let wakes = ipc.drop_pipe_reader(pid).unwrap();
     assert!(wakes.is_empty()); // nobody was parked
@@ -49,7 +50,7 @@ fn pipe_write_to_closed_reader_is_broken() {
 #[test]
 fn pipe_read_after_writer_closes_returns_eof_after_draining() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
 
     // Write some data first, then close the writer.
     let pipe = ipc.pipe_mut(pid).unwrap();
@@ -69,7 +70,7 @@ fn pipe_read_after_writer_closes_returns_eof_after_draining() {
 #[test]
 fn pipe_partial_write_when_buffer_near_full() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
     let pipe = ipc.pipe_mut(pid).unwrap();
 
     // Fill to within 100 bytes of full.
@@ -91,7 +92,7 @@ fn pipe_partial_write_when_buffer_near_full() {
 #[test]
 fn pipe_is_dead_and_reaped_after_both_ends_close() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
     assert_eq!(ipc.pipe_count(), 1);
 
     ipc.drop_pipe_writer(pid).unwrap();
@@ -104,9 +105,26 @@ fn pipe_is_dead_and_reaped_after_both_ends_close() {
 }
 
 #[test]
+fn filled_pipe_is_reaped_when_both_ends_close_without_a_read() {
+    let mut ipc = IpcTable::new();
+    for _ in 0..32 {
+        let id = ipc.create_pipe().unwrap();
+        assert_eq!(
+            ipc.pipe_mut(id)
+                .unwrap()
+                .try_write(&vec![0x5a; PIPE_BUF_CAP]),
+            PipeWriteResult::Wrote(PIPE_BUF_CAP)
+        );
+        ipc.drop_pipe_writer(id).unwrap();
+        ipc.drop_pipe_reader(id).unwrap();
+        assert_eq!(ipc.pipe_count(), 0);
+    }
+}
+
+#[test]
 fn pipe_refcounts_allow_multiple_readers_and_writers() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
 
     // Dup both ends once.
     let pipe = ipc.pipe_mut(pid).unwrap();
@@ -128,7 +146,7 @@ fn pipe_refcounts_allow_multiple_readers_and_writers() {
 #[test]
 fn pipe_drop_writer_wakes_parked_readers() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
     let pipe = ipc.pipe_mut(pid).unwrap();
     pipe.park_reader(42);
     pipe.park_reader(77);
@@ -140,7 +158,7 @@ fn pipe_drop_writer_wakes_parked_readers() {
 #[test]
 fn pipe_drop_reader_wakes_parked_writers() {
     let mut ipc = IpcTable::new();
-    let pid = ipc.create_pipe();
+    let pid = ipc.create_pipe().unwrap();
     let pipe = ipc.pipe_mut(pid).unwrap();
     pipe.park_writer(10);
 
@@ -165,7 +183,7 @@ fn pipe_operations_on_unknown_id_fail() {
 #[test]
 fn socket_create_starts_unbound() {
     let mut ipc = IpcTable::new();
-    let id = ipc.create_socket(SocketType::Stream);
+    let id = ipc.create_socket(SocketType::Stream).unwrap();
     let s = ipc.socket_mut(id).unwrap();
     assert_eq!(s.state, SocketState::Unbound);
     assert_eq!(s.ty, SocketType::Stream);
@@ -174,9 +192,24 @@ fn socket_create_starts_unbound() {
 }
 
 #[test]
+fn datagram_creation_is_rejected_without_consuming_an_id_or_object() {
+    let mut ipc = IpcTable::new();
+
+    assert_eq!(
+        ipc.create_socket(SocketType::Dgram),
+        Err(IpcError::UnsupportedSocketType)
+    );
+    assert_eq!(ipc.socket_count(), 0);
+
+    let stream = ipc.create_socket(SocketType::Stream).unwrap();
+    assert_eq!(stream, kernel::ipc::SocketId(1));
+    assert_eq!(ipc.socket_count(), 1);
+}
+
+#[test]
 fn socket_bind_then_listen_transitions_state() {
     let mut ipc = IpcTable::new();
-    let id = ipc.create_socket(SocketType::Stream);
+    let id = ipc.create_socket(SocketType::Stream).unwrap();
 
     ipc.bind_socket(id, "/run/display").unwrap();
     assert_eq!(ipc.socket_mut(id).unwrap().state, SocketState::Bound);
@@ -188,8 +221,8 @@ fn socket_bind_then_listen_transitions_state() {
 #[test]
 fn socket_bind_duplicate_path_is_address_in_use() {
     let mut ipc = IpcTable::new();
-    let a = ipc.create_socket(SocketType::Stream);
-    let b = ipc.create_socket(SocketType::Stream);
+    let a = ipc.create_socket(SocketType::Stream).unwrap();
+    let b = ipc.create_socket(SocketType::Stream).unwrap();
 
     ipc.bind_socket(a, "/run/svc").unwrap();
     let err = ipc.bind_socket(b, "/run/svc").unwrap_err();
@@ -199,7 +232,7 @@ fn socket_bind_duplicate_path_is_address_in_use() {
 #[test]
 fn socket_listen_without_bind_is_invalid_state() {
     let mut ipc = IpcTable::new();
-    let id = ipc.create_socket(SocketType::Stream);
+    let id = ipc.create_socket(SocketType::Stream).unwrap();
     let err = ipc.listen_socket(id, 4).unwrap_err();
     assert_eq!(err, IpcError::InvalidState);
 }
@@ -207,21 +240,46 @@ fn socket_listen_without_bind_is_invalid_state() {
 #[test]
 fn socket_connect_without_listener_refused() {
     let mut ipc = IpcTable::new();
-    let client = ipc.create_socket(SocketType::Stream);
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
     let err = ipc.connect_socket(client, "/run/ghost").unwrap_err();
     assert_eq!(err, IpcError::ConnectionRefused);
 }
 
 #[test]
+fn socket_connect_before_listen_is_retryable_on_the_same_client() {
+    let mut ipc = IpcTable::new();
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
+    ipc.bind_socket(listener, "/run/svc").unwrap();
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
+
+    assert_eq!(
+        ipc.connect_socket(client, "/run/svc").unwrap_err(),
+        IpcError::ConnectionRefused,
+    );
+    assert_eq!(ipc.socket_mut(client).unwrap().state, SocketState::Unbound,);
+
+    ipc.listen_socket(listener, 4).unwrap();
+    ipc.connect_socket(client, "/run/svc").unwrap();
+    assert_eq!(
+        ipc.socket_mut(client).unwrap().state,
+        SocketState::Connecting,
+    );
+    assert!(ipc.accept_socket(listener).is_ok());
+}
+
+#[test]
 fn socket_connect_accept_pairs_client_and_server() {
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
-    let client = ipc.create_socket(SocketType::Stream);
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.connect_socket(client, "/run/svc").unwrap();
-    assert_eq!(ipc.socket_mut(client).unwrap().state, SocketState::Connecting);
+    assert_eq!(
+        ipc.socket_mut(client).unwrap().state,
+        SocketState::Connecting
+    );
 
     let server = ipc.accept_socket(listener).unwrap();
     assert_ne!(server, listener);
@@ -240,7 +298,7 @@ fn socket_connect_accept_pairs_client_and_server() {
 #[test]
 fn socket_accept_without_pending_would_block() {
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
@@ -280,7 +338,11 @@ fn socket_send_with_passed_fds_round_trip() {
     let mut ipc = IpcTable::new();
     let (client, server) = paired(&mut ipc);
 
-    let passed = alloc::vec![100u32, 200, 300];
+    let passed = alloc::vec![
+        FdObject::CharDevice(100),
+        FdObject::CharDevice(200),
+        FdObject::CharDevice(300),
+    ];
     let n = ipc.send_on_socket(client, b"fd test", passed).unwrap();
     assert_eq!(n, 7);
 
@@ -288,7 +350,57 @@ fn socket_send_with_passed_fds_round_trip() {
     let (n, fds) = ipc.recv_on_socket(server, &mut buf, 4).unwrap();
     assert_eq!(n, 7);
     assert_eq!(&buf[..7], b"fd test");
-    assert_eq!(fds, vec![100, 200, 300]);
+    assert_eq!(
+        fds,
+        vec![
+            FdObject::CharDevice(100),
+            FdObject::CharDevice(200),
+            FdObject::CharDevice(300)
+        ]
+    );
+}
+
+#[test]
+fn zero_byte_fd_passing_is_bounded_and_close_reclaims_the_queue() {
+    let mut ipc = IpcTable::new();
+    let (client, server) = paired(&mut ipc);
+
+    for fd in 0..SOCKET_FD_QUEUE_CAP as u32 {
+        assert_eq!(
+            ipc.send_on_socket(client, b"", vec![FdObject::CharDevice(fd)])
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        ipc.sockets_get(server).unwrap().rx_fd_count(),
+        SOCKET_FD_QUEUE_CAP
+    );
+    assert_eq!(
+        ipc.send_on_socket(client, b"", vec![FdObject::CharDevice(999)])
+            .unwrap_err(),
+        IpcError::ResourceLimit
+    );
+
+    ipc.close_socket(server).unwrap();
+    ipc.close_socket(client).unwrap();
+    assert_eq!(ipc.socket_count(), 0);
+}
+
+#[test]
+fn filled_socket_pair_is_removed_even_when_neither_side_reads() {
+    let mut ipc = IpcTable::new();
+    for _ in 0..32 {
+        let (client, server) = paired(&mut ipc);
+        assert_eq!(
+            ipc.send_on_socket(client, &vec![0x33; kernel::ipc::SOCKET_BUF_CAP], Vec::new())
+                .unwrap(),
+            kernel::ipc::SOCKET_BUF_CAP
+        );
+        ipc.close_socket(server).unwrap();
+        ipc.close_socket(client).unwrap();
+        assert_eq!(ipc.socket_count(), 0);
+    }
 }
 
 #[test]
@@ -296,18 +408,31 @@ fn socket_recv_fd_limit_is_respected() {
     let mut ipc = IpcTable::new();
     let (client, server) = paired(&mut ipc);
 
-    let passed = alloc::vec![1u32, 2, 3, 4, 5];
+    let passed = alloc::vec![
+        FdObject::CharDevice(1),
+        FdObject::CharDevice(2),
+        FdObject::CharDevice(3),
+        FdObject::CharDevice(4),
+        FdObject::CharDevice(5),
+    ];
     ipc.send_on_socket(client, b"x", passed).unwrap();
 
     // First recv asks for max 2 fds.
     let mut buf = [0u8; 4];
     let (_, fds) = ipc.recv_on_socket(server, &mut buf, 2).unwrap();
-    assert_eq!(fds, vec![1, 2]);
+    assert_eq!(fds, vec![FdObject::CharDevice(1), FdObject::CharDevice(2)]);
 
     // Second recv asks for max 10 fds → gets the rest.
     let mut buf = [0u8; 4];
     let (_, fds) = ipc.recv_on_socket(server, &mut buf, 10).unwrap();
-    assert_eq!(fds, vec![3, 4, 5]);
+    assert_eq!(
+        fds,
+        vec![
+            FdObject::CharDevice(3),
+            FdObject::CharDevice(4),
+            FdObject::CharDevice(5)
+        ]
+    );
 }
 
 #[test]
@@ -333,6 +458,24 @@ fn socket_recv_empty_after_peer_close_returns_eof() {
 }
 
 #[test]
+fn socket_recv_drains_buffered_bytes_after_peer_close_before_eof() {
+    let mut ipc = IpcTable::new();
+    let (client, server) = paired(&mut ipc);
+    ipc.send_on_socket(client, b"pixels", Vec::new()).unwrap();
+    ipc.close_socket(client).unwrap();
+
+    let mut buf = [0u8; 8];
+    let (n, fds) = ipc.recv_on_socket(server, &mut buf, 0).unwrap();
+    assert_eq!(n, 6);
+    assert_eq!(&buf[..n], b"pixels");
+    assert!(fds.is_empty());
+
+    let (n, fds) = ipc.recv_on_socket(server, &mut buf, 0).unwrap();
+    assert_eq!(n, 0, "EOF is observable only after buffered bytes drain");
+    assert!(fds.is_empty());
+}
+
+#[test]
 fn socket_send_after_peer_close_is_broken_pipe() {
     let mut ipc = IpcTable::new();
     let (client, server) = paired(&mut ipc);
@@ -347,12 +490,12 @@ fn socket_send_after_peer_close_is_broken_pipe() {
 #[test]
 fn socket_close_unbinds_the_path() {
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
     // Second bind to the same path fails while the first is alive.
-    let other = ipc.create_socket(SocketType::Stream);
+    let other = ipc.create_socket(SocketType::Stream).unwrap();
     let err = ipc.bind_socket(other, "/run/svc").unwrap_err();
     assert_eq!(err, IpcError::AddressInUse);
 
@@ -385,14 +528,17 @@ fn socket_close_unbinds_the_path() {
 #[test]
 fn socket_close_listener_drains_pending_connecting_client_to_closed_state() {
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
-    let client = ipc.create_socket(SocketType::Stream);
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.connect_socket(client, "/run/svc").unwrap();
     // Pre-drop, the client is Connecting (queued on the backlog).
-    assert_eq!(ipc.socket_mut(client).unwrap().state, SocketState::Connecting);
+    assert_eq!(
+        ipc.socket_mut(client).unwrap().state,
+        SocketState::Connecting
+    );
 
     ipc.close_socket(listener).unwrap();
 
@@ -408,13 +554,13 @@ fn socket_close_listener_drains_pending_connecting_client_to_closed_state() {
 #[test]
 fn socket_close_listener_drains_all_pending_connecting_clients() {
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 8).unwrap();
 
     let clients: alloc::vec::Vec<_> = (0..3)
         .map(|_| {
-            let c = ipc.create_socket(SocketType::Stream);
+            let c = ipc.create_socket(SocketType::Stream).unwrap();
             ipc.connect_socket(c, "/run/svc").unwrap();
             c
         })
@@ -430,11 +576,11 @@ fn socket_close_listener_drains_all_pending_connecting_clients() {
 #[test]
 fn socket_send_on_drained_client_returns_connection_refused() {
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
-    let client = ipc.create_socket(SocketType::Stream);
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.connect_socket(client, "/run/svc").unwrap();
     ipc.close_socket(listener).unwrap();
 
@@ -448,38 +594,35 @@ fn socket_send_on_drained_client_returns_connection_refused() {
 }
 
 #[test]
-fn socket_send_on_connecting_client_with_live_listener_still_invalid_state() {
-    // Invariant: the accept-race case (listener alive, client
-    // queued but not accepted yet) keeps returning InvalidState.
-    // display-client-demo's EINVAL retry loop depends on this
-    // split — only the listener-drop case should surface the new
-    // ConnectionRefused.
+fn socket_send_on_connecting_client_with_live_listener_would_block() {
+    // A successful asynchronous connect is pending rather than malformed.
+    // The caller parks on FD_WRITE and retries after accept.
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
-    let client = ipc.create_socket(SocketType::Stream);
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.connect_socket(client, "/run/svc").unwrap();
     // No close — the listener is still live.
 
     let err = ipc
         .send_on_socket(client, b"hi", alloc::vec::Vec::new())
         .unwrap_err();
-    assert_eq!(err, IpcError::InvalidState);
+    assert_eq!(err, IpcError::WouldBlock);
 }
 
 #[test]
 fn socket_close_listener_with_empty_backlog_is_unchanged() {
     let mut ipc = IpcTable::new();
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/run/svc").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
     // No pending clients; close should behave exactly as before:
     // binding released, listener flagged closed.
     ipc.close_socket(listener).unwrap();
-    let other = ipc.create_socket(SocketType::Stream);
+    let other = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(other, "/run/svc").unwrap();
 }
 
@@ -588,6 +731,163 @@ fn ipc_shutdown_socket_rdwr_does_not_set_closed_flag() {
     assert!(!sa.closed);
 }
 
+#[test]
+fn ipc_live_object_limits_reject_before_allocation_and_reclaim() {
+    let mut ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 1,
+        live_sockets: 3,
+        buffered_bytes: 64,
+        queued_ancillary_refs: 4,
+    });
+
+    let pipe = ipc.create_pipe().unwrap();
+    assert_eq!(ipc.create_pipe(), Err(IpcError::ResourceLimit));
+    assert_eq!(ipc.pipe_count(), 1);
+    ipc.drop_pipe_reader(pipe).unwrap();
+    ipc.drop_pipe_writer(pipe).unwrap();
+    assert_eq!(ipc.pipe_count(), 0);
+    assert!(ipc.create_pipe().is_ok());
+
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
+    ipc.bind_socket(listener, "/tmp/admission").unwrap();
+    ipc.listen_socket(listener, 1).unwrap();
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
+    ipc.connect_socket(client, "/tmp/admission").unwrap();
+    let unrelated = ipc.create_socket(SocketType::Stream).unwrap();
+    assert_eq!(ipc.accept_socket(listener), Err(IpcError::ResourceLimit));
+    assert_eq!(ipc.sockets_get(listener).unwrap().backlog.len(), 1);
+    ipc.close_socket(unrelated).unwrap();
+    assert!(ipc.accept_socket(listener).is_ok());
+}
+
+#[test]
+fn ipc_aggregate_byte_budget_rejects_atomically_and_reclaims() {
+    let mut ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 2,
+        live_sockets: 4,
+        buffered_bytes: 4,
+        queued_ancillary_refs: 4,
+    });
+    let first = ipc.create_pipe().unwrap();
+    let second = ipc.create_pipe().unwrap();
+
+    assert_eq!(
+        ipc.write_pipe(first, b"abcd").unwrap(),
+        PipeWriteResult::Wrote(4)
+    );
+    assert_eq!(ipc.buffered_byte_count(), 4);
+    assert_eq!(ipc.write_pipe(second, b"x"), Err(IpcError::WouldBlock));
+    assert_eq!(ipc.pipe_mut(second).unwrap().len(), 0);
+
+    let mut read = [0u8; 2];
+    assert_eq!(
+        ipc.read_pipe(first, &mut read).unwrap(),
+        PipeReadResult::Read(2)
+    );
+    assert_eq!(ipc.buffered_byte_count(), 2);
+    assert_eq!(
+        ipc.write_pipe(second, b"xy").unwrap(),
+        PipeWriteResult::Wrote(2)
+    );
+    assert_eq!(ipc.buffered_byte_count(), 4);
+
+    ipc.drop_pipe_reader(first).unwrap();
+    ipc.drop_pipe_reader(second).unwrap();
+    assert_eq!(ipc.buffered_byte_count(), 0);
+}
+
+#[test]
+fn pipe_write_short_writes_to_global_remaining_budget() {
+    let mut ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 2,
+        live_sockets: 1,
+        buffered_bytes: 3,
+        queued_ancillary_refs: 1,
+    });
+    let occupied = ipc.create_pipe().unwrap();
+    let writer = ipc.create_pipe().unwrap();
+    assert_eq!(
+        ipc.write_pipe(occupied, b"xx").unwrap(),
+        PipeWriteResult::Wrote(2)
+    );
+    assert_eq!(ipc.buffered_byte_capacity_remaining(), 1);
+
+    assert_eq!(
+        ipc.write_pipe(writer, b"yz").unwrap(),
+        PipeWriteResult::Wrote(1)
+    );
+    assert_eq!(ipc.pipe_mut(writer).unwrap().len(), 1);
+    assert_eq!(ipc.buffered_byte_count(), 3);
+}
+
+#[test]
+fn ipc_socket_byte_and_ancillary_budgets_are_atomic_and_reclaimed() {
+    let mut ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 1,
+        live_sockets: 3,
+        buffered_bytes: 4,
+        queued_ancillary_refs: 1,
+    });
+    let (client, server) = paired(&mut ipc);
+
+    assert_eq!(
+        ipc.send_on_socket(client, b"abcd", vec![FdObject::CharDevice(7)])
+            .unwrap(),
+        4
+    );
+    assert_eq!(ipc.buffered_byte_count(), 4);
+    assert_eq!(ipc.queued_ancillary_count(), 1);
+    assert_eq!(
+        ipc.send_on_socket(client, b"z", Vec::new()),
+        Err(IpcError::WouldBlock)
+    );
+    assert_eq!(
+        ipc.send_on_socket(client, b"", vec![FdObject::CharDevice(8)]),
+        Err(IpcError::ResourceLimit)
+    );
+    assert_eq!(ipc.sockets_get(server).unwrap().rx_len(), 4);
+    assert_eq!(ipc.sockets_get(server).unwrap().rx_fd_count(), 1);
+
+    let mut buf = [0u8; 2];
+    let (n, fds) = ipc.recv_on_socket(server, &mut buf, 1).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(fds, vec![FdObject::CharDevice(7)]);
+    assert_eq!(ipc.buffered_byte_count(), 2);
+    assert_eq!(ipc.queued_ancillary_count(), 0);
+
+    assert_eq!(
+        ipc.send_on_socket(server, b"xy", vec![FdObject::CharDevice(9)])
+            .unwrap(),
+        2
+    );
+    assert_eq!(ipc.buffered_byte_count(), 4);
+    assert_eq!(ipc.queued_ancillary_count(), 1);
+    let cleanup = ipc.close_socket(client).unwrap();
+    assert_eq!(cleanup.ancillary, vec![FdObject::CharDevice(9)]);
+    assert_eq!(ipc.buffered_byte_count(), 2);
+    assert_eq!(ipc.queued_ancillary_count(), 0);
+    ipc.shutdown_socket(server, true, false).unwrap();
+    assert_eq!(ipc.buffered_byte_count(), 0);
+}
+
+#[test]
+fn socket_send_short_writes_to_global_remaining_budget() {
+    let mut ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 1,
+        live_sockets: 8,
+        buffered_bytes: 3,
+        queued_ancillary_refs: 1,
+    });
+    let (first_tx, _first_rx) = paired(&mut ipc);
+    let (second_tx, second_rx) = paired(&mut ipc);
+    assert_eq!(ipc.send_on_socket(first_tx, b"xx", Vec::new()).unwrap(), 2);
+    assert_eq!(ipc.buffered_byte_capacity_remaining(), 1);
+
+    assert_eq!(ipc.send_on_socket(second_tx, b"yz", Vec::new()).unwrap(), 1);
+    assert_eq!(ipc.sockets_get(second_rx).unwrap().rx_len(), 1);
+    assert_eq!(ipc.buffered_byte_count(), 3);
+}
+
 // ---- Helpers -------------------------------------------------------
 
 /// Build a pair of Connected sockets for use in the
@@ -595,13 +895,14 @@ fn ipc_shutdown_socket_rdwr_does_not_set_closed_flag() {
 /// connects a client, accepts to produce the server, and
 /// returns (client, server).
 fn paired(ipc: &mut IpcTable) -> (kernel::ipc::SocketId, kernel::ipc::SocketId) {
-    let listener = ipc.create_socket(SocketType::Stream);
+    let listener = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.bind_socket(listener, "/tmp/pair").unwrap();
     ipc.listen_socket(listener, 4).unwrap();
 
-    let client = ipc.create_socket(SocketType::Stream);
+    let client = ipc.create_socket(SocketType::Stream).unwrap();
     ipc.connect_socket(client, "/tmp/pair").unwrap();
     let server = ipc.accept_socket(listener).unwrap();
+    ipc.close_socket(listener).unwrap();
     (client, server)
 }
 

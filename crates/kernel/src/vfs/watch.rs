@@ -21,17 +21,35 @@
 //! subscription are dropped at notify time so the queue only
 //! grows with events the caller asked for.
 //!
-//! Recursive directory watches and rename events are deferred to
-//! a future slice — the v1 wire spec includes a `RECURSIVE` flag
-//! bit and `RenamedFrom`/`RenamedTo` event kinds, but the kernel
-//! handler rejects `RECURSIVE` (any non-zero `flags` argument)
-//! and never queues rename events.
+//! Recursive directory watches and distinct rename event kinds are deferred.
+//! The kernel rejects every non-zero `flags` argument. A successful rename is
+//! represented using the fixed v1 ABI as `WATCH_DELETE` on the old parent and
+//! `WATCH_CREATE` on the new parent, both carrying the moved inode.
 
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::{Ino, MountId};
+
+/// Maximum unread events retained by one watch fd. On overflow the oldest
+/// record is dropped so a slow watcher eventually observes current state while
+/// kernel memory stays bounded.
+pub const WATCH_EVENT_QUEUE_CAP: usize = 256;
+/// Kernel-wide watch admission ceiling. At a full 256-record queue per watch,
+/// this bounds retained event payloads to 4 MiB.
+pub const MAX_WATCHES: usize = 2_048;
+/// Maximum watches attached to one `(mount, inode)` notification target,
+/// chosen so the per-process ceiling, rather than a shared hot target, is the
+/// binding admission rule across the 256-process system limit.
+pub const MAX_WATCHES_PER_TARGET: usize = 1_024;
+/// Maximum non-transferable watch descriptors owned by one process.
+pub const MAX_WATCHES_PER_PID: usize = 4;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WatchRegisterError {
+    ResourceLimit,
+}
 
 /// Stable identifier for an installed watch. Allocated monotonically
 /// by [`WatchTable::next_id`] from 1 (zero is reserved as a "no
@@ -98,14 +116,17 @@ impl Watch {
     /// bit is part of the watch's subscription. No-op otherwise.
     pub fn enqueue_if_subscribed(&mut self, event: WatchEvent) {
         if event.mask & self.mask != 0 {
+            if self.events.len() == WATCH_EVENT_QUEUE_CAP {
+                self.events.pop_front();
+            }
             self.events.push_back(event);
         }
     }
 
     /// Drain as many events as fit in `out`, writing each as 8 LE
     /// bytes. Returns the number of bytes written; always a
-    /// multiple of [`WatchEvent::SIZE`]. An empty queue or
-    /// `out.len() < SIZE` returns 0.
+    /// multiple of [`WatchEvent::SIZE`]. The fd layer rejects an empty queue
+    /// or `out.len() < SIZE` before calling this method.
     pub fn drain_into(&mut self, out: &mut [u8]) -> usize {
         let cap = out.len() / WatchEvent::SIZE;
         let mut written = 0;
@@ -143,7 +164,20 @@ impl WatchTable {
     }
 
     /// Install a fresh watch. Returns the assigned id.
-    pub fn register(&mut self, mount_id: MountId, inode: Ino, mask: u32) -> WatchId {
+    pub fn register(
+        &mut self,
+        mount_id: MountId,
+        inode: Ino,
+        mask: u32,
+    ) -> Result<WatchId, WatchRegisterError> {
+        if self.watches.len() >= MAX_WATCHES
+            || self
+                .by_target
+                .get(&(mount_id, inode))
+                .is_some_and(|ids| ids.len() >= MAX_WATCHES_PER_TARGET)
+        {
+            return Err(WatchRegisterError::ResourceLimit);
+        }
         let id = WatchId(self.next_id);
         self.next_id = self.next_id.checked_add(1).expect("watch id overflow");
         self.watches.insert(
@@ -158,9 +192,9 @@ impl WatchTable {
         );
         self.by_target
             .entry((mount_id, inode))
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id);
-        id
+        Ok(id)
     }
 
     /// Remove the watch named by `id`. Returns `true` iff the
@@ -195,6 +229,12 @@ impl WatchTable {
         }
     }
 
+    pub fn has_mount(&self, mount_id: MountId) -> bool {
+        self.watches
+            .values()
+            .any(|watch| watch.mount_id == mount_id)
+    }
+
     /// Mutably borrow a watch by id.
     pub fn get_mut(&mut self, id: WatchId) -> Option<&mut Watch> {
         self.watches.get_mut(&id)
@@ -215,5 +255,77 @@ impl WatchTable {
 impl Default for WatchTable {
     fn default() -> Self {
         WatchTable::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_queue_is_bounded_and_preserves_the_newest_records() {
+        let mut watch = Watch {
+            id: WatchId(1),
+            mount_id: MountId(1),
+            inode: 1,
+            mask: abi::ext::WATCH_MODIFY,
+            events: VecDeque::new(),
+        };
+        for inode in 0..(WATCH_EVENT_QUEUE_CAP as u32 + 17) {
+            watch.enqueue_if_subscribed(WatchEvent {
+                mask: abi::ext::WATCH_MODIFY,
+                inode,
+            });
+        }
+
+        assert_eq!(watch.events.len(), WATCH_EVENT_QUEUE_CAP);
+        assert_eq!(watch.events.front().map(|event| event.inode), Some(17));
+        assert_eq!(
+            watch.events.back().map(|event| event.inode),
+            Some(WATCH_EVENT_QUEUE_CAP as u32 + 16)
+        );
+    }
+
+    #[test]
+    fn per_target_admission_is_exact_and_unregister_reclaims_capacity() {
+        let mut table = WatchTable::new();
+        let mut admitted = Vec::new();
+        for _ in 0..MAX_WATCHES_PER_TARGET {
+            admitted.push(
+                table
+                    .register(MountId(1), 7, abi::ext::WATCH_CREATE)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(table.len(), MAX_WATCHES_PER_TARGET);
+        assert_eq!(
+            table.register(MountId(1), 7, abi::ext::WATCH_CREATE),
+            Err(WatchRegisterError::ResourceLimit)
+        );
+        assert!(table.unregister(admitted[0]));
+        assert!(table
+            .register(MountId(1), 7, abi::ext::WATCH_CREATE)
+            .is_ok());
+    }
+
+    #[test]
+    fn global_admission_is_exact_and_unregister_reclaims_capacity() {
+        let mut table = WatchTable::new();
+        let mut first = None;
+        for inode in 1..=MAX_WATCHES as u64 {
+            let id = table
+                .register(MountId(1), inode, abi::ext::WATCH_MODIFY)
+                .unwrap();
+            first.get_or_insert(id);
+        }
+        assert_eq!(table.len(), MAX_WATCHES);
+        assert_eq!(
+            table.register(MountId(1), MAX_WATCHES as u64 + 1, abi::ext::WATCH_MODIFY),
+            Err(WatchRegisterError::ResourceLimit)
+        );
+        assert!(table.unregister(first.unwrap()));
+        assert!(table
+            .register(MountId(1), MAX_WATCHES as u64 + 1, abi::ext::WATCH_MODIFY)
+            .is_ok());
     }
 }

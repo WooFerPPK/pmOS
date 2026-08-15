@@ -38,7 +38,9 @@ fn run_inner(args: &[String]) -> Result<()> {
             port = rest.parse::<u16>().map_err(|e| format!("bad port: {e}"))?;
         } else if a == "--port" {
             i += 1;
-            port = args[i].parse::<u16>().map_err(|e| format!("bad port: {e}"))?;
+            port = args[i]
+                .parse::<u16>()
+                .map_err(|e| format!("bad port: {e}"))?;
         } else {
             return Err(format!("unknown arg: {a}").into());
         }
@@ -50,7 +52,11 @@ fn run_inner(args: &[String]) -> Result<()> {
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)?;
 
-    println!("[xtask] dev-server: serving {} on http://{}", dir.display(), addr);
+    println!(
+        "[xtask] dev-server: serving {} on http://{}",
+        dir.display(),
+        addr
+    );
     println!("[xtask] dev-server: COOP: same-origin, COEP: require-corp");
 
     for stream in listener.incoming() {

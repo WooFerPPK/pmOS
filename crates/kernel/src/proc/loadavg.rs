@@ -40,13 +40,13 @@
 //!
 //! ## When ticks happen
 //!
-//! Every read of `/proc/loadavg` calls `tick` first so the
-//! returned bytes reflect the current activity, even if the
-//! kernel has been quiescent for the whole sample window. The
-//! [`LiveProcFsSource::loadavg`](crate::wasm_entry) hook in
-//! `wasm_entry.rs` is the only production caller. Native tests
-//! drive `tick` directly to verify decay arithmetic without a
-//! real kernel.
+//! Every `/proc/loadavg` request projects `tick` into a copied
+//! accumulator so the returned bytes reflect current activity,
+//! even if the kernel has been quiescent for the whole sample
+//! window. The wasm dispatcher commits that projection only
+//! after the request succeeds; malformed requests therefore do
+//! not change scheduler state. Native tests drive `tick` directly
+//! to verify decay arithmetic without a real kernel.
 
 /// Linux fixed-point scale: `load_value * FIXED_1` is what we
 /// store in u64 fields. Exact value matches the kernel's
@@ -325,7 +325,7 @@ mod tests {
         // 0.293 * 2048 ≈ 600. Wide range to be tolerant.
         let (l1, l5, l15) = la.current_fixed();
         assert!(l1 > FIXED_1 - 100); // 1m basically saturated.
-        assert!(l5 > FIXED_1 / 2);   // 5m well past halfway.
+        assert!(l5 > FIXED_1 / 2); // 5m well past halfway.
         assert!(l15 > 200 && l15 < 1000); // 15m partway up.
     }
 

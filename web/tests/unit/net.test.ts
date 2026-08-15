@@ -120,7 +120,7 @@ function makeFakeFetcher(): {
   const pending: Array<{ resolve: (r: FakeResponse) => void; reject: (e: Error) => void }> = [];
   const calls: Array<{ url: string; init?: { method?: string; headers?: Record<string, string>; body?: Uint8Array } }> = [];
   const fetcher: Fetcher = (url, init) => {
-    const entry: { url: string; init?: typeof init } = { url };
+    const entry: { url: string; init?: NonNullable<typeof init> } = { url };
     if (init !== undefined) entry.init = init;
     calls.push(entry);
     return new Promise((resolve, reject) => {

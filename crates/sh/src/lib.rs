@@ -21,15 +21,13 @@
 //!   four-builtin dispatch (`echo`, `exit`, `cd`, `pwd`)
 //!   plus a strict `exit` argument parse that distinguishes
 //!   garbage from a missing code.
-//! * **External commands** fall through to a
-//!   "command-not-found" error with exit code 127. When a
-//!   future slice bridges `proc_spawn` into userland, the
-//!   external path will actually fork+exec; until then the
-//!   error path is enough to keep the shell usable.
+//! * **External commands** are planned as isolated PMos processes and the
+//!   production WASM binary launches them through the versioned
+//!   `proc_spawn_manifest` extension. PATH lookup, kernel pipes,
+//!   redirection, and exit-status propagation are handled without `fork`.
 //!
-//! No pipes, no redirection, no job control, no scripting
-//! constructs (if/while/for/functions). Those land in
-//! Phase 6 with `T142..T145`.
+//! Control-flow scripting (if/while/for/functions) and full job control are
+//! intentionally still outside the v1 implementation.
 
 extern crate alloc;
 
@@ -43,7 +41,13 @@ pub mod jobs;
 #[cfg(feature = "std")]
 pub mod parser;
 #[cfg(feature = "std")]
+pub mod pmos_process;
+#[cfg(feature = "std")]
+pub mod process;
+#[cfg(feature = "std")]
 pub mod run;
+#[cfg(feature = "std")]
+pub mod spawn_wire;
 
 pub use shell::{Shell, ShellOutput, BUILTINS};
 pub use tokenize::tokenize;
@@ -54,5 +58,20 @@ pub use builtin::ShellFlags;
 pub use jobs::{Job, JobStatus, JobTable};
 #[cfg(feature = "std")]
 pub use parser::{parse_pipeline, ParseError, Pipeline, RedirOp, Redirection, Stage, WordKind};
+#[cfg(all(feature = "std", target_arch = "wasm32"))]
+pub use pmos_process::WasmPmosSyscalls;
 #[cfg(feature = "std")]
-pub use run::{run, run_with_env, ExitStatus, ExpandError};
+pub use pmos_process::{PmosProcessBackend, PmosSyscalls};
+#[cfg(feature = "std")]
+pub use process::{
+    build_execution_plan, path_candidates, ExecutionPlan, ExecutionResult, NoProcessBackend,
+    PlanError, PlannedInput, PlannedOutput, PlannedStage, ProcessBackend, ProcessError, ProcessIo,
+    DEFAULT_PATH,
+};
+#[cfg(feature = "std")]
+pub use run::{
+    run, run_command_with_env_and_backend, run_with_env, run_with_env_and_backend, ExitStatus,
+    ExpandError,
+};
+#[cfg(feature = "std")]
+pub use spawn_wire::{encode_spawn_manifest_v1, SpawnEncodeError, SpawnWireManifest};

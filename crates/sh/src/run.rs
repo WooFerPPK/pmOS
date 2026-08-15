@@ -35,9 +35,12 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::PathBuf;
 
-use crate::builtin::{dispatch_builtin, BuiltinOutcome, ShellFlags};
+use crate::builtin::{dispatch_builtin, is_builtin, BuiltinOutcome, ShellFlags};
 use crate::jobs::{JobStatus, JobTable};
 use crate::parser::{parse_pipeline, Pipeline, RedirOp, WordKind};
+use crate::process::{
+    build_execution_plan, NoProcessBackend, ProcessBackend, ProcessError, ProcessIo,
+};
 
 /// Outcome of the REPL loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,16 +104,83 @@ pub fn run<R: BufRead, W: Write, E: Write>(stdin: R, stdout: W, stderr: E) -> Ex
 /// post-loop flags has `errexit == true`). The same shape
 /// `env` already uses.
 pub fn run_with_env<R: BufRead, W: Write, E: Write>(
+    stdin: R,
+    stdout: W,
+    stderr: E,
+    env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
+) -> ExitStatus {
+    let mut backend = NoProcessBackend;
+    run_with_env_and_backend(stdin, stdout, stderr, env, flags, &mut backend)
+}
+
+/// Run the REPL with an explicit process backend.
+///
+/// Simple builtins continue to execute in the shell process.  A pipeline
+/// containing any external command is converted into an [`ExecutionPlan`]
+/// and handed to `backend`, which is responsible for allocating pipes,
+/// spawning every stage, closing parent-only descriptors, and reaping the
+/// foreground children.  This split keeps parser/builtin isolation tests
+/// deterministic while the production backend uses PMos syscalls rather
+/// than host processes.
+pub fn run_with_env_and_backend<R: BufRead, W: Write, E: Write>(
+    stdin: R,
+    stdout: W,
+    stderr: E,
+    env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
+    backend: &mut dyn ProcessBackend,
+) -> ExitStatus {
+    let cwd = env
+        .get("PWD")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    run_loop(stdin, stdout, stderr, env, flags, backend, cwd, true)
+}
+
+/// Execute one command without interactive prompts and return its status.
+///
+/// This is the `/bin/sh -c` and graphical-terminal entry point. Appending an
+/// `exit $?` line lets the existing stateful loop preserve all parser,
+/// expansion, builtin, pipeline, and `set -e` semantics without inventing a
+/// second command evaluator.
+pub fn run_command_with_env_and_backend<W: Write, E: Write>(
+    command: &str,
+    stdout: W,
+    stderr: E,
+    env: &mut BTreeMap<String, String>,
+    flags: &mut ShellFlags,
+    backend: &mut dyn ProcessBackend,
+    cwd: PathBuf,
+) -> ExitStatus {
+    let script = format!("{command}\nexit $?\n");
+    run_loop(
+        Cursor::new(script.into_bytes()),
+        stdout,
+        stderr,
+        env,
+        flags,
+        backend,
+        cwd,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop<R: BufRead, W: Write, E: Write>(
     mut stdin: R,
     mut stdout: W,
     mut stderr: E,
     env: &mut BTreeMap<String, String>,
     flags: &mut ShellFlags,
+    backend: &mut dyn ProcessBackend,
+    mut cwd: PathBuf,
+    interactive: bool,
 ) -> ExitStatus {
     // Seed cwd from the real process cwd when std gives us
     // one — on wasip1 this may just be `/`. Fall back to
     // `/` when the call fails so tests stay deterministic.
-    let mut cwd: PathBuf = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let mut line = String::new();
     // POSIX `$?` parameter: the exit status of the most
     // recently executed command. Starts at 0 before any
@@ -136,11 +206,11 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
     let mut jobs: JobTable = JobTable::new();
 
     loop {
-        if write!(stdout, "$ ").is_err() {
-            return ExitStatus::IoError;
-        }
-        if stdout.flush().is_err() {
-            return ExitStatus::IoError;
+        if interactive {
+            let prompt = env.get("PS1").map(String::as_str).unwrap_or("$ ");
+            if write!(stdout, "{prompt}").is_err() || stdout.flush().is_err() {
+                return ExitStatus::IoError;
+            }
         }
 
         line.clear();
@@ -191,7 +261,7 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
         let parts = match tokenise_with_quotes(trimmed) {
             Ok(p) => p,
             Err(QuoteError::UnterminatedSingle) => {
-                if write!(stderr, "sh: unterminated single quote\n").is_err() {
+                if writeln!(stderr, "sh: unterminated single quote").is_err() {
                     return ExitStatus::IoError;
                 }
                 if stderr.flush().is_err() {
@@ -200,7 +270,7 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
                 continue;
             }
             Err(QuoteError::UnterminatedDouble) => {
-                if write!(stderr, "sh: unterminated double quote\n").is_err() {
+                if writeln!(stderr, "sh: unterminated double quote").is_err() {
                     return ExitStatus::IoError;
                 }
                 if stderr.flush().is_err() {
@@ -271,9 +341,7 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
                     // happened before the failing-expansion
                     // command had a chance to run; the
                     // dispatch_builtin call is skipped.
-                    let phrase = message
-                        .as_deref()
-                        .unwrap_or("parameter null or not set");
+                    let phrase = message.as_deref().unwrap_or("parameter null or not set");
                     if writeln!(stderr, "sh: {name}: {phrase}").is_err() {
                         return ExitStatus::IoError;
                     }
@@ -425,6 +493,7 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
             &mut jobs,
             &kinds,
             &expanded,
+            backend,
         );
         match outcome {
             BuiltinOutcome::Continue => {
@@ -445,7 +514,12 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
                 if writeln!(
                     stderr,
                     "sh: command not found: {}",
-                    pipeline.stages.last().and_then(|s| s.argv.first()).map(String::as_str).unwrap_or("")
+                    pipeline
+                        .stages
+                        .last()
+                        .and_then(|s| s.argv.first())
+                        .map(String::as_str)
+                        .unwrap_or("")
                 )
                 .is_err()
                 {
@@ -504,18 +578,17 @@ pub fn run_with_env<R: BufRead, W: Write, E: Write>(
 ///   parent's streams. Multiple redirs of the same op
 ///   evaluate left-to-right; the last `>` / `>>` wins for
 ///   stdout (matching POSIX last-redir-wins semantics).
-/// * **Multi-stage pipeline**: chain stages by capturing
+/// * **Builtin-only multi-stage pipeline**: chain stages by capturing
 ///   each non-last stage's stdout into a `Vec<u8>` and
 ///   feeding it to the next stage as a `Cursor` stdin. The
-///   v1 runner is in-process serial — every stage runs to
+///   runner is in-process serial — every stage runs to
 ///   completion before the next starts, so a stage that
 ///   tries to read more than the previous stage produced
 ///   sees EOF cleanly. This is the correct semantic for
-///   builtins (`echo`, `cat`-equivalent, `read`, …) since
-///   none of them read interactively. Real subprocess
-///   pipelines via `proc_spawn` + `ipc_pipe` are deferred
-///   to a kernel-side blocking-pipe slice — see the
-///   `crates/kernel/src/syscall/wasi.rs:2384` comment.
+///   the existing builtin-only isolation surface.
+/// * **Any external stage**: construct a real process topology and hand it
+///   to the configured [`ProcessBackend`]. Each stage gets a separate child;
+///   intermediate stdout/stdin endpoints name the same kernel pipe edge.
 /// * **Background (`&`)**: registers a [`Job`] in the table
 ///   with the original command line, runs the pipeline
 ///   synchronously (v1 has no real concurrency at the shell
@@ -541,6 +614,7 @@ fn run_pipeline<R: BufRead, W: Write, E: Write>(
     jobs: &mut JobTable,
     kinds: &[WordKind],
     expanded: &[String],
+    backend: &mut dyn ProcessBackend,
 ) -> BuiltinOutcome {
     if pipeline.stages.is_empty() {
         return BuiltinOutcome::Continue;
@@ -558,6 +632,41 @@ fn run_pipeline<R: BufRead, W: Write, E: Write>(
         if stage.argv.first().map(String::as_str) == Some("jobs") {
             return run_jobs_builtin(jobs, &stage.argv[1..], parent_stdout, parent_stderr);
         }
+    }
+
+    let contains_external = pipeline.stages.iter().any(|stage| {
+        stage
+            .argv
+            .first()
+            .map(|command| !is_builtin(command))
+            .unwrap_or(false)
+    });
+    if contains_external {
+        let plan = match build_execution_plan(pipeline, cwd, env, is_builtin) {
+            Ok(plan) => plan,
+            Err(_) => return BuiltinOutcome::Status(2),
+        };
+        let result = backend.execute(
+            &plan,
+            ProcessIo {
+                stdin: parent_stdin,
+                stdout: parent_stdout,
+                stderr: parent_stderr,
+            },
+        );
+        return match result {
+            Ok(result) if pipeline.background => {
+                let cmd_line = reassemble_command_line(kinds, expanded);
+                let pid = result.pids.last().copied().unwrap_or(0);
+                let job_id = jobs.add(pid, cmd_line);
+                if let Some(code) = result.statuses.last().copied() {
+                    jobs.set_status(job_id, JobStatus::Exited { code });
+                }
+                BuiltinOutcome::Continue
+            }
+            Ok(result) => status_outcome(result.pipeline_status()),
+            Err(error) => process_error_outcome(error, parent_stderr),
+        };
     }
 
     // Synchronous executor — handles every shape (simple,
@@ -596,6 +705,38 @@ fn run_pipeline<R: BufRead, W: Write, E: Write>(
         return BuiltinOutcome::Continue;
     }
     outcome
+}
+
+fn status_outcome(code: i32) -> BuiltinOutcome {
+    if code == 0 {
+        BuiltinOutcome::Continue
+    } else {
+        BuiltinOutcome::Status(code)
+    }
+}
+
+fn process_error_outcome(error: ProcessError, stderr: &mut dyn Write) -> BuiltinOutcome {
+    let (message, status) = match error {
+        ProcessError::CommandNotFound { command } => {
+            (format!("sh: command not found: {command}"), 127)
+        }
+        ProcessError::PermissionDenied { command } => {
+            (format!("sh: {command}: Permission denied"), 126)
+        }
+        ProcessError::Spawn { command, errno } => {
+            (format!("sh: {command}: spawn failed (errno {errno})"), 1)
+        }
+        ProcessError::Redirection { path, errno } => (
+            format!("sh: {}: redirection failed (errno {errno})", path.display()),
+            1,
+        ),
+        ProcessError::Io => return BuiltinOutcome::IoError,
+    };
+    if writeln!(stderr, "{message}").is_err() || stderr.flush().is_err() {
+        BuiltinOutcome::IoError
+    } else {
+        BuiltinOutcome::Status(status)
+    }
 }
 
 /// Reassemble the original command line from the parser's
@@ -645,12 +786,7 @@ fn execute_pipeline<R: BufRead, W: Write, E: Write>(
         let mut stage_stdin_buf: Option<Vec<u8>> = None;
         let mut stage_stdin_file: Option<BufReader<std::fs::File>> = None;
         // Walk the redirs left-to-right, last `<` wins.
-        if let Some(redir) = stage
-            .redirs
-            .iter()
-            .rev()
-            .find(|r| r.op == RedirOp::Stdin)
-        {
+        if let Some(redir) = stage.redirs.iter().rev().find(|r| r.op == RedirOp::Stdin) {
             match std::fs::File::open(&redir.target) {
                 Ok(f) => stage_stdin_file = Some(BufReader::new(f)),
                 Err(e) => {
@@ -787,15 +923,7 @@ fn dispatch_stage<R: BufRead, W: Write, E: Write>(
         parent_stdout
     };
 
-    dispatch_builtin(
-        argv,
-        cwd,
-        env,
-        flags,
-        stdin_dyn,
-        stdout_dyn,
-        parent_stderr,
-    )
+    dispatch_builtin(argv, cwd, env, flags, stdin_dyn, stdout_dyn, parent_stderr)
 }
 
 /// `jobs` builtin — list every entry in the job table. v1
@@ -1237,7 +1365,6 @@ pub(crate) enum TokenPart {
     Operator(String),
 }
 
-
 /// Reason an unterminated quote was detected — distinguishes
 /// `'...` from `"...` so the caller can surface a kind-aware
 /// error message.
@@ -1321,9 +1448,7 @@ pub(crate) fn tokenise_with_quotes(line: &str) -> Result<Vec<Vec<TokenPart>>, Qu
                         Some(next @ ('$' | '"' | '\\')) => {
                             chars.next();
                             if !buf.is_empty() {
-                                current.push(TokenPart::Unquoted(
-                                    core::mem::take(&mut buf),
-                                ));
+                                current.push(TokenPart::Unquoted(core::mem::take(&mut buf)));
                             }
                             current.push(TokenPart::Literal(next.to_string()));
                         }
@@ -1459,7 +1584,6 @@ pub(crate) fn assemble_token(
 pub(crate) fn is_operator_word(parts: &[TokenPart]) -> bool {
     parts.len() == 1 && matches!(&parts[0], TokenPart::Operator(_))
 }
-
 
 #[cfg(test)]
 mod expand_tests {
@@ -1644,10 +1768,7 @@ mod expand_tests {
         // the user level is to wrap the expansion in double
         // quotes, which the existing T142 partial supports.
         let env = env_with(&[]);
-        assert_eq!(
-            ev("${UNSET:-some default}", &env, 0),
-            "some default"
-        );
+        assert_eq!(ev("${UNSET:-some default}", &env, 0), "some default");
     }
 
     #[test]
@@ -1669,10 +1790,7 @@ mod expand_tests {
         // behavior. POSIX errors here; v1 prefers leniency
         // over surfacing a mid-line error.
         let env = env_with(&[("X", "hello")]);
-        assert_eq!(
-            ev("${X:-no_close", &env, 0),
-            "${X:-no_close"
-        );
+        assert_eq!(ev("${X:-no_close", &env, 0), "${X:-no_close");
     }
 
     #[test]
@@ -1681,10 +1799,7 @@ mod expand_tests {
         // default that contains noise: the default must NOT
         // appear in the output when the var is set.
         let env = env_with(&[("X", "actual")]);
-        assert_eq!(
-            ev("${X:-this is junk}", &env, 0),
-            "actual"
-        );
+        assert_eq!(ev("${X:-this is junk}", &env, 0), "actual");
     }
 
     #[test]
@@ -1693,10 +1808,7 @@ mod expand_tests {
         // is preserved — the scanner advances past the closing
         // `}` and resumes literal copying.
         let env = env_with(&[]);
-        assert_eq!(
-            ev("a${UNSET:-mid}b", &env, 0),
-            "amidb"
-        );
+        assert_eq!(ev("a${UNSET:-mid}b", &env, 0), "amidb");
     }
 
     #[test]
@@ -1791,7 +1903,12 @@ mod expand_tests {
         // dispatch loop translates this into the stderr
         // diagnostic and the Exit(1) termination.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
+        let flags = ShellFlags {
+            errexit: false,
+            nounset: true,
+            xtrace: false,
+            noexec: false,
+        };
         let err = expand_vars("$UNSET", &env, 0, &flags).unwrap_err();
         assert_eq!(err, ExpandError::NotSet("UNSET".to_string()));
     }
@@ -1802,7 +1919,12 @@ mod expand_tests {
         // nounset behavior — no `:-` modifier means the
         // braced arm goes through the same error path.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
+        let flags = ShellFlags {
+            errexit: false,
+            nounset: true,
+            xtrace: false,
+            noexec: false,
+        };
         let err = expand_vars("${UNSET}", &env, 0, &flags).unwrap_err();
         assert_eq!(err, ExpandError::NotSet("UNSET".to_string()));
     }
@@ -1815,7 +1937,12 @@ mod expand_tests {
         // because it's the load-bearing semantic that lets
         // the `:-` form remain useful under `set -u`.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
+        let flags = ShellFlags {
+            errexit: false,
+            nounset: true,
+            xtrace: false,
+            noexec: false,
+        };
         assert_eq!(
             expand_vars("${UNSET:-fallback}", &env, 0, &flags).unwrap(),
             "fallback"
@@ -1830,7 +1957,12 @@ mod expand_tests {
         // nounset doesn't accidentally interfere when the var
         // IS set.
         let env = env_with(&[("X", "hello")]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
+        let flags = ShellFlags {
+            errexit: false,
+            nounset: true,
+            xtrace: false,
+            noexec: false,
+        };
         assert_eq!(
             expand_vars("${X:-fallback}", &env, 0, &flags).unwrap(),
             "hello"
@@ -1843,7 +1975,12 @@ mod expand_tests {
         // a known initial value of 0) — `set -u` MUST NOT
         // fire on it. Same for the braced form `${?}`.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
+        let flags = ShellFlags {
+            errexit: false,
+            nounset: true,
+            xtrace: false,
+            noexec: false,
+        };
         assert_eq!(expand_vars("$?", &env, 0, &flags).unwrap(), "0");
         assert_eq!(expand_vars("${?}", &env, 7, &flags).unwrap(), "7");
     }
@@ -1854,7 +1991,12 @@ mod expand_tests {
         // normally — no false-positive error. Pin both the
         // bare and braced forms.
         let env = env_with(&[("X", "hello")]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
+        let flags = ShellFlags {
+            errexit: false,
+            nounset: true,
+            xtrace: false,
+            noexec: false,
+        };
         assert_eq!(expand_vars("$X", &env, 0, &flags).unwrap(), "hello");
         assert_eq!(expand_vars("${X}", &env, 0, &flags).unwrap(), "hello");
     }
@@ -1866,7 +2008,12 @@ mod expand_tests {
         // as "unset", so nounset MUST NOT trip. The literal
         // `${X` is returned as-is.
         let env = env_with(&[]);
-        let flags = ShellFlags { errexit: false, nounset: true, xtrace: false, noexec: false };
+        let flags = ShellFlags {
+            errexit: false,
+            nounset: true,
+            xtrace: false,
+            noexec: false,
+        };
         assert_eq!(expand_vars("${X", &env, 0, &flags).unwrap(), "${X");
     }
 }

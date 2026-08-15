@@ -26,6 +26,18 @@ walk-throughs in `quickstart.md §9 Troubleshooting`. Re-walk both
 when cutting a release; record the date in the release-notes git
 tag annotation.
 
+## Live process-view races
+
+System Monitor treats `/proc` as a live view rather than a transaction. A PID
+that exits between root enumeration and reading its `status` is skipped with a
+visible partial-snapshot warning. Failure to enumerate `/proc` preserves the
+last good rows and displays the error. Selection and terminate confirmation
+are keyed by PID, so row reordering cannot signal the process that happens to
+inherit an old row index. Without `PROC_KILL_ANY`, termination stays visibly
+read-only. These cases are isolated in `crates/sysmon/tests/sysmon.rs`; the
+Chromium/Firefox lifecycle workflow is
+`web/tests/integration/system-monitor.spec.ts`.
+
 ## Last walk
 
 This checklist was walked end-to-end at **T214 close** (the v1

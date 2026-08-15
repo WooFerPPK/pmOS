@@ -10,7 +10,7 @@
 //! The initial v1 set covers the requests the server
 //! actually has to decode to keep its object table in sync:
 //!
-//! * [`DisplayGetRegistry`] — binds a new registry.
+//! * [`DisplaySync`] / [`DisplayGetRegistry`] — bind ordering callback and registry objects.
 //! * [`RegistryBind`] — binds a new global (compositor, shm,
 //!   ...). Carries the interface NAME string so the server
 //!   can map it to a Rust-level [`crate::Interface`] via
@@ -25,8 +25,24 @@
 //! just journals the header. Those land when the real
 //! compositor needs them.
 
-use crate::decode::{read_i32, read_object_id, read_string, read_u32, DecodeError};
+use crate::decode::{
+    read_i32, read_object_id, read_string, read_string_byte_len, read_u32, DecodeError,
+};
 use crate::ids::ObjectId;
+
+/// `pmd_display.sync(new_id callback)` — spec §3 row 1.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DisplaySync {
+    pub new_id: ObjectId,
+}
+
+impl DisplaySync {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            new_id: read_object_id(payload, 0)?,
+        })
+    }
+}
 
 /// `pmd_display.get_registry(new_id)` — spec §3 row 2.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -137,6 +153,22 @@ impl ShmPoolCreateBuffer {
     }
 }
 
+/// `pmd_shm_pool.resize(new_size)` — replace the pool's declared backing
+/// length. The display server validates resource budgets and existing buffer
+/// extents before changing storage.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShmPoolResize {
+    pub new_size: u32,
+}
+
+impl ShmPoolResize {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            new_size: read_u32(payload, 0)?,
+        })
+    }
+}
+
 /// Known v1 pixel formats for [`ShmPoolCreateBuffer::format`].
 /// Kept as a plain u32 constant set so the decoder doesn't
 /// have to validate — the compositor's attach/commit path
@@ -145,6 +177,11 @@ pub mod buffer_format {
     pub const ARGB8888: u32 = 0;
     pub const XRGB8888: u32 = 1;
 }
+
+/// Maximum inline pixel bytes accepted by one
+/// `pmd_surface.patch_current` request. This matches one toolkit upload
+/// quantum and keeps both decode allocation and server-side copying bounded.
+pub const MAX_SURFACE_PATCH_BYTES: usize = 24 * 1024;
 
 /// `pmd_shm_pool.write(offset, bytes)` — v1 affordance to
 /// fill the server-side pool storage with pixel bytes the
@@ -170,6 +207,49 @@ impl ShmPoolWrite {
     }
 }
 
+/// `pmd_shm_pool.write_rows(offset, row_bytes, rows, stride, bytes)` copies a
+/// densely packed set of rows into a strided pool region. It is the bounded
+/// damage counterpart to [`ShmPoolWrite`]: persistent surfaces can transport a
+/// narrow rectangle in one message instead of issuing one write for every
+/// destination scanline.
+///
+/// Wire layout: four `u32` fields followed by exactly `row_bytes * rows`
+/// inline bytes. The server validates non-zero geometry, `stride >= row_bytes`,
+/// checked destination arithmetic, and the final pool extent before mutating
+/// any backing bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShmPoolWriteRows {
+    pub offset: u32,
+    pub row_bytes: u32,
+    pub rows: u32,
+    pub stride: u32,
+    pub bytes: alloc::vec::Vec<u8>,
+}
+
+impl ShmPoolWriteRows {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        let offset = read_u32(payload, 0)?;
+        let row_bytes = read_u32(payload, 4)?;
+        let rows = read_u32(payload, 8)?;
+        let stride = read_u32(payload, 12)?;
+        let bytes = payload.get(16..).unwrap_or(&[]);
+        let expected = u64::from(row_bytes) * u64::from(rows);
+        if bytes.len() as u64 != expected {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self {
+            offset,
+            row_bytes,
+            rows,
+            stride,
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
 /// `pmd_surface.attach(buffer_id, x, y)` — spec §9 row 2.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceAttach {
@@ -184,6 +264,30 @@ impl SurfaceAttach {
             buffer_id: read_object_id(payload, 0)?,
             x: read_i32(payload, 4)?,
             y: read_i32(payload, 8)?,
+        })
+    }
+}
+
+/// `pmd_surface.frame(new_id callback)` — spec §9 row 4.
+///
+/// The callback is a real one-shot [`crate::Interface::Callback`] object.
+/// Request dispatch only binds it and associates it with the surface's next
+/// commit; completion is tied to a later framebuffer presentation boundary.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SurfaceFrame {
+    pub new_id: ObjectId,
+}
+
+impl SurfaceFrame {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 4 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 4,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            new_id: read_object_id(payload, 0)?,
         })
     }
 }
@@ -204,6 +308,49 @@ impl SurfaceDamage {
             y: read_i32(payload, 4)?,
             width: read_i32(payload, 8)?,
             height: read_i32(payload, 12)?,
+        })
+    }
+}
+
+/// `pmd_surface.patch_current(x, y, width, height, pixels)` — spec §9 row 8.
+///
+/// `pixels` contains tightly packed four-byte ARGB8888/XRGB8888 rows. The
+/// decoder proves that the payload contains exactly `width * height * 4`
+/// bytes after the fixed geometry header. Surface bounds, current-buffer
+/// state, pixel format, and the inline byte ceiling are server-side semantic
+/// checks because they require the target object's live state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SurfacePatchCurrent<'a> {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: &'a [u8],
+}
+
+impl<'a> SurfacePatchCurrent<'a> {
+    pub fn decode(payload: &'a [u8]) -> Result<Self, DecodeError> {
+        let x = read_i32(payload, 0)?;
+        let y = read_i32(payload, 4)?;
+        let width = read_u32(payload, 8)?;
+        let height = read_u32(payload, 12)?;
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(DecodeError::PayloadLengthOverflow)?;
+        let pixels = payload.get(16..).unwrap_or(&[]);
+        if pixels.len() as u64 != expected {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected,
+                actual: pixels.len(),
+            });
+        }
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+            pixels,
         })
     }
 }
@@ -266,6 +413,192 @@ impl ShellManagerMinimizeWindow {
     }
 }
 
+/// `pmd_shell_manager.unminimize_window(window_id)` — spec §15.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerUnminimizeWindow {
+    pub window_id: u32,
+}
+
+impl ShellManagerUnminimizeWindow {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(ShellManagerUnminimizeWindow {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_shell_manager.set_work_area_bottom(height_px)` — reserve a bottom
+/// output strip for shell chrome such as the taskbar. The display server uses
+/// the remaining work area for subsequent application configures.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerSetWorkAreaBottom {
+    pub height_px: u32,
+}
+
+impl ShellManagerSetWorkAreaBottom {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            height_px: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_shell_manager.toggle_maximized_window(window_id)` — toggle the exact
+/// server-global toplevel between its normal geometry and the shell-published
+/// work area. The display server resolves `window_id`; client-local object IDs
+/// are never accepted as a fallback.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerToggleMaximizedWindow {
+    pub window_id: u32,
+}
+
+impl ShellManagerToggleMaximizedWindow {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        Ok(Self {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_shell_manager.desktop_ready()` — report that this authenticated shell
+/// has published its initial desktop state. The display server turns the
+/// one-shot request into a generic framebuffer presentation fence only after
+/// all preceding display requests and resulting composition work are settled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShellManagerDesktopReady;
+
+impl ShellManagerDesktopReady {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if !payload.is_empty() {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 0,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self)
+    }
+}
+
+/// Maximum timeout accepted by [`ShellManagerBeginRestore`]. The display
+/// server clamps shorter/longer caller values into `1..=2500` milliseconds so
+/// a crashed shell can never leave application windows hidden indefinitely.
+pub const MAX_SHELL_RESTORE_TIMEOUT_MS: u32 = 2_500;
+
+/// `pmd_shell_manager.subscribe_window_state()` — opt in to the v2,
+/// authoritative full-window-state stream. Opcode 1 remains the byte-stable
+/// v1 lifecycle stream for existing shells.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerSubscribeWindowState {
+    pub snapshot_id: u32,
+}
+
+impl ShellManagerSubscribeWindowState {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 4 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 4,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            snapshot_id: read_u32(payload, 0)?,
+        })
+    }
+}
+
+/// `pmd_shell_manager.begin_restore(timeout_ms)` — begin a privileged atomic
+/// restore transaction. A following `pmd_display.sync` is the protocol barrier
+/// proving that newly spawned clients will be admitted into the hidden restore
+/// set.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerBeginRestore {
+    pub restore_id: u32,
+    pub timeout_ms: u32,
+}
+
+impl ShellManagerBeginRestore {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 8 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 8,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            restore_id: read_u32(payload, 0)?,
+            timeout_ms: read_u32(payload, 4)?,
+        })
+    }
+}
+
+/// Flags accepted by [`ShellManagerPlaceRestoredWindow`]. Unknown bits are
+/// rejected by the display server before any window state changes.
+pub mod shell_restore_window_flags {
+    pub const MINIMIZED: u32 = 1 << 0;
+    pub const MAXIMIZED: u32 = 1 << 1;
+    pub const ALL: u32 = MINIMIZED | MAXIMIZED;
+}
+
+/// `pmd_shell_manager.place_restored_window(...)` — associate one hidden,
+/// newly created window with its persisted normal geometry and stack rank.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerPlaceRestoredWindow {
+    pub restore_id: u32,
+    pub window_id: u32,
+    pub normal_x: i32,
+    pub normal_y: i32,
+    pub normal_width: u32,
+    pub normal_height: u32,
+    pub z_rank: u32,
+    pub flags: u32,
+}
+
+impl ShellManagerPlaceRestoredWindow {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 32 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 32,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            restore_id: read_u32(payload, 0)?,
+            window_id: read_u32(payload, 4)?,
+            normal_x: read_i32(payload, 8)?,
+            normal_y: read_i32(payload, 12)?,
+            normal_width: read_u32(payload, 16)?,
+            normal_height: read_u32(payload, 20)?,
+            z_rank: read_u32(payload, 24)?,
+            flags: read_u32(payload, 28)?,
+        })
+    }
+}
+
+/// `pmd_shell_manager.end_restore(focus_window_id)` — atomically reveal and
+/// order all restored windows. Zero asks the server to focus the restoring
+/// shell's mapped toplevel, with a highest-visible fallback only when the shell
+/// has no focusable window.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellManagerEndRestore {
+    pub restore_id: u32,
+    pub focus_window_id: u32,
+}
+
+impl ShellManagerEndRestore {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 8 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 8,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            restore_id: read_u32(payload, 0)?,
+            focus_window_id: read_u32(payload, 4)?,
+        })
+    }
+}
+
 // ---- pmd_xdg_shell (narrowed Wayland xdg-shell) ---------------
 
 /// `pmd_xdg_shell.get_toplevel(new_id toplevel, object_id
@@ -298,6 +631,11 @@ pub struct XdgToplevelSetTitle {
 }
 
 impl XdgToplevelSetTitle {
+    /// Declared UTF-8 content bytes without allocating the owned title.
+    pub fn title_byte_len(payload: &[u8]) -> Result<usize, DecodeError> {
+        read_string_byte_len(payload, 0)
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
         let (title, _consumed) = read_string(payload, 0)?;
         Ok(XdgToplevelSetTitle {
@@ -314,6 +652,11 @@ pub struct XdgToplevelSetAppId {
 }
 
 impl XdgToplevelSetAppId {
+    /// Declared UTF-8 content bytes without allocating the owned app id.
+    pub fn app_id_byte_len(payload: &[u8]) -> Result<usize, DecodeError> {
+        read_string_byte_len(payload, 0)
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
         let (app_id, _consumed) = read_string(payload, 0)?;
         Ok(XdgToplevelSetAppId {

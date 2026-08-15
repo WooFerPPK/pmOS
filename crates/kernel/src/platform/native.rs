@@ -8,7 +8,7 @@
 //! random bytes, `panic!()` for halt.
 
 use core::panic::PanicInfo;
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use abi::ext::Pid;
@@ -31,10 +31,18 @@ pub struct DriverCall {
 pub struct SpawnCall {
     pub pid: Pid,
     pub path: String,
+    pub executable: Option<Vec<u8>>,
 }
 
-/// Shared mutable state of the native platform. Tests can reset()
-/// between runs to get a clean slate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostDownloadCall {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Mutable state of the native platform for one native test thread.
+/// Tests can reset() between runs to get a clean slate.
 pub struct NativeState {
     pub start: Instant,
     pub driver_calls: Vec<DriverCall>,
@@ -45,10 +53,16 @@ pub struct NativeState {
     pub panics: Vec<String>,
     /// Recorded `spawn_process` requests, in order.
     pub spawn_calls: Vec<SpawnCall>,
+    /// Recorded `terminate_process` requests, in order.
+    pub terminate_calls: Vec<Pid>,
+    pub host_picker_calls: u32,
+    pub host_download_calls: Vec<HostDownloadCall>,
     /// If `Some`, the next call to `spawn_process` returns this
     /// error and records nothing. Tests set this to exercise the
     /// rollback path in the `PROC_SPAWN` opcode handler.
     pub next_spawn_error: Option<super::DriverError>,
+    pub next_host_picker_error: Option<super::DriverError>,
+    pub next_host_download_error: Option<super::DriverError>,
 }
 
 impl Default for NativeState {
@@ -61,24 +75,36 @@ impl Default for NativeState {
             halted: None,
             panics: Vec::new(),
             spawn_calls: Vec::new(),
+            terminate_calls: Vec::new(),
+            host_picker_calls: 0,
+            host_download_calls: Vec::new(),
             next_spawn_error: None,
+            next_host_picker_error: None,
+            next_host_download_error: None,
         }
     }
 }
 
-/// The singleton NativePlatform instance.
-pub struct NativePlatform {
-    state: OnceLock<Mutex<NativeState>>,
+// Rust's test runner executes tests concurrently on separate threads. Keeping
+// fixture controls in thread-local storage prevents one test's reset or
+// one-shot error injection from changing another test's platform state. This
+// also matches the browser runtime's execution model: one kernel per Worker.
+std::thread_local! {
+    static NATIVE_STATE: RefCell<NativeState> = RefCell::new(NativeState::default());
 }
+
+/// The singleton NativePlatform instance.
+pub struct NativePlatform;
 
 /// Test helper: borrow the state for mutation (installing canned
 /// responses, clearing driver-call history, reading recorded panics).
 ///
 /// Only available under `cfg(feature = "native-platform")`.
 pub fn with_state<R>(f: impl FnOnce(&mut NativeState) -> R) -> R {
-    let state = NATIVE_PLATFORM.get_or_install_state();
-    let mut guard = state.lock().expect("NativeState mutex poisoned");
-    f(&mut guard)
+    NATIVE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        f(&mut state)
+    })
 }
 
 /// Test helper: reset the state back to defaults.
@@ -88,18 +114,11 @@ pub fn reset() {
 
 impl NativePlatform {
     pub(crate) const fn new() -> Self {
-        NativePlatform {
-            state: OnceLock::new(),
-        }
+        NativePlatform
     }
 
     pub(crate) fn get_or_install(&'static self) -> &'static dyn Platform {
-        self.get_or_install_state();
         self as &'static dyn Platform
-    }
-
-    pub(crate) fn get_or_install_state(&self) -> &Mutex<NativeState> {
-        self.state.get_or_init(|| Mutex::new(NativeState::default()))
     }
 }
 
@@ -107,17 +126,18 @@ pub static NATIVE_PLATFORM: NativePlatform = NativePlatform::new();
 
 impl Platform for NativePlatform {
     fn now_ns(&self) -> u64 {
-        let state = self.get_or_install_state();
-        let mut guard = state.lock().unwrap();
-        let elapsed = guard.start.elapsed();
-        let mut ns = elapsed.as_secs().saturating_mul(1_000_000_000) + u64::from(elapsed.subsec_nanos());
-        // Strict monotonicity: even two back-to-back calls within the
-        // same nanosecond must produce distinct values.
-        if ns <= guard.last_ns {
-            ns = guard.last_ns + 1;
-        }
-        guard.last_ns = ns;
-        ns
+        with_state(|state| {
+            let elapsed = state.start.elapsed();
+            let mut ns =
+                elapsed.as_secs().saturating_mul(1_000_000_000) + u64::from(elapsed.subsec_nanos());
+            // Strict monotonicity: even two back-to-back calls within the
+            // same nanosecond must produce distinct values.
+            if ns <= state.last_ns {
+                ns = state.last_ns + 1;
+            }
+            state.last_ns = ns;
+            ns
+        })
     }
 
     fn now_realtime_ns(&self) -> u64 {
@@ -141,18 +161,18 @@ impl Platform for NativePlatform {
     }
 
     fn driver_call(&self, dev: DevId, op: u32, args: &[u8]) -> DriverResult<u32> {
-        let state = self.get_or_install_state();
-        let mut guard = state.lock().unwrap();
-        guard.driver_calls.push(DriverCall {
-            dev,
-            op,
-            args: args.to_vec(),
-        });
-        match guard.canned_responses.get(&(dev as u8, op)).copied() {
-            Some(v) => Ok(v),
-            // Default: succeed with result 0.
-            None => Ok(0),
-        }
+        with_state(|state| {
+            state.driver_calls.push(DriverCall {
+                dev,
+                op,
+                args: args.to_vec(),
+            });
+            match state.canned_responses.get(&(dev as u8, op)).copied() {
+                Some(v) => Ok(v),
+                // Default: succeed with result 0.
+                None => Ok(0),
+            }
+        })
     }
 
     fn random_bytes(&self, out: &mut [u8]) {
@@ -169,32 +189,112 @@ impl Platform for NativePlatform {
     }
 
     fn halt(&self, reason: &str) -> ! {
-        let state = self.get_or_install_state();
         // Record the halt before panicking so tests can inspect it
         // from a catch_unwind harness.
-        {
-            let mut guard = state.lock().unwrap();
-            guard.halted = Some(reason.to_string());
-        }
+        with_state(|state| state.halted = Some(reason.to_string()));
         panic!("NativePlatform::halt(\"{}\")", reason);
     }
 
     fn on_panic(&self, info: &PanicInfo) {
-        let state = self.get_or_install_state();
-        let mut guard = state.lock().unwrap();
-        guard.panics.push(format!("{info}"));
+        with_state(|state| state.panics.push(format!("{info}")));
     }
 
-    fn spawn_process(&self, pid: Pid, path: &str) -> DriverResult<()> {
-        let state = self.get_or_install_state();
-        let mut guard = state.lock().unwrap();
-        if let Some(err) = guard.next_spawn_error.take() {
-            return Err(err);
-        }
-        guard.spawn_calls.push(SpawnCall {
-            pid,
-            path: path.to_string(),
-        });
+    fn spawn_process(&self, pid: Pid, path: &str, executable: Option<&[u8]>) -> DriverResult<()> {
+        with_state(|state| {
+            if let Some(err) = state.next_spawn_error.take() {
+                return Err(err);
+            }
+            state.spawn_calls.push(SpawnCall {
+                pid,
+                path: path.to_string(),
+                executable: executable.map(Vec::from),
+            });
+            Ok(())
+        })
+    }
+
+    fn terminate_process(&self, pid: Pid) -> DriverResult<()> {
+        with_state(|state| state.terminate_calls.push(pid));
         Ok(())
+    }
+
+    fn request_host_file_picker(&self) -> DriverResult<()> {
+        with_state(|state| {
+            if let Some(error) = state.next_host_picker_error.take() {
+                return Err(error);
+            }
+            state.host_picker_calls = state.host_picker_calls.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    fn download_host_file(&self, name: &str, mime: &str, bytes: &[u8]) -> DriverResult<()> {
+        with_state(|state| {
+            if let Some(error) = state.next_host_download_error.take() {
+                return Err(error);
+            }
+            state.host_download_calls.push(HostDownloadCall {
+                name: name.to_string(),
+                mime: mime.to_string(),
+                bytes: bytes.to_vec(),
+            });
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn reset_and_error_injection_are_isolated_between_test_threads() {
+        let error_installed = Arc::new(Barrier::new(2));
+        let peer_spawned = Arc::new(Barrier::new(2));
+
+        let error_thread = {
+            let error_installed = Arc::clone(&error_installed);
+            let peer_spawned = Arc::clone(&peer_spawned);
+            thread::spawn(move || {
+                reset();
+                with_state(|state| {
+                    state.next_spawn_error = Some(super::super::DriverError::NotReady);
+                });
+                error_installed.wait();
+                peer_spawned.wait();
+
+                let result = NATIVE_PLATFORM.spawn_process(41, "/bin/fail", None);
+                let calls = with_state(|state| state.spawn_calls.clone());
+                (result, calls)
+            })
+        };
+
+        let success_thread = thread::spawn(move || {
+            error_installed.wait();
+            reset();
+            let result = NATIVE_PLATFORM.spawn_process(42, "/bin/succeed", None);
+            let calls = with_state(|state| state.spawn_calls.clone());
+            peer_spawned.wait();
+            (result, calls)
+        });
+
+        let (error_result, error_calls) = error_thread.join().expect("error thread panicked");
+        let (success_result, success_calls) =
+            success_thread.join().expect("success thread panicked");
+
+        assert_eq!(error_result, Err(super::super::DriverError::NotReady));
+        assert!(error_calls.is_empty());
+        assert_eq!(success_result, Ok(()));
+        assert_eq!(
+            success_calls,
+            vec![SpawnCall {
+                pid: 42,
+                path: "/bin/succeed".to_string(),
+                executable: None,
+            }]
+        );
     }
 }

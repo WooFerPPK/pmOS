@@ -34,6 +34,20 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
+#[derive(Copy, Clone)]
+struct Counts {
+    lines: u64,
+    words: u64,
+    bytes: u64,
+}
+
+#[derive(Copy, Clone)]
+struct Selection {
+    lines: bool,
+    words: bool,
+    bytes: bool,
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut want_lines = false;
@@ -67,6 +81,11 @@ fn main() -> ExitCode {
     let show_lines = if any_flag { want_lines } else { true };
     let show_words = if any_flag { want_words } else { true };
     let show_bytes = if any_flag { want_bytes } else { true };
+    let selection = Selection {
+        lines: show_lines,
+        words: show_words,
+        bytes: show_bytes,
+    };
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -76,15 +95,19 @@ fn main() -> ExitCode {
         let mut buf = Vec::new();
         match io::stdin().lock().read_to_end(&mut buf) {
             Ok(_) => {
-                let (lines, words, bytes) = count(&buf, "stdin", &mut had_error);
-                emit(&mut out, lines, words, bytes, None, show_lines, show_words, show_bytes);
+                let counts = count(&buf, "stdin", &mut had_error);
+                emit(&mut out, counts, None, selection);
             }
             Err(e) => {
                 let _ = writeln!(io::stderr(), "wc: stdin: {e}");
                 had_error = true;
             }
         }
-        return if had_error { ExitCode::from(1) } else { ExitCode::from(0) };
+        return if had_error {
+            ExitCode::from(1)
+        } else {
+            ExitCode::from(0)
+        };
     }
 
     let multi = paths.len() > 1;
@@ -95,11 +118,11 @@ fn main() -> ExitCode {
     for path in &paths {
         match fs::read(path) {
             Ok(bytes) => {
-                let (l, w, b) = count(&bytes, path, &mut had_error);
-                emit(&mut out, l, w, b, Some(path.as_str()), show_lines, show_words, show_bytes);
-                total_lines += l;
-                total_words += w;
-                total_bytes += b;
+                let counts = count(&bytes, path, &mut had_error);
+                emit(&mut out, counts, Some(path.as_str()), selection);
+                total_lines += counts.lines;
+                total_words += counts.words;
+                total_bytes += counts.bytes;
             }
             Err(e) => {
                 let _ = writeln!(io::stderr(), "wc: {path}: {e}");
@@ -109,13 +132,26 @@ fn main() -> ExitCode {
     }
 
     if multi {
-        emit(&mut out, total_lines, total_words, total_bytes, Some("total"), show_lines, show_words, show_bytes);
+        emit(
+            &mut out,
+            Counts {
+                lines: total_lines,
+                words: total_words,
+                bytes: total_bytes,
+            },
+            Some("total"),
+            selection,
+        );
     }
 
-    if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
 }
 
-fn count(bytes: &[u8], label: &str, had_error: &mut bool) -> (u64, u64, u64) {
+fn count(bytes: &[u8], label: &str, had_error: &mut bool) -> Counts {
     let lines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
     let byte_count = bytes.len() as u64;
     let words = match std::str::from_utf8(bytes) {
@@ -126,28 +162,23 @@ fn count(bytes: &[u8], label: &str, had_error: &mut bool) -> (u64, u64, u64) {
             0
         }
     };
-    (lines, words, byte_count)
+    Counts {
+        lines,
+        words,
+        bytes: byte_count,
+    }
 }
 
-fn emit<W: Write>(
-    out: &mut W,
-    lines: u64,
-    words: u64,
-    bytes: u64,
-    label: Option<&str>,
-    show_lines: bool,
-    show_words: bool,
-    show_bytes: bool,
-) {
+fn emit<W: Write>(out: &mut W, counts: Counts, label: Option<&str>, selection: Selection) {
     let mut cols: Vec<String> = Vec::with_capacity(4);
-    if show_lines {
-        cols.push(lines.to_string());
+    if selection.lines {
+        cols.push(counts.lines.to_string());
     }
-    if show_words {
-        cols.push(words.to_string());
+    if selection.words {
+        cols.push(counts.words.to_string());
     }
-    if show_bytes {
-        cols.push(bytes.to_string());
+    if selection.bytes {
+        cols.push(counts.bytes.to_string());
     }
     if let Some(name) = label {
         cols.push(name.to_string());

@@ -5,8 +5,8 @@
 //! binary and not stripped by LTO.
 //!
 //! Why fd 99: PMos fd tables for spawned children start with fd
-//! 0/1/2 = console (per the spawn auto-install loop) and fd 3 =
-//! SignalChannel (per 9fbe708's auto-install). fd 99 is well
+//! 0/1/2 = console, fd 3 = the `/` preopen, and fd 4 = the signal
+//! channel. fd 99 is well
 //! beyond any allocation, so the kernel's `fd_close` returns
 //! `KernelError::NoSuchFd -> -EBADF` immediately. Closing a real
 //! fd would also need a path_open round-trip; an unopened-fd test
@@ -24,12 +24,7 @@
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
     fn fd_close(fd: i32) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
 }
 

@@ -23,19 +23,23 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use abi::cap::{initial, Cap};
+use abi::cap::{initial, Cap, CapSet};
 use abi::errno;
 use abi::ext as op_ext;
 use abi::ring::{Request, SAB_SIZE};
 use abi::wasi as op_wasi;
 
-use kernel::fd::{FdFlags, FdObject};
+use kernel::fd::{FdFlags, FdObject, FdTable};
 use kernel::fs::devfs::{DevFs, DEV_CONSOLE};
 use kernel::fs::procfs::ProcFs;
 use kernel::fs::tmpfs::TmpFs;
 use kernel::proc::{ExitStatus, ProcState, Signal};
-use kernel::sys::{Kernel, RegisterArgs};
-use kernel::syscall::{dispatch, Dispatcher};
+use kernel::sys::{
+    Kernel, RegisterArgs, POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT, POLL_GLOBAL_SUBSCRIPTION_LIMIT,
+    POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT, POLL_ORDINARY_SUBSCRIPTION_LIMIT,
+    POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT, POLL_SUBSCRIPTION_LIMIT,
+};
+use kernel::syscall::{dispatch, Dispatcher, ServiceOutcome};
 use ring::Sab;
 
 // ---- test harness ------------------------------------------------------
@@ -146,8 +150,8 @@ fn known_wasi_opcode_without_handler_returns_enosys() {
 #[test]
 fn known_ext_opcode_without_handler_returns_enosys() {
     // Probe the dispatcher's `_ =>` ENOSYS arm with an unallocated
-    // extension-range opcode (`0x1008`, in the gap between
-    // `IPC_PIPE = 0x1007` and `PROC_SPAWN = 0x1100`). As of the
+    // extension-range opcode (`0x100a`, in the gap between
+    // `IPC_PEER_PID = 0x1009` and `PROC_SPAWN = 0x1100`). As of the
     // HOST_FILE_RECV slice, every opcode in
     // `abi::ext::FIRST..LAST_EXCL` (0x1000..=0x1500) has a handler —
     // so the probe target had to rotate from a real-but-unimplemented
@@ -156,19 +160,20 @@ fn known_ext_opcode_without_handler_returns_enosys() {
     //
     // Rotation history: `PROC_SPAWN` → `PROC_WAIT` → `PROC_KILL` →
     // `PROC_CAPS_GET` → `CAP_GRANT` → `IPC_SEND` → `IPC_RECV` →
-    // `MOUNT` → `FS_WATCH` → `HOST_FILE_RECV` → unallocated 0x1008.
+    // `MOUNT` → `FS_WATCH` → `HOST_FILE_RECV` → unallocated 0x1009 →
+    // unallocated 0x100a.
     // Each rotation tightened the unimplemented-opcode surface until
     // none remained; the synthetic-opcode probe defends the `_ =>`
     // arm against a future regression where someone deletes the arm
     // because "every opcode is handled now."
     //
-    // 0x1008 is `is_ext()` (FIRST=0x1000, LAST_EXCL=0x1501) but is
+    // 0x100a is `is_ext()` (FIRST=0x1000, LAST_EXCL=0x1503) but is
     // not declared in `abi::ext` — it sits in the IPC subsystem's
-    // gap between IPC_PIPE (0x1007) and the start of the `proc_*`
-    // group at 0x1100. If a future slice ever allocates 0x1008,
+    // gap between IPC_PEER_PID (0x1009) and the start of the `proc_*`
+    // group at 0x1100. If a future slice ever allocates 0x100a,
     // this test should re-rotate to a still-unallocated extension
-    // number (0x1009..0x10ff or 0x1106..0x11ff, etc.).
-    const UNALLOCATED_EXT_OPCODE: u16 = 0x1008;
+    // number (0x100a..0x10ff or 0x1106..0x11ff, etc.).
+    const UNALLOCATED_EXT_OPCODE: u16 = 0x100a;
     assert!(
         op_ext::is_ext(UNALLOCATED_EXT_OPCODE),
         "probe target must live in the extension range",
@@ -346,6 +351,15 @@ fn fd_close_with_bad_fd_returns_ebadf() {
 }
 
 // ---- path_open --------------------------------------------------------
+
+fn path_open_args(fdflags: u32, oflags: u16, lookup_flags: u32, dir_fd: u32) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&fdflags.to_le_bytes());
+    args[4..6].copy_from_slice(&oflags.to_le_bytes());
+    args[8..12].copy_from_slice(&lookup_flags.to_le_bytes());
+    args[12..16].copy_from_slice(&dir_fd.to_le_bytes());
+    args
+}
 
 #[test]
 fn path_open_against_devfs_console_returns_fresh_fd() {
@@ -1220,18 +1234,15 @@ fn ipc_send_happy_path_writes_payload_to_connected_socket() {
 fn ipc_send_with_fd_to_pass_round_trips_to_receiver() {
     // Set up a connected pair, send a payload + an extra fd. The
     // receiver's socket should have the payload bytes on its rx
-    // buffer AND the passed-fd number on its `rx_fds` queue. The
-    // IPC_RECV slice (still ENOSYS) will eventually translate the
-    // queued number into a real receiver-side FdEntry; this slice
-    // just verifies the queue is populated.
+    // buffer AND the send-time object snapshot on its `rx_fds` queue.
     let mut k = make_kernel();
     let server = make_running_proc(&mut k, "srv", 0);
     let client = make_running_proc(&mut k, "cli", 0);
     let (cli_fd, srv_conn) = ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-fd", 420);
 
     // The ancillary fd: open /dev/console on the client side. The
-    // value gets queued as-is on the server's rx_fds; receiver-side
-    // FdEntry installation is the IPC_RECV slice's job.
+    // underlying object is retained on the server's rx_fds queue;
+    // receiver-side FdEntry installation is IPC_RECV's job.
     k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
         .unwrap();
 
@@ -1398,13 +1409,44 @@ fn ipc_send_with_invalid_fd_to_pass_returns_ebadf() {
     assert_eq!(sock.rx_fd_count(), 0, "no fds leaked on bad ancillary fd");
 }
 
+#[test]
+fn ipc_send_rejects_single_owner_ancillary_fd_with_enotsup_atomically() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    let (cli_fd, srv_conn) = ipc_send_connected_pair(&mut k, client, server, b"/tmp/snd-own", 495);
+    let payload = b"must-not-land";
+    let mut heap = vec![0u8; 64];
+    heap[..payload.len()].copy_from_slice(payload);
+
+    let response = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 496,
+            args: ipc_send_args(cli_fd, payload.len() as u32, cli_fd as i32, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -errno::ENOTSUP);
+
+    let socket_id = k.socket_id_from_fd_public(server, srv_conn).unwrap();
+    let socket = k.ipc.sockets_get(socket_id).unwrap();
+    assert_eq!(socket.rx_len(), 0);
+    assert_eq!(socket.rx_fd_count(), 0);
+}
+
 // ---- ipc_recv --------------------------------------------------------
 //
 // IPC_RECV is the receiver-side counterpart to IPC_SEND. It drains
 // bytes from the caller's connected socket into the caller's
-// heap_out window and (when `recv_fd_slot >= 0`) translates one
-// queued sender-side fd-number into a freshly-allocated
-// receiver-side `FdEntry`, returning the new fd-number in the first
+// heap_out window and (when `recv_fd_slot >= 0`) transfers one
+// queued send-time object snapshot into a freshly-allocated receiver-side
+// `FdEntry`, returning the new fd-number in the first
 // 4 bytes of heap_out (payload follows from offset 4).
 //
 // Every test below uses `ipc_send_connected_pair` to set up the
@@ -1553,6 +1595,194 @@ fn ipc_recv_with_fd_pass_installs_fd_in_receiver_table() {
         FdObject::CharDevice(devnum) => assert_eq!(devnum, DEV_CONSOLE),
         other => panic!("unexpected installed fd object: {:?}", other),
     }
+}
+
+#[test]
+fn ipc_recv_emfile_leaves_payload_and_snapshot_queued_for_retry() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "srv", 0);
+    let client = make_running_proc(&mut k, "cli", 0);
+    *k.fds_mut(server).unwrap() = FdTable::with_limit(2);
+    let (cli_fd, srv_conn) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/rcv-emfile", 535);
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    let payload = b"retry";
+    let mut heap = vec![0u8; 64];
+    heap[..payload.len()].copy_from_slice(payload);
+    let send = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 541,
+            args: ipc_send_args(cli_fd, payload.len() as u32, 9, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(send.status, 0);
+
+    let recv_request = Request {
+        opcode: op_ext::IPC_RECV,
+        flags: 0,
+        request_id: 542,
+        args: ipc_recv_args(srv_conn, 16, 0, 0),
+        heap_ptr: 0,
+        heap_len: 20,
+    };
+    let rejected = dispatch(&mut k, server, &recv_request, &mut heap);
+    assert_eq!(rejected.status, -errno::EMFILE);
+    let socket_id = k.socket_id_from_fd_public(server, srv_conn).unwrap();
+    assert_eq!(
+        k.ipc.sockets_get(socket_id).unwrap().rx_len(),
+        payload.len()
+    );
+    assert_eq!(k.ipc.sockets_get(socket_id).unwrap().rx_fd_count(), 1);
+
+    let listener_fd = k
+        .fds(server)
+        .unwrap()
+        .iter()
+        .find_map(|(fd, _)| (fd != srv_conn).then_some(fd))
+        .expect("listener fd");
+    k.fd_close(server, listener_fd).unwrap();
+    let accepted = dispatch(&mut k, server, &recv_request, &mut heap);
+    assert_eq!(accepted.status, 0);
+    assert_eq!(accepted.value, payload.len() as i64);
+    assert_eq!(&heap[4..4 + payload.len()], payload);
+    assert_eq!(k.ipc.queued_ancillary_count(), 0);
+}
+
+#[test]
+fn ipc_recv_cross_end_heap_is_rejected_before_bytes_or_fd_are_consumed() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "recv-oob-server", 0);
+    let client = make_running_proc(&mut k, "recv-oob-client", 0);
+    let (client_fd, server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/recv-oob", 543);
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    let payload = b"atomic";
+    let mut heap = vec![0u8; 32];
+    heap[..payload.len()].copy_from_slice(payload);
+    let sent = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 544,
+            args: ipc_send_args(client_fd, payload.len() as u32, 9, 0),
+            heap_ptr: 0,
+            heap_len: payload.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(sent.status, 0);
+
+    let socket_id = k.socket_id_from_fd_public(server, server_fd).unwrap();
+    let open_before = k.fds(server).unwrap().open_count();
+    let malformed = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 545,
+            args: ipc_recv_args(server_fd, 16, 0, 0),
+            heap_ptr: 20,
+            heap_len: 20,
+        },
+        &mut heap,
+    );
+    assert_eq!(malformed.status, -errno::EINVAL);
+    assert_eq!(k.fds(server).unwrap().open_count(), open_before);
+    assert_eq!(
+        k.ipc.sockets_get(socket_id).unwrap().rx_len(),
+        payload.len()
+    );
+    assert_eq!(k.ipc.sockets_get(socket_id).unwrap().rx_fd_count(), 1);
+
+    let accepted = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 546,
+            args: ipc_recv_args(server_fd, 16, 0, 0),
+            heap_ptr: 0,
+            heap_len: 20,
+        },
+        &mut heap,
+    );
+    assert_eq!(accepted.status, 0);
+    assert_eq!(accepted.value, payload.len() as i64);
+    assert_eq!(&heap[4..4 + payload.len()], payload);
+    assert_eq!(k.ipc.sockets_get(socket_id).unwrap().rx_len(), 0);
+    assert_eq!(k.ipc.sockets_get(socket_id).unwrap().rx_fd_count(), 0);
+}
+
+#[test]
+fn ipc_send_hard_ancillary_limit_returns_enospc_not_retryable_eagain() {
+    use kernel::ipc::{IpcLimits, IpcTable};
+
+    let mut k = make_kernel();
+    k.ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 1,
+        live_sockets: 4,
+        buffered_bytes: 64,
+        queued_ancillary_refs: 1,
+    });
+    let server = make_running_proc(&mut k, "ancillary-hard-server", 0);
+    let client = make_running_proc(&mut k, "ancillary-hard-client", 0);
+    let (client_fd, _server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/ancillary-hard", 543);
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(
+        client,
+        10,
+        FdObject::CharDevice(DEV_CONSOLE),
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+
+    let mut heap = Vec::new();
+    let admitted = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 548,
+            args: ipc_send_args(client_fd, 0, 9, 0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(admitted.status, 0);
+    let response = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 549,
+            args: ipc_send_args(client_fd, 0, 10, 0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -errno::ENOSPC);
+    assert_eq!(k.ipc.queued_ancillary_count(), 1);
 }
 
 #[test]
@@ -1889,12 +2119,228 @@ fn ipc_send_wakes_parked_recver_with_bytes() {
 }
 
 #[test]
+fn zero_byte_socket_writes_without_ancillary_do_not_wake_parked_recv() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "zero-server", 0);
+    let client = make_running_proc(&mut k, "zero-client", 0);
+    let (client_fd, server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/recv-zero", 721);
+    let mut heap = vec![0u8; 32];
+    let parked = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 722,
+            args: ipc_recv_args(server_fd, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(parked, kernel::syscall::ServiceOutcome::Parked));
+
+    let fd_write = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_wasi::FD_WRITE,
+            flags: 0,
+            request_id: 723,
+            args: u32_args(client_fd),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(fd_write.status, 0);
+    assert_eq!(fd_write.value, 0);
+    assert!(k.parked_recvers_contains(server));
+    assert!(k.pending_wakes_is_empty());
+
+    let ipc_send = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_SEND,
+            flags: 0,
+            request_id: 724,
+            args: ipc_send_args(client_fd, 0, -1, 0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(ipc_send.status, 0);
+    assert_eq!(ipc_send.value, 0);
+    assert!(k.parked_recvers_contains(server));
+    assert!(k.pending_wakes_is_empty());
+}
+
+#[test]
+fn wasi_sock_send_wakes_custom_blocking_recv() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "sock-send-server", 0);
+    let client = make_running_proc(&mut k, "sock-send-client", 0);
+    let (client_fd, server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/sock-send-wake", 725);
+    let mut heap = vec![0u8; 32];
+    let parked = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 726,
+            args: ipc_recv_args(server_fd, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(parked, kernel::syscall::ServiceOutcome::Parked));
+
+    heap[0] = b'x';
+    let sent = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_wasi::SOCK_SEND,
+            flags: 0,
+            request_id: 727,
+            args: sock_send_args(client_fd, 0),
+            heap_ptr: 0,
+            heap_len: 1,
+        },
+        &mut heap,
+    );
+    assert_eq!(sent.status, 0);
+    assert_eq!(sent.value, 1);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, server);
+    assert_eq!(wakes[0].1.status, 0);
+    assert_eq!(wakes[0].1.value, 1);
+    assert_eq!(wakes[0].2.as_ref().unwrap().bytes, b"x");
+}
+
+#[test]
+fn sock_shutdown_write_wakes_custom_blocking_recv_with_eof() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "shutdown-server", 0);
+    let client = make_running_proc(&mut k, "shutdown-client", 0);
+    let (client_fd, server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/shutdown-wake", 728);
+    let mut heap = vec![0u8; 32];
+    let parked = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 729,
+            args: ipc_recv_args(server_fd, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(parked, kernel::syscall::ServiceOutcome::Parked));
+
+    let shutdown = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_wasi::SOCK_SHUTDOWN,
+            flags: 0,
+            request_id: 730,
+            args: sock_shutdown_args(client_fd, abi::wasi::sdflags::WR as u32),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(shutdown.status, 0);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, server);
+    assert_eq!(wakes[0].1.status, 0);
+    assert_eq!(wakes[0].1.value, 0);
+    assert_eq!(wakes[0].1.extra_len, 0);
+    assert!(wakes[0].2.is_none());
+}
+
+#[test]
+fn peer_close_wakes_custom_blocking_recv_with_eof_not_ebadf() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "close-server", 0);
+    let client = make_running_proc(&mut k, "close-client", 0);
+    let (client_fd, server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/close-wake", 731);
+    let mut heap = vec![0u8; 32];
+    let parked = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 732,
+            args: ipc_recv_args(server_fd, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(parked, kernel::syscall::ServiceOutcome::Parked));
+
+    k.fd_close(client, client_fd).unwrap();
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, server);
+    assert_eq!(wakes[0].1.status, 0);
+    assert_eq!(wakes[0].1.value, 0);
+    assert_eq!(wakes[0].1.extra_len, 0);
+    assert!(wakes[0].2.is_none());
+}
+
+#[test]
+fn local_socket_close_wakes_its_custom_blocking_recv_with_ebadf() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "local-close-server", 0);
+    let client = make_running_proc(&mut k, "local-close-client", 0);
+    let (_client_fd, server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/local-close-wake", 733);
+    let mut heap = vec![0u8; 32];
+    let parked = kernel::syscall::dispatch::dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_RECV,
+            flags: 0,
+            request_id: 734,
+            args: ipc_recv_args(server_fd, 16, -1, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert!(matches!(parked, kernel::syscall::ServiceOutcome::Parked));
+
+    k.fd_close(server, server_fd).unwrap();
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, server);
+    assert_eq!(wakes[0].1.status, -errno::EBADF);
+    assert!(wakes[0].2.is_none());
+}
+
+#[test]
 fn ipc_send_wakes_parked_recver_with_fd() {
     // Server parks on ipc_recv with `recv_fd_slot = 0` (asks for
-    // an ancillary fd). Client sends payload + an ancillary fd
-    // (a /dev/console fd). The wake response must include the new
-    // fd-number at heap[0..4] AND the payload bytes after — the
-    // same fd-leading layout the non-blocking path produces.
+    // an ancillary fd). Client sends a zero-byte message carrying a
+    // /dev/console fd. Unlike a completely empty send, the queued descriptor
+    // is real progress and must wake the receiver with the fd prefix.
     let mut k = make_kernel();
     let server = make_running_proc(&mut k, "srv", 0);
     let client = make_running_proc(&mut k, "cli", 0);
@@ -1923,8 +2369,6 @@ fn ipc_send_wakes_parked_recver_with_fd() {
     );
     assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
-    let payload = b"xyz";
-    heap[..payload.len()].copy_from_slice(payload);
     let send_resp = dispatch(
         &mut k,
         client,
@@ -1932,9 +2376,9 @@ fn ipc_send_wakes_parked_recver_with_fd() {
             opcode: op_ext::IPC_SEND,
             flags: 0,
             request_id: 740,
-            args: ipc_send_args(cli_fd, payload.len() as u32, 9, 0),
+            args: ipc_send_args(cli_fd, 0, 9, 0),
             heap_ptr: 0,
-            heap_len: payload.len() as u32,
+            heap_len: 0,
         },
         &mut heap,
     );
@@ -1948,22 +2392,20 @@ fn ipc_send_wakes_parked_recver_with_fd() {
     assert_eq!(*wake_pid, server);
     assert_eq!(wake_resp.request_id, req_id);
     assert_eq!(wake_resp.status, 0);
-    assert_eq!(wake_resp.value, payload.len() as i64);
-    // extra_len = 4 (fd-prefix) + 3 (payload).
-    assert_eq!(wake_resp.extra_len, 4 + payload.len() as u32);
+    assert_eq!(wake_resp.value, 0);
+    assert_eq!(wake_resp.extra_len, 4);
 
     let pending = wake_heap
         .as_ref()
-        .expect("wake heap should carry fd + payload");
+        .expect("wake heap should carry the received fd");
     assert_eq!(pending.heap_ptr, 0);
-    assert_eq!(pending.bytes.len(), 4 + payload.len());
+    assert_eq!(pending.bytes.len(), 4);
     let new_fd = u32::from_le_bytes([
         pending.bytes[0],
         pending.bytes[1],
         pending.bytes[2],
         pending.bytes[3],
     ]);
-    assert_eq!(&pending.bytes[4..4 + payload.len()], payload);
 
     // The receiver's fd table now has a new entry pointing at the
     // same underlying object the sender's fd referred to.
@@ -2013,7 +2455,17 @@ fn ipc_recv_blocking_second_call_from_parked_pid_returns_eagain() {
     // with `status = -EAGAIN` (the WouldBlock arm of park_on_recv
     // maps via kerr_to_errno).
     let err = k
-        .park_on_recv(server, srv_conn, 770, 16, -1, 0, 16)
+        .park_on_recv(
+            server,
+            srv_conn,
+            kernel::sys::RecvParkRequest {
+                request_id: 770,
+                max_len: 16,
+                recv_fd_slot: -1,
+                heap_ptr: 0,
+                heap_len: 16,
+            },
+        )
         .unwrap_err();
     assert_eq!(err, kernel::sys::KernelError::WouldBlock);
 }
@@ -2094,7 +2546,7 @@ fn sigterm_interrupts_parked_recv_with_eintr() {
     // interrupt_parked_recv; only the recv interrupt should
     // observe a parker.
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&a.to_le_bytes());
     kill_args[4..6].copy_from_slice(&15u16.to_le_bytes());
     let kill_resp = dispatch(
         &mut k,
@@ -2198,7 +2650,7 @@ fn sigint_interrupts_parked_recv_with_eintr() {
 
     // init delivers SIGINT (signum 2) via PROC_KILL.
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&a.to_le_bytes());
     kill_args[4..6].copy_from_slice(&2u16.to_le_bytes());
     let kill_resp = dispatch(
         &mut k,
@@ -2261,7 +2713,7 @@ fn sigint_interrupts_parked_accept_with_eintr() {
     // Self-deliver SIGINT (sender == target — self-signal is
     // POSIX-allowed without any cap).
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(ds as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&ds.to_le_bytes());
     kill_args[4..6].copy_from_slice(&2u16.to_le_bytes());
     let mut heap = vec![0u8; 16];
     let kill_resp = dispatch(
@@ -2434,7 +2886,7 @@ fn sigpipe_does_not_interrupt_parked_recv() {
     // init delivers SIGPIPE (signum 13). Should queue on inbox
     // but NOT wake the parker.
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&a.to_le_bytes());
     kill_args[4..6].copy_from_slice(&13u16.to_le_bytes());
     let kill_resp = dispatch(
         &mut k,
@@ -2536,7 +2988,7 @@ fn sigchld_does_not_interrupt_parked_recv() {
 
     // init delivers SIGCHLD (signum 17).
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&a.to_le_bytes());
     kill_args[4..6].copy_from_slice(&17u16.to_le_bytes());
     let kill_resp = dispatch(
         &mut k,
@@ -2705,7 +3157,7 @@ fn sigusr1_does_not_interrupt_parked_recv() {
 
     // init delivers SIGUSR1 (signum 10).
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&a.to_le_bytes());
     kill_args[4..6].copy_from_slice(&10u16.to_le_bytes());
     let kill_resp = dispatch(
         &mut k,
@@ -2802,7 +3254,7 @@ fn sigusr2_does_not_interrupt_parked_recv() {
     assert!(matches!(outcome, kernel::syscall::ServiceOutcome::Parked));
 
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(a as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&a.to_le_bytes());
     kill_args[4..6].copy_from_slice(&12u16.to_le_bytes());
     let kill_resp = dispatch(
         &mut k,
@@ -2882,7 +3334,7 @@ fn sigusr1_does_not_interrupt_parked_accept() {
     // Self-deliver SIGUSR1 (sender == target — self-signal is
     // POSIX-allowed without any cap).
     let mut kill_args = [0u8; 16];
-    kill_args[0..4].copy_from_slice(&(ds as i32).to_le_bytes());
+    kill_args[0..4].copy_from_slice(&ds.to_le_bytes());
     kill_args[4..6].copy_from_slice(&10u16.to_le_bytes());
     let mut heap = vec![0u8; 16];
     let kill_resp = dispatch(
@@ -3511,12 +3963,7 @@ fn args_get_returns_einval_when_heap_window_is_too_small() {
 #[test]
 fn environ_sizes_get_returns_envc_and_buf_size_from_live_envp() {
     let mut k = make_kernel();
-    let pid = spawn_child_with(
-        &mut k,
-        "child",
-        vec![],
-        vec![("FOO", "1"), ("BAR", "two")],
-    );
+    let pid = spawn_child_with(&mut k, "child", vec![], vec![("FOO", "1"), ("BAR", "two")]);
     let mut heap = vec![0u8; 64];
 
     let req = Request {
@@ -3539,12 +3986,7 @@ fn environ_sizes_get_returns_envc_and_buf_size_from_live_envp() {
 #[test]
 fn environ_get_writes_sorted_concatenated_nul_terminated_envp() {
     let mut k = make_kernel();
-    let pid = spawn_child_with(
-        &mut k,
-        "child",
-        vec![],
-        vec![("FOO", "1"), ("BAR", "two")],
-    );
+    let pid = spawn_child_with(&mut k, "child", vec![], vec![("FOO", "1"), ("BAR", "two")]);
     let mut heap = vec![0u8; 64];
 
     let req = Request {
@@ -4456,9 +4898,8 @@ fn path_filestat_set_times_with_short_heap_returns_einval() {
 //   extra_len = same, echoed so the shim can read it without
 //               re-decoding `value` as BigInt
 //
-// v1 kernel is single-threaded; the semantic is "non-blocking check".
-// A CLOCK subscription is ready iff its target time has been reached
-// (absolute) or its relative timeout is zero. An FD_READ subscription
+// The kernel checks readiness atomically with parking. A CLOCK subscription
+// is ready iff its normalized absolute target has been reached. An FD_READ subscription
 // is ready iff a read() on the fd would not block — for a Vnode that
 // is always true (offset < size means data, offset >= size means EOF
 // which is also "readable"); for a CharDevice it depends on the
@@ -4520,6 +4961,13 @@ fn decode_event(heap: &[u8], offset: usize) -> (u64, u16, u8, u64, u16) {
     f.copy_from_slice(&heap[offset + pl::EVENT_OFF_RW_FLAGS..offset + pl::EVENT_OFF_RW_FLAGS + 2]);
     let flags = u16::from_le_bytes(f);
     (userdata, error, ty, nbytes, flags)
+}
+
+fn assert_poll_parked(k: &mut Kernel, pid: abi::ext::Pid, req: &Request, heap: &mut [u8]) {
+    let outcome = kernel::syscall::dispatch::dispatch(k, pid, req, heap);
+    assert!(matches!(outcome, ServiceOutcome::Parked));
+    assert!(k.parked_polls_contains(pid));
+    assert_eq!(k.procs.get(pid).unwrap().state, ProcState::BlockedOnSyscall);
 }
 
 #[test]
@@ -4655,9 +5103,7 @@ fn poll_oneoff_clock_monotonic_abstime_past_is_ready() {
 }
 
 #[test]
-fn poll_oneoff_clock_monotonic_abstime_future_is_not_ready() {
-    // ABSTIME with a timeout in the far future (u64::MAX) never
-    // fires in v1's non-blocking model. Zero events.
+fn poll_oneoff_clock_monotonic_abstime_future_parks() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "futclk", 0);
     let mut heap = vec![0u8; 128];
@@ -4677,10 +5123,7 @@ fn poll_oneoff_clock_monotonic_abstime_future_is_not_ready() {
         heap_ptr: 0,
         heap_len: 48 + 32,
     };
-    let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, 0);
-    assert_eq!(resp.value, 0);
-    assert_eq!(resp.extra_len, 0);
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
 }
 
 #[test]
@@ -4738,10 +5181,7 @@ fn poll_oneoff_clock_relative_zero_timeout_is_ready() {
 }
 
 #[test]
-fn poll_oneoff_clock_relative_nonzero_is_not_ready() {
-    // Relative non-zero means "wait N ns from now". v1 is non-
-    // blocking — userland spins instead of us blocking — so any
-    // non-zero relative timeout is reported as "not ready yet".
+fn poll_oneoff_clock_relative_nonzero_parks() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "relnonzero", 0);
     let mut heap = vec![0u8; 128];
@@ -4756,9 +5196,7 @@ fn poll_oneoff_clock_relative_nonzero_is_not_ready() {
         heap_ptr: 0,
         heap_len: 48 + 32,
     };
-    let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, 0);
-    assert_eq!(resp.value, 0);
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
 }
 
 #[test]
@@ -4902,8 +5340,7 @@ fn poll_oneoff_fd_write_vnode_always_ready() {
 }
 
 #[test]
-fn poll_oneoff_fd_read_console_empty_is_not_ready() {
-    // /dev/console with an empty input ring is not yet readable.
+fn poll_oneoff_fd_read_console_empty_parks() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "con0", 0);
     k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
@@ -4920,9 +5357,7 @@ fn poll_oneoff_fd_read_console_empty_is_not_ready() {
         heap_ptr: 0,
         heap_len: 48 + 32,
     };
-    let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, 0);
-    assert_eq!(resp.value, 0);
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
 }
 
 #[test]
@@ -4982,7 +5417,7 @@ fn poll_oneoff_fd_write_console_always_ready() {
 }
 
 #[test]
-fn poll_oneoff_fd_read_socket_empty_connected_not_ready() {
+fn poll_oneoff_fd_read_socket_empty_connected_parks() {
     // A connected socket with an empty rx buffer and a still-open
     // peer is not yet readable. Build the pair directly via the
     // IpcTable so the test doesn't depend on the full bind/listen/
@@ -4991,8 +5426,8 @@ fn poll_oneoff_fd_read_socket_empty_connected_not_ready() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sockrd", 0);
 
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -5018,9 +5453,7 @@ fn poll_oneoff_fd_read_socket_empty_connected_not_ready() {
         heap_ptr: 0,
         heap_len: 48 + 32,
     };
-    let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, 0);
-    assert_eq!(resp.value, 0);
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
 }
 
 #[test]
@@ -5029,8 +5462,8 @@ fn poll_oneoff_fd_read_socket_with_data_ready() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sockrd2", 0);
 
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -5074,8 +5507,8 @@ fn poll_oneoff_fd_read_socket_peer_closed_hangup_ready() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sockrdclosed", 0);
 
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -5117,8 +5550,8 @@ fn poll_oneoff_fd_write_socket_with_peer_capacity_ready() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sockwr", 0);
 
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -5153,11 +5586,71 @@ fn poll_oneoff_fd_write_socket_with_peer_capacity_ready() {
 }
 
 #[test]
-fn poll_oneoff_fd_read_on_empty_signal_channel_not_ready() {
-    // FD_READ on a SignalChannel with no pending signals is
-    // simply not-ready — no event emitted, not a per-sub EINVAL.
-    // This lets a caller poll fd 3 alongside other fds without
-    // burning CPU on a meaningless error.
+fn poll_oneoff_fd_write_ignores_buffered_inbound_until_full_peer_drains() {
+    use kernel::ipc::{SocketState, SocketType};
+
+    let mut k = make_kernel();
+    let poller = make_running_proc(&mut k, "full-duplex-poller", 0);
+    let peer = make_running_proc(&mut k, "full-duplex-peer", 0);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
+    {
+        let socket = k.ipc.socket_mut(a).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(b);
+    }
+    {
+        let socket = k.ipc.socket_mut(b).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(a);
+        socket.rx_cap = 1;
+    }
+    k.install_fd(poller, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(peer, 11, FdObject::Socket(b.0), FdFlags::EMPTY)
+        .unwrap();
+
+    // The poller's socket is readable, while its peer's one-byte receive
+    // buffer is full. A send-side wait must subscribe only to FD_WRITE: the
+    // unrelated inbound byte must not make the blocked write retry-spin.
+    assert_eq!(k.ipc.send_on_socket(b, b"i", Vec::new()).unwrap(), 1);
+    assert_eq!(k.ipc.send_on_socket(a, b"x", Vec::new()).unwrap(), 1);
+
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0xFDFD, abi::wasi::eventtype::FD_WRITE, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 843,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, poller, &poll, &mut heap);
+    assert!(k.pending_wakes_snapshot().is_empty());
+
+    let drain = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 844,
+        args: u32_args(11),
+        heap_ptr: 64,
+        heap_len: 1,
+    };
+    assert_eq!(dispatch(&mut k, peer, &drain, &mut heap).value, 1);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("peer-drain write wake");
+    let (userdata, error, event_type, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(userdata, 0xFDFD);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_WRITE);
+    assert_eq!(nbytes, 1);
+}
+
+#[test]
+fn poll_oneoff_fd_read_on_empty_signal_channel_parks() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sigrd", 0);
     k.install_fd(pid, 5, FdObject::SignalChannel, FdFlags::EMPTY)
@@ -5174,9 +5667,7 @@ fn poll_oneoff_fd_read_on_empty_signal_channel_not_ready() {
         heap_ptr: 0,
         heap_len: 48 + 32,
     };
-    let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, 0);
-    assert_eq!(resp.value, 0);
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
 }
 
 #[test]
@@ -5335,6 +5826,1476 @@ fn poll_oneoff_events_cap_caps_output_count() {
     // random_get / fd_read convention: "bytes written to the heap
     // scratch region".
     assert_eq!(resp.extra_len, 2 * pl::EVENT_SIZE as u32);
+}
+
+#[test]
+fn poll_oneoff_rejects_ordinary_n_plus_one_before_readiness_scan() {
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(&mut k, "pollcap", CapSet::EMPTY);
+    let count = POLL_ORDINARY_SUBSCRIPTION_LIMIT + 1;
+    let mut heap = vec![0u8; count * pl::SUBSCRIPTION_SIZE];
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 847,
+        args: poll_oneoff_args(count as u32, count as u32),
+        heap_ptr: 0,
+        heap_len: heap.len() as u32,
+    };
+
+    let resp = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(resp.status, -errno::EINVAL);
+    assert!(!k.parked_polls_contains(pid));
+}
+
+#[test]
+fn poll_oneoff_class_reserves_admit_display_and_shell_after_ordinary_saturation() {
+    let mut k = make_kernel();
+    let ordinary_sets = POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT / POLL_ORDINARY_SUBSCRIPTION_LIMIT;
+    assert_eq!(
+        ordinary_sets * POLL_ORDINARY_SUBSCRIPTION_LIMIT,
+        POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT
+    );
+    let mut heap = vec![0u8; POLL_SUBSCRIPTION_LIMIT * pl::SUBSCRIPTION_SIZE];
+    for index in 0..POLL_SUBSCRIPTION_LIMIT {
+        let sub = sub_clock(
+            index as u64,
+            abi::wasi::CLOCKID_MONOTONIC,
+            u64::MAX,
+            abi::wasi::subclockflags::ABSTIME,
+        );
+        let base = index * pl::SUBSCRIPTION_SIZE;
+        heap[base..base + pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    }
+
+    for index in 0..ordinary_sets {
+        let pid = make_proc_with_caps(&mut k, "poll-ordinary-full", CapSet::EMPTY);
+        let req = Request {
+            opcode: op_wasi::POLL_ONEOFF,
+            flags: 0,
+            request_id: 900 + index as u32,
+            args: poll_oneoff_args(
+                POLL_ORDINARY_SUBSCRIPTION_LIMIT as u32,
+                POLL_ORDINARY_SUBSCRIPTION_LIMIT as u32,
+            ),
+            heap_ptr: 0,
+            heap_len: heap.len() as u32,
+        };
+        assert_poll_parked(&mut k, pid, &req, &mut heap);
+    }
+    assert_eq!(
+        k.parked_poll_subscription_count(),
+        POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT
+    );
+
+    let overflow_pid = make_proc_with_caps(&mut k, "poll-ordinary-overflow", CapSet::EMPTY);
+    let one = sub_clock(
+        0x2049,
+        abi::wasi::CLOCKID_MONOTONIC,
+        u64::MAX,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&one);
+    let overflow = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 920,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    let outcome = kernel::syscall::dispatch::dispatch(&mut k, overflow_pid, &overflow, &mut heap);
+    let ServiceOutcome::Done(response) = outcome else {
+        panic!("ordinary reserve boundary + 1 must not be admitted");
+    };
+    assert_eq!(response.status, -errno::EAGAIN);
+    assert!(!k.parked_polls_contains(overflow_pid));
+    assert_eq!(
+        k.parked_poll_subscription_count(),
+        POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT
+    );
+
+    let display_pid = make_proc_with_caps(
+        &mut k,
+        "poll-display-reserve",
+        CapSet::from_caps(&[Cap::DisplayServer]),
+    );
+    let display_req = Request {
+        request_id: 921,
+        args: poll_oneoff_args(
+            POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT as u32,
+            POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT as u32,
+        ),
+        heap_len: (POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT * pl::SUBSCRIPTION_SIZE) as u32,
+        ..overflow
+    };
+    assert_poll_parked(&mut k, display_pid, &display_req, &mut heap);
+
+    let shell_pid = make_proc_with_caps(
+        &mut k,
+        "poll-shell-reserve",
+        CapSet::from_caps(&[Cap::Shell]),
+    );
+    let shell_req = Request {
+        request_id: 922,
+        args: poll_oneoff_args(
+            POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT as u32,
+            POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT as u32,
+        ),
+        heap_len: (POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT * pl::SUBSCRIPTION_SIZE) as u32,
+        ..overflow
+    };
+    assert_poll_parked(&mut k, shell_pid, &shell_req, &mut heap);
+    assert_eq!(
+        k.parked_poll_subscription_count(),
+        POLL_GLOBAL_SUBSCRIPTION_LIMIT
+    );
+}
+
+#[test]
+fn poll_oneoff_relative_clock_saturates_then_wakes_at_deadline() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pollclock", 0);
+    let mut heap = vec![0u8; 160];
+    let sub = sub_clock(0xA11CE, abi::wasi::CLOCKID_MONOTONIC, u64::MAX, 0);
+    heap[24..24 + pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 848,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 24,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
+    assert_eq!(k.next_poll_timeout_ns_at(u64::MAX - 10, 0), Some(10));
+    assert_eq!(k.service_poll_waiters_at(u64::MAX - 1, 0), 0);
+    assert_eq!(k.service_poll_waiters_at(u64::MAX, 0), 1);
+    assert_eq!(k.parked_poll_subscription_count(), 0);
+
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, response, payload) = &wakes[0];
+    assert_eq!(*wake_pid, pid);
+    assert_eq!(response.request_id, 848);
+    assert_eq!(response.value, 1);
+    let payload = payload.as_ref().expect("clock event payload");
+    assert_eq!(payload.heap_ptr, 24);
+    let (userdata, error, event_type, _, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(userdata, 0xA11CE);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::CLOCK);
+}
+
+#[test]
+fn poll_oneoff_socket_data_wake_preserves_heap_offset() {
+    use kernel::ipc::{SocketState, SocketType};
+
+    let mut k = make_kernel();
+    let reader = make_running_proc(&mut k, "pollsock-reader", 0);
+    let writer = make_running_proc(&mut k, "pollsock-writer", 0);
+    let read_socket = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let write_socket = k.ipc.create_socket(SocketType::Stream).unwrap();
+    {
+        let socket = k.ipc.socket_mut(read_socket).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(write_socket);
+    }
+    {
+        let socket = k.ipc.socket_mut(write_socket).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(read_socket);
+    }
+    k.install_fd(reader, 10, FdObject::Socket(read_socket.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(writer, 11, FdObject::Socket(write_socket.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 192];
+    let sub = sub_fd_rw(0x5150, abi::wasi::eventtype::FD_READ, 10);
+    heap[40..40 + pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 849,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 40,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, reader, &poll, &mut heap);
+
+    heap[..5].copy_from_slice(b"ready");
+    let write = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 850,
+        args: u32_args(11),
+        heap_ptr: 0,
+        heap_len: 5,
+    };
+    let response = dispatch(&mut k, writer, &write, &mut heap);
+    assert_eq!(response.status, 0);
+
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (_, response, payload) = &wakes[0];
+    assert_eq!(response.request_id, 849);
+    let payload = payload.as_ref().expect("socket poll event payload");
+    assert_eq!(payload.heap_ptr, 40);
+    let (userdata, error, event_type, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(userdata, 0x5150);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 5);
+    assert_eq!(k.procs.get(reader).unwrap().state, ProcState::Ready);
+}
+
+#[test]
+fn poll_oneoff_socket_wakes_for_zero_byte_ancillary_send() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "pollfd-server", 0);
+    let client = make_running_proc(&mut k, "pollfd-client", 0);
+    let (client_fd, server_fd) =
+        ipc_send_connected_pair(&mut k, client, server, b"/tmp/poll-ancillary", 870);
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 192];
+    let sub = sub_fd_rw(0xFD, abi::wasi::eventtype::FD_READ, server_fd);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 876,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, server, &poll, &mut heap);
+
+    let send = Request {
+        opcode: op_ext::IPC_SEND,
+        flags: 0,
+        request_id: 877,
+        args: ipc_send_args(client_fd, 0, 9, 0),
+        heap_ptr: 96,
+        heap_len: 0,
+    };
+    let response = dispatch(&mut k, client, &send, &mut heap);
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value, 0);
+
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("ancillary poll event payload");
+    let (userdata, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(userdata, 0xFD);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 0);
+    assert_eq!(flags, 0);
+
+    let recv = Request {
+        opcode: op_ext::IPC_RECV,
+        flags: 0,
+        request_id: 878,
+        args: ipc_recv_args(server_fd, 0, 0, 0),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    let response = dispatch(&mut k, server, &recv, &mut heap);
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value, 0);
+    assert_eq!(response.extra_len, 4);
+}
+
+#[test]
+fn poll_oneoff_fd_read_wakes_when_peer_shutdowns_write() {
+    use kernel::ipc::{SocketState, SocketType};
+
+    let mut k = make_kernel();
+    let reader = make_running_proc(&mut k, "poll-shutwr-reader", 0);
+    let peer = make_running_proc(&mut k, "poll-shutwr-peer", 0);
+    let reader_socket = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let peer_socket = k.ipc.create_socket(SocketType::Stream).unwrap();
+    {
+        let socket = k.ipc.socket_mut(reader_socket).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(peer_socket);
+    }
+    {
+        let socket = k.ipc.socket_mut(peer_socket).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(reader_socket);
+    }
+    k.install_fd(
+        reader,
+        10,
+        FdObject::Socket(reader_socket.0),
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    k.install_fd(peer, 11, FdObject::Socket(peer_socket.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0x5A17, abi::wasi::eventtype::FD_READ, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 879,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, reader, &poll, &mut heap);
+
+    let shutdown = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 880,
+        args: sock_shutdown_args(11, abi::wasi::sdflags::WR as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, peer, &shutdown, &mut heap).status, 0);
+
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("peer SHUT_WR poll event");
+    let (_, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 0);
+    assert_ne!(flags & abi::wasi::eventrwflags::FD_READWRITE_HANGUP, 0);
+}
+
+#[test]
+fn poll_oneoff_fd_write_wakes_when_peer_shutdowns_read() {
+    use kernel::ipc::{SocketState, SocketType, SOCKET_BUF_CAP};
+
+    let mut k = make_kernel();
+    let writer = make_running_proc(&mut k, "poll-shutrd-writer", 0);
+    let peer = make_running_proc(&mut k, "poll-shutrd-peer", 0);
+    let writer_socket = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let peer_socket = k.ipc.create_socket(SocketType::Stream).unwrap();
+    {
+        let socket = k.ipc.socket_mut(writer_socket).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(peer_socket);
+    }
+    {
+        let socket = k.ipc.socket_mut(peer_socket).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(writer_socket);
+        socket
+            .rx_buf
+            .extend(core::iter::repeat_n(0, SOCKET_BUF_CAP));
+    }
+    k.install_fd(
+        writer,
+        10,
+        FdObject::Socket(writer_socket.0),
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    k.install_fd(peer, 11, FdObject::Socket(peer_socket.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0x5A18, abi::wasi::eventtype::FD_WRITE, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 881,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, writer, &poll, &mut heap);
+
+    let shutdown = Request {
+        opcode: op_wasi::SOCK_SHUTDOWN,
+        flags: 0,
+        request_id: 882,
+        args: sock_shutdown_args(11, abi::wasi::sdflags::RD as u32),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, peer, &shutdown, &mut heap).status, 0);
+
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("peer SHUT_RD poll event");
+    let (_, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_WRITE);
+    assert_eq!(nbytes, 0);
+    assert_ne!(flags & abi::wasi::eventrwflags::FD_READWRITE_HANGUP, 0);
+}
+
+#[test]
+fn poll_oneoff_local_shutdown_read_is_unconditional_hangup() {
+    use kernel::ipc::{SocketState, SocketType};
+
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "poll-local-shutrd", 0);
+    let local = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let peer = k.ipc.create_socket(SocketType::Stream).unwrap();
+    {
+        let socket = k.ipc.socket_mut(local).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(peer);
+        socket.rx_buf.extend(b"discarded");
+        socket.shutdown_read = true;
+    }
+    {
+        let socket = k.ipc.socket_mut(peer).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(local);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(local.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0x5A19, abi::wasi::eventtype::FD_READ, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 883,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    let response = dispatch(&mut k, pid, &poll, &mut heap);
+    assert_eq!(response.status, 0);
+    let (_, error, event_type, nbytes, flags) = decode_event(&heap, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 0);
+    assert_ne!(flags & abi::wasi::eventrwflags::FD_READWRITE_HANGUP, 0);
+}
+
+#[test]
+fn poll_oneoff_connecting_socket_wakes_writable_after_accept() {
+    use kernel::ipc::SocketType;
+
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "poll-connect-server", 0);
+    let client = make_running_proc(&mut k, "poll-connect-client", 0);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc.bind_socket(listener, "/tmp/poll-connect").unwrap();
+    k.ipc.listen_socket(listener, 1).unwrap();
+    k.install_fd(server, 10, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
+    let client_socket = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc
+        .connect_socket(client_socket, "/tmp/poll-connect")
+        .unwrap();
+    k.install_fd(
+        client,
+        11,
+        FdObject::Socket(client_socket.0),
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0xC011, abi::wasi::eventtype::FD_WRITE, 11);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 884,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, client, &poll, &mut heap);
+
+    let accept = Request {
+        opcode: op_ext::IPC_ACCEPT,
+        flags: 0,
+        request_id: 885,
+        args: u32_args(10),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, server, &accept, &mut heap).status, 0);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("accepted write-ready event");
+    let (_, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_WRITE);
+    assert!(nbytes > 0);
+    assert_eq!(flags, 0);
+}
+
+#[test]
+fn async_ipc_connect_io_is_eagain_without_side_effect_until_accept() {
+    use kernel::ipc::{SocketState, SocketType};
+
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "async-connect-server", 0);
+    let client = make_running_proc(&mut k, "async-connect-client", 0);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc.bind_socket(listener, "/tmp/async-connect").unwrap();
+    k.ipc.listen_socket(listener, 2).unwrap();
+    k.install_fd(server, 10, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
+    let connecting = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.install_fd(client, 11, FdObject::Socket(connecting.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let path = b"/tmp/async-connect";
+    let mut heap = vec![0u8; 160];
+    heap[..path.len()].copy_from_slice(path);
+    let connect = Request {
+        opcode: op_ext::IPC_CONNECT,
+        flags: 0,
+        request_id: 886,
+        args: u32_args(11),
+        heap_ptr: 0,
+        heap_len: path.len() as u32,
+    };
+    assert_eq!(dispatch(&mut k, client, &connect, &mut heap).status, 0);
+    assert_eq!(
+        k.ipc.sockets_get(connecting).unwrap().state,
+        SocketState::Connecting
+    );
+    assert_eq!(k.ipc.sockets_get(listener).unwrap().backlog.len(), 1);
+
+    heap[128] = b'x';
+    let write = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 887,
+        args: u32_args(11),
+        heap_ptr: 128,
+        heap_len: 1,
+    };
+    assert_eq!(
+        dispatch(&mut k, client, &write, &mut heap).status,
+        -errno::EAGAIN
+    );
+    let read = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 888,
+        args: u32_args(11),
+        heap_ptr: 128,
+        heap_len: 1,
+    };
+    assert_eq!(
+        dispatch(&mut k, client, &read, &mut heap).status,
+        -errno::EAGAIN
+    );
+    assert_eq!(k.ipc.buffered_byte_count(), 0);
+    assert_eq!(k.ipc.sockets_get(listener).unwrap().backlog.len(), 1);
+
+    let read_sub = sub_fd_rw(0xC012, abi::wasi::eventtype::FD_READ, 11);
+    let write_sub = sub_fd_rw(0xC013, abi::wasi::eventtype::FD_WRITE, 11);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&read_sub);
+    heap[pl::SUBSCRIPTION_SIZE..pl::SUBSCRIPTION_SIZE * 2].copy_from_slice(&write_sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 889,
+        args: poll_oneoff_args(2, 2),
+        heap_ptr: 0,
+        heap_len: (pl::SUBSCRIPTION_SIZE * 2) as u32,
+    };
+    assert_poll_parked(&mut k, client, &poll, &mut heap);
+
+    let accept = Request {
+        opcode: op_ext::IPC_ACCEPT,
+        flags: 0,
+        request_id: 890,
+        args: u32_u32_args(10, u32::from(abi::ext::accept_flags::NONBLOCK)),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let server_fd = dispatch(&mut k, server, &accept, &mut heap).value as u32;
+    assert_eq!(
+        k.ipc.sockets_get(connecting).unwrap().state,
+        SocketState::Connected
+    );
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("accepted socket write wake");
+    let (_, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_WRITE);
+    assert!(nbytes > 0);
+    assert_eq!(flags, 0);
+
+    // Once accepted, an empty stream is not spuriously READ-ready. After the
+    // Worker drains the WRITE wake and parks on READ, peer data is the event
+    // that makes that direction ready.
+    k.procs
+        .transition(client, kernel::proc::ProcState::Running)
+        .unwrap();
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&read_sub);
+    let read_poll = Request {
+        request_id: 891,
+        args: poll_oneoff_args(1, 1),
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+        ..poll
+    };
+    assert_poll_parked(&mut k, client, &read_poll, &mut heap);
+    heap[128] = b'y';
+    let server_write = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 892,
+        args: u32_args(server_fd),
+        heap_ptr: 128,
+        heap_len: 1,
+    };
+    assert_eq!(dispatch(&mut k, server, &server_write, &mut heap).value, 1);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 2);
+    let payload = wakes[1].2.as_ref().expect("peer-data read wake");
+    let (_, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 1);
+    assert_eq!(flags, 0);
+}
+
+#[test]
+fn connecting_socket_listener_close_wakes_hup_and_io_refuses() {
+    use kernel::ipc::SocketType;
+
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "connect-close-server", 0);
+    let client = make_running_proc(&mut k, "connect-close-client", 0);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc.bind_socket(listener, "/tmp/connect-close").unwrap();
+    k.ipc.listen_socket(listener, 1).unwrap();
+    k.install_fd(server, 10, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
+    let connecting = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc
+        .connect_socket(connecting, "/tmp/connect-close")
+        .unwrap();
+    k.install_fd(client, 11, FdObject::Socket(connecting.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 160];
+    let read_sub = sub_fd_rw(0xC013, abi::wasi::eventtype::FD_READ, 11);
+    let write_sub = sub_fd_rw(0xC014, abi::wasi::eventtype::FD_WRITE, 11);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&read_sub);
+    heap[pl::SUBSCRIPTION_SIZE..pl::SUBSCRIPTION_SIZE * 2].copy_from_slice(&write_sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 891,
+        args: poll_oneoff_args(2, 2),
+        heap_ptr: 0,
+        heap_len: (pl::SUBSCRIPTION_SIZE * 2) as u32,
+    };
+    assert_poll_parked(&mut k, client, &poll, &mut heap);
+
+    let close = Request {
+        opcode: op_wasi::FD_CLOSE,
+        flags: 0,
+        request_id: 892,
+        args: u32_args(10),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, server, &close, &mut heap).status, 0);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].1.value, 2);
+    let payload = wakes[0].2.as_ref().expect("listener-close HUP events");
+    for index in 0..2 {
+        let (_, error, _, nbytes, flags) = decode_event(&payload.bytes, index * pl::EVENT_SIZE);
+        assert_eq!(error, 0);
+        assert_eq!(nbytes, 0);
+        assert_ne!(flags & abi::wasi::eventrwflags::FD_READWRITE_HANGUP, 0);
+    }
+
+    heap[128] = b'x';
+    let write = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 893,
+        args: u32_args(11),
+        heap_ptr: 128,
+        heap_len: 1,
+    };
+    assert_eq!(
+        dispatch(&mut k, client, &write, &mut heap).status,
+        -errno::ECONNREFUSED
+    );
+    let read = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 894,
+        args: u32_args(11),
+        heap_ptr: 128,
+        heap_len: 1,
+    };
+    assert_eq!(
+        dispatch(&mut k, client, &read, &mut heap).status,
+        -errno::ECONNREFUSED
+    );
+}
+
+#[test]
+fn ipc_accept_rejects_unknown_flags_without_consuming_backlog() {
+    use kernel::ipc::SocketType;
+
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "accept-flags-server", 0);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc.bind_socket(listener, "/tmp/accept-flags").unwrap();
+    k.ipc.listen_socket(listener, 1).unwrap();
+    k.install_fd(server, 10, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
+    let client = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc.connect_socket(client, "/tmp/accept-flags").unwrap();
+    let mut heap = vec![0u8; 32];
+
+    let invalid = Request {
+        opcode: op_ext::IPC_ACCEPT,
+        flags: 0,
+        request_id: 895,
+        args: u32_u32_args(10, u32::from(abi::ext::accept_flags::NONBLOCK) | 0x0002),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(
+        dispatch(&mut k, server, &invalid, &mut heap).status,
+        -errno::EINVAL
+    );
+    assert_eq!(k.ipc.sockets_get(listener).unwrap().backlog.len(), 1);
+
+    let valid = Request {
+        args: u32_u32_args(10, u32::from(abi::ext::accept_flags::NONBLOCK)),
+        request_id: 896,
+        ..invalid
+    };
+    assert!(dispatch(&mut k, server, &valid, &mut heap).value >= 0);
+    assert!(k.ipc.sockets_get(listener).unwrap().backlog.is_empty());
+}
+
+#[test]
+fn poll_oneoff_listener_wakes_when_backlog_grows() {
+    use kernel::ipc::SocketType;
+
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "polllistener", 0);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc.bind_socket(listener, "/run/poll-listener").unwrap();
+    k.ipc.listen_socket(listener, 4).unwrap();
+    k.install_fd(server, 12, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(1, abi::wasi::eventtype::FD_READ, 12);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 851,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, server, &req, &mut heap);
+
+    let client = k.ipc.create_socket(SocketType::Stream).unwrap();
+    k.ipc.connect_socket(client, "/run/poll-listener").unwrap();
+    assert_eq!(k.service_poll_waiters(), 1);
+    let wakes = k.pending_wakes_snapshot();
+    let payload = wakes[0].2.as_ref().expect("listener event payload");
+    let (_, error, event_type, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 1);
+}
+
+#[test]
+fn poll_oneoff_pipe_wakes_after_writer_syscall() {
+    let mut k = make_kernel();
+    let reader = make_running_proc(&mut k, "pollpipe-reader", 0);
+    let writer = make_running_proc(&mut k, "pollpipe-writer", 0);
+    let pipe = k.ipc.create_pipe().unwrap();
+    k.install_fd(reader, 10, FdObject::PipeRead(pipe.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(writer, 11, FdObject::PipeWrite(pipe.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(2, abi::wasi::eventtype::FD_READ, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 852,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, reader, &poll, &mut heap);
+
+    heap[..4].copy_from_slice(b"pipe");
+    let write = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 853,
+        args: u32_args(11),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    assert_eq!(dispatch(&mut k, writer, &write, &mut heap).status, 0);
+    let wakes = k.pending_wakes_snapshot();
+    let payload = wakes[0].2.as_ref().expect("pipe event payload");
+    let (_, error, _, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(nbytes, 4);
+}
+
+#[test]
+fn poll_oneoff_pipe_read_wakes_with_hangup_after_writer_close() {
+    let mut k = make_kernel();
+    let reader = make_running_proc(&mut k, "pollpipe-eof-reader", 0);
+    let writer = make_running_proc(&mut k, "pollpipe-eof-writer", 0);
+    let pipe = k.ipc.create_pipe().unwrap();
+    k.install_fd(reader, 10, FdObject::PipeRead(pipe.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(writer, 11, FdObject::PipeWrite(pipe.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0xE0F, abi::wasi::eventtype::FD_READ, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 860,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, reader, &poll, &mut heap);
+
+    let close = Request {
+        opcode: op_wasi::FD_CLOSE,
+        flags: 0,
+        request_id: 861,
+        args: u32_args(11),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, writer, &close, &mut heap).status, 0);
+
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("pipe EOF poll event payload");
+    let (userdata, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(userdata, 0xE0F);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 0);
+    assert_ne!(flags & abi::wasi::eventrwflags::FD_READWRITE_HANGUP, 0);
+}
+
+#[test]
+fn proc_raise_sigkill_closes_pipe_peer_and_synchronously_wakes_fd_poll() {
+    let mut k = make_kernel();
+    let reader = make_running_proc(&mut k, "raise-hup-reader", 0);
+    let writer = make_running_proc(&mut k, "raise-hup-writer", 0);
+    let _busy = make_running_proc(&mut k, "raise-hup-unrelated", 0);
+    let pipe = k.ipc.create_pipe().unwrap();
+    k.install_fd(reader, 10, FdObject::PipeRead(pipe.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(writer, 11, FdObject::PipeWrite(pipe.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 128];
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub_fd_rw(
+        0x0516_B111,
+        abi::wasi::eventtype::FD_READ,
+        10,
+    ));
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 862,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, reader, &poll, &mut heap);
+
+    let raised = Request {
+        opcode: op_wasi::PROC_RAISE,
+        flags: 0,
+        request_id: 863,
+        args: proc_raise_args(9),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, writer, &raised, &mut heap).status, 0);
+
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(
+        wakes.len(),
+        1,
+        "PROC_RAISE must rescan before dispatch returns"
+    );
+    assert_eq!(wakes[0].0, reader);
+    let payload = wakes[0].2.as_ref().expect("pipe HUP payload");
+    let (_, error, event_type, nbytes, flags) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 0);
+    assert_ne!(flags & abi::wasi::eventrwflags::FD_READWRITE_HANGUP, 0);
+}
+
+#[test]
+fn poll_oneoff_pipe_fd_write_honors_global_budget_and_unrelated_drain_wakes() {
+    use kernel::ipc::{IpcLimits, IpcTable};
+
+    let mut k = make_kernel();
+    k.ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 8,
+        live_sockets: 8,
+        buffered_bytes: 4,
+        queued_ancillary_refs: 8,
+    });
+    let filler = make_running_proc(&mut k, "poll-budget-pipe-fill", 0);
+    let drainer = make_running_proc(&mut k, "poll-budget-pipe-drain", 0);
+    let poller = make_running_proc(&mut k, "poll-budget-pipe-poll", 0);
+    let sink = make_running_proc(&mut k, "poll-budget-pipe-sink", 0);
+    let occupied = k.ipc.create_pipe().unwrap();
+    let waiting = k.ipc.create_pipe().unwrap();
+    k.install_fd(filler, 10, FdObject::PipeWrite(occupied.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(drainer, 11, FdObject::PipeRead(occupied.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(poller, 12, FdObject::PipeWrite(waiting.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(sink, 13, FdObject::PipeRead(waiting.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 128];
+    heap[..4].copy_from_slice(b"full");
+    let fill = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 887,
+        args: u32_args(10),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    assert_eq!(dispatch(&mut k, filler, &fill, &mut heap).status, 0);
+    assert_eq!(k.ipc.buffered_byte_capacity_remaining(), 0);
+
+    let sub = sub_fd_rw(0xB001, abi::wasi::eventtype::FD_WRITE, 12);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 888,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, poller, &poll, &mut heap);
+
+    let drain = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 889,
+        args: u32_args(11),
+        heap_ptr: 64,
+        heap_len: 2,
+    };
+    assert_eq!(dispatch(&mut k, drainer, &drain, &mut heap).value, 2);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("pipe global-budget wake");
+    let (_, error, event_type, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_WRITE);
+    assert_eq!(nbytes, 2);
+}
+
+#[test]
+fn poll_oneoff_socket_fd_write_honors_global_budget_and_unrelated_drain_wakes() {
+    use kernel::ipc::{IpcLimits, IpcTable, SocketState, SocketType};
+
+    let mut k = make_kernel();
+    k.ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 8,
+        live_sockets: 8,
+        buffered_bytes: 4,
+        queued_ancillary_refs: 8,
+    });
+    let filler = make_running_proc(&mut k, "poll-budget-socket-fill", 0);
+    let drainer = make_running_proc(&mut k, "poll-budget-socket-drain", 0);
+    let poller = make_running_proc(&mut k, "poll-budget-socket-poll", 0);
+    let sink = make_running_proc(&mut k, "poll-budget-socket-sink", 0);
+    let fill_tx = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let fill_rx = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let wait_tx = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let wait_rx = k.ipc.create_socket(SocketType::Stream).unwrap();
+    for (id, peer) in [
+        (fill_tx, fill_rx),
+        (fill_rx, fill_tx),
+        (wait_tx, wait_rx),
+        (wait_rx, wait_tx),
+    ] {
+        let socket = k.ipc.socket_mut(id).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(peer);
+    }
+    k.install_fd(filler, 10, FdObject::Socket(fill_tx.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(drainer, 11, FdObject::Socket(fill_rx.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(poller, 12, FdObject::Socket(wait_tx.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(sink, 13, FdObject::Socket(wait_rx.0), FdFlags::EMPTY)
+        .unwrap();
+
+    let mut heap = vec![0u8; 128];
+    heap[..4].copy_from_slice(b"full");
+    let fill = Request {
+        opcode: op_wasi::FD_WRITE,
+        flags: 0,
+        request_id: 890,
+        args: u32_args(10),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    assert_eq!(dispatch(&mut k, filler, &fill, &mut heap).status, 0);
+    assert_eq!(k.ipc.buffered_byte_capacity_remaining(), 0);
+
+    let sub = sub_fd_rw(0xB002, abi::wasi::eventtype::FD_WRITE, 12);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 891,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, poller, &poll, &mut heap);
+
+    let drain = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 892,
+        args: u32_args(11),
+        heap_ptr: 64,
+        heap_len: 3,
+    };
+    assert_eq!(dispatch(&mut k, drainer, &drain, &mut heap).value, 3);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("socket global-budget wake");
+    let (_, error, event_type, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_WRITE);
+    assert_eq!(nbytes, 3);
+}
+
+#[test]
+fn poll_oneoff_input_wakes_after_host_injection() {
+    use kernel::fs::devfs::DEV_INPUT_KBD;
+
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pollkbd", 0);
+    k.install_fd(pid, 10, FdObject::CharDevice(DEV_INPUT_KBD), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(3, abi::wasi::eventtype::FD_READ, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 854,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
+
+    k.devs.inject_kbd_event(b"kbd");
+    assert_eq!(k.service_poll_waiters(), 1);
+    let wakes = k.pending_wakes_snapshot();
+    let payload = wakes[0].2.as_ref().expect("input event payload");
+    let (_, error, _, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(nbytes, 3);
+}
+
+#[test]
+fn poll_oneoff_mouse_wakes_after_host_injection() {
+    use kernel::fs::devfs::DEV_INPUT_MOUSE;
+
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pollmouse", 0);
+    k.install_fd(
+        pid,
+        10,
+        FdObject::CharDevice(DEV_INPUT_MOUSE),
+        FdFlags::EMPTY,
+    )
+    .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0xB0A5E, abi::wasi::eventtype::FD_READ, 10);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 862,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
+
+    k.devs.inject_mouse_event(b"mouse");
+    assert_eq!(k.service_poll_waiters(), 1);
+    let wakes = k.pending_wakes_snapshot();
+    let payload = wakes[0].2.as_ref().expect("mouse poll event payload");
+    let (userdata, error, event_type, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(userdata, 0xB0A5E);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, 5);
+}
+
+#[test]
+fn poll_oneoff_watch_wakes_after_vfs_event() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pollwatch", 0);
+    let watch_fd = k.fs_watch(pid, "/", abi::ext::WATCH_CREATE).unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(4, abi::wasi::eventtype::FD_READ, watch_fd);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 855,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
+
+    k.vfs_create("/created-after-poll", 0o644).unwrap();
+    assert_eq!(k.service_poll_waiters(), 1);
+    let wakes = k.pending_wakes_snapshot();
+    let payload = wakes[0].2.as_ref().expect("watch event payload");
+    let (_, error, _, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(nbytes, kernel::vfs::WatchEvent::SIZE as u64);
+
+    // poll_oneoff reports readiness but does not consume the fixed-size
+    // record; the ordinary nonblocking read drains it afterwards.
+    let mut record = [0u8; kernel::vfs::WatchEvent::SIZE];
+    assert_eq!(k.fd_read(pid, watch_fd, &mut record).unwrap(), record.len());
+    assert_eq!(
+        u32::from_le_bytes(record[..4].try_into().unwrap()),
+        abi::ext::WATCH_CREATE
+    );
+}
+
+#[test]
+fn poll_oneoff_parent_watch_wakes_for_atomic_preference_rename_and_reads_new_file() {
+    let mut k = make_kernel();
+    let watcher = make_running_proc(&mut k, "preference-watch", 0);
+    let writer = make_running_proc(&mut k, "preference-writer", 0);
+    k.vfs.mkdir("/etc", 0o755).unwrap();
+    k.vfs_create("/etc/preferences.toml", 0o644).unwrap();
+    let old_fd = k
+        .path_open(writer, "/etc/preferences.toml", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
+    k.fd_write(writer, old_fd, b"theme=old").unwrap();
+    k.fd_close(writer, old_fd).unwrap();
+    k.vfs_create("/etc/.preferences.tmp", 0o644).unwrap();
+    let temp_fd = k
+        .path_open(writer, "/etc/.preferences.tmp", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
+    k.fd_write(writer, temp_fd, b"theme=new").unwrap();
+    k.fd_close(writer, temp_fd).unwrap();
+
+    let watch_fd = k
+        .fs_watch(
+            watcher,
+            "/etc",
+            abi::ext::WATCH_DELETE | abi::ext::WATCH_CREATE,
+        )
+        .unwrap();
+    let mut heap = vec![0u8; 256];
+    let sub = sub_fd_rw(0xA70C, abi::wasi::eventtype::FD_READ, watch_fd);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 856,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, watcher, &poll, &mut heap);
+
+    let old_path = b"/etc/.preferences.tmp";
+    let new_path = b"/etc/preferences.toml";
+    heap[..old_path.len()].copy_from_slice(old_path);
+    heap[old_path.len()..old_path.len() + new_path.len()].copy_from_slice(new_path);
+    let rename = Request {
+        opcode: op_wasi::PATH_RENAME,
+        flags: 0,
+        request_id: 857,
+        args: path_rename_args(0, 0, old_path.len() as u32),
+        heap_ptr: 0,
+        heap_len: (old_path.len() + new_path.len()) as u32,
+    };
+    assert_eq!(dispatch(&mut k, writer, &rename, &mut heap).status, 0);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let payload = wakes[0].2.as_ref().expect("rename watch wake");
+    let (_, error, event_type, nbytes, _) = decode_event(&payload.bytes, 0);
+    assert_eq!(error, 0);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+    assert_eq!(nbytes, (3 * kernel::vfs::WatchEvent::SIZE) as u64);
+
+    let mut records = [0u8; 3 * kernel::vfs::WatchEvent::SIZE];
+    assert_eq!(
+        k.fd_read(watcher, watch_fd, &mut records).unwrap(),
+        records.len()
+    );
+    assert_eq!(
+        u32::from_le_bytes(records[..4].try_into().unwrap()),
+        abi::ext::WATCH_DELETE
+    );
+    assert_eq!(
+        u32::from_le_bytes(records[8..12].try_into().unwrap()),
+        abi::ext::WATCH_DELETE
+    );
+    assert_eq!(
+        u32::from_le_bytes(records[16..20].try_into().unwrap()),
+        abi::ext::WATCH_CREATE
+    );
+
+    let reopened = k
+        .path_open(writer, "/etc/preferences.toml", 0, 0, 0, FdFlags::EMPTY)
+        .unwrap();
+    let mut contents = [0u8; 16];
+    let read = k.fd_read(writer, reopened, &mut contents).unwrap();
+    assert_eq!(&contents[..read], b"theme=new");
+}
+
+#[test]
+fn poll_oneoff_stale_watch_fd_emits_ebadf_event() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pollwatch-stale", 0);
+    let watch_fd = k.fs_watch(pid, "/", abi::ext::WATCH_CREATE).unwrap();
+    let watch_id = match k.fds(pid).unwrap().get(watch_fd).unwrap().object {
+        FdObject::Watch { watch_id } => watch_id,
+        other => panic!("expected watch fd, got {other:?}"),
+    };
+    assert!(k.vfs.unregister_watch(watch_id));
+
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0xBADF, abi::wasi::eventtype::FD_READ, watch_fd);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 886,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    let response = dispatch(&mut k, pid, &req, &mut heap);
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value, 1);
+    let (userdata, error, event_type, _, _) = decode_event(&heap, 0);
+    assert_eq!(userdata, 0xBADF);
+    assert_eq!(error, errno::EBADF as u16);
+    assert_eq!(event_type, abi::wasi::eventtype::FD_READ);
+}
+
+#[test]
+fn poll_oneoff_signal_interrupt_and_exit_remove_parker() {
+    let mut k = make_kernel();
+    let interrupted = make_running_proc(&mut k, "pollintr", 0);
+    k.install_fd(interrupted, 5, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(5, abi::wasi::eventtype::FD_READ, 5);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 856,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, interrupted, &req, &mut heap);
+    assert!(k.interrupt_parked_poll(interrupted));
+    assert!(!k.parked_polls_contains(interrupted));
+    assert_eq!(k.parked_poll_subscription_count(), 0);
+    assert_eq!(k.pending_wakes_snapshot()[0].1.status, -errno::EINTR);
+
+    let exiting = make_running_proc(&mut k, "pollexit", 0);
+    k.install_fd(exiting, 5, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let exit_req = Request {
+        request_id: 857,
+        ..req
+    };
+    assert_poll_parked(&mut k, exiting, &exit_req, &mut heap);
+    assert_eq!(k.parked_poll_subscription_count(), 1);
+    k.proc_exit(exiting, ExitStatus::Exited(0)).unwrap();
+    assert!(!k.parked_polls_contains(exiting));
+    assert_eq!(k.parked_poll_subscription_count(), 0);
+}
+
+#[test]
+fn poll_oneoff_sigterm_syscall_interrupts_parked_target() {
+    let mut k = make_kernel();
+    let sender = make_running_proc(&mut k, "poll-signal-sender", 0);
+    let target = make_running_proc(&mut k, "poll-signal-target", sender);
+    k.install_fd(target, 5, FdObject::SignalChannel, FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 128];
+    let sub = sub_fd_rw(0x515, abi::wasi::eventtype::FD_READ, 5);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 863,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, target, &poll, &mut heap);
+
+    let mut kill_args = [0u8; 16];
+    kill_args[..4].copy_from_slice(&target.to_le_bytes());
+    kill_args[4..6].copy_from_slice(&15u16.to_le_bytes());
+    let kill = Request {
+        opcode: op_ext::PROC_KILL,
+        flags: 0,
+        request_id: 864,
+        args: kill_args,
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, sender, &kill, &mut heap).status, 0);
+
+    assert!(!k.parked_polls_contains(target));
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, target);
+    assert_eq!(wakes[0].1.request_id, 863);
+    assert_eq!(wakes[0].1.status, -errno::EINTR);
+}
+
+#[test]
+fn poll_oneoff_process_exit_purges_already_queued_wake() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "poll-wake-exit", 0);
+    let mut heap = vec![0u8; 128];
+    let sub = sub_clock(
+        0xDEAD,
+        abi::wasi::CLOCKID_MONOTONIC,
+        u64::MAX,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 865,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, pid, &poll, &mut heap);
+    assert_eq!(k.service_poll_waiters_at(u64::MAX, 0), 1);
+    assert_eq!(k.pending_wakes_snapshot().len(), 1);
+
+    k.proc_exit(pid, ExitStatus::Exited(0)).unwrap();
+    assert!(k.pending_wakes_snapshot().is_empty());
+}
+
+#[test]
+fn poll_oneoff_sigkill_purges_already_queued_wake() {
+    let mut k = make_kernel();
+    let sender = make_running_proc(&mut k, "poll-wake-killer", 0);
+    let target = make_running_proc(&mut k, "poll-wake-killed", sender);
+    let mut heap = vec![0u8; 128];
+    let sub = sub_clock(
+        0xBEEF,
+        abi::wasi::CLOCKID_MONOTONIC,
+        u64::MAX,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 866,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, target, &poll, &mut heap);
+    assert_eq!(k.service_poll_waiters_at(u64::MAX, 0), 1);
+    assert_eq!(k.pending_wakes_snapshot().len(), 1);
+
+    k.proc_kill(sender, target, Signal::Kill).unwrap();
+    assert!(k.pending_wakes_snapshot().is_empty());
+    assert_eq!(k.procs.get(target).unwrap().state, ProcState::Zombie);
+}
+
+#[test]
+fn poll_oneoff_allows_only_one_parked_set_per_pid() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pollonce", 0);
+    let mut heap = vec![0u8; 128];
+    let sub = sub_clock(
+        1,
+        abi::wasi::CLOCKID_MONOTONIC,
+        u64::MAX,
+        abi::wasi::subclockflags::ABSTIME,
+    );
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let req = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 858,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, pid, &req, &mut heap);
+
+    let second = Request {
+        request_id: 859,
+        ..req
+    };
+    let outcome = kernel::syscall::dispatch::dispatch(&mut k, pid, &second, &mut heap);
+    let ServiceOutcome::Done(response) = outcome else {
+        panic!("second poll must not replace the existing parker");
+    };
+    assert_eq!(response.status, -errno::EAGAIN);
 }
 
 // ---- fd_filestat_set_times -------------------------------------------
@@ -6081,14 +8042,11 @@ fn fd_readdir_with_zero_sized_buffer_returns_zero_bytes() {
 //
 // Two filesystem-mutation opcodes that expand the syscall surface
 // beyond the "read-mostly" set already covered by the prior eleven
-// WASI slices. Both thread through the existing Vfs public API
-// (`Vfs::unlink` + `Vfs::rename`) — no new Vfs methods or Filesystem
-// trait additions; each in-tree fs (tmpfs, devfs, procfs, opfs)
-// already implements the trait-level `unlink` + `rename` methods.
-// The slice is purely about new syscall wire layouts + handlers.
+// WASI slices. Unlink routes through the dirfd-aware VFS wrapper;
+// rename retains its absolute-path v1 behaviour.
 //
 // PATH_UNLINK_FILE wire layout:
-//   args[0..4]  = dir_fd (u32, ignored — v1 has no preopens)
+//   args[0..4]  = dir_fd (u32; base directory for relative paths)
 //   heap_ptr    = offset of UTF-8 path bytes
 //   heap_len    = length of the path
 // Response: value = 0 on success; status = -errno on error.
@@ -6433,15 +8391,11 @@ fn path_rename_with_zero_new_path_returns_einval() {
 
 // ---- path_create_directory / path_remove_directory -----------------
 //
-// mkdir + rmdir opcodes at 0x0040 + 0x0046. Both thread through the
-// existing Vfs API (`Vfs::mkdir` + `Vfs::rmdir`) — no new Vfs methods
-// and no Filesystem trait additions; each in-tree fs (tmpfs, devfs,
-// procfs, opfs) already implements the trait-level `mkdir` + `rmdir`
-// methods. The slice is purely syscall wiring, mirroring the shape
-// of path_unlink_file.
+// mkdir + rmdir opcodes at 0x0040 + 0x0046. Rmdir routes through the
+// dirfd-aware VFS wrapper; mkdir retains its absolute-path v1 behaviour.
 //
-// Wire layouts match path_unlink_file: args[0..4] = dir_fd (ignored
-// in v1, no preopens); heap = UTF-8 path bytes; heap_len = path
+// Wire layouts match path_unlink_file: args[0..4] = dir_fd (base
+// directory for relative paths); heap = UTF-8 path bytes; heap_len = path
 // length. PATH_CREATE_DIRECTORY hard-codes mode 0o755 — WASI's
 // mkdir signature has no mode argument, so the kernel picks a
 // sensible default for the new directory's permission bits.
@@ -6457,6 +8411,127 @@ fn path_rmdir_args(dir_fd: u32) -> [u8; 16] {
     let mut args = [0u8; 16];
     args[0..4].copy_from_slice(&dir_fd.to_le_bytes());
     args
+}
+
+#[test]
+fn dirfd_relative_open_unlink_and_rmdir_remove_nested_tree() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "recursive_remover", 0);
+    k.vfs.mkdir("/opt", 0o755).expect("mkdir /opt");
+    k.vfs.mkdir("/opt/hello", 0o755).expect("mkdir package");
+    k.vfs
+        .mkdir("/opt/hello/bin", 0o755)
+        .expect("mkdir package bin");
+    k.vfs
+        .create("/opt/hello/bin/hello.wasm", 0o755)
+        .expect("create installed binary");
+    k.install_root_preopen_fd(pid, 3)
+        .expect("install root preopen");
+
+    let mut heap = vec![0u8; 64];
+    let mounted_path = b"dev/console";
+    heap[..mounted_path.len()].copy_from_slice(mounted_path);
+    let open_mounted = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::PATH_OPEN,
+            flags: 0,
+            request_id: 906,
+            args: path_open_args(0, 0, 0, 3),
+            heap_ptr: 0,
+            heap_len: mounted_path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(
+        open_mounted.status, 0,
+        "root-relative lookup crosses into the /dev mount"
+    );
+    assert!(matches!(
+        k.fds(pid)
+            .expect("fd table")
+            .get(open_mounted.value as u32)
+            .expect("mounted fd")
+            .object,
+        FdObject::CharDevice(DEV_CONSOLE)
+    ));
+
+    let package_path = b"opt/hello";
+    heap[..package_path.len()].copy_from_slice(package_path);
+    let open_package = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::PATH_OPEN,
+            flags: 0,
+            request_id: 907,
+            args: path_open_args(0, abi::wasi::oflags::DIRECTORY, 0, 3),
+            heap_ptr: 0,
+            heap_len: package_path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(
+        open_package.status, 0,
+        "open package relative to root preopen"
+    );
+    let package_fd = open_package.value as u32;
+
+    let bin_path = b"bin";
+    heap[..bin_path.len()].copy_from_slice(bin_path);
+    let open_bin = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::PATH_OPEN,
+            flags: 0,
+            request_id: 908,
+            args: path_open_args(0, abi::wasi::oflags::DIRECTORY, 0, package_fd),
+            heap_ptr: 0,
+            heap_len: bin_path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(open_bin.status, 0, "open bin relative to package fd");
+    let bin_fd = open_bin.value as u32;
+
+    let child_path = b"hello.wasm";
+    heap[..child_path.len()].copy_from_slice(child_path);
+    let unlink_child = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::PATH_UNLINK_FILE,
+            flags: 0,
+            request_id: 909,
+            args: path_unlink_file_args(bin_fd),
+            heap_ptr: 0,
+            heap_len: child_path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(unlink_child.status, 0, "unlink child relative to bin fd");
+
+    heap[..bin_path.len()].copy_from_slice(bin_path);
+    let remove_bin = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::PATH_REMOVE_DIRECTORY,
+            flags: 0,
+            request_id: 910,
+            args: path_rmdir_args(package_fd),
+            heap_ptr: 0,
+            heap_len: bin_path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(remove_bin.status, 0, "rmdir bin relative to package fd");
+    assert_eq!(
+        k.vfs.stat("/opt/hello/bin").unwrap_err(),
+        kernel::vfs::FsError::NotFound,
+    );
 }
 
 #[test]
@@ -7305,18 +9380,21 @@ fn fd_filestat_set_size_on_procfs_returns_erofs() {
         .expect("resolve proc version");
     k.install_fd(pid, 10, FdObject::Vnode { mount_id, ino }, FdFlags::EMPTY)
         .unwrap();
+    let same_size = k.vfs.stat("/proc/version").unwrap().size;
+    let dirty_before = k.vfs.dirty_mount_count();
     let mut heap = vec![0u8; 16];
 
     let req = Request {
         opcode: op_wasi::FD_FILESTAT_SET_SIZE,
         flags: 0,
         request_id: 935,
-        args: fd_filestat_set_size_args(10, 0),
+        args: fd_filestat_set_size_args(10, same_size),
         heap_ptr: 0,
         heap_len: 0,
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
     assert_eq!(resp.status, -errno::EROFS);
+    assert_eq!(k.vfs.dirty_mount_count(), dirty_before);
 }
 
 // ---- sock_send / sock_recv -----------------------------------------
@@ -7325,11 +9403,11 @@ fn fd_filestat_set_size_on_procfs_returns_erofs() {
 // on Socket fds. Wire:
 //
 //   SOCK_SEND: args[0..4] = fd (u32)
-//              args[4..8] = si_flags (u16 low; ignored in v1)
+//              args[4..8] = si_flags (u16 low; zero in v1)
 //              heap_ptr   = source bytes
 //              heap_len   = byte count
 //   SOCK_RECV: args[0..4] = fd (u32)
-//              args[4..8] = ri_flags (u16 low; ignored in v1)
+//              args[4..8] = ri_flags (u16 low; PEEK/WAITALL unsupported)
 //              heap_ptr   = destination buffer
 //              heap_len   = buffer capacity
 // Response (sock_send): value = bytes sent
@@ -7342,10 +9420,8 @@ fn fd_filestat_set_size_on_procfs_returns_erofs() {
 // unconnected socket) also surfaces as EINVAL via the standard
 // IpcError → KernelError mapping. Unopened fds return EBADF.
 //
-// v1 ignores the si_flags / ri_flags u16 entirely — WASI defines
-// them for out-of-band data, MSG_PEEK, MSG_DONTWAIT etc., none of
-// which v1's single-threaded kernel exposes. The dispatcher
-// accepts whatever low 16 bits are supplied and discards them.
+// v1 rejects defined-but-unsupported receive behavior with ENOTSUP and
+// malformed/reserved bits with EINVAL before touching socket state.
 
 fn sock_send_args(fd: u32, si_flags: u32) -> [u8; 16] {
     let mut args = [0u8; 16];
@@ -7368,8 +9444,8 @@ fn sock_send_delivers_bytes_to_connected_peer() {
     let pid = make_running_proc(&mut k, "sender", 0);
 
     // Wire a connected socket pair a ↔ b.
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -7404,13 +9480,13 @@ fn sock_send_delivers_bytes_to_connected_peer() {
 }
 
 #[test]
-fn sock_send_ignores_si_flags() {
+fn sock_send_rejects_nonzero_si_flags_without_delivering_bytes() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sender", 0);
 
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -7427,8 +9503,6 @@ fn sock_send_ignores_si_flags() {
     let mut heap = vec![0u8; 64];
     heap[..2].copy_from_slice(b"hi");
 
-    // Non-zero si_flags (e.g. WASI's siflags bit 0) must not break the
-    // call — v1 discards those bits rather than validating them.
     let req = Request {
         opcode: op_wasi::SOCK_SEND,
         flags: 0,
@@ -7438,8 +9512,8 @@ fn sock_send_ignores_si_flags() {
         heap_len: 2,
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, 0);
-    assert_eq!(resp.value, 2);
+    assert_eq!(resp.status, -errno::ENOTSUP);
+    assert_eq!(k.ipc.socket_mut(b).unwrap().rx_len(), 0);
 }
 
 #[test]
@@ -7487,8 +9561,8 @@ fn sock_recv_reads_bytes_from_peer_send() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "receiver", 0);
 
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -7517,6 +9591,62 @@ fn sock_recv_reads_bytes_from_peer_send() {
     assert_eq!(resp.status, 0);
     assert_eq!(resp.value, 7);
     assert_eq!(resp.extra_len, 7);
+    assert_eq!(&heap[..7], b"payload");
+}
+
+#[test]
+fn sock_recv_peek_is_rejected_without_consuming_bytes() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "peek-receiver", 0);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
+    {
+        let socket = k.ipc.socket_mut(a).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(b);
+        socket.rx_buf.extend(b"payload");
+    }
+    {
+        let socket = k.ipc.socket_mut(b).unwrap();
+        socket.state = SocketState::Connected;
+        socket.peer = Some(a);
+    }
+    k.install_fd(pid, 10, FdObject::Socket(a.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 32];
+
+    let rejected = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::SOCK_RECV,
+            flags: 0,
+            request_id: 955,
+            args: sock_recv_args(10, abi::wasi::riflags::RECV_PEEK as u32),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert_eq!(rejected.status, -errno::ENOTSUP);
+    assert_eq!(k.ipc.socket_mut(a).unwrap().rx_len(), 7);
+
+    let accepted = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::SOCK_RECV,
+            flags: 0,
+            request_id: 956,
+            args: sock_recv_args(10, 0),
+            heap_ptr: 0,
+            heap_len: 16,
+        },
+        &mut heap,
+    );
+    assert_eq!(accepted.status, 0);
+    assert_eq!(accepted.value, 7);
     assert_eq!(&heap[..7], b"payload");
 }
 
@@ -7595,8 +9725,8 @@ fn sock_accept_returns_fresh_fd_for_pending_backlog_client() {
     let pid = make_running_proc(&mut k, "accepter", 0);
 
     // Listener with a pending Connecting client on its backlog.
-    let listener = k.ipc.create_socket(SocketType::Stream);
-    let client = k.ipc.create_socket(SocketType::Stream);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let client = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let ls = k.ipc.socket_mut(listener).unwrap();
         ls.state = SocketState::Listening;
@@ -7633,8 +9763,8 @@ fn sock_accept_applies_wasi_fdflags_to_the_new_fd() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "accepter", 0);
 
-    let listener = k.ipc.create_socket(SocketType::Stream);
-    let client = k.ipc.create_socket(SocketType::Stream);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let client = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let ls = k.ipc.socket_mut(listener).unwrap();
         ls.state = SocketState::Listening;
@@ -7664,12 +9794,61 @@ fn sock_accept_applies_wasi_fdflags_to_the_new_fd() {
 }
 
 #[test]
+fn sock_accept_rejects_unknown_fdflags_without_consuming_backlog() {
+    use kernel::ipc::{SocketState, SocketType};
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "accept-flags", 0);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let client = k.ipc.create_socket(SocketType::Stream).unwrap();
+    {
+        let socket = k.ipc.socket_mut(listener).unwrap();
+        socket.state = SocketState::Listening;
+        socket.backlog.push_back(client);
+    }
+    k.ipc.socket_mut(client).unwrap().state = SocketState::Connecting;
+    k.install_fd(pid, 3, FdObject::Socket(listener.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 16];
+
+    let rejected = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::SOCK_ACCEPT,
+            flags: 0,
+            request_id: 972,
+            args: sock_accept_args(3, 0x20),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(rejected.status, -errno::EINVAL);
+    assert_eq!(k.ipc.socket_mut(listener).unwrap().backlog.len(), 1);
+
+    let accepted = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_wasi::SOCK_ACCEPT,
+            flags: 0,
+            request_id: 973,
+            args: sock_accept_args(3, 0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(accepted.status, 0);
+}
+
+#[test]
 fn sock_accept_on_empty_backlog_returns_eagain() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "accepter", 0);
 
-    let listener = k.ipc.create_socket(SocketType::Stream);
+    let listener = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let ls = k.ipc.socket_mut(listener).unwrap();
         ls.state = SocketState::Listening;
@@ -7698,7 +9877,7 @@ fn sock_accept_on_non_listening_socket_returns_einval() {
     let pid = make_running_proc(&mut k, "accepter", 0);
 
     // Fresh socket — state defaults to Unbound, not Listening.
-    let s = k.ipc.create_socket(SocketType::Stream);
+    let s = k.ipc.create_socket(SocketType::Stream).unwrap();
     k.install_fd(pid, 3, FdObject::Socket(s.0), FdFlags::EMPTY)
         .unwrap();
     let mut heap = vec![0u8; 16];
@@ -7785,8 +9964,8 @@ fn sock_shutdown_rdwr_closes_socket_observable_via_peer_eof() {
     let pid = make_running_proc(&mut k, "shutter", 0);
 
     // Connect a ↔ b.
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -7827,7 +10006,7 @@ fn sock_shutdown_rd_alone_marks_read_side_shutdown() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
     k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
         .unwrap();
@@ -7854,7 +10033,7 @@ fn sock_shutdown_wr_alone_marks_write_side_shutdown() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
     k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
         .unwrap();
@@ -7885,7 +10064,7 @@ fn sock_shutdown_rdwr_sets_both_flags_without_closing() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
     k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
         .unwrap();
@@ -7916,8 +10095,8 @@ fn sock_shutdown_read_makes_recv_return_eof() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -7960,8 +10139,8 @@ fn sock_shutdown_read_makes_peer_send_return_pipe_broken() {
     use kernel::ipc::{IpcError, SocketState, SocketType};
     let mut k = make_kernel();
     let _pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -7984,8 +10163,8 @@ fn sock_shutdown_write_makes_send_return_pipe_broken() {
     use kernel::ipc::{IpcError, SocketState, SocketType};
     let mut k = make_kernel();
     let _pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -8010,8 +10189,8 @@ fn sock_shutdown_write_makes_peer_recv_observe_eof_when_rx_drains() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let _pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -8043,7 +10222,7 @@ fn sock_shutdown_with_zero_how_returns_einval() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
     k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
         .unwrap();
@@ -8069,19 +10248,19 @@ fn sock_shutdown_with_reserved_bits_returns_einval() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "shutter", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
     k.ipc.socket_mut(a).unwrap().state = SocketState::Connected;
     k.install_fd(pid, 3, FdObject::Socket(a.0), FdFlags::EMPTY)
         .unwrap();
     let mut heap = vec![0u8; 16];
 
-    // Bit 0x80 is undefined; RD | WR = 0x3, so 0x83 has the
-    // full-close pair set but also an undefined bit.
+    // Bit 0x100 is outside even the low u8; validating after masking would
+    // incorrectly accept this as RD.
     let req = Request {
         opcode: op_wasi::SOCK_SHUTDOWN,
         flags: 0,
         request_id: 984,
-        args: sock_shutdown_args(3, 0x83),
+        args: sock_shutdown_args(3, 0x101),
         heap_ptr: 0,
         heap_len: 0,
     };
@@ -8747,6 +10926,49 @@ fn ipc_pipe_allocates_two_fresh_fds_and_installs_read_and_write_pair() {
 }
 
 #[test]
+fn ipc_pipe_hard_live_object_limit_returns_enospc() {
+    use kernel::ipc::{IpcLimits, IpcTable};
+
+    let mut k = make_kernel();
+    k.ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 1,
+        live_sockets: 1,
+        buffered_bytes: 64,
+        queued_ancillary_refs: 1,
+    });
+    let pid = make_running_proc(&mut k, "pipe-hard-cap", 0);
+    let mut heap = vec![0u8; 8];
+    let first = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_PIPE,
+            flags: 0,
+            request_id: 1101,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 8,
+        },
+        &mut heap,
+    );
+    assert_eq!(first.status, 0);
+    let response = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_PIPE,
+            flags: 0,
+            request_id: 1102,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 8,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -errno::ENOSPC);
+}
+
+#[test]
 fn ipc_pipe_round_trip_write_then_read_via_fd_syscalls() {
     // End-to-end: IPC_PIPE to create, FD_WRITE via the write fd,
     // FD_READ via the read fd. Confirms the fbddb91 pipe fd arms
@@ -8916,6 +11138,45 @@ fn ipc_pipe_with_short_heap_returns_einval() {
     assert_eq!(table.open_count(), 0);
 }
 
+#[test]
+fn ipc_pipe_cross_end_heap_is_rejected_without_leaking_pipe_or_fds() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pipe-oob", 0);
+    let mut heap = vec![0u8; 8];
+    let malformed = Request {
+        opcode: op_ext::IPC_PIPE,
+        flags: 0,
+        request_id: 1111,
+        args: [0u8; 16],
+        heap_ptr: 4,
+        heap_len: 8,
+    };
+
+    for _ in 0..3 {
+        let response = dispatch(&mut k, pid, &malformed, &mut heap);
+        assert_eq!(response.status, -errno::EINVAL);
+        assert_eq!(k.fds(pid).unwrap().open_count(), 0);
+        assert_eq!(k.ipc.pipe_count(), 0);
+    }
+
+    let valid = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_PIPE,
+            flags: 0,
+            request_id: 1112,
+            args: [0u8; 16],
+            heap_ptr: 0,
+            heap_len: 8,
+        },
+        &mut heap,
+    );
+    assert_eq!(valid.status, 0);
+    assert_eq!(k.fds(pid).unwrap().open_count(), 2);
+    assert_eq!(k.ipc.pipe_count(), 1);
+}
+
 // ---- fd_read / fd_write on pipe fds --------------------------------
 //
 // Pre-slice, Kernel::fd_read on a PipeRead fd and Kernel::fd_write on
@@ -8930,7 +11191,7 @@ fn ipc_pipe_with_short_heap_returns_einval() {
 //
 //   PipeReadResult::Read(n)       → Ok(n)
 //   PipeReadResult::Eof           → Ok(0)                     (EOF convention)
-//   PipeReadResult::WouldBlock    → Err(KernelError::WouldBlock)  → EAGAIN
+//   PipeReadResult::WouldBlock    → park, or EAGAIN with NONBLOCK
 //   PipeWriteResult::Wrote(n)     → Ok(n)
 //   PipeWriteResult::Broken       → Err(KernelError::PipeBroken)  → EPIPE
 //   PipeWriteResult::WouldBlock   → Err(KernelError::WouldBlock)  → EAGAIN
@@ -8939,7 +11200,7 @@ fn ipc_pipe_with_short_heap_returns_einval() {
 fn fd_read_on_pipe_read_returns_bytes_written_by_other_side() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "reader", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     // Preload the pipe with content via the IpcTable helper.
     k.ipc.pipe_mut(pipe_id).unwrap().try_write(b"hello");
     k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
@@ -8964,7 +11225,7 @@ fn fd_read_on_pipe_read_returns_bytes_written_by_other_side() {
 fn fd_read_on_pipe_read_returns_zero_when_writer_closed_and_buffer_empty() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "reader", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     // Drop the writer side; the buffer is empty and writer_closed.
     k.ipc.drop_pipe_writer(pipe_id).unwrap();
     k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
@@ -8985,11 +11246,11 @@ fn fd_read_on_pipe_read_returns_zero_when_writer_closed_and_buffer_empty() {
 }
 
 #[test]
-fn fd_read_on_empty_pipe_with_writer_open_returns_eagain() {
+fn nonblocking_fd_read_on_empty_pipe_with_writer_open_returns_eagain() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "reader", 0);
-    let pipe_id = k.ipc.create_pipe();
-    k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+    let pipe_id = k.ipc.create_pipe().unwrap();
+    k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::NONBLOCK)
         .unwrap();
     let mut heap = vec![0u8; 64];
 
@@ -9006,10 +11267,124 @@ fn fd_read_on_empty_pipe_with_writer_open_returns_eagain() {
 }
 
 #[test]
+fn blocking_fd_read_on_empty_pipe_wakes_with_written_bytes() {
+    let mut k = make_kernel();
+    let reader = make_running_proc(&mut k, "reader", 0);
+    let writer = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe().unwrap();
+    k.install_fd(reader, 10, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(writer, 11, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1082,
+        args: u32_args(10),
+        heap_ptr: 8,
+        heap_len: 16,
+    };
+
+    let outcome = kernel::syscall::dispatch::dispatch(&mut k, reader, &req, &mut heap);
+    assert!(matches!(outcome, ServiceOutcome::Parked));
+    assert!(k.parked_pipe_readers_contains(reader));
+    assert_eq!(
+        k.procs.get(reader).unwrap().state,
+        ProcState::BlockedOnSyscall
+    );
+
+    assert_eq!(k.fd_write(writer, 11, b"ready").unwrap(), 5);
+    assert!(!k.parked_pipe_readers_contains(reader));
+    assert_eq!(k.procs.get(reader).unwrap().state, ProcState::Ready);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, response, heap) = &wakes[0];
+    assert_eq!(*wake_pid, reader);
+    assert_eq!(response.request_id, 1082);
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value, 5);
+    assert_eq!(response.extra_len, 5);
+    let heap = heap.as_ref().expect("read wake heap payload");
+    assert_eq!(heap.heap_ptr, 8);
+    assert_eq!(heap.bytes, b"ready");
+}
+
+#[test]
+fn blocking_fd_read_wakes_with_eof_when_final_writer_closes() {
+    let mut k = make_kernel();
+    let reader = make_running_proc(&mut k, "reader", 0);
+    let writer = make_running_proc(&mut k, "writer", 0);
+    let pipe_id = k.ipc.create_pipe().unwrap();
+    k.install_fd(reader, 10, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(writer, 11, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1083,
+        args: u32_args(10),
+        heap_ptr: 8,
+        heap_len: 16,
+    };
+
+    let outcome = kernel::syscall::dispatch::dispatch(&mut k, reader, &req, &mut heap);
+    assert!(matches!(outcome, ServiceOutcome::Parked));
+    k.fd_close(writer, 11).unwrap();
+
+    assert!(!k.parked_pipe_readers_contains(reader));
+    assert_eq!(k.procs.get(reader).unwrap().state, ProcState::Ready);
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, response, heap) = &wakes[0];
+    assert_eq!(*wake_pid, reader);
+    assert_eq!(response.request_id, 1083);
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value, 0);
+    assert_eq!(response.extra_len, 0);
+    assert!(heap.is_none());
+}
+
+#[test]
+fn interrupted_blocking_pipe_read_removes_the_pipe_waiter() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "reader", 0);
+    let pipe_id = k.ipc.create_pipe().unwrap();
+    k.install_fd(pid, 10, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    k.install_fd(pid, 11, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
+        .unwrap();
+    let mut heap = vec![0u8; 64];
+    let req = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 1084,
+        args: u32_args(10),
+        heap_ptr: 8,
+        heap_len: 16,
+    };
+
+    let outcome = kernel::syscall::dispatch::dispatch(&mut k, pid, &req, &mut heap);
+    assert!(matches!(outcome, ServiceOutcome::Parked));
+    assert!(k.interrupt_parked_pipe_read(pid));
+    assert!(!k.parked_pipe_readers_contains(pid));
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].1.request_id, 1084);
+    assert_eq!(wakes[0].1.status, -errno::EINTR);
+
+    // A later write must not discover a stale waiter and queue a second wake.
+    assert_eq!(k.fd_write(pid, 11, b"later").unwrap(), 5);
+    assert_eq!(k.pending_wakes_snapshot().len(), 1);
+}
+
+#[test]
 fn fd_write_on_pipe_write_buffers_bytes_for_reader() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "writer", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
         .unwrap();
     let mut heap = vec![0u8; 64];
@@ -9038,7 +11413,7 @@ fn fd_write_on_pipe_write_buffers_bytes_for_reader() {
 fn fd_write_on_pipe_write_returns_epipe_when_reader_closed() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "writer", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     // Drop the reader side first — subsequent writes are broken.
     k.ipc.drop_pipe_reader(pipe_id).unwrap();
     k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
@@ -9062,7 +11437,7 @@ fn fd_write_on_pipe_write_returns_epipe_when_reader_closed() {
 fn fd_write_on_pipe_write_returns_eagain_when_buffer_full() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "writer", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     // Fill the pipe's 64 KiB buffer via direct IpcTable calls.
     let chunk = vec![0u8; 64 * 1024];
     let res = k.ipc.pipe_mut(pipe_id).unwrap().try_write(&chunk);
@@ -9090,7 +11465,7 @@ fn fd_read_on_pipe_write_fd_returns_einval() {
     // NotSupportedOnFd → EINVAL, distinct from the read-end paths.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "misreader", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
         .unwrap();
     let mut heap = vec![0u8; 64];
@@ -9112,7 +11487,7 @@ fn fd_write_on_pipe_read_fd_returns_einval() {
     // Writing to the read end is still a wrong-direction op.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "miswriter", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
         .unwrap();
     let mut heap = vec![0u8; 64];
@@ -9136,7 +11511,7 @@ fn pipe_round_trip_via_fd_read_and_fd_write_syscalls() {
     // back via the paired fd.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "round_tripper", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     k.install_fd(pid, 3, FdObject::PipeRead(pipe_id.0), FdFlags::EMPTY)
         .unwrap();
     k.install_fd(pid, 4, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
@@ -9192,8 +11567,8 @@ fn fd_write_on_socket_after_peer_close_returns_epipe() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sender", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -9228,8 +11603,8 @@ fn fd_write_on_write_shutdown_socket_returns_epipe() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sender", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -9264,8 +11639,8 @@ fn sock_send_on_socket_with_peer_read_shutdown_returns_epipe() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sender", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -9315,7 +11690,7 @@ fn sock_send_on_socket_with_peer_read_shutdown_returns_epipe() {
 fn fd_write_on_broken_pipe_posts_sigpipe_alongside_epipe() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "writer", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     k.ipc.drop_pipe_reader(pipe_id).unwrap();
     k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
         .unwrap();
@@ -9342,8 +11717,8 @@ fn fd_write_on_broken_socket_posts_sigpipe_alongside_epipe() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sender", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -9379,8 +11754,8 @@ fn sock_send_on_broken_socket_posts_sigpipe_alongside_epipe() {
     use kernel::ipc::{SocketState, SocketType};
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "sender", 0);
-    let a = k.ipc.create_socket(SocketType::Stream);
-    let b = k.ipc.create_socket(SocketType::Stream);
+    let a = k.ipc.create_socket(SocketType::Stream).unwrap();
+    let b = k.ipc.create_socket(SocketType::Stream).unwrap();
     {
         let sa = k.ipc.socket_mut(a).unwrap();
         sa.state = SocketState::Connected;
@@ -9420,7 +11795,7 @@ fn sock_send_on_broken_socket_posts_sigpipe_alongside_epipe() {
 fn successful_fd_write_on_pipe_does_not_queue_sigpipe() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "writer", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     // Both ends open; the write succeeds.
     k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
         .unwrap();
@@ -9448,7 +11823,7 @@ fn repeated_broken_writes_coalesce_to_single_sigpipe_entry() {
     // Observable state after the loop: exactly one SIGPIPE pending.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "writer", 0);
-    let pipe_id = k.ipc.create_pipe();
+    let pipe_id = k.ipc.create_pipe().unwrap();
     k.ipc.drop_pipe_reader(pipe_id).unwrap();
     k.install_fd(pid, 3, FdObject::PipeWrite(pipe_id.0), FdFlags::EMPTY)
         .unwrap();
@@ -9647,36 +12022,33 @@ fn fd_read_on_signal_channel_coalesces_repeated_same_signal() {
 // ---- fd_prestat_dir_name --------------------------------------------
 //
 // Opcode 0x002C. WASI preopen-name lookup; companion to
-// fd_prestat_get. v1 has no preopens, so the honest answer for every
-// fd is EBADF (matching fd_prestat_get's semantic). Userland's
-// libc-style preopen-discovery loops iterate fd 3/4/5 calling both
-// fd_prestat_get and fd_prestat_dir_name until both return EBADF;
-// pre-slice, v1 returned EBADF from get and ENOSYS from dir_name,
-// which broke the loop. Post-slice, both agree on EBADF and the
-// loop terminates cleanly.
+// fd_prestat_get. PMos exposes exactly one preopen: `/` at fd 3.
 
 #[test]
-fn fd_prestat_dir_name_returns_ebadf_for_any_fd() {
+fn fd_prestat_dir_name_writes_root_name() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "libc_probe", 0);
+    k.install_root_preopen_fd(pid, abi::fd::ROOT_PREOPEN)
+        .unwrap();
     let mut heap = vec![0u8; 64];
 
     let req = Request {
         opcode: op_wasi::FD_PRESTAT_DIR_NAME,
         flags: 0,
         request_id: 1030,
-        args: u32_args(3),
+        args: u32_args(abi::fd::ROOT_PREOPEN),
         heap_ptr: 0,
-        heap_len: 64,
+        heap_len: 1,
     };
     let resp = dispatch(&mut k, pid, &req, &mut heap);
-    assert_eq!(resp.status, -errno::EBADF);
+    assert_eq!(resp.status, 0);
+    assert_eq!(resp.value, 1);
+    assert_eq!(resp.extra_len, 1);
+    assert_eq!(&heap[..1], b"/");
 }
 
 #[test]
-fn fd_prestat_dir_name_returns_ebadf_for_unopened_fd() {
-    // Same EBADF whether the fd is unallocated or allocated — v1 has
-    // no preopens at all.
+fn fd_prestat_dir_name_rejects_non_preopen_fd() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "libc_probe", 0);
     k.install_fd(pid, 3, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
@@ -9696,36 +12068,22 @@ fn fd_prestat_dir_name_returns_ebadf_for_unopened_fd() {
 }
 
 #[test]
-fn fd_prestat_dir_name_and_fd_prestat_get_agree_on_ebadf() {
-    // Pin the consistency invariant: whatever fd_prestat_get returns
-    // for a given fd, fd_prestat_dir_name returns the same (both
-    // EBADF in v1, matching the libc preopen-discovery contract).
+fn fd_prestat_dir_name_rejects_short_output_buffer() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "libc_probe", 0);
+    k.install_root_preopen_fd(pid, abi::fd::ROOT_PREOPEN)
+        .unwrap();
     let mut heap = vec![0u8; 64];
-
-    let get_req = Request {
-        opcode: op_wasi::FD_PRESTAT_GET,
-        flags: 0,
-        request_id: 1032,
-        args: u32_args(4),
-        heap_ptr: 0,
-        heap_len: 0,
-    };
-    let get_resp = dispatch(&mut k, pid, &get_req, &mut heap);
-
     let name_req = Request {
         opcode: op_wasi::FD_PRESTAT_DIR_NAME,
         flags: 0,
         request_id: 1033,
-        args: u32_args(4),
+        args: u32_args(abi::fd::ROOT_PREOPEN),
         heap_ptr: 0,
-        heap_len: 64,
+        heap_len: 0,
     };
     let name_resp = dispatch(&mut k, pid, &name_req, &mut heap);
-
-    assert_eq!(get_resp.status, name_resp.status);
-    assert_eq!(get_resp.status, -errno::EBADF);
+    assert_eq!(name_resp.status, -errno::ENAMETOOLONG);
 }
 
 // ---- path_readlink -------------------------------------------------
@@ -10662,26 +13020,39 @@ fn fd_datasync_on_invalid_fd_returns_ebadf() {
 // ---- fd_prestat_get ---------------------------------------------------
 
 #[test]
-fn fd_prestat_get_always_returns_ebadf() {
-    // PMos has no preopen dirs; the WASI preopen-discovery loop
-    // hits EBADF at the first probe and stops. The handler ignores
-    // the fd entirely — every fd gets the same EBADF.
+fn fd_prestat_get_reports_root_then_terminates_scan() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "prestat", 0);
+    k.install_root_preopen_fd(pid, abi::fd::ROOT_PREOPEN)
+        .unwrap();
+    k.install_fd(
+        pid,
+        abi::fd::SIGNAL,
+        FdObject::SignalChannel,
+        FdFlags::EMPTY,
+    )
+    .unwrap();
     let mut heap = vec![0u8; 16];
 
-    for fd in [3u32, 4, 7, 42] {
-        let req = Request {
-            opcode: op_wasi::FD_PRESTAT_GET,
-            flags: 0,
-            request_id: 91,
-            args: u32_args(fd),
-            heap_ptr: 0,
-            heap_len: 0,
-        };
-        let resp = dispatch(&mut k, pid, &req, &mut heap);
-        assert_eq!(resp.status, -errno::EBADF, "fd={fd}");
-    }
+    let root_req = Request {
+        opcode: op_wasi::FD_PRESTAT_GET,
+        flags: 0,
+        request_id: 91,
+        args: u32_args(abi::fd::ROOT_PREOPEN),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    let root = dispatch(&mut k, pid, &root_req, &mut heap);
+    assert_eq!(root.status, 0);
+    assert_eq!(root.value, 1);
+
+    let signal_req = Request {
+        args: u32_args(abi::fd::SIGNAL),
+        request_id: 92,
+        ..root_req
+    };
+    let signal = dispatch(&mut k, pid, &signal_req, &mut heap);
+    assert_eq!(signal.status, -errno::EBADF);
 }
 
 // ---- IPC sockets ------------------------------------------------------
@@ -10749,6 +13120,112 @@ fn ipc_socket_rejects_invalid_type_with_einval() {
 }
 
 #[test]
+fn ipc_socket_rejects_reserved_datagram_type_with_enotsup_atomically() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "dgram-rejected", 0);
+    let mut heap = vec![0u8; 64];
+    let response = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 12786,
+            args: u32_args(abi::ext::SocketType::Dgram as u32),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+
+    assert_eq!(response.status, -errno::ENOTSUP);
+    assert_eq!(k.ipc.socket_count(), 0);
+    assert_eq!(k.fds(pid).unwrap().open_count(), 0);
+
+    let stream = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    assert_eq!(stream, 0, "rejection must not consume the lowest fd");
+    assert_eq!(
+        k.fds(pid).unwrap().get(stream).unwrap().object,
+        FdObject::Socket(1),
+        "rejection must not consume a socket id"
+    );
+
+    let full_pid = make_running_proc(&mut k, "dgram-full-fd-table", 0);
+    for fd in 0..kernel::fd::FD_SOFT_LIMIT as u32 {
+        k.install_fd(
+            full_pid,
+            fd,
+            FdObject::CharDevice(DEV_CONSOLE),
+            FdFlags::EMPTY,
+        )
+        .unwrap();
+    }
+    let sockets_before = k.ipc.socket_count();
+    let response = dispatch(
+        &mut k,
+        full_pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 12787,
+            args: u32_args(abi::ext::SocketType::Dgram as u32),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -errno::ENOTSUP);
+    assert_eq!(k.ipc.socket_count(), sockets_before);
+    assert_eq!(
+        k.fds(full_pid).unwrap().open_count(),
+        kernel::fd::FD_SOFT_LIMIT
+    );
+}
+
+#[test]
+fn ipc_socket_hard_live_object_limit_returns_enospc() {
+    use kernel::ipc::{IpcLimits, IpcTable};
+
+    let mut k = make_kernel();
+    k.ipc = IpcTable::with_limits(IpcLimits {
+        live_pipes: 1,
+        live_sockets: 1,
+        buffered_bytes: 64,
+        queued_ancillary_refs: 1,
+    });
+    let pid = make_running_proc(&mut k, "socket-hard-cap", 0);
+    let mut heap = Vec::new();
+    let first = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 412,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(first.status, 0);
+    let response = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_SOCKET,
+            flags: 0,
+            request_id: 413,
+            args: u32_args(0),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -errno::ENOSPC);
+}
+
+#[test]
 fn ipc_bind_and_listen_transition_a_fresh_socket() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "server", 0);
@@ -10778,6 +13255,11 @@ fn ipc_bind_and_listen_transition_a_fresh_socket() {
     };
     let bind_resp = dispatch(&mut k, pid, &bind_req, &mut heap);
     assert_eq!(bind_resp.status, 0);
+    assert_eq!(
+        k.vfs.resolve("/tmp/sock").unwrap_err(),
+        kernel::vfs::FsError::NotFound,
+        "IPC bindings live in the abstract kernel namespace, not the VFS"
+    );
 
     // Listen with backlog 4.
     let listen_req = Request {
@@ -10866,6 +13348,40 @@ fn ipc_bind_on_already_bound_path_returns_eaddrinuse() {
 }
 
 #[test]
+fn generic_ipc_bind_cannot_claim_reserved_display_endpoint() {
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(&mut k, "display-impostor", CapSet::EMPTY);
+    let fd = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    let socket_id = k.socket_id_from_fd_public(pid, fd).unwrap();
+    let path = kernel::sys::DISPLAY_SOCKET_PATH.as_bytes();
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+
+    let response = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::IPC_BIND,
+            flags: 0,
+            request_id: 114,
+            args: u32_args(fd),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -errno::ENOTCAPABLE);
+    assert_eq!(
+        k.ipc.sockets_get(socket_id).unwrap().state,
+        kernel::ipc::SocketState::Unbound
+    );
+    assert!(k
+        .ipc
+        .lookup_binding(kernel::sys::DISPLAY_SOCKET_PATH)
+        .is_none());
+}
+
+#[test]
 fn ipc_connect_to_nonexistent_path_returns_econnrefused() {
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "client", 0);
@@ -10902,6 +13418,53 @@ fn ipc_connect_to_nonexistent_path_returns_econnrefused() {
         &mut heap,
     );
     assert_eq!(resp.status, -errno::ECONNREFUSED);
+}
+
+#[test]
+fn generic_ipc_connect_cannot_bypass_display_capability_gate() {
+    let mut k = make_kernel();
+    let server = make_proc_with_caps(&mut k, "display-server", CapSet(Cap::DisplayServer.bit()));
+    let listener_fd = k.display_bind(server).unwrap();
+    let listener_id = k
+        .socket_id_from_fd_public(server, listener_fd)
+        .expect("display listener");
+
+    let client = make_proc_with_caps(&mut k, "ordinary-client", CapSet::EMPTY);
+    let client_fd = k
+        .ipc_socket(client, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    let client_id = k.socket_id_from_fd_public(client, client_fd).unwrap();
+    let path = kernel::sys::DISPLAY_SOCKET_PATH.as_bytes();
+    let mut heap = vec![0u8; 64];
+    heap[..path.len()].copy_from_slice(path);
+    let rejected = dispatch(
+        &mut k,
+        client,
+        &Request {
+            opcode: op_ext::IPC_CONNECT,
+            flags: 0,
+            request_id: 122,
+            args: u32_args(client_fd),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(rejected.status, -errno::ENOTCAPABLE);
+    assert_eq!(
+        k.ipc.sockets_get(client_id).unwrap().state,
+        kernel::ipc::SocketState::Unbound
+    );
+    assert!(k.ipc.sockets_get(listener_id).unwrap().backlog.is_empty());
+
+    let capable = make_proc_with_caps(&mut k, "display-client", CapSet(Cap::DisplayClient.bit()));
+    let connected_fd = k.display_connect(capable).unwrap();
+    let connected_id = k.socket_id_from_fd_public(capable, connected_fd).unwrap();
+    assert_eq!(
+        k.ipc.sockets_get(connected_id).unwrap().state,
+        kernel::ipc::SocketState::Connecting
+    );
+    assert_eq!(k.ipc.sockets_get(listener_id).unwrap().backlog.len(), 1);
 }
 
 #[test]
@@ -11003,6 +13566,147 @@ fn ipc_accept_on_non_socket_fd_returns_einval() {
         &mut heap,
     );
     assert_eq!(resp.status, -errno::EINVAL);
+}
+
+#[test]
+fn ipc_peer_caps_returns_kernel_authenticated_connection_snapshot() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "credential-server", 0);
+    let peer_caps = CapSet::from_caps(&[Cap::DisplayClient, Cap::Shell]);
+    let client = k
+        .register_process(RegisterArgs {
+            name: "credential-client",
+            ppid: 0,
+            caps: peer_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(client).unwrap();
+    k.procs.transition(client, ProcState::Running).unwrap();
+
+    let listener = k
+        .ipc_socket(server, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    k.ipc_bind(server, listener, "/tmp/credentials").unwrap();
+    k.ipc_listen(server, listener, 1).unwrap();
+    let client_fd = k
+        .ipc_socket(client, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    k.ipc_connect(client, client_fd, "/tmp/credentials")
+        .unwrap();
+    let accepted = k.accept_socket(server, listener).unwrap();
+
+    let response = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_PEER_CAPS,
+            flags: 0,
+            request_id: 141,
+            args: u32_args(accepted),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut [],
+    );
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value as u64, peer_caps.0);
+}
+
+#[test]
+fn ipc_peer_caps_rejects_non_socket_and_unconnected_socket() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "credential-server", 0);
+    k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let listener = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    k.ipc_bind(pid, listener, "/tmp/not-connected").unwrap();
+    k.ipc_listen(pid, listener, 1).unwrap();
+
+    for (fd, expected) in [(0, errno::ENOTSOCK), (listener, errno::ENOTCONN)] {
+        let response = dispatch(
+            &mut k,
+            pid,
+            &Request {
+                opcode: op_ext::IPC_PEER_CAPS,
+                flags: 0,
+                request_id: 142,
+                args: u32_args(fd),
+                heap_ptr: 0,
+                heap_len: 0,
+            },
+            &mut [],
+        );
+        assert_eq!(response.status, -expected, "fd={fd}");
+    }
+}
+
+#[test]
+fn ipc_peer_pid_returns_kernel_authenticated_connection_snapshot() {
+    let mut k = make_kernel();
+    let server = make_running_proc(&mut k, "pid-credential-server", 0);
+    let client = make_running_proc(&mut k, "pid-credential-client", 0);
+
+    let listener = k
+        .ipc_socket(server, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    k.ipc_bind(server, listener, "/tmp/pid-credentials")
+        .unwrap();
+    k.ipc_listen(server, listener, 1).unwrap();
+    let client_fd = k
+        .ipc_socket(client, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    k.ipc_connect(client, client_fd, "/tmp/pid-credentials")
+        .unwrap();
+    let accepted = k.accept_socket(server, listener).unwrap();
+
+    let response = dispatch(
+        &mut k,
+        server,
+        &Request {
+            opcode: op_ext::IPC_PEER_PID,
+            flags: 0,
+            request_id: 143,
+            args: u32_args(accepted),
+            heap_ptr: 0,
+            heap_len: 0,
+        },
+        &mut [],
+    );
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value, client as i64);
+}
+
+#[test]
+fn ipc_peer_pid_rejects_bad_fd_non_socket_and_unconnected_socket() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "pid-credential-server", 0);
+    k.install_fd(pid, 0, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    let listener = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    k.ipc_bind(pid, listener, "/tmp/pid-not-connected").unwrap();
+    k.ipc_listen(pid, listener, 1).unwrap();
+
+    for (fd, expected) in [
+        (999, errno::EBADF),
+        (0, errno::ENOTSOCK),
+        (listener, errno::ENOTCONN),
+    ] {
+        let response = dispatch(
+            &mut k,
+            pid,
+            &Request {
+                opcode: op_ext::IPC_PEER_PID,
+                flags: 0,
+                request_id: 144,
+                args: u32_args(fd),
+                heap_ptr: 0,
+                heap_len: 0,
+            },
+            &mut [],
+        );
+        assert_eq!(response.status, -expected, "fd={fd}");
+    }
 }
 
 #[test]
@@ -11274,10 +13978,8 @@ fn fd_write_on_pending_client_after_listener_drop_returns_econnrefused() {
         0,
     );
 
-    // Pre-drop sanity: fd_write on the pending client returns
-    // EINVAL (the accept-race signal display-client-demo retries
-    // on). If this assertion drifts, the retry loop semantic has
-    // broken even before the listener drops.
+    // Pre-drop sanity: I/O on a pending asynchronous connection is
+    // retryable EAGAIN until accept completes.
     heap[..2].copy_from_slice(b"hi");
     let pre_drop = dispatch(
         &mut k,
@@ -11292,7 +13994,7 @@ fn fd_write_on_pending_client_after_listener_drop_returns_econnrefused() {
         },
         &mut heap,
     );
-    assert_eq!(pre_drop.status, -errno::EINVAL);
+    assert_eq!(pre_drop.status, -errno::EAGAIN);
 
     // Server closes the listener fd WITHOUT accepting. The close
     // path drains the backlog so the still-pending client
@@ -11694,8 +14396,14 @@ fn proc_spawn_creates_child_and_records_platform_spawn_call() {
     assert!(child_fds.get(0).is_some());
     assert!(child_fds.get(1).is_some());
     assert!(child_fds.get(2).is_some());
-    // Signal channel auto-installed at fd 3.
-    assert_eq!(child_fds.get(3).unwrap().object, FdObject::SignalChannel,);
+    assert!(matches!(
+        child_fds.get(abi::fd::ROOT_PREOPEN).unwrap().object,
+        FdObject::Vnode { .. }
+    ));
+    assert_eq!(
+        child_fds.get(abi::fd::SIGNAL).unwrap().object,
+        FdObject::SignalChannel,
+    );
 
     // Platform was asked to spawn a Worker for the new pid.
     kernel::platform::native::with_state(|s| {
@@ -11703,7 +14411,122 @@ fn proc_spawn_creates_child_and_records_platform_spawn_call() {
         let call = &s.spawn_calls[0];
         assert_eq!(call.pid, new_pid);
         assert_eq!(call.path, "/usr/bin/hello");
+        assert_eq!(call.executable, None);
     });
+}
+
+#[test]
+fn proc_spawn_publishes_exact_executable_bytes_from_vfs() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    for dir in ["/opt", "/opt/hello", "/opt/hello/bin"] {
+        k.vfs.mkdir(dir, 0o755).unwrap();
+    }
+    let path = "/opt/hello/bin/hello.wasm";
+    let executable = b"\0asm\x01\0\0\0dynamic-package";
+    k.vfs.create(path, 0o755).unwrap();
+    assert_eq!(k.vfs.write(path, 0, executable).unwrap(), executable.len());
+
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    let mut heap = vec![0u8; 4096];
+    heap[..path.len()].copy_from_slice(path.as_bytes());
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 7001,
+            args: proc_spawn_args(path.len() as u32, abi::cap::initial::INIT.0),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, 0);
+    kernel::platform::native::with_state(|state| {
+        assert_eq!(state.spawn_calls.len(), 1);
+        let call = &state.spawn_calls[0];
+        assert_eq!(call.path, path);
+        assert_eq!(call.executable.as_deref(), Some(executable.as_slice()));
+    });
+}
+
+#[test]
+fn proc_spawn_fails_closed_outside_opt_and_on_opt_symlink_escape() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    for dir in ["/opt", "/tmp", "/home"] {
+        k.vfs.mkdir(dir, 0o755).unwrap();
+    }
+    for path in ["/tmp/tool.wasm", "/home/tool.wasm"] {
+        k.vfs.create(path, 0o755).unwrap();
+        k.vfs.write(path, 0, b"\0asm\x01\0\0\0").unwrap();
+    }
+    k.vfs
+        .symlink("/home/tool.wasm", "/opt/escape.wasm")
+        .unwrap();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    let live_before = k.procs.live_count();
+
+    for (request_id, path, expected_errno) in [
+        (7010, "/tmp/tool.wasm", errno::EACCES),
+        (7011, "/opt/escape.wasm", errno::EACCES),
+        (7012, "/opt/missing.wasm", errno::ENOENT),
+    ] {
+        let mut heap = vec![0u8; 4096];
+        heap[..path.len()].copy_from_slice(path.as_bytes());
+        let response = dispatch(
+            &mut k,
+            parent,
+            &Request {
+                opcode: op_ext::PROC_SPAWN,
+                flags: 0,
+                request_id,
+                args: proc_spawn_args(path.len() as u32, abi::cap::initial::INIT.0),
+                heap_ptr: 0,
+                heap_len: path.len() as u32,
+            },
+            &mut heap,
+        );
+        assert_eq!(response.status, -expected_errno, "path {path}");
+        assert_eq!(k.procs.live_count(), live_before);
+    }
+    kernel::platform::native::with_state(|state| assert!(state.spawn_calls.is_empty()));
+}
+
+#[test]
+fn proc_spawn_rejects_existing_non_executable_vfs_file_atomically() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    k.vfs.mkdir("/opt", 0o755).unwrap();
+    let path = "/opt/data.wasm";
+    k.vfs.create(path, 0o644).unwrap();
+    k.vfs.write(path, 0, b"\0asm\x01\0\0\0").unwrap();
+
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    let live_before = k.procs.live_count();
+    let mut heap = vec![0u8; 4096];
+    heap[..path.len()].copy_from_slice(path.as_bytes());
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 7002,
+            args: proc_spawn_args(path.len() as u32, abi::cap::initial::INIT.0),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -abi::errno::EACCES);
+    assert_eq!(k.procs.live_count(), live_before);
+    kernel::platform::native::with_state(|state| assert!(state.spawn_calls.is_empty()));
 }
 
 #[test]
@@ -11727,7 +14550,7 @@ fn proc_spawn_rolls_back_when_platform_refuses() {
 
     // Remember which pids exist pre-call so we can assert that NO new
     // pid survives the rollback.
-    let before_alive: Vec<_> = (0..20).filter(|p| k.procs.is_alive(*p as i32)).collect();
+    let before_alive: Vec<_> = (0..20).filter(|p| k.procs.is_alive(*p)).collect();
 
     let req = Request {
         opcode: op_ext::PROC_SPAWN,
@@ -11742,13 +14565,44 @@ fn proc_spawn_rolls_back_when_platform_refuses() {
     assert_eq!(resp.status, -errno::EIO);
     // No new pid in the process table: the set of alive pids is
     // the same as before the call.
-    let after_alive: Vec<_> = (0..20).filter(|p| k.procs.is_alive(*p as i32)).collect();
+    let after_alive: Vec<_> = (0..20).filter(|p| k.procs.is_alive(*p)).collect();
     assert_eq!(before_alive, after_alive);
     // Platform recorded no successful spawn (the error consumed the
     // `next_spawn_error` slot without appending).
     kernel::platform::native::with_state(|s| {
         assert_eq!(s.spawn_calls.len(), 0);
     });
+}
+
+#[test]
+fn proc_spawn_preserves_platform_enoent_for_bundled_path_fallback() {
+    kernel::platform::native::reset();
+    kernel::platform::native::with_state(|state| {
+        state.next_spawn_error = Some(kernel::platform::DriverError::Errno(errno::ENOENT));
+    });
+
+    let mut kernel = make_kernel();
+    let parent = make_running_proc(&mut kernel, "parent", 0);
+    install_default_stdio(&mut kernel, parent);
+    let path = "/usr/bin/missing-tool";
+    let mut heap = vec![0_u8; path.len()];
+    heap.copy_from_slice(path.as_bytes());
+    let response = dispatch(
+        &mut kernel,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 711,
+            args: proc_spawn_args(path.len() as u32, abi::cap::initial::INIT.0),
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+
+    assert_eq!(response.status, -errno::ENOENT);
+    assert_eq!(kernel.procs.child_count(parent), 0);
 }
 
 #[test]
@@ -11976,10 +14830,8 @@ fn service_one_returns_false_when_ring_empty() {
 //   args[0..4] = target_pid (i32). 0 or -1 → any child; > 0 → specific
 //                 pid; < -1 → EINVAL (process-group wait unsupported).
 //                 == caller's own pid → ECHILD (can't wait on self).
-//   args[4..8] = options (u32). WNOHANG = 0x1. v1 is always non-
-//                blocking — dispatcher can't park processes yet — so
-//                the bit is decoded for forward-compat but all waits
-//                return -EAGAIN on WouldBlock regardless.
+//   args[4..8] = options (u32). WNOHANG = 0x1; options=0 parks on a
+//                live matching child, while WNOHANG returns immediately.
 //   heap_len   = 0 (no child pid read-back) or 4 (write child pid to
 //                heap[0..4] on a successful reap).
 // Response:
@@ -11994,8 +14846,8 @@ fn service_one_returns_false_when_ring_empty() {
 // Errors (negated errno in .status):
 //   ECHILD     = no children matching the target, or target ==
 //                sender pid.
-//   EAGAIN     = live children exist but none are zombies (also
-//                returned when WNOHANG is set; v1 never blocks).
+//   EAGAIN     = live children exist but none are zombies and WNOHANG
+//                was requested.
 //   EINVAL     = malformed target_pid (< -1) or the options u32 has
 //                unknown bits set beyond WNOHANG.
 
@@ -12115,6 +14967,31 @@ fn proc_wait_wnohang_with_live_child_returns_eagain() {
     let mut heap = vec![0u8; 16];
     let resp = dispatch(&mut k, init, &req, &mut heap);
     assert_eq!(resp.status, -errno::EAGAIN);
+}
+
+#[test]
+fn repeated_sigkill_then_wnohang_reap_does_not_leak_process_slots() {
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "term-parent", 0);
+    let baseline = k.procs.live_count();
+    let mut heap = vec![0u8; 16];
+
+    for index in 0..32 {
+        let child = register_child(&mut k, parent, "term-shell");
+        k.proc_kill(parent, child, Signal::Kill).unwrap();
+        assert_eq!(k.procs.get(child).unwrap().state, ProcState::Zombie);
+        let wait = Request {
+            opcode: op_ext::PROC_WAIT,
+            flags: 0,
+            request_id: 12_500 + index,
+            args: proc_wait_args(child, abi::ext::wait_opts::WNOHANG),
+            heap_ptr: 0,
+            heap_len: 0,
+        };
+        assert_eq!(dispatch(&mut k, parent, &wait, &mut heap).status, 0);
+        assert_eq!(k.procs.live_count(), baseline);
+        assert!(!k.procs.is_alive(child));
+    }
 }
 
 #[test]
@@ -12317,17 +15194,24 @@ fn proc_kill_unknown_signum_returns_einval() {
     let init = make_running_proc(&mut k, "init", 0);
     let child = register_child(&mut k, init, "child");
 
-    let req = Request {
-        opcode: op_ext::PROC_KILL,
-        flags: 0,
-        request_id: 1213,
-        args: proc_kill_args(child, 77),
-        heap_ptr: 0,
-        heap_len: 0,
-    };
-    let mut heap = vec![0u8; 16];
-    let resp = dispatch(&mut k, init, &req, &mut heap);
-    assert_eq!(resp.status, -errno::EINVAL);
+    for signum in [1, 3, 77] {
+        let req = Request {
+            opcode: op_ext::PROC_KILL,
+            flags: 0,
+            request_id: 1213,
+            args: proc_kill_args(child, signum),
+            heap_ptr: 0,
+            heap_len: 0,
+        };
+        let mut heap = vec![0u8; 16];
+        let resp = dispatch(&mut k, init, &req, &mut heap);
+        assert_eq!(resp.status, -errno::EINVAL, "signum {signum}");
+        assert_eq!(
+            k.pending_signals(child).unwrap(),
+            0,
+            "unsupported signum {signum} must not be delivered"
+        );
+    }
 }
 
 #[test]
@@ -13438,8 +16322,8 @@ fn mount_path_already_a_mount_returns_ebusy() {
 #[test]
 fn mount_unknown_fstype_returns_einval() {
     // fstype "ext4" — unknown to the v1 factory → -EINVAL. The
-    // factory dispatch happens AFTER the path-validity checks and
-    // BEFORE the actual mount call; the assertion pins that the
+    // factory dispatch happens AFTER the lexical path checks and
+    // BEFORE consulting the target VFS; the assertion pins that the
     // unknown-fstype path doesn't accidentally fall through to a
     // generic "always succeed" branch.
     let mut k = make_kernel();
@@ -13469,6 +16353,40 @@ fn mount_unknown_fstype_returns_einval() {
 
     assert_eq!(resp.status, -errno::EINVAL);
     assert_eq!(k.vfs.mount_count(), mount_count_before, "no side effect");
+}
+
+#[test]
+fn mount_kernel_owned_fstypes_cannot_be_created_by_userland() {
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "mounter",
+        abi::cap::CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).expect("mkdir /mnt");
+    let mount_count_before = k.vfs.mount_count();
+
+    for fstype in [b"devfs".as_slice(), b"procfs", b"opfs"] {
+        let path = b"/mnt";
+        let mut heap = vec![0u8; 32];
+        heap[..path.len()].copy_from_slice(path);
+        heap[path.len()..path.len() + fstype.len()].copy_from_slice(fstype);
+        let response = dispatch(
+            &mut k,
+            pid,
+            &Request {
+                opcode: op_ext::MOUNT,
+                flags: 0,
+                request_id: 108,
+                args: mount_args(0, path.len() as u32, path.len() as u32, fstype.len() as u32),
+                heap_ptr: 0,
+                heap_len: (path.len() + fstype.len()) as u32,
+            },
+            &mut heap,
+        );
+        assert_eq!(response.status, -errno::EINVAL, "fstype {fstype:?}");
+        assert_eq!(k.vfs.mount_count(), mount_count_before);
+    }
 }
 
 #[test]
@@ -13698,6 +16616,63 @@ fn umount_with_open_fds_returns_ebusy() {
         resp2.status, 0,
         "umount succeeds after the pinning fd closes"
     );
+}
+
+#[test]
+fn watched_mount_is_busy_until_watch_close_and_keeps_delivering() {
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(&mut k, "watch-mounter", CapSet::from_caps(&[Cap::Mount]));
+    k.vfs.mkdir("/mnt", 0o755).unwrap();
+    k.mount(pid, "/mnt", "tmpfs", 0).unwrap();
+    let watch_fd = k.fs_watch(pid, "/mnt", abi::ext::WATCH_CREATE).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    heap[..4].copy_from_slice(b"/mnt");
+    let req = Request {
+        opcode: op_ext::UMOUNT,
+        flags: 0,
+        request_id: 115,
+        args: umount_args(0, 4),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, -errno::EBUSY);
+
+    let inode = k.vfs_create("/mnt/still-live", 0o644).unwrap();
+    let mut event = [0u8; 8];
+    assert_eq!(k.fd_read(pid, watch_fd, &mut event).unwrap(), 8);
+    assert_eq!(
+        u32::from_le_bytes(event[4..8].try_into().unwrap()),
+        inode as u32
+    );
+
+    k.fd_close(pid, watch_fd).unwrap();
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, 0);
+}
+
+#[test]
+fn watch_on_unrelated_mount_does_not_block_umount() {
+    let mut k = make_kernel();
+    let pid = make_proc_with_caps(
+        &mut k,
+        "unrelated-watch-mounter",
+        CapSet::from_caps(&[Cap::Mount]),
+    );
+    k.vfs.mkdir("/mnt", 0o755).unwrap();
+    k.mount(pid, "/mnt", "tmpfs", 0).unwrap();
+    let _root_watch = k.fs_watch(pid, "/", abi::ext::WATCH_CREATE).unwrap();
+
+    let mut heap = vec![0u8; 64];
+    heap[..4].copy_from_slice(b"/mnt");
+    let req = Request {
+        opcode: op_ext::UMOUNT,
+        flags: 0,
+        request_id: 116,
+        args: umount_args(0, 4),
+        heap_ptr: 0,
+        heap_len: 4,
+    };
+    assert_eq!(dispatch(&mut k, pid, &req, &mut heap).status, 0);
 }
 
 // ---------- mount remount ----------
@@ -14101,6 +17076,52 @@ fn mount_remount_root_is_supported() {
     );
 }
 
+// ---- fs_chmod ----------------------------------------------------------
+
+#[test]
+fn fs_chmod_sets_executable_mode_and_rejects_unknown_bits() {
+    let mut k = make_kernel();
+    k.vfs.create("/app.wasm", 0o644).unwrap();
+    let pid = make_running_proc(&mut k, "installer", 0);
+    let path = b"/app.wasm";
+    let mut heap = path.to_vec();
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&(path.len() as u32).to_le_bytes());
+    args[4..8].copy_from_slice(&0o755u32.to_le_bytes());
+    let response = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::FS_CHMOD,
+            flags: 0,
+            request_id: 7990,
+            args,
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, 0);
+    assert_eq!(k.vfs.stat("/app.wasm").unwrap().mode, 0o755);
+
+    args[4..8].copy_from_slice(&0o1755u32.to_le_bytes());
+    let response = dispatch(
+        &mut k,
+        pid,
+        &Request {
+            opcode: op_ext::FS_CHMOD,
+            flags: 0,
+            request_id: 7991,
+            args,
+            heap_ptr: 0,
+            heap_len: path.len() as u32,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -abi::errno::EINVAL);
+    assert_eq!(k.vfs.stat("/app.wasm").unwrap().mode, 0o755);
+}
+
 // ---- fs_watch ----------------------------------------------------------
 //
 // Wire layout per `contracts/syscalls.md §3.7`:
@@ -14156,6 +17177,20 @@ fn dispatch_fs_watch(
     dispatch(k, pid, &req, heap)
 }
 
+fn drain_watch_records(k: &mut Kernel, pid: abi::ext::Pid, fd: u32) -> Vec<(u32, u32)> {
+    let mut bytes = [0u8; 8 * 16];
+    let written = k.fd_read(pid, fd, &mut bytes).expect("watch records");
+    bytes[..written]
+        .chunks_exact(8)
+        .map(|record| {
+            (
+                u32::from_le_bytes(record[0..4].try_into().unwrap()),
+                u32::from_le_bytes(record[4..8].try_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn fs_watch_register_returns_watch_fd() {
     // Happy path: register a watch on the root tmpfs, assert the
@@ -14208,6 +17243,26 @@ fn fs_watch_path_does_not_exist_returns_enoent() {
         701,
     );
     assert_eq!(resp.status, -errno::ENOENT);
+}
+
+#[test]
+fn fs_watch_rejects_synthetic_devfs_and_procfs_targets() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "synthetic-watch", 0);
+    let mut heap = vec![0u8; 64];
+    for (request_id, path) in [(7011, &b"/dev"[..]), (7012, &b"/proc"[..])] {
+        let response = dispatch_fs_watch(
+            &mut k,
+            pid,
+            &mut heap,
+            path,
+            abi::ext::WATCH_MODIFY,
+            0,
+            request_id,
+        );
+        assert_eq!(response.status, -errno::ENOTSUP);
+    }
+    assert_eq!(k.vfs.watches().len(), 0);
 }
 
 #[test]
@@ -14340,6 +17395,61 @@ fn fs_watch_create_event_is_delivered() {
 }
 
 #[test]
+fn fs_watch_empty_read_returns_eagain_not_false_eof() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-empty", 0);
+    let watch_fd = k.fs_watch(pid, "/", abi::ext::WATCH_CREATE).unwrap();
+    let mut heap = vec![0u8; kernel::vfs::WatchEvent::SIZE];
+    let read = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 711,
+        args: u32_args(watch_fd),
+        heap_ptr: 0,
+        heap_len: heap.len() as u32,
+    };
+    let response = dispatch(&mut k, pid, &read, &mut heap);
+    assert_eq!(response.status, -errno::EAGAIN);
+    assert_eq!(response.value, 0);
+}
+
+#[test]
+fn fs_watch_short_read_is_einval_and_does_not_consume_record() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-short", 0);
+    let watch_fd = k.fs_watch(pid, "/", abi::ext::WATCH_CREATE).unwrap();
+    k.vfs_create("/short-record", 0o644).unwrap();
+
+    let mut short = vec![0u8; kernel::vfs::WatchEvent::SIZE - 1];
+    let read_short = Request {
+        opcode: op_wasi::FD_READ,
+        flags: 0,
+        request_id: 712,
+        args: u32_args(watch_fd),
+        heap_ptr: 0,
+        heap_len: short.len() as u32,
+    };
+    assert_eq!(
+        dispatch(&mut k, pid, &read_short, &mut short).status,
+        -errno::EINVAL
+    );
+
+    let mut full = vec![0u8; kernel::vfs::WatchEvent::SIZE];
+    let read_full = Request {
+        request_id: 713,
+        heap_len: full.len() as u32,
+        ..read_short
+    };
+    let response = dispatch(&mut k, pid, &read_full, &mut full);
+    assert_eq!(response.status, 0);
+    assert_eq!(response.value, kernel::vfs::WatchEvent::SIZE as i64);
+    assert_eq!(
+        u32::from_le_bytes(full[..4].try_into().unwrap()),
+        abi::ext::WATCH_CREATE
+    );
+}
+
+#[test]
 fn fs_watch_delete_event_is_delivered() {
     // Register a watch on /dir, unlink an existing /dir/file, the
     // watch fd reports a DELETE event with the unlinked file's
@@ -14414,10 +17524,243 @@ fn fs_watch_modify_event_is_delivered() {
 }
 
 #[test]
+fn fs_watch_link_and_symlink_create_events_are_exact_and_failures_are_silent() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-links", 0);
+    k.vfs_mkdir("/dir", 0o755).unwrap();
+    let source = k.vfs_create("/dir/source", 0o644).unwrap();
+    let watch = k.fs_watch(pid, "/dir", abi::ext::WATCH_CREATE).unwrap();
+
+    k.vfs_link("/dir/source", "/dir/hard").unwrap();
+    let symlink = k.vfs_symlink("source", "/dir/soft").unwrap();
+    assert_eq!(
+        drain_watch_records(&mut k, pid, watch),
+        vec![
+            (abi::ext::WATCH_CREATE, source as u32),
+            (abi::ext::WATCH_CREATE, symlink as u32),
+        ]
+    );
+
+    assert!(k.vfs_link("/dir/source", "/dir/hard").is_err());
+    assert!(k.vfs_symlink("source", "/dir/soft").is_err());
+    let mut record = [0u8; 8];
+    assert_eq!(
+        k.fd_read(pid, watch, &mut record),
+        Err(kernel::sys::KernelError::WouldBlock)
+    );
+}
+
+#[test]
+fn fs_watch_unlink_symlink_reports_link_inode_absolute_and_dirfd_relative() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-unlink-symlink", 0);
+    k.vfs_mkdir("/dir", 0o755).unwrap();
+    let target = k.vfs_create("/dir/target", 0o644).unwrap();
+    let absolute_link = k.vfs_symlink("target", "/dir/absolute-link").unwrap();
+    let relative_link = k.vfs_symlink("target", "/dir/relative-link").unwrap();
+    let watch = k.fs_watch(pid, "/dir", abi::ext::WATCH_DELETE).unwrap();
+
+    k.vfs_unlink("/dir/absolute-link").unwrap();
+    assert_eq!(
+        drain_watch_records(&mut k, pid, watch),
+        vec![(abi::ext::WATCH_DELETE, absolute_link as u32)]
+    );
+
+    let dir_fd = k
+        .path_open(
+            pid,
+            "/dir",
+            0,
+            abi::wasi::oflags::DIRECTORY,
+            0,
+            FdFlags::EMPTY,
+        )
+        .unwrap();
+    k.vfs_unlink_at(pid, dir_fd, "relative-link").unwrap();
+    assert_eq!(
+        drain_watch_records(&mut k, pid, watch),
+        vec![(abi::ext::WATCH_DELETE, relative_link as u32)]
+    );
+    assert_eq!(k.vfs.resolve("/dir/target").unwrap().1, target);
+}
+
+#[test]
+fn fs_watch_rename_replacement_order_noops_and_destination_hardlink_survival() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-rename-exact", 0);
+    k.vfs_mkdir("/old", 0o755).unwrap();
+    k.vfs_mkdir("/new", 0o755).unwrap();
+    let source = k.vfs_create("/old/source", 0o644).unwrap();
+    let source_mount = k.vfs.resolve("/old/source").unwrap().0;
+    k.vfs_write_at(source_mount, source, 0, b"source").unwrap();
+    let replaced = k.vfs_create("/new/destination", 0o644).unwrap();
+    let replaced_mount = k.vfs.resolve("/new/destination").unwrap().0;
+    k.vfs_write_at(replaced_mount, replaced, 0, b"kept")
+        .unwrap();
+    k.vfs_link("/new/destination", "/new/keep").unwrap();
+
+    let old_watch = k.fs_watch(pid, "/old", abi::ext::WATCH_DELETE).unwrap();
+    let new_watch = k
+        .fs_watch(pid, "/new", abi::ext::WATCH_CREATE | abi::ext::WATCH_DELETE)
+        .unwrap();
+    k.vfs_rename("/old/source", "/new/destination").unwrap();
+    assert_eq!(
+        drain_watch_records(&mut k, pid, old_watch),
+        vec![(abi::ext::WATCH_DELETE, source as u32)]
+    );
+    assert_eq!(
+        drain_watch_records(&mut k, pid, new_watch),
+        vec![
+            (abi::ext::WATCH_DELETE, replaced as u32),
+            (abi::ext::WATCH_CREATE, source as u32),
+        ]
+    );
+
+    let mut kept = [0u8; 8];
+    assert_eq!(k.vfs.read("/new/keep", 0, &mut kept).unwrap(), 4);
+    assert_eq!(&kept[..4], b"kept");
+
+    k.vfs_link("/new/destination", "/new/source-alias").unwrap();
+    let _ = drain_watch_records(&mut k, pid, new_watch);
+    k.vfs_rename("/new/destination", "/new/destination")
+        .unwrap();
+    k.vfs_rename("/new/destination", "/new/source-alias")
+        .unwrap();
+    assert!(k.vfs_rename("/new/missing", "/new/other").is_err());
+    let mut record = [0u8; 8];
+    assert_eq!(
+        k.fd_read(pid, new_watch, &mut record),
+        Err(kernel::sys::KernelError::WouldBlock)
+    );
+    assert_eq!(k.vfs.resolve("/new/destination").unwrap().1, source);
+    assert_eq!(k.vfs.resolve("/new/source-alias").unwrap().1, source);
+}
+
+#[test]
+fn fs_watch_zero_progress_write_and_same_size_truncate_remain_parked() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-zero-progress", 0);
+    let inode = k.vfs_create("/file", 0o644).unwrap();
+    let mount_id = k.vfs.resolve("/file").unwrap().0;
+    let fd = k.path_open(pid, "/file", 0, 0, 0, FdFlags::EMPTY).unwrap();
+    k.fd_write(pid, fd, b"abcd").unwrap();
+    let watch = k.fs_watch(pid, "/file", abi::ext::WATCH_MODIFY).unwrap();
+
+    let mut heap = vec![0u8; 128];
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub_fd_rw(
+        0x0bad,
+        abi::wasi::eventtype::FD_READ,
+        watch,
+    ));
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 731,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, pid, &poll, &mut heap);
+
+    assert_eq!(k.vfs_write_at(mount_id, inode, 0, b"").unwrap(), 0);
+    k.vfs_truncate_ino(mount_id, inode, 4).unwrap();
+    assert!(k.parked_polls_contains(pid));
+    assert!(k.pending_wakes_snapshot().is_empty());
+
+    k.vfs_truncate_ino(mount_id, inode, 2).unwrap();
+    k.service_poll_waiters();
+    assert!(!k.parked_polls_contains(pid));
+    assert_eq!(k.pending_wakes_snapshot().len(), 1);
+}
+
+#[test]
+fn trunc_pwrite_and_set_size_publish_only_real_successful_content_changes() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-write-variants", 0);
+    let inode = k.vfs_create("/file", 0o644).unwrap();
+    let mount_id = k.vfs.resolve("/file").unwrap().0;
+    k.vfs_write_at(mount_id, inode, 0, b"abcd").unwrap();
+    let watch = k.fs_watch(pid, "/file", abi::ext::WATCH_MODIFY).unwrap();
+
+    let fd = k
+        .path_open(pid, "/file", 0, abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
+        .unwrap();
+    assert_eq!(
+        drain_watch_records(&mut k, pid, watch),
+        vec![(abi::ext::WATCH_MODIFY, inode as u32)]
+    );
+
+    // A second O_TRUNC observes an already-empty regular file and is a
+    // successful no-op, not a content mutation.
+    k.path_open(pid, "/file", 0, abi::wasi::oflags::TRUNC, 0, FdFlags::EMPTY)
+        .unwrap();
+    let mut record = [0u8; 8];
+    assert_eq!(
+        k.fd_read(pid, watch, &mut record),
+        Err(kernel::sys::KernelError::WouldBlock)
+    );
+
+    let mut heap = vec![b'x'; 64];
+    let pwrite = Request {
+        opcode: op_wasi::FD_PWRITE,
+        flags: 0,
+        request_id: 732,
+        args: fd_pwrite_args(fd, 0),
+        heap_ptr: 0,
+        heap_len: 1,
+    };
+    assert_eq!(dispatch(&mut k, pid, &pwrite, &mut heap).status, 0);
+    assert_eq!(
+        drain_watch_records(&mut k, pid, watch),
+        vec![(abi::ext::WATCH_MODIFY, inode as u32)]
+    );
+
+    let resize = Request {
+        opcode: op_wasi::FD_FILESTAT_SET_SIZE,
+        flags: 0,
+        request_id: 733,
+        args: fd_filestat_set_size_args(fd, 3),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, pid, &resize, &mut heap).status, 0);
+    assert_eq!(
+        drain_watch_records(&mut k, pid, watch),
+        vec![(abi::ext::WATCH_MODIFY, inode as u32)]
+    );
+
+    let same_size = Request {
+        request_id: 734,
+        ..resize
+    };
+    assert_eq!(dispatch(&mut k, pid, &same_size, &mut heap).status, 0);
+    let empty_pwrite = Request {
+        request_id: 735,
+        heap_len: 0,
+        ..pwrite
+    };
+    assert_eq!(dispatch(&mut k, pid, &empty_pwrite, &mut heap).status, 0);
+    let failed = Request {
+        request_id: 736,
+        args: fd_pwrite_args(u32::MAX, 0),
+        heap_len: 1,
+        ..pwrite
+    };
+    assert_eq!(
+        dispatch(&mut k, pid, &failed, &mut heap).status,
+        -errno::EBADF
+    );
+    assert_eq!(
+        k.fd_read(pid, watch, &mut record),
+        Err(kernel::sys::KernelError::WouldBlock)
+    );
+}
+
+#[test]
 fn fs_watch_no_event_when_mask_excludes() {
     // Register a watch on /dir with mask = DELETE only. A create
     // mutation must NOT queue an event because CREATE isn't in the
-    // mask. fd_read on the watch fd returns 0 bytes.
+    // mask. The nonblocking read returns EAGAIN and poll remains parked.
     let mut k = make_kernel();
     let pid = make_running_proc(&mut k, "watcher", 0);
     k.vfs.mkdir("/dir", 0o755).expect("mkdir");
@@ -14438,10 +17781,22 @@ fn fs_watch_no_event_when_mask_excludes() {
     k.vfs_create("/dir/file", 0o644).expect("create");
 
     let mut buf = [0u8; 16];
-    let n = k
-        .fd_read(pid, watch_fd, &mut buf)
-        .expect("fd_read on watch");
-    assert_eq!(n, 0, "create event filtered out by DELETE-only mask");
+    assert!(matches!(
+        k.fd_read(pid, watch_fd, &mut buf),
+        Err(kernel::sys::KernelError::WouldBlock)
+    ));
+
+    let sub = sub_fd_rw(0xF17E, abi::wasi::eventtype::FD_READ, watch_fd);
+    heap[..pl::SUBSCRIPTION_SIZE].copy_from_slice(&sub);
+    let poll = Request {
+        opcode: op_wasi::POLL_ONEOFF,
+        flags: 0,
+        request_id: 741,
+        args: poll_oneoff_args(1, 1),
+        heap_ptr: 0,
+        heap_len: pl::SUBSCRIPTION_SIZE as u32,
+    };
+    assert_poll_parked(&mut k, pid, &poll, &mut heap);
 }
 
 #[test]
@@ -14477,6 +17832,79 @@ fn fs_watch_close_unregisters() {
     // is gone. Just confirm the create still works without panic.
     k.vfs_create("/dir/post-close", 0o644)
         .expect("create after close");
+}
+
+#[test]
+fn fs_watch_per_pid_limit_is_enospc_and_close_exit_reclaim_capacity() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "watch-cap", 0);
+    let mut fds = Vec::new();
+    for _ in 0..kernel::vfs::MAX_WATCHES_PER_PID {
+        fds.push(k.fs_watch(pid, "/", abi::ext::WATCH_CREATE).unwrap());
+    }
+    assert_eq!(k.vfs.watches().len(), kernel::vfs::MAX_WATCHES_PER_PID);
+
+    let mut heap = vec![0u8; 64];
+    let rejected = dispatch_fs_watch(&mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 0, 761);
+    assert_eq!(rejected.status, -errno::ENOSPC);
+    assert_eq!(k.vfs.watches().len(), kernel::vfs::MAX_WATCHES_PER_PID);
+
+    k.fd_close(pid, fds[0]).unwrap();
+    let readmitted =
+        dispatch_fs_watch(&mut k, pid, &mut heap, b"/", abi::ext::WATCH_CREATE, 0, 762);
+    assert_eq!(readmitted.status, 0);
+    assert_eq!(k.vfs.watches().len(), kernel::vfs::MAX_WATCHES_PER_PID);
+
+    k.proc_exit(pid, ExitStatus::Exited(0)).unwrap();
+    assert_eq!(k.vfs.watches().len(), 0);
+    let next = make_running_proc(&mut k, "watch-cap-next", 0);
+    assert!(k.fs_watch(next, "/", abi::ext::WATCH_CREATE).is_ok());
+}
+
+#[test]
+fn fs_watch_hot_preferences_parent_admits_max_desktop_clients_and_core() {
+    let mut k = make_kernel();
+    k.vfs_mkdir("/etc", 0o755).unwrap();
+    let mut watchers = Vec::new();
+    for _ in 0..64 {
+        let pid = make_proc_with_caps(
+            &mut k,
+            "display-client-watch",
+            CapSet::from_caps(&[Cap::DisplayClient]),
+        );
+        let fd = k.fs_watch(pid, "/etc", abi::ext::WATCH_CREATE).unwrap();
+        watchers.push((pid, fd));
+    }
+    let display_server = k
+        .register_process(RegisterArgs {
+            name: "display-server-watch",
+            ppid: watchers[0].0,
+            caps: CapSet::from_caps(&[Cap::DisplayServer]),
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(display_server).unwrap();
+    k.procs
+        .transition(display_server, ProcState::Running)
+        .unwrap();
+    let display_watch = k
+        .fs_watch(display_server, "/etc", abi::ext::WATCH_CREATE)
+        .unwrap();
+    watchers.push((display_server, display_watch));
+
+    let inode = k.vfs_create("/etc/preferences.toml", 0o644).unwrap();
+    for (pid, fd) in watchers {
+        let mut record = [0u8; 8];
+        assert_eq!(k.fd_read(pid, fd, &mut record).unwrap(), 8);
+        assert_eq!(
+            u32::from_le_bytes(record[0..4].try_into().unwrap()),
+            abi::ext::WATCH_CREATE
+        );
+        assert_eq!(
+            u32::from_le_bytes(record[4..8].try_into().unwrap()),
+            inode as u32
+        );
+    }
 }
 
 #[test]
@@ -14573,7 +18001,8 @@ fn drop_host_file(k: &mut Kernel, token: u32, name: &str, bytes: &[u8]) {
     k.host_file_dropped(
         token,
         kernel::host_file::HostFile::new(name, "application/octet-stream", bytes.to_vec()),
-    );
+    )
+    .unwrap();
 }
 
 #[test]
@@ -14748,6 +18177,103 @@ fn host_file_recv_proc_exit_releases_kernel_side_bytes() {
     );
 }
 
+fn host_file_send_args(name_len: usize, mime_len: usize) -> [u8; 16] {
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&(name_len as u32).to_le_bytes());
+    args[4..8].copy_from_slice(&(mime_len as u32).to_le_bytes());
+    args
+}
+
+#[test]
+fn host_file_pick_and_send_dispatch_are_capability_gated_and_finalize_on_close() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let allowed = make_running_proc(&mut k, "files", 0);
+    let denied = k
+        .register_process(RegisterArgs {
+            name: "ordinary",
+            ppid: 0,
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(denied).unwrap();
+    k.procs.transition(denied, ProcState::Running).unwrap();
+    let mut heap = vec![0u8; 512];
+
+    let pick = Request {
+        opcode: op_ext::HOST_FILE_PICK,
+        flags: 0,
+        request_id: 901,
+        args: [0; 16],
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(
+        dispatch(&mut k, denied, &pick, &mut heap).status,
+        -errno::ENOTCAPABLE
+    );
+    assert_eq!(dispatch(&mut k, allowed, &pick, &mut heap).status, 0);
+
+    let name = b"export.txt";
+    let mime = b"text/plain";
+    heap[..name.len()].copy_from_slice(name);
+    heap[name.len()..name.len() + mime.len()].copy_from_slice(mime);
+    let send = Request {
+        opcode: op_ext::HOST_FILE_SEND,
+        flags: 0,
+        request_id: 902,
+        args: host_file_send_args(name.len(), mime.len()),
+        heap_ptr: 0,
+        heap_len: (name.len() + mime.len()) as u32,
+    };
+    assert_eq!(
+        dispatch(&mut k, denied, &send, &mut heap).status,
+        -errno::ENOTCAPABLE
+    );
+    let response = dispatch(&mut k, allowed, &send, &mut heap);
+    assert_eq!(response.status, 0);
+    let fd = response.value as u32;
+    k.fd_write(allowed, fd, b"round trip").unwrap();
+
+    let close = Request {
+        opcode: op_wasi::FD_CLOSE,
+        flags: 0,
+        request_id: 903,
+        args: u32_args(fd),
+        heap_ptr: 0,
+        heap_len: 0,
+    };
+    assert_eq!(dispatch(&mut k, allowed, &close, &mut heap).status, 0);
+    kernel::platform::native::with_state(|state| {
+        assert_eq!(state.host_picker_calls, 1);
+        assert_eq!(state.host_download_calls.len(), 1);
+        assert_eq!(state.host_download_calls[0].bytes, b"round trip");
+    });
+}
+
+#[test]
+fn host_file_send_rejects_malformed_metadata_without_allocating_fd() {
+    let mut k = make_kernel();
+    let pid = make_running_proc(&mut k, "files", 0);
+    let mut heap = vec![0xffu8; 8];
+    let before = k.fds(pid).unwrap().open_count();
+    let request = Request {
+        opcode: op_ext::HOST_FILE_SEND,
+        flags: 0,
+        request_id: 904,
+        args: host_file_send_args(4, 4),
+        heap_ptr: 0,
+        heap_len: 8,
+    };
+    assert_eq!(
+        dispatch(&mut k, pid, &request, &mut heap).status,
+        -errno::EINVAL
+    );
+    assert_eq!(k.fds(pid).unwrap().open_count(), before);
+    assert_eq!(k.host_download_count(), 0);
+}
+
 #[test]
 fn host_file_recv_emfile_rolls_back_to_pending() {
     // If the caller's fd table is full when `host_file_recv` runs,
@@ -14877,7 +18403,10 @@ fn proc_spawn_with_argv_threads_argv_into_child_process() {
     let child = resp.value as i32;
 
     let proc = k.procs.get(child).expect("child process");
-    assert_eq!(proc.argv, argv.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_eq!(
+        proc.argv,
+        argv.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+    );
     assert!(proc.envp.is_empty());
 }
 
@@ -15025,4 +18554,353 @@ fn proc_spawn_with_invalid_envp_entry_returns_einval() {
     };
     let resp = dispatch(&mut k, parent, &req, &mut heap);
     assert_eq!(resp.status, -abi::errno::EINVAL);
+}
+
+// ---- proc_spawn canonical v1 manifest -------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn pack_spawn_v1(
+    path: &str,
+    argv: &[&str],
+    envp: &[(&str, &str)],
+    stdin_fd: Option<u32>,
+    stdout_fd: Option<u32>,
+    stderr_fd: Option<u32>,
+    extra_fds: &[(u32, u32)],
+    cwd: Option<&str>,
+    caps: Option<u64>,
+) -> ([u8; 16], Vec<u8>) {
+    use abi::ext::spawn_v1 as wire;
+
+    let total_len = wire::HEADER_LEN
+        + path.len()
+        + cwd.map(str::len).unwrap_or(0)
+        + argv.iter().map(|arg| 2 + arg.len()).sum::<usize>()
+        + envp
+            .iter()
+            .map(|(key, value)| 4 + key.len() + value.len())
+            .sum::<usize>()
+        + extra_fds.len() * 8;
+    let mut heap = vec![0u8; total_len];
+    let flags = if cwd.is_some() { wire::FLAG_CWD } else { 0 }
+        | if caps.is_some() { wire::FLAG_CAPS } else { 0 };
+    heap[wire::OFF_MAGIC..wire::OFF_MAGIC + 4].copy_from_slice(&wire::MAGIC.to_le_bytes());
+    heap[wire::OFF_VERSION..wire::OFF_VERSION + 2].copy_from_slice(&wire::VERSION.to_le_bytes());
+    heap[wire::OFF_FLAGS..wire::OFF_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
+    heap[wire::OFF_TOTAL_LEN..wire::OFF_TOTAL_LEN + 4]
+        .copy_from_slice(&(total_len as u32).to_le_bytes());
+    heap[wire::OFF_PATH_LEN..wire::OFF_PATH_LEN + 2]
+        .copy_from_slice(&(path.len() as u16).to_le_bytes());
+    heap[wire::OFF_CWD_LEN..wire::OFF_CWD_LEN + 2]
+        .copy_from_slice(&(cwd.map(str::len).unwrap_or(0) as u16).to_le_bytes());
+    heap[wire::OFF_ARGC..wire::OFF_ARGC + 2].copy_from_slice(&(argv.len() as u16).to_le_bytes());
+    heap[wire::OFF_ENVC..wire::OFF_ENVC + 2].copy_from_slice(&(envp.len() as u16).to_le_bytes());
+    heap[wire::OFF_EXTRA_FD_COUNT..wire::OFF_EXTRA_FD_COUNT + 2]
+        .copy_from_slice(&(extra_fds.len() as u16).to_le_bytes());
+    for (offset, fd) in [
+        (wire::OFF_STDIN_FD, stdin_fd),
+        (wire::OFF_STDOUT_FD, stdout_fd),
+        (wire::OFF_STDERR_FD, stderr_fd),
+    ] {
+        let raw = fd.map(|value| value as i32).unwrap_or(wire::INHERIT_FD);
+        heap[offset..offset + 4].copy_from_slice(&raw.to_le_bytes());
+    }
+    heap[wire::OFF_CAPS..wire::OFF_CAPS + 8].copy_from_slice(&caps.unwrap_or(0).to_le_bytes());
+
+    let mut offset = wire::HEADER_LEN;
+    let mut put = |bytes: &[u8]| {
+        heap[offset..offset + bytes.len()].copy_from_slice(bytes);
+        offset += bytes.len();
+    };
+    put(path.as_bytes());
+    if let Some(cwd) = cwd {
+        put(cwd.as_bytes());
+    }
+    for arg in argv {
+        put(&(arg.len() as u16).to_le_bytes());
+        put(arg.as_bytes());
+    }
+    for (key, value) in envp {
+        put(&(key.len() as u16).to_le_bytes());
+        put(&(value.len() as u16).to_le_bytes());
+        put(key.as_bytes());
+        put(value.as_bytes());
+    }
+    for (parent_fd, child_fd) in extra_fds {
+        put(&parent_fd.to_le_bytes());
+        put(&child_fd.to_le_bytes());
+    }
+    assert_eq!(offset, total_len);
+
+    let mut args = [0u8; 16];
+    args[0..4].copy_from_slice(&wire::MAGIC.to_le_bytes());
+    args[4..8].copy_from_slice(&(total_len as u32).to_le_bytes());
+    args[8..10].copy_from_slice(&wire::VERSION.to_le_bytes());
+    (args, heap)
+}
+
+#[test]
+fn proc_spawn_v1_maps_stdio_extra_fds_argv_env_cwd_and_caps() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    k.procs.get_mut(parent).unwrap().cwd = "/home/user".to_string();
+    let (read_fd, write_fd) = k.create_pipe_fds(parent).expect("pipe");
+    let read_object = k.fds(parent).unwrap().get(read_fd).unwrap().object;
+    let write_object = k.fds(parent).unwrap().get(write_fd).unwrap().object;
+
+    let (args, mut heap) = pack_spawn_v1(
+        "/bin/grep",
+        &["grep", "needle"],
+        &[("PATH", "/bin"), ("MODE", "test")],
+        Some(read_fd),
+        Some(write_fd),
+        None,
+        &[(1, 7)],
+        Some("/work"),
+        Some(initial::ORDINARY_APP.0),
+    );
+    let heap_len = heap.len() as u32;
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 900,
+            args,
+            heap_ptr: 0,
+            heap_len,
+        },
+        &mut heap,
+    );
+
+    assert_eq!(response.status, 0);
+    let child = response.value as i32;
+    let process = k.procs.get(child).unwrap();
+    assert_eq!(process.argv, vec!["grep", "needle"]);
+    assert_eq!(process.envp.get("MODE").map(String::as_str), Some("test"));
+    assert_eq!(process.envp.get("PATH").map(String::as_str), Some("/bin"));
+    assert_eq!(process.cwd, "/work");
+    assert_eq!(k.caps.list(child).unwrap(), initial::ORDINARY_APP);
+    let fds = k.fds(child).unwrap();
+    assert_eq!(fds.get(0).unwrap().object, read_object);
+    assert_eq!(fds.get(1).unwrap().object, write_object);
+    assert_eq!(
+        fds.get(2).unwrap().object,
+        FdObject::CharDevice(DEV_CONSOLE)
+    );
+    assert!(matches!(fds.get(3).unwrap().object, FdObject::Vnode { .. }));
+    assert_eq!(fds.get(4).unwrap().object, FdObject::SignalChannel);
+    assert_eq!(
+        fds.get(7).unwrap().object,
+        FdObject::CharDevice(DEV_CONSOLE)
+    );
+}
+
+#[test]
+fn proc_spawn_v1_omissions_inherit_parent_stdio_cwd_and_caps() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    k.procs.get_mut(parent).unwrap().cwd = "/home/user".to_string();
+    let (args, mut heap) =
+        pack_spawn_v1("/bin/ls", &["ls"], &[], None, None, None, &[], None, None);
+    let heap_len = heap.len() as u32;
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 901,
+            args,
+            heap_ptr: 0,
+            heap_len,
+        },
+        &mut heap,
+    );
+
+    assert_eq!(response.status, 0);
+    let child = response.value as i32;
+    assert_eq!(k.procs.get(child).unwrap().cwd, "/home/user");
+    assert_eq!(k.caps.list(child).unwrap(), initial::INIT);
+    for fd in 0..=2 {
+        assert_eq!(
+            k.fds(child).unwrap().get(fd).unwrap().object,
+            k.fds(parent).unwrap().get(fd).unwrap().object
+        );
+    }
+}
+
+#[test]
+fn proc_spawn_v1_rejects_reserved_extra_fd_without_publishing_child() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    let live_before = k.procs.live_count();
+    let (args, mut heap) = pack_spawn_v1(
+        "/bin/ls",
+        &["ls"],
+        &[],
+        None,
+        None,
+        None,
+        &[(1, abi::fd::SIGNAL)],
+        None,
+        None,
+    );
+    let heap_len = heap.len() as u32;
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 902,
+            args,
+            heap_ptr: 0,
+            heap_len,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -abi::errno::EINVAL);
+    assert_eq!(k.procs.live_count(), live_before);
+    kernel::platform::native::with_state(|state| assert!(state.spawn_calls.is_empty()));
+}
+
+#[test]
+fn proc_spawn_v1_rejects_socket_extra_fd_without_child_or_endpoint_loss() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "socket-parent", 0);
+    install_default_stdio(&mut k, parent);
+    let socket_fd = k
+        .ipc_socket(parent, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    let socket_object = k.fds(parent).unwrap().get(socket_fd).unwrap().object;
+    let (_pipe_read_fd, pipe_write_fd) = k.create_pipe_fds(parent).unwrap();
+    let pipe_id = match k.fds(parent).unwrap().get(pipe_write_fd).unwrap().object {
+        FdObject::PipeWrite(id) => kernel::ipc::PipeId(id),
+        other => panic!("expected pipe writer, got {other:?}"),
+    };
+    let pipe_writers_before = k.ipc.pipe_mut(pipe_id).unwrap().writer_count();
+    let live_before = k.procs.live_count();
+    let sockets_before = k.ipc.socket_count();
+    let next_pid_before = k.procs.next_pid_peek();
+    let parent_signals_before = k.pending_signals(parent).unwrap();
+    let (args, mut heap) = pack_spawn_v1(
+        "/bin/ls",
+        &["ls"],
+        &[],
+        None,
+        None,
+        None,
+        &[
+            (pipe_write_fd, abi::fd::FIRST_DYNAMIC),
+            (socket_fd, abi::fd::FIRST_DYNAMIC + 1),
+        ],
+        None,
+        None,
+    );
+    let heap_len = heap.len() as u32;
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 9021,
+            args,
+            heap_ptr: 0,
+            heap_len,
+        },
+        &mut heap,
+    );
+
+    assert_eq!(response.status, -abi::errno::ENOTSUP);
+    assert_eq!(k.procs.live_count(), live_before);
+    assert_eq!(k.procs.next_pid_peek(), next_pid_before);
+    assert_eq!(k.pending_signals(parent).unwrap(), parent_signals_before);
+    assert_eq!(k.ipc.socket_count(), sockets_before);
+    assert_eq!(
+        k.ipc.pipe_mut(pipe_id).unwrap().writer_count(),
+        pipe_writers_before,
+        "rollback releases earlier tentative extra-fd references"
+    );
+    assert_eq!(
+        k.fds(parent).unwrap().get(socket_fd).unwrap().object,
+        socket_object
+    );
+    k.ipc_bind(parent, socket_fd, "/run/spawn-rollback-proof")
+        .expect("parent socket remains live and usable");
+    kernel::platform::native::with_state(|state| assert!(state.spawn_calls.is_empty()));
+}
+
+#[test]
+fn proc_spawn_v1_rejects_unknown_parent_fd_without_publishing_child() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    let live_before = k.procs.live_count();
+    let (args, mut heap) = pack_spawn_v1(
+        "/bin/ls",
+        &["ls"],
+        &[],
+        None,
+        Some(999),
+        None,
+        &[],
+        None,
+        None,
+    );
+    let heap_len = heap.len() as u32;
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 903,
+            args,
+            heap_ptr: 0,
+            heap_len,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -abi::errno::EINVAL);
+    assert_eq!(k.procs.live_count(), live_before);
+    kernel::platform::native::with_state(|state| assert!(state.spawn_calls.is_empty()));
+}
+
+#[test]
+fn proc_spawn_v1_rejects_truncated_blob_without_publishing_child() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let parent = make_running_proc(&mut k, "parent", 0);
+    install_default_stdio(&mut k, parent);
+    let live_before = k.procs.live_count();
+    let (args, mut heap) =
+        pack_spawn_v1("/bin/ls", &["ls"], &[], None, None, None, &[], None, None);
+    heap.pop();
+    let heap_len = heap.len() as u32;
+    let response = dispatch(
+        &mut k,
+        parent,
+        &Request {
+            opcode: op_ext::PROC_SPAWN,
+            flags: 0,
+            request_id: 904,
+            args,
+            heap_ptr: 0,
+            heap_len,
+        },
+        &mut heap,
+    );
+    assert_eq!(response.status, -abi::errno::EINVAL);
+    assert_eq!(k.procs.live_count(), live_before);
 }

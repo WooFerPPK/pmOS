@@ -16,3 +16,6 @@ path = "src/main.rs"
 abi = { path = "../abi" }
 toolkit = { path = "../toolkit" }
 display-proto = { path = "../display-proto" }
+preferences = { path = "../preferences" }
+sh = { path = "../sh" }
+png = { version = "0.18.1", default-features = false }

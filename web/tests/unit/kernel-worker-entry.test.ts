@@ -8,7 +8,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { installWorkerEntry } from "../../src/kernel-worker-entry";
+import {
+  installWorkerEntry,
+  storageDegradedMessageFromConsoleLine,
+} from "../../src/kernel-worker-entry";
 import type { WorkerMessaging } from "../../src/kernel-worker-entry";
 import type { KernelToMain, MainToKernel } from "../../src/shared/worker-proto";
 import {
@@ -17,7 +20,8 @@ import {
   packMouseButton,
   packMouseMotion,
 } from "../../src/shared/input-proto";
-import { CAPSET_ALL, OP_WASI } from "../../src/shared/syscall";
+import { CAPSET_ALL, OP_EXT, OP_WASI } from "../../src/shared/syscall";
+import { resolveCargoTargetDirectory } from "../helpers/cargo-target";
 
 let helloStdWasmBytes: ArrayBuffer;
 
@@ -42,6 +46,67 @@ function makeMessaging(): FakeMessaging {
   return fake;
 }
 
+function makeCorruptImageHandle(): {
+  readonly handle: import("../../src/drivers/block").SyncAccessHandle;
+  readonly snapshot: () => Uint8Array;
+} {
+  let storage = new Uint8Array(4096 * 4096);
+  storage.fill(0xa5, 0, 4096);
+  return {
+    handle: {
+      read(buffer, { at }): number {
+        const count = Math.max(0, Math.min(buffer.byteLength, storage.length - at));
+        buffer.set(storage.subarray(at, at + count));
+        return count;
+      },
+      write(buffer, { at }): number {
+        if (at + buffer.byteLength > storage.length) return 0;
+        storage.set(buffer, at);
+        return buffer.byteLength;
+      },
+      flush(): void {},
+      getSize(): number {
+        return storage.byteLength;
+      },
+      truncate(newSize): void {
+        const resized = new Uint8Array(newSize);
+        resized.set(storage.subarray(0, newSize));
+        storage = resized;
+      },
+      close(): void {},
+    },
+    snapshot: () => storage.slice(0, 4096),
+  };
+}
+
+describe("degraded-storage signal classification", () => {
+  it("maps both Rust volatile-root fallback lines and ignores normal mounts", () => {
+    expect(
+      storageDegradedMessageFromConsoleLine(
+        "[pmos] persistent root unavailable or invalid; storage left untouched; using volatile tmpfs root\n",
+      ),
+    ).toMatchObject({
+      kind: "storage:degraded",
+      reason: "persistent-root-invalid",
+      existingImagePreserved: true,
+    });
+    expect(
+      storageDegradedMessageFromConsoleLine(
+        "[pmos] persistent root unavailable; storage left untouched; using volatile tmpfs root\n",
+      ),
+    ).toMatchObject({
+      kind: "storage:degraded",
+      reason: "persistent-root-unavailable",
+      existingImagePreserved: true,
+    });
+    expect(
+      storageDegradedMessageFromConsoleLine(
+        "[pmos] persistent OPFS root mounted at /\n",
+      ),
+    ).toBeNull();
+  });
+});
+
 describe("installWorkerEntry", () => {
   it("installs an onmessage handler before any messages arrive", () => {
     const msg = makeMessaging();
@@ -58,6 +123,18 @@ describe("installWorkerEntry", () => {
     expect(p?.kind).toBe("panic");
     if (p && p.kind === "panic") {
       expect(p.message).toMatch(/before boot/);
+    }
+  });
+
+  it("does not defer input until a boot request has arrived", () => {
+    const msg = makeMessaging();
+    installWorkerEntry(msg);
+    msg.send({ kind: "input:kbd", bytes: new Uint8Array([0x61, 0x0a]) });
+    expect(msg.posted).toHaveLength(1);
+    const posted = msg.posted[0];
+    expect(posted?.kind).toBe("panic");
+    if (posted?.kind === "panic") {
+      expect(posted.message).toMatch(/before boot/);
     }
   });
 
@@ -311,9 +388,13 @@ describe("installWorkerEntry", () => {
 let kernelWasmBytes: ArrayBuffer;
 
 beforeAll(() => {
-  const wasmPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-unknown-unknown/release/kernel.wasm",
+  const cargoTargetDirectory = resolveCargoTargetDirectory(
+    path.resolve(__dirname, "../../.."),
+    process.env.CARGO_TARGET_DIR,
+  );
+  const wasmPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-unknown-unknown/release/kernel.wasm",
   );
   if (!fs.existsSync(wasmPath)) {
     throw new Error(
@@ -326,9 +407,9 @@ beforeAll(() => {
     raw.byteOffset + raw.byteLength,
   ) as ArrayBuffer;
 
-  const helloPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-wasip1/release/hello-std.wasm",
+  const helloPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-wasip1/release/hello-std.wasm",
   );
   if (!fs.existsSync(helloPath)) {
     throw new Error(
@@ -343,6 +424,73 @@ beforeAll(() => {
 });
 
 describe("installWorkerEntry with useRealKernel", () => {
+  it("reports an OPFS-open failure exactly once before the kernel is ready", async () => {
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, {
+      kernelWasmBytes,
+      openBlockDriver: async () => {
+        throw new Error("permission denied by storage partition");
+      },
+    });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+
+    await entry.whenReady;
+    const degraded = msg.posted.filter(
+      (posted) => posted.kind === "storage:degraded",
+    );
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]).toMatchObject({
+      reason: "opfs-open-failed",
+      existingImagePreserved: true,
+    });
+    expect(msg.posted.indexOf(degraded[0]!)).toBeLessThan(
+      msg.posted.findIndex((posted) => posted.kind === "ready"),
+    );
+  });
+
+  it("turns Rust's corrupt-image fallback into a typed event without changing bytes", async () => {
+    const { BlockDriver, BlockImageState } = await import(
+      "../../src/drivers/block"
+    );
+    const image = makeCorruptImageHandle();
+    const before = image.snapshot();
+    const blockDriver = BlockDriver.withHandle(
+      image.handle,
+      4096,
+      BlockImageState.Existing,
+    );
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, { kernelWasmBytes, blockDriver });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+
+    await entry.whenReady;
+    expect(
+      msg.posted.filter((posted) => posted.kind === "storage:degraded"),
+    ).toEqual([
+      expect.objectContaining({
+        reason: "persistent-root-invalid",
+        existingImagePreserved: true,
+      }),
+    ]);
+    expect(image.snapshot()).toEqual(before);
+  });
+
   it("constructs a KernelWasmHost asynchronously and posts ready once initialised", async () => {
     const msg = makeMessaging();
     const entry = installWorkerEntry(msg, { kernelWasmBytes });
@@ -363,6 +511,55 @@ describe("installWorkerEntry with useRealKernel", () => {
     expect(entry.scaffold?.driverCount).toBe(1);
     const readyCount = msg.posted.filter((m) => m.kind === "ready").length;
     expect(readyCount).toBe(1);
+  });
+
+  it("queues input received during asynchronous boot and replays a defensive copy", async () => {
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, { kernelWasmBytes });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: false,
+        enableInput: true,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+
+    const earlyLine = new Uint8Array([0x61, 0x0a]);
+    msg.send({ kind: "input:kbd", bytes: earlyLine });
+    earlyLine[0] = 0x7a;
+    expect(msg.posted.some((posted) => posted.kind === "panic")).toBe(false);
+
+    await entry.whenReady;
+    const host = entry.realKernel;
+    expect(host).toBeDefined();
+    if (host === undefined) return;
+
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const pathBytes = new TextEncoder().encode("/dev/input_kbd");
+    const opened = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 1,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.byteLength,
+      },
+      pathBytes,
+    );
+    expect(opened.response?.status).toBe(0);
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 2,
+      arg0: Number(opened.response?.value),
+      heapPtr: 0,
+      heapLen: 8,
+    });
+    expect(read.response?.status).toBe(0);
+    expect(Array.from(read.heapOut ?? [])).toEqual([0x61, 0x0a]);
   });
 
   it("routes a real-kernel FD_WRITE to /dev/console as a console:write postMessage", async () => {
@@ -470,7 +667,7 @@ describe("installWorkerEntry with useRealKernel", () => {
         enableInput: false,
         enableFramebuffer: false,
         useRealKernel: true,
-        bootBinary: "/bin/hello-std",
+        bootBinary: "/usr/bin/hello-std",
       },
     });
 
@@ -486,7 +683,7 @@ describe("installWorkerEntry with useRealKernel", () => {
     await waitFor(() => msg.posted.some((m) => m.kind === "proc:spawn"));
     const spawn = msg.posted.find((m) => m.kind === "proc:spawn");
     if (!spawn || spawn.kind !== "proc:spawn") throw new Error("unreachable");
-    expect(spawn.path).toBe("/bin/hello-std");
+    expect(spawn.path).toBe("/usr/bin/hello-std");
     const sab = new ArrayBuffer(SAB_SIZE);
     seedFdWriteOnce(sab, "hello from std\n", 1);
     msg.send({ kind: "proc:sab", pid: spawn.pid, sab });
@@ -619,6 +816,51 @@ describe("installWorkerEntry with useRealKernel", () => {
     expect(calls).toBe(1);
   });
 
+  it("reconciles a trapped Worker once and wakes its parked parent", async () => {
+    const msg = makeMessaging();
+    const entry = installWorkerEntry(msg, { kernelWasmBytes });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: false,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+      },
+    });
+    await entry.whenReady;
+    const host = entry.realKernel;
+    expect(host).toBeDefined();
+    if (!host) return;
+
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+    const child = host.spawnChildForTest(parent, "trap-fixture");
+    const waitArgs = new Uint8Array(16);
+    const waitView = new DataView(waitArgs.buffer);
+    waitView.setInt32(0, -1, true);
+    waitView.setUint32(4, 0, true);
+    const wait = host.dispatch(parent, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 0x7701,
+      args: waitArgs,
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(wait.parked).toBe(true);
+
+    msg.send({ kind: "proc:exited", pid: child, code: -1, trap: "unreachable" });
+    const wake = host.takeNextWakeForPidWithHeap(parent);
+    expect(wake?.response.requestId).toBe(0x7701);
+    expect(wake?.response.value).toBe(BigInt(0x04) << BigInt(40));
+
+    msg.send({ kind: "proc:exited", pid: child, code: 0 });
+    expect(host.takeNextWakeForPid(parent)).toBeNull();
+  });
+
   it("ignores a sync:request before the real kernel finishes booting (no panic)", () => {
     const msg = makeMessaging();
     installWorkerEntry(msg, { kernelWasmBytes });
@@ -699,6 +941,45 @@ async function waitFor(
 }
 
 describe("installWorkerEntry with useRealKernel + proc:spawn routing", () => {
+  it("finishes boot when Worker creation fails before proc:sab publication", async () => {
+    const msg = makeMessaging();
+    const registry = new Map<string, BufferSource>([
+      ["/bin/hello-std", helloStdWasmBytes],
+    ]);
+    const entry = installWorkerEntry(msg, {
+      kernelWasmBytes,
+      binaryRegistry: registry,
+    });
+    msg.send({
+      kind: "boot",
+      config: {
+        enableConsole: true,
+        enableInput: false,
+        enableFramebuffer: false,
+        useRealKernel: true,
+        bootBinary: "/bin/hello-std",
+      },
+    });
+
+    await waitFor(() => msg.posted.some((posted) => posted.kind === "proc:spawn"));
+    const spawn = msg.posted.find((posted) => posted.kind === "proc:spawn");
+    if (!spawn || spawn.kind !== "proc:spawn") throw new Error("unreachable");
+
+    // Main failed to construct/deliver boot to the Worker, so the
+    // SAB was never acknowledged or published. The synthetic exit
+    // must still reconcile the Ready pid and satisfy the loop's
+    // terminal predicate.
+    msg.send({
+      kind: "proc:exited",
+      pid: spawn.pid,
+      code: -1,
+      trap: "Worker constructor rejected",
+    });
+    await entry.whenReady;
+
+    expect(msg.posted.some((posted) => posted.kind === "panic")).toBe(false);
+  });
+
   it("PROC_SPAWN init posts proc:spawn to the messaging channel and the dispatch loop services proc:sab-supplied SAB rings", async () => {
     const msg = makeMessaging();
     const registry = new Map<string, BufferSource>([
@@ -728,6 +1009,9 @@ describe("installWorkerEntry with useRealKernel + proc:spawn routing", () => {
     if (!spawn || spawn.kind !== "proc:spawn") throw new Error("unreachable");
     expect(spawn.path).toBe("/bin/hello-std");
     expect(spawn.pid).toBeGreaterThan(0);
+    const host = entry.realKernel;
+    expect(host).toBeDefined();
+    const wakeBeforeSab = Atomics.load(host!.wakeSlot, 0);
 
     // Step 2: simulate main allocating a SAB and pre-seeding it with
     // a FD_WRITE request. Real main would post `boot {sab, ...}` to a
@@ -737,6 +1021,7 @@ describe("installWorkerEntry with useRealKernel + proc:spawn routing", () => {
     seedFdWriteOnce(sab, "hello from fake user\n", 42);
 
     msg.send({ kind: "proc:sab", pid: spawn.pid, sab });
+    expect(Atomics.load(host!.wakeSlot, 0)).toBe(wakeBeforeSab + 1);
 
     // Step 3: wait for the FD_WRITE to land — the kernel's dispatch
     // loop services the pid's ring and the kernel posts a console
@@ -763,7 +1048,9 @@ describe("installWorkerEntry with useRealKernel + proc:spawn routing", () => {
     // Step 4: simulate the user Worker exiting. The kernel's
     // proc:exited handler drops the pid from the dispatch loop's
     // pidMap, and since it was the last pid the loop halts.
+    const wakeBeforeExit = Atomics.load(host!.wakeSlot, 0);
     msg.send({ kind: "proc:exited", pid: spawn.pid, code: 0 });
+    expect(Atomics.load(host!.wakeSlot, 0)).toBe(wakeBeforeExit + 1);
 
     await entry.whenReady;
     // No panic posted along the way.

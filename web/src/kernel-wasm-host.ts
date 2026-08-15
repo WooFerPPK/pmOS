@@ -68,7 +68,10 @@ import {
   SAB_SIZE,
   STATUS_READY,
 } from "./shared/sab-layout";
-import type { KernelToMain } from "./shared/worker-proto";
+import {
+  HOST_FILE_IMPORT_MAX_BYTES,
+  type KernelToMain,
+} from "./shared/worker-proto";
 import {
   decodeRequest,
   decodeResponse,
@@ -80,6 +83,101 @@ import {
   type SyscallResponse,
   DEV,
 } from "./shared/syscall";
+
+const NO_POLL_TIMEOUT_NS = 0xffff_ffff_ffff_ffffn;
+
+/** Convert the kernel's nanosecond deadline delta to waitAsync milliseconds. */
+export function pollTimeoutMs(timeoutNs: bigint): number | undefined {
+  if (timeoutNs === NO_POLL_TIMEOUT_NS) return undefined;
+  return Math.max(0, Number(timeoutNs) / 1_000_000);
+}
+
+interface PendingWorkerTaskYield {
+  readonly resolve: () => void;
+  readonly reject: (reason: unknown) => void;
+}
+
+/**
+ * Reusable task-level yield for one dispatch-loop invocation.
+ *
+ * A fulfilled promise only reaches the microtask queue and cannot admit
+ * Worker message tasks. A zero-delay timer is a task, but browsers may clamp
+ * repeated timers. MessagePort delivery is a real task without that timer
+ * delay. Both ports are owned by the surrounding dispatch loop and closed in
+ * its `finally` path.
+ */
+class WorkerTaskYielder {
+  private readonly channel: MessageChannel;
+  private pending: PendingWorkerTaskYield | undefined;
+  private closed = false;
+
+  constructor() {
+    if (typeof globalThis.MessageChannel !== "function") {
+      throw new Error(
+        "KernelWasmHost: task-yielding dispatcher requires MessageChannel",
+      );
+    }
+    const channel = new MessageChannel();
+    try {
+      channel.port1.onmessage = () => {
+        const pending = this.pending;
+        if (pending === undefined) return;
+        this.pending = undefined;
+        pending.resolve();
+      };
+      channel.port1.onmessageerror = () => {
+        const pending = this.pending;
+        if (pending === undefined) return;
+        this.pending = undefined;
+        pending.reject(
+          new Error("KernelWasmHost: MessageChannel task yield failed"),
+        );
+      };
+      channel.port1.start();
+    } catch (error) {
+      channel.port1.close();
+      channel.port2.close();
+      throw error;
+    }
+    this.channel = channel;
+  }
+
+  nextTask(): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(
+        new Error("KernelWasmHost: task yielder is already closed"),
+      );
+    }
+    if (this.pending !== undefined) {
+      return Promise.reject(
+        new Error("KernelWasmHost: task yield is already pending"),
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      this.pending = { resolve, reject };
+      try {
+        this.channel.port2.postMessage(undefined);
+      } catch (error) {
+        this.pending = undefined;
+        reject(error);
+      }
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const pending = this.pending;
+    this.pending = undefined;
+    this.channel.port1.onmessage = null;
+    this.channel.port1.onmessageerror = null;
+    this.channel.port1.close();
+    this.channel.port2.close();
+    pending?.reject(
+      new Error("KernelWasmHost: task yielder closed before delivery"),
+    );
+  }
+}
 
 // ---- Export surface --------------------------------------------------
 
@@ -99,15 +197,44 @@ interface KernelExports {
     name_len: number,
   ) => number;
   readonly kernel_install_console_fd: (pid: number, fd: number) => number;
-  readonly kernel_install_signal_channel_fd: (pid: number, fd: number) => number;
+  readonly kernel_install_root_preopen_fd: (pid: number, fd: number) => number;
+  readonly kernel_install_signal_channel_fd: (
+    pid: number,
+    fd: number,
+  ) => number;
   readonly kernel_mark_running: (pid: number) => number;
+  readonly kernel_reconcile_process_exit: (
+    pid: number,
+    code: number,
+    crashed: number,
+  ) => number;
   readonly kernel_record_process_memory: (
     pid: number,
     bytesLo: number,
     bytesHi: number,
   ) => number;
   readonly kernel_sync_all: () => number;
+  readonly kernel_host_file_dropped: (
+    token: number,
+    nameLen: number,
+    mimeLen: number,
+    bytesLen: number,
+  ) => number;
+  readonly kernel_host_file_drop_begin: (
+    token: number,
+    nameLen: number,
+    mimeLen: number,
+    expectedSize: number,
+  ) => number;
+  readonly kernel_host_file_drop_chunk: (
+    token: number,
+    bytesLen: number,
+  ) => number;
+  readonly kernel_host_file_drop_end: (token: number) => number;
+  readonly kernel_host_file_drop_abort: (token: number) => void;
   readonly kernel_dispatch: (pid: number) => number;
+  readonly kernel_service_poll_waiters: () => number;
+  readonly kernel_next_poll_timeout_ns: () => bigint;
   readonly kernel_take_next_wake_for_pid: (pid: number) => number;
   readonly kernel_resp_heap_ptr: () => number;
   readonly kernel_inject_console_input: (len: number) => number;
@@ -134,8 +261,7 @@ interface KernelExports {
  * thread the precise errno through.
  */
 export type SpawnOutcome =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly errno: number };
+  { readonly ok: true } | { readonly ok: false; readonly errno: number };
 
 // ---- Host-import callbacks ------------------------------------------
 
@@ -204,9 +330,11 @@ export interface KernelWasmHostOptions {
   /**
    * Called when the kernel asks the host to spawn a user Worker for
    * a newly-created pid. The callback receives the pid the kernel
-   * allocated and the UTF-8 binary path the caller passed to
-   * `PROC_SPAWN`, and returns a [`SpawnOutcome`] describing whether
-   * the host accepted the spawn request.
+   * allocated, the UTF-8 binary path, and (when that path resolved
+   * in the PMos VFS) a freshly owned copy of the executable bytes.
+   * `undefined` means the path must resolve through the immutable
+   * bundled registry. The callback returns a [`SpawnOutcome`]
+   * describing whether the host accepted the spawn request.
    *
    * When [`binaryRegistry`](#binaryregistry) AND
    * [`kernelWorkerChannel`](#kernelworkerchannel) are BOTH set and
@@ -228,7 +356,27 @@ export interface KernelWasmHostOptions {
    * roll-back path: the new pid is reaped before the `PROC_SPAWN`
    * syscall returns `-EIO` to the caller.
    */
-  readonly onSpawnProcess?: (pid: number, path: string) => SpawnOutcome;
+  readonly onSpawnProcess?: (
+    pid: number,
+    path: string,
+    executable?: Uint8Array,
+  ) => SpawnOutcome;
+  /**
+   * Called after the kernel has made `pid` terminal via SIGKILL.
+   * Production defaults this to a `proc:terminate` post on
+   * [`kernelWorkerChannel`]; tests may inject a recorder. Throwing
+   * reports a transport failure to the kernel but never revives the
+   * already-killed process.
+   */
+  readonly onTerminateProcess?: (pid: number) => void;
+  /** Called after the kernel authorises a native file-picker request. */
+  readonly onHostFilePicker?: () => void;
+  /** Called when explicit close finalises a kernel-owned host download. */
+  readonly onHostDownload?: (
+    name: string,
+    mime: string,
+    bytes: Uint8Array,
+  ) => void;
   /**
    * Map from binary path (e.g. `/usr/bin/hello`) to the wasm bytes
    * for that binary. Used by the default [`onSpawnProcess`]
@@ -266,16 +414,17 @@ export interface KernelWasmHostOptions {
    * calls whenever a `driver_call(Framebuffer, ...)` lands. The
    * payload the kernel forwarded is interpreted as a driver-framed
    * message: byte 0 is the device-specific op (e.g.
-   * `fb.OP_SET_MODE = 0x01`, `fb.OP_BLIT = 0x02`), the rest is the
-   * driver's own payload. The host invokes `driver.init(...)` once
+   * `fb.OP_SET_MODE = 0x01`, `fb.OP_BLIT = 0x02`, or
+   * `fb.OP_PATCH = 0x06`), the rest is the driver's own payload. The
+   * host invokes `driver.init(...)` once
    * at construction (with a minimal [`DriverHost`] that forwards
    * every `postToMain` to [`onFramebufferMessage`]) and then
    * `driver.call(op, payload)` on every framebuffer write.
    *
    * Independent of [`onFramebufferWrite`]: when both are set, the
    * raw-bytes callback fires first and the framed driver call fires
-   * after. Callers that only want the decoded `fb:set-mode` /
-   * `fb:blit` messages set just `framebufferDriver` +
+   * after. Callers that only want the decoded `fb:set-mode`,
+   * `fb:blit`, or `fb:patch` messages set just `framebufferDriver` +
    * `onFramebufferMessage`; callers that want the untouched bytes
    * (tests, tracing) use `onFramebufferWrite`.
    *
@@ -290,7 +439,7 @@ export interface KernelWasmHostOptions {
    * Called when [`framebufferDriver`]'s `init(host)` handler uses
    * `host.postToMain(msg)` — i.e. when the driver has decoded a
    * `driver_call` payload into a typed main-thread message like
-   * `fb:set-mode` or `fb:blit`. No-op when unset.
+   * `fb:set-mode`, `fb:blit`, or `fb:patch`. No-op when unset.
    */
   readonly onFramebufferMessage?: (msg: unknown) => void;
   /**
@@ -304,11 +453,11 @@ export interface KernelWasmHostOptions {
    *
    * Production wiring: `BlockDriver.openInOpfs()` returns a ready
    * driver after the `FileSystemSyncAccessHandle` for `pmos.img`
-   * is open. The `kernel_init` Rust path mounts an OPFS at
-   * `/persist` only if `driver_call(Block, OP_BLOCK_COUNT)`
-   * succeeds, so omitting this field cleanly skips the OPFS
-   * mount (handy for tests and for environments where OPFS
-   * isn't available).
+   * is open. The `kernel_init` Rust path uses that OPFS image as
+   * `/` only if the block-device probes and image validation
+   * succeed. Omitting this field selects the observable volatile
+   * tmpfs-root fallback (handy for tests and environments where
+   * OPFS is unavailable).
    */
   readonly blockDriver?: Driver;
   /**
@@ -405,12 +554,16 @@ export class KernelWasmHost implements Kernel {
     const binaryRegistry = options.binaryRegistry;
     const kernelWorkerChannel = options.kernelWorkerChannel;
     const resolvedOnSpawnProcess:
-      | ((pid: number, path: string) => SpawnOutcome)
+      | ((pid: number, path: string, executable?: Uint8Array) => SpawnOutcome)
       | undefined =
       options.onSpawnProcess ??
       (binaryRegistry !== undefined && kernelWorkerChannel !== undefined
-        ? (pid: number, path: string): SpawnOutcome => {
-            const bytes = binaryRegistry.get(path);
+        ? (
+            pid: number,
+            path: string,
+            executable?: Uint8Array,
+          ): SpawnOutcome => {
+            const bytes = executable ?? binaryRegistry.get(path);
             if (bytes === undefined) {
               return { ok: false, errno: ERRNO.ENOENT };
             }
@@ -435,22 +588,60 @@ export class KernelWasmHost implements Kernel {
             return { ok: true };
           }
         : undefined);
+    const resolvedOnTerminateProcess =
+      options.onTerminateProcess ??
+      (kernelWorkerChannel !== undefined
+        ? (pid: number): void => {
+            kernelWorkerChannel.postMessage({
+              kind: "proc:terminate",
+              pid,
+              signal: 9,
+            });
+          }
+        : undefined);
+    const resolvedOnHostFilePicker =
+      options.onHostFilePicker ??
+      (kernelWorkerChannel !== undefined
+        ? (): void => {
+            kernelWorkerChannel.postMessage({ kind: "host:pick" });
+          }
+        : undefined);
+    const resolvedOnHostDownload =
+      options.onHostDownload ??
+      (kernelWorkerChannel !== undefined
+        ? (name: string, mime: string, bytes: Uint8Array): void => {
+            kernelWorkerChannel.postMessage({
+              kind: "host:download",
+              name,
+              mime,
+              bytes,
+            });
+          }
+        : undefined);
 
-    const randomBytes = options.randomBytes ?? ((out: Uint8Array): void => {
-      crypto.getRandomValues(out);
-    });
-    const nowNs = options.nowNs ?? ((): bigint => {
-      return BigInt(Math.floor(performance.now() * 1_000_000));
-    });
-    const nowRealtimeNs = options.nowRealtimeNs ?? ((): bigint => {
-      // `Date.now()` is ms since the Unix epoch; multiply by 1e6 to
-      // reach ns. The product fits in i64 — the year-2262 overflow
-      // is far enough out that we don't guard for it here.
-      return BigInt(Date.now()) * 1_000_000n;
-    });
-    const onPanic = options.onPanic ?? ((message: string): void => {
-      throw new Error(`KernelWasmHost panic: ${message}`);
-    });
+    const randomBytes =
+      options.randomBytes ??
+      ((out: Uint8Array): void => {
+        crypto.getRandomValues(out);
+      });
+    const nowNs =
+      options.nowNs ??
+      ((): bigint => {
+        return BigInt(Math.floor(performance.now() * 1_000_000));
+      });
+    const nowRealtimeNs =
+      options.nowRealtimeNs ??
+      ((): bigint => {
+        // `Date.now()` is ms since the Unix epoch; multiply by 1e6 to
+        // reach ns. The product fits in i64 — the year-2262 overflow
+        // is far enough out that we don't guard for it here.
+        return BigInt(Date.now()) * 1_000_000n;
+      });
+    const onPanic =
+      options.onPanic ??
+      ((message: string): void => {
+        throw new Error(`KernelWasmHost panic: ${message}`);
+      });
 
     // Initialise the framebuffer driver (if provided) with a
     // `DriverHost` whose `postToMain` forwards to the caller's
@@ -622,12 +813,40 @@ export class KernelWasmHost implements Kernel {
           pid: number,
           pathPtr: number,
           pathLen: number,
+          executablePtr: number,
+          executableLen: number,
         ): number => {
           if (memory === undefined) return 0;
+          if (
+            pathPtr < 0 ||
+            pathLen < 0 ||
+            pathPtr + pathLen > memory.buffer.byteLength ||
+            executablePtr < 0 ||
+            executableLen < 0 ||
+            executablePtr + executableLen > memory.buffer.byteLength
+          ) {
+            return 1;
+          }
           const pathBytes = new Uint8Array(memory.buffer, pathPtr, pathLen);
           const path = new TextDecoder().decode(pathBytes);
+          const executable =
+            executablePtr === 0
+              ? undefined
+              : new Uint8Array(
+                  memory.buffer,
+                  executablePtr,
+                  executableLen,
+                ).slice();
           if (resolvedOnSpawnProcess === undefined) return 0;
-          const outcome = resolvedOnSpawnProcess(pid, path);
+          let outcome: SpawnOutcome;
+          try {
+            outcome = resolvedOnSpawnProcess(pid, path, executable);
+          } catch {
+            // A postMessage/Worker-channel failure is a transport
+            // rejection, not an escaped wasm import exception. The
+            // positive rc lets PROC_SPAWN run its kernel rollback.
+            return 1;
+          }
           // Rust-side contract: 0 = success, <0 = -errno, >0 = transport error.
           if (outcome.ok) return 0;
           // The kernel-side `WasmPlatform::spawn_process` expects a
@@ -636,6 +855,54 @@ export class KernelWasmHost implements Kernel {
           // rollback path always hit DriverError::Errno — pass a
           // positive errno and it gets negated here.
           return -outcome.errno;
+        },
+
+        pmos_host_terminate_process: (pid: number): number => {
+          if (resolvedOnTerminateProcess === undefined) return 1;
+          try {
+            resolvedOnTerminateProcess(pid);
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+
+        pmos_host_file_picker: (): number => {
+          if (resolvedOnHostFilePicker === undefined) return 1;
+          try {
+            resolvedOnHostFilePicker();
+            return 0;
+          } catch {
+            return 1;
+          }
+        },
+
+        pmos_host_download_file: (
+          namePtr: number,
+          nameLen: number,
+          mimePtr: number,
+          mimeLen: number,
+          bytesPtr: number,
+          bytesLen: number,
+        ): number => {
+          if (memory === undefined || resolvedOnHostDownload === undefined)
+            return 1;
+          try {
+            const decoder = new TextDecoder("utf-8", { fatal: true });
+            const name = decoder.decode(
+              new Uint8Array(memory.buffer, namePtr, nameLen),
+            );
+            const mime = decoder.decode(
+              new Uint8Array(memory.buffer, mimePtr, mimeLen),
+            );
+            const bytes = new Uint8Array(
+              new Uint8Array(memory.buffer, bytesPtr, bytesLen),
+            );
+            resolvedOnHostDownload(name, mime, bytes);
+            return 0;
+          } catch {
+            return 1;
+          }
         },
       },
     };
@@ -652,9 +919,9 @@ export class KernelWasmHost implements Kernel {
     // Allocate the shared kernel wake slot. Production Worker scope
     // has `SharedArrayBuffer` available (COOP/COEP); vitest under node
     // without cross-origin-isolation falls back to a plain
-    // `ArrayBuffer`, which `Atomics.load`/`store` both accept (but
-    // `Atomics.wait`/`waitAsync` do not — the default park path
-    // detects this and falls back to a microtask yield).
+    // `ArrayBuffer`, which `Atomics.load`/`store` both accept. Tests
+    // inject `parkFn` because `Atomics.wait`/`waitAsync` require a
+    // SharedArrayBuffer-backed view.
     let wakeBuffer: ArrayBufferLike;
     try {
       wakeBuffer = new SharedArrayBuffer(32);
@@ -676,7 +943,9 @@ export class KernelWasmHost implements Kernel {
   registerProcess(caps: bigint): number {
     const pid = this.exports.kernel_register_process(caps);
     if (pid < 0) {
-      throw new Error(`KernelWasmHost.registerProcess: kernel_register_process returned ${pid}`);
+      throw new Error(
+        `KernelWasmHost.registerProcess: kernel_register_process returned ${pid}`,
+      );
     }
     return pid;
   }
@@ -688,7 +957,19 @@ export class KernelWasmHost implements Kernel {
   installConsoleFd(pid: number, fd: number): void {
     const rc = this.exports.kernel_install_console_fd(pid, fd);
     if (rc !== 0) {
-      throw new Error(`KernelWasmHost.installConsoleFd(${pid}, ${fd}): rc=${rc}`);
+      throw new Error(
+        `KernelWasmHost.installConsoleFd(${pid}, ${fd}): rc=${rc}`,
+      );
+    }
+  }
+
+  /** Install the WASI `/` directory preopen at `fd`. */
+  installRootPreopenFd(pid: number, fd: number): void {
+    const rc = this.exports.kernel_install_root_preopen_fd(pid, fd);
+    if (rc !== 0) {
+      throw new Error(
+        `KernelWasmHost.installRootPreopenFd(${pid}, ${fd}): rc=${rc}`,
+      );
     }
   }
 
@@ -698,7 +979,7 @@ export class KernelWasmHost implements Kernel {
    * a way to stage the per-process signal channel on a pid
    * that was created via `registerProcess` (which deliberately
    * does not auto-install, unlike proc_spawn'd children which
-   * get fd 3 = SignalChannel for free).
+   * get fd 4 = SignalChannel for free).
    */
   installSignalChannelFd(pid: number, fd: number): void {
     const rc = this.exports.kernel_install_signal_channel_fd(pid, fd);
@@ -722,9 +1003,31 @@ export class KernelWasmHost implements Kernel {
     }
   }
 
+  /**
+   * Make a host-observed Worker return/trap authoritative in the
+   * kernel. Returns `true` when the pid was known (including an
+   * idempotent acknowledgement of an already-terminal process) and
+   * `false` for a stale/unknown pid.
+   */
+  reconcileProcessExit(pid: number, code: number, crashed: boolean): boolean {
+    const rc = this.exports.kernel_reconcile_process_exit(
+      pid,
+      code,
+      crashed ? 1 : 0,
+    );
+    if (rc < 0) {
+      throw new Error(
+        `KernelWasmHost.reconcileProcessExit(${pid}, ${code}): rc=${rc}`,
+      );
+    }
+    return rc === 0;
+  }
+
   recordProcessMemory(pid: number, bytes: number): void {
     if (!Number.isFinite(bytes) || bytes < 0 || !Number.isSafeInteger(bytes)) {
-      throw new Error(`KernelWasmHost.recordProcessMemory: invalid byte count ${bytes}`);
+      throw new Error(
+        `KernelWasmHost.recordProcessMemory: invalid byte count ${bytes}`,
+      );
     }
     const bytesLo = bytes >>> 0;
     const bytesHi = Math.floor(bytes / 0x1_0000_0000) >>> 0;
@@ -750,6 +1053,93 @@ export class KernelWasmHost implements Kernel {
    */
   syncAll(): boolean {
     return this.exports.kernel_sync_all() === 0;
+  }
+
+  /**
+   * Register a host-imported file in the kernel's host-file table.
+   * The bootstrap-side drag-drop / file-picker handler calls this
+   * with the token it has assigned to the host `File`, the file's
+   * name + mime, and the raw bytes the user dropped. A subsequent
+   * userland `host_file_recv(token)` (extension opcode 0x1500)
+   * consumes the entry and hands the bytes to the calling process
+   * as a read-only fd.
+   *
+   * Metadata is copied once, then bytes are copied through repeated bounded
+   * scratch windows. The kernel reserves the declared size before accepting
+   * chunks, so files up to the shared 16 MiB import limit do not depend on
+   * the 64 KiB syscall scratch size.
+   */
+  hostFileDropped(
+    token: number,
+    name: string,
+    mime: string,
+    bytes: Uint8Array,
+  ): boolean {
+    const enc = new TextEncoder();
+    const nameBytes = enc.encode(name);
+    const mimeBytes = enc.encode(mime);
+    const heapLen = this.exports.kernel_heap_len();
+    if (
+      nameBytes.length + mimeBytes.length > heapLen ||
+      bytes.length > HOST_FILE_IMPORT_MAX_BYTES
+    ) {
+      console.warn(
+        `[pmos-kernel-worker] rejected host import token=${token}: metadata=${nameBytes.length + mimeBytes.length}, bytes=${bytes.length}`,
+      );
+      return false;
+    }
+    const heapPtr = this.exports.kernel_heap_ptr();
+    let view = new Uint8Array(
+      this.exports.memory.buffer,
+      heapPtr,
+      nameBytes.length + mimeBytes.length,
+    );
+    view.set(nameBytes, 0);
+    view.set(mimeBytes, nameBytes.length);
+    const begin = this.exports.kernel_host_file_drop_begin(
+      token,
+      nameBytes.length,
+      mimeBytes.length,
+      bytes.length,
+    );
+    if (begin !== 0) {
+      console.warn(
+        `[pmos-kernel-worker] rejected host import token=${token} at begin: rc=${begin}`,
+      );
+      return false;
+    }
+    for (let offset = 0; offset < bytes.length; offset += heapLen) {
+      const chunk = bytes.subarray(
+        offset,
+        Math.min(offset + heapLen, bytes.length),
+      );
+      view = new Uint8Array(this.exports.memory.buffer, heapPtr, chunk.length);
+      view.set(chunk);
+      const chunkRc = this.exports.kernel_host_file_drop_chunk(
+        token,
+        chunk.length,
+      );
+      if (chunkRc !== 0) {
+        this.exports.kernel_host_file_drop_abort(token);
+        console.warn(
+          `[pmos-kernel-worker] rejected host import token=${token} at offset=${offset}: rc=${chunkRc}`,
+        );
+        return false;
+      }
+    }
+    const end = this.exports.kernel_host_file_drop_end(token);
+    if (end !== 0) {
+      this.exports.kernel_host_file_drop_abort(token);
+      console.warn(
+        `[pmos-kernel-worker] rejected host import token=${token} at end: rc=${end}`,
+      );
+      return false;
+    }
+    console.info(
+      `[pmos-kernel-worker] accepted host import token=${token} bytes=${bytes.length}`,
+    );
+    this.notifyDispatchLoop();
+    return true;
   }
 
   /**
@@ -793,7 +1183,9 @@ export class KernelWasmHost implements Kernel {
       );
     }
     const heapPtr = this.exports.kernel_heap_ptr();
-    new Uint8Array(this.exports.memory.buffer, heapPtr, bytes.length).set(bytes);
+    new Uint8Array(this.exports.memory.buffer, heapPtr, bytes.length).set(
+      bytes,
+    );
     return bytes.length;
   }
 
@@ -810,7 +1202,11 @@ export class KernelWasmHost implements Kernel {
    * handlers use the same convention — the heap scratch is a
    * contiguous buffer addressed starting at offset 0.
    */
-  dispatch(pid: number, request: SyscallRequest, heapIn?: Uint8Array): DispatchResult {
+  dispatch(
+    pid: number,
+    request: SyscallRequest,
+    heapIn?: Uint8Array,
+  ): DispatchResult {
     const reqBytes = encodeRequest(request);
 
     // Stage the request + heap input into the kernel's scratch
@@ -839,14 +1235,18 @@ export class KernelWasmHost implements Kernel {
       return { heapOut: new Uint8Array(0), parked: true };
     }
     if (rc !== 0) {
-      throw new Error(`KernelWasmHost.dispatch: kernel_dispatch returned ${rc}`);
+      throw new Error(
+        `KernelWasmHost.dispatch: kernel_dispatch returned ${rc}`,
+      );
     }
 
     // Read the response back. memory.buffer may have changed if the
     // dispatcher allocated; re-fetch.
     const respBuf = this.exports.memory.buffer;
     const respPtr = this.exports.kernel_resp_ptr();
-    const respBytes = new Uint8Array(new Uint8Array(respBuf, respPtr, SLOT_SIZE));
+    const respBytes = new Uint8Array(
+      new Uint8Array(respBuf, respPtr, SLOT_SIZE),
+    );
     const response = decodeResponse(respBytes);
 
     let heapOut = new Uint8Array(0);
@@ -1061,10 +1461,10 @@ export class KernelWasmHost implements Kernel {
       );
     }
 
-    // Dispatch. Remap `heapPtr` to 0 because the kernel's scratch
-    // region is not the SAB's — the user's SAB-side offset is not
-    // meaningful to the kernel, which always writes at offset 0 in
-    // its own scratch.
+    // Dispatch with the same bounded scratch offset used in the SAB. Keeping
+    // the offset stable lets a delayed response retain response metadata
+    // without retaining a user-memory pointer; both scratch regions have the
+    // same HEAP_SCRATCH_BYTES bound validated above.
     const dispatchResult = this.dispatch(
       pid,
       {
@@ -1072,7 +1472,7 @@ export class KernelWasmHost implements Kernel {
         flags: decoded.flags,
         requestId: decoded.requestId,
         args: decoded.args,
-        heapPtr: 0,
+        heapPtr: decoded.heapPtr,
         heapLen: decoded.heapLen,
       },
       heapIn,
@@ -1168,6 +1568,35 @@ export class KernelWasmHost implements Kernel {
     if (rc !== 0) {
       throw new Error(`KernelWasmHost.injectInput: ${fnName} returned ${rc}`);
     }
+
+    // Input is external work just like a user-worker syscall request. Wake
+    // the indefinitely parked dispatch loop after publishing device readiness.
+    this.notifyDispatchLoop();
+  }
+
+  /**
+   * Publish browser-substrate work to the kernel dispatch loop. Host input
+   * and completed file imports both mutate kernel queues outside a user
+   * process's SAB request path, so neither has a user Worker available to
+   * bump the shared wake counter on its behalf.
+   */
+  /**
+   * Notify the steady-state dispatcher after work arrives outside a user
+   * process's syscall ring. Kernel-worker lifecycle messages use this for
+   * newly published SABs and host-reconciled exits; both can otherwise leave
+   * runnable work or a parked parent's completion behind an existing
+   * `Atomics.waitAsync` epoch.
+   */
+  notifyDispatchLoop(): void {
+    if (
+      typeof SharedArrayBuffer !== "undefined" &&
+      this.wakeBuffer instanceof SharedArrayBuffer
+    ) {
+      Atomics.add(this.wakeView, 0, 1);
+      Atomics.notify(this.wakeView, 0);
+    } else {
+      this.wakeView[0] = (this.wakeView[0] + 1) | 0;
+    }
   }
 
   // ---- dispatch loop -------------------------------------------------
@@ -1176,18 +1605,31 @@ export class KernelWasmHost implements Kernel {
    * Shared kernel wake slot. 32 bytes backed by a `SharedArrayBuffer`
    * when the environment allows; a plain `ArrayBuffer` otherwise
    * (vitest under node). Every user Worker's `SabBackend` and the
-   * main thread's `injectInput` routing bumps `index 0` via
-   * `Atomics.add` + `Atomics.notify` so the kernel's dispatch loop
-   * wakes from its `Atomics.waitAsync` park.
+   * browser-substrate event routing bumps `index 0` via `Atomics.add` +
+   * `Atomics.notify` so the kernel's dispatch loop wakes from its
+   * `Atomics.waitAsync` park.
    *
    * The slot is semantically "wake counter": notifiers increment it,
    * the parker reads it before waiting, and a spurious-wake-free
    * park returns as soon as the counter changes. Production code
-   * should NEVER mutate the counter directly — use `Atomics.add` +
-   * `Atomics.notify` via a helper when that helper lands in T234.
+   * should NEVER mutate the counter directly — use
+   * [`notifyDispatchLoop`] for host-side work.
    */
   get wakeSlot(): Int32Array {
     return this.wakeView;
+  }
+
+  /** Re-check the kernel's bounded parked `poll_oneoff` sets. */
+  servicePollWaiters(): number {
+    return this.exports.kernel_service_poll_waiters();
+  }
+
+  /** Nanoseconds to the nearest poll clock, or `u64::MAX` for fd-only waits. */
+  nextPollTimeoutNs(): bigint {
+    // WebAssembly exposes every i64 result as a signed BigInt, even when the
+    // Rust export is u64. Restore the raw 64-bit value so u64::MAX remains the
+    // no-deadline sentinel instead of becoming -1ns and a zero-timeout spin.
+    return BigInt.asUintN(64, this.exports.kernel_next_poll_timeout_ns());
   }
 
   /**
@@ -1205,7 +1647,12 @@ export class KernelWasmHost implements Kernel {
    * lifecycle change at the start of the next pass.
    *
    * `parkFn` defaults to a `SharedArrayBuffer`-backed
-   * `Atomics.waitAsync` on the shared wake slot with a 50 ms timeout.
+   * `Atomics.waitAsync` on the shared wake slot. Fd-only waits are indefinite;
+   * a poll clock supplies the nearest real deadline.
+   * The loop snapshots the wake counter before scanning any rings and
+   * passes that epoch to the parker. A notifier racing with the scan then
+   * makes the wait return `not-equal` instead of being hidden by a fresh
+   * post-scan load and sleeping until the timeout.
    * Under vitest (no cross-origin-isolated context), tests pass a
    * microtask-yield stub so the loop never actually blocks — the
    * test seeds the rings synchronously anyway.
@@ -1216,118 +1663,181 @@ export class KernelWasmHost implements Kernel {
    */
   async startDispatchLoop(args: StartDispatchLoopArgs): Promise<void> {
     const budget = args.budget ?? 8;
-    const parkFn = args.parkFn ?? ((): Promise<void> => this.defaultPark());
+    const passesBeforeTaskYield = Math.max(
+      1,
+      Math.trunc(args.passesBeforeTaskYield ?? 4),
+    );
+    const parkFn =
+      args.parkFn ??
+      ((observedWake: number, timeoutMs: number | undefined): Promise<void> =>
+        this.defaultPark(observedWake, timeoutMs));
+    const taskYielder =
+      args.taskYieldFn === undefined ? new WorkerTaskYielder() : undefined;
+    const taskYieldFn = args.taskYieldFn ?? (() => taskYielder!.nextTask());
     const haveSharedArrayBuffer = typeof SharedArrayBuffer !== "undefined";
-    while (!args.halted()) {
-      let anyServiced = false;
-      const pids = args.pidSource();
-      for (const [pid, sab] of pids) {
-        const view = new Uint8Array(sab);
-        // Shared header view for the user-wake protocol step (T234).
-        // Constructed once per pid per pass; cheap, but pulled out of
-        // the inner loop to avoid an extra allocation per syscall.
-        const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
-        const sabIsShared =
-          haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
-        for (let i = 0; i < budget; i++) {
-          // T095/T110 (slice 2c.2): a delayed wake (parked
-          // proc_wait's reap, parked ipc_accept's connect wake,
-          // EINTR interrupt) may land via drainWakesForPid even
-          // when the request ring is empty. The RES_HEAD delta
-          // across drainWakesForPid + serviceSab is the
-          // authoritative "did anything reach the user's response
-          // ring?" signal, since serviceSab returns 0 for BOTH a
-          // normal-service response push AND a park (no push).
-          const resHeadBefore = Atomics.load(header, OFF_RES_HEAD / 4);
-          const wakesPushed = this.drainWakesForPid(pid, view);
-          if (wakesPushed > 0) {
-            // The kernel's wake paths (`wake_parked_waiter_for_child`,
-            // `interrupt_parked_*`, `ipc_connect`) transition the
-            // woken pid from Blocked* back to Ready — but the pid's
-            // next syscall, which for a loop like init's proc_wait
-            // supervisor is often another blocking call, needs the
-            // pid to be Running so park_on_wait's Running→Blocked*
-            // transition succeeds. Bump it here. Errors swallowed —
-            // already-Running or reaped are both safe no-ops.
-            try {
-              this.markRunning(pid);
-            } catch {
-              // pass
+    let passesSinceTaskYield = 0;
+    try {
+      while (!args.halted()) {
+        // Capture the epoch before the scan. A producer publishes its SAB
+        // request before incrementing this counter, so either this pass sees
+        // the request or a later increment makes the park return immediately.
+        // Loading here (rather than inside defaultPark after the scan) closes
+        // the classic check-then-sleep lost-wakeup window.
+        const observedWake = Atomics.load(this.wakeView, 0);
+        let anyServiced = false;
+        const pids = args.pidSource();
+        for (const [pid, sab] of pids) {
+          const view = new Uint8Array(sab);
+          // Shared header view for the user-wake protocol step (T234).
+          // Constructed once per pid per pass; cheap, but pulled out of
+          // the inner loop to avoid an extra allocation per syscall.
+          const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+          const sabIsShared =
+            haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
+          for (let i = 0; i < budget; i++) {
+            // T095/T110 (slice 2c.2): a delayed wake (parked
+            // proc_wait's reap, parked ipc_accept's connect wake,
+            // EINTR interrupt) may land via drainWakesForPid even
+            // when the request ring is empty. The RES_HEAD delta
+            // across drainWakesForPid + serviceSab is the
+            // authoritative "did anything reach the user's response
+            // ring?" signal, since serviceSab returns 0 for BOTH a
+            // normal-service response push AND a park (no push).
+            const resHeadBefore = Atomics.load(header, OFF_RES_HEAD / 4);
+            const wakesPushed = this.drainWakesForPid(pid, view);
+            if (wakesPushed > 0) {
+              // The kernel's wake paths (`wake_parked_waiter_for_child`,
+              // `interrupt_parked_*`, `ipc_connect`) transition the
+              // woken pid from Blocked* back to Ready — but the pid's
+              // next syscall, which for a loop like init's proc_wait
+              // supervisor is often another blocking call, needs the
+              // pid to be Running so park_on_wait's Running→Blocked*
+              // transition succeeds. Bump it here. Errors swallowed —
+              // already-Running or reaped are both safe no-ops.
+              try {
+                this.markRunning(pid);
+              } catch {
+                // pass
+              }
             }
-          }
-          const rc = this.serviceSab(pid, view);
-          const resHeadAfter = Atomics.load(header, OFF_RES_HEAD / 4);
-          const responsePushed = resHeadAfter !== resHeadBefore;
-          if (responsePushed) {
-            // T234 production wake protocol step 5: now that a
-            // response (service push or drained wake) has landed
-            // in the ring, wake the user Worker's
-            // `Atomics.wait(header, OFF_USER_WAIT_SLOT/4,
-            // STATUS_REQUESTED)`. Storing any value other than
-            // `STATUS_REQUESTED` makes a pre-existing waiter
-            // return "ok" on the subsequent notify, AND makes a
-            // not-yet-parked waiter return "not-equal" immediately
-            // when it does call `wait`. Both paths land in the
-            // same place: the user pops the response.
-            // `Atomics.notify` only accepts `SharedArrayBuffer`-
-            // backed views, so guard it; the `Atomics.store`
-            // itself is legal on either backing and is harmless
-            // when the user Worker is the legacy synchronous
-            // `serviceHook` path.
-            Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
-            if (sabIsShared) {
-              Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+            const rc = this.serviceSab(pid, view);
+            // `0` means the request was consumed, including the parked/no-
+            // response case. Its dispatch may have queued a wake for a pid that
+            // appeared earlier in this pass, so force another round before any
+            // park even when this pid's response head did not advance.
+            if (rc === 0) {
+              anyServiced = true;
             }
-            anyServiced = true;
-          }
-          if (rc === 1) {
-            // Ring empty (or handler parked without push). Any
-            // wakes drained above have been notified. Stop
-            // spinning so the next pass can visit other pids.
-            break;
+            const resHeadAfter = Atomics.load(header, OFF_RES_HEAD / 4);
+            const responsePushed = resHeadAfter !== resHeadBefore;
+            if (responsePushed) {
+              // T234 production wake protocol step 5: now that a
+              // response (service push or drained wake) has landed
+              // in the ring, wake the user Worker's
+              // `Atomics.wait(header, OFF_USER_WAIT_SLOT/4,
+              // STATUS_REQUESTED)`. Storing any value other than
+              // `STATUS_REQUESTED` makes a pre-existing waiter
+              // return "ok" on the subsequent notify, AND makes a
+              // not-yet-parked waiter return "not-equal" immediately
+              // when it does call `wait`. Both paths land in the
+              // same place: the user pops the response.
+              // `Atomics.notify` only accepts `SharedArrayBuffer`-
+              // backed views, so guard it; the `Atomics.store`
+              // itself is legal on either backing and is harmless
+              // when the user Worker is the legacy synchronous
+              // `serviceHook` path.
+              Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+              if (sabIsShared) {
+                Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+              }
+              anyServiced = true;
+            }
+            if (rc === 1) {
+              // Ring empty. Any wakes drained above have been notified. Stop
+              // scanning this pid so the pass can visit other pids.
+              break;
+            }
           }
         }
+        // Check again after the pass so a caller whose halt condition
+        // becomes true during servicing (e.g. init's `proc:exited`
+        // arrived mid-pass and emptied the pidMap) exits without a
+        // wasted park.
+        if (args.halted()) return;
+        // Clock polls must advance even when another process keeps this pass
+        // busy with read-only syscalls. Readiness-mutating syscalls service
+        // pollers in the kernel, but an elapsed monotonic deadline is an
+        // independent state transition and cannot wait for a globally idle
+        // round.
+        if (this.nextPollTimeoutNs() === 0n && this.servicePollWaiters() > 0) {
+          anyServiced = true;
+        }
+        if (!anyServiced) {
+          // A clock may have expired during the ring scan, and a host-side
+          // mutation may have made an fd ready without publishing a user SAB
+          // response. Re-check immediately before sleeping. If this queues a
+          // wake, the next pass drains it; never enter wait with completed work.
+          if (this.servicePollWaiters() > 0) {
+            anyServiced = true;
+          } else {
+            const timeoutNs = this.nextPollTimeoutNs();
+            const timeoutMs = pollTimeoutMs(timeoutNs);
+            await parkFn(observedWake, timeoutMs);
+          }
+        }
+        passesSinceTaskYield += 1;
+        if (passesSinceTaskYield >= passesBeforeTaskYield) {
+          passesSinceTaskYield = 0;
+          // Resolve from a task, not an already-fulfilled promise. That gives
+          // other queued tasks an opportunity to run both under continuously
+          // busy SAB traffic and when racing wake increments make waitAsync
+          // return the synchronous `not-equal` result on every idle pass.
+          await taskYieldFn();
+        }
       }
-      // Check again after the pass so a caller whose halt condition
-      // becomes true during servicing (e.g. init's `proc:exited`
-      // arrived mid-pass and emptied the pidMap) exits without a
-      // wasted park.
-      if (args.halted()) return;
-      if (!anyServiced) {
-        await parkFn();
-      }
+    } finally {
+      taskYielder?.close();
     }
   }
 
   /**
-   * Default [`startDispatchLoop`] park. `Atomics.waitAsync` on the
-   * shared wake slot with a 50 ms timeout when the wake buffer is a
-   * real `SharedArrayBuffer` and `Atomics.waitAsync` is available;
-   * otherwise a microtask yield (`setTimeout(0)`) so the event loop
-   * still gets a chance to drain messages between busy-spin passes.
-   *
-   * The 50 ms timeout exists as a belt-and-suspenders against lost
-   * notifications; `Atomics.notify` never drops under contention, but
-   * a caller that writes the wake slot before the kernel parks would
-   * be a lost wake if the kernel waited forever. The plan §10 notes
-   * 50 ms keeps well below the Principle IX 100 ms input budget.
+   * Default [`startDispatchLoop`] park. Fd-only waits have no timeout;
+   * clock-backed waits use exactly the nearest kernel deadline. Unsupported
+   * runtimes fail explicitly instead of falling back to a polling timer.
    */
-  private async defaultPark(): Promise<void> {
-    if (
-      typeof SharedArrayBuffer !== "undefined" &&
-      this.wakeBuffer instanceof SharedArrayBuffer &&
-      typeof Atomics.waitAsync === "function"
-    ) {
-      const last = Atomics.load(this.wakeView, 0);
-      const r = Atomics.waitAsync(this.wakeView, 0, last, 50);
-      if (r.async) {
-        await r.value;
+  private async defaultPark(
+    observedWake: number,
+    timeoutMs: number | undefined,
+  ): Promise<void> {
+    type WaitAsyncResult =
+      | { readonly async: false; readonly value: "not-equal" | "timed-out" }
+      | {
+          readonly async: true;
+          readonly value: Promise<"ok" | "timed-out">;
+        };
+    const waitAsync = (
+      Atomics as unknown as {
+        waitAsync?: (
+          view: Int32Array,
+          index: number,
+          value: number,
+          timeout?: number,
+        ) => WaitAsyncResult;
       }
-      return;
+    ).waitAsync;
+    if (
+      typeof SharedArrayBuffer === "undefined" ||
+      !(this.wakeBuffer instanceof SharedArrayBuffer) ||
+      waitAsync === undefined
+    ) {
+      throw new Error(
+        "KernelWasmHost: blocking dispatcher requires SharedArrayBuffer and Atomics.waitAsync",
+      );
     }
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 0);
-    });
+    const r = waitAsync(this.wakeView, 0, observedWake, timeoutMs);
+    if (r.async) {
+      await r.value;
+    }
   }
 }
 
@@ -1348,11 +1858,14 @@ export interface StartDispatchLoopArgs {
   readonly halted: () => boolean;
   /**
    * Invoked when a pass completed without servicing any request.
-   * Defaults to a shared-wake-slot `Atomics.waitAsync` with a 50 ms
-   * timeout (see [`KernelWasmHost.wakeSlot`]); tests pass a
+   * Defaults to a shared-wake-slot `Atomics.waitAsync` with no timeout unless
+   * the kernel reports a real poll clock deadline; tests pass a
    * microtask-yield stub so the loop never actually blocks.
    */
-  readonly parkFn?: () => Promise<void>;
+  readonly parkFn?: (
+    observedWake: number,
+    timeoutMs: number | undefined,
+  ) => Promise<void>;
   /**
    * Maximum requests serviced per pid per pass. Defaults to 8; the
    * value keeps one chatty process from starving the others. Tuned
@@ -1360,4 +1873,12 @@ export interface StartDispatchLoopArgs {
    * the round-robin visible.
    */
   readonly budget?: number;
+  /**
+   * Maximum dispatch passes before yielding to the Worker's task queue. The
+   * bound applies to syscall-active passes and to idle scans whose park
+   * resolves synchronously because the wake epoch already changed.
+   */
+  readonly passesBeforeTaskYield?: number;
+  /** Injectable task yield for deterministic fairness tests. */
+  readonly taskYieldFn?: () => Promise<void>;
 }

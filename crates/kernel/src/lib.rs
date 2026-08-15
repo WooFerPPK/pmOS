@@ -28,18 +28,18 @@
 
 extern crate alloc;
 
-pub mod platform;
 pub mod alloc_;
-pub mod proc;
-pub mod fd;
-pub mod vfs;
-pub mod fs;
-pub mod ipc;
-pub mod syscall;
 pub mod cap;
 pub mod dev;
+pub mod fd;
+pub mod fs;
 pub mod host_file;
+pub mod ipc;
+pub mod platform;
+pub mod proc;
 pub mod sys;
+pub mod syscall;
+pub mod vfs;
 
 // wasm32-only entry points: the narrow extern "C" seam that lets
 // the kernel Worker call into the dispatcher from the TS side.

@@ -21,7 +21,7 @@
 //! collapse is undone in a future slice.
 //!
 //! The parse helpers at the bottom decode message headers
-//! + payloads from `drain_outbound` so each test can
+//! and payloads from `drain_outbound` so each test can
 //! assert on the exact request sequence the Window sent.
 
 use std::collections::VecDeque;
@@ -32,7 +32,7 @@ use display_proto::requests::{
 };
 
 use toolkit::protocol::Connection;
-use toolkit::{App, HEADER_SIZE, Interface, MessageHeader, ObjectId, Window};
+use toolkit::{App, Interface, MessageHeader, ObjectId, Window, HEADER_SIZE};
 
 /// Bidirectional in-memory [`Connection`] for Window
 /// tests. Same shape as the `LoopbackConnection` used by
@@ -57,6 +57,9 @@ impl LoopbackConnection {
 impl Connection for LoopbackConnection {
     fn send(&mut self, bytes: &[u8]) {
         self.outbound.extend_from_slice(bytes);
+        if let Some(done) = sync_done_for(bytes) {
+            self.inbound.push_back(done);
+        }
     }
 
     fn drain_outbound(&mut self) -> Vec<u8> {
@@ -68,23 +71,31 @@ impl Connection for LoopbackConnection {
     }
 }
 
+fn sync_done_for(request: &[u8]) -> Option<Vec<u8>> {
+    let header = MessageHeader::decode(request).ok()?;
+    if header.object_id != ObjectId::DISPLAY || header.opcode != 1 {
+        return None;
+    }
+    let callback = ObjectId::new(u32::from_le_bytes(
+        request.get(HEADER_SIZE..HEADER_SIZE + 4)?.try_into().ok()?,
+    ));
+    let payload = 0u32.to_le_bytes();
+    let mut out = vec![0u8; HEADER_SIZE + payload.len()];
+    MessageHeader::try_new(callback, 1, payload.len(), 0)
+        .ok()?
+        .encode(&mut out[..HEADER_SIZE])
+        .ok()?;
+    out[HEADER_SIZE..].copy_from_slice(&payload);
+    Some(out)
+}
+
 /// The toolkit's id allocator hands the registry id out
 /// first: `get_registry` always lands at raw id 3.
 const REGISTRY_ID: ObjectId = ObjectId::new(3);
 
-/// After registry + three globals the next client-side
-/// id the allocator produces (for the surface) is 11 —
-/// but we read the actual id out of the Window rather
-/// than assuming a specific allocator order.
-
 /// Build a single framed `pmd_registry.global(name,
 /// interface, version)` event targeting `registry_id`.
-fn build_global_event(
-    registry_id: ObjectId,
-    name: u32,
-    interface: &str,
-    version: u32,
-) -> Vec<u8> {
+fn build_global_event(registry_id: ObjectId, name: u32, interface: &str, version: u32) -> Vec<u8> {
     let event = RegistryGlobal {
         name,
         interface: interface.to_string(),
@@ -93,8 +104,7 @@ fn build_global_event(
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut out = vec![0u8; HEADER_SIZE + payload.len()];
-    let header =
-        MessageHeader::try_new(registry_id, 1 /* global */, payload.len(), 0).unwrap();
+    let header = MessageHeader::try_new(registry_id, 1 /* global */, payload.len(), 0).unwrap();
     header.encode(&mut out[..HEADER_SIZE]).unwrap();
     out[HEADER_SIZE..].copy_from_slice(&payload);
     out
@@ -105,12 +115,7 @@ fn build_global_event(
 /// The `states` bitfield is fixed at zero — see
 /// [`build_configure_event_with_states`] for the
 /// state-bearing variant used by maximize/restore tests.
-fn build_configure_event(
-    toplevel_id: ObjectId,
-    serial: u32,
-    width: i32,
-    height: i32,
-) -> Vec<u8> {
+fn build_configure_event(toplevel_id: ObjectId, serial: u32, width: i32, height: i32) -> Vec<u8> {
     build_configure_event_with_states(toplevel_id, serial, width, height, 0)
 }
 
@@ -125,12 +130,16 @@ fn build_configure_event_with_states(
     height: i32,
     states: u32,
 ) -> Vec<u8> {
-    let event = XdgToplevelConfigure { serial, width, height, states };
+    let event = XdgToplevelConfigure {
+        serial,
+        width,
+        height,
+        states,
+    };
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut out = vec![0u8; HEADER_SIZE + payload.len()];
-    let header =
-        MessageHeader::try_new(toplevel_id, 1 /* configure */, payload.len(), 0).unwrap();
+    let header = MessageHeader::try_new(toplevel_id, 1 /* configure */, payload.len(), 0).unwrap();
     header.encode(&mut out[..HEADER_SIZE]).unwrap();
     out[HEADER_SIZE..].copy_from_slice(&payload);
     out
@@ -143,8 +152,7 @@ fn build_close_event(toplevel_id: ObjectId) -> Vec<u8> {
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut out = vec![0u8; HEADER_SIZE];
-    let header =
-        MessageHeader::try_new(toplevel_id, 2 /* close */, payload.len(), 0).unwrap();
+    let header = MessageHeader::try_new(toplevel_id, 2 /* close */, payload.len(), 0).unwrap();
     header.encode(&mut out[..HEADER_SIZE]).unwrap();
     // close has no payload bytes to append.
     let _ = payload;
@@ -219,7 +227,11 @@ fn window_new_sends_create_surface_sequence() {
     // doc for the collapse rationale.)
     let compositor_id = window.app().compositor();
     let xdg_shell_id = window.app().xdg_shell();
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     let requests = parse_requests(&bytes);
     assert_eq!(requests.len(), 2);
 
@@ -248,18 +260,26 @@ fn window_set_title_sends_set_title_request() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
     window.set_title("Hello").expect("set_title must succeed");
     assert_eq!(window.title(), "Hello");
 
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     let requests = parse_requests(&bytes);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].object_id, toplevel_id);
     assert_eq!(requests[0].opcode, 1 /* set_title */);
-    let set_title = XdgToplevelSetTitle::decode(&requests[0].payload)
-        .expect("set_title payload must decode");
+    let set_title =
+        XdgToplevelSetTitle::decode(&requests[0].payload).expect("set_title payload must decode");
     assert_eq!(set_title.title, "Hello");
 }
 
@@ -272,7 +292,11 @@ fn window_dispatch_handles_configure() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
     // Mock the server: a single inbound batch that carries
     // the merged configure event (serial=1, w=800, h=600).
@@ -289,7 +313,11 @@ fn window_dispatch_handles_configure() {
     assert!(!window.close_requested());
 
     // Window must have sent an ack_configure(1) in reply.
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     let requests = parse_requests(&bytes);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].object_id, toplevel_id);
@@ -308,7 +336,11 @@ fn window_dispatch_records_close() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
     // Mock the server: send xdg_toplevel::close.
     window
@@ -324,7 +356,11 @@ fn window_dispatch_records_close() {
     assert_eq!(window.configured_size(), (0, 0));
 
     // close does not induce any outbound reply.
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     assert!(bytes.is_empty());
 
     // Interface binding remains intact after the close
@@ -332,6 +368,31 @@ fn window_dispatch_records_close() {
     // yet.
     let client = window.app().client();
     assert_eq!(client.get(toplevel_id), Some(Interface::XdgToplevel));
+}
+
+#[test]
+fn take_close_requested_consumes_only_the_pending_event() {
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+    window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .push_inbound(build_close_event(toplevel_id));
+
+    window.dispatch().expect("dispatch must succeed");
+    assert!(window.take_close_requested());
+    assert!(!window.take_close_requested());
+    assert!(!window.close_requested());
 }
 
 #[test]
@@ -343,14 +404,24 @@ fn window_dispatch_decodes_states_bitfield() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
     let mixed = xdg_toplevel_state::MAXIMIZED | xdg_toplevel_state::ACTIVATED;
     window
         .app_mut()
         .client_mut()
         .connection_mut()
-        .push_inbound(build_configure_event_with_states(toplevel_id, 7, 1024, 768, mixed));
+        .push_inbound(build_configure_event_with_states(
+            toplevel_id,
+            7,
+            1024,
+            768,
+            mixed,
+        ));
 
     let _ = window.dispatch().expect("dispatch must succeed");
     assert!(window.is_configured());
@@ -372,6 +443,41 @@ fn window_states_default_to_zero_until_configure_lands() {
     assert!(!window.is_maximized());
     assert!(!window.is_fullscreen());
     assert!(!window.is_activated());
+    assert!(!window.is_resizing());
+    assert!(!window.resizing_seen_in_last_dispatch());
+}
+
+#[test]
+fn window_preserves_a_resizing_transition_within_one_dispatch_batch() {
+    use display_proto::xdg_toplevel_state;
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+
+    let mut batch =
+        build_configure_event_with_states(toplevel_id, 1, 900, 560, xdg_toplevel_state::RESIZING);
+    batch.extend(build_configure_event(toplevel_id, 2, 900, 560));
+    window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .push_inbound(batch);
+
+    window.dispatch().expect("batched configure dispatch");
+    assert_eq!(window.configured_size(), (900, 560));
+    assert!(!window.is_resizing());
+    assert!(window.resizing_seen_in_last_dispatch());
+
+    window.dispatch().expect("empty dispatch");
+    assert!(!window.resizing_seen_in_last_dispatch());
 }
 
 #[test]
@@ -382,11 +488,19 @@ fn window_set_maximized_sends_request_with_empty_payload() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
     window.set_maximized().expect("set_maximized must succeed");
 
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     let requests = parse_requests(&bytes);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].object_id, toplevel_id);
@@ -402,11 +516,21 @@ fn window_unset_maximized_sends_request_with_empty_payload() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
-    window.unset_maximized().expect("unset_maximized must succeed");
+    window
+        .unset_maximized()
+        .expect("unset_maximized must succeed");
 
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     let requests = parse_requests(&bytes);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].object_id, toplevel_id);
@@ -423,14 +547,24 @@ fn window_maximize_restore_round_trip_via_state_bit() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
     // First configure: not maximized.
     window
         .app_mut()
         .client_mut()
         .connection_mut()
-        .push_inbound(build_configure_event_with_states(toplevel_id, 1, 800, 600, 0));
+        .push_inbound(build_configure_event_with_states(
+            toplevel_id,
+            1,
+            800,
+            600,
+            0,
+        ));
     let _ = window.dispatch().expect("dispatch 1");
     assert!(!window.is_maximized());
     assert_eq!(window.configured_size(), (800, 600));
@@ -456,7 +590,13 @@ fn window_maximize_restore_round_trip_via_state_bit() {
         .app_mut()
         .client_mut()
         .connection_mut()
-        .push_inbound(build_configure_event_with_states(toplevel_id, 3, 800, 600, 0));
+        .push_inbound(build_configure_event_with_states(
+            toplevel_id,
+            3,
+            800,
+            600,
+            0,
+        ));
     let _ = window.dispatch().expect("dispatch 3");
     assert!(!window.is_maximized());
     assert_eq!(window.configured_size(), (800, 600));
@@ -470,11 +610,21 @@ fn window_request_move_sends_move_request_with_serial() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
-    window.request_move(0x1234_5678).expect("request_move must succeed");
+    window
+        .request_move(0x1234_5678)
+        .expect("request_move must succeed");
 
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     let requests = parse_requests(&bytes);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].object_id, toplevel_id);
@@ -495,13 +645,21 @@ fn window_request_resize_sends_resize_request_with_serial_and_edges() {
     let _ = app.client_mut().connection_mut().drain_outbound();
     let mut window = Window::new(&mut app).expect("window creation must succeed");
     let toplevel_id = window.xdg_toplevel();
-    let _ = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
 
     window
         .request_resize(0xCAFE, edge::BOTTOM_RIGHT)
         .expect("request_resize must succeed");
 
-    let bytes = window.app_mut().client_mut().connection_mut().drain_outbound();
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
     let requests = parse_requests(&bytes);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].object_id, toplevel_id);

@@ -83,6 +83,64 @@ var ConsoleHost = class {
   }
 };
 
+// src/console-transcript.ts
+var CONSOLE_TRANSCRIPT_MAX_BYTES = 256 * 1024;
+var CONSOLE_TRANSCRIPT_MAX_LINES = 512;
+function tailByLines(text, maxLines) {
+  if (text === "" || maxLines <= 0) return "";
+  let retainedLines = text.endsWith("\n") ? 0 : 1;
+  let cursor = text.length;
+  while (cursor > 0) {
+    const newline = text.lastIndexOf("\n", cursor - 1);
+    if (newline < 0) return text;
+    retainedLines += 1;
+    if (retainedLines > maxLines) return text.slice(newline + 1);
+    cursor = newline;
+  }
+  return text;
+}
+function tailByUtf8Bytes(text, maxBytes) {
+  if (text === "" || maxBytes <= 0) return "";
+  const encoded = new TextEncoder().encode(text);
+  if (encoded.byteLength <= maxBytes) return text;
+  let start = encoded.byteLength - maxBytes;
+  while (start < encoded.byteLength && (encoded[start] & 192) === 128) {
+    start += 1;
+  }
+  return new TextDecoder().decode(encoded.subarray(start));
+}
+function boundedConsoleTail(text, limits) {
+  return tailByUtf8Bytes(
+    tailByLines(text, limits.maxLines),
+    limits.maxBytes
+  );
+}
+var ConsoleTranscript = class {
+  constructor(sink, limits = {
+    maxBytes: CONSOLE_TRANSCRIPT_MAX_BYTES,
+    maxLines: CONSOLE_TRANSCRIPT_MAX_LINES
+  }) {
+    this.sink = sink;
+    this.limits = limits;
+    if (limits.maxBytes <= 0 || limits.maxLines <= 0) {
+      throw new RangeError("console transcript limits must be positive");
+    }
+  }
+  sink;
+  limits;
+  value = "";
+  append(text) {
+    if (text === "") return;
+    const incoming = boundedConsoleTail(text, this.limits);
+    this.value = boundedConsoleTail(`${this.value}${incoming}`, this.limits);
+    this.sink.textContent = this.value;
+  }
+  /** Current retained text, exposed for diagnostics and isolation tests. */
+  get text() {
+    return this.value;
+  }
+};
+
 // src/console-check.ts
 function runEchoCheck(host, options) {
   return new Promise((resolve) => {
@@ -133,9 +191,13 @@ function runEchoCheck(host, options) {
 // src/fb-host.ts
 var FbHost = class {
   frameHandlers = [];
+  patchHandlers = [];
+  patchBatchHandlers = [];
   modeHandlers = [];
+  presentFenceHandlers = [];
   currentMode = null;
   blitCount = 0;
+  patchCount = 0;
   constructor(options) {
     options.worker.addEventListener("message", (ev) => {
       this.handleMessage(ev.data);
@@ -149,13 +211,29 @@ var FbHost = class {
   get blitsObserved() {
     return this.blitCount;
   }
+  /** Number of rectangular patches observed since construction. */
+  get patchesObserved() {
+    return this.patchCount;
+  }
   /** Subscribe to blit events. */
   onFrame(handler) {
     this.frameHandlers.push(handler);
   }
+  /** Subscribe to rectangular patch events. */
+  onPatch(handler) {
+    this.patchHandlers.push(handler);
+  }
+  /** Subscribe to atomic rectangular-patch batches. */
+  onPatchBatch(handler) {
+    this.patchBatchHandlers.push(handler);
+  }
   /** Subscribe to mode-change events. */
   onModeChange(handler) {
     this.modeHandlers.push(handler);
+  }
+  /** Subscribe to display-server presentation fences. */
+  onPresentFence(handler) {
+    this.presentFenceHandlers.push(handler);
   }
   handleMessage(msg) {
     switch (msg.kind) {
@@ -179,6 +257,42 @@ var FbHost = class {
         }
         return;
       }
+      case "fb:patch": {
+        this.patchCount += 1;
+        const patch = {
+          x: msg.x,
+          y: msg.y,
+          width: msg.width,
+          height: msg.height,
+          rgba: msg.rgba
+        };
+        for (const h of this.patchHandlers) {
+          h(patch);
+        }
+        return;
+      }
+      case "fb:patch-batch": {
+        this.patchCount += msg.patches.length;
+        const batch = {
+          patches: msg.patches.map((patch) => ({
+            x: patch.x,
+            y: patch.y,
+            width: patch.width,
+            height: patch.height,
+            rgba: patch.rgba
+          }))
+        };
+        for (const h of this.patchBatchHandlers) {
+          h(batch);
+        }
+        return;
+      }
+      case "fb:present-fence": {
+        for (const h of this.presentFenceHandlers) {
+          h(msg.serial);
+        }
+        return;
+      }
       default:
         return;
     }
@@ -190,8 +304,6 @@ var FbRenderer = class {
   canvas;
   offscreenFactory;
   imageDataFactory;
-  offscreen = null;
-  offscreenCtx = null;
   handlers = [];
   currentMode = null;
   /**
@@ -200,11 +312,7 @@ var FbRenderer = class {
    * without needing a canvas-pixel comparison.
    */
   presentsCompleted = 0;
-  /**
-   * Tracks whether the renderer is using the OffscreenCanvas
-   * fast path. Read by tests; the value is decided by
-   * `setMode` based on the factory's return value.
-   */
+  /** Legacy diagnostic reporting whether OffscreenCanvas 2D is available. */
   usingFastPath = false;
   constructor(options) {
     this.canvas = options.canvas;
@@ -216,9 +324,8 @@ var FbRenderer = class {
     this.handlers.push(handler);
   }
   /**
-   * Resize the canvas + (re-)create the offscreen surface for
-   * the new mode. Idempotent: passing the same geometry as the
-   * current mode is a no-op.
+   * Resize the canvas and refresh the OffscreenCanvas capability probe.
+   * Idempotent: passing the same geometry as the current mode is a no-op.
    */
   setMode(mode) {
     if (this.currentMode !== null && this.currentMode.width === mode.width && this.currentMode.height === mode.height) {
@@ -228,15 +335,8 @@ var FbRenderer = class {
     this.canvas.width = mode.width;
     this.canvas.height = mode.height;
     const offscreen = this.offscreenFactory(mode.width, mode.height);
-    if (offscreen !== null) {
-      this.offscreen = offscreen;
-      this.offscreenCtx = offscreen.getContext("2d");
-      this.usingFastPath = this.offscreenCtx !== null;
-    } else {
-      this.offscreen = null;
-      this.offscreenCtx = null;
-      this.usingFastPath = false;
-    }
+    const offscreenCtx = offscreen?.getContext("2d") ?? null;
+    this.usingFastPath = offscreenCtx !== null;
   }
   /**
    * Paint one RGBA8 frame. The renderer assumes the frame's
@@ -261,6 +361,82 @@ var FbRenderer = class {
     if (ctx !== null) {
       ctx.putImageData(imageData, 0, 0);
     }
+    this.finishPresent();
+  }
+  /**
+   * Paint one tightly packed RGBA8 rectangle into the current mode.
+   * Invalid, empty, out-of-bounds, or byte-count-mismatched patches
+   * are dropped without firing a present-complete notification.
+   *
+   * The visible context is updated directly, keeping work proportional to
+   * the damage rectangle. Full frames use the same visible-canvas path.
+   */
+  paintPatch(patch) {
+    const ctx = this.canvas.getContext("2d");
+    if (ctx === null) {
+      return;
+    }
+    const prepared = this.preparePatch(patch);
+    if (prepared === null) {
+      return;
+    }
+    ctx.putImageData(prepared.imageData, prepared.x, prepared.y);
+    this.finishPresent();
+  }
+  /**
+   * Validate every rectangle before painting any of them, then update the
+   * visible canvas and emit exactly one completion. Canvas writes happen in
+   * one main-thread task, so no partially updated batch is observable.
+   */
+  paintPatchBatch(patches) {
+    if (patches.length === 0) {
+      return;
+    }
+    const ctx = this.canvas.getContext("2d");
+    if (ctx === null) {
+      return;
+    }
+    const prepared = [];
+    for (const patch of patches) {
+      const next = this.preparePatch(patch);
+      if (next === null) {
+        return;
+      }
+      prepared.push(next);
+    }
+    for (const patch of prepared) {
+      ctx.putImageData(patch.imageData, patch.x, patch.y);
+    }
+    this.finishPresent();
+  }
+  preparePatch(patch) {
+    const mode = this.currentMode;
+    if (mode === null) {
+      return null;
+    }
+    if (!Number.isSafeInteger(patch.x) || !Number.isSafeInteger(patch.y) || !Number.isSafeInteger(patch.width) || !Number.isSafeInteger(patch.height) || patch.x < 0 || patch.y < 0 || patch.width <= 0 || patch.height <= 0) {
+      return null;
+    }
+    const right = patch.x + patch.width;
+    const bottom = patch.y + patch.height;
+    const pixelCount = patch.width * patch.height;
+    const pixelBytes = pixelCount * 4;
+    if (!Number.isSafeInteger(right) || !Number.isSafeInteger(bottom) || !Number.isSafeInteger(pixelCount) || !Number.isSafeInteger(pixelBytes) || right > mode.width || bottom > mode.height || pixelBytes !== patch.rgba.byteLength) {
+      return null;
+    }
+    const rgba = new Uint8ClampedArray(
+      patch.rgba.buffer,
+      patch.rgba.byteOffset,
+      patch.rgba.byteLength
+    );
+    const imageData = this.imageDataFactory(
+      rgba,
+      patch.width,
+      patch.height
+    );
+    return { x: patch.x, y: patch.y, imageData };
+  }
+  finishPresent() {
     this.presentsCompleted += 1;
     for (const h of this.handlers) {
       h();
@@ -346,38 +522,176 @@ function packKbdEvent(key, state) {
   return out;
 }
 
-// src/bootstrap.ts
-var BOOT_VERSION = "0.1.0-demo";
-var EXPECTED_MANIFEST_VERSION = 40;
-async function ensureFreshBootstrap() {
-  try {
-    const resp = await fetch("/manifest.json", { cache: "no-store" });
-    if (!resp.ok) return;
-    const json = await resp.json();
-    if (typeof json.version !== "number") return;
-    if (json.version > EXPECTED_MANIFEST_VERSION) {
-      console.log(
-        `[pmos-bootstrap] cached bootstrap is stale (built for v${EXPECTED_MANIFEST_VERSION}, deployed v${json.version}); reloading`
-      );
-      if ("caches" in self) {
-        try {
-          const names = await caches.keys();
-          await Promise.all(
-            names.filter((n) => n.startsWith("pmos-")).map((n) => caches.delete(n))
-          );
-        } catch {
-        }
-      }
-      window.location.reload();
-    }
-  } catch {
+// src/shared/worker-proto.ts
+var HOST_FILE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
+var HOST_FILE_IMPORT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+var HOST_FILE_IMPORT_MAX_FILES = 64;
+
+// src/storage-recovery.ts
+var gates = /* @__PURE__ */ new WeakMap();
+function describeReason(reason) {
+  switch (reason) {
+    case "opfs-open-failed":
+      return "The browser could not open PMos persistent storage.";
+    case "persistent-root-unavailable":
+      return "The persistent filesystem could not be installed as the root filesystem.";
+    case "persistent-root-invalid":
+      return "The existing PMos filesystem image could not be validated or mounted.";
   }
 }
+function showStorageRecoveryGate(message, options = {}) {
+  const targetDocument = options.document ?? document;
+  const existing = gates.get(targetDocument);
+  if (existing !== void 0) {
+    if (existing.blocked) {
+      existing.detail.textContent = `${describeReason(message.reason)} ${message.detail}`;
+    }
+    return existing.controller;
+  }
+  const overlay = targetDocument.createElement("section");
+  overlay.id = "pmos-storage-recovery";
+  overlay.dataset["state"] = "blocked";
+  overlay.style.cssText = [
+    "position: fixed",
+    "inset: 0",
+    "z-index: 2147483647",
+    "display: grid",
+    "place-items: center",
+    "padding: 2rem",
+    "box-sizing: border-box",
+    "color: #f3f6fa",
+    "background: rgba(5, 9, 14, 0.98)",
+    'font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    "pointer-events: auto"
+  ].join("; ");
+  const panel = targetDocument.createElement("div");
+  panel.style.cssText = [
+    "width: min(42rem, 100%)",
+    "padding: 2rem",
+    "box-sizing: border-box",
+    "border: 1px solid #cf6a52",
+    "border-radius: 0.75rem",
+    "background: #151b24",
+    "box-shadow: 0 1.5rem 5rem rgba(0, 0, 0, 0.65)"
+  ].join("; ");
+  const title = targetDocument.createElement("h1");
+  title.id = "pmos-storage-recovery-title";
+  title.textContent = "Persistent storage needs attention";
+  title.style.cssText = "margin: 0 0 1rem; font-size: 1.65rem";
+  const summary = targetDocument.createElement("p");
+  summary.textContent = "PMos paused the desktop because it cannot currently guarantee that files will survive a reload.";
+  summary.style.cssText = "margin: 0 0 1rem; line-height: 1.55";
+  const detail = targetDocument.createElement("p");
+  detail.id = "pmos-storage-recovery-detail";
+  detail.textContent = `${describeReason(message.reason)} ${message.detail}`;
+  detail.style.cssText = [
+    "margin: 0 0 1rem",
+    "padding: 0.75rem",
+    "border-radius: 0.4rem",
+    "background: #0d1219",
+    "color: #d9e1eb",
+    'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+    "font-size: 0.85rem",
+    "overflow-wrap: anywhere"
+  ].join("; ");
+  const preservation = targetDocument.createElement("p");
+  preservation.textContent = "Any existing pmos.img was left in place and was not reformatted or overwritten.";
+  preservation.style.cssText = "margin: 0 0 1.5rem; color: #b9c5d3; line-height: 1.55";
+  const actions = targetDocument.createElement("div");
+  actions.style.cssText = "display: flex; flex-wrap: wrap; gap: 0.75rem";
+  const retry = targetDocument.createElement("button");
+  retry.id = "pmos-storage-retry";
+  retry.type = "button";
+  retry.textContent = "Retry persistent storage";
+  retry.style.cssText = [
+    "padding: 0.75rem 1rem",
+    "border: 0",
+    "border-radius: 0.4rem",
+    "font: inherit",
+    "font-weight: 650",
+    "color: #091018",
+    "background: #8fc8ff",
+    "cursor: pointer"
+  ].join("; ");
+  const continueTemporary = targetDocument.createElement("button");
+  continueTemporary.id = "pmos-storage-continue-temporary";
+  continueTemporary.type = "button";
+  continueTemporary.textContent = "Continue temporary session \u2014 files will be lost on reload";
+  continueTemporary.style.cssText = [
+    "padding: 0.75rem 1rem",
+    "border: 1px solid #cf6a52",
+    "border-radius: 0.4rem",
+    "font: inherit",
+    "color: #ffd8cf",
+    "background: transparent",
+    "cursor: pointer"
+  ].join("; ");
+  actions.append(retry, continueTemporary);
+  panel.append(title, summary, detail, preservation, actions);
+  overlay.append(panel);
+  targetDocument.body.append(overlay);
+  const previousOverflow = targetDocument.body.style.overflow;
+  targetDocument.body.style.overflow = "hidden";
+  targetDocument.body.dataset["pmosStorageState"] = "degraded-blocked";
+  const blockOutsideGate = (event) => {
+    const target = event.target;
+    if (target !== null && overlay.contains(target)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+  targetDocument.addEventListener("keydown", blockOutsideGate, true);
+  targetDocument.addEventListener("keyup", blockOutsideGate, true);
+  const state = {};
+  const controller = {
+    get blocked() {
+      return state.blocked;
+    }
+  };
+  state.blocked = true;
+  state.controller = controller;
+  state.detail = detail;
+  gates.set(targetDocument, state);
+  retry.addEventListener("click", () => {
+    options.onRetry?.();
+  });
+  continueTemporary.addEventListener("click", () => {
+    if (!state.blocked) return;
+    state.blocked = false;
+    overlay.dataset["state"] = "temporary";
+    targetDocument.body.dataset["pmosStorageState"] = "temporary";
+    targetDocument.body.style.overflow = previousOverflow;
+    targetDocument.removeEventListener("keydown", blockOutsideGate, true);
+    targetDocument.removeEventListener("keyup", blockOutsideGate, true);
+    overlay.remove();
+    options.onContinueTemporary?.();
+  });
+  return controller;
+}
+
+// src/bootstrap.ts
+var BOOT_VERSION = "0.1.0-demo";
 function hasSharedArrayBuffer() {
   return typeof SharedArrayBuffer !== "undefined";
 }
+function unsupportedBrowserReasons() {
+  const reasons = [];
+  if (!isCrossOriginIsolated())
+    reasons.push("cross-origin isolation (COOP/COEP)");
+  if (!hasSharedArrayBuffer()) reasons.push("SharedArrayBuffer");
+  if (!hasAtomicsWait()) reasons.push("Atomics.wait");
+  if (!hasAtomicsWaitAsync()) reasons.push("Atomics.waitAsync");
+  if (typeof Worker === "undefined") reasons.push("dedicated Workers");
+  if (!hasOpfs()) reasons.push("Origin Private File System (OPFS)");
+  if (typeof navigator === "undefined" || typeof navigator.serviceWorker === "undefined") {
+    reasons.push("service workers");
+  }
+  return reasons;
+}
 function hasAtomicsWait() {
   return typeof Atomics !== "undefined" && typeof Atomics.wait === "function";
+}
+function hasAtomicsWaitAsync() {
+  return typeof Atomics !== "undefined" && typeof Atomics.waitAsync === "function";
 }
 function isCrossOriginIsolated() {
   return typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
@@ -385,7 +699,16 @@ function isCrossOriginIsolated() {
 function hasOpfs() {
   return typeof navigator !== "undefined" && typeof navigator.storage !== "undefined" && typeof navigator.storage.getDirectory === "function";
 }
-function registerServiceWorker(scriptURL = "/assets/sw.js", options = { type: "module" }, container) {
+function serviceWorkerScriptUrl(baseUrl) {
+  const baseHref = baseUrl ?? (typeof document !== "undefined" ? document.baseURI : void 0);
+  if (baseHref === void 0) {
+    return "/sw.js";
+  }
+  const base = new URL(baseHref);
+  const script = new URL("./sw.js", base);
+  return `${script.pathname}${script.search}`;
+}
+function registerServiceWorker(scriptURL = serviceWorkerScriptUrl(), options = { type: "module" }, container) {
   const target = container ?? (typeof navigator !== "undefined" ? navigator.serviceWorker : void 0);
   if (target === void 0) {
     return Promise.resolve(null);
@@ -526,12 +849,27 @@ function paintBoot(c, rows, animationFrame) {
 }
 function main() {
   console.log(`[pmos-bootstrap] PMos ${BOOT_VERSION} starting`);
-  void ensureFreshBootstrap();
+  const unsupported = unsupportedBrowserReasons();
+  if (unsupported.length > 0) {
+    const detail = `Missing required browser capabilities: ${unsupported.join(", ")}`;
+    console.error(`[pmos-bootstrap] unsupported browser: ${detail}`);
+    showUnsupportedBrowserMessage(detail);
+    return;
+  }
+  void registerServiceWorker().catch((error) => {
+    console.warn(
+      `[pmos-bootstrap] service-worker registration failed: ${String(error)}`
+    );
+  });
   if (!window.location.hash.includes("mock-kernel")) {
     const hash = window.location.hash;
     let bootBinary;
     if (hash.includes("input-echo")) {
       bootBinary = "/bin/hello_input_echo";
+    } else if (hash.includes("process-trap")) {
+      bootBinary = "/bin/hello_trap";
+    } else if (hash.includes("process-sigkill")) {
+      bootBinary = "/bin/hello_self_kill";
     } else if (hash.includes("real-kernel")) {
       bootBinary = "/bin/init";
     } else {
@@ -541,13 +879,25 @@ function main() {
     return;
   }
   const rows = [
-    { label: "Cross-origin isolation (COOP/COEP)", status: "pending", detail: "" },
+    {
+      label: "Cross-origin isolation (COOP/COEP)",
+      status: "pending",
+      detail: ""
+    },
     { label: "SharedArrayBuffer", status: "pending", detail: "" },
-    { label: "Atomics.wait", status: "pending", detail: "" },
-    { label: "Origin Private Filesystem (OPFS)", status: "pending", detail: "" },
+    { label: "Atomics.wait / waitAsync", status: "pending", detail: "" },
+    {
+      label: "Origin Private Filesystem (OPFS)",
+      status: "pending",
+      detail: ""
+    },
     { label: "Service worker", status: "pending", detail: "" },
     { label: "OffscreenCanvas", status: "pending", detail: "" },
-    { label: "Kernel WASM load (/assets/kernel.wasm)", status: "pending", detail: "" },
+    {
+      label: "Kernel WASM load (/assets/kernel.wasm)",
+      status: "pending",
+      detail: ""
+    },
     { label: "Kernel worker + console echo", status: "pending", detail: "" },
     { label: "Display server", status: "pending", detail: "" },
     { label: "Desktop shell", status: "pending", detail: "" }
@@ -598,12 +948,12 @@ function main() {
     }
   });
   step(2, 900, () => {
-    if (hasAtomicsWait()) {
+    if (hasAtomicsWait() && hasAtomicsWaitAsync()) {
       rows[2].status = "ok";
-      rows[2].detail = "Atomics.wait available";
+      rows[2].detail = "blocking user + async kernel waits available";
     } else {
       rows[2].status = "fail";
-      rows[2].detail = "Atomics.wait missing";
+      rows[2].detail = "Atomics.wait or Atomics.waitAsync missing";
     }
   });
   step(3, 1200, () => {
@@ -860,6 +1210,7 @@ function createKernelSession() {
     "error",
     (event) => {
       const message = event.message || event.error?.toString?.() || "worker load error";
+      void message;
     },
     { once: true }
   );
@@ -882,6 +1233,8 @@ function domCodeToScancode(code) {
   switch (code) {
     case "Enter":
       return 40;
+    case "Escape":
+      return 41;
     case "Backspace":
       return 42;
     case "Tab":
@@ -910,6 +1263,26 @@ function domCodeToScancode(code) {
       return 55;
     case "Slash":
       return 56;
+    case "Insert":
+      return 73;
+    case "Home":
+      return 74;
+    case "PageUp":
+      return 75;
+    case "Delete":
+      return 76;
+    case "End":
+      return 77;
+    case "PageDown":
+      return 78;
+    case "ArrowRight":
+      return 79;
+    case "ArrowLeft":
+      return 80;
+    case "ArrowDown":
+      return 81;
+    case "ArrowUp":
+      return 82;
     case "ShiftLeft":
       return 225;
     case "ShiftRight":
@@ -918,9 +1291,25 @@ function domCodeToScancode(code) {
       return 224;
     case "ControlRight":
       return 228;
+    case "AltLeft":
+      return 226;
+    case "AltRight":
+      return 230;
     default:
       return null;
   }
+}
+function createGuiKeyboardInputHandler(kernelWorker, state) {
+  return (event) => {
+    if (event.metaKey) return;
+    const scancode = domCodeToScancode(event.code);
+    if (scancode === null) return;
+    event.preventDefault();
+    kernelWorker.postMessage({
+      kind: "input:kbd",
+      bytes: packKbdEvent(scancode, state)
+    });
+  };
 }
 function keyToBytes(key) {
   if (key === "Enter") {
@@ -936,6 +1325,50 @@ function keyToBytes(key) {
     }
   }
   return null;
+}
+function createLegacyKeyboardInputHandler(kernelWorker, maxLineBytes = 4096) {
+  if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) {
+    throw new Error(
+      `createLegacyKeyboardInputHandler: maxLineBytes must be a positive integer, got ${maxLineBytes}`
+    );
+  }
+  const chunks = [];
+  let bufferedBytes = 0;
+  return (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) {
+      return;
+    }
+    if (event.key === "Backspace") {
+      if (chunks.length > 0) {
+        const removed = chunks.pop();
+        bufferedBytes -= removed?.byteLength ?? 0;
+      }
+      event.preventDefault();
+      return;
+    }
+    const bytes = keyToBytes(event.key);
+    if (bytes === null) {
+      return;
+    }
+    event.preventDefault();
+    if (event.key !== "Enter") {
+      if (bufferedBytes + bytes.byteLength <= maxLineBytes) {
+        chunks.push(bytes);
+        bufferedBytes += bytes.byteLength;
+      }
+      return;
+    }
+    const line = new Uint8Array(bufferedBytes + bytes.byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      line.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    line.set(bytes, offset);
+    chunks.length = 0;
+    bufferedBytes = 0;
+    kernelWorker.postMessage({ kind: "input:kbd", bytes: line });
+  };
 }
 function paintBlitToCanvas(c, frame_) {
   const { ctx, canvas, dpr } = c;
@@ -1016,6 +1449,61 @@ function paintBlitToCanvasFullscreen(c, frame_) {
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(tmp, dx, dy, dw, dh);
 }
+function createGuiDesktopReadyLatch(onReady) {
+  let ready = false;
+  return {
+    get ready() {
+      return ready;
+    },
+    notePresentFence(serial) {
+      if (ready || !Number.isInteger(serial) || serial <= 0 || serial > 4294967295) {
+        return;
+      }
+      ready = true;
+      onReady();
+    }
+  };
+}
+function isBootInteractionAllowed(state) {
+  return state.kernelReady && (!state.storageDegraded || state.temporaryStorageAccepted) && (state.guiDesktopReady === null || state.guiDesktopReady);
+}
+function wireFramebufferPresentations(options) {
+  const now = options.now ?? (() => performance.now());
+  const makeFrameEvent = options.makeFrameEvent ?? ((detail) => new CustomEvent("pmos:frame", { detail }));
+  let sequence = 0;
+  let firstPresentSeen = false;
+  let receivedAt = null;
+  options.renderer.onPresentComplete(() => {
+    sequence += 1;
+    const presentationReceivedAt = receivedAt ?? now();
+    receivedAt = null;
+    const paintedAt = now();
+    options.target.dataset.pmosFrameSequence = String(sequence);
+    options.target.dispatchEvent(
+      makeFrameEvent({
+        sequence,
+        receivedAt: presentationReceivedAt,
+        paintedAt
+      })
+    );
+    if (!firstPresentSeen) {
+      firstPresentSeen = true;
+      options.onFirstPresent?.();
+    }
+  });
+  options.host.onFrame((frame) => {
+    receivedAt = now();
+    options.renderer.paintFrame(frame);
+  });
+  options.host.onPatch((patch) => {
+    receivedAt = now();
+    options.renderer.paintPatch(patch);
+  });
+  options.host.onPatchBatch((batch) => {
+    receivedAt = now();
+    options.renderer.paintPatchBatch(batch.patches);
+  });
+}
 function runRealKernelMode(bootBinary) {
   console.log(
     `[pmos-bootstrap] real-kernel mode enabled via URL (bootBinary=${bootBinary})`
@@ -1024,6 +1512,23 @@ function runRealKernelMode(bootBinary) {
   const consoleEl = mountRealKernelConsole(isGuiBoot);
   const splash = isGuiBoot ? mountBootSplash() : null;
   const worker = new Worker("/assets/kernel-worker.js", { type: "module" });
+  let kernelReady = false;
+  let storageDegraded = false;
+  let temporaryStorageAccepted = false;
+  const guiDesktopReady = isGuiBoot ? createGuiDesktopReadyLatch(() => {
+    splash?.markStarted("Desktop ready");
+    splash?.dismiss();
+  }) : null;
+  const userInteractionAllowed = () => isBootInteractionAllowed({
+    kernelReady,
+    storageDegraded,
+    temporaryStorageAccepted,
+    guiDesktopReady: guiDesktopReady?.ready ?? null
+  });
+  const targetsStorageRecoveryControl = (event) => {
+    const recovery = document.getElementById("pmos-storage-recovery");
+    return event.target !== null && recovery?.contains(event.target) === true;
+  };
   if (splash) {
     splash.markStarted("Browser environment ready");
     splash.markStarted("Kernel worker spawned");
@@ -1041,19 +1546,23 @@ function runRealKernelMode(bootBinary) {
         canvas.style.width = `${mode.width}px`;
         canvas.style.height = `${mode.height}px`;
         if (splash) {
-          splash.markStarted(`Framebuffer mode set ${mode.width}\xD7${mode.height}`);
+          splash.markStarted(
+            `Framebuffer mode set ${mode.width}\xD7${mode.height}`
+          );
         }
       });
-      let firstFrameSeen = false;
-      fbHost.onFrame((frame) => {
-        renderer.paintFrame(frame);
-        if (!firstFrameSeen) {
-          firstFrameSeen = true;
+      wireFramebufferPresentations({
+        host: fbHost,
+        renderer,
+        target: canvas,
+        onFirstPresent: () => {
           if (splash) {
-            splash.markStarted("Desktop wallpaper rendered");
-            splash.dismiss();
+            splash.markStarted("Framebuffer presentation completed");
           }
         }
+      });
+      fbHost.onPresentFence((serial) => {
+        guiDesktopReady?.notePresentFence(serial);
       });
       const toFbCoords = (event) => {
         if (!guiFbMode) return null;
@@ -1078,6 +1587,7 @@ function runRealKernelMode(bootBinary) {
         }
       };
       canvas.addEventListener("pointermove", (event) => {
+        if (!userInteractionAllowed()) return;
         const coords = toFbCoords(event);
         if (!coords) return;
         const [x, y] = coords;
@@ -1087,6 +1597,10 @@ function runRealKernelMode(bootBinary) {
         });
       });
       canvas.addEventListener("pointerdown", (event) => {
+        if (!userInteractionAllowed()) {
+          event.preventDefault();
+          return;
+        }
         const coords = toFbCoords(event);
         if (!coords) return;
         const [x, y] = coords;
@@ -1097,6 +1611,10 @@ function runRealKernelMode(bootBinary) {
         });
       });
       canvas.addEventListener("pointerup", (event) => {
+        if (!userInteractionAllowed()) {
+          event.preventDefault();
+          return;
+        }
         const coords = toFbCoords(event);
         if (!coords) return;
         const [x, y] = coords;
@@ -1109,24 +1627,27 @@ function runRealKernelMode(bootBinary) {
       canvas.addEventListener("contextmenu", (event) => {
         event.preventDefault();
       });
+      const guiKeyDown = createGuiKeyboardInputHandler(
+        worker,
+        KbdKeyState.Pressed
+      );
+      const guiKeyUp = createGuiKeyboardInputHandler(
+        worker,
+        KbdKeyState.Released
+      );
       window.addEventListener("keydown", (event) => {
-        const sc = domCodeToScancode(event.code);
-        if (sc === null) return;
-        if (event.ctrlKey || event.metaKey || event.altKey) return;
-        event.preventDefault();
-        worker.postMessage({
-          kind: "input:kbd",
-          bytes: packKbdEvent(sc, KbdKeyState.Pressed)
-        });
+        if (!userInteractionAllowed()) {
+          if (!targetsStorageRecoveryControl(event)) event.preventDefault();
+          return;
+        }
+        guiKeyDown(event);
       });
       window.addEventListener("keyup", (event) => {
-        const sc = domCodeToScancode(event.code);
-        if (sc === null) return;
-        if (event.ctrlKey || event.metaKey || event.altKey) return;
-        worker.postMessage({
-          kind: "input:kbd",
-          bytes: packKbdEvent(sc, KbdKeyState.Released)
-        });
+        if (!userInteractionAllowed()) {
+          if (!targetsStorageRecoveryControl(event)) event.preventDefault();
+          return;
+        }
+        guiKeyUp(event);
       });
     }
   }
@@ -1142,7 +1663,10 @@ function runRealKernelMode(bootBinary) {
         return new ArrayBuffer(SAB_SIZE);
       }
     },
-    getKernelWakeSlot: () => kernelWakeSlot
+    getKernelWakeSlot: () => kernelWakeSlot,
+    onLiveWorkersChanged: (count) => {
+      document.body.dataset["pmosLiveWorkers"] = String(count);
+    }
   });
   worker.addEventListener("message", (ev) => {
     const msg = ev.data;
@@ -1151,7 +1675,32 @@ function runRealKernelMode(bootBinary) {
       document.body.dataset["pmosWakeSlotReady"] = "1";
       return;
     }
+    if (msg.kind === "host:pick") {
+      requestHostFilePicker(worker, void 0, userInteractionAllowed);
+      return;
+    }
+    if (msg.kind === "host:download") {
+      saveHostDownload(msg.name, msg.mime, msg.bytes);
+      return;
+    }
+    if (msg.kind === "storage:degraded") {
+      storageDegraded = true;
+      showStorageRecoveryGate(msg, {
+        onRetry: () => window.location.reload(),
+        onContinueTemporary: () => {
+          temporaryStorageAccepted = true;
+          console.warn(
+            "[pmos-bootstrap] temporary storage session explicitly accepted; files will be lost on reload"
+          );
+        }
+      });
+      return;
+    }
     router.handleKernelMessage(msg);
+    if (msg.kind === "proc:terminate") {
+      document.body.dataset["pmosLastTerminatedPid"] = String(msg.pid);
+      document.body.dataset["pmosLastTerminatedSignal"] = String(msg.signal);
+    }
     if (router.liveWorkers.size > peakLiveWorkers) {
       peakLiveWorkers = router.liveWorkers.size;
       document.body.dataset["pmosPeakLiveWorkers"] = String(peakLiveWorkers);
@@ -1176,9 +1725,10 @@ function runRealKernelMode(bootBinary) {
   const crashScreen = isGuiBoot ? mountCrashScreen() : null;
   const recentLines = [];
   const RECENT_LINES_CAP = 80;
+  const transcript = new ConsoleTranscript(consoleEl);
   consoleHost.onOutput((bytes) => {
     const text = new TextDecoder().decode(bytes);
-    consoleEl.textContent += text;
+    transcript.append(text);
     console.log(`[real-kernel] ${text.replace(/\n$/, "")}`);
     if (splash) {
       splash.observeConsoleLine(text);
@@ -1189,15 +1739,16 @@ function runRealKernelMode(bootBinary) {
   });
   consoleHost.onLifecycle((event) => {
     if (event.kind === "ready") {
+      kernelReady = true;
       console.log("[pmos-bootstrap] real kernel ready");
       if (splash) {
         splash.markStarted("Kernel ready");
       }
     } else if (event.kind === "panic") {
       console.error(`[pmos-bootstrap] real kernel panic: ${event.message}`);
-      consoleEl.textContent += `
+      transcript.append(`
 [panic] ${event.message}
-`;
+`);
       if (splash) {
         splash.markFailed(`Kernel panic: ${event.message}`);
       }
@@ -1243,22 +1794,23 @@ function runRealKernelMode(bootBinary) {
     }
   });
   if (!isGuiBoot) {
+    const legacyKeyDown = createLegacyKeyboardInputHandler(worker);
     document.addEventListener("keydown", (event) => {
-      if (event.ctrlKey || event.metaKey || event.altKey) {
+      if (!userInteractionAllowed()) {
+        if (!targetsStorageRecoveryControl(event)) event.preventDefault();
         return;
       }
-      const bytes = keyToBytes(event.key);
-      if (bytes === null) {
-        return;
-      }
-      event.preventDefault();
-      const msg = { kind: "input:kbd", bytes };
-      worker.postMessage(msg);
+      legacyKeyDown(event);
     });
   }
   installPagehideSync(worker);
   installBeforeUnloadSync(worker);
   installPeriodicSync(worker);
+  installHostFileDropHandler(
+    worker,
+    window,
+    userInteractionAllowed
+  );
 }
 function mountRealKernelConsole(gui = false) {
   const existing = document.getElementById("pmos-real-console");
@@ -1323,13 +1875,9 @@ function mountBootSplash() {
     "color: #e6e6e6",
     'font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace',
     "z-index: 1000",
-    "transition: opacity 350ms ease-out",
     "opacity: 1",
-    // Don't intercept clicks; once the canvas is alive the
-    // user's clicks need to reach it. (The splash dismiss
-    // animation overlaps for ~350ms; pointer-events:none
-    // makes the splash transparent to input during that
-    // window.)
+    // The bootstrap's explicit input gate discards canvas input until desktop
+    // readiness. The overlay never owns pointer input, including while booting.
     "pointer-events: none"
   ].join("; ");
   const titleBlock = document.createElement("div");
@@ -1371,18 +1919,97 @@ function mountBootSplash() {
   overlay.appendChild(list);
   document.body.appendChild(overlay);
   const steps = [
-    { label: "Browser environment ready", consoleHints: [], startedAt: null, failed: false, failureMessage: null },
-    { label: "Kernel worker spawned", consoleHints: [], startedAt: null, failed: false, failureMessage: null },
-    { label: "Kernel ready", consoleHints: [], startedAt: null, failed: false, failureMessage: null },
-    { label: "init (PID 1) running", consoleHints: ["init-desktop starting"], startedAt: null, failed: false, failureMessage: null },
-    { label: "display-server spawned", consoleHints: ["init-desktop spawned display-server"], startedAt: null, failed: false, failureMessage: null },
-    { label: "shell spawned", consoleHints: ["init-desktop spawned shell"], startedAt: null, failed: false, failureMessage: null },
-    { label: "init supervising children", consoleHints: ["init-desktop entering supervision loop"], startedAt: null, failed: false, failureMessage: null },
-    { label: "display-server bound /run/display", consoleHints: ["display-server starting"], startedAt: null, failed: false, failureMessage: null },
-    { label: "shell connected to display", consoleHints: ["shell: connected to /run/display"], startedAt: null, failed: false, failureMessage: null },
-    { label: "shell handshake complete", consoleHints: ["display-server served client 0"], startedAt: null, failed: false, failureMessage: null },
-    { label: "Framebuffer mode set 1024\xD7768", consoleHints: [], startedAt: null, failed: false, failureMessage: null },
-    { label: "Desktop wallpaper rendered", consoleHints: [], startedAt: null, failed: false, failureMessage: null }
+    {
+      label: "Browser environment ready",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "Kernel worker spawned",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "Kernel ready",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "init (PID 1) running",
+      consoleHints: ["init-desktop starting"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "display-server spawned",
+      consoleHints: ["init-desktop spawned display-server"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "shell spawned",
+      consoleHints: ["init-desktop spawned shell"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "init supervising children",
+      consoleHints: ["init-desktop entering supervision loop"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "display-server bound /run/display",
+      consoleHints: ["display-server starting"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "shell connected to display",
+      consoleHints: ["shell: connected to /run/display"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "shell handshake complete",
+      consoleHints: ["display-server served client 0"],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "Framebuffer mode set 1024\xD7768",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "Framebuffer presentation completed",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    },
+    {
+      label: "Desktop ready",
+      consoleHints: [],
+      startedAt: null,
+      failed: false,
+      failureMessage: null
+    }
   ];
   const rows = steps.map((step) => {
     const row = document.createElement("div");
@@ -1493,12 +2120,26 @@ function mountBootSplash() {
     }
   }
   function dismiss() {
-    overlay.style.opacity = "0";
-    window.setTimeout(() => {
-      overlay.remove();
-    }, 400);
+    overlay.remove();
   }
   return { markStarted, markFailed, observeConsoleLine, dismiss };
+}
+function classifyFatalConsoleText(text) {
+  const lower = text.toLowerCase();
+  const lastLine = text.trim().split("\n").slice(-1)[0] ?? "";
+  if (lower.includes("real kernel panic")) {
+    return { title: "Kernel panic", subtitle: lastLine };
+  }
+  if (lower.includes("dispatch error")) {
+    return { title: "Shell dispatch error", subtitle: lastLine };
+  }
+  if (lower.includes("init-desktop reaped child pid=3")) {
+    return {
+      title: "Display server died",
+      subtitle: "init-desktop reaped the display-server. The desktop cannot run without it."
+    };
+  }
+  return null;
 }
 function mountCrashScreen() {
   const overlay = document.createElement("div");
@@ -1519,10 +2160,7 @@ function mountCrashScreen() {
     "overflow: auto"
   ].join("; ");
   const container = document.createElement("div");
-  container.style.cssText = [
-    "max-width: 880px",
-    "width: 100%"
-  ].join("; ");
+  container.style.cssText = ["max-width: 880px", "width: 100%"].join("; ");
   const banner = document.createElement("div");
   banner.style.cssText = [
     "background: #ff4040",
@@ -1577,10 +2215,7 @@ function mountCrashScreen() {
     "word-break: break-word"
   ].join("; ");
   const buttons = document.createElement("div");
-  buttons.style.cssText = [
-    "display: flex",
-    "gap: 0.75rem"
-  ].join("; ");
+  buttons.style.cssText = ["display: flex", "gap: 0.75rem"].join("; ");
   const reload = document.createElement("button");
   reload.textContent = "Reload";
   reload.style.cssText = [
@@ -1632,26 +2267,13 @@ function mountCrashScreen() {
         recentSink.shift();
       }
     }
-    const lower = text.toLowerCase();
-    if (!shown && (lower.includes("dispatch error") || lower.includes("real kernel panic") || lower.includes("init-desktop reaped child pid=4") || lower.includes("init-desktop reaped child pid=3"))) {
+    const diagnosis = classifyFatalConsoleText(text);
+    if (!shown && diagnosis !== null) {
       window.setTimeout(() => {
         if (shown) return;
-        let title2 = "Userland process crashed";
-        let subtitle2 = text.trim().split("\n").slice(-1)[0] ?? "";
-        if (lower.includes("real kernel panic")) {
-          title2 = "Kernel panic";
-        } else if (lower.includes("dispatch error")) {
-          title2 = "Shell dispatch error";
-        } else if (lower.includes("init-desktop reaped child pid=3")) {
-          title2 = "Display server died";
-          subtitle2 = "init-desktop reaped the display-server. The desktop cannot run without it.";
-        } else if (lower.includes("init-desktop reaped child pid=4")) {
-          title2 = "Shell died";
-          subtitle2 = "init-desktop reaped the shell. The desktop cannot run without it.";
-        }
         show({
-          title: title2,
-          subtitle: subtitle2,
+          title: diagnosis.title,
+          subtitle: diagnosis.subtitle,
           recent: recentSink
         });
       }, 50);
@@ -1676,6 +2298,15 @@ function showFallbackMessage(error) {
       <p style="color:#808591">See devtools console for details.</p>
     </div>`;
 }
+function showUnsupportedBrowserMessage(detail) {
+  document.body.innerHTML = `
+    <main id="pmos-unsupported-browser" style="box-sizing:border-box;padding:2rem;font-family:ui-monospace,monospace;color:#e6e6e6;background:#0a0e14;min-height:100vh">
+      <h1 style="color:#ffb454">PMos cannot start in this browser</h1>
+      <p>${escapeHtml(detail)}</p>
+      <p>PMos requires persistent browser-local storage so it never presents a desktop that silently loses your files.</p>
+      <p style="color:#a8adb7">Use a current browser with OPFS, service workers, cross-origin isolation, SharedArrayBuffer, Atomics.wait, Atomics.waitAsync, and dedicated Workers.</p>
+    </main>`;
+}
 function showPanic(message) {
   const panel = document.getElementById("pmos-panic");
   const msg = document.getElementById("pmos-panic-message");
@@ -1699,12 +2330,224 @@ function showPanic(message) {
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
+var MAX_LIVE_USER_WORKERS = 256;
+var USER_WORKER_TRAP_LOG_MAX = 240;
+function sanitizeUserWorkerTrap(trap) {
+  const singleLine = trap.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim();
+  const visible = singleLine === "" ? "(empty trap)" : singleLine;
+  return visible.length <= USER_WORKER_TRAP_LOG_MAX ? visible : `${visible.slice(0, USER_WORKER_TRAP_LOG_MAX - 3)}...`;
+}
 function installPagehideSync(kernelWorker, target = window) {
   const listener = () => {
     kernelWorker.postMessage({ kind: "sync:request" });
   };
   target.addEventListener("pagehide", listener);
   return listener;
+}
+function browserHostFilePicker() {
+  return {
+    pick(onFiles) {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.multiple = true;
+      input.hidden = true;
+      input.addEventListener(
+        "change",
+        () => {
+          if (input.files !== null) onFiles(input.files);
+          input.remove();
+        },
+        { once: true }
+      );
+      document.body.append(input);
+      input.click();
+    }
+  };
+}
+function requestHostFilePicker(kernelWorker, picker = browserHostFilePicker(), interactionAllowed = () => true) {
+  if (!interactionAllowed()) {
+    console.warn(
+      "[pmos-bootstrap] host file picker blocked while storage recovery is active"
+    );
+    return;
+  }
+  picker.pick((files) => {
+    if (!interactionAllowed()) {
+      console.warn(
+        "[pmos-bootstrap] host file selection ignored while storage recovery is active"
+      );
+      return;
+    }
+    enqueueHostFileBatch(kernelWorker, files, interactionAllowed);
+  });
+}
+function browserHostDownloadTarget() {
+  return {
+    save(name, mime, bytes) {
+      const owned = new Uint8Array(bytes.byteLength);
+      owned.set(bytes);
+      const blob = new Blob([owned], {
+        type: mime || "application/octet-stream"
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = name;
+      anchor.hidden = true;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+  };
+}
+function safeHostDownloadName(name) {
+  const normalised = name.replaceAll("\\", "/");
+  const leaf = normalised.split("/").pop()?.trim() ?? "";
+  return leaf === "" || leaf === "." || leaf === ".." ? "download" : leaf;
+}
+function saveHostDownload(name, mime, bytes, target = browserHostDownloadTarget()) {
+  const owned = new Uint8Array(bytes.byteLength);
+  owned.set(bytes);
+  target.save(
+    safeHostDownloadName(name),
+    mime || "application/octet-stream",
+    owned
+  );
+}
+var nextHostFileToken = 1;
+function allocateHostFileToken() {
+  const token = nextHostFileToken;
+  nextHostFileToken = nextHostFileToken === 4294967295 ? 1 : nextHostFileToken + 1;
+  return token;
+}
+function installHostFileDropHandler(kernelWorker, target = window, interactionAllowed = () => true) {
+  const dragover = (e) => {
+    e.preventDefault();
+  };
+  const drop = (e) => {
+    e.preventDefault();
+    if (!interactionAllowed()) {
+      console.warn(
+        "[pmos-bootstrap] host file drop ignored while storage recovery is active"
+      );
+      return;
+    }
+    const dt = e.dataTransfer;
+    if (!dt || !dt.files) {
+      return;
+    }
+    enqueueHostFileBatch(kernelWorker, dt.files, interactionAllowed);
+  };
+  target.addEventListener("dragover", dragover);
+  target.addEventListener("drop", drop);
+  return { dragover, drop };
+}
+function preadmitHostFileBatch(files) {
+  if (!Number.isSafeInteger(files.length) || files.length < 0 || files.length > HOST_FILE_IMPORT_MAX_FILES) {
+    console.warn(
+      `[pmos-bootstrap] host import batch contains ${files.length} files; cap is ${HOST_FILE_IMPORT_MAX_FILES}; ignored`
+    );
+    return null;
+  }
+  const admitted = [];
+  let aggregateBytes = 0;
+  for (let i = 0; i < files.length; i += 1) {
+    const file = files[i];
+    if (!file) continue;
+    if (!Number.isSafeInteger(file.size) || file.size < 0) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: invalid browser File.size; ignored`
+      );
+      continue;
+    }
+    if (file.size > HOST_FILE_IMPORT_MAX_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: ${file.size} bytes exceeds v1 cap of ${HOST_FILE_IMPORT_MAX_BYTES}; ignored`
+      );
+      continue;
+    }
+    aggregateBytes += file.size;
+    if (aggregateBytes > HOST_FILE_IMPORT_MAX_TOTAL_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host import batch exceeds v1 aggregate cap of ${HOST_FILE_IMPORT_MAX_TOTAL_BYTES} bytes; ignored`
+      );
+      return null;
+    }
+    admitted.push(file);
+  }
+  return { files: admitted, bytes: aggregateBytes };
+}
+var pendingHostFileCount = 0;
+var pendingHostFileBytes = 0;
+var hostFileReadTail = Promise.resolve();
+function enqueueHostFileBatch(kernelWorker, files, interactionAllowed) {
+  const admitted = preadmitHostFileBatch(files);
+  if (admitted === null) return;
+  const nextCount = pendingHostFileCount + admitted.files.length;
+  const nextBytes = pendingHostFileBytes + admitted.bytes;
+  if (nextCount > HOST_FILE_IMPORT_MAX_FILES || nextBytes > HOST_FILE_IMPORT_MAX_TOTAL_BYTES) {
+    console.warn(
+      "[pmos-bootstrap] host import queue is at the v1 live-import limit; selection ignored"
+    );
+    return;
+  }
+  pendingHostFileCount = nextCount;
+  pendingHostFileBytes = nextBytes;
+  hostFileReadTail = hostFileReadTail.then(async () => {
+    try {
+      for (const file of admitted.files) {
+        if (!interactionAllowed()) {
+          console.warn(
+            "[pmos-bootstrap] queued host import cancelled while storage recovery is active"
+          );
+          return;
+        }
+        await deliverDropFile(kernelWorker, file);
+      }
+    } finally {
+      pendingHostFileCount -= admitted.files.length;
+      pendingHostFileBytes -= admitted.bytes;
+    }
+  }).catch((error) => {
+    console.warn(
+      `[pmos-bootstrap] host import queue failed: ${String(error)}`
+    );
+  });
+}
+async function deliverDropFile(kernelWorker, file) {
+  try {
+    if (file.size > HOST_FILE_IMPORT_MAX_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: ${file.size} bytes exceeds v1 cap of ${HOST_FILE_IMPORT_MAX_BYTES}; ignored`
+      );
+      return;
+    }
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    if (bytes.length > HOST_FILE_IMPORT_MAX_BYTES) {
+      console.warn(
+        `[pmos-bootstrap] host drop ${file.name}: ${bytes.length} bytes exceeds v1 cap of ${HOST_FILE_IMPORT_MAX_BYTES}; ignored`
+      );
+      return;
+    }
+    if (bytes.length !== file.size) {
+      console.warn(
+        `[pmos-bootstrap] host import ${file.name}: browser size changed from ${file.size} to ${bytes.length}; ignored`
+      );
+      return;
+    }
+    const token = allocateHostFileToken();
+    kernelWorker.postMessage({
+      kind: "host:dropped",
+      token,
+      name: file.name,
+      mime: file.type ?? "application/octet-stream",
+      bytes
+    });
+  } catch (e) {
+    console.warn(`[pmos-bootstrap] host drop failed: ${e.message}`);
+  }
 }
 function installBeforeUnloadSync(kernelWorker, target = window) {
   const listener = () => {
@@ -1729,6 +2572,7 @@ function installPeriodicSync(kernelWorker, intervalMs = 6e4, scheduler = {
 }
 function createSpawnRouter(deps) {
   const live = /* @__PURE__ */ new Map();
+  const maxLiveWorkers = deps.maxLiveWorkers ?? MAX_LIVE_USER_WORKERS;
   function recordMemory(pid, bytes) {
     if (!live.has(pid)) {
       return;
@@ -1740,7 +2584,15 @@ function createSpawnRouter(deps) {
     if (!entry) {
       return;
     }
+    if (trap !== void 0) {
+      console.error(
+        `[pmos-bootstrap] user worker crashed pid=${pid}: ${sanitizeUserWorkerTrap(trap)}`
+      );
+    }
     live.delete(pid);
+    deps.onLiveWorkersChanged?.(live.size);
+    entry.worker.removeEventListener("message", entry.onMessage);
+    entry.worker.removeEventListener("error", entry.onError);
     entry.worker.terminate();
     deps.kernelWorker.postMessage(
       trap !== void 0 ? { kind: "proc:exited", pid, code, trap } : { kind: "proc:exited", pid, code }
@@ -1749,53 +2601,114 @@ function createSpawnRouter(deps) {
   return {
     liveWorkers: live,
     handleKernelMessage(msg) {
+      if (msg.kind === "proc:terminate") {
+        reap(msg.pid, 128 + msg.signal, void 0);
+        return;
+      }
       if (msg.kind !== "proc:spawn") {
         return;
       }
-      const sab = deps.allocSab();
-      const worker = deps.workerFactory();
-      live.set(msg.pid, { worker, sab });
-      worker.addEventListener("message", (ev) => {
-        const m = ev.data;
-        if (m.pid !== msg.pid) {
-          return;
-        }
-        if (m.kind === "memory") {
-          recordMemory(msg.pid, m.bytes);
-          return;
-        }
-        if (m.memoryBytes !== void 0) {
-          recordMemory(msg.pid, m.memoryBytes);
-        }
-        if (m.kind === "exited") {
-          reap(msg.pid, m.code, m.trap);
-        }
-      });
-      worker.addEventListener("error", (ev) => {
-        reap(msg.pid, -1, ev.message ?? "user worker error");
-      });
-      const kernelWakeSlot = deps.getKernelWakeSlot?.() ?? null;
-      worker.postMessage(
-        kernelWakeSlot !== null ? {
-          kind: "boot",
+      if (live.has(msg.pid)) {
+        return;
+      }
+      if (live.size >= maxLiveWorkers) {
+        deps.kernelWorker.postMessage({
+          kind: "proc:exited",
           pid: msg.pid,
+          code: -1,
+          trap: `user worker limit exceeded (${maxLiveWorkers})`
+        });
+        return;
+      }
+      let worker;
+      try {
+        const sab = deps.allocSab();
+        worker = deps.workerFactory();
+        const onMessage = (ev) => {
+          const m = ev.data;
+          if (m.pid !== msg.pid) {
+            return;
+          }
+          if (m.kind === "booted") {
+            const entry = live.get(msg.pid);
+            if (!entry || entry.sabPublished) {
+              return;
+            }
+            entry.sabPublished = true;
+            deps.kernelWorker.postMessage({
+              kind: "proc:sab",
+              pid: msg.pid,
+              sab
+            });
+            return;
+          }
+          if (m.kind === "memory") {
+            recordMemory(msg.pid, m.bytes);
+            return;
+          }
+          if (m.kind === "exited" && m.memoryBytes !== void 0) {
+            recordMemory(msg.pid, m.memoryBytes);
+          }
+          if (m.kind === "exited") {
+            reap(msg.pid, m.code, m.trap);
+          }
+        };
+        const onError = (ev) => {
+          reap(msg.pid, -1, ev.message ?? "user worker error");
+        };
+        live.set(msg.pid, {
+          worker,
           sab,
-          wasmBytes: msg.wasmBytes,
-          kernelWakeSlot
-        } : {
-          kind: "boot",
-          pid: msg.pid,
-          sab,
-          wasmBytes: msg.wasmBytes
+          sabPublished: false,
+          onMessage,
+          onError
+        });
+        deps.onLiveWorkersChanged?.(live.size);
+        worker.addEventListener("message", onMessage);
+        worker.addEventListener("error", onError);
+        const kernelWakeSlot = deps.getKernelWakeSlot?.() ?? null;
+        worker.postMessage(
+          kernelWakeSlot !== null ? {
+            kind: "boot",
+            pid: msg.pid,
+            sab,
+            wasmBytes: msg.wasmBytes,
+            kernelWakeSlot
+          } : {
+            kind: "boot",
+            pid: msg.pid,
+            sab,
+            wasmBytes: msg.wasmBytes
+          }
+        );
+      } catch (error) {
+        const entry = live.get(msg.pid);
+        if (entry) {
+          live.delete(msg.pid);
+          deps.onLiveWorkersChanged?.(live.size);
+          entry.worker.removeEventListener("message", entry.onMessage);
+          entry.worker.removeEventListener("error", entry.onError);
+          entry.worker.terminate();
+        } else {
+          worker?.terminate();
         }
-      );
-      deps.kernelWorker.postMessage({ kind: "proc:sab", pid: msg.pid, sab });
+        const trap = error instanceof Error ? error.message : String(error);
+        deps.kernelWorker.postMessage({
+          kind: "proc:exited",
+          pid: msg.pid,
+          code: -1,
+          trap: `user worker boot failed: ${trap}`
+        });
+      }
     },
     terminateAll() {
       for (const [pid, entry] of live) {
+        entry.worker.removeEventListener("message", entry.onMessage);
+        entry.worker.removeEventListener("error", entry.onError);
         entry.worker.terminate();
         live.delete(pid);
       }
+      deps.onLiveWorkersChanged?.(live.size);
     }
   };
 }
@@ -1807,14 +2720,27 @@ if (typeof document !== "undefined") {
   }
 }
 export {
+  MAX_LIVE_USER_WORKERS,
   SAB_SIZE,
+  classifyFatalConsoleText,
+  createGuiDesktopReadyLatch,
+  createGuiKeyboardInputHandler,
+  createLegacyKeyboardInputHandler,
   createSpawnRouter,
   hasAtomicsWait,
+  hasAtomicsWaitAsync,
   hasOpfs,
   installBeforeUnloadSync,
+  installHostFileDropHandler,
   installPagehideSync,
   installPeriodicSync,
+  isBootInteractionAllowed,
   isCrossOriginIsolated,
   registerServiceWorker,
-  showPanic
+  requestHostFilePicker,
+  saveHostDownload,
+  serviceWorkerScriptUrl,
+  showPanic,
+  unsupportedBrowserReasons,
+  wireFramebufferPresentations
 };

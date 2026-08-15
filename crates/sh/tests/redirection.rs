@@ -18,7 +18,11 @@ fn unique_path(name: &str) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let mut p = std::env::temp_dir();
-    p.push(format!("sh_redirection_{}_{}_{name}", std::process::id(), n));
+    p.push(format!(
+        "sh_redirection_{}_{}_{name}",
+        std::process::id(),
+        n
+    ));
     let _ = fs::remove_file(&p);
     p
 }
@@ -46,8 +50,7 @@ fn drive(input: &str) -> (ExitStatus, String, String) {
 fn redirect_stdout_truncates_existing_file() {
     let p = unique_path("trunc");
     fs::write(&p, b"old contents").unwrap();
-    let (status, stdout, _stderr) =
-        drive(&format!("echo new > {}\nexit\n", p.display()));
+    let (status, stdout, _stderr) = drive(&format!("echo new > {}\nexit\n", p.display()));
     assert_eq!(status, ExitStatus::Exit(0));
     // Nothing on parent stdout — bytes went to file.
     assert!(!stdout.contains("new"));
@@ -59,8 +62,7 @@ fn redirect_stdout_truncates_existing_file() {
 #[test]
 fn redirect_stdout_creates_file_when_absent() {
     let p = unique_path("create");
-    let (_status, _stdout, _stderr) =
-        drive(&format!("echo hi > {}\nexit\n", p.display()));
+    let (_status, _stdout, _stderr) = drive(&format!("echo hi > {}\nexit\n", p.display()));
     let actual = fs::read_to_string(&p).unwrap();
     assert_eq!(actual, "hi\n");
     fs::remove_file(&p).ok();
@@ -70,8 +72,7 @@ fn redirect_stdout_creates_file_when_absent() {
 fn redirect_stdout_append_preserves_existing_bytes() {
     let p = unique_path("append");
     fs::write(&p, b"first\n").unwrap();
-    let (_status, _stdout, _stderr) =
-        drive(&format!("echo second >> {}\nexit\n", p.display()));
+    let (_status, _stdout, _stderr) = drive(&format!("echo second >> {}\nexit\n", p.display()));
     let actual = fs::read_to_string(&p).unwrap();
     assert_eq!(actual, "first\nsecond\n");
     fs::remove_file(&p).ok();
@@ -148,8 +149,10 @@ fn quoted_pipe_is_not_an_operator() {
 
 #[test]
 fn quoted_redirect_chars_pass_through() {
-    let (_status, stdout, _stderr) = drive(r#"echo "a>b<c"
+    let (_status, stdout, _stderr) = drive(
+        r#"echo "a>b<c"
 exit
-"#);
+"#,
+    );
     assert!(stdout.contains("a>b<c\n"), "stdout: {stdout:?}");
 }

@@ -51,11 +51,11 @@ use abi::ext::Pid;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DevId {
     Framebuffer = 0,
-    InputKbd    = 1,
-    InputMouse  = 2,
-    Block       = 3,
-    Net         = 4,
-    Console     = 5,
+    InputKbd = 1,
+    InputMouse = 2,
+    Block = 3,
+    Net = 4,
+    Console = 5,
 }
 
 /// Driver error codes the Platform may return from a control-channel call.
@@ -139,7 +139,29 @@ pub trait Platform: Sync + 'static {
     /// process-table entry. The caller (the `PROC_SPAWN` opcode
     /// handler) is responsible for the rollback; `spawn_process`
     /// itself has no side effects on kernel state.
-    fn spawn_process(&self, pid: Pid, path: &str) -> DriverResult<()>;
+    /// `executable` contains an owned-VFS program image when `path` resolved
+    /// inside PMos. `None` asks the host to resolve a bundled immutable binary.
+    fn spawn_process(&self, pid: Pid, path: &str, executable: Option<&[u8]>) -> DriverResult<()>;
+
+    /// Ask the host to forcibly terminate the user Worker backing
+    /// `pid`. The kernel has already transitioned the process to a
+    /// terminal state before calling this hook, so host transport
+    /// failure must not roll the kernel state back or make the pid
+    /// runnable again.
+    ///
+    /// This hook is used for non-catchable termination such as
+    /// SIGKILL. Voluntary exits and traps are reported in the other
+    /// direction by the host's process-exit reconciliation path.
+    fn terminate_process(&self, pid: Pid) -> DriverResult<()>;
+
+    /// Request the browser's native file picker after the kernel has
+    /// authorised the calling process with `Cap::HostTransfer`.
+    fn request_host_file_picker(&self) -> DriverResult<()>;
+
+    /// Publish a completed, kernel-owned download to the browser. This is
+    /// called only for an explicitly closed host-download fd; teardown paths
+    /// cancel their staging state without invoking the hook.
+    fn download_host_file(&self, name: &str, mime: &str, bytes: &[u8]) -> DriverResult<()>;
 }
 
 // --- Active-implementation selector ------------------------------------

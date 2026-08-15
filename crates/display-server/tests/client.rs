@@ -1,12 +1,14 @@
 //! Per-client state machine tests.
 
+use display_proto::MAX_SURFACE_PATCH_BYTES;
 use display_server::client::{
-    BufferAttachment, BufferInfo, Client, ClientError, ClientId, DamageRect, HandledRequest,
-    Pool, Surface, Toplevel, AUTO_LAYOUT_STEP, MAX_POOL_SIZE,
+    BufferAttachment, BufferInfo, Client, ClientError, ClientId, DamageRect, HandledRequest, Pool,
+    Surface, Toplevel, AUTO_LAYOUT_STEP, MAX_JOURNAL_ENTRIES, MAX_POOL_SIZE,
 };
 use display_server::ids::{IdKind, ObjectId};
 use display_server::objects::Interface;
 use display_server::wire::MessageHeader;
+use display_server::HEADER_SIZE;
 
 fn frame_request(object_id: ObjectId, opcode: u16) -> MessageHeader {
     MessageHeader::new(object_id, opcode, 0, 0)
@@ -34,7 +36,7 @@ fn registry_bind_payload(
     out.extend_from_slice(&name.to_le_bytes());
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
-    out.extend(core::iter::repeat(0u8).take(pad));
+    out.extend(core::iter::repeat_n(0u8, pad));
     out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&new_id.raw().to_le_bytes());
     out
@@ -46,6 +48,30 @@ fn new_client_has_only_the_display_object() {
     assert_eq!(c.object_count(), 1);
     assert_eq!(c.get(ObjectId::DISPLAY), Some(Interface::Display));
     assert_eq!(c.get(ObjectId::new(3)), None);
+}
+
+#[test]
+fn handled_request_journal_is_metadata_only_and_strictly_bounded() {
+    let mut c = Client::new(ClientId(1));
+    for fd_passing in 0..(MAX_JOURNAL_ENTRIES + 17) {
+        let payload = ObjectId::new(3).raw().to_le_bytes();
+        let header = MessageHeader::try_new(
+            ObjectId::DISPLAY,
+            1, /* sync */
+            payload.len(),
+            fd_passing as u8,
+        )
+        .unwrap();
+        c.dispatch_request(header, &payload).unwrap();
+        c.drain_pending_events();
+    }
+
+    assert_eq!(c.journal_len(), MAX_JOURNAL_ENTRIES);
+    let retained = c.drain_journal();
+    assert_eq!(retained.len(), MAX_JOURNAL_ENTRIES);
+    assert_eq!(retained[0].fd_passing, 17);
+    assert_eq!(retained.last().unwrap().fd_passing, 16);
+    assert_eq!(c.journal_len(), 0);
 }
 
 #[test]
@@ -65,6 +91,44 @@ fn dispatch_display_get_registry_succeeds_and_auto_installs_registry() {
     // Registry was auto-installed — no hand installation
     // by the test.
     assert_eq!(c.get(registry_id), Some(Interface::Registry));
+}
+
+#[test]
+fn dispatch_display_sync_emits_done_before_delete_and_destroys_callback() {
+    let mut c = Client::new(ClientId(1));
+    let callback_id = ObjectId::new(3);
+    let payload = callback_id.raw().to_le_bytes();
+    let header = MessageHeader::try_new(ObjectId::DISPLAY, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    assert_eq!(c.get(callback_id), None);
+    let events = c.drain_pending_events();
+    let done = MessageHeader::decode(&events).unwrap();
+    assert_eq!(done.object_id, callback_id);
+    assert_eq!(done.opcode, 1);
+    assert_eq!(done.length as usize, display_server::HEADER_SIZE + 4);
+    assert_eq!(
+        u32::from_le_bytes(
+            events[display_server::HEADER_SIZE..display_server::HEADER_SIZE + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+
+    let delete_offset = done.length as usize;
+    let delete = MessageHeader::decode(&events[delete_offset..]).unwrap();
+    assert_eq!(delete.object_id, ObjectId::DISPLAY);
+    assert_eq!(delete.opcode, 2);
+    assert_eq!(
+        u32::from_le_bytes(
+            events[delete_offset + display_server::HEADER_SIZE
+                ..delete_offset + display_server::HEADER_SIZE + 4]
+                .try_into()
+                .unwrap()
+        ),
+        callback_id.raw()
+    );
 }
 
 #[test]
@@ -408,7 +472,8 @@ fn emit_window_created_enqueues_a_shell_window_created_event() {
     let sm_id = ObjectId::new(5);
     c.install_client_object(sm_id, Interface::ShellManager)
         .unwrap();
-    c.emit_window_created(sm_id, 42, "term", "pmos.term").unwrap();
+    c.emit_window_created(sm_id, 42, "term", "pmos.term")
+        .unwrap();
 
     let bytes = c.drain_pending_events();
     let header = MessageHeader::decode(&bytes).unwrap();
@@ -443,6 +508,41 @@ fn emit_window_destroyed_focused_title_changed_use_distinct_opcodes() {
     assert_eq!(h3.opcode, 4 /* window_title_changed */);
     cursor += h3.length as usize;
     assert_eq!(cursor, bytes.len());
+}
+
+#[test]
+fn pending_window_titles_coalesce_by_window_and_retain_fifo_position() {
+    use display_proto::ShellWindowTitleChanged;
+    let mut client = Client::new(ClientId(1));
+    let shell_manager = ObjectId::new(5);
+    client
+        .install_client_object(shell_manager, Interface::ShellManager)
+        .unwrap();
+
+    client
+        .emit_window_title_changed(shell_manager, 3, "old")
+        .unwrap();
+    client
+        .emit_window_title_changed(shell_manager, 4, "other")
+        .unwrap();
+    client
+        .emit_window_title_changed(shell_manager, 3, "latest")
+        .unwrap();
+    assert_eq!(client.pending_events_len(), 2);
+    assert!(!client.event_queue_overflowed());
+
+    let bytes = client.drain_pending_events();
+    let first_header = MessageHeader::decode(&bytes).unwrap();
+    let first =
+        ShellWindowTitleChanged::decode(&bytes[HEADER_SIZE..first_header.length as usize]).unwrap();
+    assert_eq!((first.window_id, first.new_title.as_str()), (3, "latest"));
+    let second_offset = first_header.length as usize;
+    let second_header = MessageHeader::decode(&bytes[second_offset..]).unwrap();
+    let second = ShellWindowTitleChanged::decode(
+        &bytes[second_offset + HEADER_SIZE..second_offset + second_header.length as usize],
+    )
+    .unwrap();
+    assert_eq!((second.window_id, second.new_title.as_str()), (4, "other"));
 }
 
 #[test]
@@ -488,10 +588,8 @@ fn dispatch_registry_bind_shell_manager_without_cap_shell_is_permission_denied()
     let header = display_proto::wire::MessageHeader::decode(&event_bytes).unwrap();
     assert_eq!(header.object_id, ObjectId::DISPLAY);
     assert_eq!(header.opcode, 1 /* error */);
-    let decoded = display_proto::DisplayError::decode(
-        &event_bytes[10..header.length as usize],
-    )
-    .unwrap();
+    let decoded =
+        display_proto::DisplayError::decode(&event_bytes[10..header.length as usize]).unwrap();
     assert_eq!(decoded.object_id, ObjectId::new(5));
     assert_eq!(decoded.code, display_proto::error_code::PERMISSION_DENIED);
     assert!(decoded.message.contains("pmd_shell_manager"));
@@ -543,7 +641,11 @@ fn interface_required_cap_is_only_set_for_shell_manager_in_v1() {
         Interface::Buffer,
         Interface::Surface,
     ] {
-        assert_eq!(interface_required_cap(iface), None, "{iface:?} should be unrestricted");
+        assert_eq!(
+            interface_required_cap(iface),
+            None,
+            "{iface:?} should be unrestricted"
+        );
     }
 }
 
@@ -601,8 +703,10 @@ fn dispatch_full_walk_display_to_compositor_to_surface_via_auto_install() {
 
     let journal = c.drain_journal();
     assert_eq!(journal.len(), 4);
-    let names: Vec<(Interface, &str)> =
-        journal.iter().map(|r| (r.interface, r.opcode_name)).collect();
+    let names: Vec<(Interface, &str)> = journal
+        .iter()
+        .map(|r| (r.interface, r.opcode_name))
+        .collect();
     assert_eq!(
         names,
         vec![
@@ -648,6 +752,22 @@ fn shm_pool_create_buffer_payload(
     out.extend_from_slice(&height.to_le_bytes());
     out.extend_from_slice(&stride.to_le_bytes());
     out.extend_from_slice(&format.to_le_bytes());
+    out
+}
+
+fn shm_pool_write_rows_payload(
+    offset: u32,
+    row_bytes: u32,
+    rows: u32,
+    stride: u32,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + bytes.len());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&row_bytes.to_le_bytes());
+    out.extend_from_slice(&rows.to_le_bytes());
+    out.extend_from_slice(&stride.to_le_bytes());
+    out.extend_from_slice(bytes);
     out
 }
 
@@ -757,8 +877,7 @@ fn dispatch_full_walk_display_to_surface_commit_with_attached_buffer() {
     c.dispatch_request(header, &payload).unwrap();
 
     // 6. pool.create_buffer.
-    let payload =
-        shm_pool_create_buffer_payload(buffer_id, 0, 320, 240, 320 * 4, 0);
+    let payload = shm_pool_create_buffer_payload(buffer_id, 0, 320, 240, 320 * 4, 0);
     let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
     c.dispatch_request(header, &payload).unwrap();
 
@@ -888,7 +1007,10 @@ fn pool_bytes_mut_lets_a_test_simulate_a_client_sab_write() {
     }
     // Read-back path.
     let read = c.pool_bytes(pool_id).unwrap();
-    assert_eq!(read, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    assert_eq!(
+        read,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    );
 }
 
 #[test]
@@ -925,14 +1047,7 @@ fn create_buffer_records_buffer_info_in_the_per_client_map() {
     dispatch_create_pool(&mut c, shm_id, pool_id, 8 * 8 * 4);
 
     let buffer_id = ObjectId::new(9);
-    let payload = shm_pool_create_buffer_payload(
-        buffer_id,
-        0,
-        8,
-        8,
-        8 * 4,
-        0, /* ARGB8888 */
-    );
+    let payload = shm_pool_create_buffer_payload(buffer_id, 0, 8, 8, 8 * 4, 0 /* ARGB8888 */);
     let header = MessageHeader::try_new(pool_id, 1, payload.len(), 0).unwrap();
     c.dispatch_request(header, &payload).unwrap();
 
@@ -1016,7 +1131,10 @@ fn buffer_bytes_returns_the_sub_slice_of_the_parent_pool() {
     c.dispatch_request(header, &payload).unwrap();
 
     let bytes = c.buffer_bytes(buffer_id).expect("buffer bytes");
-    assert_eq!(bytes, &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
+    assert_eq!(
+        bytes,
+        &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    );
 }
 
 #[test]
@@ -1046,8 +1164,10 @@ fn buffer_bytes_sees_subsequent_pool_writes_live() {
     let bytes = c.buffer_bytes(buffer_id).unwrap();
     assert_eq!(
         bytes,
-        &[0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8, 0xF7, 0xF6, 0xF5, 0xF4,
-          0xF3, 0xF2, 0xF1, 0xF0]
+        &[
+            0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8, 0xF7, 0xF6, 0xF5, 0xF4, 0xF3, 0xF2,
+            0xF1, 0xF0
+        ]
     );
 }
 
@@ -1063,6 +1183,64 @@ fn pool_none_for_unknown_object_id() {
     let c = Client::new(ClientId(1));
     assert!(c.pool(ObjectId::new(999)).is_none());
     assert!(c.pool_bytes(ObjectId::new(999)).is_none());
+}
+
+#[test]
+fn packed_pool_rows_update_only_the_validated_strided_region() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    let pool_id = ObjectId::new(7);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    dispatch_create_pool(&mut c, shm_id, pool_id, 16);
+
+    let payload = shm_pool_write_rows_payload(1, 3, 2, 5, &[1, 2, 3, 4, 5, 6]);
+    let header = MessageHeader::try_new(pool_id, 5, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+
+    assert_eq!(
+        c.pool_bytes(pool_id).unwrap(),
+        &[0, 1, 2, 3, 0, 0, 4, 5, 6, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(c.drain_journal().last().unwrap().opcode_name, "write_rows");
+}
+
+#[test]
+fn packed_pool_rows_reject_malformed_geometry_and_extent_atomically() {
+    let mut c = Client::new(ClientId(1));
+    let shm_id = ObjectId::new(5);
+    let pool_id = ObjectId::new(7);
+    c.install_client_object(shm_id, Interface::Shm).unwrap();
+    dispatch_create_pool(&mut c, shm_id, pool_id, 16);
+    c.pool_bytes_mut(pool_id).unwrap().fill(0x55);
+    let before = c.pool_bytes(pool_id).unwrap().to_vec();
+
+    let truncated = shm_pool_write_rows_payload(1, 3, 2, 5, &[1, 2, 3, 4, 5]);
+    let header = MessageHeader::try_new(pool_id, 5, truncated.len(), 0).unwrap();
+    assert!(matches!(
+        c.dispatch_request(header, &truncated).unwrap_err(),
+        ClientError::Malformed { .. }
+    ));
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), before);
+
+    let overlapping = shm_pool_write_rows_payload(1, 3, 2, 2, &[1, 2, 3, 4, 5, 6]);
+    let header = MessageHeader::try_new(pool_id, 5, overlapping.len(), 0).unwrap();
+    assert!(matches!(
+        c.dispatch_request(header, &overlapping).unwrap_err(),
+        ClientError::InvalidPoolWriteRows {
+            row_bytes: 3,
+            rows: 2,
+            stride: 2,
+        }
+    ));
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), before);
+
+    let outside = shm_pool_write_rows_payload(14, 2, 2, u32::MAX, &[1, 2, 3, 4]);
+    let header = MessageHeader::try_new(pool_id, 5, outside.len(), 0).unwrap();
+    assert!(matches!(
+        c.dispatch_request(header, &outside).unwrap_err(),
+        ClientError::BufferOutOfPool { .. }
+    ));
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), before);
 }
 
 // ---- Surface state machine (attach / damage / commit) ----------
@@ -1133,6 +1311,23 @@ fn surface_damage_payload(x: i32, y: i32, w: i32, h: i32) -> Vec<u8> {
     out
 }
 
+fn surface_patch_payload(x: i32, y: i32, width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + pixels.len());
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(pixels);
+    out
+}
+
+fn shm_pool_write_payload(offset: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
 fn dispatch_attach(c: &mut Client, surface_id: ObjectId, buffer_id: ObjectId, x: i32, y: i32) {
     let payload = surface_attach_payload(buffer_id, x, y);
     let header = MessageHeader::try_new(surface_id, 2, payload.len(), 0).unwrap();
@@ -1148,6 +1343,51 @@ fn dispatch_damage(c: &mut Client, surface_id: ObjectId, x: i32, y: i32, w: i32,
 fn dispatch_commit(c: &mut Client, surface_id: ObjectId) {
     let header = MessageHeader::try_new(surface_id, 7, 0, 0).unwrap();
     c.dispatch_request(header, &[]).unwrap();
+}
+
+fn dispatch_patch(
+    c: &mut Client,
+    surface_id: ObjectId,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), ClientError> {
+    let payload = surface_patch_payload(x, y, width, height, pixels);
+    let header = MessageHeader::try_new(surface_id, 8, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload)
+}
+
+fn create_test_surface(c: &mut Client, surface_id: ObjectId) {
+    let payload = new_id_payload(surface_id);
+    let header = MessageHeader::try_new(ObjectId::new(5), 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+}
+
+fn create_test_buffer(c: &mut Client, buffer_id: ObjectId, info: BufferInfo) {
+    let payload = shm_pool_create_buffer_payload(
+        buffer_id,
+        info.offset,
+        info.width,
+        info.height,
+        info.stride,
+        info.format,
+    );
+    let header = MessageHeader::try_new(info.pool_id, 1, payload.len(), 0).unwrap();
+    c.dispatch_request(header, &payload).unwrap();
+}
+
+fn drain_event_descriptors(c: &mut Client) -> Vec<(ObjectId, u16)> {
+    let bytes = c.drain_pending_events();
+    let mut offset = 0;
+    let mut events = Vec::new();
+    while offset < bytes.len() {
+        let header = MessageHeader::decode(&bytes[offset..]).unwrap();
+        events.push((header.object_id, header.opcode));
+        offset += header.length as usize;
+    }
+    events
 }
 
 #[test]
@@ -1294,17 +1534,9 @@ fn detach_via_attach_null_then_commit_clears_current_buffer() {
 
     // Now attach(null) + commit → detach.
     dispatch_attach(&mut c, surface_id, ObjectId::NULL, 0, 0);
-    // The pending buffer is None; on commit, this branch
-    // takes the "no pending attach" path and leaves
-    // current in place. Wayland's canonical detach is
-    // attach(null) + commit; we match that by NOT
-    // clearing current here. A follow-up slice may
-    // distinguish "no attach" from "explicit detach".
     dispatch_commit(&mut c, surface_id);
-    // For now, the v1 semantics leave `current_buffer`
-    // pinned after attach(null). That's documented here
-    // so the behaviour is explicit.
-    assert!(c.surface(surface_id).unwrap().current_buffer.is_some());
+    assert!(c.surface(surface_id).unwrap().current_buffer.is_none());
+    assert!(!c.surface(surface_id).unwrap().pending_attach);
 }
 
 #[test]
@@ -1321,6 +1553,515 @@ fn two_attaches_before_a_commit_keep_only_the_last_pending() {
             y: 2,
         })
     );
+}
+
+#[test]
+fn patch_current_updates_only_the_requested_current_rows_without_release() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    assert!(drain_event_descriptors(&mut c).is_empty());
+
+    let attachment = c.surface(surface_id).unwrap().current_buffer;
+    let pixels = [1, 2, 3, 4, 5, 6, 7, 8];
+    dispatch_patch(&mut c, surface_id, 1, 2, 2, 1, &pixels).unwrap();
+
+    let pool = c.pool_bytes(pool_id).unwrap();
+    assert_eq!(&pool[36..44], &pixels);
+    assert!(pool[..36].iter().all(|byte| *byte == 0));
+    assert!(pool[44..].iter().all(|byte| *byte == 0));
+    let surface = c.surface(surface_id).unwrap();
+    assert_eq!(surface.current_buffer, attachment);
+    assert!(!surface.pending_attach);
+    assert!(surface.pending_damage.is_empty());
+    assert_eq!(surface.commit_count, 2);
+    assert!(drain_event_descriptors(&mut c).is_empty());
+    assert_eq!(
+        c.drain_journal().last().unwrap().opcode_name,
+        "patch_current"
+    );
+}
+
+#[test]
+fn patch_current_missing_malformed_and_pending_rejections_are_atomic() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    let pool_before = c.pool_bytes(pool_id).unwrap().to_vec();
+    let surface_before = c.surface(surface_id).unwrap().clone();
+    assert_eq!(
+        dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &[0; 4]).unwrap_err(),
+        ClientError::SurfacePatchNoCurrentBuffer { surface_id }
+    );
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+    let malformed = surface_patch_payload(0, 0, 1, 1, &[1, 2, 3]);
+    let header = MessageHeader::try_new(surface_id, 8, malformed.len(), 0).unwrap();
+    let pool_before = c.pool_bytes(pool_id).unwrap().to_vec();
+    let surface_before = c.surface(surface_id).unwrap().clone();
+    assert!(matches!(
+        c.dispatch_request(header, &malformed).unwrap_err(),
+        ClientError::Malformed {
+            interface: Interface::Surface,
+            opcode: 8,
+            error: display_proto::DecodeError::PayloadLengthMismatch { .. },
+        }
+    ));
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+
+    dispatch_attach(&mut c, surface_id, buffer_id, 3, 3);
+    let pending_before = c.surface(surface_id).unwrap().clone();
+    assert_eq!(
+        dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &[9; 4]).unwrap_err(),
+        ClientError::SurfacePatchHasPendingState { surface_id }
+    );
+    assert_eq!(c.surface(surface_id).unwrap(), &pending_before);
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+    dispatch_damage(&mut c, surface_id, 0, 0, 1, 1);
+    let pending_before = c.surface(surface_id).unwrap().clone();
+    assert_eq!(
+        dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &[9; 4]).unwrap_err(),
+        ClientError::SurfacePatchHasPendingState { surface_id }
+    );
+    assert_eq!(c.surface(surface_id).unwrap(), &pending_before);
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+}
+
+#[test]
+fn patch_current_accepts_exact_cap_and_rejects_the_next_pixel_atomically() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    let next_pixel_bytes = MAX_SURFACE_PATCH_BYTES + 4;
+    {
+        let pool = c.pools.get_mut(&pool_id).unwrap();
+        pool.size = next_pixel_bytes as u32;
+        pool.storage.resize(next_pixel_bytes, 0);
+        let buffer = c.buffers.get_mut(&buffer_id).unwrap();
+        buffer.width = (next_pixel_bytes / 4) as u32;
+        buffer.height = 1;
+        buffer.stride = next_pixel_bytes as u32;
+    }
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+
+    let at_cap = vec![0x5a; MAX_SURFACE_PATCH_BYTES];
+    dispatch_patch(
+        &mut c,
+        surface_id,
+        0,
+        0,
+        (MAX_SURFACE_PATCH_BYTES / 4) as u32,
+        1,
+        &at_cap,
+    )
+    .unwrap();
+    assert_eq!(
+        &c.pool_bytes(pool_id).unwrap()[..MAX_SURFACE_PATCH_BYTES],
+        at_cap
+    );
+
+    let pool_before = c.pool_bytes(pool_id).unwrap().to_vec();
+    let surface_before = c.surface(surface_id).unwrap().clone();
+    let over_cap = vec![0xa5; next_pixel_bytes];
+    assert_eq!(
+        dispatch_patch(
+            &mut c,
+            surface_id,
+            0,
+            0,
+            (next_pixel_bytes / 4) as u32,
+            1,
+            &over_cap,
+        )
+        .unwrap_err(),
+        ClientError::SurfacePatchTooLarge {
+            bytes: next_pixel_bytes as u64,
+            max: MAX_SURFACE_PATCH_BYTES,
+        }
+    );
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+}
+
+#[test]
+fn patch_current_format_geometry_and_backing_failures_do_not_mutate() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+    let pixels = [7; 4];
+
+    c.buffers.get_mut(&buffer_id).unwrap().format = 99;
+    let pool_before = c.pool_bytes(pool_id).unwrap().to_vec();
+    let surface_before = c.surface(surface_id).unwrap().clone();
+    assert_eq!(
+        dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &pixels).unwrap_err(),
+        ClientError::SurfacePatchUnsupportedFormat {
+            buffer_id,
+            format: 99,
+        }
+    );
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+
+    c.buffers.get_mut(&buffer_id).unwrap().format = 0;
+    assert!(matches!(
+        dispatch_patch(&mut c, surface_id, -1, 0, 1, 1, &pixels).unwrap_err(),
+        ClientError::SurfacePatchInvalidGeometry { .. }
+    ));
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+
+    c.buffers.get_mut(&buffer_id).unwrap().stride = 1;
+    assert_eq!(
+        dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &pixels).unwrap_err(),
+        ClientError::SurfacePatchInvalidBacking { buffer_id, pool_id }
+    );
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+}
+
+#[test]
+fn patch_current_fails_closed_for_aliased_or_incomplete_other_current_state() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+    let other_surface = ObjectId::new(15);
+    create_test_surface(&mut c, other_surface);
+    c.surfaces.get_mut(&other_surface).unwrap().current_buffer = Some(BufferAttachment {
+        buffer_id,
+        x: 0,
+        y: 0,
+    });
+
+    let pool_before = c.pool_bytes(pool_id).unwrap().to_vec();
+    let target_before = c.surface(surface_id).unwrap().clone();
+    assert_eq!(
+        dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &[1; 4]).unwrap_err(),
+        ClientError::SurfacePatchAliasedCurrentBuffer {
+            surface_id,
+            other_surface_id: other_surface,
+        }
+    );
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &target_before);
+
+    let missing_buffer = ObjectId::new(17);
+    c.surfaces.get_mut(&other_surface).unwrap().current_buffer = Some(BufferAttachment {
+        buffer_id: missing_buffer,
+        x: 0,
+        y: 0,
+    });
+    assert_eq!(
+        dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &[1; 4]).unwrap_err(),
+        ClientError::SurfacePatchInvalidAliasBacking {
+            other_surface_id: other_surface,
+            buffer_id: missing_buffer,
+        }
+    );
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert_eq!(c.surface(surface_id).unwrap(), &target_before);
+}
+
+#[test]
+fn pool_write_cannot_change_current_bytes_before_a_patch_recomposition() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    {
+        let buffer = c.buffers.get_mut(&buffer_id).unwrap();
+        buffer.width = 2;
+        buffer.height = 1;
+        buffer.stride = 8;
+    }
+    let red = [0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff];
+    let payload = shm_pool_write_payload(0, &red);
+    c.dispatch_request(
+        MessageHeader::try_new(pool_id, 4, payload.len(), 0).unwrap(),
+        &payload,
+    )
+    .unwrap();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+
+    let green = [0, 0xff, 0, 0xff];
+    let payload = shm_pool_write_payload(0, &green);
+    let surface_before = c.surface(surface_id).unwrap().clone();
+    assert_eq!(
+        c.dispatch_request(
+            MessageHeader::try_new(pool_id, 4, payload.len(), 0).unwrap(),
+            &payload,
+        )
+        .unwrap_err(),
+        ClientError::PoolWriteIntersectsCurrentBuffer {
+            pool_id,
+            surface_id,
+            buffer_id,
+        }
+    );
+    assert_eq!(&c.pool_bytes(pool_id).unwrap()[..8], &red);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+
+    let blue = [0xff, 0, 0, 0xff];
+    dispatch_patch(&mut c, surface_id, 1, 0, 1, 1, &blue).unwrap();
+    assert_eq!(&c.pool_bytes(pool_id).unwrap()[..4], &red[..4]);
+    assert_eq!(&c.pool_bytes(pool_id).unwrap()[4..8], &blue);
+}
+
+#[test]
+fn write_rows_checks_actual_rows_not_stride_gaps_and_rejects_overlap_atomically() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    {
+        let buffer = c.buffers.get_mut(&buffer_id).unwrap();
+        buffer.offset = 4;
+        buffer.width = 1;
+        buffer.height = 1;
+        buffer.stride = 4;
+    }
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+
+    let gap_write = shm_pool_write_rows_payload(0, 4, 2, 8, &[1, 1, 1, 1, 2, 2, 2, 2]);
+    c.dispatch_request(
+        MessageHeader::try_new(pool_id, 5, gap_write.len(), 0).unwrap(),
+        &gap_write,
+    )
+    .unwrap();
+    assert_eq!(&c.pool_bytes(pool_id).unwrap()[0..4], &[1; 4]);
+    assert_eq!(&c.pool_bytes(pool_id).unwrap()[4..8], &[0; 4]);
+    assert_eq!(&c.pool_bytes(pool_id).unwrap()[8..12], &[2; 4]);
+
+    let overlap = shm_pool_write_rows_payload(4, 4, 1, 4, &[9; 4]);
+    let before = c.pool_bytes(pool_id).unwrap().to_vec();
+    let surface_before = c.surface(surface_id).unwrap().clone();
+    assert!(matches!(
+        c.dispatch_request(
+            MessageHeader::try_new(pool_id, 5, overlap.len(), 0).unwrap(),
+            &overlap,
+        )
+        .unwrap_err(),
+        ClientError::PoolWriteIntersectsCurrentBuffer { .. }
+    ));
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), before);
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+}
+
+#[test]
+fn commit_rejects_cross_surface_same_and_overlapping_current_backing() {
+    let (mut c, first_surface, pool_id, first_buffer) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, first_surface, first_buffer, 0, 0);
+    dispatch_commit(&mut c, first_surface);
+    c.drain_pending_events();
+
+    let second_surface = ObjectId::new(15);
+    create_test_surface(&mut c, second_surface);
+    dispatch_attach(&mut c, second_surface, first_buffer, 0, 0);
+    let before = c.surface(second_surface).unwrap().clone();
+    let error = c
+        .dispatch_request(frame_request(second_surface, 7), &[])
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ClientError::SurfaceCommitAliasedBuffer {
+            surface_id: second_surface,
+            buffer_id: first_buffer,
+            conflicting_surface_id: first_surface,
+            conflicting_buffer_id: first_buffer,
+        }
+    );
+    assert_eq!(c.surface(second_surface).unwrap(), &before);
+
+    let overlapping_buffer = ObjectId::new(17);
+    create_test_buffer(
+        &mut c,
+        overlapping_buffer,
+        BufferInfo {
+            pool_id,
+            offset: 32,
+            width: 2,
+            height: 4,
+            stride: 8,
+            format: 0,
+        },
+    );
+    dispatch_attach(&mut c, second_surface, overlapping_buffer, 0, 0);
+    let before = c.surface(second_surface).unwrap().clone();
+    assert!(matches!(
+        c.dispatch_request(frame_request(second_surface, 7), &[])
+            .unwrap_err(),
+        ClientError::SurfaceCommitAliasedBuffer {
+            conflicting_surface_id,
+            ..
+        } if conflicting_surface_id == first_surface
+    ));
+    assert_eq!(c.surface(second_surface).unwrap(), &before);
+    assert!(drain_event_descriptors(&mut c).is_empty());
+}
+
+#[test]
+fn commit_rejects_same_surface_overlapping_replacement_without_state_change() {
+    let (mut c, surface_id, pool_id, first_buffer) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, first_buffer, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+    let overlapping_buffer = ObjectId::new(15);
+    create_test_buffer(
+        &mut c,
+        overlapping_buffer,
+        BufferInfo {
+            pool_id,
+            offset: 32,
+            width: 2,
+            height: 4,
+            stride: 8,
+            format: 0,
+        },
+    );
+    dispatch_attach(&mut c, surface_id, overlapping_buffer, 0, 0);
+    dispatch_damage(&mut c, surface_id, 1, 1, 1, 1);
+    let surface_before = c.surface(surface_id).unwrap().clone();
+    let pool_before = c.pool_bytes(pool_id).unwrap().to_vec();
+    assert_eq!(
+        c.dispatch_request(frame_request(surface_id, 7), &[])
+            .unwrap_err(),
+        ClientError::SurfaceCommitAliasedBuffer {
+            surface_id,
+            buffer_id: overlapping_buffer,
+            conflicting_surface_id: surface_id,
+            conflicting_buffer_id: first_buffer,
+        }
+    );
+    assert_eq!(c.surface(surface_id).unwrap(), &surface_before);
+    assert_eq!(c.pool_bytes(pool_id).unwrap(), pool_before);
+    assert!(drain_event_descriptors(&mut c).is_empty());
+}
+
+#[test]
+fn releases_only_live_buffers_that_actually_cease_to_be_current() {
+    let (mut c, surface_id, pool_id, first_buffer) = boot_client_with_surface_and_buffer();
+    let resize = 128u32.to_le_bytes();
+    c.dispatch_request(
+        MessageHeader::try_new(pool_id, 2, resize.len(), 0).unwrap(),
+        &resize,
+    )
+    .unwrap();
+    let second_buffer = ObjectId::new(15);
+    create_test_buffer(
+        &mut c,
+        second_buffer,
+        BufferInfo {
+            pool_id,
+            offset: 64,
+            width: 4,
+            height: 4,
+            stride: 16,
+            format: 0,
+        },
+    );
+
+    dispatch_attach(&mut c, surface_id, first_buffer, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    assert!(drain_event_descriptors(&mut c).is_empty(), "initial commit");
+
+    dispatch_damage(&mut c, surface_id, 0, 0, 1, 1);
+    dispatch_commit(&mut c, surface_id);
+    assert!(
+        drain_event_descriptors(&mut c).is_empty(),
+        "damage-only commit"
+    );
+
+    dispatch_attach(&mut c, surface_id, first_buffer, 1, 1);
+    dispatch_commit(&mut c, surface_id);
+    assert!(
+        drain_event_descriptors(&mut c).is_empty(),
+        "same-buffer reattach"
+    );
+
+    dispatch_attach(&mut c, surface_id, second_buffer, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    assert_eq!(drain_event_descriptors(&mut c), [(first_buffer, 1)]);
+
+    dispatch_attach(&mut c, surface_id, ObjectId::NULL, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    assert_eq!(drain_event_descriptors(&mut c), [(second_buffer, 1)]);
+}
+
+#[test]
+fn destroying_a_live_roleless_surface_releases_current_before_deferred_surface_delete() {
+    let (mut c, surface_id, _, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+
+    c.dispatch_request(frame_request(surface_id, 1), &[])
+        .unwrap();
+    assert_eq!(drain_event_descriptors(&mut c), [(buffer_id, 1)]);
+    assert_eq!(c.cancelled_frame_callback_lifecycle_count(), 1);
+}
+
+#[test]
+fn replacing_a_client_destroyed_current_buffer_emits_delete_without_release() {
+    let (mut c, surface_id, pool_id, first_buffer) = boot_client_with_surface_and_buffer();
+    let resize = 128u32.to_le_bytes();
+    c.dispatch_request(
+        MessageHeader::try_new(pool_id, 2, resize.len(), 0).unwrap(),
+        &resize,
+    )
+    .unwrap();
+    let second_buffer = ObjectId::new(15);
+    create_test_buffer(
+        &mut c,
+        second_buffer,
+        BufferInfo {
+            pool_id,
+            offset: 64,
+            width: 4,
+            height: 4,
+            stride: 16,
+            format: 0,
+        },
+    );
+    dispatch_attach(&mut c, surface_id, first_buffer, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+
+    c.dispatch_request(frame_request(first_buffer, 1), &[])
+        .unwrap();
+    assert!(c.drain_pending_events().is_empty());
+    dispatch_attach(&mut c, surface_id, second_buffer, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+
+    let events = c.drain_pending_events();
+    let header = MessageHeader::decode(&events).unwrap();
+    assert_eq!((header.object_id, header.opcode), (ObjectId::DISPLAY, 2));
+    assert_eq!(events.len(), header.length as usize);
+    assert_eq!(
+        u32::from_le_bytes(events[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap()),
+        first_buffer.raw()
+    );
+}
+
+#[test]
+fn patch_current_uses_destroyed_but_retained_current_backing() {
+    let (mut c, surface_id, pool_id, buffer_id) = boot_client_with_surface_and_buffer();
+    dispatch_attach(&mut c, surface_id, buffer_id, 0, 0);
+    dispatch_commit(&mut c, surface_id);
+    c.drain_pending_events();
+    c.dispatch_request(frame_request(buffer_id, 1), &[])
+        .unwrap();
+    c.dispatch_request(frame_request(pool_id, 3), &[]).unwrap();
+    assert!(c.drain_pending_events().is_empty());
+
+    dispatch_patch(&mut c, surface_id, 0, 0, 1, 1, &[4, 3, 2, 1]).unwrap();
+    assert_eq!(&c.pool_bytes(pool_id).unwrap()[..4], &[4, 3, 2, 1]);
+    assert!(drain_event_descriptors(&mut c).is_empty());
 }
 
 #[test]
@@ -1348,7 +2089,7 @@ fn xdg_set_string_payload(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + bytes.len() + pad);
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
-    out.extend(core::iter::repeat(0u8).take(pad));
+    out.extend(core::iter::repeat_n(0u8, pad));
     out
 }
 

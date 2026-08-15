@@ -20,13 +20,8 @@
 //! means "header only, zero-byte payload" and `length <
 //! HEADER_SIZE` is a malformed message.
 //!
-//! > **Spec caveat.** The spec text in display-protocol.md says
-//! > the payload is `length - 8` bytes, which is inconsistent
-//! > with the 10-byte struct definition immediately above that
-//! > comment. This implementation follows the struct literally
-//! > (header is 10 bytes, payload is `length - 10` bytes) and
-//! > documents the discrepancy so the eventual spec amendment
-//! > pins it down.
+//! The protocol contract and this codec both define a 10-byte header,
+//! so the payload length is `length - HEADER_SIZE`.
 //!
 //! The [`MessageHeader::decode`] / [`MessageHeader::encode`]
 //! functions are the only public framing API. They operate on
@@ -75,12 +70,7 @@ impl MessageHeader {
     /// Construct a header. The caller is responsible for making
     /// sure `payload_len + HEADER_SIZE <= u16::MAX`; use
     /// [`MessageHeader::try_new`] for the checked version.
-    pub const fn new(
-        object_id: ObjectId,
-        opcode: u16,
-        payload_len: u16,
-        fd_passing: u8,
-    ) -> Self {
+    pub const fn new(object_id: ObjectId, opcode: u16, payload_len: u16, fd_passing: u8) -> Self {
         let length = payload_len.saturating_add(HEADER_SIZE as u16);
         MessageHeader {
             object_id,

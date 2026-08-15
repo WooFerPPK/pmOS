@@ -12,17 +12,17 @@
 //! a real fd in the table can be released cleanly.
 //!
 //! fd 2 is auto-installed by proc_spawn (kernel-side) alongside
-//! fd 0 / 1 = console + fd 3 = SignalChannel. Closing fd 2
-//! releases the slot without affecting fd 0 / 1 / 3.
+//! fd 0 / 1 = console, fd 3 = the `/` preopen, and fd 4 = the signal
+//! channel. Closing fd 2 releases the slot without affecting them.
 //!
 //! Exit codes:
 //!
-//!   * 0   = success — wrote the 5-byte record cleanly
-//!   * 13  = fd_write to stdout failed or short-wrote
-//!   * 14  = re-close of the just-closed fd 2 didn't surface
-//!           EBADF as expected (kernel might have left the slot
-//!           half-released — invariant violation)
-//!   * 101 = panic
+//! * 0   = success — wrote the 5-byte record cleanly
+//! * 13  = fd_write to stdout failed or short-wrote
+//! * 14  = re-close of the just-closed fd 2 didn't surface
+//!   EBADF as expected (kernel might have left the slot
+//!   half-released — invariant violation)
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
@@ -30,12 +30,7 @@
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
     fn fd_close(fd: i32) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
 }
 

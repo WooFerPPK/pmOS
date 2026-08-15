@@ -13,4 +13,5 @@ path = "src/main.rs"
 
 [dependencies]
 abi = { path = "../abi" }
+display-proto = { path = "../display-proto" }
 toolkit = { path = "../toolkit" }

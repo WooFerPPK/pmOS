@@ -46,7 +46,7 @@ pub use button::{Button, ButtonState, BUTTON_HPAD, BUTTON_VPAD};
 pub use container::Container;
 pub use frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
-    TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, TITLEBAR_HEIGHT,
+    TITLEBAR_HEIGHT, TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP,
 };
 pub use label::{Label, LABEL_HPAD, LABEL_VPAD};
 pub use list::{List, ListDimensions, ListKey, ListKeyOutcome, LIST_HPAD, LIST_ROW_HEIGHT};

@@ -35,13 +35,15 @@
 
 use crate::draw::{Canvas, Color, Rect};
 
+type ChildPainter<'child> = dyn FnMut(&mut Canvas<'_>, Rect) + 'child;
+
 /// A rectangular region that optionally strokes a border,
 /// shrinks its bounds by a uniform padding, and paints a
 /// single child inside the resulting interior rect.
 pub struct Container<'child> {
     padding: u32,
     border: Option<(u32, Color)>,
-    child: Option<Box<dyn FnMut(&mut Canvas<'_>, Rect) + 'child>>,
+    child: Option<Box<ChildPainter<'child>>>,
 }
 
 impl<'child> Container<'child> {

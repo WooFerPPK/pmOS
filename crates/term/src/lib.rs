@@ -6,14 +6,10 @@
 //! [`sh::Shell`] — is testable on the native host without
 //! needing a display-protocol connection or a WASI sandbox.
 //!
-//! The design mirrors the TypeScript-side `web/src/terminal.ts`
-//! used by the bootstrap demo: bounded scrollback, a `feed_key`
-//! method for DOM-like keystrokes, and an `append_output`
-//! method for streaming UTF-8 bytes. The crucial difference is
-//! that the Rust terminal **owns** its own [`Shell`] instance,
-//! so committed lines are evaluated in-process and their
-//! stdout/stderr are appended to scrollback directly — there
-//! is no kernel round-trip.
+//! The state machine retains an embedded [`Shell`] for deterministic native
+//! tests. Production uses [`PmosShellSession`], a persistent isolated
+//! `/bin/sh` Worker connected by kernel pipes, and appends the returned byte
+//! stream to the same bounded scrollback model.
 //!
 //! [`run::run_term`] is the production-facing entry point: it
 //! connects to the display server through the supplied
@@ -22,29 +18,34 @@
 //! per-key scancode table in [`keymap`].
 
 pub mod keymap;
+pub mod pmos_shell;
 pub mod rasterizer;
 pub mod run;
 pub mod session;
 pub mod terminal;
 
 pub use sh::{Shell, ShellOutput};
-// Font constants live in `toolkit::draw::font` so every
-// bundled app (term, files, edit, …) shares the same
-// bitmap glyphs. Re-exported here for backwards compat
-// with the existing `term::CELL_HEIGHT` / `GLYPH_WIDTH`
-// usage sites.
-pub use toolkit::draw::font::{CELL_HEIGHT, CELL_WIDTH, GLYPH_HEIGHT, GLYPH_WIDTH};
+// These legacy names describe the safe default font. Font-aware callers should
+// use `BitmapFont` methods because the selected atlas may instead be 8×16.
 pub use keymap::{translate as translate_scancode, Modifiers};
+pub use pmos_shell::{PmosShellSession, StepwiseCommandRunner, StepwiseShellUpdate};
 pub use rasterizer::{
-    colors, rasterize_snapshot, rasterize_snapshot_with_palette, Palette, BYTES_PER_PIXEL,
-    PADDING,
+    colors, default_font, load_startup_font, load_startup_font_with, rasterize_snapshot,
+    rasterize_snapshot_with_font, rasterize_snapshot_with_palette,
+    rasterize_snapshot_with_palette_and_font, BitmapFont, FontError, Palette, BYTES_PER_PIXEL,
+    DEFAULT_CELL_HEIGHT as CELL_HEIGHT, DEFAULT_CELL_WIDTH as CELL_WIDTH, DEFAULT_FONT_NAME,
+    DEFAULT_GLYPH_HEIGHT as GLYPH_HEIGHT, DEFAULT_GLYPH_WIDTH as GLYPH_WIDTH, FONT_DIR,
+    MAX_FONT_BYTES, MAX_PREFERENCES_BYTES, PADDING, VGA_FONT_NAME,
 };
-pub use run::{run_term, run_term_with_options, TermExit, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+pub use run::{
+    run_term, run_term_with_font, run_term_with_options, run_term_with_runner,
+    run_term_with_runner_and_font, run_term_with_stepwise_runner_and_font, TermExit,
+    DEFAULT_HEIGHT, DEFAULT_WIDTH,
+};
 pub use session::{
-    GlobalEntry, ProtocolErrorNotice, Session, SessionError, SessionStep,
-    INTERESTING_INTERFACES,
+    GlobalEntry, ProtocolErrorNotice, Session, SessionError, SessionStep, INTERESTING_INTERFACES,
 };
 pub use terminal::{
-    Key, KeyFeedResult, LineKind, Terminal, TerminalLine, TerminalOptions, TerminalSnapshot,
-    DEFAULT_MAX_LINES,
+    CommandRunResult, CommandRunner, Key, KeyFeedResult, LineKind, Terminal, TerminalLine,
+    TerminalOptions, TerminalSnapshot, DEFAULT_MAX_LINES, MAX_PENDING_OUTPUT_BYTES,
 };

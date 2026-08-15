@@ -66,6 +66,7 @@ pub enum PipeWriteResult {
 /// Ownership: the [`super::IpcTable`] owns `Pipe` values by
 /// `PipeId`. The per-process fd table holds `PipeId` handles
 /// + a `ReaderOrWriter` tag. When the process closes an fd
+///
 /// referring to a pipe end, the ipc table decrements the
 /// matching `reader_refcount` / `writer_refcount`; when the
 /// count reaches zero the end is marked closed.
@@ -129,11 +130,11 @@ impl Pipe {
         self.writer_refcount == 0
     }
 
-    /// True iff the pipe is fully dead — both ends closed AND
-    /// the buffer has been drained. The IPC table drops fully-
-    /// dead pipes from its map.
+    /// True iff the pipe is fully dead. Once both endpoint refcounts reach
+    /// zero, unread bytes have no possible consumer and must not pin the
+    /// kernel object.
     pub fn is_dead(&self) -> bool {
-        self.reader_closed() && self.writer_closed() && self.buffer.is_empty()
+        self.reader_closed() && self.writer_closed()
     }
 
     /// Dup a reader reference (for [`dup`]-style fd copying or
@@ -155,6 +156,9 @@ impl Pipe {
     pub fn drop_reader(&mut self) -> Vec<Pid> {
         self.reader_refcount = self.reader_refcount.saturating_sub(1);
         if self.reader_refcount == 0 {
+            // No future reader can observe queued bytes. Reclaim them now so a
+            // writer cannot fill a pipe, close both ends, and retain 64 KiB.
+            self.buffer.clear();
             core::mem::take(&mut self.waiting_writers)
         } else {
             Vec::new()
@@ -183,9 +187,9 @@ impl Pipe {
             return PipeReadResult::WouldBlock;
         }
         let take = core::cmp::min(buf.len(), self.buffer.len());
-        for i in 0..take {
+        for byte in buf.iter_mut().take(take) {
             // VecDeque::pop_front is O(1) amortised.
-            buf[i] = self.buffer.pop_front().unwrap();
+            *byte = self.buffer.pop_front().unwrap();
         }
         PipeReadResult::Read(take)
     }
@@ -214,7 +218,14 @@ impl Pipe {
     /// this when a process calls `read` on an empty pipe and
     /// the fd is blocking.
     pub fn park_reader(&mut self, pid: Pid) {
-        self.waiting_readers.push(pid);
+        if !self.waiting_readers.contains(&pid) {
+            self.waiting_readers.push(pid);
+        }
+    }
+
+    /// Remove a reader waiter during signal/exit rollback.
+    pub fn remove_waiting_reader(&mut self, pid: Pid) {
+        self.waiting_readers.retain(|waiting| *waiting != pid);
     }
 
     /// Park `pid` on the writer-wait list.

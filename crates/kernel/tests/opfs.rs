@@ -8,14 +8,18 @@
 
 #![cfg(feature = "native-platform")]
 
-use kernel::fs::opfs::block::{BlockDevice, MockBlockDevice};
+use std::sync::{Arc, Mutex};
+
+use kernel::fs::opfs::block::{BlockDevice, BlockImageState, MockBlockDevice};
 use kernel::fs::opfs::layout::{
-    BLOCK_SIZE, DEFAULT_INODE_TABLE_BLOCKS, DEFAULT_JOURNAL_BLOCKS, ROOT_INO,
+    BLOCK_SIZE, DEFAULT_INODE_TABLE_BLOCKS, DEFAULT_JOURNAL_BLOCKS, MAX_FILE_BYTES,
+    MIN_BLOCK_COUNT, ROOT_INO,
 };
 use kernel::fs::opfs::mkfs::{
     default_credits_txt, default_edit_desktop, default_files_desktop, default_init_conf,
-    default_license_txt, default_settings_desktop, default_sysmon_desktop,
-    default_terminal_desktop, mkfs, starter_editing, starter_readme, starter_welcome,
+    default_license_txt, default_pc_vga_16, default_settings_desktop, default_sysmon_desktop,
+    default_terminal_desktop, default_unifont_mono_14, mkfs, starter_editing, starter_readme,
+    starter_welcome,
 };
 use kernel::fs::opfs::OpfsFs;
 use kernel::vfs::{Filesystem, FsError, NodeType};
@@ -32,6 +36,27 @@ fn fresh_device() -> Box<MockBlockDevice> {
 
 fn fresh_fs() -> OpfsFs {
     mkfs(fresh_device()).expect("mkfs")
+}
+
+#[derive(Clone)]
+struct SharedBlockDevice(Arc<Mutex<MockBlockDevice>>);
+
+impl BlockDevice for SharedBlockDevice {
+    fn read(&mut self, lba: u64, out: &mut [u8; BLOCK_SIZE]) -> Result<(), FsError> {
+        self.0.lock().unwrap().read(lba, out)
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8; BLOCK_SIZE]) -> Result<(), FsError> {
+        self.0.lock().unwrap().write(lba, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), FsError> {
+        self.0.lock().unwrap().flush()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.0.lock().unwrap().block_count()
+    }
 }
 
 // ---- Layout + mkfs --------------------------------------------------
@@ -88,6 +113,23 @@ fn mkfs_refuses_tiny_device() {
     match mkfs(device) {
         Ok(_) => panic!("mkfs on a 10-block device should fail"),
         Err(e) => assert_eq!(e, FsError::NoSpace),
+    }
+}
+
+#[test]
+fn mkfs_minimum_matches_the_complete_seeded_root() {
+    let fs = mkfs(Box::new(MockBlockDevice::new(MIN_BLOCK_COUNT)))
+        .expect("declared minimum must hold every bundled root asset");
+    assert_eq!(fs.superblock().total_blocks, MIN_BLOCK_COUNT);
+    assert_eq!(
+        fs.superblock().data_block_free,
+        0,
+        "the minimum is the measured exact fresh-root boundary"
+    );
+
+    match mkfs(Box::new(MockBlockDevice::new(MIN_BLOCK_COUNT - 1))) {
+        Ok(_) => panic!("one block below the declared minimum must fail"),
+        Err(error) => assert_eq!(error, FsError::NoSpace),
     }
 }
 
@@ -253,18 +295,78 @@ fn large_write_spans_multiple_blocks() {
 }
 
 #[test]
-fn max_file_size_is_48_kib_for_direct_blocks_only() {
+fn single_indirect_file_round_trips_past_48_kib() {
     let mut fs = fresh_fs();
     let ino = fs.create(ROOT_INO, "big.bin", 0o644).unwrap();
-    // 48 KiB = exactly 12 direct blocks. Should fit.
-    let data = vec![0x55u8; 48 * 1024];
+    let mut data = vec![0u8; 96 * 1024 + 17];
+    for (index, byte) in data.iter_mut().enumerate() {
+        *byte = ((index * 31 + 7) & 0xff) as u8;
+    }
     let n = fs.write(ino, 0, &data).unwrap();
     assert_eq!(n, data.len());
 
-    // 49 KiB would spill past the 12 direct slots → NoSpace in v1.
-    let too_big = vec![0u8; 49 * 1024];
-    let err = fs.write(ino, 0, &too_big).unwrap_err();
+    let mut read_back = vec![0u8; data.len()];
+    let n = fs.read(ino, 0, &mut read_back).unwrap();
+    assert_eq!(n, data.len());
+    assert_eq!(read_back, data);
+}
+
+#[test]
+fn single_indirect_file_survives_remount() {
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "installed.wasm", 0o755).unwrap();
+    let data: Vec<u8> = (0..80 * 1024 + 3)
+        .map(|index| ((index * 17 + 11) & 0xff) as u8)
+        .collect();
+    fs.write(ino, 0, &data).unwrap();
+    fs.sync().unwrap();
+
+    let device = fs.into_device();
+    let mut remounted = OpfsFs::mount(device).unwrap();
+    let ino = remounted.lookup(ROOT_INO, "installed.wasm").unwrap();
+    let mut read_back = vec![0u8; data.len()];
+    let n = remounted.read(ino, 0, &mut read_back).unwrap();
+    assert_eq!(n, data.len());
+    assert_eq!(read_back, data);
+}
+
+#[test]
+fn single_indirect_capacity_is_enforced_before_allocation() {
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "too-big.bin", 0o644).unwrap();
+    let next_free_before = fs.superblock().next_free_data_block;
+
+    let err = fs.write(ino, MAX_FILE_BYTES, &[1]).unwrap_err();
     assert_eq!(err, FsError::NoSpace);
+    assert_eq!(fs.superblock().next_free_data_block, next_free_before);
+}
+
+#[test]
+fn single_indirect_capacity_is_reachable_with_syscall_sized_writes() {
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "capacity.bin", 0o644).unwrap();
+    let chunk = vec![0x6d; 32 * 1024];
+    let mut offset = 0u64;
+    while offset < MAX_FILE_BYTES {
+        let remaining = (MAX_FILE_BYTES - offset) as usize;
+        let write_len = remaining.min(chunk.len());
+        let written = fs.write(ino, offset, &chunk[..write_len]).unwrap();
+        assert_eq!(written, write_len);
+        offset += written as u64;
+    }
+
+    assert_eq!(fs.stat(ino).unwrap().size, MAX_FILE_BYTES);
+    let mut tail = [0u8; 17];
+    let n = fs
+        .read(ino, MAX_FILE_BYTES - tail.len() as u64, &mut tail)
+        .unwrap();
+    assert_eq!(n, tail.len());
+    assert_eq!(tail, [0x6d; 17]);
+
+    assert_eq!(
+        fs.write(ino, MAX_FILE_BYTES, &[0x6d]).unwrap_err(),
+        FsError::NoSpace,
+    );
 }
 
 #[test]
@@ -426,6 +528,20 @@ fn stat_reports_type_and_size() {
 }
 
 #[test]
+fn executable_mode_change_survives_remount() {
+    let mut fs = fresh_fs();
+    let file = fs.create(ROOT_INO, "installed.wasm", 0o644).unwrap();
+    fs.write(file, 0, b"\0asm\x01\0\0\0").unwrap();
+    fs.set_mode(file, 0o755).unwrap();
+    fs.sync().unwrap();
+
+    let device = fs.into_device();
+    let mut reopened = OpfsFs::mount(device).unwrap();
+    let file = reopened.lookup(ROOT_INO, "installed.wasm").unwrap();
+    assert_eq!(reopened.stat(file).unwrap().mode, 0o755);
+}
+
+#[test]
 fn truncate_shrinks_and_extends() {
     let mut fs = fresh_fs();
     let ino = fs.create(ROOT_INO, "t", 0o644).unwrap();
@@ -441,6 +557,38 @@ fn truncate_shrinks_and_extends() {
     assert_eq!(fs.stat(ino).unwrap().size, 6);
     let n = fs.read(ino, 0, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"abc\0\0\0");
+}
+
+#[test]
+fn truncate_across_indirect_boundary_discards_old_tail() {
+    let mut fs = fresh_fs();
+    let ino = fs.create(ROOT_INO, "indirect-truncate", 0o644).unwrap();
+    let data: Vec<u8> = (0..72 * 1024)
+        .map(|index| ((index * 13 + 5) & 0xff) as u8)
+        .collect();
+    fs.write(ino, 0, &data).unwrap();
+
+    let retained = 48 * 1024 + 29;
+    fs.truncate(ino, retained as u64).unwrap();
+    fs.truncate(ino, data.len() as u64).unwrap();
+
+    let mut read_back = vec![0xff; data.len()];
+    let n = fs.read(ino, 0, &mut read_back).unwrap();
+    assert_eq!(n, data.len());
+    assert_eq!(&read_back[..retained], &data[..retained]);
+    assert!(read_back[retained..].iter().all(|byte| *byte == 0));
+
+    fs.truncate(ino, (BLOCK_SIZE + 7) as u64).unwrap();
+    fs.truncate(ino, (64 * 1024) as u64).unwrap();
+    let mut after_direct_shrink = vec![0xff; 64 * 1024];
+    fs.read(ino, 0, &mut after_direct_shrink).unwrap();
+    assert_eq!(
+        &after_direct_shrink[..BLOCK_SIZE + 7],
+        &data[..BLOCK_SIZE + 7]
+    );
+    assert!(after_direct_shrink[BLOCK_SIZE + 7..]
+        .iter()
+        .all(|byte| *byte == 0));
 }
 
 #[test]
@@ -509,6 +657,26 @@ fn remount_after_multiple_mutations() {
 }
 
 #[test]
+fn canonical_home_content_survives_filesystem_reinstantiation() {
+    let mut fs = fresh_fs();
+    let home = fs.lookup(ROOT_INO, "home").unwrap();
+    let user = fs.lookup(home, "user").unwrap();
+    let notes = fs.create(user, "persistent-notes.txt", 0o644).unwrap();
+    fs.write(notes, 0, b"survives a fresh kernel filesystem")
+        .unwrap();
+    fs.sync().unwrap();
+
+    let device = fs.into_device();
+    let mut remounted = OpfsFs::mount(device).expect("remount persistent root");
+    let home = remounted.lookup(ROOT_INO, "home").unwrap();
+    let user = remounted.lookup(home, "user").unwrap();
+    let notes = remounted.lookup(user, "persistent-notes.txt").unwrap();
+    let mut buf = [0u8; 64];
+    let n = remounted.read(notes, 0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"survives a fresh kernel filesystem");
+}
+
+#[test]
 fn mount_generation_increments_on_remount() {
     let device = fresh_device();
     let fs = mkfs(device).expect("mkfs");
@@ -573,6 +741,55 @@ fn corrupt_superblock_checksum_fails_mount() {
         Ok(_) => panic!("mount with corrupted superblock should fail"),
         Err(e) => assert_eq!(e, FsError::Io),
     }
+}
+
+#[test]
+fn newly_created_image_state_is_the_only_state_that_formats() {
+    let fs = OpfsFs::open_image(fresh_device(), BlockImageState::NewlyCreated)
+        .expect("new image should be formatted");
+    assert_eq!(fs.superblock().total_blocks, TEST_BLOCKS);
+}
+
+#[test]
+fn existing_empty_image_fails_without_any_format_writes() {
+    let storage = Arc::new(Mutex::new(MockBlockDevice::new(TEST_BLOCKS)));
+    let device = SharedBlockDevice(Arc::clone(&storage));
+
+    let error = match OpfsFs::open_image(Box::new(device), BlockImageState::Existing) {
+        Ok(_) => panic!("existing empty image must not be formatted"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error, FsError::Io);
+    let storage = storage.lock().unwrap();
+    assert_eq!(storage.total_writes(), 0);
+    assert_eq!(storage.allocated_blocks(), 0);
+}
+
+#[test]
+fn corrupt_existing_image_fails_without_overwriting_any_blocks() {
+    let storage = Arc::new(Mutex::new(MockBlockDevice::new(TEST_BLOCKS)));
+    let mut corrupt_superblock = [0xA5; BLOCK_SIZE];
+    corrupt_superblock[..8].copy_from_slice(b"CORRUPT!");
+    let sentinel = [0x3C; BLOCK_SIZE];
+    {
+        let mut inner = storage.lock().unwrap();
+        inner.write(0, &corrupt_superblock).unwrap();
+        inner.write(73, &sentinel).unwrap();
+    }
+    let writes_before_mount = storage.lock().unwrap().total_writes();
+    let device = SharedBlockDevice(Arc::clone(&storage));
+
+    let error = match OpfsFs::open_image(Box::new(device), BlockImageState::Existing) {
+        Ok(_) => panic!("corrupt existing image must not be formatted"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error, FsError::Io);
+    let storage = storage.lock().unwrap();
+    assert_eq!(storage.total_writes(), writes_before_mount);
+    assert_eq!(storage.raw_block(0), Some(&corrupt_superblock));
+    assert_eq!(storage.raw_block(73), Some(&sentinel));
 }
 
 // ---- Real vnode timestamps ----------------------------------------
@@ -708,7 +925,7 @@ fn mkfs_installs_default_desktop_entries() {
         assert_eq!(&buf[..n], *expected, "{name} content mismatch");
 
         // Spot-check: every entry declares at least DISPLAY_CLIENT.
-        let content = core::str::from_utf8(*expected).unwrap();
+        let content = core::str::from_utf8(expected).unwrap();
         assert!(
             content.contains("X-PMos-Caps=") && content.contains("DISPLAY_CLIENT"),
             "{name} missing X-PMos-Caps=...DISPLAY_CLIENT"
@@ -731,4 +948,28 @@ fn mkfs_installs_default_desktop_entries() {
         sysmon_content.contains("PROC_KILL_ANY"),
         "sysmon.desktop missing PROC_KILL_ANY"
     );
+}
+
+#[test]
+fn mkfs_installs_both_terminal_font_atlases() {
+    let mut fs = fresh_fs();
+    let usr_ino = fs.lookup(ROOT_INO, "usr").unwrap();
+    let share_ino = fs.lookup(usr_ino, "share").unwrap();
+    let fonts_ino = fs.lookup(share_ino, "fonts").unwrap();
+
+    for (name, expected) in [
+        ("unifont-mono-14.pbm", default_unifont_mono_14()),
+        ("pc-vga-16.pbm", default_pc_vga_16()),
+    ] {
+        let ino = fs.lookup(fonts_ino, name).unwrap();
+        let stat = fs.stat(ino).unwrap();
+        assert_eq!(stat.ty, NodeType::RegularFile);
+        assert_eq!(stat.mode, 0o644);
+        assert_eq!(stat.size as usize, expected.len());
+
+        let mut bytes = vec![0; expected.len()];
+        let read = fs.read(ino, 0, &mut bytes).unwrap();
+        assert_eq!(&bytes[..read], expected);
+        assert!(bytes.starts_with(b"P1\n"));
+    }
 }

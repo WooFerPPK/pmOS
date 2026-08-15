@@ -59,8 +59,7 @@ fn colon_alone_is_a_no_op() {
 fn colon_ignores_extra_args() {
     // `: foo bar baz` discards every arg and emits no
     // output. Same two-prompt shape as the bare-colon case.
-    let (status, stdout, stderr, _env) =
-        drive(": foo bar baz\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive(": foo bar baz\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(stdout, "$ $ ");
@@ -73,8 +72,7 @@ fn colon_followed_by_echo_on_next_line_runs_normally() {
     // produces its usual `done\n` output. The v1 sh has no
     // `;` separator, so this is the closest equivalent to
     // the POSIX `: ; echo done` sequence test.
-    let (status, stdout, stderr, _env) =
-        drive(":\necho done\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive(":\necho done\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(
@@ -89,8 +87,7 @@ fn colon_with_unset_variable_does_not_error() {
     // the empty string (POSIX `set -u`-off default), and the
     // colon arm then ignores the empty arg. No stderr, REPL
     // stays alive.
-    let (status, _stdout, stderr, _env) =
-        drive(": $UNSET_VAR\nexit\n", BTreeMap::new());
+    let (status, _stdout, stderr, _env) = drive(": $UNSET_VAR\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.is_empty(),

@@ -13,14 +13,110 @@
 //! into `Server::dispatch_request` / consumes
 //! `Server::take_pending_events`.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use crate::client::{Client, ClientError, ClientId};
+use crate::client::{
+    Client, ClientError, ClientId, ClientLimits, FrameCallbackCompletion, ServerResourceBudgets,
+};
 use crate::compositor::{Framebuffer, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use crate::protocol::keymap::{load_bundled, load_default, Keymap, KeymapError, Scancode};
+use display_proto::events::key_state;
+use display_proto::events::{shell_restore_status, shell_window_state_flags, ShellWindowState};
 use display_proto::ids::ObjectId;
 use display_proto::objects::Interface;
+use display_proto::requests::{
+    shell_restore_window_flags, ShellManagerBeginRestore, ShellManagerEndRestore,
+    ShellManagerPlaceRestoredWindow, MAX_SHELL_RESTORE_TIMEOUT_MS,
+};
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
+use preferences::KeyboardLayout;
+
+/// Maximum simultaneously accepted display-protocol connections. This bounds
+/// every per-connection queue and object table even when one process opens
+/// many sockets.
+pub const MAX_SERVER_CLIENTS: usize = 64;
+/// At most the active and one replacement desktop shell may overlap. The
+/// transport reserves a write attempt for each authenticated shell every turn.
+pub const MAX_SERVER_SHELL_CLIENTS: usize = 2;
+/// Ordinary clients cannot consume the slots reserved for an active and a
+/// replacement desktop shell.
+pub const MAX_SERVER_ORDINARY_CLIENTS: usize = MAX_SERVER_CLIENTS - MAX_SERVER_SHELL_CLIENTS;
+
+/// Maximum aggregate shm-pool backing retained by the display server. A normal
+/// full-output double buffer is about 6 MiB, so 128 MiB leaves room for roughly
+/// twenty such windows without allowing one tab to grow toward host OOM.
+pub const MAX_SERVER_POOL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum live toplevel roles across every connection. Besides bounding the
+/// global window maps, this keeps a replacement-shell catch-up snapshot within
+/// one client's ordered event queue.
+pub const MAX_SERVER_TOPLEVELS: usize = 512;
+
+/// Maximum title/app-id UTF-8 bytes retained across all connections.
+pub const MAX_SERVER_TOPLEVEL_METADATA_BYTES: u64 = 64 * 1024;
+
+/// Maximum one-shot frame callbacks converted into ordered `done`/`delete_id`
+/// pairs in one production outer turn. With at most 64 clients, the fair
+/// one-per-client passes prevent a single callback-heavy client from starving
+/// another and cap new lifecycle traffic at 128 events per turn.
+pub const MAX_FRAME_CALLBACK_COMPLETIONS_PER_TURN: usize = 64;
+
+/// Lower bound for a shell-requested restore timeout. Zero is not an infinite
+/// transaction; it is clamped to one millisecond and therefore fails open.
+pub const MIN_SHELL_RESTORE_TIMEOUT_MS: u32 = 1;
+
+/// Exact backing required by the shipped shell's full-output double buffer.
+pub const SHELL_FULL_OUTPUT_POOL_BYTES: u64 = DEFAULT_WIDTH as u64 * DEFAULT_HEIGHT as u64 * 4 * 2;
+/// Each authenticated shell connection is guaranteed one toplevel and its
+/// maximum wire-representable title/app-id metadata.
+pub const SHELL_TOPLEVELS_RESERVED_PER_CLIENT: usize = 1;
+pub const SHELL_METADATA_BYTES_RESERVED_PER_CLIENT: u64 =
+    crate::client::MAX_TOPLEVEL_METADATA_BYTES;
+const _: () = assert!(
+    MAX_SERVER_POOL_BYTES >= SHELL_FULL_OUTPUT_POOL_BYTES * MAX_SERVER_SHELL_CLIENTS as u64
+);
+const _: () =
+    assert!(MAX_SERVER_TOPLEVELS >= SHELL_TOPLEVELS_RESERVED_PER_CLIENT * MAX_SERVER_SHELL_CLIENTS);
+const _: () = assert!(
+    MAX_SERVER_TOPLEVEL_METADATA_BYTES
+        >= SHELL_METADATA_BYTES_RESERVED_PER_CLIENT * MAX_SERVER_SHELL_CLIENTS as u64
+);
+
+/// Worst-case encoded replacement-shell catch-up snapshot: one
+/// `window_created` per toplevel plus the single focused-window event. Each
+/// created event has a 10-byte header, a 4-byte id, two 4-byte string lengths,
+/// and at most six bytes of string padding in addition to retained metadata.
+pub const MAX_SERVER_WINDOW_SNAPSHOT_BYTES: usize =
+    MAX_SERVER_TOPLEVEL_METADATA_BYTES as usize + MAX_SERVER_TOPLEVELS * 80 + 28;
+const _: () =
+    assert!(MAX_SERVER_WINDOW_SNAPSHOT_BYTES <= crate::client::MAX_PENDING_EVENT_BYTES - 64 * 1024);
+const _: () = assert!(MAX_SERVER_TOPLEVELS + 2 <= crate::client::MAX_PENDING_EVENTS);
+
+/// Server-wide resource ceilings. Tests inject smaller limits to exercise
+/// exact N/N+1 boundaries without large allocations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ServerLimits {
+    pub clients: usize,
+    pub shell_clients: usize,
+    pub pool_bytes: u64,
+    pub toplevels: usize,
+    pub client_toplevel_metadata_bytes: u64,
+    pub toplevel_metadata_bytes: u64,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            clients: MAX_SERVER_CLIENTS,
+            shell_clients: MAX_SERVER_SHELL_CLIENTS,
+            pool_bytes: MAX_SERVER_POOL_BYTES,
+            toplevels: MAX_SERVER_TOPLEVELS,
+            client_toplevel_metadata_bytes: crate::client::MAX_CLIENT_TOPLEVEL_METADATA_BYTES,
+            toplevel_metadata_bytes: MAX_SERVER_TOPLEVEL_METADATA_BYTES,
+        }
+    }
+}
 
 /// Errors surfaced by [`Server`] operations. Most of them are
 /// thin wrappers over [`ClientError`] or [`WireError`] so the
@@ -36,6 +132,12 @@ pub enum ServerError {
     Wire(WireError),
     /// Client-state error from request dispatch.
     Client(ClientError),
+    /// Accepting another connection would exceed either the server-wide cap
+    /// or the ordinary-client share after shell slots are reserved.
+    ClientLimitExceeded { attempted: usize, limit: usize },
+    /// Accepting another Cap::Shell connection would exhaust the reserved
+    /// per-turn shell transport service.
+    ShellClientLimitExceeded { attempted: usize, limit: usize },
 }
 
 impl From<WireError> for ServerError {
@@ -63,6 +165,39 @@ pub struct HitResult {
     /// toplevel.y)`).
     pub local_x: i32,
     pub local_y: i32,
+}
+
+/// Server-global identity for one live toplevel. Unlike
+/// [`ObjectId`], this namespace is shared by every client and is
+/// therefore safe to expose through `pmd_shell_manager`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId(pub u32);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct WindowOwner {
+    client_id: ClientId,
+    toplevel_id: ObjectId,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct RestorePlacement {
+    z_rank: u32,
+    expected_width: u32,
+    expected_height: u32,
+    commit_count_at_place: u32,
+    settled: bool,
+}
+
+/// One bounded shell-owned restore transaction. Windows in `hidden` remain
+/// fully protocol-dispatchable but are excluded from composition, hit testing,
+/// and automatic first-map focus until completion or fail-open abort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RestoreTransaction {
+    owner: ClientId,
+    restore_id: u32,
+    deadline_ms: u64,
+    hidden: BTreeSet<WindowId>,
+    placements: BTreeMap<WindowId, RestorePlacement>,
 }
 
 /// What kind of interactive drag is in progress, when one
@@ -99,12 +234,45 @@ pub struct DragState {
 pub struct Server {
     next_client_id: u32,
     clients: BTreeMap<ClientId, Client>,
+    limits: ServerLimits,
+    pool_bytes: u64,
+    toplevel_metadata_bytes: u64,
+    /// Monotonic global namespace exported to shell clients. Zero is
+    /// reserved as "no window" and IDs are never reused within a
+    /// server lifetime.
+    next_window_id: u32,
+    windows: BTreeMap<WindowId, WindowOwner>,
+    window_ids: BTreeMap<(ClientId, ObjectId), WindowId>,
+    /// Next non-zero toplevel ordinal for each authenticated peer PID. This is
+    /// server-wide rather than connection-local because one process may open
+    /// multiple display sockets; `(owner_pid, ordinal)` must remain unique.
+    next_toplevel_ordinal_by_pid: BTreeMap<u32, u32>,
+    /// Explicit bottom-to-top stack of live global window IDs. Authenticated
+    /// shell toplevels enter at the bottom so a replacement wallpaper cannot
+    /// cover surviving applications; ordinary creation appends at the top.
+    /// Focusing or clicking any window moves its ID to the end.
+    z_order: Vec<WindowId>,
     /// The composed output framebuffer that every committed
     /// surface blits into. v1 is a single global output at
     /// [`DEFAULT_WIDTH`] × [`DEFAULT_HEIGHT`]; real
     /// multi-output support lands with the kernel-side
     /// `Fb` driver.
     framebuffer: Framebuffer,
+    /// Incremented after every full-scene composition pass so the
+    /// transport loop can present state changes that did not come
+    /// from `surface.commit` (move, minimize, close, disconnect).
+    scene_generation: u64,
+    /// Incremented whenever logical state requests a scene rebuild, including
+    /// while composition is deferred. The transport uses this to stop after
+    /// one scene-mutating protocol request without conflating requested work
+    /// with a completed framebuffer pass.
+    recomposition_serial: u64,
+    /// The transport batches every logical mutation handled in one outer
+    /// event-loop turn into at most one full-scene rebuild. Direct library
+    /// callers retain immediate composition unless they explicitly open a
+    /// batch.
+    recomposition_deferred: bool,
+    recomposition_pending: bool,
     /// Current pointer position in screen space. Updated
     /// by [`Server::inject_pointer_motion`]; consulted by
     /// [`Server::inject_pointer_button`] when the click
@@ -112,30 +280,75 @@ pub struct Server {
     /// is currently over.
     pointer_x: i32,
     pointer_y: i32,
+    /// Monotonic serial copied into each routed pointer-button event. Clients
+    /// echo a press serial in interactive move/resize requests.
+    next_pointer_serial: u32,
     /// Currently-focused client + surface for keyboard
     /// input. Set by
     /// [`Server::inject_pointer_button`] on a press
     /// (click-to-focus); cleared when the focused window
     /// is destroyed.
     keyboard_focus: Option<(ClientId, ObjectId)>,
+    /// Persisted layout currently applied to physical keyboard input.
+    keyboard_layout: KeyboardLayout,
+    /// Physical-scancode to codepoint map selected by Settings.
+    active_keymap: Keymap,
+    /// Stable v1 client-facing logical HID map. Existing applications consume
+    /// logical scancodes through their US-HID tables, so the server maps the
+    /// selected layout back into this namespace before emitting events.
+    logical_keymap: Keymap,
+    /// Bit 0 = left shift held, bit 1 = right shift held. Tracking both avoids
+    /// clearing Shift when only one of two simultaneously-held keys releases.
+    shift_mask: u8,
     /// Pixels reserved at the bottom of the framebuffer for
     /// the desktop shell's taskbar. `set_maximized`
     /// configures use the framebuffer height MINUS this
     /// value as the work-area height. Defaults to 0;
     /// updated by [`Server::set_taskbar_height_px`].
     taskbar_height_px: u32,
+    /// Shell client that most recently reserved the bottom work-area strip.
+    /// Disconnect clears only the reservation owned by that client, so a
+    /// replacement shell can claim the strip before the old shell exits.
+    work_area_owner: Option<ClientId>,
+    /// A press routed through the shell-owned work-area reservation. The next
+    /// window-control request from that shell completes this command rather
+    /// than starting an independent click-to-focus operation.
+    pending_shell_command_owner: Option<ClientId>,
+    /// A reserved-strip focus changed logical z-order, but presentation is
+    /// held until the initiating shell commits its matching taskbar or menu
+    /// pixels. Target raise and shell feedback then become one transaction.
+    deferred_focus_commit_owner: Option<ClientId>,
+    /// Next generic framebuffer presentation-fence serial. Zero is reserved
+    /// so browser-side latches can use it as an uninitialised sentinel.
+    next_present_fence_serial: u32,
+    /// Shell connections that have already issued their one-shot
+    /// `pmd_shell_manager.desktop_ready` request.
+    present_fence_clients: BTreeSet<ClientId>,
+    /// Authenticated desktop-ready requests awaiting a fully settled
+    /// presentation boundary in the production transport.
+    pending_present_fences: VecDeque<(ClientId, u32)>,
+    /// Client-id cursor used to rotate the first callback lifecycle admission
+    /// attempt across bounded outer turns.
+    frame_callback_client_cursor: u32,
+    /// Transport-supplied monotonic time. Native isolation tests advance this
+    /// explicitly; the production loop updates it before dispatch and after a
+    /// restore-deadline wakeup.
+    monotonic_ms: u64,
+    restore_transaction: Option<RestoreTransaction>,
     /// Active interactive drag, if any. Set by
     /// `pmd_xdg_toplevel.move` / `.resize` request dispatch;
     /// consulted by `inject_pointer_motion`; cleared by
     /// `inject_pointer_button` on release.
     active_drag: Option<DragState>,
-    /// Cross-client auto-layout counter. Each new toplevel
-    /// across ANY client is positioned at
+    /// Cross-client auto-layout counter. Each new ordinary application
+    /// toplevel is positioned at
     /// (counter, counter) and the counter advances by
     /// AUTO_LAYOUT_STEP. Without this, every client's first
     /// toplevel would land at (0, 0) and stack invisibly
     /// — so spawning two `hello-toplevel` instances looks
-    /// like nothing happened on the second click.
+    /// like nothing happened on the second click. Capability-authenticated
+    /// desktop-shell surfaces stay at the output origin and do not consume a
+    /// cascade slot.
     next_toplevel_offset: i32,
 }
 
@@ -149,14 +362,47 @@ impl Server {
     /// allocated pixel buffer small and to produce
     /// deterministic clipping boundaries.
     pub fn with_framebuffer_size(width: u32, height: u32) -> Self {
+        Self::with_limits(width, height, ServerLimits::default())
+    }
+
+    /// Build a server with injectable global resource ceilings.
+    pub fn with_limits(width: u32, height: u32, limits: ServerLimits) -> Self {
+        let active_keymap = load_default();
+        let logical_keymap = load_default();
         Server {
             next_client_id: 1,
             clients: BTreeMap::new(),
+            limits,
+            pool_bytes: 0,
+            toplevel_metadata_bytes: 0,
+            next_window_id: 1,
+            windows: BTreeMap::new(),
+            window_ids: BTreeMap::new(),
+            next_toplevel_ordinal_by_pid: BTreeMap::new(),
+            z_order: Vec::new(),
             framebuffer: Framebuffer::new(width, height),
+            scene_generation: 0,
+            recomposition_serial: 0,
+            recomposition_deferred: false,
+            recomposition_pending: false,
             pointer_x: 0,
             pointer_y: 0,
+            next_pointer_serial: 1,
             keyboard_focus: None,
+            keyboard_layout: KeyboardLayout::default(),
+            active_keymap,
+            logical_keymap,
+            shift_mask: 0,
             taskbar_height_px: 0,
+            work_area_owner: None,
+            pending_shell_command_owner: None,
+            deferred_focus_commit_owner: None,
+            next_present_fence_serial: 1,
+            present_fence_clients: BTreeSet::new(),
+            pending_present_fences: VecDeque::new(),
+            frame_callback_client_cursor: 1,
+            monotonic_ms: 0,
+            restore_transaction: None,
             active_drag: None,
             next_toplevel_offset: 0,
         }
@@ -178,6 +424,583 @@ impl Server {
         &mut self.framebuffer
     }
 
+    /// Monotonic change counter for the composed scene.
+    pub fn scene_generation(&self) -> u64 {
+        self.scene_generation
+    }
+
+    /// Monotonic count of logical requests for a complete-scene rebuild.
+    pub fn recomposition_serial(&self) -> u64 {
+        self.recomposition_serial
+    }
+
+    /// Defer full-scene rebuilds until [`Server::finish_recomposition_batch`].
+    /// The display transport opens one batch per input-first outer turn so a
+    /// burst of motion, protocol commits, or disconnects cannot trigger an
+    /// unbounded number of complete framebuffer traversals.
+    pub fn begin_recomposition_batch(&mut self) {
+        debug_assert!(!self.recomposition_deferred);
+        self.recomposition_deferred = true;
+    }
+
+    /// Close the current batch and materialize all accumulated scene changes
+    /// in one composition pass. Returns whether a pass ran.
+    pub fn finish_recomposition_batch(&mut self) -> bool {
+        debug_assert!(self.recomposition_deferred);
+        self.recomposition_deferred = false;
+        if !core::mem::take(&mut self.recomposition_pending) {
+            return false;
+        }
+        self.recomposite_scene();
+        true
+    }
+
+    fn request_recomposition(&mut self) {
+        self.recomposition_serial = self.recomposition_serial.wrapping_add(1);
+        if self.recomposition_deferred {
+            self.recomposition_pending = true;
+        } else {
+            self.recomposite_scene();
+        }
+    }
+
+    /// Whether the transport must wait for a shell surface commit before
+    /// publishing the current logical focus transaction.
+    pub fn presentation_deferred(&self) -> bool {
+        self.deferred_focus_commit_owner.is_some()
+    }
+
+    /// Number of authenticated shell readiness fences waiting for the
+    /// transport to finish all earlier presentation work.
+    pub fn pending_present_fence_count(&self) -> usize {
+        self.pending_present_fences.len()
+    }
+
+    /// Qualify every commit-associated frame callback at one successfully
+    /// completed framebuffer presentation boundary. Each client moves its
+    /// complete awaiting FIFO into a timestamped batch in O(1), so a deferred
+    /// presentation cannot turn into an unbounded one-turn callback walk.
+    pub fn mark_frame_callbacks_presented(&mut self, callback_data: u32) {
+        for client in self.clients.values_mut() {
+            client.mark_frame_callbacks_presented(callback_data);
+        }
+    }
+
+    /// Drain ready presentation and cancellation lifecycle work against one
+    /// caller-owned outer-turn budget. Each pass attempts at most one item per
+    /// client; capacity-blocked clients retain their oldest item while other
+    /// clients progress. The rotating start preserves fairness across turns.
+    pub fn drain_ready_frame_callback_lifecycle(&mut self, remaining: &mut usize) -> usize {
+        if *remaining == 0 || self.clients.is_empty() {
+            return 0;
+        }
+        let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
+        let mut start = client_ids
+            .iter()
+            .position(|id| id.0 >= self.frame_callback_client_cursor)
+            .unwrap_or(0);
+        let mut completed = 0usize;
+        let mut last_completed = None;
+        loop {
+            let mut pass_progress = false;
+            for offset in 0..client_ids.len() {
+                if *remaining == 0 {
+                    break;
+                }
+                let index = (start + offset) % client_ids.len();
+                let client_id = client_ids[index];
+                let client = self
+                    .clients
+                    .get_mut(&client_id)
+                    .expect("callback client id came from live map");
+                if client.try_complete_ready_frame_callback_lifecycle()
+                    == FrameCallbackCompletion::Completed
+                {
+                    completed += 1;
+                    *remaining -= 1;
+                    pass_progress = true;
+                    last_completed = Some(index);
+                }
+            }
+            if !pass_progress || *remaining == 0 {
+                break;
+            }
+            start = (start + 1) % client_ids.len();
+        }
+        if let Some(index) = last_completed {
+            self.frame_callback_client_cursor = client_ids[(index + 1) % client_ids.len()].0;
+        }
+        completed
+    }
+
+    /// Presentation-site spelling for the shared lifecycle drain. The caller
+    /// first invokes [`Self::mark_frame_callbacks_presented`] and passes the
+    /// same outer-turn budget used by cancellation drains.
+    pub fn complete_presented_frame_callbacks(&mut self, remaining: &mut usize) -> usize {
+        self.drain_ready_frame_callback_lifecycle(remaining)
+    }
+
+    pub fn presented_frame_callback_count(&self) -> usize {
+        self.clients
+            .values()
+            .map(Client::presented_frame_callback_count)
+            .sum()
+    }
+
+    pub fn cancelled_frame_callback_lifecycle_count(&self) -> usize {
+        self.clients
+            .values()
+            .map(Client::cancelled_frame_callback_lifecycle_count)
+            .sum()
+    }
+
+    pub fn has_ready_frame_callback_lifecycle(&self) -> bool {
+        self.clients
+            .values()
+            .any(Client::has_ready_frame_callback_lifecycle)
+    }
+
+    /// True only when a bounded completion turn can enqueue at least one exact
+    /// lifecycle pair immediately. A capacity-blocked callback relies on the
+    /// existing event/outbound FD_WRITE readiness instead of forcing a spin.
+    pub fn ready_frame_callback_lifecycle_can_progress(&self) -> bool {
+        self.clients
+            .values()
+            .any(Client::ready_frame_callback_lifecycle_can_progress)
+    }
+
+    /// Remove the oldest presentation-fence serial once the transport has
+    /// proved that no earlier scene/frame work remains. The serial is generic
+    /// framebuffer ordering metadata; desktop policy stays in the privileged
+    /// shell-manager request that created it.
+    pub fn take_pending_present_fence(&mut self) -> Option<u32> {
+        while let Some((client_id, serial)) = self.pending_present_fences.pop_front() {
+            if self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.capabilities.contains(abi::cap::Cap::Shell))
+            {
+                return Some(serial);
+            }
+        }
+        None
+    }
+
+    /// Advance the server's transport-independent monotonic clock and fail an
+    /// expired restore transaction open. Returns true when expiry revealed or
+    /// otherwise mutated scene state.
+    pub fn advance_monotonic_time(&mut self, now_ms: u64) -> bool {
+        self.monotonic_ms = self.monotonic_ms.max(now_ms);
+        let expired = self
+            .restore_transaction
+            .as_ref()
+            .is_some_and(|restore| restore.deadline_ms <= self.monotonic_ms);
+        if expired {
+            self.abort_restore(shell_restore_status::TIMED_OUT, true)
+        } else {
+            false
+        }
+    }
+
+    /// Remaining time until the active restore must fail open. The production
+    /// transport uses this as its exact `poll_oneoff` clock deadline, avoiding
+    /// timers, periodic wakes, and idle spin.
+    pub fn restore_poll_timeout_ms(&self) -> Option<u64> {
+        self.restore_transaction
+            .as_ref()
+            .map(|restore| restore.deadline_ms.saturating_sub(self.monotonic_ms))
+    }
+
+    pub fn restore_transaction_owner(&self) -> Option<ClientId> {
+        self.restore_transaction
+            .as_ref()
+            .map(|restore| restore.owner)
+    }
+
+    fn begin_restore(&mut self, client_id: ClientId, request: ShellManagerBeginRestore) -> bool {
+        let authenticated_shell = self.clients.get(&client_id).is_some_and(|client| {
+            client.capabilities.contains(abi::cap::Cap::Shell) && client.shell_manager_id.is_some()
+        });
+        if !authenticated_shell || request.restore_id == 0 {
+            return false;
+        }
+        if self.restore_transaction.is_some() {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                if let Some(shell_manager_id) = client.shell_manager_id {
+                    let _ = client.emit_restore_finished(
+                        shell_manager_id,
+                        request.restore_id,
+                        shell_restore_status::BUSY,
+                        0,
+                    );
+                }
+            }
+            return false;
+        }
+        let timeout_ms = request
+            .timeout_ms
+            .clamp(MIN_SHELL_RESTORE_TIMEOUT_MS, MAX_SHELL_RESTORE_TIMEOUT_MS);
+        self.restore_transaction = Some(RestoreTransaction {
+            owner: client_id,
+            restore_id: request.restore_id,
+            deadline_ms: self.monotonic_ms.saturating_add(u64::from(timeout_ms)),
+            hidden: BTreeSet::new(),
+            placements: BTreeMap::new(),
+        });
+        true
+    }
+
+    fn place_restored_window(
+        &mut self,
+        client_id: ClientId,
+        request: ShellManagerPlaceRestoredWindow,
+    ) -> bool {
+        let window_id = WindowId(request.window_id);
+        let valid_transaction = self.restore_transaction.as_ref().is_some_and(|restore| {
+            restore.owner == client_id
+                && restore.restore_id == request.restore_id
+                && restore.hidden.contains(&window_id)
+        });
+        if !valid_transaction
+            || request.restore_id == 0
+            || request.normal_width == 0
+            || request.normal_height == 0
+            || request.flags & !shell_restore_window_flags::ALL != 0
+        {
+            return false;
+        }
+        let Some(owner) = self.windows.get(&window_id).copied() else {
+            return false;
+        };
+        if self
+            .clients
+            .get(&owner.client_id)
+            .is_none_or(|client| client.capabilities.contains(abi::cap::Cap::Shell))
+        {
+            return false;
+        }
+
+        let work_width = self.work_area_width().max(1);
+        let work_height = self.work_area_height().max(1);
+        let normal_width = request.normal_width.min(work_width).max(1);
+        let normal_height = request.normal_height.min(work_height).max(1);
+        let max_x = work_width.saturating_sub(normal_width) as i32;
+        let max_y = work_height.saturating_sub(normal_height) as i32;
+        let normal_x = request.normal_x.clamp(0, max_x);
+        let normal_y = request.normal_y.clamp(0, max_y);
+        let minimized = request.flags & shell_restore_window_flags::MINIMIZED != 0;
+        let maximized = request.flags & shell_restore_window_flags::MAXIMIZED != 0;
+        let expected_dimensions = if maximized {
+            (work_width, work_height)
+        } else {
+            (normal_width, normal_height)
+        };
+        let Some((commit_count_at_place, current_dimensions)) =
+            self.clients.get(&owner.client_id).and_then(|client| {
+                let toplevel = client.toplevels.get(&owner.toplevel_id)?;
+                let surface = client.surfaces.get(&toplevel.surface_id)?;
+                let dimensions = surface.current_buffer.and_then(|attachment| {
+                    client
+                        .buffers
+                        .get(&attachment.buffer_id)
+                        .map(|buffer| (buffer.width, buffer.height))
+                });
+                Some((surface.commit_count, dimensions))
+            })
+        else {
+            return false;
+        };
+        let Some(client) = self.clients.get_mut(&owner.client_id) else {
+            return false;
+        };
+        let Some(toplevel) = client.toplevels.get_mut(&owner.toplevel_id) else {
+            return false;
+        };
+        toplevel.normal_x = normal_x;
+        toplevel.normal_y = normal_y;
+        toplevel.normal_width = normal_width;
+        toplevel.normal_height = normal_height;
+        toplevel.minimized = minimized;
+        toplevel.maximized = maximized;
+        toplevel.initial_configure_sent = true;
+        if maximized {
+            toplevel.restore_origin = Some((normal_x, normal_y));
+            toplevel.x = 0;
+            toplevel.y = 0;
+        } else {
+            toplevel.restore_origin = None;
+            toplevel.x = normal_x;
+            toplevel.y = normal_y;
+        }
+        let normal_serial = client.next_configure_serial();
+        let _ = client.emit_xdg_toplevel_configure(
+            owner.toplevel_id,
+            normal_serial,
+            normal_width as i32,
+            normal_height as i32,
+            0,
+        );
+        if maximized {
+            let maximized_serial = client.next_configure_serial();
+            let _ = client.emit_xdg_toplevel_configure(
+                owner.toplevel_id,
+                maximized_serial,
+                work_width as i32,
+                work_height as i32,
+                display_proto::xdg_toplevel_state::MAXIMIZED,
+            );
+        }
+        if let Some(restore) = self.restore_transaction.as_mut() {
+            restore.placements.insert(
+                window_id,
+                RestorePlacement {
+                    z_rank: request.z_rank,
+                    expected_width: expected_dimensions.0,
+                    expected_height: expected_dimensions.1,
+                    commit_count_at_place,
+                    settled: current_dimensions == Some(expected_dimensions),
+                },
+            );
+        }
+        self.broadcast_window_state_changed(window_id);
+        true
+    }
+
+    fn end_restore(&mut self, client_id: ClientId, request: ShellManagerEndRestore) -> bool {
+        let matches = self.restore_transaction.as_ref().is_some_and(|restore| {
+            restore.owner == client_id && restore.restore_id == request.restore_id
+        });
+        if !matches || request.restore_id == 0 {
+            return false;
+        }
+        let placements_are_settled = self.restore_transaction.as_ref().is_some_and(|restore| {
+            restore
+                .placements
+                .values()
+                .all(|placement| placement.settled)
+        });
+        if !placements_are_settled {
+            return false;
+        }
+        let ranks_are_contiguous = self.restore_transaction.as_ref().is_some_and(|restore| {
+            let mut ranks = restore
+                .placements
+                .values()
+                .map(|placement| placement.z_rank)
+                .collect::<Vec<_>>();
+            ranks.sort_unstable();
+            ranks
+                .iter()
+                .enumerate()
+                .all(|(index, rank)| *rank == index as u32)
+        });
+        if !ranks_are_contiguous {
+            self.abort_restore(shell_restore_status::ABORTED, true);
+            return false;
+        }
+        let restore = self
+            .restore_transaction
+            .take()
+            .expect("restore checked above");
+        let ranks_before = self
+            .z_order
+            .iter()
+            .enumerate()
+            .map(|(rank, window_id)| (*window_id, rank))
+            .collect::<BTreeMap<_, _>>();
+        let focus_before = self
+            .keyboard_focus
+            .and_then(|(owner, surface)| self.window_id_for_surface(owner, surface));
+
+        let mut ranked = restore
+            .placements
+            .iter()
+            .map(|(window_id, placement)| (placement.z_rank, *window_id))
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by_key(|(rank, window_id)| (*rank, *window_id));
+        self.z_order
+            .retain(|window_id| !restore.placements.contains_key(window_id));
+        self.z_order
+            .extend(ranked.iter().map(|(_, window_id)| *window_id));
+
+        for window_id in &restore.hidden {
+            if let Some(owner) = self.windows.get(window_id).copied() {
+                if let Some(toplevel) = self
+                    .clients
+                    .get_mut(&owner.client_id)
+                    .and_then(|client| client.toplevels.get_mut(&owner.toplevel_id))
+                {
+                    toplevel.hidden_for_restore = false;
+                }
+            }
+        }
+
+        let requested_focus = (request.focus_window_id != 0)
+            .then_some(WindowId(request.focus_window_id))
+            .filter(|window_id| restore.placements.contains_key(window_id))
+            .filter(|window_id| self.window_is_focusable(*window_id));
+        let fallback_focus = self
+            .focusable_window_for_client(restore.owner)
+            .or_else(|| {
+                self.z_order.iter().rev().copied().find(|window_id| {
+                    restore.hidden.contains(window_id) && self.window_is_focusable(*window_id)
+                })
+            })
+            .or_else(|| {
+                self.z_order
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|window_id| self.window_is_focusable(*window_id))
+            });
+        let focus = requested_focus.or(fallback_focus);
+        self.keyboard_focus = focus.and_then(|window_id| {
+            let owner = self.windows.get(&window_id)?;
+            let surface_id = self
+                .clients
+                .get(&owner.client_id)?
+                .toplevels
+                .get(&owner.toplevel_id)?
+                .surface_id;
+            Some((owner.client_id, surface_id))
+        });
+        if let Some(window_id) = focus {
+            self.move_window_to_top(window_id);
+        }
+        self.request_recomposition();
+        let mut changed_windows = restore.hidden.clone();
+        for (rank, window_id) in self.z_order.iter().copied().enumerate() {
+            if ranks_before.get(&window_id).copied() != Some(rank) {
+                changed_windows.insert(window_id);
+            }
+        }
+        if let Some(window_id) = focus_before {
+            changed_windows.insert(window_id);
+        }
+        if let Some(window_id) = focus {
+            changed_windows.insert(window_id);
+        }
+        for window_id in changed_windows {
+            self.broadcast_window_state_changed(window_id);
+        }
+        self.broadcast_window_focused(focus.map_or(0, |window_id| window_id.0));
+        self.emit_restore_finished(
+            restore.owner,
+            restore.restore_id,
+            shell_restore_status::COMPLETED,
+            restore.placements.len() as u32,
+        );
+        true
+    }
+
+    fn abort_restore(&mut self, status: u32, notify_owner: bool) -> bool {
+        let Some(restore) = self.restore_transaction.take() else {
+            return false;
+        };
+        for window_id in &restore.hidden {
+            if let Some(owner) = self.windows.get(window_id).copied() {
+                if let Some(toplevel) = self
+                    .clients
+                    .get_mut(&owner.client_id)
+                    .and_then(|client| client.toplevels.get_mut(&owner.toplevel_id))
+                {
+                    toplevel.hidden_for_restore = false;
+                }
+            }
+        }
+        if self.keyboard_focus.is_none() {
+            if let Some(window_id) = self.focusable_window_for_client(restore.owner).or_else(|| {
+                self.z_order
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|window_id| self.window_is_focusable(*window_id))
+            }) {
+                let owner = self.windows.get(&window_id).copied();
+                self.keyboard_focus = owner.and_then(|owner| {
+                    let surface_id = self
+                        .clients
+                        .get(&owner.client_id)?
+                        .toplevels
+                        .get(&owner.toplevel_id)?
+                        .surface_id;
+                    Some((owner.client_id, surface_id))
+                });
+            }
+        }
+        self.request_recomposition();
+        for window_id in &restore.hidden {
+            self.broadcast_window_state_changed(*window_id);
+        }
+        let focused = self.keyboard_focus.and_then(|(owner, surface)| {
+            self.window_id_for_surface(owner, surface)
+                .map(|window_id| window_id.0)
+        });
+        self.broadcast_window_focused(focused.unwrap_or(0));
+        if notify_owner {
+            self.emit_restore_finished(
+                restore.owner,
+                restore.restore_id,
+                status,
+                restore.placements.len() as u32,
+            );
+        }
+        true
+    }
+
+    fn emit_restore_finished(
+        &mut self,
+        owner: ClientId,
+        restore_id: u32,
+        status: u32,
+        placed: u32,
+    ) {
+        if let Some(client) = self.clients.get_mut(&owner) {
+            if let Some(shell_manager_id) = client.shell_manager_id {
+                let _ = client.emit_restore_finished(shell_manager_id, restore_id, status, placed);
+            }
+        }
+    }
+
+    fn window_is_focusable(&self, window_id: WindowId) -> bool {
+        let Some(owner) = self.windows.get(&window_id) else {
+            return false;
+        };
+        let Some(client) = self.clients.get(&owner.client_id) else {
+            return false;
+        };
+        let Some(toplevel) = client.toplevels.get(&owner.toplevel_id) else {
+            return false;
+        };
+        !toplevel.minimized
+            && !toplevel.hidden_for_restore
+            && client
+                .surfaces
+                .get(&toplevel.surface_id)
+                .is_some_and(|surface| surface.current_buffer.is_some())
+    }
+
+    fn focusable_window_for_client(&self, client_id: ClientId) -> Option<WindowId> {
+        let focused = self
+            .keyboard_focus
+            .filter(|(owner, _)| *owner == client_id)
+            .and_then(|(owner, surface)| self.window_id_for_surface(owner, surface))
+            .filter(|window_id| self.window_is_focusable(*window_id));
+        focused.or_else(|| {
+            self.z_order.iter().rev().copied().find(|window_id| {
+                self.windows
+                    .get(window_id)
+                    .is_some_and(|owner| owner.client_id == client_id)
+                    && self.window_is_focusable(*window_id)
+            })
+        })
+    }
+
+    /// Current global window stack in bottom-to-top order.
+    pub fn window_z_order(&self) -> &[WindowId] {
+        &self.z_order
+    }
+
     /// Current pointer position in screen space.
     pub fn pointer_position(&self) -> (i32, i32) {
         (self.pointer_x, self.pointer_y)
@@ -189,16 +1012,32 @@ impl Server {
         self.keyboard_focus
     }
 
+    /// Keyboard layout currently applied to subsequently-routed key events.
+    pub const fn keyboard_layout(&self) -> KeyboardLayout {
+        self.keyboard_layout
+    }
+
+    /// Atomically replace the live keyboard map. The embedded bytes are fully
+    /// parsed before any server state changes, preserving the prior map if a
+    /// bundled asset is malformed.
+    pub fn set_keyboard_layout(&mut self, layout: KeyboardLayout) -> Result<bool, KeymapError> {
+        if layout == self.keyboard_layout {
+            return Ok(false);
+        }
+        let keymap = load_bundled(layout)?;
+        self.active_keymap = keymap;
+        self.keyboard_layout = layout;
+        Ok(true)
+    }
+
     /// Hit-test a screen-space point against the toplevels
     /// in every connected client. Returns the topmost
     /// surface whose rectangle contains `(x, y)`, or
     /// `None` if the point doesn't land on any window.
     ///
-    /// Z-order is "newer wins" in v1: toplevels created
-    /// later sit on top of older ones. The `BTreeMap`
-    /// iteration is by ascending `ObjectId`, and object
-    /// ids are monotonic, so walking the map in reverse
-    /// yields the most-recently-created toplevel first.
+    /// Z-order comes from the explicit server-global stack.
+    /// The stack is walked top-to-bottom, so focus raises and
+    /// cross-client creation order are reflected exactly.
     ///
     /// The hit rectangle is `(top.x, top.y, top.x + w,
     /// top.y + h)` where `(w, h)` comes from the
@@ -206,36 +1045,43 @@ impl Server {
     /// hasn't committed a buffer yet is invisible to the
     /// hit-test (no rectangle → no hit).
     pub fn hit_test(&self, x: i32, y: i32) -> Option<HitResult> {
-        for (&client_id, client) in self.clients.iter().rev() {
-            for (&toplevel_id, toplevel) in client.toplevels.iter().rev() {
-                let _ = toplevel_id;
-                let Some(surface) = client.surfaces.get(&toplevel.surface_id)
-                else {
-                    continue;
-                };
-                let Some(attachment) = surface.current_buffer else {
-                    continue;
-                };
-                let Some(info) = client.buffers.get(&attachment.buffer_id)
-                else {
-                    continue;
-                };
-                let rect_x = toplevel.x.saturating_add(attachment.x);
-                let rect_y = toplevel.y.saturating_add(attachment.y);
-                let rect_w = info.width as i32;
-                let rect_h = info.height as i32;
-                if x >= rect_x
-                    && x < rect_x.saturating_add(rect_w)
-                    && y >= rect_y
-                    && y < rect_y.saturating_add(rect_h)
-                {
-                    return Some(HitResult {
-                        client_id,
-                        surface_id: toplevel.surface_id,
-                        local_x: x - rect_x,
-                        local_y: y - rect_y,
-                    });
-                }
+        for window_id in self.z_order.iter().rev() {
+            let Some(owner) = self.windows.get(window_id) else {
+                continue;
+            };
+            let Some(client) = self.clients.get(&owner.client_id) else {
+                continue;
+            };
+            let Some(toplevel) = client.toplevels.get(&owner.toplevel_id) else {
+                continue;
+            };
+            if toplevel.minimized || toplevel.hidden_for_restore {
+                continue;
+            }
+            let Some(surface) = client.surfaces.get(&toplevel.surface_id) else {
+                continue;
+            };
+            let Some(attachment) = surface.current_buffer else {
+                continue;
+            };
+            let Some(info) = client.buffers.get(&attachment.buffer_id) else {
+                continue;
+            };
+            let rect_x = toplevel.x.saturating_add(attachment.x);
+            let rect_y = toplevel.y.saturating_add(attachment.y);
+            let rect_w = info.width as i32;
+            let rect_h = info.height as i32;
+            if x >= rect_x
+                && x < rect_x.saturating_add(rect_w)
+                && y >= rect_y
+                && y < rect_y.saturating_add(rect_h)
+            {
+                return Some(HitResult {
+                    client_id: owner.client_id,
+                    surface_id: toplevel.surface_id,
+                    local_x: x - rect_x,
+                    local_y: y - rect_y,
+                });
             }
         }
         None
@@ -248,11 +1094,7 @@ impl Server {
     /// its pointer object carrying surface-local
     /// coordinates. Returns the hit result, or `None`
     /// if the pointer didn't land on any window.
-    pub fn inject_pointer_motion(
-        &mut self,
-        x: i32,
-        y: i32,
-    ) -> Option<HitResult> {
+    pub fn inject_pointer_motion(&mut self, x: i32, y: i32) -> Option<HitResult> {
         self.pointer_x = x;
         self.pointer_y = y;
         // T133 server: if a drag is in progress, update the
@@ -269,8 +1111,7 @@ impl Server {
         let hit = self.hit_test(x, y)?;
         let client = self.clients.get_mut(&hit.client_id)?;
         if client.pointer_id.is_some() {
-            let _ =
-                client.emit_pointer_motion(hit.surface_id, hit.local_x, hit.local_y);
+            let _ = client.emit_pointer_motion(hit.surface_id, hit.local_x, hit.local_y);
         }
         Some(hit)
     }
@@ -283,69 +1124,80 @@ impl Server {
         use display_proto::xdg_toplevel_state;
         let dx = pointer_x - drag.start_pointer.0;
         let dy = pointer_y - drag.start_pointer.1;
-        let Some(client) = self.clients.get_mut(&drag.client_id) else {
-            return;
+        let moved = {
+            let Some(client) = self.clients.get_mut(&drag.client_id) else {
+                return;
+            };
+            match drag.kind {
+                DragKind::Move => {
+                    if let Some(toplevel) = client.toplevels.get_mut(&drag.toplevel_id) {
+                        let new_x = drag.start_origin.0.saturating_add(dx);
+                        let new_y = drag.start_origin.1.saturating_add(dy);
+                        let changed = (toplevel.x, toplevel.y) != (new_x, new_y);
+                        toplevel.x = new_x;
+                        toplevel.y = new_y;
+                        changed
+                    } else {
+                        false
+                    }
+                }
+                DragKind::Resize { edges } => {
+                    // V1 resize semantics: the surface buffer's
+                    // width/height come from the client side
+                    // (client decides the buffer geometry on
+                    // attach). The server emits a configure
+                    // proposing the new size; the client
+                    // respects it on its next attach.
+                    let surface_id = match client.toplevels.get(&drag.toplevel_id) {
+                        Some(t) => t.surface_id,
+                        None => return,
+                    };
+                    let (start_w, start_h) = client
+                        .surfaces
+                        .get(&surface_id)
+                        .and_then(|s| s.current_buffer)
+                        .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
+                        .map(|info| (info.width as i32, info.height as i32))
+                        .unwrap_or((320, 240));
+                    let mut new_w = start_w;
+                    let mut new_h = start_h;
+                    if edges & edge::RIGHT != 0 {
+                        new_w = (start_w + dx).max(1);
+                    } else if edges & edge::LEFT != 0 {
+                        new_w = (start_w - dx).max(1);
+                    }
+                    if edges & edge::BOTTOM != 0 {
+                        new_h = (start_h + dy).max(1);
+                    } else if edges & edge::TOP != 0 {
+                        new_h = (start_h - dy).max(1);
+                    }
+                    let serial = client.next_configure_serial();
+                    let _ = client.emit_xdg_toplevel_configure(
+                        drag.toplevel_id,
+                        serial,
+                        new_w,
+                        new_h,
+                        xdg_toplevel_state::RESIZING,
+                    );
+                    false
+                }
+            }
         };
-        match drag.kind {
-            DragKind::Move => {
-                if let Some(toplevel) = client.toplevels.get_mut(&drag.toplevel_id) {
-                    toplevel.x = drag.start_origin.0.saturating_add(dx);
-                    toplevel.y = drag.start_origin.1.saturating_add(dy);
-                }
-            }
-            DragKind::Resize { edges } => {
-                // V1 resize semantics: the surface buffer's
-                // width/height come from the client side
-                // (client decides the buffer geometry on
-                // attach). The server emits a configure
-                // proposing the new size; the client
-                // respects it on its next attach.
-                let surface_id = match client.toplevels.get(&drag.toplevel_id) {
-                    Some(t) => t.surface_id,
-                    None => return,
-                };
-                let (start_w, start_h) = client
-                    .surfaces
-                    .get(&surface_id)
-                    .and_then(|s| s.current_buffer)
-                    .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
-                    .map(|info| (info.width as i32, info.height as i32))
-                    .unwrap_or((320, 240));
-                let mut new_w = start_w;
-                let mut new_h = start_h;
-                if edges & edge::RIGHT != 0 {
-                    new_w = (start_w + dx).max(1);
-                } else if edges & edge::LEFT != 0 {
-                    new_w = (start_w - dx).max(1);
-                }
-                if edges & edge::BOTTOM != 0 {
-                    new_h = (start_h + dy).max(1);
-                } else if edges & edge::TOP != 0 {
-                    new_h = (start_h - dy).max(1);
-                }
-                let serial = client.next_configure_serial();
-                let _ = client.emit_xdg_toplevel_configure(
-                    drag.toplevel_id,
-                    serial,
-                    new_w,
-                    new_h,
-                    xdg_toplevel_state::RESIZING,
-                );
-            }
+        if moved {
+            self.request_recomposition();
         }
     }
 
     /// Inject a pointer button event at the current
     /// pointer position. Emits a `button` event on the
     /// target client's pointer object (if any), and on a
-    /// press, sets keyboard focus to the hit surface.
+    /// press, sets keyboard focus to the hit surface. Presses in the
+    /// shell-owned bottom work-area reservation are delivered without the
+    /// generic focus/raise step: that strip contains shell commands whose
+    /// handlers select the actual target window.
     /// Returns the hit result, or `None` if the click
     /// didn't land on any window.
-    pub fn inject_pointer_button(
-        &mut self,
-        button: u32,
-        state: u32,
-    ) -> Option<HitResult> {
+    pub fn inject_pointer_button(&mut self, button: u32, state: u32) -> Option<HitResult> {
         // T133 server: a release during a drag terminates
         // the drag and emits a final configure (resize) with
         // the RESIZING bit cleared. Move drags don't need a
@@ -355,14 +1207,47 @@ impl Server {
                 if let DragKind::Resize { .. } = drag.kind {
                     self.emit_resize_final_configure(drag);
                 }
+                self.settle_drag_geometry(drag);
+                if let Some(window_id) = self
+                    .window_ids
+                    .get(&(drag.client_id, drag.toplevel_id))
+                    .copied()
+                {
+                    self.broadcast_window_state_changed(window_id);
+                }
                 return None;
             }
         }
         let hit = self.hit_test(self.pointer_x, self.pointer_y)?;
+        let serial = self.next_pointer_serial;
+        self.next_pointer_serial = self.next_pointer_serial.wrapping_add(1).max(1);
+        let is_shell_command = self.work_area_owner == Some(hit.client_id)
+            && self.pointer_y >= self.work_area_height() as i32;
         if state == display_proto::events::pointer_button_state::PRESSED {
+            if is_shell_command {
+                self.pending_shell_command_owner = Some(hit.client_id);
+            } else {
+                self.pending_shell_command_owner = None;
+                if self.deferred_focus_commit_owner.take().is_some() {
+                    // A new independent press supersedes an incomplete shell
+                    // transaction. Materialize its logical z-order before
+                    // routing the new click so a failed shell cannot withhold
+                    // presentation indefinitely.
+                    self.request_recomposition();
+                }
+            }
+        }
+        if state == display_proto::events::pointer_button_state::PRESSED && !is_shell_command {
             let prev_focus = self.keyboard_focus;
             let new_focus = (hit.client_id, hit.surface_id);
             self.keyboard_focus = Some(new_focus);
+            let focused_window_id = self.window_id_for_surface(hit.client_id, hit.surface_id);
+            if focused_window_id
+                .map(|window_id| self.raise_window(window_id))
+                .unwrap_or(false)
+            {
+                self.request_recomposition();
+            }
             // Only broadcast window_focused on a real focus
             // change. Re-clicking the already-focused window
             // re-emitted the same broadcast every time, which
@@ -371,23 +1256,15 @@ impl Server {
             // shm_pool.write traffic. Suppress those.
             let focus_changed = prev_focus != Some(new_focus);
             if focus_changed {
-                let mut focused_window_id: Option<u32> = None;
-                if let Some(client) = self.clients.get(&hit.client_id) {
-                    for (toplevel_id, toplevel) in client.toplevels.iter() {
-                        if toplevel.surface_id == hit.surface_id {
-                            focused_window_id = Some(toplevel_id.0);
-                            break;
-                        }
-                    }
-                }
                 if let Some(wid) = focused_window_id {
-                    self.broadcast_window_focused(wid);
+                    self.broadcast_window_focused(wid.0);
                 }
             }
         }
         let client = self.clients.get_mut(&hit.client_id)?;
         if client.pointer_id.is_some() {
             let _ = client.emit_pointer_button(
+                serial,
                 hit.surface_id,
                 hit.local_x,
                 hit.local_y,
@@ -424,6 +1301,34 @@ impl Server {
         let _ = client.emit_xdg_toplevel_configure(drag.toplevel_id, serial, w, h, 0);
     }
 
+    fn settle_drag_geometry(&mut self, drag: DragState) {
+        let Some(client) = self.clients.get_mut(&drag.client_id) else {
+            return;
+        };
+        let Some(toplevel) = client.toplevels.get(&drag.toplevel_id) else {
+            return;
+        };
+        if toplevel.maximized {
+            return;
+        }
+        let surface_id = toplevel.surface_id;
+        let (x, y) = (toplevel.x, toplevel.y);
+        let dimensions = client
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.current_buffer)
+            .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
+            .map(|buffer| (buffer.width, buffer.height));
+        if let Some(toplevel) = client.toplevels.get_mut(&drag.toplevel_id) {
+            toplevel.normal_x = x;
+            toplevel.normal_y = y;
+            if let Some((width, height)) = dimensions {
+                toplevel.normal_width = width;
+                toplevel.normal_height = height;
+            }
+        }
+    }
+
     /// Inject a keyboard key event. Routes to the
     /// currently-focused client + surface (if any). The
     /// target client must have a bound `pmd_keyboard`
@@ -431,12 +1336,9 @@ impl Server {
     /// Returns the (client_id, surface_id) the event was
     /// routed to, or `None` if no window has keyboard
     /// focus.
-    pub fn inject_keyboard_key(
-        &mut self,
-        key: u32,
-        state: u32,
-    ) -> Option<(ClientId, ObjectId)> {
+    pub fn inject_keyboard_key(&mut self, key: u32, state: u32) -> Option<(ClientId, ObjectId)> {
         let (client_id, surface_id) = self.keyboard_focus?;
+        let key = self.map_keyboard_key(key, state);
         let client = self.clients.get_mut(&client_id)?;
         if client.keyboard_id.is_some() {
             let _ = client.emit_keyboard_key(surface_id, key, state);
@@ -444,13 +1346,42 @@ impl Server {
         Some((client_id, surface_id))
     }
 
+    fn map_keyboard_key(&mut self, key: u32, state: u32) -> u32 {
+        let shift_bit = match u8::try_from(key)
+            .ok()
+            .and_then(|raw| Scancode::try_from(raw).ok())
+        {
+            Some(Scancode::ShiftLeft) => Some(1),
+            Some(Scancode::ShiftRight) => Some(2),
+            _ => None,
+        };
+        if let Some(bit) = shift_bit {
+            match state {
+                key_state::PRESSED => self.shift_mask |= bit,
+                key_state::RELEASED => self.shift_mask &= !bit,
+                _ => {}
+            }
+            return key;
+        }
+
+        if self.keyboard_layout == KeyboardLayout::UsQwerty {
+            return key;
+        }
+        self.active_keymap
+            .map_to_logical_scancode(key, self.shift_mask != 0, &self.logical_keymap)
+    }
+
     /// Explicitly set keyboard focus. Used by tests and
     /// by the desktop shell's click-to-focus path.
-    pub fn set_keyboard_focus(
-        &mut self,
-        focus: Option<(ClientId, ObjectId)>,
-    ) {
+    pub fn set_keyboard_focus(&mut self, focus: Option<(ClientId, ObjectId)>) {
         self.keyboard_focus = focus;
+        let raised = focus
+            .and_then(|(client_id, surface_id)| self.window_id_for_surface(client_id, surface_id))
+            .map(|window_id| self.raise_window(window_id))
+            .unwrap_or(false);
+        if raised {
+            self.request_recomposition();
+        }
     }
 
     /// Accept a new client connection. Returns the
@@ -462,7 +1393,14 @@ impl Server {
     /// connecting process holds capabilities the bind
     /// dispatcher should honour.
     pub fn accept(&mut self) -> ClientId {
-        self.accept_with_caps(abi::cap::CapSet::EMPTY)
+        self.try_accept()
+            .expect("display server client limit exceeded")
+    }
+
+    /// Fallible production accept path. Admission happens before allocating a
+    /// `Client`, so rejected sockets retain no server-side protocol state.
+    pub fn try_accept(&mut self) -> Result<ClientId, ServerError> {
+        self.try_accept_with_caps(abi::cap::CapSet::EMPTY)
     }
 
     /// Accept a new client connection with a given
@@ -474,10 +1412,72 @@ impl Server {
     /// their own entries to
     /// [`crate::client::interface_required_cap`].
     pub fn accept_with_caps(&mut self, caps: abi::cap::CapSet) -> ClientId {
+        self.try_accept_with_caps(caps)
+            .expect("display server client limit exceeded")
+    }
+
+    /// Fallible capability-authenticated accept used by the production
+    /// transport.
+    pub fn try_accept_with_caps(
+        &mut self,
+        caps: abi::cap::CapSet,
+    ) -> Result<ClientId, ServerError> {
+        self.try_accept_with_credentials(caps, 0)
+    }
+
+    /// Accept using immutable credentials queried from the accepted kernel
+    /// socket. Production callers must pass a non-zero peer PID; the zero value
+    /// is retained only by the older native fixture helpers above.
+    pub fn try_accept_with_credentials(
+        &mut self,
+        caps: abi::cap::CapSet,
+        peer_pid: u32,
+    ) -> Result<ClientId, ServerError> {
+        let shell_clients = self
+            .clients
+            .values()
+            .filter(|client| client.capabilities.contains(abi::cap::Cap::Shell))
+            .count();
+        if caps.contains(abi::cap::Cap::Shell) {
+            let attempted = shell_clients.saturating_add(1);
+            if attempted > self.limits.shell_clients {
+                return Err(ServerError::ShellClientLimitExceeded {
+                    attempted,
+                    limit: self.limits.shell_clients,
+                });
+            }
+        } else {
+            let ordinary_clients = self.clients.len().saturating_sub(shell_clients);
+            let ordinary_limit = self
+                .limits
+                .clients
+                .saturating_sub(self.limits.shell_clients);
+            let attempted = ordinary_clients.saturating_add(1);
+            if attempted > ordinary_limit {
+                return Err(ServerError::ClientLimitExceeded {
+                    attempted,
+                    limit: ordinary_limit,
+                });
+            }
+        }
+        let attempted = self.clients.len().saturating_add(1);
+        if attempted > self.limits.clients {
+            return Err(ServerError::ClientLimitExceeded {
+                attempted,
+                limit: self.limits.clients,
+            });
+        }
         let id = ClientId(self.next_client_id);
-        self.next_client_id = self.next_client_id.checked_add(1).unwrap_or(u32::MAX);
-        self.clients.insert(id, Client::new_with_caps(id, caps));
-        id
+        self.next_client_id = self.next_client_id.saturating_add(1);
+        let client_limits = ClientLimits {
+            toplevel_metadata_bytes: self.limits.client_toplevel_metadata_bytes,
+            ..ClientLimits::default()
+        };
+        self.clients.insert(
+            id,
+            Client::new_with_credentials_and_limits(id, caps, peer_pid, client_limits),
+        );
+        Ok(id)
     }
 
     /// Drop a client, e.g. on connection close. Returns the
@@ -490,21 +1490,108 @@ impl Server {
     /// associated taskbar entries before the connection's
     /// last events are flushed.
     pub fn disconnect(&mut self, id: ClientId) -> Option<Client> {
-        let dying_window_ids: alloc::vec::Vec<u32> = self
+        let owned_restore = self
+            .restore_transaction
+            .as_ref()
+            .is_some_and(|restore| restore.owner == id);
+        let had_composed_surface = self
             .clients
             .get(&id)
-            .map(|c| c.toplevels.keys().map(|tid| tid.0).collect())
-            .unwrap_or_default();
+            .map(|client| {
+                client
+                    .surfaces
+                    .values()
+                    .any(|surface| surface.current_buffer.is_some())
+            })
+            .unwrap_or(false);
+        let dying_windows: alloc::vec::Vec<(ObjectId, WindowId)> = self
+            .window_ids
+            .iter()
+            .filter_map(|(&(client_id, toplevel_id), &window_id)| {
+                (client_id == id).then_some((toplevel_id, window_id))
+            })
+            .collect();
+        let had_windows = !dying_windows.is_empty();
         let removed = self.clients.remove(&id);
-        for wid in dying_window_ids {
-            self.broadcast_window_destroyed(wid);
+        if let Some(client) = removed.as_ref() {
+            self.pool_bytes = self.pool_bytes.saturating_sub(client.pool_bytes_len());
+            self.toplevel_metadata_bytes = self
+                .toplevel_metadata_bytes
+                .saturating_sub(client.toplevel_metadata_bytes_len());
+        }
+        if self.keyboard_focus.map(|(client_id, _)| client_id) == Some(id) {
+            self.keyboard_focus = None;
+        }
+        if self.active_drag.map(|drag| drag.client_id) == Some(id) {
+            self.active_drag = None;
+        }
+        if self.work_area_owner == Some(id) {
+            self.work_area_owner = None;
+            self.taskbar_height_px = 0;
+        }
+        if self.pending_shell_command_owner == Some(id) {
+            self.pending_shell_command_owner = None;
+        }
+        if self.deferred_focus_commit_owner == Some(id) {
+            self.deferred_focus_commit_owner = None;
+        }
+        self.present_fence_clients.remove(&id);
+        self.pending_present_fences
+            .retain(|(client_id, _)| *client_id != id);
+        let dying_window_ids = dying_windows
+            .iter()
+            .map(|(_, window_id)| *window_id)
+            .collect::<BTreeSet<_>>();
+        let shifted_windows = self.remove_from_z_order(&dying_window_ids);
+        for (toplevel_id, window_id) in dying_windows {
+            self.window_ids.remove(&(id, toplevel_id));
+            self.windows.remove(&window_id);
+            self.broadcast_window_destroyed(window_id.0);
+            if let Some(restore) = self.restore_transaction.as_mut() {
+                restore.hidden.remove(&window_id);
+                restore.placements.remove(&window_id);
+            }
+        }
+        for window_id in shifted_windows {
+            self.broadcast_window_state_changed(window_id);
+        }
+        let restore_aborted =
+            owned_restore && self.abort_restore(shell_restore_status::ABORTED, false);
+        if !restore_aborted && removed.is_some() && (had_composed_surface || had_windows) {
+            self.request_recomposition();
         }
         removed
+    }
+
+    /// Look up the shell-visible global ID for a client's local
+    /// toplevel object. Protocol clients learn IDs through events;
+    /// this accessor is for server integrations and isolation tests.
+    pub fn window_id(&self, client_id: ClientId, toplevel_id: ObjectId) -> Option<u32> {
+        self.window_ids
+            .get(&(client_id, toplevel_id))
+            .map(|id| id.0)
+    }
+
+    /// Resolve a shell-visible ID back to its exact owning client and
+    /// client-local toplevel object.
+    pub fn window_owner(&self, window_id: u32) -> Option<(ClientId, ObjectId)> {
+        let owner = self.windows.get(&WindowId(window_id))?;
+        Some((owner.client_id, owner.toplevel_id))
     }
 
     /// Number of currently-connected clients.
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    /// Aggregate live/retained shm-pool backing across every connection.
+    pub fn pool_bytes_len(&self) -> u64 {
+        self.pool_bytes
+    }
+
+    /// Aggregate UTF-8 bytes retained in live toplevel titles and app ids.
+    pub fn toplevel_metadata_bytes_len(&self) -> u64 {
+        self.toplevel_metadata_bytes
     }
 
     /// Immutably borrow a client.
@@ -515,6 +1602,16 @@ impl Server {
     /// Mutably borrow a client.
     pub fn client_mut(&mut self, id: ClientId) -> Option<&mut Client> {
         self.clients.get_mut(&id)
+    }
+
+    /// Whether the per-client protocol event queue crossed a hard ceiling.
+    /// The transport owner must close this connection; the queue deliberately
+    /// does not resume after a drain because continuing would silently lose an
+    /// ordered protocol event.
+    pub fn client_event_queue_overflowed(&self, id: ClientId) -> bool {
+        self.clients
+            .get(&id)
+            .is_some_and(Client::event_queue_overflowed)
     }
 
     /// Drain any events the server has enqueued for a
@@ -529,6 +1626,31 @@ impl Server {
     pub fn drain_client_events(&mut self, client_id: ClientId) -> Option<Vec<u8>> {
         let client = self.clients.get_mut(&client_id)?;
         Some(client.drain_pending_events())
+    }
+
+    /// Encoded event bytes currently awaiting transport for `client_id`.
+    pub fn client_pending_event_bytes(&self, client_id: ClientId) -> Option<usize> {
+        self.clients
+            .get(&client_id)
+            .map(Client::pending_event_bytes)
+    }
+
+    /// Encoded size of the next complete ordered event for `client_id`.
+    pub fn client_next_pending_event_bytes(&self, client_id: ClientId) -> Option<usize> {
+        self.clients
+            .get(&client_id)
+            .and_then(Client::next_pending_event_bytes)
+    }
+
+    /// Drain a framing-preserving event prefix under a transport-turn byte
+    /// budget. The remainder stays queued in exact protocol order.
+    pub fn drain_client_events_bounded(
+        &mut self,
+        client_id: ClientId,
+        max_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        let client = self.clients.get_mut(&client_id)?;
+        Some(client.drain_pending_events_bounded(max_bytes))
     }
 
     /// Feed one wire-format request (header + payload) through
@@ -561,31 +1683,199 @@ impl Server {
             .clients
             .get(&client_id)
             .and_then(|c| c.get(header.object_id));
+        let surface_geometry_before = if pre_interface == Some(Interface::Surface) {
+            self.clients.get(&client_id).and_then(|client| {
+                let attachment = client.surfaces.get(&header.object_id)?.current_buffer?;
+                let buffer = client.buffers.get(&attachment.buffer_id)?;
+                Some((buffer.width, buffer.height))
+            })
+        } else {
+            None
+        };
+        let reserved_shell_command = pre_interface == Some(Interface::ShellManager)
+            && matches!(header.opcode, 2 | 3 | 4 | 5 | 7)
+            && self.pending_shell_command_owner == Some(client_id);
+        let restore_holds_toplevel_geometry = pre_interface == Some(Interface::XdgToplevel)
+            && matches!(header.opcode, 5..=8)
+            && self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.toplevels.get(&header.object_id))
+                .is_some_and(|toplevel| toplevel.hidden_for_restore);
+        if restore_holds_toplevel_geometry {
+            return Ok(());
+        }
 
+        let pool_bytes_before = self
+            .clients
+            .get(&client_id)
+            .ok_or(ServerError::NoSuchClient { id: client_id })?
+            .pool_bytes_len();
+        let toplevel_metadata_bytes_before = self
+            .clients
+            .get(&client_id)
+            .ok_or(ServerError::NoSuchClient { id: client_id })?
+            .toplevel_metadata_bytes_len();
+        let is_shell = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.capabilities.contains(abi::cap::Cap::Shell));
+        let reserved_shell_pool_bytes =
+            SHELL_FULL_OUTPUT_POOL_BYTES.saturating_mul(self.limits.shell_clients as u64);
+        let reserved_shell_toplevels =
+            SHELL_TOPLEVELS_RESERVED_PER_CLIENT.saturating_mul(self.limits.shell_clients);
+        let reserved_shell_metadata_bytes = SHELL_METADATA_BYTES_RESERVED_PER_CLIENT
+            .saturating_mul(self.limits.shell_clients as u64);
         let client = self
             .clients
             .get_mut(&client_id)
             .ok_or(ServerError::NoSuchClient { id: client_id })?;
-        client.dispatch_request(header, payload)?;
+        client.dispatch_request_with_server_budgets(
+            header,
+            payload,
+            ServerResourceBudgets {
+                pool_bytes: self.pool_bytes,
+                pool_byte_limit: if is_shell {
+                    self.limits.pool_bytes
+                } else {
+                    self.limits
+                        .pool_bytes
+                        .saturating_sub(reserved_shell_pool_bytes)
+                },
+                toplevels: self.windows.len(),
+                toplevel_limit: if is_shell {
+                    self.limits.toplevels
+                } else {
+                    self.limits
+                        .toplevels
+                        .saturating_sub(reserved_shell_toplevels)
+                },
+                toplevel_metadata_bytes: self.toplevel_metadata_bytes,
+                toplevel_metadata_byte_limit: if is_shell {
+                    self.limits.toplevel_metadata_bytes
+                } else {
+                    self.limits
+                        .toplevel_metadata_bytes
+                        .saturating_sub(reserved_shell_metadata_bytes)
+                },
+            },
+        )?;
+        let pool_bytes_after = client.pool_bytes_len();
+        let toplevel_metadata_bytes_after = client.toplevel_metadata_bytes_len();
+        self.pool_bytes = self
+            .pool_bytes
+            .saturating_sub(pool_bytes_before)
+            .saturating_add(pool_bytes_after);
+        self.toplevel_metadata_bytes = self
+            .toplevel_metadata_bytes
+            .saturating_sub(toplevel_metadata_bytes_before)
+            .saturating_add(toplevel_metadata_bytes_after);
+        if reserved_shell_command {
+            self.pending_shell_command_owner = None;
+        }
 
-        if pre_interface == Some(Interface::Surface)
-            && header.opcode == 7 /* commit */
+        if is_shell
+            && pre_interface == Some(Interface::ShellManager)
+            && header.opcode == 8
+            && display_proto::requests::ShellManagerDesktopReady::decode(payload).is_ok()
+            && self.present_fence_clients.insert(client_id)
         {
+            let serial = self.next_present_fence_serial;
+            self.next_present_fence_serial = self.next_present_fence_serial.wrapping_add(1).max(1);
+            self.pending_present_fences.push_back((client_id, serial));
+        }
+
+        if pre_interface == Some(Interface::Surface) && header.opcode == 7
+        /* commit */
+        {
+            let geometry_changed = self.update_normal_geometry_after_commit(
+                client_id,
+                header.object_id,
+                surface_geometry_before,
+            );
+            let placement_settled =
+                self.settle_restore_placement_after_commit(client_id, header.object_id);
+            let newly_focused = self.focus_newly_mapped_toplevel(client_id, header.object_id);
             self.composite_surface_commit(client_id, header.object_id);
+            if self.deferred_focus_commit_owner == Some(client_id) {
+                self.deferred_focus_commit_owner = None;
+            }
+            if let Some(window_id) = newly_focused {
+                self.broadcast_window_focused(window_id.0);
+            }
+            if let Some(window_id) = geometry_changed.or(placement_settled) {
+                let dragging_same_window = self
+                    .active_drag
+                    .and_then(|drag| self.window_ids.get(&(drag.client_id, drag.toplevel_id)))
+                    .is_some_and(|dragged| *dragged == window_id);
+                if !dragging_same_window {
+                    self.broadcast_window_state_changed(window_id);
+                }
+            }
             self.maybe_emit_initial_configure(client_id, header.object_id);
         }
 
-        // T131: cross-client shell_manager.minimize_window
-        // takes effect server-wide. The payload is a window_id
-        // owned by some OTHER client; we walk every client's
-        // toplevel table to find the match and flip the flag.
-        if pre_interface == Some(Interface::ShellManager)
-            && header.opcode == 4 /* minimize_window */
+        if pre_interface == Some(Interface::Surface) && header.opcode == 8
+        /* patch_current */
+        {
+            self.request_recomposition();
+        }
+
+        if pre_interface == Some(Interface::Surface) && header.opcode == 1
+        /* destroy */
+        {
+            if self.keyboard_focus == Some((client_id, header.object_id)) {
+                self.keyboard_focus = None;
+            }
+            self.request_recomposition();
+        }
+
+        // Shell-manager window IDs live in the server-global window
+        // registry, never in a client's local ObjectId namespace.
+        if pre_interface == Some(Interface::ShellManager) && header.opcode == 4
+        /* minimize_window */
         {
             if let Ok(req) = display_proto::requests::ShellManagerMinimizeWindow::decode(payload) {
-                let target = display_proto::ids::ObjectId::new(req.window_id);
-                self.set_toplevel_minimized_across_clients(target, true);
+                self.set_window_minimized(req.window_id, true);
             }
+        }
+
+        if pre_interface == Some(Interface::ShellManager) && header.opcode == 5
+        /* unminimize_window */
+        {
+            if let Ok(req) = display_proto::requests::ShellManagerUnminimizeWindow::decode(payload)
+            {
+                // Resolve only through the server-global window registry.
+                // Restoring from the taskbar also activates and raises the
+                // window, matching the existing focus-window behavior.
+                self.focus_window_by_id(req.window_id, None);
+            }
+        }
+
+        if pre_interface == Some(Interface::ShellManager) && header.opcode == 6
+        /* set_work_area_bottom */
+        {
+            if let Ok(req) = display_proto::requests::ShellManagerSetWorkAreaBottom::decode(payload)
+            {
+                self.set_work_area_bottom_for(client_id, req.height_px);
+            }
+        }
+
+        if pre_interface == Some(Interface::ShellManager) && header.opcode == 7
+        /* toggle_maximized_window */
+        {
+            if let Ok(req) =
+                display_proto::requests::ShellManagerToggleMaximizedWindow::decode(payload)
+            {
+                self.toggle_window_maximized(req.window_id);
+            }
+        }
+
+        if pre_interface == Some(Interface::XdgToplevel) && header.opcode == 3
+        /* destroy */
+        {
+            self.destroy_toplevel(client_id, header.object_id);
+            return Ok(());
         }
 
         // T132 server emit: set_maximized / unset_maximized
@@ -599,9 +1889,19 @@ impl Server {
             match header.opcode {
                 5 /* set_maximized */ => {
                     self.emit_configure_for_max_state(client_id, header.object_id, true)?;
+                    if let Some(window_id) =
+                        self.window_ids.get(&(client_id, header.object_id)).copied()
+                    {
+                        self.broadcast_window_state_changed(window_id);
+                    }
                 }
                 6 /* unset_maximized */ => {
                     self.emit_configure_for_max_state(client_id, header.object_id, false)?;
+                    if let Some(window_id) =
+                        self.window_ids.get(&(client_id, header.object_id)).copied()
+                    {
+                        self.broadcast_window_state_changed(window_id);
+                    }
                 }
                 7 /* move */ | 8 /* resize */ => {
                     self.start_drag_from_request(client_id, header.object_id, header.opcode, payload);
@@ -625,7 +1925,10 @@ impl Server {
                     if let Ok(req) =
                         display_proto::requests::ShellManagerFocusWindow::decode(payload)
                     {
-                        self.focus_window_by_id(req.window_id);
+                        self.focus_window_by_id(
+                            req.window_id,
+                            reserved_shell_command.then_some(client_id),
+                        );
                     }
                 }
                 3 /* close_window */ => {
@@ -633,6 +1936,28 @@ impl Server {
                         display_proto::requests::ShellManagerCloseWindow::decode(payload)
                     {
                         self.close_window_by_id(req.window_id);
+                    }
+                }
+                9 /* subscribe_window_state */ => {
+                    if let Ok(req) =
+                        display_proto::requests::ShellManagerSubscribeWindowState::decode(payload)
+                    {
+                        self.subscribe_window_state_for(client_id, req.snapshot_id);
+                    }
+                }
+                10 /* begin_restore */ => {
+                    if let Ok(req) = ShellManagerBeginRestore::decode(payload) {
+                        self.begin_restore(client_id, req);
+                    }
+                }
+                11 /* place_restored_window */ => {
+                    if let Ok(req) = ShellManagerPlaceRestoredWindow::decode(payload) {
+                        self.place_restored_window(client_id, req);
+                    }
+                }
+                12 /* end_restore */ => {
+                    if let Ok(req) = ShellManagerEndRestore::decode(payload) {
+                        self.end_restore(client_id, req);
                     }
                 }
                 _ => {}
@@ -665,12 +1990,34 @@ impl Server {
         // it using the server-global staircase so two
         // separate clients' first toplevels don't both land
         // at (0, 0). Then broadcast window_created.
-        if pre_interface == Some(Interface::XdgShell) && header.opcode == 1 /* get_toplevel */ {
-            if let Ok(req) =
-                display_proto::requests::XdgShellGetToplevel::decode(payload)
-            {
+        if pre_interface == Some(Interface::XdgShell) && header.opcode == 1
+        /* get_toplevel */
+        {
+            if let Ok(req) = display_proto::requests::XdgShellGetToplevel::decode(payload) {
                 self.position_new_toplevel(client_id, req.new_id);
+                self.assign_toplevel_ordinal(client_id, req.new_id);
                 self.broadcast_window_created(client_id, req.new_id);
+                // Assigning a role changes pixels only when the
+                // surface was already mapped through the roleless
+                // base plane. Avoid publishing a blank intermediate
+                // frame for the common create-role-before-first-commit
+                // sequence; early input must not race that placeholder.
+                let was_visible = self
+                    .clients
+                    .get(&client_id)
+                    .and_then(|client| {
+                        let toplevel = client.toplevels.get(&req.new_id)?;
+                        client.surfaces.get(&toplevel.surface_id)
+                    })
+                    .and_then(|surface| surface.current_buffer)
+                    .is_some();
+                if was_visible {
+                    let newly_focused = self.focus_newly_mapped_toplevel(client_id, req.surface_id);
+                    self.request_recomposition();
+                    if let Some(window_id) = newly_focused {
+                        self.broadcast_window_focused(window_id.0);
+                    }
+                }
             }
         }
 
@@ -703,14 +2050,383 @@ impl Server {
         toplevel_id: display_proto::ids::ObjectId,
     ) {
         use crate::client::AUTO_LAYOUT_STEP;
-        let pos = self.next_toplevel_offset;
-        self.next_toplevel_offset = self.next_toplevel_offset.saturating_add(AUTO_LAYOUT_STEP);
+        use abi::cap::Cap;
+        let is_shell = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.capabilities.contains(Cap::Shell));
+        let pos = if is_shell {
+            // A replacement desktop shell owns the full-output wallpaper and
+            // bottom chrome planes. It must never inherit the application
+            // cascade offset, and it must not consume an app cascade slot.
+            0
+        } else {
+            let pos = self.next_toplevel_offset;
+            self.next_toplevel_offset = self.next_toplevel_offset.saturating_add(AUTO_LAYOUT_STEP);
+            pos
+        };
+        let hide_for_restore = !is_shell && self.restore_transaction.is_some();
         if let Some(client) = self.clients.get_mut(&client_id) {
             if let Some(toplevel) = client.toplevels.get_mut(&toplevel_id) {
                 toplevel.x = pos;
                 toplevel.y = pos;
+                toplevel.normal_x = pos;
+                toplevel.normal_y = pos;
+                toplevel.hidden_for_restore = hide_for_restore;
             }
         }
+    }
+
+    fn assign_toplevel_ordinal(&mut self, client_id: ClientId, toplevel_id: ObjectId) {
+        let Some(peer_pid) = self.clients.get(&client_id).map(|client| client.peer_pid) else {
+            return;
+        };
+        // Zero is confined to native fixtures that do not model kernel peer
+        // credentials. Their Client-local non-zero ordinal remains sufficient
+        // for existing isolation tests; production never enters this branch.
+        if peer_pid == 0 {
+            return;
+        }
+        let next = self
+            .next_toplevel_ordinal_by_pid
+            .entry(peer_pid)
+            .or_insert(1);
+        let ordinal = *next;
+        *next = next
+            .checked_add(1)
+            .expect("per-process toplevel ordinal exhausted");
+        if let Some(toplevel) = self
+            .clients
+            .get_mut(&client_id)
+            .and_then(|client| client.toplevels.get_mut(&toplevel_id))
+        {
+            toplevel.ordinal = ordinal;
+        }
+    }
+
+    fn register_window(
+        &mut self,
+        client_id: ClientId,
+        toplevel_id: ObjectId,
+    ) -> (WindowId, Vec<WindowId>) {
+        if let Some(&window_id) = self.window_ids.get(&(client_id, toplevel_id)) {
+            return (window_id, Vec::new());
+        }
+        let window_id = WindowId(self.next_window_id);
+        self.next_window_id = self
+            .next_window_id
+            .checked_add(1)
+            .expect("server-global window id exhausted");
+        self.windows.insert(
+            window_id,
+            WindowOwner {
+                client_id,
+                toplevel_id,
+            },
+        );
+        self.window_ids.insert((client_id, toplevel_id), window_id);
+        let is_shell = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.capabilities.contains(abi::cap::Cap::Shell));
+        let shifted_windows = if is_shell {
+            let shifted = self.z_order.clone();
+            self.z_order.insert(0, window_id);
+            shifted
+        } else {
+            self.z_order.push(window_id);
+            Vec::new()
+        };
+        if self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.toplevels.get(&toplevel_id))
+            .is_some_and(|toplevel| toplevel.hidden_for_restore)
+        {
+            if let Some(restore) = self.restore_transaction.as_mut() {
+                restore.hidden.insert(window_id);
+            }
+        }
+        (window_id, shifted_windows)
+    }
+
+    fn window_id_for_surface(&self, client_id: ClientId, surface_id: ObjectId) -> Option<WindowId> {
+        let toplevel_id = self
+            .clients
+            .get(&client_id)?
+            .toplevel_by_surface
+            .get(&surface_id)
+            .copied()?;
+        self.window_ids.get(&(client_id, toplevel_id)).copied()
+    }
+
+    /// Record normal geometry only when a commit changes the mapped state or
+    /// the non-maximized buffer rectangle. Damage-only commits therefore do
+    /// not produce shell state traffic.
+    fn update_normal_geometry_after_commit(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        geometry_before: Option<(u32, u32)>,
+    ) -> Option<WindowId> {
+        let client = self.clients.get_mut(&client_id)?;
+        let toplevel_id = client.toplevel_by_surface.get(&surface_id).copied()?;
+        let surface = client.surfaces.get(&surface_id)?;
+        let attachment = surface.current_buffer;
+        let dimensions = attachment.and_then(|attachment| {
+            client
+                .buffers
+                .get(&attachment.buffer_id)
+                .map(|buffer| (buffer.width, buffer.height))
+        });
+        let toplevel = client.toplevels.get_mut(&toplevel_id)?;
+        let mut changed = geometry_before != dimensions;
+        if !toplevel.maximized {
+            if let Some((width, height)) = dimensions {
+                let geometry = (toplevel.x, toplevel.y, width, height);
+                let normal = (
+                    toplevel.normal_x,
+                    toplevel.normal_y,
+                    toplevel.normal_width,
+                    toplevel.normal_height,
+                );
+                changed |= geometry != normal;
+                toplevel.normal_x = toplevel.x;
+                toplevel.normal_y = toplevel.y;
+                toplevel.normal_width = width;
+                toplevel.normal_height = height;
+            }
+        }
+        changed
+            .then(|| self.window_ids.get(&(client_id, toplevel_id)).copied())
+            .flatten()
+    }
+
+    /// Mark a hidden restore placement settled only when a commit strictly
+    /// follows the placement boundary and promotes a buffer with the exact
+    /// effective size. This gives the shell a causal readiness signal rather
+    /// than letting an already-mapped default buffer masquerade as restored.
+    fn settle_restore_placement_after_commit(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Option<WindowId> {
+        let window_id = self.window_id_for_surface(client_id, surface_id)?;
+        let (commit_count_at_place, expected_dimensions, was_settled) = {
+            let placement = self
+                .restore_transaction
+                .as_ref()?
+                .placements
+                .get(&window_id)?;
+            (
+                placement.commit_count_at_place,
+                (placement.expected_width, placement.expected_height),
+                placement.settled,
+            )
+        };
+        let (commit_count, current_dimensions) = {
+            let client = self.clients.get(&client_id)?;
+            let surface = client.surfaces.get(&surface_id)?;
+            let dimensions = surface.current_buffer.and_then(|attachment| {
+                client
+                    .buffers
+                    .get(&attachment.buffer_id)
+                    .map(|buffer| (buffer.width, buffer.height))
+            });
+            (surface.commit_count, dimensions)
+        };
+        if commit_count <= commit_count_at_place || current_dimensions != Some(expected_dimensions)
+        {
+            if commit_count <= commit_count_at_place || !was_settled {
+                return None;
+            }
+            let placement = self
+                .restore_transaction
+                .as_mut()?
+                .placements
+                .get_mut(&window_id)?;
+            placement.settled = false;
+            return Some(window_id);
+        }
+        let placement = self
+            .restore_transaction
+            .as_mut()?
+            .placements
+            .get_mut(&window_id)?;
+        if placement.settled {
+            return None;
+        }
+        placement.settled = true;
+        Some(window_id)
+    }
+
+    /// Give a toplevel focus on its first transition to mapped.
+    /// Returns the focused global ID so the caller can broadcast
+    /// after its composition pass. Hidden first maps are marked but
+    /// do not steal focus.
+    fn focus_newly_mapped_toplevel(
+        &mut self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Option<WindowId> {
+        let (toplevel_id, minimized, hidden, is_shell) = {
+            let client = self.clients.get_mut(&client_id)?;
+            let is_shell = client.capabilities.contains(abi::cap::Cap::Shell);
+            let toplevel_id = client.toplevel_by_surface.get(&surface_id).copied()?;
+            let surface = client.surfaces.get(&surface_id)?;
+            surface.current_buffer?;
+            let toplevel = client.toplevels.get_mut(&toplevel_id)?;
+            if toplevel.mapped_once {
+                return None;
+            }
+            toplevel.mapped_once = true;
+            (
+                toplevel_id,
+                toplevel.minimized,
+                toplevel.hidden_for_restore,
+                is_shell,
+            )
+        };
+        // The shell deliberately delays its first full-output buffer while
+        // bounded wallpaper and session-restore work advances. A surviving
+        // ordinary mapped window keeps its stack position even if focus was
+        // temporarily cleared before a replacement shell maps. With no such
+        // window, the shell-only cold path retains conventional initial focus.
+        let mapped_focusable_ordinary_survives = is_shell
+            && self.windows.values().any(|owner| {
+                let Some(client) = self.clients.get(&owner.client_id) else {
+                    return false;
+                };
+                if client.capabilities.contains(abi::cap::Cap::Shell) {
+                    return false;
+                }
+                let Some(toplevel) = client.toplevels.get(&owner.toplevel_id) else {
+                    return false;
+                };
+                !toplevel.minimized
+                    && !toplevel.hidden_for_restore
+                    && client
+                        .surfaces
+                        .get(&toplevel.surface_id)
+                        .is_some_and(|surface| surface.current_buffer.is_some())
+            });
+        if minimized || hidden || mapped_focusable_ordinary_survives {
+            return None;
+        }
+        let window_id = self.window_ids.get(&(client_id, toplevel_id)).copied()?;
+        self.keyboard_focus = Some((client_id, surface_id));
+        self.raise_window(window_id);
+        Some(window_id)
+    }
+
+    /// Move a live window to the top of the explicit stack.
+    /// Returns true only when the visible ordering changed. Every v2 shell
+    /// subscriber receives fresh authoritative state for the complete changed
+    /// rank interval, so session capture never has to infer displaced ranks
+    /// from the separate focus event.
+    fn raise_window(&mut self, window_id: WindowId) -> bool {
+        let changed = self.move_window_to_top(window_id);
+        if changed.is_empty() {
+            return false;
+        }
+        for changed_window in changed {
+            self.broadcast_window_state_changed(changed_window);
+        }
+        true
+    }
+
+    /// Apply the stack mutation without publishing intermediate ranks. Restore
+    /// end uses this while assembling one atomic final order, then emits the
+    /// complete final authoritative state set exactly once.
+    fn move_window_to_top(&mut self, window_id: WindowId) -> Vec<WindowId> {
+        let Some(index) = self.z_order.iter().position(|id| *id == window_id) else {
+            return Vec::new();
+        };
+        if index + 1 == self.z_order.len() {
+            return Vec::new();
+        }
+        let changed = self.z_order[index..].to_vec();
+        self.z_order.remove(index);
+        self.z_order.push(window_id);
+        changed
+    }
+
+    /// Remove a set of windows and return every surviving window whose
+    /// authoritative rank shifted. Callers publish destruction first and then
+    /// one fresh v2 state per returned window, avoiding both stale rank caches
+    /// and quadratic intermediate broadcasts when a whole client exits.
+    fn remove_from_z_order(&mut self, removed: &BTreeSet<WindowId>) -> Vec<WindowId> {
+        let Some(first_removed) = self
+            .z_order
+            .iter()
+            .position(|window_id| removed.contains(window_id))
+        else {
+            return Vec::new();
+        };
+        self.z_order
+            .retain(|window_id| !removed.contains(window_id));
+        self.z_order[first_removed.min(self.z_order.len())..].to_vec()
+    }
+
+    fn destroy_toplevel(&mut self, client_id: ClientId, toplevel_id: ObjectId) {
+        let removed_surface = self.clients.get_mut(&client_id).and_then(|client| {
+            let pool_bytes_before = client.pool_bytes_len();
+            let metadata_bytes_before = client.toplevel_metadata_bytes_len();
+            let toplevel = client.toplevels.remove(&toplevel_id)?;
+            client.release_toplevel_metadata(&toplevel);
+            client.toplevel_by_surface.remove(&toplevel.surface_id);
+            client.objects.remove(&toplevel_id);
+            let _ = client.emit_delete_id(toplevel_id);
+            client.detach_surface_resources(toplevel.surface_id);
+            Some((
+                toplevel.surface_id,
+                pool_bytes_before,
+                client.pool_bytes_len(),
+                metadata_bytes_before,
+                client.toplevel_metadata_bytes_len(),
+            ))
+        });
+        let Some((
+            surface_id,
+            pool_bytes_before,
+            pool_bytes_after,
+            metadata_bytes_before,
+            metadata_bytes_after,
+        )) = removed_surface
+        else {
+            return;
+        };
+        self.pool_bytes = self
+            .pool_bytes
+            .saturating_sub(pool_bytes_before)
+            .saturating_add(pool_bytes_after);
+        self.toplevel_metadata_bytes = self
+            .toplevel_metadata_bytes
+            .saturating_sub(metadata_bytes_before)
+            .saturating_add(metadata_bytes_after);
+        if self.keyboard_focus == Some((client_id, surface_id)) {
+            self.keyboard_focus = None;
+        }
+        if self
+            .active_drag
+            .map(|drag| (drag.client_id, drag.toplevel_id))
+            == Some((client_id, toplevel_id))
+        {
+            self.active_drag = None;
+        }
+        if let Some(window_id) = self.window_ids.remove(&(client_id, toplevel_id)) {
+            self.windows.remove(&window_id);
+            let shifted_windows = self.remove_from_z_order(&BTreeSet::from([window_id]));
+            if let Some(restore) = self.restore_transaction.as_mut() {
+                restore.hidden.remove(&window_id);
+                restore.placements.remove(&window_id);
+            }
+            self.broadcast_window_destroyed(window_id.0);
+            for shifted_window in shifted_windows {
+                self.broadcast_window_state_changed(shifted_window);
+            }
+        }
+        self.request_recomposition();
     }
 
     /// Mark `client_id` as subscribed to shell_manager
@@ -726,25 +2442,29 @@ impl Server {
         else {
             return;
         };
-        // Snapshot every (window_id, title, app_id, focused)
-        // tuple BEFORE mutating the subscriber so the iteration
-        // borrow is independent of the mutation.
-        let snapshot: alloc::vec::Vec<(u32, alloc::string::String, alloc::string::String, bool)> = self
-            .clients
-            .values()
-            .flat_map(|c| {
-                let pinned_focus = self.keyboard_focus;
-                c.toplevels
-                    .iter()
-                    .map(move |(_, t)| {
-                        let focused = pinned_focus
-                            .map(|(_, surf)| surf == t.surface_id)
-                            .unwrap_or(false);
-                        (t.id.0, t.title.clone(), t.app_id.clone(), focused)
-                    })
-                    .collect::<alloc::vec::Vec<_>>()
-            })
-            .collect();
+        // Snapshot in stable global-ID order before mutating the
+        // subscriber. Focus comparison includes ClientId because
+        // surface ObjectIds are client-local and may collide.
+        let snapshot: alloc::vec::Vec<(u32, alloc::string::String, alloc::string::String, bool)> =
+            self.z_order
+                .iter()
+                .filter_map(|window_id| {
+                    let owner = self.windows.get(window_id)?;
+                    let toplevel = self
+                        .clients
+                        .get(&owner.client_id)?
+                        .toplevels
+                        .get(&owner.toplevel_id)?;
+                    let focused =
+                        self.keyboard_focus == Some((owner.client_id, toplevel.surface_id));
+                    Some((
+                        window_id.0,
+                        toplevel.title.clone(),
+                        toplevel.app_id.clone(),
+                        focused,
+                    ))
+                })
+                .collect();
         let Some(client) = self.clients.get_mut(&client_id) else {
             return;
         };
@@ -755,6 +2475,39 @@ impl Server {
                 let _ = client.emit_window_focused(shell_manager_id, *window_id);
             }
         }
+    }
+
+    fn subscribe_window_state_for(&mut self, client_id: ClientId, snapshot_id: u32) {
+        if snapshot_id == 0 {
+            return;
+        }
+        let Some(shell_manager_id) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.shell_manager_id)
+        else {
+            return;
+        };
+        let snapshot = self
+            .z_order
+            .iter()
+            .filter_map(|window_id| self.window_state(*window_id, snapshot_id))
+            .collect::<Vec<_>>();
+        let focused = self.keyboard_focus.and_then(|(owner, surface)| {
+            self.window_id_for_surface(owner, surface)
+                .map(|window_id| window_id.0)
+        });
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        client.shell_manager_state_snapshot_id = Some(snapshot_id);
+        for state in &snapshot {
+            let _ = client.emit_window_created_v2(shell_manager_id, state);
+        }
+        if let Some(window_id) = focused {
+            let _ = client.emit_window_focused(shell_manager_id, window_id);
+        }
+        let _ = client.emit_window_snapshot_done(shell_manager_id, snapshot_id);
     }
 
     /// Broadcast `window_created` to every subscribed client.
@@ -776,15 +2529,25 @@ impl Server {
         };
         let title = toplevel.title.clone();
         let app_id = toplevel.app_id.clone();
-        let window_id = toplevel.id.0;
+        let (window_id, shifted_windows) = self.register_window(owning_client_id, toplevel_id);
+        let state = self.window_state(window_id, 0);
         for client in self.clients.values_mut() {
-            if !client.shell_manager_subscribed {
-                continue;
-            }
             let Some(sm_id) = client.shell_manager_id else {
                 continue;
             };
-            let _ = client.emit_window_created(sm_id, window_id, &title, &app_id);
+            if client.shell_manager_subscribed {
+                let _ = client.emit_window_created(sm_id, window_id.0, &title, &app_id);
+            }
+            if let (Some(snapshot_id), Some(state)) =
+                (client.shell_manager_state_snapshot_id, state.as_ref())
+            {
+                let mut state = state.clone();
+                state.snapshot_id = snapshot_id;
+                let _ = client.emit_window_created_v2(sm_id, &state);
+            }
+        }
+        for shifted_window in shifted_windows {
+            self.broadcast_window_state_changed(shifted_window);
         }
     }
 
@@ -794,7 +2557,8 @@ impl Server {
     /// `xdg_toplevel.destroy`).
     pub fn broadcast_window_destroyed(&mut self, window_id: u32) {
         for client in self.clients.values_mut() {
-            if !client.shell_manager_subscribed {
+            if !client.shell_manager_subscribed && client.shell_manager_state_snapshot_id.is_none()
+            {
                 continue;
             }
             let Some(sm_id) = client.shell_manager_id else {
@@ -819,15 +2583,103 @@ impl Server {
             return;
         };
         let new_title = toplevel.title.clone();
-        let window_id = toplevel.id.0;
+        let Some(window_id) = self
+            .window_ids
+            .get(&(owning_client_id, toplevel_id))
+            .copied()
+        else {
+            return;
+        };
         for client in self.clients.values_mut() {
-            if !client.shell_manager_subscribed {
-                continue;
-            }
             let Some(sm_id) = client.shell_manager_id else {
                 continue;
             };
-            let _ = client.emit_window_title_changed(sm_id, window_id, &new_title);
+            if client.shell_manager_subscribed {
+                let _ = client.emit_window_title_changed(sm_id, window_id.0, &new_title);
+            }
+        }
+        self.broadcast_window_state_changed(window_id);
+    }
+
+    fn window_state(&self, window_id: WindowId, snapshot_id: u32) -> Option<ShellWindowState> {
+        let z_rank = self.z_order.iter().position(|id| *id == window_id)? as u32;
+        let owner = self.windows.get(&window_id)?;
+        let client = self.clients.get(&owner.client_id)?;
+        let toplevel = client.toplevels.get(&owner.toplevel_id)?;
+        let attachment = client
+            .surfaces
+            .get(&toplevel.surface_id)
+            .and_then(|surface| surface.current_buffer);
+        let (current_x, current_y, current_width, current_height) = attachment
+            .and_then(|attachment| {
+                client.buffers.get(&attachment.buffer_id).map(|buffer| {
+                    (
+                        toplevel.x.saturating_add(attachment.x),
+                        toplevel.y.saturating_add(attachment.y),
+                        buffer.width,
+                        buffer.height,
+                    )
+                })
+            })
+            .unwrap_or((toplevel.x, toplevel.y, 0, 0));
+        let mut flags = 0;
+        if attachment.is_some() {
+            flags |= shell_window_state_flags::MAPPED;
+        }
+        if toplevel.minimized {
+            flags |= shell_window_state_flags::MINIMIZED;
+        }
+        if toplevel.maximized {
+            flags |= shell_window_state_flags::MAXIMIZED;
+        }
+        if self.keyboard_focus == Some((owner.client_id, toplevel.surface_id)) {
+            flags |= shell_window_state_flags::FOCUSED;
+        }
+        if toplevel.hidden_for_restore {
+            flags |= shell_window_state_flags::HIDDEN_FOR_RESTORE;
+        }
+        if self
+            .restore_transaction
+            .as_ref()
+            .and_then(|restore| restore.placements.get(&window_id))
+            .is_some_and(|placement| placement.settled)
+        {
+            flags |= shell_window_state_flags::RESTORE_PLACEMENT_APPLIED;
+        }
+        Some(ShellWindowState {
+            snapshot_id,
+            window_id: window_id.0,
+            owner_pid: client.peer_pid,
+            ordinal: toplevel.ordinal,
+            current_x,
+            current_y,
+            current_width,
+            current_height,
+            normal_x: toplevel.normal_x,
+            normal_y: toplevel.normal_y,
+            normal_width: toplevel.normal_width,
+            normal_height: toplevel.normal_height,
+            flags,
+            z_rank,
+            title: toplevel.title.clone(),
+            app_id: toplevel.app_id.clone(),
+        })
+    }
+
+    fn broadcast_window_state_changed(&mut self, window_id: WindowId) {
+        let Some(state) = self.window_state(window_id, 0) else {
+            return;
+        };
+        for client in self.clients.values_mut() {
+            let (Some(shell_manager_id), Some(snapshot_id)) = (
+                client.shell_manager_id,
+                client.shell_manager_state_snapshot_id,
+            ) else {
+                continue;
+            };
+            let mut state = state.clone();
+            state.snapshot_id = snapshot_id;
+            let _ = client.emit_window_state_changed(shell_manager_id, &state);
         }
     }
 
@@ -837,7 +2689,8 @@ impl Server {
     /// shell_manager.focus_window dispatch hook.
     fn broadcast_window_focused(&mut self, window_id: u32) {
         for client in self.clients.values_mut() {
-            if !client.shell_manager_subscribed {
+            if !client.shell_manager_subscribed && client.shell_manager_state_snapshot_id.is_none()
+            {
                 continue;
             }
             let Some(sm_id) = client.shell_manager_id else {
@@ -848,57 +2701,122 @@ impl Server {
     }
 
     /// Implementation of `pmd_shell_manager.focus_window`.
-    /// Walk every client; the toplevel whose ObjectId matches
-    /// `window_id` becomes the keyboard focus target. The
-    /// shell uses this from the taskbar click-to-focus path.
-    fn focus_window_by_id(&mut self, window_id: u32) {
-        let target = display_proto::ids::ObjectId::new(window_id);
-        let mut hit: Option<(ClientId, display_proto::ids::ObjectId)> = None;
-        for (cid, client) in self.clients.iter() {
-            if let Some(t) = client.toplevels.get(&target) {
-                hit = Some((*cid, t.surface_id));
-                break;
+    /// Resolve the server-global ID to its exact owning client and
+    /// make that toplevel's surface the keyboard focus target.
+    fn focus_window_by_id(&mut self, window_id: u32, defer_until_commit_by: Option<ClientId>) {
+        let global_id = WindowId(window_id);
+        let owner = self.windows.get(&global_id).copied();
+        if let Some(owner) = owner {
+            if self
+                .clients
+                .get(&owner.client_id)
+                .and_then(|client| client.toplevels.get(&owner.toplevel_id))
+                .is_some_and(|toplevel| toplevel.hidden_for_restore)
+            {
+                return;
             }
-        }
-        if let Some((cid, surface_id)) = hit {
+            let Some((surface_id, restored)) = self
+                .clients
+                .get_mut(&owner.client_id)
+                .and_then(|client| client.toplevels.get_mut(&owner.toplevel_id))
+                .map(|toplevel| {
+                    let restored = toplevel.minimized;
+                    toplevel.minimized = false;
+                    (toplevel.surface_id, restored)
+                })
+            else {
+                return;
+            };
+            let cid = owner.client_id;
             self.keyboard_focus = Some((cid, surface_id));
-            // Restoring a minimized toplevel is part of the
-            // "click to focus" UX — the shell expects a
-            // single focus_window call to bring the window
-            // back regardless of prior minimized state.
-            self.set_toplevel_minimized_across_clients(target, false);
+            let raised = self.raise_window(global_id);
+            if restored || raised {
+                if let Some(shell_client_id) = defer_until_commit_by {
+                    self.deferred_focus_commit_owner = Some(shell_client_id);
+                } else {
+                    self.deferred_focus_commit_owner = None;
+                    self.request_recomposition();
+                }
+            }
             self.broadcast_window_focused(window_id);
+            self.broadcast_window_state_changed(global_id);
         }
     }
 
     /// Implementation of `pmd_shell_manager.close_window`.
-    /// Sends `xdg_toplevel.close` to the owning client so it
-    /// can tear down its surface; the client's subsequent
-    /// drop of the toplevel triggers a window_destroyed
-    /// broadcast in the disconnect path.
+    /// Activates the target before sending `xdg_toplevel.close` so a client
+    /// that vetoes the request (for example, to show an unsaved-changes
+    /// prompt) remains visible and owns keyboard focus. The client's
+    /// subsequent drop of the toplevel triggers a `window_destroyed`
+    /// broadcast; a veto leaves the registered window intact.
     fn close_window_by_id(&mut self, window_id: u32) {
-        let target = display_proto::ids::ObjectId::new(window_id);
-        let mut owning: Option<ClientId> = None;
-        for (cid, client) in self.clients.iter() {
-            if client.toplevels.contains_key(&target) {
-                owning = Some(*cid);
-                break;
-            }
+        self.focus_window_by_id(window_id, None);
+        let Some(owner) = self.windows.get(&WindowId(window_id)).copied() else {
+            return;
+        };
+        if let Some(client) = self.clients.get_mut(&owner.client_id) {
+            let _ = client.emit_xdg_toplevel_close(owner.toplevel_id);
         }
-        if let Some(cid) = owning {
-            if let Some(client) = self.clients.get_mut(&cid) {
-                let _ = client.emit_xdg_toplevel_close(target);
-            }
+    }
+
+    /// Toggle maximization for the exact toplevel named by the shell-visible
+    /// server-global ID. This deliberately never scans client-local object
+    /// tables: two clients may use the same toplevel `ObjectId` without the
+    /// shell affecting the wrong owner. The operation also restores, raises,
+    /// and activates the target as one user-visible action.
+    fn toggle_window_maximized(&mut self, window_id: u32) -> bool {
+        let global_id = WindowId(window_id);
+        let Some(owner) = self.windows.get(&global_id).copied() else {
+            return false;
+        };
+        if self
+            .clients
+            .get(&owner.client_id)
+            .and_then(|client| client.toplevels.get(&owner.toplevel_id))
+            .is_some_and(|toplevel| toplevel.hidden_for_restore)
+        {
+            return false;
         }
+        let Some((surface_id, maximize, restored)) = self
+            .clients
+            .get_mut(&owner.client_id)
+            .and_then(|client| client.toplevels.get_mut(&owner.toplevel_id))
+            .map(|toplevel| {
+                let restored = toplevel.minimized;
+                let maximize = !toplevel.maximized;
+                toplevel.minimized = false;
+                toplevel.maximized = maximize;
+                (toplevel.surface_id, maximize, restored)
+            })
+        else {
+            return false;
+        };
+
+        self.keyboard_focus = Some((owner.client_id, surface_id));
+        let raised = self.raise_window(global_id);
+        let generation = self.scene_generation;
+        if self
+            .emit_configure_for_max_state(owner.client_id, owner.toplevel_id, maximize)
+            .is_err()
+        {
+            return false;
+        }
+        // The configure helper recomposes when geometry moved. If the target
+        // was only unminimized or raised, present that scene transition here.
+        if (restored || raised) && self.scene_generation == generation {
+            self.request_recomposition();
+        }
+        self.broadcast_window_focused(window_id);
+        self.broadcast_window_state_changed(global_id);
+        true
     }
 
     /// Server-driven configure emission for the
     /// `set_maximized` / `unset_maximized` request handlers.
-    /// On `set_maximized = true`, snapshots the current
-    /// pre-max size onto the toplevel + emits a configure
-    /// with the framebuffer dimensions + the MAXIMIZED bit.
-    /// On `set_maximized = false`, emits a configure with
-    /// the cached pre-max size + cleared MAXIMIZED bit.
+    /// On `set_maximized = true`, snapshots the current origin, moves the
+    /// toplevel to the work-area origin, and emits a work-area-sized configure
+    /// with the MAXIMIZED bit. On `set_maximized = false`, restores the
+    /// server-assigned origin and lets the client resume its preferred size.
     fn emit_configure_for_max_state(
         &mut self,
         client_id: ClientId,
@@ -908,28 +2826,73 @@ impl Server {
         use display_proto::xdg_toplevel_state;
         let work_area_w = self.work_area_width();
         let work_area_h = self.work_area_height();
-        let client = self
-            .clients
-            .get_mut(&client_id)
-            .ok_or(ServerError::NoSuchClient { id: client_id })?;
-        // Read pre-max snapshot before mutating; the
-        // toplevel's state was already updated by the
-        // dispatch arm above, so `maximized` already
-        // reflects the new value here.
-        let _toplevel = client
-            .toplevels
-            .get(&toplevel_id)
-            .ok_or(ServerError::NoSuchClient { id: client_id })?; // misuse if absent
-        let serial = client.next_configure_serial();
-        let (w, h, states) = if maximize {
-            (work_area_w as i32, work_area_h as i32, xdg_toplevel_state::MAXIMIZED)
-        } else {
-            // V1: defer to the client's preferred size when
-            // unmaximizing — the client's toolkit caches its
-            // own preferred size, so 0/0 means "you pick".
-            (0, 0, 0)
+        let moved = {
+            let client = self
+                .clients
+                .get_mut(&client_id)
+                .ok_or(ServerError::NoSuchClient { id: client_id })?;
+            let current_dimensions = client
+                .toplevels
+                .get(&toplevel_id)
+                .and_then(|toplevel| client.surfaces.get(&toplevel.surface_id))
+                .and_then(|surface| surface.current_buffer)
+                .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
+                .map(|buffer| (buffer.width, buffer.height));
+            // The per-client dispatcher already updated `maximized`; the
+            // server owns screen-space placement and therefore snapshots and
+            // restores the origin here.
+            let moved = {
+                let toplevel = client
+                    .toplevels
+                    .get_mut(&toplevel_id)
+                    .ok_or(ServerError::NoSuchClient { id: client_id })?;
+                if maximize {
+                    if toplevel.restore_origin.is_none() {
+                        toplevel.restore_origin = Some((toplevel.x, toplevel.y));
+                        toplevel.normal_x = toplevel.x;
+                        toplevel.normal_y = toplevel.y;
+                        if let Some((width, height)) = current_dimensions {
+                            toplevel.normal_width = width;
+                            toplevel.normal_height = height;
+                        }
+                    }
+                    let moved = (toplevel.x, toplevel.y) != (0, 0);
+                    toplevel.x = 0;
+                    toplevel.y = 0;
+                    moved
+                } else if let Some((x, y)) = toplevel.restore_origin.take() {
+                    let moved = (toplevel.x, toplevel.y) != (x, y);
+                    toplevel.x = toplevel.normal_x;
+                    toplevel.y = toplevel.normal_y;
+                    moved
+                } else {
+                    false
+                }
+            };
+            let serial = client.next_configure_serial();
+            let (w, h, states) = if maximize {
+                (
+                    work_area_w as i32,
+                    work_area_h as i32,
+                    xdg_toplevel_state::MAXIMIZED,
+                )
+            } else {
+                let toplevel = client
+                    .toplevels
+                    .get(&toplevel_id)
+                    .ok_or(ServerError::NoSuchClient { id: client_id })?;
+                (
+                    toplevel.normal_width as i32,
+                    toplevel.normal_height as i32,
+                    0,
+                )
+            };
+            let _ = client.emit_xdg_toplevel_configure(toplevel_id, serial, w, h, states);
+            moved
         };
-        let _ = client.emit_xdg_toplevel_configure(toplevel_id, serial, w, h, states);
+        if moved {
+            self.request_recomposition();
+        }
         Ok(())
     }
 
@@ -938,12 +2901,7 @@ impl Server {
     /// framebuffer width; a future T130 slice that lands the
     /// taskbar will subtract the taskbar's width / height.
     pub fn work_area_width(&self) -> u32 {
-        let h = self.framebuffer.height();
-        if h > self.taskbar_height_px {
-            self.framebuffer.width()
-        } else {
-            self.framebuffer.width()
-        }
+        self.framebuffer.width()
     }
 
     /// Height of the v1 "work area" — framebuffer height
@@ -963,7 +2921,13 @@ impl Server {
     /// a work-area height that excludes the taskbar strip.
     /// Pass `0` to clear the reservation.
     pub fn set_taskbar_height_px(&mut self, px: u32) {
-        self.taskbar_height_px = px;
+        self.taskbar_height_px = px.min(self.framebuffer.height());
+        self.work_area_owner = None;
+    }
+
+    fn set_work_area_bottom_for(&mut self, client_id: ClientId, px: u32) {
+        self.taskbar_height_px = px.min(self.framebuffer.height());
+        self.work_area_owner = Some(client_id);
     }
 
     /// Begin an interactive drag from a `pmd_xdg_toplevel.move`
@@ -1036,11 +3000,11 @@ impl Server {
     /// first commit synthesises the configure (clients
     /// commit an empty buffer or a placeholder buffer
     /// before they know the size).
-    pub fn maybe_emit_initial_configure(
-        &mut self,
-        client_id: ClientId,
-        surface_id: ObjectId,
-    ) {
+    pub fn maybe_emit_initial_configure(&mut self, client_id: ClientId, surface_id: ObjectId) {
+        use abi::cap::Cap;
+
+        let output_w = self.framebuffer.width() as i32;
+        let output_h = self.framebuffer.height() as i32;
         let work_area_w = self.work_area_width() as i32;
         let work_area_h = self.work_area_height() as i32;
         let Some(client) = self.clients.get_mut(&client_id) else {
@@ -1059,14 +3023,25 @@ impl Server {
         if already_sent {
             return;
         }
+        let (configured_w, configured_h) = if client.capabilities.contains(Cap::Shell) {
+            // The desktop shell paints the wallpaper and reserved chrome over
+            // the complete output. Its own surface is not constrained by the
+            // work area it publishes for ordinary application windows.
+            (output_w, output_h)
+        } else {
+            let (origin_x, origin_y) = client
+                .toplevels
+                .get(&toplevel_id)
+                .map(|top| (top.x.max(0), top.y.max(0)))
+                .unwrap_or((0, 0));
+            (
+                work_area_w.saturating_sub(origin_x).max(1),
+                work_area_h.saturating_sub(origin_y).max(1),
+            )
+        };
         let serial = client.next_configure_serial();
-        let _ = client.emit_xdg_toplevel_configure(
-            toplevel_id,
-            serial,
-            work_area_w,
-            work_area_h,
-            0,
-        );
+        let _ =
+            client.emit_xdg_toplevel_configure(toplevel_id, serial, configured_w, configured_h, 0);
         if let Some(toplevel) = client.toplevels.get_mut(&toplevel_id) {
             toplevel.initial_configure_sent = true;
         }
@@ -1082,11 +3057,7 @@ impl Server {
     /// that cap (see [`crate::client::interface_required_cap`]).
     /// The numeric `name` values are the registry handles
     /// the client echoes back through `registry.bind`.
-    pub fn advertise_globals_to(
-        &mut self,
-        client_id: ClientId,
-        registry_id: ObjectId,
-    ) {
+    pub fn advertise_globals_to(&mut self, client_id: ClientId, registry_id: ObjectId) {
         use abi::cap::Cap;
         let Some(client) = self.clients.get_mut(&client_id) else {
             return;
@@ -1096,28 +3067,57 @@ impl Server {
         let _ = client.emit_global(registry_id, 3, "pmd_xdg_shell", 1);
         let _ = client.emit_global(registry_id, 4, "pmd_seat", 1);
         if client.capabilities.contains(Cap::Shell) {
-            let _ = client.emit_global(registry_id, 5, "pmd_shell_manager", 1);
+            let _ = client.emit_global(registry_id, 5, "pmd_shell_manager", 2);
         }
     }
 
-    /// Walk every client's toplevel table and flip the
-    /// `minimized` flag on whichever toplevel matches
-    /// `target_id` (if any). Used by T131's cross-client
-    /// `pmd_shell_manager.minimize_window` dispatch and by
-    /// the server-driven restore path. No-op if no toplevel
-    /// matches; in v1 toplevel ids are unique across clients.
-    pub fn set_toplevel_minimized_across_clients(
-        &mut self,
-        target_id: display_proto::ids::ObjectId,
-        minimized: bool,
-    ) -> bool {
-        for client in self.clients.values_mut() {
-            if let Some(toplevel) = client.toplevels.get_mut(&target_id) {
+    /// Flip the minimized state of the exact toplevel named by a
+    /// server-global shell-manager window ID.
+    pub fn set_window_minimized(&mut self, window_id: u32, minimized: bool) -> bool {
+        let Some(owner) = self.windows.get(&WindowId(window_id)).copied() else {
+            return false;
+        };
+        if self
+            .clients
+            .get(&owner.client_id)
+            .and_then(|client| client.toplevels.get(&owner.toplevel_id))
+            .is_some_and(|toplevel| toplevel.hidden_for_restore)
+        {
+            return false;
+        }
+        let Some((surface_id, changed)) = self
+            .clients
+            .get_mut(&owner.client_id)
+            .and_then(|client| client.toplevels.get_mut(&owner.toplevel_id))
+            .map(|toplevel| {
+                let changed = toplevel.minimized != minimized;
                 toplevel.minimized = minimized;
-                return true;
+                (toplevel.surface_id, changed)
+            })
+        else {
+            return false;
+        };
+        if changed {
+            let cleared_focus =
+                minimized && self.keyboard_focus == Some((owner.client_id, surface_id));
+            if cleared_focus {
+                self.keyboard_focus = None;
+            }
+            if minimized
+                && self
+                    .active_drag
+                    .map(|drag| (drag.client_id, drag.toplevel_id))
+                    == Some((owner.client_id, owner.toplevel_id))
+            {
+                self.active_drag = None;
+            }
+            self.request_recomposition();
+            self.broadcast_window_state_changed(WindowId(window_id));
+            if cleared_focus {
+                self.broadcast_window_focused(0);
             }
         }
-        false
+        true
     }
 
     /// Server-driven restore for a previously-minimized
@@ -1128,64 +3128,31 @@ impl Server {
     /// so this method exists for callers wiring restore
     /// through other channels (test harnesses, future
     /// taskbar click routing).
-    pub fn restore_toplevel(
-        &mut self,
-        target_id: display_proto::ids::ObjectId,
-    ) -> bool {
-        self.set_toplevel_minimized_across_clients(target_id, false)
+    pub fn restore_window(&mut self, window_id: u32) -> bool {
+        self.set_window_minimized(window_id, false)
     }
 
-    /// Blit a surface's current buffer into the server's
-    /// framebuffer. Called by [`Server::dispatch_request`]
-    /// after a `pmd_surface.commit` has promoted the
-    /// pending buffer to current on the client side. Silently
-    /// no-ops if any of the required state is missing —
-    /// the client may have legitimately committed a surface
-    /// with nothing attached.
-    ///
-    /// If the surface has an associated
-    /// [`crate::client::Toplevel`], the blit lands at that
-    /// toplevel's server-assigned origin (plus any offset
-    /// the attach request supplied). Otherwise the blit
-    /// uses only the attach offset, which is what ordinary
-    /// non-toplevel surfaces want.
+    /// Schedule a full-scene rebuild after a successful surface commit. Buffer
+    /// release ownership stays in the client state transition so state and
+    /// event ordering are settled before recomposition.
     fn composite_surface_commit(
         &mut self,
-        client_id: ClientId,
-        surface_id: display_proto::ids::ObjectId,
+        _client_id: ClientId,
+        _surface_id: display_proto::ids::ObjectId,
     ) {
-        // Buffer-release for the client whose surface just
-        // committed: the server's pool storage already holds
-        // a copy of the painted pixels (via shm_pool.write),
-        // so the client can recycle this buffer.
-        let released_buffer = self
-            .clients
-            .get(&client_id)
-            .and_then(|c| c.surfaces.get(&surface_id))
-            .and_then(|s| s.current_buffer)
-            .map(|att| att.buffer_id);
-        if let (Some(buffer_id), Some(client_mut)) =
-            (released_buffer, self.clients.get_mut(&client_id))
-        {
-            let _ = client_mut.emit_buffer_release(buffer_id);
-        }
-        // Re-composite the whole scene: walk every client +
-        // every toplevel in (client_id, toplevel_id) order
-        // and blit each toplevel's current buffer onto the
-        // framebuffer. (client_id, toplevel_id) is the
-        // creation order — the shell connects first so its
-        // wallpaper toplevel paints first, then app windows
-        // paint on top in the order they were created.
+        // Re-composite the whole scene: clear the backbuffer,
+        // draw roleless base-plane surfaces, then draw every
+        // live toplevel in the explicit global z-order.
         // Without this loop a single-surface blit on a later
         // surface.commit would not restore the OTHER
         // toplevels' pixels and the shell's wallpaper paint
         // would erase every app window.
-        self.recomposite_scene();
+        self.request_recomposition();
     }
 
-    /// Walk every client's surfaces in creation order and
-    /// blit each one's current buffer into the framebuffer.
-    /// Toplevel surfaces blit at the toplevel's
+    /// Clear and reconstruct the complete scene. Roleless
+    /// surfaces form a base plane; toplevel surfaces then blit
+    /// in explicit global bottom-to-top z-order at the toplevel's
     /// (x + attach.x, y + attach.y) origin; non-toplevel
     /// surfaces blit at the attach offset (matches the
     /// pre-multi-window behaviour the integration tests
@@ -1202,43 +3169,94 @@ impl Server {
         let Server {
             clients,
             framebuffer,
+            windows,
+            z_order,
+            scene_generation,
             ..
         } = self;
+        framebuffer.clear_for_composition();
+
+        // Roleless surfaces form the base plane. A surface that
+        // previously held a toplevel role stays unmapped after that
+        // role is destroyed; otherwise it would be redrawn at its
+        // raw attach offset and leave a ghost window behind.
         for client in clients.values() {
-            // Iterating surfaces in BTreeMap order puts
-            // older surfaces first; toplevels added later
-            // paint on top of earlier ones (creation-order
-            // z-stack).
             for (surface_id, surface) in client.surfaces.iter() {
+                if surface.had_toplevel_role || client.toplevel_by_surface.contains_key(surface_id)
+                {
+                    continue;
+                }
                 let Some(attachment) = surface.current_buffer else {
                     continue;
                 };
-                let Some(info) = client.buffers.get(&attachment.buffer_id) else {
-                    continue;
-                };
-                let Some(pool) = client.pools.get(&info.pool_id) else {
-                    continue;
-                };
-                let start = info.offset as usize;
-                let end = info.byte_end() as usize;
-                let Some(src_bytes) = pool.storage.get(start..end) else {
-                    continue;
-                };
-                let (origin_x, origin_y) =
-                    if let Some(toplevel) = client.toplevel_for_surface(*surface_id) {
-                        if toplevel.minimized {
-                            continue;
-                        }
-                        (
-                            toplevel.x.saturating_add(attachment.x),
-                            toplevel.y.saturating_add(attachment.y),
-                        )
-                    } else {
-                        (attachment.x, attachment.y)
-                    };
-                framebuffer.blit_buffer(info, src_bytes, origin_x, origin_y);
+                Self::blit_client_surface(
+                    framebuffer,
+                    client,
+                    *surface_id,
+                    attachment.x,
+                    attachment.y,
+                );
             }
         }
+
+        // Toplevels are then composed in the explicit global
+        // bottom-to-top stack. Neither client IDs nor ObjectIds
+        // are treated as ordering signals.
+        for window_id in z_order.iter() {
+            let Some(owner) = windows.get(window_id) else {
+                continue;
+            };
+            let Some(client) = clients.get(&owner.client_id) else {
+                continue;
+            };
+            let Some(toplevel) = client.toplevels.get(&owner.toplevel_id) else {
+                continue;
+            };
+            if toplevel.minimized || toplevel.hidden_for_restore {
+                continue;
+            }
+            let Some(surface) = client.surfaces.get(&toplevel.surface_id) else {
+                continue;
+            };
+            let Some(attachment) = surface.current_buffer else {
+                continue;
+            };
+            Self::blit_client_surface(
+                framebuffer,
+                client,
+                toplevel.surface_id,
+                toplevel.x.saturating_add(attachment.x),
+                toplevel.y.saturating_add(attachment.y),
+            );
+        }
+        *scene_generation = scene_generation.wrapping_add(1);
+    }
+
+    fn blit_client_surface(
+        framebuffer: &mut Framebuffer,
+        client: &Client,
+        surface_id: ObjectId,
+        origin_x: i32,
+        origin_y: i32,
+    ) {
+        let Some(surface) = client.surfaces.get(&surface_id) else {
+            return;
+        };
+        let Some(attachment) = surface.current_buffer else {
+            return;
+        };
+        let Some(info) = client.buffers.get(&attachment.buffer_id) else {
+            return;
+        };
+        let Some(pool) = client.pools.get(&info.pool_id) else {
+            return;
+        };
+        let start = info.offset as usize;
+        let end = info.byte_end() as usize;
+        let Some(src_bytes) = pool.storage.get(start..end) else {
+            return;
+        };
+        framebuffer.blit_buffer(info, src_bytes, origin_x, origin_y);
     }
 }
 

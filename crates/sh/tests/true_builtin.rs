@@ -56,8 +56,7 @@ fn true_alone_is_no_op_with_exit_zero() {
 fn true_with_extra_args_is_still_no_op() {
     // `true foo bar baz` discards every arg and emits no
     // output. Same two-prompt shape as the bare-true case.
-    let (status, stdout, stderr, _env) =
-        drive("true foo bar baz\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("true foo bar baz\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(stdout, "$ $ ");

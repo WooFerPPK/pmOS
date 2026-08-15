@@ -1,22 +1,27 @@
-//! Toolkit theme: colour palette consumed by every widget
-//! that draws chrome around a window.
+//! Toolkit theme palettes and the live VFS preference reader.
 //!
-//! A [`Theme`] is a plain bag of colours. The toolkit itself
-//! only knows about the light theme today; the dark-theme
-//! entry is populated opportunistically and is not yet wired
-//! into any runtime picker. Theme switching from the
-//! settings app (US9 / T184) writes the theme *name* into
-//! `/etc/preferences.toml` and any client that cares reloads
-//! by constructing a new [`Theme`] from the stored name.
-//!
-//! This module intentionally has no dependency on
-//! `display_proto` or any protocol message — themes are a
-//! pure client concern. A future slice may add a
-//! `watch_theme()` helper using `fs_watch` on the
-//! preferences file, but today a client that wants to react
-//! to theme changes just reconstructs its widgets.
+//! Themes stay entirely on the application side of the display protocol.
+//! [`watch_theme`] reads `/etc/preferences.toml` synchronously at startup and
+//! then returns a bounded [`ThemeWatcher`]. Production consumers pair it with
+//! toolkit `PathWatch` and call [`ThemeWatcher::refresh`] only after
+//! stable-parent/current-inode readiness. A changed normalized theme produces
+//! one repaint signal; unchanged snapshots do not. The explicit clock-gated
+//! poll method remains only for deterministic native compatibility fixtures.
+
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::draw::Color;
+
+/// Maximum preference snapshot accepted by a theme-aware application.
+pub const THEME_PREFERENCE_MAX_BYTES: usize = 64 * 1024;
+
+/// Minimum interval between VFS reads, capping each watcher at ten per second.
+pub const THEME_POLL_INTERVAL_MS: u64 = 100;
+
+/// Avoid a monotonic-clock syscall on every empty display dispatch.
+pub const THEME_CLOCK_CHECK_EVERY_ITERATIONS: u32 = 16;
 
 /// A complete palette for window chrome and default widget
 /// backgrounds.
@@ -141,12 +146,9 @@ impl Theme {
         text_input_border: Color::rgb(0x8a, 0x8e, 0x96),
     };
 
-    /// Placeholder dark theme. The titlebar / border /
-    /// text entries are filled in, but the hover colour
-    /// and glyph tint are intentionally borrowed from
-    /// [`Self::LIGHT`] until the settings app lands and
-    /// someone actually picks dark-mode colours. Treat the
-    /// values here as provisional.
+    /// Bundled dark theme used by Settings-aware applications. The red close
+    /// hover stays intentionally shared with light mode so destructive chrome
+    /// retains one recognizable accent across palettes.
     pub const DARK: Theme = Theme {
         name: "dark",
         window_background: Color::rgb(0x1c, 0x1f, 0x26),
@@ -172,10 +174,185 @@ impl Theme {
         text_input_placeholder_fg: Color::rgb(0x6a, 0x6a, 0x6a),
         text_input_border: Color::rgb(0x54, 0x58, 0x60),
     };
+
+    /// Normalize a persisted v1 theme name. Unknown and absent names use the
+    /// documented safe light palette.
+    pub fn from_name(name: Option<&str>) -> Theme {
+        match name {
+            Some("dark") => Theme::DARK,
+            Some("light") | None | Some(_) => Theme::LIGHT,
+        }
+    }
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Theme::LIGHT
+    }
+}
+
+/// Read seam shared by the production VFS source and deterministic tests.
+pub trait ThemeSource {
+    /// `Ok(None)` means the canonical preference file does not exist.
+    fn read(&mut self) -> io::Result<Option<Vec<u8>>>;
+}
+
+/// Bounded reader for the canonical preferences file.
+pub struct FilesystemThemeSource {
+    path: PathBuf,
+}
+
+impl FilesystemThemeSource {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl ThemeSource for FilesystemThemeSource {
+    fn read(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::with_capacity(1024);
+        file.take((THEME_PREFERENCE_MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > THEME_PREFERENCE_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "preferences exceed the 64 KiB theme-reader limit",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+}
+
+/// Monotonic clock seam used to make the polling cadence testable.
+pub trait ThemeClock {
+    fn monotonic_ms(&mut self) -> u64;
+}
+
+pub struct SystemThemeClock {
+    started: Instant,
+}
+
+impl SystemThemeClock {
+    pub fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemThemeClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ThemeClock for SystemThemeClock {
+    fn monotonic_ms(&mut self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+}
+
+/// Application-owned live theme monitor.
+///
+/// A transient I/O failure retains the last good palette. A missing or
+/// malformed snapshot restores the safe light palette, matching the canonical
+/// preference contract. [`Self::poll`] returns `Some` only when the normalized
+/// palette actually changes, so callers can use it directly as a repaint gate.
+pub struct ThemeWatcher<S = FilesystemThemeSource, C = SystemThemeClock> {
+    source: S,
+    clock: C,
+    current: Theme,
+    last_poll_ms: u64,
+    clock_check_every_iterations: u32,
+    iterations_until_clock_check: u32,
+}
+
+impl ThemeWatcher<FilesystemThemeSource, SystemThemeClock> {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self::from_parts(FilesystemThemeSource::new(path), SystemThemeClock::new())
+    }
+}
+
+impl<S: ThemeSource, C: ThemeClock> ThemeWatcher<S, C> {
+    /// Construct a watcher and synchronously read its initial palette.
+    pub fn from_parts(mut source: S, mut clock: C) -> Self {
+        let current = read_theme_snapshot(&mut source).unwrap_or_default();
+        let last_poll_ms = clock.monotonic_ms();
+        Self {
+            source,
+            clock,
+            current,
+            last_poll_ms,
+            clock_check_every_iterations: THEME_CLOCK_CHECK_EVERY_ITERATIONS,
+            iterations_until_clock_check: 0,
+        }
+    }
+
+    /// Override the cheap iteration gate for deterministic isolation tests.
+    pub fn with_clock_check_every_iterations(mut self, iterations: u32) -> Self {
+        self.clock_check_every_iterations = iterations.max(1);
+        self.iterations_until_clock_check = 0;
+        self
+    }
+
+    pub const fn current(&self) -> Theme {
+        self.current
+    }
+
+    /// Re-read the canonical snapshot immediately after an external
+    /// readiness source reports a preference-file mutation.
+    pub fn refresh(&mut self) -> Option<Theme> {
+        let now_ms = self.clock.monotonic_ms();
+        self.refresh_at(now_ms)
+    }
+
+    fn refresh_at(&mut self, now_ms: u64) -> Option<Theme> {
+        self.last_poll_ms = now_ms;
+        let next = read_theme_snapshot(&mut self.source)?;
+        if next == self.current {
+            return None;
+        }
+        self.current = next;
+        Some(next)
+    }
+
+    /// Clock-gated compatibility path for deterministic native fixtures.
+    pub fn poll(&mut self) -> Option<Theme> {
+        if self.iterations_until_clock_check > 0 {
+            self.iterations_until_clock_check -= 1;
+            return None;
+        }
+        self.iterations_until_clock_check = self.clock_check_every_iterations - 1;
+
+        let now_ms = self.clock.monotonic_ms();
+        if now_ms.saturating_sub(self.last_poll_ms) < THEME_POLL_INTERVAL_MS {
+            return None;
+        }
+        self.refresh_at(now_ms)
+    }
+}
+
+/// Start watching the canonical PMos preference file. The initial snapshot is
+/// read before this function returns.
+pub fn watch_theme() -> ThemeWatcher {
+    ThemeWatcher::new(preferences::DEFAULT_PATH)
+}
+
+fn read_theme_snapshot(source: &mut impl ThemeSource) -> Option<Theme> {
+    match source.read() {
+        Ok(Some(bytes)) => Some(
+            preferences::Preferences::parse(&bytes)
+                .map(|prefs| Theme::from_name(prefs.theme_name.as_deref()))
+                .unwrap_or_default(),
+        ),
+        Ok(None) => Some(Theme::LIGHT),
+        Err(_) => None,
     }
 }

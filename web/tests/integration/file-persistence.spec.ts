@@ -1,38 +1,78 @@
-// T139 — file persistence across reload (US3).
-//
-// Use the `#real-kernel` flow (which boots a real kernel + OPFS
-// block driver). The kernel's first-boot mkfs creates the FR-013a
-// starter kit; rebooting must show the same starter files (the
-// /etc/init.conf fingerprint is stable). The proxy assertion is
-// that init-desktop boots successfully twice in a row from the
-// same browser context, which requires OPFS persistence to round-trip.
+// T139 — canonical browser-level persistent-root gate. A real Terminal writes
+// a user file through the guest VFS, an external child exit supplies the
+// durability barrier, and a fresh kernel Worker/WASM instance reads the exact
+// bytes back from the remounted OPFS root.
 
 import { expect, test } from "@playwright/test";
 
-test("desktop boots twice from the same browser context (OPFS round-trip)", async ({
+import {
+  bootDesktop,
+  launchTerminal,
+  runTerminalCommand,
+  runTerminalCommandToPrompt,
+} from "./guest-terminal";
+
+test.use({ viewport: { width: 1280, height: 900 } });
+
+test("a guest-created file survives a fresh page and kernel instance", async ({
+  context,
   page,
+  browserName,
 }) => {
-  const lines1: string[] = [];
-  page.on("console", (msg) => lines1.push(msg.text()));
+  test.skip(
+    browserName === "webkit",
+    "WebKit lacks the persistent OPFS substrate required by the v1 persistence gate.",
+  );
 
-  await page.goto("/index.html");
-  await expect
-    .poll(
-      () =>
-        lines1.find((l) => /display-server served client \d+/.test(l)) ?? null,
-      { timeout: 15_000 },
-    )
-    .not.toBeNull();
+  const firstLines: string[] = [];
+  page.on("console", (message) => firstLines.push(message.text()));
+  page.on("pageerror", (error) =>
+    firstLines.push(`[pageerror] ${error.message}`),
+  );
+  await bootDesktop(page, firstLines);
+  await launchTerminal(page, firstLines);
+  await runTerminalCommandToPrompt(
+    page,
+    firstLines,
+    "mkdir -p /home/user/notes",
+  );
+  await runTerminalCommandToPrompt(
+    page,
+    firstLines,
+    "echo hello-pmos-persistence > /home/user/notes/.hi.tmp",
+  );
+  await runTerminalCommandToPrompt(
+    page,
+    firstLines,
+    "cp /home/user/notes/.hi.tmp /home/user/notes/hi.txt",
+  );
+  await runTerminalCommand(
+    page,
+    firstLines,
+    "echo persistence-write-durable > /dev/console",
+    (line) => line.includes("persistence-write-durable"),
+  );
 
-  // Reload — same context, same OPFS. Re-mount must not fail.
-  const lines2: string[] = [];
-  page.on("console", (msg) => lines2.push(msg.text()));
-  await page.reload();
-  await expect
-    .poll(
-      () =>
-        lines2.find((l) => /display-server served client \d+/.test(l)) ?? null,
-      { timeout: 15_000 },
-    )
-    .not.toBeNull();
+  await page.close();
+  const secondLines: string[] = [];
+  const secondPage = await context.newPage();
+  secondPage.on("console", (message) => secondLines.push(message.text()));
+  secondPage.on("pageerror", (error) =>
+    secondLines.push(`[pageerror] ${error.message}`),
+  );
+  await bootDesktop(secondPage, secondLines);
+  await launchTerminal(secondPage, secondLines);
+  const read = await runTerminalCommand(
+    secondPage,
+    secondLines,
+    "cat /home/user/notes/hi.txt > /dev/console",
+    (line) => line.includes("hello-pmos-persistence"),
+  );
+  expect(read).toContain("hello-pmos-persistence");
+  const allLines = [...firstLines, ...secondLines];
+  expect(allLines.some((line) => line.includes("real kernel panic"))).toBe(false);
+  expect(
+    allLines.some((line) => line.includes("user worker crashed pid=")),
+  ).toBe(false);
+  expect(allLines.some((line) => line.startsWith("[pageerror]"))).toBe(false);
 });

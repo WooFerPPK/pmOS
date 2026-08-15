@@ -8,7 +8,15 @@
 /// - v1.0 — initial release
 /// - **v1.1** — adds `fs_watch` (0x1402, §3.7) and `host_file_recv`
 ///   (0x1500, §3.6). Additive; v1.0 programs continue to run unchanged.
-pub const ABI_VERSION: (u16, u16) = (1, 1);
+/// - **v1.2** — adds `ipc_peer_caps` (0x1008, §3.1), the generic
+///   kernel-authenticated peer-credential query used by privileged
+///   IPC services such as the display server.
+/// - **v1.3** — adds `host_file_pick` (0x1501), the write-only
+///   `host_file_send` stream (0x1502), `fs_chmod` (0x1403), and
+///   `HOST_TRANSFER`.
+/// - **v1.4** — adds the fd-scoped, kernel-authenticated
+///   `ipc_peer_pid` query (0x1009, §3.1).
+pub const ABI_VERSION: (u16, u16) = (1, 4);
 
 /// Major component.
 pub const ABI_MAJOR: u16 = ABI_VERSION.0;
@@ -46,30 +54,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_is_one_one() {
-        assert_eq!(ABI_VERSION, (1, 1));
+    fn current_is_one_four() {
+        assert_eq!(ABI_VERSION, (1, 4));
         assert_eq!(ABI_MAJOR, 1);
-        assert_eq!(ABI_MINOR, 1);
+        assert_eq!(ABI_MINOR, 4);
     }
 
     #[test]
     fn packed_roundtrip() {
         let p = packed();
-        assert_eq!(p, 0x0001_0001);
+        assert_eq!(p, 0x0001_0004);
         assert!(is_compatible_packed(p));
     }
 
     #[test]
     fn old_minor_still_compatible() {
-        // v1.0 program on v1.1 kernel: OK.
+        // Older v1 programs on a v1.4 kernel: OK.
         assert!(is_compatible(1, 0));
+        assert!(is_compatible(1, 1));
+        assert!(is_compatible(1, 2));
+        assert!(is_compatible(1, 3));
     }
 
     #[test]
     fn newer_minor_is_incompatible() {
-        // v1.2 program on v1.1 kernel: NOT OK (kernel doesn't know
+        // v1.5 program on v1.4 kernel: NOT OK (kernel doesn't know
         // the new opcodes yet).
-        assert!(!is_compatible(1, 2));
+        assert!(!is_compatible(1, 5));
     }
 
     #[test]

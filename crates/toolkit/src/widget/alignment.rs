@@ -21,18 +21,13 @@
 /// toolkit's monospace bitmap font is fixed-height, so
 /// "centre vertically" is the only sensible choice and
 /// widgets do it automatically.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Alignment {
     /// Flush with the container's left edge.
+    #[default]
     Left,
     /// Centred horizontally within the container.
     Center,
     /// Flush with the container's right edge.
     Right,
-}
-
-impl Default for Alignment {
-    fn default() -> Self {
-        Alignment::Left
-    }
 }

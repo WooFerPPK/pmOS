@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
 Name=System Monitor
-Exec=/usr/bin/sysmon
+Exec=/bin/sysmon
 Categories=System;
 X-PMos-Caps=DISPLAY_CLIENT;PROC_ENUMERATE;PROC_KILL_ANY

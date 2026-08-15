@@ -20,12 +20,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-ls-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-ls-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -109,16 +104,16 @@ fn multi_path_args_emit_headers_and_blank_separator() {
     write_file(&a, "one", b"1");
     write_file(&b, "two", b"2");
 
-    let out = Command::new(LS)
-        .arg(&a)
-        .arg(&b)
-        .output()
-        .expect("spawn ls");
+    let out = Command::new(LS).arg(&a).arg(&b).output().expect("spawn ls");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let expected = format!("{a_str}:\none\n\n{b_str}:\ntwo\n", a_str = a.display(), b_str = b.display());
+    let expected = format!(
+        "{a_str}:\none\n\n{b_str}:\ntwo\n",
+        a_str = a.display(),
+        b_str = b.display()
+    );
     assert_eq!(stdout, expected, "stdout = {stdout:?}");
     cleanup(&dir);
 }

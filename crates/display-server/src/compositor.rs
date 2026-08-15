@@ -7,12 +7,10 @@
 //! [`crate::client::BufferInfo`]) into the framebuffer at a
 //! caller-specified destination origin.
 //!
-//! There is **no state machine beyond the pixel buffer**.
-//! Surface composition (Z order, multiple clients, opacity)
-//! lands in later slices. The job of this module is to turn
-//! "client committed a buffer" into "server has the pixels
-//! written to a framebuffer of record" so the future
-//! kernel-side `Fb` driver has something concrete to read.
+//! This module is the pixel primitive rather than the scene graph:
+//! [`crate::server::Server`] owns surfaces, global z-order, focus,
+//! and full-scene recomposition, and calls this framebuffer's clipped
+//! blit operation for each surface in the chosen order.
 //!
 //! All coordinates are signed 32-bit — the same type
 //! `pmd_surface.attach` and `pmd_surface.damage` carry on the
@@ -51,6 +49,7 @@ pub struct Framebuffer {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+    clear_argb: u32,
 }
 
 impl Framebuffer {
@@ -67,6 +66,7 @@ impl Framebuffer {
             width,
             height,
             pixels: vec![0u8; total],
+            clear_argb: 0,
         }
     }
 
@@ -108,6 +108,18 @@ impl Framebuffer {
     /// `B`, then `G`, `R`, `A`. Used by tests to pre-paint a
     /// distinctive background so blits can be detected.
     pub fn clear(&mut self, argb: u32) {
+        self.clear_argb = argb;
+        self.fill(argb);
+    }
+
+    /// Clear the backbuffer to the configured scene background
+    /// without changing that background. The server calls this
+    /// before every full-scene composition pass.
+    pub(crate) fn clear_for_composition(&mut self) {
+        self.fill(self.clear_argb);
+    }
+
+    fn fill(&mut self, argb: u32) {
         let b = (argb & 0xff) as u8;
         let g = ((argb >> 8) & 0xff) as u8;
         let r = ((argb >> 16) & 0xff) as u8;
@@ -179,8 +191,7 @@ impl Framebuffer {
                 // than its declared geometry.
                 break;
             }
-            let dst_row_start =
-                fb_stride * (y0 as usize + row) + (x0 as usize) * BYTES_PER_PIXEL;
+            let dst_row_start = fb_stride * (y0 as usize + row) + (x0 as usize) * BYTES_PER_PIXEL;
             let dst_row_end = dst_row_start + row_bytes;
             self.pixels[dst_row_start..dst_row_end]
                 .copy_from_slice(&src_bytes[src_row_start..src_row_end]);

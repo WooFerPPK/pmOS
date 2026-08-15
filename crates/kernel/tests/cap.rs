@@ -18,7 +18,7 @@
 
 #![cfg(feature = "native-platform")]
 
-use abi::cap::{Cap, CapSet, initial};
+use abi::cap::{initial, Cap, CapSet};
 use kernel::cap::{CapError, CapTable};
 
 // ---- Install / lookup ----------------------------------------------
@@ -68,7 +68,10 @@ fn check_returns_true_for_held_caps_and_false_otherwise() {
 #[test]
 fn check_unknown_pid_is_error() {
     let t = CapTable::new();
-    assert_eq!(t.check(7, Cap::DisplayClient).unwrap_err(), CapError::NoSuchPid);
+    assert_eq!(
+        t.check(7, Cap::DisplayClient).unwrap_err(),
+        CapError::NoSuchPid
+    );
 }
 
 // ---- grant enforcement --------------------------------------------
@@ -134,7 +137,8 @@ fn grant_merges_with_existing_caps() {
     t.install(2, CapSet::from_caps(&[Cap::DisplayClient]));
 
     t.grant(1, 2, CapSet::from_caps(&[Cap::Net])).unwrap();
-    t.grant(1, 2, CapSet::from_caps(&[Cap::KeymapAdmin])).unwrap();
+    t.grant(1, 2, CapSet::from_caps(&[Cap::KeymapAdmin]))
+        .unwrap();
 
     let set = t.list(2).unwrap();
     assert!(set.contains(Cap::DisplayClient));
@@ -165,7 +169,10 @@ fn grant_from_missing_granter_is_no_such_pid() {
 #[test]
 fn self_drop_caps_succeeds() {
     let mut t = CapTable::new();
-    t.install(10, CapSet::from_caps(&[Cap::DisplayClient, Cap::Net, Cap::KeymapAdmin]));
+    t.install(
+        10,
+        CapSet::from_caps(&[Cap::DisplayClient, Cap::Net, Cap::KeymapAdmin]),
+    );
     t.drop_caps(10, 10, CapSet::from_caps(&[Cap::Net])).unwrap();
 
     let set = t.list(10).unwrap();
@@ -229,7 +236,8 @@ fn shell_can_delegate_keymap_admin_if_it_also_had_cap_grant() {
     // launcher hadn't yet applied X-PMos-Caps).
     t.install(2, CapSet::from_caps(&[Cap::DisplayClient]));
 
-    t.grant(1, 2, CapSet::from_caps(&[Cap::KeymapAdmin])).unwrap();
+    t.grant(1, 2, CapSet::from_caps(&[Cap::KeymapAdmin]))
+        .unwrap();
 
     let settings = t.list(2).unwrap();
     assert!(settings.contains(Cap::DisplayClient));

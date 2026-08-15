@@ -29,19 +29,25 @@ pub mod wire;
 
 pub use decode::DecodeError;
 pub use events::{
-    error_code, key_state, pointer_button_state, xdg_toplevel_state, BufferRelease,
+    error_code, key_state, pointer_button_state, xdg_toplevel_state, BufferRelease, CallbackDone,
     DisplayDeleteId, DisplayError, KeyboardKey, PointerButton, PointerMotion, RegistryGlobal,
-    RegistryGlobalRemove, ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused,
-    ShellWindowTitleChanged, ShmFormat, XdgToplevelClose, XdgToplevelConfigure,
+    RegistryGlobalRemove, ShellRestoreFinished, ShellWindowCreated, ShellWindowDestroyed,
+    ShellWindowFocused, ShellWindowSnapshotDone, ShellWindowState, ShellWindowTitleChanged,
+    ShmFormat, XdgToplevelClose, XdgToplevelConfigure,
 };
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
+pub use requests::MAX_SURFACE_PATCH_BYTES;
 pub use requests::{
     buffer_format, xdg_toplevel_resize_edge, CompositorCreateSurface, DisplayGetRegistry,
-    RegistryBind, SeatGetKeyboard, SeatGetPointer, ShellManagerCloseWindow,
-    ShellManagerFocusWindow, ShellManagerMinimizeWindow, ShellManagerSubscribeWindows,
-    ShmCreatePool, ShmPoolCreateBuffer, ShmPoolWrite, SurfaceAttach, SurfaceDamage,
-    XdgShellGetToplevel, XdgToplevelAckConfigure, XdgToplevelMove, XdgToplevelResize,
-    XdgToplevelSetAppId, XdgToplevelSetMaximized, XdgToplevelSetTitle, XdgToplevelUnsetMaximized,
+    DisplaySync, RegistryBind, SeatGetKeyboard, SeatGetPointer, ShellManagerBeginRestore,
+    ShellManagerCloseWindow, ShellManagerDesktopReady, ShellManagerEndRestore,
+    ShellManagerFocusWindow, ShellManagerMinimizeWindow, ShellManagerPlaceRestoredWindow,
+    ShellManagerSetWorkAreaBottom, ShellManagerSubscribeWindowState, ShellManagerSubscribeWindows,
+    ShellManagerToggleMaximizedWindow, ShellManagerUnminimizeWindow, ShmCreatePool,
+    ShmPoolCreateBuffer, ShmPoolResize, ShmPoolWrite, ShmPoolWriteRows, SurfaceAttach,
+    SurfaceDamage, SurfaceFrame, SurfacePatchCurrent, XdgShellGetToplevel, XdgToplevelAckConfigure,
+    XdgToplevelMove, XdgToplevelResize, XdgToplevelSetAppId, XdgToplevelSetMaximized,
+    XdgToplevelSetTitle, XdgToplevelUnsetMaximized,
 };
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

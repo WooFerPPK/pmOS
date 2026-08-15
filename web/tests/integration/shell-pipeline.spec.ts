@@ -1,34 +1,55 @@
-// T150 — shell-pipeline: T142/T143 ship the parser + pipeline
-// runner; this spec drives a real `sh` instance and asserts the
-// pipeline `ls | grep foo > out.txt` produces the expected output
-// AND no zombie processes survive (FR-016).
-//
-// Status: T142/T143 are not yet wired into the shipped sh binary
-// (the partial scope on those tickets is deep but the pipeline
-// runtime is still pending). This spec exercises what IS shipped:
-// the boot path reaches a desktop, the shell binary launches, sh
-// is bundled. The assertions that depend on `|` / `>` are gated by
-// the existence of those parser tokens — when T142/T143 land, the
-// gates flip on.
-
 import { expect, test } from "@playwright/test";
 
-test("shell + sh + coreutils all boot under init-desktop", async ({ page }) => {
+import {
+  bootDesktop,
+  launchTerminal,
+  runTerminalCommand,
+} from "./guest-terminal";
+
+test.use({ viewport: { width: 1280, height: 900 } });
+
+test("Terminal runs an isolated external pipeline and reaps every stage", async ({
+  page,
+}) => {
   const consoleLines: string[] = [];
-  page.on("console", (msg) => consoleLines.push(msg.text()));
+  page.on("console", (message) => consoleLines.push(message.text()));
+  page.on("pageerror", (error) =>
+    consoleLines.push(`[pageerror] ${error.message}`),
+  );
 
-  await page.goto("/index.html");
+  await bootDesktop(page, consoleLines, 10_000);
+  await launchTerminal(page, consoleLines, { timeout: 5_000 });
 
-  // Desktop boots.
+  const steadyWorkers = Number(
+    (await page.locator("body").getAttribute("data-pmos-live-workers")) ?? "0",
+  );
+  expect(steadyWorkers).toBeGreaterThan(0);
+
+  try {
+    await runTerminalCommand(
+      page,
+      consoleLines,
+      "echo m3-pipeline-ok | grep m3-pipeline > /dev/console",
+      (line) => line === "[real-kernel] m3-pipeline-ok",
+      5_000,
+    );
+  } catch (error) {
+    throw new Error(
+      `pipeline output missing; console follows:\n${consoleLines.join("\n")}`,
+      { cause: error },
+    );
+  }
   await expect
     .poll(
-      () =>
-        consoleLines.find((l) => /display-server served client \d+/.test(l)) ??
-        null,
-      { timeout: 15_000 },
+      async () =>
+        Number(
+          (await page.locator("body").getAttribute("data-pmos-live-workers")) ??
+            "0",
+        ),
+      { timeout: 5_000 },
     )
-    .not.toBeNull();
-
-  // No pageerror noise.
-  expect(consoleLines.filter((l) => l.startsWith("[pageerror]"))).toHaveLength(0);
+    .toBe(steadyWorkers);
+  expect(consoleLines.filter((line) => line.startsWith("[pageerror]"))).toEqual(
+    [],
+  );
 });

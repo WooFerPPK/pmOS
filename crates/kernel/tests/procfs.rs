@@ -23,10 +23,10 @@ use abi::cap::CapSet;
 use abi::ext::Pid;
 
 use kernel::fs::procfs::{
-    fd_symlink_ino, format_argv_cmdline, format_pid_maps, pid_cmdline_ino, pid_fd_dir_ino,
-    pid_maps_ino, pid_status_ino, pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs,
-    ProcFsSource, ProcStatusSnapshot, ProcStatusState, StaticProcFsSource, StorageSnapshot,
-    PID_STRIDE,
+    classify_procfs_ino, classify_procfs_path, fd_symlink_ino, format_argv_cmdline,
+    format_pid_maps, pid_cmdline_ino, pid_dir_ino, pid_fd_dir_ino, pid_maps_ino, pid_status_ino,
+    pid_subtree_ino, KernelProcFsSource, ProcFdSnapshot, ProcFs, ProcFsNode, ProcFsSource,
+    ProcStatusSnapshot, ProcStatusState, StaticProcFsSource, StorageSnapshot, PID_STRIDE,
 };
 use kernel::proc::{table::ProcessTable, ExitStatus, ProcState, Process};
 use kernel::vfs::{FsError, NodeType, Vfs};
@@ -78,6 +78,7 @@ fn snapshots_from(table: &ProcessTable) -> Vec<ProcStatusSnapshot> {
                 state: project_state(p.state),
                 vm_size_bytes: p.vm_size_bytes,
                 vm_peak_bytes: p.vm_peak_bytes,
+                open_fds: None,
             })
         })
         .collect()
@@ -258,6 +259,22 @@ fn status_ends_with_trailing_newline_and_nine_fields() {
     assert!(lines[6].starts_with("VmSize:\t"), "line 6: {:?}", lines[6]);
     assert!(lines[7].starts_with("VmPeak:\t"), "line 7: {:?}", lines[7]);
     assert_eq!(lines[8], "Threads:\t1", "line 8: {:?}", lines[8]);
+}
+
+#[test]
+fn status_optionally_reports_the_exact_open_fd_count() {
+    let mut table = ProcessTable::new();
+    let pid = table.allocate_pid();
+    table.insert(make_process(pid, 1, "sysmon")).unwrap();
+
+    let mut snapshots = snapshots_from(&table);
+    snapshots[0].open_fds = Some(7);
+    let mut vfs = vfs_with_snapshots(snapshots);
+    let bytes = read_status(&mut vfs, pid).unwrap();
+    let text = core::str::from_utf8(&bytes).unwrap();
+
+    assert!(text.ends_with("Threads:\t1\nFDCount:\t7\n"), "{text:?}");
+    assert_eq!(text.matches("FDCount:\t").count(), 1);
 }
 
 #[test]
@@ -489,6 +506,7 @@ fn stub_status(pid: Pid, ppid: Pid, name: &str) -> ProcStatusSnapshot {
         state: ProcStatusState::Sleeping,
         vm_size_bytes: 0,
         vm_peak_bytes: 0,
+        open_fds: None,
     }
 }
 
@@ -689,6 +707,7 @@ fn kernel_procfs_source_pid_status_returns_spawned_process() {
             state: ProcStatusState::Sleeping,
             vm_size_bytes: 0,
             vm_peak_bytes: 0,
+            open_fds: None,
         },
     );
 }
@@ -1020,8 +1039,16 @@ fn maps_emits_single_wasm_memory_line_with_rw_p_perms() {
     // rights live in the module table, not in linear memory).
     assert!(line.contains(" rw-p "), "missing rw-p perms in {:?}", line);
     // Offset is zero; dev:inode 00:00; pathname [wasm-memory].
-    assert!(line.contains(" 00000000 00:00 0 "), "wrong meta in {:?}", line);
-    assert!(line.ends_with(" [wasm-memory]\n"), "wrong tag in {:?}", line);
+    assert!(
+        line.contains(" 00000000 00:00 0 "),
+        "wrong meta in {:?}",
+        line
+    );
+    assert!(
+        line.ends_with(" [wasm-memory]\n"),
+        "wrong tag in {:?}",
+        line
+    );
 }
 
 #[test]
@@ -1035,7 +1062,11 @@ fn maps_zero_size_emits_zero_length_region() {
 
     let bytes = read_maps(&mut vfs, pid).expect("read maps");
     let text = core::str::from_utf8(&bytes).expect("utf-8");
-    assert!(text.starts_with("00000000-00000000 rw-p "), "line: {:?}", text);
+    assert!(
+        text.starts_with("00000000-00000000 rw-p "),
+        "line: {:?}",
+        text
+    );
 }
 
 #[test]
@@ -1099,10 +1130,7 @@ fn maps_stat_reports_regular_file_mode_0o444() {
 #[test]
 fn maps_lookup_rejects_nonexistent_pid() {
     let mut vfs = vfs_with_snapshots(vec![]);
-    assert!(matches!(
-        vfs.stat("/proc/999/maps"),
-        Err(FsError::NotFound)
-    ));
+    assert!(matches!(vfs.stat("/proc/999/maps"), Err(FsError::NotFound)));
 }
 
 #[test]
@@ -1133,4 +1161,58 @@ fn kernel_procfs_source_projects_live_vm_size_to_maps() {
     let text = core::str::from_utf8(&bytes).unwrap();
     // 8 * 65536 = 524288 = 0x80000.
     assert!(text.starts_with("00000000-00080000"), "{}", text);
+}
+
+#[test]
+fn procfs_inode_classifier_covers_every_source_backed_node() {
+    let pid = 41;
+    assert_eq!(classify_procfs_ino(1), Some(ProcFsNode::Root));
+    assert_eq!(classify_procfs_ino(4), Some(ProcFsNode::Meminfo));
+    assert_eq!(
+        classify_procfs_ino(pid_dir_ino(pid)),
+        Some(ProcFsNode::PidDir(pid))
+    );
+    assert_eq!(
+        classify_procfs_ino(pid_status_ino(pid)),
+        Some(ProcFsNode::PidStatus(pid))
+    );
+    assert_eq!(
+        classify_procfs_ino(pid_fd_dir_ino(pid)),
+        Some(ProcFsNode::PidFdDir(pid))
+    );
+    assert_eq!(
+        classify_procfs_ino(pid_cmdline_ino(pid)),
+        Some(ProcFsNode::PidCmdline(pid))
+    );
+    assert_eq!(
+        classify_procfs_ino(pid_maps_ino(pid)),
+        Some(ProcFsNode::PidMaps(pid))
+    );
+    assert_eq!(
+        classify_procfs_ino(fd_symlink_ino(pid, 17)),
+        Some(ProcFsNode::PidFd(pid, 17))
+    );
+    assert_eq!(classify_procfs_ino(pid_subtree_ino(pid, 5)), None);
+}
+
+#[test]
+fn procfs_path_classifier_normalizes_and_keeps_deepest_required_snapshot() {
+    assert_eq!(
+        classify_procfs_path("/proc//9/./status"),
+        Some(ProcFsNode::PidStatus(9))
+    );
+    assert_eq!(
+        classify_procfs_path("proc/9/fd/7"),
+        Some(ProcFsNode::PidFd(9, 7))
+    );
+    assert_eq!(
+        classify_procfs_path("/proc/9/cmdline/child"),
+        Some(ProcFsNode::PidCmdline(9))
+    );
+    assert_eq!(
+        classify_procfs_path("/proc/9/not-a-node"),
+        Some(ProcFsNode::PidDir(9))
+    );
+    assert_eq!(classify_procfs_path("/proc-not/9/status"), None);
+    assert_eq!(classify_procfs_path("/proc/not-a-pid/status"), None);
 }

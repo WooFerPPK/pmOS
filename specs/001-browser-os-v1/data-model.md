@@ -69,6 +69,9 @@ enum ProcState {
   its `pid` and `exit_status` are retained, for `waitpid` to read.
 - `BlockedOnSyscall` and `BlockedOnIpc` are distinct so the
   scheduler can decide what event unblocks the process.
+- At most 256 non-reaped processes exist globally and at most 64 non-reaped
+  children belong to one parent. Zombies retain a slot. Admission is checked
+  before pid allocation or creation of per-process fd/cap/signal/Worker state.
 
 **State transitions**:
 
@@ -112,10 +115,12 @@ enum FdObject {
 **Invariants**:
 
 - `fd 0, 1, 2` are reserved for `stdin`, `stdout`, `stderr`. They
-  may refer to any `FdObject`; `proc_spawn` sets them up from the
-  parent's fd table per the spawn manifest.
-- `fd` numbers are not stable across processes; dup/spawn inherit by
-  contents, not by index.
+  may refer only to objects with safe dup-equivalent ownership;
+  `proc_spawn` sets eligible objects up from the parent's fd table per the
+  spawn manifest. `SocketEndpoint` and other single-owner/per-process objects
+  return `ENOTSUP` rather than copying an unrefcounted identifier.
+- `fd` numbers are not stable across processes; eligible dup/spawn mappings
+  inherit the underlying object, not the parent-local index.
 - Closing the last reference to a `VnodeHandle` drops any in-memory
   cache associated with that inode.
 
@@ -236,8 +241,18 @@ indirect_block   u64        // pointer to an indirect block of more pointers
 double_indirect  u64
 ```
 
-Enough inline capacity for 48 KiB per file before any indirection;
-good enough for the bundled apps' typical outputs.
+The implemented v1 filesystem uses the 12 direct pointers and one
+single-indirect block containing 512 `u64` LBAs. Regular files therefore
+address up to 524 blocks (2,146,304 bytes). Direct-only images remain
+mount-compatible because the existing `indirect_block` field is zero. The
+reserved double-indirect pointer remains a future format extension.
+
+Fresh formatting requires at least 1,498 blocks (6,135,808 bytes): one
+superblock, 256 journal blocks, 128 inode-table blocks, and the measured 1,113
+data blocks occupied by the complete starter/system tree, bundled wallpapers,
+terminal fonts, and timezone database. The default browser image is 4,096
+blocks (16 MiB), leaving 2,598 data blocks available after seeding. A device below the minimum is
+rejected before formatting begins rather than exposing a partially seeded OS.
 
 **Journaling**: every write that mutates metadata goes through the
 ring journal. On mount, the kernel replays unfinished transactions.
@@ -268,13 +283,15 @@ struct Pipe {
 - A pipe lives as long as at least one of its ends has an open fd.
   When the last writer closes, readers see EOF; when the last reader
   closes, writers receive a pipe-closed signal-equivalent.
+- Once both refcounts reach zero, unread bytes are unreachable and the IPC
+  table removes the pipe immediately.
 
 ### 4.2 Unix-domain-socket-equivalent
 
 ```rust
 struct Socket {
     id: SocketId,
-    ty: SocketType,                  // Stream, Dgram
+    ty: SocketType,                  // always Stream for constructible v1 objects
     state: SocketState,              // Unbound, Listening, Connected, Closed
     bound_path: Option<PathBuf>,     // present after ipc_bind
     backlog: VecDeque<PendingConnect>,
@@ -282,14 +299,30 @@ struct Socket {
     tx: RingBuffer,                  // outbox (points into the peer's rx)
     passed_fds_rx: VecDeque<FdObject>, // fd-passing queue
     peer: Option<SocketId>,
+    credentials: Option<SocketCredentials>, // kernel-captured pid + CapSet snapshot
 }
 ```
 
-The `/run/display` socket is an ordinary `Socket` with a
-well-known bound path, plus a kernel check that only processes
-holding the `DISPLAY_CLIENT` capability may `ipc_connect` to it.
-(`display_connect` is a thin wrapper around that connect that
-encodes the capability check in a dedicated opcode.)
+Each `rx` ring is capped at 64 KiB and `passed_fds_rx` at 64 entries. Closing
+an endpoint removes its socket record and unread queues immediately, clears
+the surviving peer link, and preserves only bytes already queued on that
+surviving endpoint for drain-before-EOF semantics.
+
+Every constructible v1 `Socket` has `ty == Stream`. The `Dgram` discriminant
+remains reserved so the wire ABI does not need renumbering, but rejection
+happens before an id or object is allocated and returns `ENOTSUP`. A future
+datagram object needs a record queue and explicit source/destination semantics;
+the stream backlog and peer model is not a datagram implementation.
+
+The `/run/display` endpoint uses the same stream `Socket` object internally,
+but its abstract binding is reserved: generic `ipc_bind` and `ipc_connect`
+cannot claim or enter it. The display server must use `display_bind` with
+`DISPLAY_SERVER`, and clients must use `display_connect` with
+`DISPLAY_CLIENT`. Keeping those as the only public routes makes the compositor
+capability boundary auditable at two dedicated opcodes.
+The display server queries each accepted endpoint with
+`ipc_peer_caps`; protocol clients cannot populate or modify the
+credential snapshot.
 
 ---
 
@@ -308,6 +341,8 @@ enum Cap {
     CAP_GRANT        = 8,  // may call cap_grant
     DEV_BLOCK        = 9,  // may open block devices directly
     KEYMAP_ADMIN     = 10, // may bind pmd_keymap_manager and switch the system keyboard layout
+    PROC_INSPECT     = 11, // may inspect another process's capability set
+    HOST_TRANSFER    = 12, // may open a host picker or emit a browser download
 }
 
 struct CapSet(u64);    // bitset — v1 has < 64 caps
@@ -320,9 +355,9 @@ struct CapSet(u64);    // bitset — v1 has < 64 caps
 - **display server**: `DISPLAY_SERVER`, `DEV_BLOCK` (for reading
   its own binary/config).
 - **desktop shell**: `DISPLAY_CLIENT`, `SHELL`, `PROC_ENUMERATE`,
-  `KEYMAP_ADMIN` (so the taskbar can see all windows and
-  processes, and so the launcher can hand `KEYMAP_ADMIN` to the
-  settings app at spawn time).
+  `PROC_KILL_ANY`, `KEYMAP_ADMIN`, `HOST_TRANSFER` (so the taskbar can see all
+  windows and processes, and so the launcher can delegate the privileged
+  Sysmon, Settings, and Files capabilities declared by their desktop entries).
 - **bundled sysmon**: `PROC_ENUMERATE`, `PROC_KILL_ANY` (so it can
   list processes and kill them).
 - **bundled settings** (when launched via the desktop shell's
@@ -330,14 +365,22 @@ struct CapSet(u64);    // bitset — v1 has < 64 caps
   passes `KEYMAP_ADMIN` through from its own cap set on spawn;
   the settings `.desktop` entry declares it via
   `X-PMos-Caps=DISPLAY_CLIENT;KEYMAP_ADMIN`.
-- **everything else** (terminal, files, edit, third-party apps):
+- **bundled files** (when launched via the desktop shell):
+  `DISPLAY_CLIENT`, `HOST_TRANSFER`; its desktop entry declares both.
+- **everything else** (terminal, edit, third-party apps):
   `DISPLAY_CLIENT` and nothing else by default.
 
 `cap_grant` is the only way to widen a process's capability set
 after startup, and it requires the caller to hold `CAP_GRANT`. In
 v1 only init has `CAP_GRANT`, which means capability grants
 effectively happen at spawn time and not at runtime. Runtime
-grant is the forward-compatible hook.
+grant is the forward-compatible hook. Init treats mutable `init.conf` grants
+as requests and intersects them with compiled role ceilings; it accepts only
+the bundled display server and the two bundled shell implementations for
+privileged boot roles. `/bin` and `/usr/bin` executable resolution bypasses
+the writable VFS and uses the immutable browser registry, while dynamically
+installed VFS executables remain confined to `/opt`. Thus writable boot
+configuration cannot redirect init's authority to attacker-provided bytes.
 
 ---
 
@@ -353,9 +396,23 @@ struct Client {
     id: ClientId,
     pid: Pid,                    // for /proc lookups and window-list → pid mapping
     socket: SocketId,
-    objects: BTreeMap<ObjectId, Object>,  // client-local object ID space
-    pending_frame_callbacks: Vec<CallbackId>,
+    objects: BTreeMap<ObjectId, Object>,  // live client-local objects
+    retired_object_ids: BTreeSet<ObjectId>, // deferred IDs remain cap-charged
+    awaiting_present_callbacks: VecDeque<(ObjectId, CallbackId)>, // commit FIFO
+    ready_frame_callbacks: VecDeque<ReadyFrameBatch>,
     caps_snapshot: CapSet,       // checked at connect time
+}
+
+struct ReadyFrameBatch {
+    callback_data: Option<u32>,  // Some(presentation_ms) => done; None => cancellation
+    callbacks: VecDeque<(ObjectId, CallbackId)>,
+    surface_delete_id: Option<ObjectId>,
+}
+
+struct WindowRegistry {
+    next_id: u32,
+    owners: BTreeMap<WindowId, (ClientId, ObjectId)>,
+    ids: BTreeMap<(ClientId, ObjectId), WindowId>,
 }
 
 enum Object {
@@ -380,7 +437,7 @@ struct Surface {
     pending: SurfaceState,       // double-buffered state, applied on commit
     current: SurfaceState,
     role: Option<SurfaceRole>,
-    frame_callbacks: Vec<CallbackId>,
+    pending_frame_callbacks: Vec<CallbackId>, // requested since the last commit
     input_region: Option<Region>,
     opaque_region: Option<Region>,
 }
@@ -423,9 +480,26 @@ struct ShmPool {
 - A `Buffer`'s underlying pixel data lives in the client's SAB
   shm pool, visible to the server as a borrowed byte slice. No
   copy is needed on commit.
-- A frame callback fires exactly once: the compositor inserts a
-  "ready to draw next frame" event onto the client's event
-  queue after presenting this frame, then removes the callback.
+- A frame request binds a typed callback but emits nothing and dirties nothing.
+  The next successful surface commit moves the surface's pending callbacks to
+  the client's commit-ordered `awaiting_present_callbacks` FIFO; later requests
+  wait for a later commit.
+- A frame callback fires exactly once only after a non-deferred production
+  framebuffer presentation succeeds, including the pixel-identical proof path.
+  The server queues `done(presentation_ms mod 2^32)`, removes the Callback,
+  then queues `display.delete_id` as one capacity-preflighted ordered unit.
+- Surface destruction cancels only callbacks that have not crossed that
+  presentation boundary, producing delete-only lifecycle items before the
+  trailing surface delete. Presentation-qualified items remain done-eligible;
+  disconnect drops all callback state silently.
+- Callback lifecycle emission is bounded to one shared 64-item budget per
+  production outer turn and fair across clients. Capacity-blocked items retain
+  their object/tombstone charge and wait for output readiness; no timer or spin
+  drives them (Principle IX).
+- Shell-visible `WindowId` values are server-global and stable for a
+  toplevel's lifetime. Client-local `ObjectId` values never cross the
+  shell-manager boundary as global identity. Disconnect and explicit
+  toplevel destruction retire both sides of the registry mapping.
 
 ---
 
@@ -525,16 +599,19 @@ autostart      = []                    # v1: empty; optional apps to launch
 grant = ["DISPLAY_SERVER", "DEV_BLOCK"]
 
 [capabilities.shell]
-grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE"]
+grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE", "PROC_KILL_ANY", "KEYMAP_ADMIN", "HOST_TRANSFER"]
 
 [capabilities.sysmon]
 grant = ["DISPLAY_CLIENT", "PROC_ENUMERATE", "PROC_KILL_ANY"]
 ```
 
-Changes to `/etc/init.conf` take effect on the next boot. Init
-reads this file, spawns the display server, waits for its
-`/run/display` socket to exist, spawns the shell, then spawns
-anything under `autostart`.
+Valid changes to `/etc/init.conf` take effect on the next boot; a change between
+the trusted `/usr/bin/shell` and `/usr/bin/alt-shell` choices also takes effect
+when init next respawns the shell. Privileged service paths outside the
+allow-list invalidate the file, and capability grants are bounded by the
+compiled role ceilings described in §5.
+Init reads this file, spawns the display server, waits for its `/run/display`
+socket to exist, spawns the shell, then spawns anything under `autostart`.
 
 ---
 

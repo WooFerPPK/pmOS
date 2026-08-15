@@ -44,6 +44,11 @@ use crate::fs::devfs::{
 };
 use crate::platform::{self, DevId, DriverError};
 
+/// Maximum retained bytes for an unterminated `/dev/console` line.
+/// Complete lines are forwarded immediately; a writer that never emits `\n`
+/// gets a rolling tail rather than unbounded kernel memory.
+pub const CONSOLE_PARTIAL_LINE_CAP: usize = 16 * 1024;
+
 /// Errors returned by device dispatch.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DevError {
@@ -133,10 +138,26 @@ impl DeviceDispatcher {
         core::mem::take(&mut self.console_output_sink)
     }
 
+    /// Bytes retained for the current unterminated console line.
+    #[doc(hidden)]
+    pub fn console_output_len(&self) -> usize {
+        self.console_output_sink.len()
+    }
+
     /// Number of bytes currently available on the `/dev/console`
     /// input ring.
     pub fn console_input_len(&self) -> usize {
         self.console_input.len()
+    }
+
+    /// Number of bytes currently available on `/dev/input/kbd`.
+    pub fn input_kbd_len(&self) -> usize {
+        self.input_kbd.len()
+    }
+
+    /// Number of bytes currently available on `/dev/input/mouse`.
+    pub fn input_mouse_len(&self) -> usize {
+        self.input_mouse.len()
     }
 
     // --- Cap checks ---------------------------------------------------
@@ -175,13 +196,13 @@ impl DeviceDispatcher {
     /// * `zero`   — fills `buf` with zeros.
     /// * `random` — fills `buf` with `Platform::random_bytes`.
     /// * `console`— drains up to `buf.len()` bytes from the
-    ///              input ring. Returns `WouldBlock` if empty
-    ///              (the syscall layer blocks the process on
-    ///              a non-zero-len request against an empty
-    ///              ring, or returns `EAGAIN` under NONBLOCK).
+    ///   input ring. Returns `WouldBlock` if empty (the syscall
+    ///   layer blocks the process on a non-zero-len request
+    ///   against an empty ring, or returns `EAGAIN` under
+    ///   NONBLOCK).
     /// * `fb0`    — write-only; returns `NotSupported`.
     /// * `input_kbd` / `input_mouse` — drains the ring like
-    ///              console.
+    ///   console.
     pub fn read(&mut self, devnum: u32, buf: &mut [u8]) -> Result<usize, DevError> {
         match devnum {
             DEV_NULL => Ok(0),
@@ -208,10 +229,10 @@ impl DeviceDispatcher {
     ///
     /// * `null`   — discards, returns `buf.len()`.
     /// * `zero`   — writes are accepted and discarded (like
-    ///              `/dev/null`).
+    ///   `/dev/null`).
     /// * `random` — read-only; returns `NotSupported`.
     /// * `console`— appends to `console_output_sink`, flushing
-    ///              whole lines to `Platform::driver_call`.
+    ///   whole lines to `Platform::driver_call`.
     /// * `fb0`    — forwards to the framebuffer driver.
     /// * `input_*`— read-only; returns `NotSupported`.
     pub fn write(&mut self, devnum: u32, buf: &[u8]) -> Result<usize, DevError> {
@@ -236,7 +257,10 @@ impl DeviceDispatcher {
         // a single driver_call; the trailing partial line
         // stays in the buffer until a newline arrives.
         let mut drained = 0usize;
-        while let Some(nl) = self.console_output_sink[drained..].iter().position(|&b| b == b'\n') {
+        while let Some(nl) = self.console_output_sink[drained..]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
             let end = drained + nl + 1;
             let line = &self.console_output_sink[drained..end];
             // Fire and forget: the native Platform's driver_call
@@ -247,6 +271,14 @@ impl DeviceDispatcher {
         }
         if drained > 0 {
             self.console_output_sink.drain(..drained);
+        }
+        // Keep the newest diagnostic bytes. A process can issue an unlimited
+        // sequence of newline-free writes, but the kernel retains at most one
+        // bounded tail between calls. The syscall still reports the full input
+        // length as accepted, matching a lossy serial console under pressure.
+        if self.console_output_sink.len() > CONSOLE_PARTIAL_LINE_CAP {
+            let excess = self.console_output_sink.len() - CONSOLE_PARTIAL_LINE_CAP;
+            self.console_output_sink.drain(..excess);
         }
         Ok(buf.len())
     }
@@ -284,8 +316,8 @@ fn drain_ring(ring: &mut VecDeque<u8>, buf: &mut [u8]) -> Result<usize, DevError
         return Err(DevError::WouldBlock);
     }
     let take = core::cmp::min(buf.len(), ring.len());
-    for i in 0..take {
-        buf[i] = ring.pop_front().unwrap();
+    for byte in buf.iter_mut().take(take) {
+        *byte = ring.pop_front().unwrap();
     }
     Ok(take)
 }

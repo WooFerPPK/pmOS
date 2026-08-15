@@ -1,6 +1,6 @@
-// T081 production-path: FbRenderer tests covering both the fast
-// path (OffscreenCanvas + transferToImageBitmap) and the fallback
-// (direct putImageData), plus present_complete event delivery.
+// T081 production-path: FbRenderer tests covering OffscreenCanvas
+// capability detection, artifact-safe direct full-frame paints,
+// rectangular patches, and present_complete event delivery.
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -16,11 +16,6 @@ import {
 } from "../../src/fb-renderer";
 
 // ---- fakes -----------------------------------------------------------
-
-interface FakeImageBitmap {
-  readonly _width: number;
-  readonly _height: number;
-}
 
 function makeFakeImageData(): ImageDataFactory {
   return (data, width, height) => ({ width, height, data });
@@ -108,7 +103,7 @@ describe("FbRenderer — OffscreenCanvas fast path", () => {
     expect(renderer.usingFastPath).toBe(true);
   });
 
-  it("paintFrame composes offscreen + drawImage onto the visible canvas", () => {
+  it("paintFrame stays on direct putImageData when offscreen is available", () => {
     const canvas = makeFakeCanvas();
     const { factory, created } = makeFakeOffscreenFactory();
     const renderer = new FbRenderer({
@@ -120,13 +115,12 @@ describe("FbRenderer — OffscreenCanvas fast path", () => {
     const rgba = new Uint8Array(64).fill(0x33);
     renderer.paintFrame({ width: 4, height: 4, rgba });
 
-    expect(created[0]!.ctxPutCalls).toHaveLength(1);
-    expect(created[0]!.bitmapCount).toBe(1);
-    expect(canvas.drawCalls).toHaveLength(1);
-    expect(canvas.drawCalls[0]!.dx).toBe(0);
-    expect(canvas.drawCalls[0]!.dy).toBe(0);
-    // No direct putImageData on the visible canvas in the fast path.
-    expect(canvas.putCalls).toHaveLength(0);
+    expect(created[0]!.ctxPutCalls).toHaveLength(0);
+    expect(created[0]!.bitmapCount).toBe(0);
+    expect(canvas.drawCalls).toHaveLength(0);
+    expect(canvas.putCalls).toHaveLength(1);
+    expect(canvas.putCalls[0]!.dx).toBe(0);
+    expect(canvas.putCalls[0]!.dy).toBe(0);
   });
 
   it("paintFrame fires present_complete handlers in registration order", () => {
@@ -199,6 +193,142 @@ describe("FbRenderer — fallback path", () => {
     expect(canvas.putCalls).toHaveLength(1);
     expect(canvas.drawCalls).toHaveLength(0);
     expect(renderer.presentsCompleted).toBe(1);
+  });
+});
+
+// ---- rectangular patches -------------------------------------------
+
+describe("FbRenderer — rectangular patches", () => {
+  it("paintPatch uploads only rect-sized ImageData at the requested offset", () => {
+    const canvas = makeFakeCanvas();
+    const { factory, created } = makeFakeOffscreenFactory();
+    const renderer = new FbRenderer({
+      canvas,
+      offscreenCanvasFactory: factory,
+      imageDataFactory: makeFakeImageData(),
+    });
+    renderer.setMode({ width: 10, height: 8 });
+    const rgba = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    renderer.paintPatch({ x: 3, y: 4, width: 2, height: 1, rgba });
+
+    expect(canvas.putCalls).toHaveLength(1);
+    expect(canvas.putCalls[0]).toMatchObject({ dx: 3, dy: 4 });
+    expect(canvas.putCalls[0]!.image.width).toBe(2);
+    expect(canvas.putCalls[0]!.image.height).toBe(1);
+    expect(Array.from(canvas.putCalls[0]!.image.data)).toEqual(Array.from(rgba));
+    expect(canvas.drawCalls).toHaveLength(0);
+    expect(created[0]!.ctxPutCalls).toHaveLength(0);
+    expect(created[0]!.bitmapCount).toBe(0);
+  });
+
+  it("paintPatch completes one presentation and notifies subscribers", () => {
+    const canvas = makeFakeCanvas();
+    const renderer = new FbRenderer({
+      canvas,
+      offscreenCanvasFactory: () => null,
+      imageDataFactory: makeFakeImageData(),
+    });
+    renderer.setMode({ width: 4, height: 4 });
+    const handler = vi.fn();
+    renderer.onPresentComplete(handler);
+
+    renderer.paintPatch({
+      x: 1,
+      y: 1,
+      width: 1,
+      height: 1,
+      rgba: new Uint8Array(4),
+    });
+
+    expect(renderer.presentsCompleted).toBe(1);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("paintPatchBatch paints every rectangle and completes one presentation", () => {
+    const canvas = makeFakeCanvas();
+    const renderer = new FbRenderer({
+      canvas,
+      offscreenCanvasFactory: () => null,
+      imageDataFactory: makeFakeImageData(),
+    });
+    renderer.setMode({ width: 6, height: 5 });
+    const handler = vi.fn();
+    renderer.onPresentComplete(handler);
+
+    renderer.paintPatchBatch([
+      { x: 0, y: 1, width: 2, height: 1, rgba: new Uint8Array(8).fill(1) },
+      { x: 4, y: 3, width: 1, height: 2, rgba: new Uint8Array(8).fill(2) },
+    ]);
+
+    expect(canvas.putCalls).toHaveLength(2);
+    expect(canvas.putCalls.map((call) => [call.dx, call.dy])).toEqual([
+      [0, 1],
+      [4, 3],
+    ]);
+    expect(renderer.presentsCompleted).toBe(1);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("paintPatchBatch validates the complete batch before changing pixels", () => {
+    const canvas = makeFakeCanvas();
+    const renderer = new FbRenderer({
+      canvas,
+      offscreenCanvasFactory: () => null,
+      imageDataFactory: makeFakeImageData(),
+    });
+    renderer.setMode({ width: 4, height: 4 });
+    const handler = vi.fn();
+    renderer.onPresentComplete(handler);
+
+    renderer.paintPatchBatch([
+      { x: 0, y: 0, width: 1, height: 1, rgba: new Uint8Array(4) },
+      { x: 4, y: 0, width: 1, height: 1, rgba: new Uint8Array(4) },
+    ]);
+
+    expect(canvas.putCalls).toHaveLength(0);
+    expect(renderer.presentsCompleted).toBe(0);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("paintPatch rejects pre-mode, empty, malformed, and out-of-bounds damage", () => {
+    const canvas = makeFakeCanvas();
+    const renderer = new FbRenderer({
+      canvas,
+      offscreenCanvasFactory: () => null,
+      imageDataFactory: makeFakeImageData(),
+    });
+    const handler = vi.fn();
+    renderer.onPresentComplete(handler);
+    renderer.paintPatch({
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      rgba: new Uint8Array(4),
+    });
+    renderer.setMode({ width: 4, height: 4 });
+
+    const invalid = [
+      { x: 0, y: 0, width: 0, height: 1, rgba: new Uint8Array(0) },
+      { x: 0, y: 0, width: 1, height: 1, rgba: new Uint8Array(3) },
+      { x: 4, y: 0, width: 1, height: 1, rgba: new Uint8Array(4) },
+      { x: 0, y: 4, width: 1, height: 1, rgba: new Uint8Array(4) },
+      {
+        x: Number.MAX_SAFE_INTEGER,
+        y: 0,
+        width: 1,
+        height: 1,
+        rgba: new Uint8Array(4),
+      },
+    ];
+    for (const patch of invalid) {
+      renderer.paintPatch(patch);
+    }
+
+    expect(canvas.putCalls).toHaveLength(0);
+    expect(renderer.presentsCompleted).toBe(0);
+    expect(handler).not.toHaveBeenCalled();
   });
 });
 

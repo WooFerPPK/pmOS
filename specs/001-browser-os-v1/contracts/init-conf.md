@@ -7,7 +7,10 @@ tests that need a different boot configuration.
 
 The file lives at `/etc/init.conf`. Init (PID 1) reads it at boot
 and uses it to decide what to spawn, in what order, and with what
-capabilities. Changes take effect on the next boot.
+capabilities. Changes take effect on the next boot. Because every process has
+the v1 root preopen, this file is input to a security policy rather than the
+policy itself: it can select only trusted bundled privileged services, and no
+configured grant can exceed the compiled ceiling for that role.
 
 ---
 
@@ -37,7 +40,7 @@ autostart      = []                         # default
 grant = ["DISPLAY_SERVER", "DEV_BLOCK"]
 
 [capabilities.shell]
-grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE", "KEYMAP_ADMIN"]
+grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE", "PROC_KILL_ANY", "KEYMAP_ADMIN", "HOST_TRANSFER"]
 
 [capabilities.sysmon]
 grant = ["DISPLAY_CLIENT", "PROC_ENUMERATE", "PROC_KILL_ANY"]
@@ -61,6 +64,24 @@ serial_shell     = false     # if true, also spawn a headless shell on /dev/cons
 ## 3. Semantics
 
 ### 3.1 Boot sequence
+
+Before PID 1 starts, the kernel mounts a successfully opened OPFS image as
+`/`, then overlays volatile `tmpfs` instances at `/tmp` and `/run`, `devfs` at
+`/dev`, and `procfs` at `/proc`. The canonical system and user paths are
+therefore `/etc`, `/usr`, and `/home/user`; there is no `/persist`
+compatibility mount.
+
+Only an image explicitly reported as newly created by the block driver may be
+formatted. If persistent storage is unavailable, or an existing image cannot
+be validated and mounted, the kernel leaves its bytes untouched, logs the
+degraded boot, and may prepare a volatile `tmpfs` at `/`. In that fallback mode
+`/proc/storage` reports `0 0 0`; init may follow the sequence below so recovery
+is coherent, but the browser substrate blocks all ordinary interaction by
+default. Main exposes only Retry and an explicitly labelled temporary-session
+choice whose files will be lost on reload. Missing persistent configuration
+and binaries take their documented fallback paths only after that explicit
+choice; preparation of the recovery tree never authorises rewriting the
+existing image.
 
 1. Init waits for the kernel to have finished mounting `/`,
    `/tmp`, `/dev`, `/proc`, and `/run`.
@@ -106,11 +127,13 @@ spawn churn.
 7. Test passes.
 
 **Replacement with a different binary**: the layering test also
-covers the case where the shell is replaced by a different
-binary, not just respawned. For that, sysmon (or a test) edits
-`/etc/init.conf` to point `boot.shell` at a different path and
-kills the shell. On respawn, init reads the conf again and
-spawns the new binary. The rest of the sequence is identical.
+covers the case where the shell is replaced by the independently compiled
+bundled `/usr/bin/alt-shell`, not just respawned. For that, sysmon (or a test)
+edits `/etc/init.conf` to select `/usr/bin/alt-shell` and kills the shell. On
+respawn, init reads the conf again and spawns the new binary. The rest of the
+sequence is identical. V1 accepts only `/usr/bin/shell` and
+`/usr/bin/alt-shell` for this privileged role; a future trusted package/signing
+mechanism may extend that allow-list without changing lower layers.
 
 ### 3.3 Autostart failures
 
@@ -120,12 +143,22 @@ Autostart is best-effort.
 
 ### 3.4 Capability inheritance
 
-Init holds every capability in the system — it is PID 1 and the
-root of all grants. When init spawns a child, it applies the
-caps listed in the child's `capabilities.<name>` section and
-nothing else. A section that is missing yields an empty cap
-set. A capability name that does not exist yields a boot-time
-warning and is ignored.
+Init holds every capability in the system — it is PID 1 and the root of all
+grants. When init spawns a child, it intersects the caps listed in the child's
+`capabilities.<name>` section with a compiled role ceiling. The display server
+ceiling is `DISPLAY_SERVER|DEV_BLOCK`; the shell ceiling is the documented
+desktop-shell set; bundled Files, Settings, and Sysmon autostarts use their
+documented initial sets; every other autostart is capped at `DISPLAY_CLIENT`.
+A missing section yields an empty cap set. Unknown names and known names above
+the ceiling produce boot-time warnings and are ignored. Mutable configuration
+therefore cannot turn init's `CAP_GRANT` authority into privilege escalation.
+
+The privileged boot paths are also constrained: `boot.display_server` must be
+`/usr/bin/display-server`, and `boot.shell` must be `/usr/bin/shell` or
+`/usr/bin/alt-shell`. The kernel resolves `/bin/*` and `/usr/bin/*` only through
+the immutable bundled registry, so a writable VFS shadow cannot replace those
+bytes. Dynamically installed executable content belongs under `/opt` and is
+never eligible for a privileged init role in v1.
 
 ### 3.5 Missing binaries
 
@@ -147,6 +180,12 @@ file. The whitelist for v1 is:
 | env var | preferences key     | default if absent |
 |---------|---------------------|-------------------|
 | `TZ`    | `timezone.iana`     | `UTC`             |
+
+The v1 timezone allow-list is `UTC`, `America/New_York`, `Europe/London`, and
+`Asia/Tokyo`. Init must normalize through the shared `preferences` crate;
+missing files, malformed snapshots, missing keys, and unsupported names all
+produce `TZ=UTC`. Preference text is never copied directly into an environment
+entry or filesystem path.
 
 Semantics:
 
@@ -171,6 +210,12 @@ Semantics:
 No signal-broadcast infrastructure (SIGHUP or equivalent) is
 needed or used for this mechanism.
 
+Init launches these children through the documented
+`pmos_ext.proc_spawn_manifest` import and the canonical `spawn_v1` encoder.
+Adding `TZ` must not change the launch's path, argv, fd mappings, inherited
+stdio/cwd markers, or least-privilege capability grant. The preference file is
+read separately for every direct spawn and every future respawn attempt.
+
 ---
 
 ## 4. Default file shipped in the initramfs
@@ -185,7 +230,7 @@ autostart      = []
 grant = ["DISPLAY_SERVER", "DEV_BLOCK"]
 
 [capabilities.shell]
-grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE", "KEYMAP_ADMIN"]
+grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE", "PROC_KILL_ANY", "KEYMAP_ADMIN", "HOST_TRANSFER"]
 
 [capabilities.sysmon]
 grant = ["DISPLAY_CLIENT", "PROC_ENUMERATE", "PROC_KILL_ANY"]
@@ -202,18 +247,20 @@ kernel_log_level = "info"
 serial_shell     = false
 ```
 
-This is what new users start with. It can be edited from a text
-editor; a reboot (tab reload) applies the change.
+This is what new users start with. It can be edited from a text editor; a
+reboot (tab reload) applies valid changes. A path or capability grant outside
+the security policy is rejected and the complete built-in safe configuration
+is used.
 
 ---
 
 ## 5. Validation
 
-Init validates the file at boot with the same TOML schema-check
-the package manifest uses. Validation errors produce a single
-warning line to `/dev/console` and defaults are used. Init never
-panics on a bad `/etc/init.conf` — PID 1 crashing is a product
-failure, so invalid conf always falls back to built-in defaults.
+Init validates the file at boot with the same TOML schema-check the package
+manifest uses, including the trusted privileged-service path allow-list.
+Validation errors produce a single warning line to `/dev/console` and defaults
+are used. Init never panics on a bad `/etc/init.conf` — PID 1 crashing is a
+product failure, so invalid conf always falls back to built-in defaults.
 
 ---
 

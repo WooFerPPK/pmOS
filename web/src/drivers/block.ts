@@ -12,15 +12,11 @@
 // data blocks all live as ranges within the same file, mirroring
 // the kernel's layout module.
 //
-// First-boot creation: the SyncAccessHandle is opened with
-// `{ create: true }` so a fresh OPFS gets the file. The handle's
-// `.truncate(blockCount * BLOCK_SIZE)` pre-sizes it; reads past
-// the high-water mark return zero bytes (sparse-file semantics
-// match `MockBlockDevice`'s "unwritten LBAs read as zeros"
-// contract). When the kernel's `OpfsFs::mount` reads LBA 0
-// (superblock), it sees zeros, returns `FsError::Io`, and
-// `kernel_init` then calls `mkfs(device)` which writes a fresh
-// superblock + zeroes the inode table + journal.
+// First-boot creation: the driver first opens `pmos.img` without
+// `create`, and only creates it after a `NotFoundError`. It reports
+// that provenance through OP_IMAGE_STATE. The kernel formats only a
+// newly-created image; an existing empty or corrupt image is never
+// reformatted after a mount error.
 //
 // Quota mapping: a `QuotaExceededError` from `.write()` is
 // surfaced as `errno = ENOSPC = 51`, propagating through the
@@ -46,9 +42,9 @@ export const EIO = 5;
 export const EINVAL = 22;
 
 /**
- * Default block count: 4096 blocks * 4 KiB = 16 MiB. Above
- * `MIN_BLOCK_COUNT` (~386) on the kernel side, which is the
- * minimum size for a formatted OPFS image.
+ * Default block count: 4096 blocks * 4 KiB = 16 MiB. Above the kernel's
+ * exact 1498-block minimum (complete bundled root plus layout metadata),
+ * leaving about 10 MiB for user data on a new image.
  */
 export const DEFAULT_BLOCK_COUNT = 4096;
 
@@ -58,6 +54,15 @@ export const OP_BLOCK_COUNT = 0x01;
 export const OP_READ = 0x02;
 export const OP_WRITE = 0x03;
 export const OP_FLUSH = 0x04;
+export const OP_IMAGE_STATE = 0x05;
+
+/** Image provenance returned by `OP_IMAGE_STATE`. */
+export const BlockImageState = {
+  Existing: 0,
+  NewlyCreated: 1,
+} as const;
+export type BlockImageState =
+  (typeof BlockImageState)[keyof typeof BlockImageState];
 
 /** OPFS image filename in the OPFS root directory. */
 export const PMOS_IMG_FILENAME = "pmos.img";
@@ -118,6 +123,7 @@ export class BlockDriver implements Driver {
   private constructor(
     private handle: SyncAccessHandle,
     public readonly blockCount: number,
+    public readonly imageState: BlockImageState,
   ) {}
 
   /**
@@ -125,9 +131,8 @@ export class BlockDriver implements Driver {
    * Creates `pmos.img` if it doesn't exist; pre-sizes it to
    * `blockCount * BLOCK_SIZE` bytes so the kernel sees a
    * fixed-size device. Idempotent: reopening an existing
-   * `pmos.img` keeps its contents (the kernel reads the
-   * superblock and either mounts the existing FS or runs mkfs
-   * if the image is freshly zeroed).
+   * `pmos.img` keeps its contents and reports `Existing`; only
+   * creating the file in this call reports `NewlyCreated`.
    *
    * In tests, `rootOverride` lets a fake `OpfsRoot` stand in
    * for `navigator.storage.getDirectory()`.
@@ -139,13 +144,27 @@ export class BlockDriver implements Driver {
     const root: OpfsRoot =
       rootOverride ??
       (await navigator.storage.getDirectory() as unknown as OpfsRoot);
-    const file = await root.getFileHandle(PMOS_IMG_FILENAME, { create: true });
+    let file: Awaited<ReturnType<OpfsRoot["getFileHandle"]>>;
+    let imageState: BlockImageState;
+    try {
+      file = await root.getFileHandle(PMOS_IMG_FILENAME);
+      imageState = BlockImageState.Existing;
+    } catch (e: unknown) {
+      if (!isNotFound(e)) throw e;
+      file = await root.getFileHandle(PMOS_IMG_FILENAME, { create: true });
+      imageState = BlockImageState.NewlyCreated;
+    }
     const handle = await file.createSyncAccessHandle();
+    // Another context may populate the file between the existence check and
+    // access-handle creation. If that happened, preserve it as existing.
+    if (imageState === BlockImageState.NewlyCreated && handle.getSize() !== 0) {
+      imageState = BlockImageState.Existing;
+    }
     const expectedSize = blockCount * BLOCK_SIZE;
     if (handle.getSize() < expectedSize) {
       handle.truncate(expectedSize);
     }
-    return new BlockDriver(handle, blockCount);
+    return new BlockDriver(handle, blockCount, imageState);
   }
 
   /**
@@ -153,17 +172,20 @@ export class BlockDriver implements Driver {
    * `SyncAccessHandle`. Tests use this with the in-memory
    * `MemSyncAccessHandle` from `web/tests/unit/block.test.ts` so
    * the driver behaviour can be exercised without touching the
-   * real OPFS surface (which jsdom doesn't expose).
+   * real OPFS surface (which jsdom doesn't expose). The safe
+   * default is `Existing`; first-boot tests must opt into
+   * `NewlyCreated` explicitly.
    */
   static withHandle(
     handle: SyncAccessHandle,
     blockCount: number = DEFAULT_BLOCK_COUNT,
+    imageState: BlockImageState = BlockImageState.Existing,
   ): BlockDriver {
     const expectedSize = blockCount * BLOCK_SIZE;
     if (handle.getSize() < expectedSize) {
       handle.truncate(expectedSize);
     }
-    return new BlockDriver(handle, blockCount);
+    return new BlockDriver(handle, blockCount, imageState);
   }
 
   init(_host: DriverHost): void {
@@ -181,6 +203,8 @@ export class BlockDriver implements Driver {
         return this.write(payload);
       case OP_FLUSH:
         return this.flushOp();
+      case OP_IMAGE_STATE:
+        return { ok: true, value: this.imageState };
       default:
         return { ok: false, error: DriverErrorCode.Transport };
     }
@@ -246,7 +270,10 @@ export class BlockDriver implements Driver {
     const offset = lba * BLOCK_SIZE;
     const src = new Uint8Array(payload.buffer, payload.byteOffset + 8, BLOCK_SIZE);
     try {
-      this.handle.write(src, { at: offset });
+      const n = this.handle.write(src, { at: offset });
+      if (n !== BLOCK_SIZE) {
+        return { ok: false, error: DriverErrorCode.Errno, errno: EIO };
+      }
       return { ok: true, value: BLOCK_SIZE };
     } catch (e: unknown) {
       const errno = isQuotaExceeded(e) ? ENOSPC : EIO;
@@ -274,4 +301,10 @@ function isQuotaExceeded(e: unknown): boolean {
   if (typeof e !== "object" || e === null) return false;
   const cand = e as { name?: unknown };
   return cand.name === "QuotaExceededError";
+}
+
+function isNotFound(e: unknown): boolean {
+  if (typeof e !== "object" || e === null) return false;
+  const cand = e as { name?: unknown };
+  return cand.name === "NotFoundError";
 }

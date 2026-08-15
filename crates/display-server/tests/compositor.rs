@@ -139,7 +139,7 @@ fn blit_with_wide_stride_skips_padding_bytes() {
         out.extend_from_slice(&[0, 0, 0xFF, 0xFF]);
         out.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]); // padding
         out.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]); // padding
-        // row 1: green green _ _
+                                                          // row 1: green green _ _
         out.extend_from_slice(&[0, 0xFF, 0, 0xFF]);
         out.extend_from_slice(&[0, 0xFF, 0, 0xFF]);
         out.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]); // padding

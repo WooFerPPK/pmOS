@@ -19,12 +19,15 @@ EXCLUDES=(
   --exclude-dir=dist
   --exclude-dir=build
   --exclude-dir=.git
+  --exclude-dir=.claude
+  --exclude-dir=.worktrees
 )
 
-# Exclude the audit script itself + the generated compliance doc so they
-# don't self-trigger every pattern they enumerate.
+# Exclude the audit script, its fixture test, and the generated compliance
+# doc so they don't self-trigger the patterns they enumerate.
 SELF_EXCLUDES=(
   --exclude=non-goal-audit.sh
+  --exclude=non-goal-audit.test.sh
   --exclude=non-goal-compliance.md
 )
 
@@ -71,6 +74,14 @@ section "Authentication keywords (FR-041)" \
   '\boauth\b' \
   '\bjwt\b' \
   '\bsession_token\b'
+
+CPU_EMULATION_INTENT='(emulat(e|es|ed|ing)|emulator|emulation)'
+CPU_ARCH_MARKER='(cpu|processor|instruction[ -]?set|isa|x86(_64)?|i[3-6]86|amd64|arm(32|64)?|aarch64|risc-?v|mips(32|64)?)'
+
+section "CPU emulation (FR-042)" \
+  "\\b${CPU_EMULATION_INTENT}\\b.{0,80}\\b${CPU_ARCH_MARKER}\\b" \
+  "\\b${CPU_ARCH_MARKER}\\b.{0,80}\\b${CPU_EMULATION_INTENT}\\b" \
+  '\b(qemu(-system)?|bochs|dosbox|boxedwine|jslinux|cheerpx|pcjs|js-dos|v86|unicorn[-_]engine|dynarmic|box86|box64|x86emu)\b'
 
 section "WebGL / WebGPU (FR-043)" \
   '\bwebgl\b' \

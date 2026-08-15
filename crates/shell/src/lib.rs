@@ -37,25 +37,60 @@
 
 #![forbid(unsafe_code)]
 
+pub mod desktop_preferences;
 pub mod launcher;
 pub mod launcher_watcher;
 pub mod paint;
 pub mod session;
+pub mod session_restore;
+pub mod session_store;
+pub mod spawn;
 pub mod taskbar;
+pub mod wallpaper;
 
+pub use desktop_preferences::{
+    format_clock, ClockSnapshot, DesktopPreferenceRuntime, DesktopPreferenceUpdate,
+    DesktopPreferences, FilesystemPreferenceSource, PreferenceClock, PreferenceMonitor,
+    PreferenceSource, SystemPreferenceClock, ThemeChoice, TimezoneChoice, WallpaperChoice,
+    WallpaperFit, PREFERENCE_CLOCK_CHECK_EVERY_ITERATIONS, PREFERENCE_POLL_INTERVAL_MS,
+};
 pub use launcher::{
-    DesktopEntry, DesktopEntryStore, Launcher, LauncherError, MemoryStore,
+    DesktopEntry, DesktopEntryStore, FilesystemStore, Launcher, LauncherClock, LauncherError,
+    LauncherRuntime, MemoryStore, SystemLauncherClock, LAUNCHER_CLOCK_CHECK_EVERY_ITERATIONS,
 };
 pub use paint::{
-    run_desktop_shell, run_shell, run_shell_with_taskbar, LauncherSlot, ShellExit,
-    Spawner, DEFAULT_HEIGHT, DEFAULT_LAUNCHER_SLOTS, DEFAULT_WIDTH,
-    LAUNCHER_BUTTON_RIGHT_MARGIN, LAUNCHER_BUTTON_WIDTH, LAUNCHER_MENU_PADDING,
-    LAUNCHER_MENU_ROW_HEIGHT, LAUNCHER_MENU_TEXT_MARGIN, LAUNCHER_MENU_WIDTH,
+    run_desktop_shell, run_desktop_shell_live, run_desktop_shell_live_with_events,
+    run_desktop_shell_live_with_events_and_session, run_desktop_shell_with_preferences,
+    run_desktop_shell_with_runtimes, run_desktop_shell_with_runtimes_and_events,
+    run_desktop_shell_with_runtimes_events_and_session, run_shell, run_shell_with_taskbar,
+    DesktopEventSource, DesktopWake, LauncherSlot, ShellExit, Spawner, DEFAULT_HEIGHT,
+    DEFAULT_LAUNCHER_SLOTS, DEFAULT_WIDTH, LAUNCHER_BUTTON_RIGHT_MARGIN, LAUNCHER_BUTTON_WIDTH,
+    LAUNCHER_MENU_PADDING, LAUNCHER_MENU_ROW_HEIGHT, LAUNCHER_MENU_TEXT_MARGIN,
+    LAUNCHER_MENU_WIDTH,
 };
-pub use session::{
-    GlobalEntry, Session, SessionError, SessionStep, INTERESTING_INTERFACES,
+pub use session::{GlobalEntry, Session, SessionError, SessionStep, INTERESTING_INTERFACES};
+pub use session_restore::{
+    CatalogIdentity, SessionAction, SessionRuntime, SESSION_RESTORE_ID,
+    SESSION_RESTORE_SOFT_DEADLINE, SESSION_SNAPSHOT_ID,
 };
+pub use session_store::{
+    AtomicSessionWriter, SessionFile, SessionFilesystem, SessionFormatError, SessionLoadStep,
+    SessionLoader, SessionWait, SessionWriteStep, StdSessionFilesystem, StoredInstance,
+    StoredSession, StoredWindow, MAX_SESSION_BYTES, MAX_SESSION_IDENTIFIER_BYTES,
+    MAX_SESSION_INSTANCES, MAX_SESSION_WINDOWS, SESSION_FLAG_MAXIMIZED, SESSION_FLAG_MINIMIZED,
+    SESSION_IO_CHUNK_BYTES, SESSION_PATH,
+};
+pub use spawn::encode_with_spawn_timezone;
 pub use taskbar::{
-    Taskbar, TaskbarClick, TaskbarEntry, TaskbarError, TASKBAR_ENTRY_GAP, TASKBAR_ENTRY_WIDTH,
-    TASKBAR_HEIGHT, TASKBAR_LEFT_MARGIN,
+    Taskbar, TaskbarClick, TaskbarEntry, TaskbarError, TASKBAR_CLOCK_RESERVED_WIDTH,
+    TASKBAR_CLOCK_RIGHT_MARGIN, TASKBAR_ENTRY_CONTROL_GAP, TASKBAR_ENTRY_CONTROL_WIDTH,
+    TASKBAR_ENTRY_GAP, TASKBAR_ENTRY_WIDTH, TASKBAR_HEIGHT, TASKBAR_LAUNCHER_RESERVED_WIDTH,
+    TASKBAR_LEFT_MARGIN, TASKBAR_MIN_ENTRY_WIDTH, TASKBAR_OVERFLOW_WIDTH,
+};
+pub use wallpaper::{
+    paint_wallpaper, FilesystemWallpaperSource, WallpaperDecodeError, WallpaperImage,
+    WallpaperRefreshStep, WallpaperRuntime, WallpaperSource, MAX_WALLPAPER_DECODED_BYTES,
+    MAX_WALLPAPER_DIMENSION, MAX_WALLPAPER_ENCODED_BYTES, MAX_WALLPAPER_PIXELS,
+    WALLPAPER_DECODE_BYTES_PER_STEP, WALLPAPER_DECODE_ROWS_PER_STEP, WALLPAPER_DIRECTORY,
+    WALLPAPER_READ_BYTES_PER_STEP,
 };

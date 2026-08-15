@@ -17,3 +17,4 @@ abi = { path = "../abi" }
 sh = { path = "../sh" }
 toolkit = { path = "../toolkit" }
 display-proto = { path = "../display-proto" }
+preferences = { path = "../preferences" }

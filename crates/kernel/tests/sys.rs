@@ -44,18 +44,19 @@
 #![cfg(feature = "native-platform")]
 
 use abi::cap::{initial, Cap, CapSet};
+use abi::fd as well_known_fd;
 use kernel::dev::DevError;
 use kernel::fd::{FdFlags, FdObject};
-use kernel::fs::devfs::{DevFs, DEV_CONSOLE};
+use kernel::fs::devfs::{DevFs, DEV_CONSOLE, DEV_NULL};
 use kernel::fs::procfs::ProcFs;
 use kernel::fs::tmpfs::TmpFs;
 use kernel::ipc::PipeId;
-use kernel::proc::ExitStatus;
+use kernel::proc::{ExitStatus, PROCESS_LIMIT_GLOBAL, PROCESS_LIMIT_PER_PARENT};
 use kernel::sys::{
-    Kernel, KernelError, RegisterArgs, Signal, SpawnArgs, WaitOutcome, WaitTarget,
+    Kernel, KernelError, RecvParkRequest, RegisterArgs, Signal, SpawnArgs, WaitOutcome, WaitTarget,
     DISPLAY_SOCKET_PATH,
 };
-use kernel::vfs::FsError;
+use kernel::vfs::{FsError, WatchId};
 
 /// Build a Kernel with the v1 default mount layout:
 ///
@@ -99,6 +100,36 @@ fn register_process_installs_caps_and_empty_fd_table() {
     assert!(k.procs.is_alive(pid));
     assert!(k.caps.check(pid, Cap::CapGrant).unwrap());
     assert_eq!(k.fds(pid).unwrap().open_count(), 0);
+}
+
+#[test]
+fn register_process_global_limit_rejects_before_consuming_a_pid() {
+    let mut k = make_kernel();
+    for index in 0..PROCESS_LIMIT_GLOBAL {
+        k.register_process(RegisterArgs {
+            name: "bounded",
+            ppid: index as abi::ext::Pid + 10_000,
+            caps: CapSet::EMPTY,
+            cwd: "/",
+        })
+        .unwrap();
+    }
+    let next_pid = k.procs.next_pid_peek();
+    assert_eq!(
+        k.register_process(RegisterArgs {
+            name: "rejected",
+            ppid: -9,
+            caps: CapSet::EMPTY,
+            cwd: "/",
+        }),
+        Err(KernelError::ProcessLimit)
+    );
+    assert_eq!(k.procs.next_pid_peek(), next_pid);
+    assert!(k.fds(next_pid).is_err());
+    assert_eq!(
+        kernel::syscall::kerr_to_errno(KernelError::ProcessLimit),
+        abi::errno::EAGAIN
+    );
 }
 
 #[test]
@@ -666,7 +697,7 @@ fn principle_viii_headless_shell_gate() {
 
 // ---- proc_spawn / proc_wait / proc_kill (T074-T076) ---------------
 
-fn spawn_ordinary_app<'a>(k: &mut Kernel, parent: abi::ext::Pid, name: &'a str) -> abi::ext::Pid {
+fn spawn_ordinary_app(k: &mut Kernel, parent: abi::ext::Pid, name: &str) -> abi::ext::Pid {
     k.proc_spawn(
         parent,
         SpawnArgs {
@@ -717,18 +748,125 @@ fn proc_spawn_creates_child_with_stdio_and_marks_ready() {
             FdObject::CharDevice(DEV_CONSOLE)
         );
     }
-    // Signal channel auto-installed at fd 3 (POSIX signalfd
-    // analogue — every proc_spawn'd child can observe its own
-    // signal stream without an explicit install step).
-    assert_eq!(table.get(3).unwrap().object, FdObject::SignalChannel,);
+    assert!(matches!(
+        table.get(well_known_fd::ROOT_PREOPEN).unwrap().object,
+        FdObject::Vnode { .. }
+    ));
+    // Signal channel follows the WASI root preopen.
+    assert_eq!(
+        table.get(well_known_fd::SIGNAL).unwrap().object,
+        FdObject::SignalChannel,
+    );
     // Child is on the scheduler's ready queue.
     assert!(k.sched.ready_len() >= 1);
 }
 
 #[test]
+fn proc_spawn_parent_limit_is_atomic_before_child_state_allocation() {
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+
+    for _ in 0..PROCESS_LIMIT_PER_PARENT {
+        spawn_ordinary_app(&mut k, parent, "child");
+    }
+    let next_pid = k.procs.next_pid_peek();
+    let ready_before = k.sched.ready_len();
+    let result = k.proc_spawn(
+        parent,
+        SpawnArgs {
+            name: "rejected",
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+            argv: Vec::new(),
+            envp: alloc::collections::BTreeMap::new(),
+            stdin: FdObject::CharDevice(DEV_CONSOLE),
+            stdout: FdObject::CharDevice(DEV_CONSOLE),
+            stderr: FdObject::CharDevice(DEV_CONSOLE),
+        },
+    );
+
+    assert_eq!(result, Err(KernelError::ProcessLimit));
+    assert_eq!(k.procs.next_pid_peek(), next_pid);
+    assert_eq!(k.procs.child_count(parent), PROCESS_LIMIT_PER_PARENT);
+    assert_eq!(k.sched.ready_len(), ready_before);
+    assert!(k.fds(next_pid).is_err());
+    assert_eq!(k.pending_signals(next_pid), Err(KernelError::NoSuchPid));
+}
+
+#[test]
+fn reserved_binary_namespaces_ignore_writable_vfs_shadows() {
+    let mut k = make_kernel();
+    k.vfs.mkdir("/bin", 0o755).unwrap();
+    k.vfs.mkdir("/usr", 0o755).unwrap();
+    k.vfs.mkdir("/usr/bin", 0o755).unwrap();
+    k.vfs.mkdir("/opt", 0o755).unwrap();
+
+    for path in ["/bin/shell", "/usr/bin/display-server", "/opt/tool"] {
+        let ino = k.vfs.create(path, 0o755).unwrap();
+        let (mount_id, _, _) = k.vfs.open(path).unwrap();
+        k.vfs.write_ino(mount_id, ino, 0, b"dynamic-wasm").unwrap();
+    }
+
+    assert_eq!(k.load_vfs_executable("/bin/shell").unwrap(), None);
+    assert_eq!(
+        k.load_vfs_executable("/usr/bin/display-server").unwrap(),
+        None
+    );
+    assert_eq!(
+        k.load_vfs_executable("/opt/../bin/shell").unwrap(),
+        None,
+        "normalisation cannot bypass the reserved namespace"
+    );
+    assert_eq!(
+        k.load_vfs_executable("/opt/tool").unwrap(),
+        Some(b"dynamic-wasm".to_vec())
+    );
+}
+
+#[test]
+fn dynamic_executables_are_confined_to_opt_across_normalisation_and_symlinks() {
+    let mut k = make_kernel();
+    for dir in ["/opt", "/home", "/tmp"] {
+        k.vfs.mkdir(dir, 0o755).unwrap();
+    }
+    for path in ["/home/outside.wasm", "/tmp/outside.wasm"] {
+        k.vfs.create(path, 0o755).unwrap();
+        k.vfs.write(path, 0, b"outside").unwrap();
+    }
+    k.vfs.create("/opt/inside.wasm", 0o755).unwrap();
+    k.vfs.write("/opt/inside.wasm", 0, b"inside").unwrap();
+    k.vfs.symlink("/home/outside.wasm", "/opt/escape").unwrap();
+    k.vfs.symlink("inside.wasm", "/opt/inside-link").unwrap();
+
+    assert_eq!(
+        k.load_vfs_executable("/tmp/outside.wasm"),
+        Err(KernelError::Fs(FsError::PermissionDenied))
+    );
+    assert_eq!(
+        k.load_vfs_executable("/opt/escape"),
+        Err(KernelError::Fs(FsError::PermissionDenied))
+    );
+    assert_eq!(
+        k.load_vfs_executable("/opt/missing"),
+        Err(KernelError::Fs(FsError::NotFound))
+    );
+    assert_eq!(
+        k.load_vfs_executable("/opt/inside-link").unwrap(),
+        Some(b"inside".to_vec())
+    );
+}
+
+#[test]
 fn proc_spawn_signal_channel_fd_reads_signals_posted_by_parent() {
     // End-to-end: parent spawns a child, posts SIGTERM to the
-    // child, and the child's own fd 3 (SignalChannel) reads the
+    // child, and the child's own signal channel reads the
     // 2-byte u16 LE signum. Proves the auto-install path gives
     // the child a live, read-drainable signal channel.
     let mut k = make_kernel();
@@ -753,9 +891,9 @@ fn proc_spawn_signal_channel_fd_reads_signals_posted_by_parent() {
     k.proc_kill(init, child, Signal::Term).unwrap();
     assert_eq!(k.pending_signals(child).unwrap(), 1);
 
-    // Child fd_read on fd 3 drains the signal as a u16 LE.
+    // Child fd_read on the well-known signal fd drains a u16 LE record.
     let mut buf = [0u8; 4];
-    let n = k.fd_read(child, 3, &mut buf).unwrap();
+    let n = k.fd_read(child, well_known_fd::SIGNAL, &mut buf).unwrap();
     assert_eq!(n, 2);
     assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), Signal::Term.number(),);
     assert_eq!(k.pending_signals(child).unwrap(), 0);
@@ -764,7 +902,7 @@ fn proc_spawn_signal_channel_fd_reads_signals_posted_by_parent() {
 #[test]
 fn proc_spawn_signal_channel_read_on_empty_inbox_returns_would_block() {
     // A freshly spawned child with no signals pending surfaces
-    // WouldBlock on fd 3 reads — the kernel-level return that
+    // WouldBlock on signal-channel reads — the kernel-level return that
     // the syscall layer maps to -EAGAIN.
     let mut k = make_kernel();
     let init = k
@@ -782,7 +920,9 @@ fn proc_spawn_signal_channel_read_on_empty_inbox_returns_would_block() {
     let child = spawn_ordinary_app(&mut k, init, "app");
 
     let mut buf = [0u8; 8];
-    let err = k.fd_read(child, 3, &mut buf).unwrap_err();
+    let err = k
+        .fd_read(child, well_known_fd::SIGNAL, &mut buf)
+        .unwrap_err();
     assert_eq!(err, kernel::sys::KernelError::WouldBlock);
 }
 
@@ -819,6 +959,93 @@ fn proc_spawn_rejects_child_caps_not_a_subset_of_parent() {
 }
 
 #[test]
+fn proc_spawn_rejects_non_refcounted_watch_mappings() {
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "watch-parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    let watch_fd = k.fs_watch(parent, "/", abi::ext::WATCH_CREATE).unwrap();
+    let watch = k.fds(parent).unwrap().get(watch_fd).unwrap().object;
+    assert!(matches!(watch, FdObject::Watch { .. }));
+
+    let next_pid = k.procs.next_pid_peek();
+    let result = k.proc_spawn(
+        parent,
+        SpawnArgs {
+            name: "watch-stdio-rejected",
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+            argv: alloc::vec::Vec::new(),
+            envp: alloc::collections::BTreeMap::new(),
+            stdin: watch,
+            stdout: FdObject::CharDevice(DEV_CONSOLE),
+            stderr: FdObject::CharDevice(DEV_CONSOLE),
+        },
+    );
+    assert_eq!(result, Err(KernelError::NotSupportedOnFd));
+    assert_eq!(k.procs.next_pid_peek(), next_pid);
+
+    let child = spawn_ordinary_app(&mut k, parent, "watch-extra-target");
+    assert_eq!(
+        k.install_spawn_extra_fd(child, well_known_fd::FIRST_DYNAMIC, watch),
+        Err(KernelError::NotSupportedOnFd)
+    );
+    assert!(k
+        .fds(child)
+        .unwrap()
+        .get(well_known_fd::FIRST_DYNAMIC)
+        .is_none());
+    assert!(k.fds(parent).unwrap().get(watch_fd).is_some());
+}
+
+#[test]
+fn proc_spawn_rejects_socket_stdio_before_consuming_child_or_endpoint() {
+    let mut k = make_kernel();
+    let parent = k
+        .register_process(RegisterArgs {
+            name: "socket-parent",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    let socket_fd = k
+        .ipc_socket(parent, kernel::ipc::SocketType::Stream)
+        .unwrap();
+    let socket = k.fds(parent).unwrap().get(socket_fd).unwrap().object;
+    let next_pid = k.procs.next_pid_peek();
+    let socket_count = k.ipc.socket_count();
+
+    let result = k.proc_spawn(
+        parent,
+        SpawnArgs {
+            name: "socket-stdio-rejected",
+            caps: initial::ORDINARY_APP,
+            cwd: "/",
+            argv: alloc::vec::Vec::new(),
+            envp: alloc::collections::BTreeMap::new(),
+            stdin: FdObject::CharDevice(DEV_CONSOLE),
+            stdout: socket,
+            stderr: FdObject::CharDevice(DEV_CONSOLE),
+        },
+    );
+
+    assert_eq!(result, Err(KernelError::UnsupportedAncillary));
+    assert_eq!(k.procs.next_pid_peek(), next_pid);
+    assert_eq!(k.procs.child_count(parent), 0);
+    assert_eq!(k.ipc.socket_count(), socket_count);
+    assert_eq!(
+        k.fds(parent).unwrap().get(socket_fd).unwrap().object,
+        socket
+    );
+}
+
+#[test]
 fn proc_spawn_bumps_pipe_refcount_so_parent_and_child_share_writer() {
     let mut k = make_kernel();
     let init = k
@@ -833,7 +1060,7 @@ fn proc_spawn_bumps_pipe_refcount_so_parent_and_child_share_writer() {
 
     // init creates a pipe and holds both ends on fd 10 (read)
     // and fd 11 (write).
-    let pid = k.ipc.create_pipe();
+    let pid = k.ipc.create_pipe().unwrap();
     k.install_fd(init, 10, FdObject::PipeRead(pid.0), FdFlags::EMPTY)
         .unwrap();
     k.install_fd(init, 11, FdObject::PipeWrite(pid.0), FdFlags::EMPTY)
@@ -962,6 +1189,7 @@ fn proc_wait_specific_finds_only_the_named_child() {
 
 #[test]
 fn proc_kill_sigkill_from_parent_zombifies_the_child() {
+    kernel::platform::native::reset();
     let mut k = make_kernel();
     let init = k
         .register_process(RegisterArgs {
@@ -975,12 +1203,50 @@ fn proc_kill_sigkill_from_parent_zombifies_the_child() {
     let child = spawn_ordinary_app(&mut k, init, "victim");
 
     k.proc_kill(init, child, Signal::Kill).unwrap();
+    assert_eq!(
+        kernel::platform::native::with_state(|state| state.terminate_calls.clone()),
+        vec![child],
+    );
+    assert_eq!(
+        k.proc_kill(init, child, Signal::Kill),
+        Err(KernelError::NoSuchPid),
+    );
+    assert_eq!(
+        kernel::platform::native::with_state(|state| state.terminate_calls.clone()),
+        vec![child],
+    );
     // Child is a zombie with Signaled(9).
     let status = k.procs.get(child).unwrap().exit_status.unwrap();
     assert_eq!(status, ExitStatus::Signaled(9));
     // Parent can now reap it.
     let outcome = k.proc_wait(init, WaitTarget::Specific(child)).unwrap();
     assert_eq!(outcome, WaitOutcome::Reaped(child, ExitStatus::Signaled(9)));
+}
+
+#[test]
+fn duplicate_exit_cannot_overwrite_status_or_repeat_lifecycle_side_effects() {
+    let mut k = make_kernel();
+    let init = k
+        .register_process(RegisterArgs {
+            name: "init",
+            ppid: 0,
+            caps: initial::INIT,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(init).unwrap();
+    let child = spawn_ordinary_app(&mut k, init, "child");
+
+    k.proc_exit(child, ExitStatus::Exited(7)).unwrap();
+    assert_eq!(
+        k.proc_exit(child, ExitStatus::Crashed),
+        Err(KernelError::NoSuchPid),
+    );
+    assert_eq!(
+        k.procs.get(child).and_then(|process| process.exit_status),
+        Some(ExitStatus::Exited(7)),
+    );
+    assert_eq!(k.drain_signals(init).unwrap(), vec![Signal::Child]);
 }
 
 #[test]
@@ -1200,7 +1466,7 @@ fn proc_spawn_with_shared_pipe_then_child_exit_cleans_up_pipe() {
     k.mark_ready(init).unwrap();
 
     // Parent-side pipe setup: init holds both ends.
-    let pid = k.ipc.create_pipe();
+    let pid = k.ipc.create_pipe().unwrap();
     k.install_fd(init, 10, FdObject::PipeRead(pid.0), FdFlags::EMPTY)
         .unwrap();
     k.install_fd(init, 11, FdObject::PipeWrite(pid.0), FdFlags::EMPTY)
@@ -1356,6 +1622,7 @@ fn double_display_bind_returns_address_in_use() {
     // bind a second time — the path is already taken.
     let err = k.display_bind(ds).unwrap_err();
     assert_eq!(err, KernelError::AddressInUse);
+    assert_eq!(k.ipc.socket_count(), 1);
 }
 
 #[test]
@@ -1381,6 +1648,7 @@ fn display_connect_with_no_listener_is_connection_refused() {
     let app = register_display_client(&mut k, "app");
     let err = k.display_connect(app).unwrap_err();
     assert_eq!(err, KernelError::ConnectionRefused);
+    assert_eq!(k.ipc.socket_count(), 0);
 }
 
 #[test]
@@ -1408,6 +1676,54 @@ fn accept_socket_pops_one_pending_client_and_returns_a_fresh_fd() {
     assert_ne!(server_side, listener_fd);
     let entry = k.fds(ds).unwrap().get(server_side).unwrap();
     assert!(matches!(entry.object, FdObject::Socket(_)));
+}
+
+#[test]
+fn accepted_socket_exposes_kernel_captured_peer_credentials() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    let listener_fd = k.display_bind(ds).unwrap();
+    let shell_caps = CapSet::from_caps(&[Cap::DisplayClient, Cap::Shell, Cap::ProcEnumerate]);
+    let shell = k
+        .register_process(RegisterArgs {
+            name: "shell",
+            ppid: 0,
+            caps: shell_caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(shell).unwrap();
+
+    let shell_fd = k.display_connect(shell).unwrap();
+    let server_fd = k.accept_socket(ds, listener_fd).unwrap();
+
+    assert_eq!(k.ipc_peer_caps(ds, server_fd).unwrap(), shell_caps);
+    assert_eq!(k.ipc_peer_pid(ds, server_fd).unwrap(), shell);
+    assert_eq!(
+        k.ipc_peer_caps(shell, shell_fd).unwrap(),
+        CapSet::from_caps(&[Cap::DisplayServer, Cap::DisplayClient, Cap::DevBlock]),
+    );
+    assert_eq!(k.ipc_peer_pid(shell, shell_fd).unwrap(), ds);
+
+    // Credential state is a connection-time snapshot. A later cap
+    // grant changes the process table but cannot retroactively widen
+    // the authority of an already-accepted service connection.
+    k.caps.install(shell, CapSet::ALL);
+    assert_eq!(k.ipc_peer_caps(ds, server_fd).unwrap(), shell_caps);
+    assert_eq!(k.ipc_peer_pid(ds, server_fd).unwrap(), shell);
+}
+
+#[test]
+fn peer_credential_queries_are_fd_scoped_and_reject_non_sockets() {
+    let mut k = make_kernel();
+    let ds = register_display_server(&mut k);
+    k.install_fd(ds, 5, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+
+    assert_eq!(k.ipc_peer_caps(ds, 999), Err(KernelError::BadFd));
+    assert_eq!(k.ipc_peer_caps(ds, 5), Err(KernelError::NotSupportedOnFd),);
+    assert_eq!(k.ipc_peer_pid(ds, 999), Err(KernelError::BadFd));
+    assert_eq!(k.ipc_peer_pid(ds, 5), Err(KernelError::NotSupportedOnFd));
 }
 
 #[test]
@@ -1473,6 +1789,148 @@ fn fd_write_on_server_and_fd_read_on_client_round_trips_bytes() {
     let m = k.fd_read(app, client_fd, &mut buf).unwrap();
     assert_eq!(m, event.len());
     assert_eq!(&buf[..m], event);
+}
+
+#[test]
+fn ancillary_snapshot_survives_sender_close_and_fd_number_reuse() {
+    let mut k = make_kernel();
+    let server = register_display_server(&mut k);
+    let listener_fd = k.display_bind(server).unwrap();
+    let client = register_display_client(&mut k, "client");
+    let client_fd = k.display_connect(client).unwrap();
+    let server_fd = k.accept_socket(server, listener_fd).unwrap();
+
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_CONSOLE), FdFlags::EMPTY)
+        .unwrap();
+    assert_eq!(k.ipc_send(client, client_fd, b"snapshot", Some(9)), Ok(8));
+    k.fd_close(client, 9).unwrap();
+    k.install_fd(client, 9, FdObject::CharDevice(DEV_NULL), FdFlags::EMPTY)
+        .unwrap();
+
+    let (bytes, received_fd) = k.ipc_recv(server, server_fd, 16, true).unwrap();
+    assert_eq!(bytes, b"snapshot");
+    let received_fd = received_fd.expect("snapshot installed");
+    assert_eq!(
+        k.fds(server).unwrap().get(received_fd).unwrap().object,
+        FdObject::CharDevice(DEV_CONSOLE)
+    );
+}
+
+#[test]
+fn ancillary_pipe_reference_transfers_to_receiver_and_releases_on_close() {
+    let mut k = make_kernel();
+    let server = register_display_server(&mut k);
+    let listener_fd = k.display_bind(server).unwrap();
+    let client = register_display_client(&mut k, "client");
+    let client_fd = k.display_connect(client).unwrap();
+    let server_fd = k.accept_socket(server, listener_fd).unwrap();
+    let (read_fd, write_fd) = k.create_pipe_fds(client).unwrap();
+    let pipe_id = match k.fds(client).unwrap().get(write_fd).unwrap().object {
+        FdObject::PipeWrite(id) => PipeId(id),
+        other => panic!("unexpected pipe fd: {other:?}"),
+    };
+
+    assert_eq!(k.ipc_send(client, client_fd, b"", Some(write_fd)), Ok(0));
+    assert_eq!(k.ipc.pipe_mut(pipe_id).unwrap().writer_count(), 2);
+    k.fd_close(client, write_fd).unwrap();
+    assert_eq!(k.ipc.pipe_mut(pipe_id).unwrap().writer_count(), 1);
+
+    let (_, received_fd) = k.ipc_recv(server, server_fd, 0, true).unwrap();
+    let received_fd = received_fd.expect("pipe endpoint installed");
+    assert_eq!(k.ipc.pipe_mut(pipe_id).unwrap().writer_count(), 1);
+    k.fd_close(server, received_fd).unwrap();
+    assert_eq!(k.ipc.pipe_mut(pipe_id).unwrap().writer_count(), 0);
+
+    let mut byte = [0u8; 1];
+    assert_eq!(k.fd_read(client, read_fd, &mut byte), Ok(0));
+    k.fd_close(client, read_fd).unwrap();
+    assert_eq!(k.ipc.pipe_count(), 0);
+}
+
+#[test]
+fn closing_socket_releases_unreceived_ancillary_pipe_reference() {
+    let mut k = make_kernel();
+    let server = register_display_server(&mut k);
+    let listener_fd = k.display_bind(server).unwrap();
+    let client = register_display_client(&mut k, "client");
+    let client_fd = k.display_connect(client).unwrap();
+    let server_fd = k.accept_socket(server, listener_fd).unwrap();
+    let (read_fd, write_fd) = k.create_pipe_fds(client).unwrap();
+    let pipe_id = match k.fds(client).unwrap().get(write_fd).unwrap().object {
+        FdObject::PipeWrite(id) => PipeId(id),
+        other => panic!("unexpected pipe fd: {other:?}"),
+    };
+
+    k.ipc_send(client, client_fd, b"queued", Some(write_fd))
+        .unwrap();
+    k.fd_close(client, write_fd).unwrap();
+    assert_eq!(k.ipc.pipe_mut(pipe_id).unwrap().writer_count(), 1);
+    k.fd_close(server, server_fd).unwrap();
+    assert_eq!(k.ipc.pipe_mut(pipe_id).unwrap().writer_count(), 0);
+    assert_eq!(k.ipc.queued_ancillary_count(), 0);
+    k.fd_close(client, read_fd).unwrap();
+}
+
+#[test]
+fn read_shutdown_releases_unreceived_ancillary_pipe_reference() {
+    let mut k = make_kernel();
+    let server = register_display_server(&mut k);
+    let listener_fd = k.display_bind(server).unwrap();
+    let client = register_display_client(&mut k, "client");
+    let client_fd = k.display_connect(client).unwrap();
+    let server_fd = k.accept_socket(server, listener_fd).unwrap();
+    let (read_fd, write_fd) = k.create_pipe_fds(client).unwrap();
+    let pipe_id = match k.fds(client).unwrap().get(write_fd).unwrap().object {
+        FdObject::PipeWrite(id) => PipeId(id),
+        other => panic!("unexpected pipe fd: {other:?}"),
+    };
+
+    k.ipc_send(client, client_fd, b"queued", Some(write_fd))
+        .unwrap();
+    k.fd_close(client, write_fd).unwrap();
+    k.shutdown_socket_fd(server, server_fd, true, false)
+        .unwrap();
+    assert_eq!(k.ipc.pipe_mut(pipe_id).unwrap().writer_count(), 0);
+    assert_eq!(k.ipc.buffered_byte_count(), 0);
+    assert_eq!(k.ipc.queued_ancillary_count(), 0);
+    k.fd_close(client, read_fd).unwrap();
+}
+
+#[test]
+fn unsupported_ancillary_kinds_fail_without_enqueuing_payload() {
+    let mut k = make_kernel();
+    let server = register_display_server(&mut k);
+    let listener_fd = k.display_bind(server).unwrap();
+    let client = register_display_client(&mut k, "client");
+    let client_fd = k.display_connect(client).unwrap();
+    let server_fd = k.accept_socket(server, listener_fd).unwrap();
+
+    assert_eq!(
+        k.ipc_send(client, client_fd, b"socket", Some(client_fd)),
+        Err(KernelError::UnsupportedAncillary)
+    );
+    let unsupported = [
+        FdObject::DisplayConn(77),
+        FdObject::SignalChannel,
+        FdObject::Watch {
+            watch_id: WatchId(77),
+        },
+        FdObject::HostFile { token: 77 },
+        FdObject::HostDownload { id: 77 },
+    ];
+    for (index, object) in unsupported.into_iter().enumerate() {
+        k.install_fd(client, 9, object, FdFlags::EMPTY).unwrap();
+        assert_eq!(
+            k.ipc_send(client, client_fd, b"rejected", Some(9)),
+            Err(KernelError::UnsupportedAncillary),
+            "unsupported object index {index}"
+        );
+    }
+
+    let socket_id = k.socket_id_from_fd_public(server, server_fd).unwrap();
+    let socket = k.ipc.sockets_get(socket_id).unwrap();
+    assert_eq!(socket.rx_len(), 0);
+    assert_eq!(socket.rx_fd_count(), 0);
 }
 
 #[test]
@@ -1794,7 +2252,7 @@ fn signum_zero_probe_does_not_wake_parked_accept() {
 }
 
 #[test]
-fn sigkill_on_parked_accept_exits_without_eintr_wake() {
+fn sigkill_on_parked_accept_releases_listener_without_eintr_wake() {
     // SIGKILL is non-catchable. `Kernel::proc_kill`'s `Signal::Kill`
     // match arm calls `self.procs.exit` synchronously with
     // `ExitStatus::Signaled(9)`, bypassing `Kernel::proc_exit`
@@ -1851,11 +2309,13 @@ fn sigkill_on_parked_accept_exits_without_eintr_wake() {
         Some(kernel::proc::ExitStatus::Signaled(9))
     ));
 
-    // Listener's parked_acceptor is cleared by the surgical
-    // `clear_parked_acceptor_for_pid` call this slice added
-    // inside the `Signal::Kill` arm of `Kernel::proc_kill`.
-    let listener = k.ipc.sockets_get(listener_socket_id).unwrap();
-    assert_eq!(listener.parked_acceptor, None);
+    // SIGKILL uses the same resource-release barrier as proc_exit:
+    // the owned listener is closed and its binding is gone
+    // immediately, without waiting for the parent to reap the
+    // zombie. The listener has no peer that needs a tombstone, so its socket
+    // object is reclaimed immediately rather than retained until reap.
+    assert!(k.ipc.sockets_get(listener_socket_id).is_none());
+    assert!(k.ipc.lookup_binding(DISPLAY_SOCKET_PATH).is_none());
 
     // No EINTR wake queued — the pid is dead, not interrupted.
     // The SIGKILL arm of `Kernel::proc_kill` does not route
@@ -2471,7 +2931,7 @@ fn proc_exit_drops_pipe_writer_refcount_before_reap() {
         .unwrap();
     k.mark_ready(init).unwrap();
 
-    let pid = k.ipc.create_pipe();
+    let pid = k.ipc.create_pipe().unwrap();
     k.install_fd(init, 10, FdObject::PipeRead(pid.0), FdFlags::EMPTY)
         .unwrap();
     k.install_fd(init, 11, FdObject::PipeWrite(pid.0), FdFlags::EMPTY)
@@ -2568,8 +3028,8 @@ fn proc_exit_of_pending_client_leaves_listener_intact() {
 // POSIX: when a child process transitions to Zombie (either via a
 // voluntary proc_exit or via SIGKILL), the kernel delivers SIGCHLD
 // to the parent. In PMos v1, SIGCHLD lands in the parent's
-// SignalInbox; combined with the auto-installed fd 3 SignalChannel,
-// a parent can observe every child exit by polling fd 3.
+// SignalInbox; combined with the auto-installed signal channel, a parent can
+// observe every child exit by polling the well-known signal fd.
 
 #[test]
 fn proc_exit_posts_sigchld_to_parent_inbox() {
@@ -2671,7 +3131,7 @@ fn orphan_process_exit_does_not_panic() {
 fn parent_fd_read_fd3_observes_sigchld_after_child_exit() {
     // End-to-end: parent has its own SignalChannel auto-installed
     // (via a prior proc_spawn from init), child exits, parent's
-    // fd 3 read returns 2 bytes = u16 LE SIGCHLD number.
+    // A signal-fd read returns 2 bytes = u16 LE SIGCHLD number.
     let mut k = make_kernel();
     let init = k
         .register_process(RegisterArgs {
@@ -2686,7 +3146,7 @@ fn parent_fd_read_fd3_observes_sigchld_after_child_exit() {
         .transition(init, kernel::proc::ProcState::Running)
         .unwrap();
     // Parent is a proc_spawn'd child of init — so it has an
-    // auto-installed SignalChannel at fd 3.
+    // auto-installed SignalChannel.
     let parent = spawn_ordinary_app(&mut k, init, "supervisor");
     k.procs
         .transition(parent, kernel::proc::ProcState::Running)
@@ -2696,9 +3156,9 @@ fn parent_fd_read_fd3_observes_sigchld_after_child_exit() {
 
     k.proc_exit(child, ExitStatus::Exited(0)).unwrap();
 
-    // Parent's fd 3 drains the SIGCHLD.
+    // Parent's signal channel drains the SIGCHLD.
     let mut buf = [0u8; 4];
-    let n = k.fd_read(parent, 3, &mut buf).unwrap();
+    let n = k.fd_read(parent, well_known_fd::SIGNAL, &mut buf).unwrap();
     assert_eq!(n, 2);
     assert_eq!(u16::from_le_bytes([buf[0], buf[1]]), Signal::Child.number(),);
 }
@@ -2747,7 +3207,7 @@ fn sigchld_reposts_after_drain_when_another_child_exits() {
     // After the parent drains its SIGCHLD, a subsequent child
     // exit re-posts a fresh SIGCHLD — the coalescing is
     // per-still-pending-entry, not per-kernel-lifetime. This
-    // matches POSIX: a supervisor can reliably sleep on fd 3
+    // matches POSIX: a supervisor can reliably sleep on the signal fd
     // between batches of child exits without losing edges.
     let mut k = make_kernel();
     let init = k
@@ -3212,4 +3672,410 @@ fn path_open_nofollow_traverses_intermediate_symlink() {
         FdObject::Vnode { ino, .. } => assert_eq!(ino, real_file_ino),
         other => panic!("expected Vnode fd, got {:?}", other),
     }
+}
+
+fn running_host_transfer_proc(k: &mut Kernel, caps: CapSet) -> abi::ext::Pid {
+    let pid = k
+        .register_process(RegisterArgs {
+            name: "host-transfer-test",
+            ppid: 0,
+            caps,
+            cwd: "/",
+        })
+        .unwrap();
+    k.mark_ready(pid).unwrap();
+    k.procs
+        .transition(pid, kernel::proc::ProcState::Running)
+        .unwrap();
+    pid
+}
+
+#[test]
+fn host_transfer_endpoint_and_syscalls_fail_closed_without_capability() {
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::ORDINARY_APP);
+    let socket = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    assert_eq!(
+        k.ipc_connect(pid, socket, abi::ext::host_file::ENDPOINT),
+        Err(KernelError::NotCapable)
+    );
+    assert_eq!(k.host_file_pick(pid), Err(KernelError::NotCapable));
+    assert_eq!(
+        k.host_file_send(pid, "notes.txt", "text/plain"),
+        Err(KernelError::NotCapable)
+    );
+    k.host_file_dropped(
+        77,
+        kernel::host_file::HostFile::new("notes.txt", "text/plain", b"x".to_vec()),
+    )
+    .unwrap();
+    assert_eq!(k.host_file_recv(pid, 77), Err(KernelError::NotCapable));
+    assert_eq!(k.host_file_pending_tokens(), vec![77]);
+}
+
+#[test]
+fn host_transfer_endpoint_delivers_metadata_then_token_streams_bytes() {
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    let socket = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    k.ipc_connect(pid, socket, abi::ext::host_file::ENDPOINT)
+        .unwrap();
+
+    k.host_file_dropped(
+        91,
+        kernel::host_file::HostFile::new("hello.txt", "text/plain", b"hello".to_vec()),
+    )
+    .unwrap();
+    let mut notification = [0u8; 128];
+    let n = k.fd_read(pid, socket, &mut notification).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(notification[0..4].try_into().unwrap()) as usize,
+        n
+    );
+    assert_eq!(
+        u32::from_le_bytes(notification[4..8].try_into().unwrap()),
+        abi::ext::host_file::NOTIFICATION_MAGIC
+    );
+    assert_eq!(
+        u32::from_le_bytes(notification[12..16].try_into().unwrap()),
+        91
+    );
+    assert_eq!(
+        u64::from_le_bytes(notification[16..24].try_into().unwrap()),
+        5
+    );
+    assert!(notification[..n].ends_with(b"hello.txttext/plain"));
+
+    let file_fd = k.host_file_recv(pid, 91).unwrap();
+    let mut body = [0u8; 8];
+    assert_eq!(k.fd_read(pid, file_fd, &mut body).unwrap(), 5);
+    assert_eq!(&body[..5], b"hello");
+    assert_eq!(k.fd_read(pid, file_fd, &mut body).unwrap(), 0);
+}
+
+#[test]
+fn repeated_host_transfer_connect_close_reclaims_internal_server_sockets() {
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+
+    for _ in 0..32 {
+        let client = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+        k.ipc_connect(pid, client, abi::ext::host_file::ENDPOINT)
+            .unwrap();
+        k.fd_close(pid, client).unwrap();
+        assert_eq!(
+            k.ipc.socket_count(),
+            1,
+            "only the kernel-owned host-file listener persists"
+        );
+    }
+}
+
+#[test]
+fn host_transfer_connect_quota_failure_is_atomic_and_retryable() {
+    let mut k = make_kernel();
+    k.ipc = kernel::ipc::IpcTable::with_limits(kernel::ipc::IpcLimits {
+        live_pipes: 1,
+        live_sockets: 3,
+        buffered_bytes: 1024,
+        queued_ancillary_refs: 1,
+    });
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    let client = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    let filler = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    let client_id = match k.fds(pid).unwrap().get(client).unwrap().object {
+        FdObject::Socket(id) => kernel::ipc::SocketId(id),
+        other => panic!("expected socket fd, got {other:?}"),
+    };
+
+    assert_eq!(
+        k.ipc_connect(pid, client, abi::ext::host_file::ENDPOINT),
+        Err(KernelError::ResourceLimit)
+    );
+    let listener_id = k
+        .ipc
+        .lookup_binding(abi::ext::host_file::ENDPOINT)
+        .expect("failed connect still creates the hidden listener");
+    assert_eq!(k.ipc.socket_count(), 3);
+    assert_eq!(
+        k.ipc.sockets_get(client_id).unwrap().state,
+        kernel::ipc::SocketState::Unbound
+    );
+    assert!(k.ipc.sockets_get(listener_id).unwrap().backlog.is_empty());
+
+    k.fd_close(pid, filler).unwrap();
+    k.ipc_connect(pid, client, abi::ext::host_file::ENDPOINT)
+        .unwrap();
+    assert_eq!(k.ipc.socket_count(), 3);
+    assert_eq!(
+        k.ipc.sockets_get(client_id).unwrap().state,
+        kernel::ipc::SocketState::Connected
+    );
+    assert!(k.ipc.sockets_get(listener_id).unwrap().backlog.is_empty());
+}
+
+#[test]
+fn repeated_filled_pipe_close_reclaims_kernel_objects() {
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::ORDINARY_APP);
+    let bytes = vec![0x44; kernel::ipc::PIPE_BUF_CAP];
+
+    for _ in 0..32 {
+        let (reader, writer) = k.create_pipe_fds(pid).unwrap();
+        assert_eq!(k.fd_write(pid, writer, &bytes).unwrap(), bytes.len());
+        k.fd_close(pid, writer).unwrap();
+        k.fd_close(pid, reader).unwrap();
+        assert_eq!(k.ipc.pipe_count(), 0);
+    }
+}
+
+#[test]
+fn host_transfer_drop_wakes_a_parked_notification_reader() {
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    let socket = k.ipc_socket(pid, kernel::ipc::SocketType::Stream).unwrap();
+    k.ipc_connect(pid, socket, abi::ext::host_file::ENDPOINT)
+        .unwrap();
+
+    let request_id = 0x484f_5354;
+    k.park_on_recv(
+        pid,
+        socket,
+        RecvParkRequest {
+            request_id,
+            max_len: 128,
+            recv_fd_slot: -1,
+            heap_ptr: 32,
+            heap_len: 128,
+        },
+    )
+    .unwrap();
+    assert!(k.parked_recvers_contains(pid));
+    assert_eq!(
+        k.procs.get(pid).unwrap().state,
+        kernel::proc::ProcState::BlockedOnIpc
+    );
+
+    k.host_file_dropped(
+        92,
+        kernel::host_file::HostFile::new("parked.txt", "text/plain", b"wake".to_vec()),
+    )
+    .unwrap();
+
+    assert!(!k.parked_recvers_contains(pid));
+    assert_eq!(
+        k.procs.get(pid).unwrap().state,
+        kernel::proc::ProcState::Ready
+    );
+    let wakes = k.pending_wakes_snapshot();
+    assert_eq!(wakes.len(), 1);
+    let (wake_pid, response, heap) = &wakes[0];
+    assert_eq!(*wake_pid, pid);
+    assert_eq!(response.request_id, request_id);
+    assert_eq!(response.status, 0);
+    let heap = heap.as_ref().expect("notification wake carries bytes");
+    assert_eq!(heap.heap_ptr, 32);
+    assert_eq!(heap.bytes.len(), response.value as usize);
+    assert_eq!(
+        u32::from_le_bytes(heap.bytes[4..8].try_into().unwrap()),
+        abi::ext::host_file::NOTIFICATION_MAGIC
+    );
+    assert_eq!(
+        u32::from_le_bytes(heap.bytes[12..16].try_into().unwrap()),
+        92
+    );
+}
+
+#[test]
+fn completed_host_import_bytes_stay_bounded_until_fd_close() {
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    let per_file = abi::ext::host_file::MAX_IMPORT_BYTES;
+
+    k.host_file_dropped(
+        201,
+        kernel::host_file::HostFile::new("one.bin", "application/octet-stream", vec![1; per_file]),
+    )
+    .unwrap();
+    k.host_file_dropped(
+        202,
+        kernel::host_file::HostFile::new("two.bin", "application/octet-stream", vec![2; per_file]),
+    )
+    .unwrap();
+    assert_eq!(
+        k.host_file_live_bytes(),
+        abi::ext::host_file::MAX_IMPORT_BYTES_TOTAL
+    );
+    assert_eq!(
+        k.host_file_drop_begin(203, "three.bin", "application/octet-stream", 1),
+        Err(KernelError::FileTooLarge)
+    );
+
+    let fd = k.host_file_recv(pid, 201).unwrap();
+    assert_eq!(
+        k.host_file_live_bytes(),
+        abi::ext::host_file::MAX_IMPORT_BYTES_TOTAL,
+        "moving pending bytes behind an fd does not release the budget"
+    );
+    k.fd_close(pid, fd).unwrap();
+    assert_eq!(k.host_file_live_bytes(), per_file);
+    k.host_file_drop_begin(203, "three.bin", "application/octet-stream", 1)
+        .unwrap();
+}
+
+#[test]
+fn zero_byte_host_import_count_is_bounded_and_reusable_after_close() {
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    for token in 1..=abi::ext::host_file::MAX_LIVE_IMPORTS as u32 {
+        k.host_file_dropped(
+            token,
+            kernel::host_file::HostFile::new("empty.bin", "application/octet-stream", Vec::new()),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        k.host_file_live_count(),
+        abi::ext::host_file::MAX_LIVE_IMPORTS
+    );
+    assert_eq!(
+        k.host_file_drop_begin(999, "more.bin", "application/octet-stream", 0),
+        Err(KernelError::FileTooLarge)
+    );
+
+    let fd = k.host_file_recv(pid, 1).unwrap();
+    k.fd_close(pid, fd).unwrap();
+    assert_eq!(
+        k.host_file_live_count(),
+        abi::ext::host_file::MAX_LIVE_IMPORTS - 1
+    );
+    k.host_file_drop_begin(999, "more.bin", "application/octet-stream", 0)
+        .unwrap();
+}
+
+#[test]
+fn host_import_chunks_complete_atomically_beyond_one_scratch_window() {
+    let mut k = make_kernel();
+    let body = (0..(96 * 1024 + 17))
+        .map(|index| (index * 31) as u8)
+        .collect::<Vec<_>>();
+    k.host_file_drop_begin(92, "large.bin", "application/octet-stream", body.len())
+        .unwrap();
+    for chunk in body.chunks(16 * 1024) {
+        k.host_file_drop_chunk(92, chunk).unwrap();
+    }
+    assert_eq!(k.host_file_import_count(), 1);
+    assert_eq!(k.host_file_import_reserved_bytes(), body.len());
+    k.host_file_drop_end(92).unwrap();
+    assert_eq!(k.host_file_import_count(), 0);
+    assert_eq!(k.host_file_import_reserved_bytes(), 0);
+
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    let fd = k.host_file_recv(pid, 92).unwrap();
+    let mut actual = vec![0u8; body.len()];
+    let mut offset = 0;
+    while offset < actual.len() {
+        let n = k.fd_read(pid, fd, &mut actual[offset..]).unwrap();
+        assert_ne!(n, 0);
+        offset += n;
+    }
+    assert_eq!(actual, body);
+}
+
+#[test]
+fn host_import_limits_and_abort_release_reserved_capacity() {
+    let mut k = make_kernel();
+    assert_eq!(
+        k.host_file_drop_begin(
+            100,
+            "too-large.bin",
+            "application/octet-stream",
+            abi::ext::host_file::MAX_IMPORT_BYTES + 1,
+        ),
+        Err(KernelError::FileTooLarge)
+    );
+
+    k.host_file_drop_begin(
+        101,
+        "first.bin",
+        "application/octet-stream",
+        abi::ext::host_file::MAX_IMPORT_BYTES,
+    )
+    .unwrap();
+    k.host_file_drop_begin(
+        102,
+        "second.bin",
+        "application/octet-stream",
+        abi::ext::host_file::MAX_IMPORT_BYTES,
+    )
+    .unwrap();
+    assert_eq!(
+        k.host_file_drop_begin(103, "third.bin", "application/octet-stream", 1),
+        Err(KernelError::FileTooLarge)
+    );
+    assert_eq!(
+        k.host_file_import_reserved_bytes(),
+        abi::ext::host_file::MAX_IMPORT_BYTES_TOTAL
+    );
+    k.host_file_drop_abort(101);
+    assert_eq!(
+        k.host_file_import_reserved_bytes(),
+        abi::ext::host_file::MAX_IMPORT_BYTES
+    );
+    k.host_file_drop_abort(102);
+    assert_eq!(k.host_file_import_reserved_bytes(), 0);
+}
+
+#[test]
+fn host_picker_and_explicit_download_close_reach_native_platform() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    k.host_file_pick(pid).unwrap();
+
+    let fd = k.host_file_send(pid, "notes.txt", "text/plain").unwrap();
+    assert_eq!(k.fd_write(pid, fd, b"hello host").unwrap(), 10);
+    assert_eq!(k.host_download_count(), 1);
+    k.fd_close(pid, fd).unwrap();
+    assert_eq!(k.host_download_count(), 0);
+    assert_eq!(k.host_download_bytes_total(), 0);
+
+    kernel::platform::native::with_state(|state| {
+        assert_eq!(state.host_picker_calls, 1);
+        assert_eq!(state.host_download_calls.len(), 1);
+        let call = &state.host_download_calls[0];
+        assert_eq!(call.name, "notes.txt");
+        assert_eq!(call.mime, "text/plain");
+        assert_eq!(call.bytes, b"hello host");
+    });
+}
+
+#[test]
+fn host_download_teardown_and_failed_write_cancel_without_partial_file() {
+    kernel::platform::native::reset();
+    let mut k = make_kernel();
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    let fd = k
+        .host_file_send(pid, "cancel.bin", "application/octet-stream")
+        .unwrap();
+    k.fd_write(pid, fd, b"partial").unwrap();
+    k.proc_exit(pid, ExitStatus::Exited(0)).unwrap();
+    assert_eq!(k.host_download_count(), 0);
+    assert!(kernel::platform::native::with_state(|state| state
+        .host_download_calls
+        .is_empty()));
+
+    let pid = running_host_transfer_proc(&mut k, initial::FILES);
+    let fd = k
+        .host_file_send(pid, "large.bin", "application/octet-stream")
+        .unwrap();
+    let too_large = vec![0u8; abi::ext::host_file::MAX_DOWNLOAD_BYTES + 1];
+    assert_eq!(
+        k.fd_write(pid, fd, &too_large),
+        Err(KernelError::FileTooLarge)
+    );
+    k.fd_close(pid, fd).unwrap();
+    assert!(kernel::platform::native::with_state(|state| state
+        .host_download_calls
+        .is_empty()));
 }

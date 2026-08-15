@@ -30,12 +30,13 @@ use alloc::vec::Vec;
 
 use abi::cap::{Cap, CapSet};
 use abi::ext::Pid;
+use abi::fd as well_known_fd;
 
 use crate::cap::{CapError, CapTable};
 use crate::dev::{DevError, DeviceDispatcher};
 use crate::fd::{FdEntry, FdError, FdFlags, FdObject, FdTable};
-use crate::host_file::{HostFile, HostFileFd};
-use crate::ipc::{IpcError, IpcTable, PipeId, SocketId, SocketType};
+use crate::host_file::{HostDownload, HostFile, HostFileFd, HostImport};
+use crate::ipc::{IpcError, IpcTable, PipeId, SocketCredentials, SocketId, SocketType};
 pub use crate::proc::Signal;
 use crate::proc::{
     table::{InsertError, ZombieTarget},
@@ -57,11 +58,22 @@ pub enum KernelError {
     BadFd,
     /// The calling process has hit its fd soft limit.
     OutOfFds,
+    /// A global or per-parent process-table limit would be exceeded.
+    ProcessLimit,
     /// The fd's object type doesn't support this operation
     /// (e.g. writing to a `PipeRead` fd).
     NotSupportedOnFd,
+    /// A descriptor selected for a dup-equivalent fd-table transfer (IPC
+    /// ancillary delivery or spawn inheritance) has ownership semantics that
+    /// cannot be represented safely.
+    UnsupportedAncillary,
+    /// The requested IPC socket type is reserved by the ABI but has no
+    /// truthful implementation in this kernel version.
+    UnsupportedSocketType,
     /// Not a valid path / argument.
     InvalidArgument,
+    /// A bounded transfer would exceed its documented maximum.
+    FileTooLarge,
     /// Capability check failure.
     NotCapable,
     /// Operation would have blocked. The caller turns this
@@ -74,6 +86,9 @@ pub enum KernelError {
     /// Path already bound — e.g. a second `display_bind`
     /// call against the same socket path.
     AddressInUse,
+    /// A hard, non-retryable bounded IPC admission ceiling was reached
+    /// (live objects or ancillary references), surfaced as ENOSPC.
+    ResourceLimit,
     /// Write attempted on a pipe / stream whose write path is broken
     /// — peer fully closed, local `shutdown(WR)` applied, or peer
     /// `shutdown(RD)` applied. Surfaces to userland as EPIPE (POSIX's
@@ -131,6 +146,8 @@ impl From<IpcError> for KernelError {
             IpcError::WouldBlock => KernelError::WouldBlock,
             IpcError::PipeBroken => KernelError::PipeBroken,
             IpcError::MsgTooLarge => KernelError::InvalidArgument,
+            IpcError::UnsupportedSocketType => KernelError::UnsupportedSocketType,
+            IpcError::ResourceLimit => KernelError::ResourceLimit,
         }
     }
 }
@@ -155,6 +172,15 @@ pub struct RegisterArgs<'a> {
     pub ppid: Pid,
     pub caps: CapSet,
     pub cwd: &'a str,
+}
+
+/// Decoded option fields shared by absolute and dirfd-relative path opens.
+#[derive(Copy, Clone)]
+pub(crate) struct PathOpenOptions {
+    pub lookup_flags: u32,
+    pub oflags: u16,
+    pub mode: u16,
+    pub flags: FdFlags,
 }
 
 /// Configuration for [`Kernel::proc_spawn`]. Populated by the
@@ -262,6 +288,19 @@ pub struct Kernel {
     /// ipc_recv from an already-parked pid returns -EAGAIN. Mirror
     /// of the `parked_acceptor`/`parked_waiters` one-parker rules.
     pub(crate) parked_recvers: alloc::collections::BTreeMap<Pid, RecvParker>,
+    /// Pids parked in blocking WASI `fd_read` on an empty pipe.
+    pub(crate) parked_pipe_readers: alloc::collections::BTreeMap<Pid, PipeReadParker>,
+    /// Pids parked in WASI `poll_oneoff`. Each process may own at most one
+    /// entry, and each entry contains only bounded, kernel-owned subscription
+    /// data plus offsets into the fixed syscall scratch window.
+    pub(crate) parked_polls: alloc::collections::BTreeMap<Pid, PollParker>,
+    /// Total subscriptions retained by `parked_polls`. Admission is bounded
+    /// kernel-wide so an unprivileged process population cannot amplify one
+    /// readiness scan into process-limit × per-poll-limit work.
+    pub(crate) parked_poll_subscriptions: usize,
+    pub(crate) parked_poll_ordinary_subscriptions: usize,
+    pub(crate) parked_poll_display_subscriptions: usize,
+    pub(crate) parked_poll_shell_subscriptions: usize,
     /// Pending host-imported-file payloads keyed by the bootstrap-
     /// minted token (`contracts/syscalls.md §3.6`). Populated by the
     /// future TS-side bootstrap drag-drop notification path via
@@ -288,6 +327,21 @@ pub struct Kernel {
     /// `FdObject` to the streaming state — no per-fd allocation
     /// beyond the table entry.
     pub(crate) host_file_fds: BTreeMap<u32, HostFileFd>,
+    host_file_imports: BTreeMap<u32, HostImport>,
+    host_file_import_reserved_total: usize,
+    /// Completed pending + fd-backed import bytes. Together with in-progress
+    /// reservations, this stays within the shared import budget.
+    host_file_live_bytes_total: usize,
+    /// Kernel-owned listener and accepted server endpoints for the
+    /// capability-gated `/run/host-files` notification stream.
+    host_file_listener: Option<SocketId>,
+    host_file_subscribers: Vec<SocketId>,
+    host_file_assignments: BTreeMap<u32, SocketId>,
+    /// Write-only host-download staging objects, addressed by the opaque id
+    /// carried in `FdObject::HostDownload`.
+    host_downloads: BTreeMap<u32, HostDownload>,
+    next_host_download_id: u32,
+    host_download_bytes_total: usize,
     /// Coarse flush policy that gates `vfs.sync_dirty()` on the
     /// proc_exit and periodic-sync paths. See
     /// [`crate::fs::opfs::flush::FlushPolicy`] for the contract;
@@ -342,7 +396,7 @@ pub struct WaitParker {
 /// ([`Kernel::wake_parked_recver_if_any`]) +
 /// [`Kernel::interrupt_parked_recv`] + the SIGKILL/proc_exit
 /// surgical `parked_recvers.remove` calls + the socket-close drain
-/// in [`Kernel::wake_parked_recvers_on_socket_close`].
+/// in [`Kernel::wake_terminal_parked_recvers_after_socket_close`].
 ///
 /// `socket_id` is the receive-side socket the parker is draining.
 /// The peer's send hook compares `peer_id == parker.socket_id` to
@@ -358,6 +412,106 @@ pub struct RecvParker {
     pub recv_fd_slot: i32,
     pub heap_ptr: u32,
     pub heap_len: u32,
+}
+
+/// Caller-provided portion of a parked `IPC_RECV` request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RecvParkRequest {
+    pub request_id: u32,
+    pub max_len: u32,
+    pub recv_fd_slot: i32,
+    pub heap_ptr: u32,
+    pub heap_len: u32,
+}
+
+/// In-flight blocking WASI `fd_read` on a pipe.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PipeReadParker {
+    pub req_id: u32,
+    pub pipe_id: PipeId,
+    pub max_len: u32,
+    pub heap_ptr: u32,
+}
+
+/// Maximum number of subscriptions admitted by one `poll_oneoff` call.
+/// Keeping this below the process limit bounds a full readiness sweep even
+/// when every process is parked at once.
+pub const POLL_SUBSCRIPTION_LIMIT: usize = abi::wasi::poll::MAX_SUBSCRIPTIONS;
+
+/// Unprivileged calls are intentionally much smaller than the display-server
+/// ABI maximum, bounding normalization/readiness work even for immediately
+/// ready or duplicate subscriptions that never park.
+pub const POLL_ORDINARY_SUBSCRIPTION_LIMIT: usize = 32;
+pub const POLL_SHELL_SUBSCRIPTION_LIMIT: usize = 32;
+
+/// Maximum number of normalized subscriptions retained across all parked
+/// processes. At the per-call maximum this admits eight full display-sized
+/// wait sets while bounding a complete service pass to 2,048 checks.
+pub const POLL_GLOBAL_SUBSCRIPTION_LIMIT: usize = 2_048;
+pub const POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT: usize = 256;
+pub const POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT: usize = 32;
+pub const POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT: usize = POLL_GLOBAL_SUBSCRIPTION_LIMIT
+    - POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT
+    - POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PollAdmissionClass {
+    Ordinary,
+    DisplayServer,
+    Shell,
+}
+
+impl PollAdmissionClass {
+    pub const fn per_call_limit(self) -> usize {
+        match self {
+            Self::DisplayServer => POLL_SUBSCRIPTION_LIMIT,
+            Self::Ordinary => POLL_ORDINARY_SUBSCRIPTION_LIMIT,
+            Self::Shell => POLL_SHELL_SUBSCRIPTION_LIMIT,
+        }
+    }
+}
+
+/// Clock domain retained by a normalized poll subscription.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PollClock {
+    Monotonic,
+    Realtime,
+}
+
+/// Kernel-owned form of a WASI poll subscription. Relative clock timeouts are
+/// converted to absolute deadlines before an entry reaches this type.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PollSubscription {
+    Clock {
+        userdata: u64,
+        clock: PollClock,
+        deadline_ns: u64,
+    },
+    FdRead {
+        userdata: u64,
+        fd: u32,
+    },
+    FdWrite {
+        userdata: u64,
+        fd: u32,
+    },
+    Error {
+        userdata: u64,
+        event_type: u8,
+        errno: u16,
+    },
+}
+
+/// One in-flight blocking `poll_oneoff` request. No reference into user memory
+/// survives registration: `heap_ptr` is a validated offset into the bounded
+/// per-process scratch area and `subscriptions` is an owned normalized copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PollParker {
+    pub req_id: u32,
+    pub heap_ptr: u32,
+    pub event_cap: usize,
+    pub subscriptions: Vec<PollSubscription>,
+    pub admission_class: PollAdmissionClass,
 }
 
 /// Test helper: expose the `ext.rs`-private `pack_exit_status`
@@ -383,8 +537,23 @@ impl Kernel {
             pending_wakes: alloc::vec::Vec::new(),
             parked_waiters: alloc::collections::BTreeMap::new(),
             parked_recvers: alloc::collections::BTreeMap::new(),
+            parked_pipe_readers: alloc::collections::BTreeMap::new(),
+            parked_polls: alloc::collections::BTreeMap::new(),
+            parked_poll_subscriptions: 0,
+            parked_poll_ordinary_subscriptions: 0,
+            parked_poll_display_subscriptions: 0,
+            parked_poll_shell_subscriptions: 0,
             host_files: BTreeMap::new(),
             host_file_fds: BTreeMap::new(),
+            host_file_imports: BTreeMap::new(),
+            host_file_import_reserved_total: 0,
+            host_file_live_bytes_total: 0,
+            host_file_listener: None,
+            host_file_subscribers: Vec::new(),
+            host_file_assignments: BTreeMap::new(),
+            host_downloads: BTreeMap::new(),
+            next_host_download_id: 1,
+            host_download_bytes_total: 0,
             flush_policy: crate::fs::opfs::flush::FlushPolicy::new(),
         }
     }
@@ -401,6 +570,9 @@ impl Kernel {
     /// `ProcessTable::allocate_pid` keeps pids monotonic regardless
     /// of which caller goes first.
     pub fn register_process(&mut self, args: RegisterArgs<'_>) -> Result<Pid, KernelError> {
+        if !self.procs.has_spawn_capacity(args.ppid) {
+            return Err(KernelError::ProcessLimit);
+        }
         let pid = self.procs.allocate_pid();
         let proc = Process::new_starting(
             pid,
@@ -497,14 +669,51 @@ impl Kernel {
         mode: u16,
         flags: FdFlags,
     ) -> Result<u32, KernelError> {
+        self.path_open_from(
+            pid,
+            None,
+            path,
+            PathOpenOptions {
+                lookup_flags,
+                oflags,
+                mode,
+                flags,
+            },
+        )
+    }
+
+    /// WASI `path_open` with a directory fd base for relative paths.
+    /// Absolute paths retain PMos's v1 global-path behaviour and do not
+    /// consult `dir_fd`.
+    pub(crate) fn path_open_at(
+        &mut self,
+        pid: Pid,
+        dir_fd: u32,
+        path: &str,
+        options: PathOpenOptions,
+    ) -> Result<u32, KernelError> {
+        if path.starts_with('/') {
+            return self.path_open_from(pid, None, path, options);
+        }
+        let base = self.directory_vnode_for_fd(pid, dir_fd)?;
+        self.path_open_from(pid, Some(base), path, options)
+    }
+
+    fn path_open_from(
+        &mut self,
+        pid: Pid,
+        base: Option<(MountId, Ino)>,
+        path: &str,
+        options: PathOpenOptions,
+    ) -> Result<u32, KernelError> {
         use abi::wasi::lookupflags as wasi_lookup;
         use abi::wasi::oflags as wasi_oflags;
 
-        let creat = (oflags & wasi_oflags::CREAT) != 0;
-        let excl = (oflags & wasi_oflags::EXCL) != 0;
-        let trunc = (oflags & wasi_oflags::TRUNC) != 0;
-        let directory = (oflags & wasi_oflags::DIRECTORY) != 0;
-        let follow_symlink = (lookup_flags & wasi_lookup::SYMLINK_FOLLOW) != 0;
+        let creat = (options.oflags & wasi_oflags::CREAT) != 0;
+        let excl = (options.oflags & wasi_oflags::EXCL) != 0;
+        let trunc = (options.oflags & wasi_oflags::TRUNC) != 0;
+        let directory = (options.oflags & wasi_oflags::DIRECTORY) != 0;
+        let follow_symlink = (options.lookup_flags & wasi_lookup::SYMLINK_FOLLOW) != 0;
 
         if creat && directory {
             return Err(KernelError::InvalidArgument);
@@ -513,10 +722,11 @@ impl Kernel {
         let caps = self.caps.list(pid)?;
 
         let open_path = |vfs: &mut Vfs, p: &str| -> Result<(MountId, Ino, NodeType), FsError> {
-            if follow_symlink {
-                vfs.open(p)
-            } else {
-                vfs.open_nofollow(p)
+            match (base, follow_symlink) {
+                (None, true) => vfs.open(p),
+                (None, false) => vfs.open_nofollow(p),
+                (Some((mount_id, dir_ino)), true) => vfs.open_at(mount_id, dir_ino, p),
+                (Some((mount_id, dir_ino)), false) => vfs.open_at_nofollow(mount_id, dir_ino, p),
             }
         };
 
@@ -531,14 +741,22 @@ impl Kernel {
                     (m, i, t)
                 }
                 Err(crate::vfs::FsError::NotFound) => {
-                    let effective_mode: u32 = if mode == 0 { 0o644 } else { mode as u32 };
+                    let effective_mode: u32 = if options.mode == 0 {
+                        0o644
+                    } else {
+                        options.mode as u32
+                    };
                     // Use the watch-aware wrapper so a watcher on
                     // the parent directory observes the implicit
                     // create that O_CREAT performs.
-                    self.vfs_create(path, effective_mode)?;
+                    if let Some((mount_id, dir_ino)) = base {
+                        self.vfs_create_at(mount_id, dir_ino, path, effective_mode)?;
+                    } else {
+                        self.vfs_create(path, effective_mode)?;
+                    }
                     // Freshly-created regular file; follow_symlink
                     // is moot because the target isn't a symlink.
-                    self.vfs.open(path)?
+                    open_path(&mut self.vfs, path)?
                 }
                 Err(e) => return Err(KernelError::Fs(e)),
             }
@@ -556,8 +774,7 @@ impl Kernel {
                     return Err(KernelError::Fs(crate::vfs::FsError::IsADirectory));
                 }
                 NodeType::RegularFile => {
-                    self.vfs.truncate_ino(mount_id, ino, 0)?;
-                    self.flush_policy.record_dirty();
+                    self.vfs_truncate_ino(mount_id, ino, 0)?;
                 }
                 _ => {
                     // Non-regular, non-directory targets (char devices,
@@ -582,8 +799,29 @@ impl Kernel {
             | NodeType::Socket => FdObject::Vnode { mount_id, ino },
         };
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
-        let fd = table.alloc(FdEntry::with_flags(object, flags))?;
+        let fd = table.alloc(FdEntry::with_flags(object, options.flags))?;
         Ok(fd)
+    }
+
+    fn directory_vnode_for_fd(
+        &mut self,
+        pid: Pid,
+        dir_fd: u32,
+    ) -> Result<(MountId, Ino), KernelError> {
+        let object = self
+            .fds
+            .get(&pid)
+            .ok_or(KernelError::NoSuchPid)?
+            .get(dir_fd)
+            .ok_or(KernelError::BadFd)?
+            .object;
+        let FdObject::Vnode { mount_id, ino } = object else {
+            return Err(KernelError::Fs(FsError::NotADirectory));
+        };
+        if self.vfs.stat_ino(mount_id, ino)?.ty != NodeType::Directory {
+            return Err(KernelError::Fs(FsError::NotADirectory));
+        }
+        Ok((mount_id, ino))
     }
 
     /// Install a caller-provided fd entry directly. Used by
@@ -605,6 +843,24 @@ impl Kernel {
         Ok(())
     }
 
+    /// Install the WASI `/` directory preopen for `pid` at `fd`.
+    ///
+    /// Production processes receive this automatically from
+    /// [`Kernel::proc_spawn`]. The explicit helper exists for the lower-level
+    /// `register_process` host/test path, whose fd table is deliberately empty.
+    pub fn install_root_preopen_fd(&mut self, pid: Pid, fd: u32) -> Result<(), KernelError> {
+        let object = self.root_preopen_object()?;
+        self.install_fd(pid, fd, object, FdFlags::EMPTY)
+    }
+
+    fn root_preopen_object(&mut self) -> Result<FdObject, KernelError> {
+        let (mount_id, ino, ty) = self.vfs.open("/")?;
+        if ty != NodeType::Directory {
+            return Err(KernelError::InvalidArgument);
+        }
+        Ok(FdObject::Vnode { mount_id, ino })
+    }
+
     /// `fd_read(pid, fd, buf) -> bytes_read`.
     ///
     /// Routes to the right subsystem based on the fd's object
@@ -612,7 +868,9 @@ impl Kernel {
     ///
     /// * `Vnode` → [`Vfs::read_ino`], advancing the fd's offset.
     /// * `CharDevice` → [`DeviceDispatcher::read`], no offset.
-    /// * `PipeRead` / `Socket` → wired in a later slice.
+    /// * `PipeRead` → bytes, EOF, or `WouldBlock` for the syscall
+    ///   layer to park unless the descriptor is non-blocking.
+    /// * `Socket` → available bytes or `WouldBlock`.
     /// * `PipeWrite` / `DisplayConn` / `SignalChannel` →
     ///   [`KernelError::NotSupportedOnFd`].
     pub fn fd_read(&mut self, pid: Pid, fd: u32, buf: &mut [u8]) -> Result<usize, KernelError> {
@@ -640,8 +898,7 @@ impl Kernel {
             }
             FdObject::PipeRead(id) => {
                 use crate::ipc::{PipeId, PipeReadResult};
-                let pipe = self.ipc.pipe_mut(PipeId(id))?;
-                match pipe.try_read(buf) {
+                match self.ipc.read_pipe(PipeId(id), buf)? {
                     PipeReadResult::Read(n) => Ok(n),
                     PipeReadResult::Eof => Ok(0),
                     PipeReadResult::WouldBlock => Err(KernelError::WouldBlock),
@@ -675,17 +932,21 @@ impl Kernel {
             }
             FdObject::Watch { watch_id } => {
                 // Watch fds drain the per-watch event queue into the
-                // caller's buffer in 8-byte records (mask u32 LE +
-                // inode u32 LE). An empty queue returns 0 bytes
-                // (non-blocking — a future slice may park the caller
-                // on the watch the way ipc_recv parks on a socket).
-                // A buffer shorter than one record returns 0 too,
-                // matching `fd_read`'s no-op semantic when the
-                // window can't hold a single record.
+                // caller's buffer in 8-byte records (mask u32 LE + inode
+                // u32 LE). Reads are explicitly nonblocking: poll_oneoff is
+                // the blocking primitive, so an empty queue is EAGAIN rather
+                // than a false EOF. Reject a short record window atomically
+                // so callers never lose a queued notification.
+                if buf.len() < crate::vfs::WatchEvent::SIZE {
+                    return Err(KernelError::InvalidArgument);
+                }
                 let watches = self.vfs.watches_mut();
                 let Some(watch) = watches.get_mut(watch_id) else {
                     return Err(KernelError::BadFd);
                 };
+                if watch.events.is_empty() {
+                    return Err(KernelError::WouldBlock);
+                }
                 Ok(watch.drain_into(buf))
             }
             FdObject::HostFile { token } => {
@@ -699,7 +960,9 @@ impl Kernel {
                 };
                 Ok(state.read(buf))
             }
-            FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => Err(KernelError::NotSupportedOnFd),
+            FdObject::PipeWrite(_) | FdObject::DisplayConn(_) | FdObject::HostDownload { .. } => {
+                Err(KernelError::NotSupportedOnFd)
+            }
         }
     }
 
@@ -721,30 +984,18 @@ impl Kernel {
             .ok_or(KernelError::NoSuchPid)?
             .get(fd)
             .ok_or(KernelError::BadFd)?;
+        let mut pipe_reader_wakes = Vec::new();
+        let mut written_pipe = None;
         let result: Result<usize, KernelError> = match entry.object {
             FdObject::Vnode { mount_id, ino } => {
-                match self.vfs.write_ino(mount_id, ino, entry.offset, buf) {
+                match self.vfs_write_at(mount_id, ino, entry.offset, buf) {
                     Ok(n) => {
-                        let slot = match self
+                        let slot = self
                             .fds
                             .get_mut(&pid)
                             .and_then(|t| t.get_mut(fd))
-                            .ok_or(KernelError::BadFd)
-                        {
-                            Ok(s) => s,
-                            Err(e) => return Err(e),
-                        };
+                            .ok_or(KernelError::BadFd)?;
                         slot.offset = slot.offset.saturating_add(n as u64);
-                        // Watch hook: a successful write fires
-                        // WATCH_MODIFY on the file's own inode. Zero-
-                        // byte writes still notify — POSIX doesn't
-                        // distinguish them and a watcher waiting on
-                        // a touch() probe would otherwise miss it.
-                        self.notify_modify(mount_id, ino);
-                        // T136: bump the flush policy so the
-                        // periodic-sync path sees the pending
-                        // dirty work.
-                        self.flush_policy.record_dirty();
                         Ok(n)
                     }
                     Err(e) => Err(KernelError::Fs(e)),
@@ -756,7 +1007,7 @@ impl Kernel {
                     .ipc
                     .send_on_socket(SocketId(id), buf, Vec::new())
                     .map_err(KernelError::from);
-                if r.is_ok() {
+                if matches!(r, Ok(written) if written > 0) {
                     // Bytes landed on the peer's rx_buf — if any pid
                     // is parked on a blocking ipc_recv against the
                     // peer socket, wake it now with the freshly-
@@ -769,15 +1020,23 @@ impl Kernel {
             }
             FdObject::PipeWrite(id) => {
                 use crate::ipc::{PipeId, PipeWriteResult};
-                match self.ipc.pipe_mut(PipeId(id)) {
-                    Ok(pipe) => match pipe.try_write(buf) {
-                        PipeWriteResult::Wrote(n) => Ok(n),
+                match self.ipc.write_pipe(PipeId(id), buf) {
+                    Ok(result) => match result {
+                        PipeWriteResult::Wrote(n) => {
+                            if n > 0 {
+                                let pipe = self.ipc.pipe_mut(PipeId(id))?;
+                                pipe_reader_wakes = pipe.drain_waiting_readers();
+                                written_pipe = Some(PipeId(id));
+                            }
+                            Ok(n)
+                        }
                         PipeWriteResult::Broken => Err(KernelError::PipeBroken),
                         PipeWriteResult::WouldBlock => Err(KernelError::WouldBlock),
                     },
                     Err(e) => Err(KernelError::from(e)),
                 }
             }
+            FdObject::HostDownload { id } => self.append_host_download(id, buf),
             FdObject::PipeRead(_)
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel
@@ -787,13 +1046,19 @@ impl Kernel {
         if matches!(result, Err(KernelError::PipeBroken)) {
             self.post_sigpipe(pid);
         }
+        if let Some(pipe_id) = written_pipe {
+            for reader_pid in pipe_reader_wakes {
+                self.wake_parked_pipe_reader(reader_pid, pipe_id);
+            }
+        }
         result
     }
 
     /// Deliver [`Signal::Pipe`] into `pid`'s signal inbox, if
     /// the process has one. Called by every syscall path that
     /// can surface [`KernelError::PipeBroken`] — currently
-    /// [`Self::fd_write`] and the `handle_sock_send` opcode arm.
+    /// [`Self::fd_write`] and [`Self::ipc_send`] (including the WASI
+    /// `sock_send` adapter that routes through it).
     /// Missing inboxes (a pid whose process table entry is gone)
     /// silently no-op: by the time the write was dispatched the
     /// caller existed; a disappearing inbox between dispatch and
@@ -825,8 +1090,12 @@ impl Kernel {
     pub fn fd_close(&mut self, pid: Pid, fd: u32) -> Result<(), KernelError> {
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         let entry = table.close(fd)?;
-        self.release_object(entry.object);
-        Ok(())
+        if let FdObject::HostDownload { id } = entry.object {
+            self.finalize_host_download(id)
+        } else {
+            self.release_object(entry.object);
+            Ok(())
+        }
     }
 
     /// `fd_readdir(pid, fd) -> Vec<DirEntry>`. Resolves `fd` in
@@ -901,12 +1170,33 @@ impl Kernel {
         if !caps.contains(Cap::DisplayServer) {
             return Err(KernelError::NotCapable);
         }
-        let socket_id = self.ipc.create_socket(SocketType::Stream);
-        self.ipc.bind_socket(socket_id, DISPLAY_SOCKET_PATH)?;
-        self.ipc.listen_socket(socket_id, DISPLAY_LISTEN_BACKLOG)?;
+        if !self.fds(pid)?.has_capacity(1) {
+            return Err(KernelError::OutOfFds);
+        }
+        let socket_id = self.ipc.create_socket(SocketType::Stream)?;
+        self.ipc.set_socket_credentials(
+            socket_id,
+            SocketCredentials {
+                pid,
+                capabilities: caps,
+            },
+        )?;
+        if let Err(error) = self.ipc.bind_socket(socket_id, DISPLAY_SOCKET_PATH) {
+            let _ = self.close_ipc_socket(socket_id);
+            return Err(error.into());
+        }
+        if let Err(error) = self.ipc.listen_socket(socket_id, DISPLAY_LISTEN_BACKLOG) {
+            let _ = self.close_ipc_socket(socket_id);
+            return Err(error.into());
+        }
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
-        let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
-        Ok(fd)
+        match table.alloc(FdEntry::new(FdObject::Socket(socket_id.0))) {
+            Ok(fd) => Ok(fd),
+            Err(error) => {
+                let _ = self.close_ipc_socket(socket_id);
+                Err(error.into())
+            }
+        }
     }
 
     /// Connect to `/run/display`. The caller must hold
@@ -920,10 +1210,32 @@ impl Kernel {
         if !caps.contains(Cap::DisplayClient) {
             return Err(KernelError::NotCapable);
         }
-        let socket_id = self.ipc.create_socket(SocketType::Stream);
-        let parker = self.ipc.connect_socket(socket_id, DISPLAY_SOCKET_PATH)?;
+        if !self.fds(pid)?.has_capacity(1) {
+            return Err(KernelError::OutOfFds);
+        }
+        let socket_id = self.ipc.create_socket(SocketType::Stream)?;
+        self.ipc.set_socket_credentials(
+            socket_id,
+            SocketCredentials {
+                pid,
+                capabilities: caps,
+            },
+        )?;
+        let parker = match self.ipc.connect_socket(socket_id, DISPLAY_SOCKET_PATH) {
+            Ok(parker) => parker,
+            Err(error) => {
+                let _ = self.close_ipc_socket(socket_id);
+                return Err(error.into());
+            }
+        };
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
-        let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
+        let fd = match table.alloc(FdEntry::new(FdObject::Socket(socket_id.0))) {
+            Ok(fd) => fd,
+            Err(error) => {
+                let _ = self.close_ipc_socket(socket_id);
+                return Err(error.into());
+            }
+        };
         self.wake_parked_acceptor_if_any(parker)?;
         Ok(fd)
     }
@@ -948,7 +1260,18 @@ impl Kernel {
             FdObject::Socket(id) => SocketId(id),
             _ => return Err(KernelError::NotSupportedOnFd),
         };
+        if !self.fds(pid)?.has_capacity(1) {
+            return Err(KernelError::OutOfFds);
+        }
         let server_id = self.ipc.accept_socket(listener_id)?;
+        let caps = self.caps.list(pid)?;
+        self.ipc.set_socket_credentials(
+            server_id,
+            SocketCredentials {
+                pid,
+                capabilities: caps,
+            },
+        )?;
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         let fd = table.alloc(FdEntry::new(FdObject::Socket(server_id.0)))?;
         Ok(fd)
@@ -1009,7 +1332,18 @@ impl Kernel {
         acceptor_pid: Pid,
         listener_id: crate::ipc::SocketId,
     ) -> Result<u32, KernelError> {
+        if !self.fds(acceptor_pid)?.has_capacity(1) {
+            return Err(KernelError::OutOfFds);
+        }
         let server_id = self.ipc.accept_socket(listener_id)?;
+        let caps = self.caps.list(acceptor_pid)?;
+        self.ipc.set_socket_credentials(
+            server_id,
+            SocketCredentials {
+                pid: acceptor_pid,
+                capabilities: caps,
+            },
+        )?;
         let table = self
             .fds
             .get_mut(&acceptor_pid)
@@ -1100,11 +1434,7 @@ impl Kernel {
         &mut self,
         pid: Pid,
         fd: u32,
-        request_id: u32,
-        max_len: u32,
-        recv_fd_slot: i32,
-        heap_ptr: u32,
-        heap_len: u32,
+        request: RecvParkRequest,
     ) -> Result<(), KernelError> {
         if self.parked_recvers.contains_key(&pid) {
             return Err(KernelError::WouldBlock);
@@ -1123,12 +1453,12 @@ impl Kernel {
         self.parked_recvers.insert(
             pid,
             RecvParker {
-                req_id: request_id,
+                req_id: request.request_id,
                 socket_id,
-                max_len,
-                recv_fd_slot,
-                heap_ptr,
-                heap_len,
+                max_len: request.max_len,
+                recv_fd_slot: request.recv_fd_slot,
+                heap_ptr: request.heap_ptr,
+                heap_len: request.heap_len,
             },
         );
         self.procs
@@ -1197,8 +1527,8 @@ impl Kernel {
 
         // Reuse the non-blocking semantic: drain bytes + optional
         // fd via `Kernel::ipc_recv`, which routes through the same
-        // `IpcTable::recv_on_socket` + `translate_passed_fd` flow
-        // the f00e559 handler uses. We need an fd here — derive it
+        // `IpcTable::recv_on_socket` + snapshot-install flow the
+        // f00e559 handler uses. We need an fd here — derive it
         // by reverse-looking-up the socket id in the parker's fd
         // table. The parker's socket fd may have been closed in
         // the window between park and wake; if so, queue an EBADF
@@ -1316,13 +1646,33 @@ impl Kernel {
     // add per-path-prefix gating here without changing the opcode
     // wire format.
 
-    /// Create an unbound socket of the given type and install it at
-    /// a fresh fd in `pid`'s fd table. Returns the new fd number.
+    /// Create an unbound stream socket and install it at a fresh fd in
+    /// `pid`'s fd table. The ABI-reserved datagram type returns
+    /// [`KernelError::UnsupportedSocketType`] before allocation.
     pub fn ipc_socket(&mut self, pid: Pid, ty: SocketType) -> Result<u32, KernelError> {
-        let socket_id = self.ipc.create_socket(ty);
+        if ty != SocketType::Stream {
+            return Err(KernelError::UnsupportedSocketType);
+        }
+        let caps = self.caps.list(pid)?;
+        if !self.fds(pid)?.has_capacity(1) {
+            return Err(KernelError::OutOfFds);
+        }
+        let socket_id = self.ipc.create_socket(ty)?;
+        self.ipc.set_socket_credentials(
+            socket_id,
+            SocketCredentials {
+                pid,
+                capabilities: caps,
+            },
+        )?;
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
-        let fd = table.alloc(FdEntry::new(FdObject::Socket(socket_id.0)))?;
-        Ok(fd)
+        match table.alloc(FdEntry::new(FdObject::Socket(socket_id.0))) {
+            Ok(fd) => Ok(fd),
+            Err(error) => {
+                let _ = self.close_ipc_socket(socket_id);
+                Err(error.into())
+            }
+        }
     }
 
     /// Create a pipe pair and install both ends on `pid`'s fd table.
@@ -1336,7 +1686,10 @@ impl Kernel {
     /// The underlying `Pipe` object is also dropped from the IPC
     /// table's live map since neither end ever got a reference.
     pub fn create_pipe_fds(&mut self, pid: Pid) -> Result<(u32, u32), KernelError> {
-        let pipe_id = self.ipc.create_pipe();
+        if !self.fds(pid)?.has_capacity(2) {
+            return Err(KernelError::OutOfFds);
+        }
+        let pipe_id = self.ipc.create_pipe()?;
         // First fd: read side.
         let table = self.fds.get_mut(&pid).ok_or(KernelError::NoSuchPid)?;
         let read_fd = match table.alloc(FdEntry::new(FdObject::PipeRead(pipe_id.0))) {
@@ -1364,19 +1717,156 @@ impl Kernel {
         Ok((read_fd, write_fd))
     }
 
+    /// Park a blocking WASI `fd_read` on an empty pipe. The syscall
+    /// dispatcher calls this only after [`Self::fd_read`] reports
+    /// [`KernelError::WouldBlock`]. Non-blocking descriptors retain
+    /// their immediate `EAGAIN` behavior.
+    pub fn park_on_pipe_read(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+        request_id: u32,
+        max_len: u32,
+        heap_ptr: u32,
+    ) -> Result<(), KernelError> {
+        if self.parked_pipe_readers.contains_key(&pid) {
+            return Err(KernelError::WouldBlock);
+        }
+        let entry = *self
+            .fds
+            .get(&pid)
+            .ok_or(KernelError::NoSuchPid)?
+            .get(fd)
+            .ok_or(KernelError::BadFd)?;
+        if entry.flags.contains(FdFlags::NONBLOCK) {
+            return Err(KernelError::WouldBlock);
+        }
+        let FdObject::PipeRead(id) = entry.object else {
+            return Err(KernelError::NotSupportedOnFd);
+        };
+        let pipe_id = PipeId(id);
+        self.ipc.pipe_mut(pipe_id)?.park_reader(pid);
+        self.parked_pipe_readers.insert(
+            pid,
+            PipeReadParker {
+                req_id: request_id,
+                pipe_id,
+                max_len,
+                heap_ptr,
+            },
+        );
+        self.procs
+            .transition(pid, ProcState::BlockedOnSyscall)
+            .map_err(|_| {
+                self.parked_pipe_readers.remove(&pid);
+                if let Ok(pipe) = self.ipc.pipe_mut(pipe_id) {
+                    pipe.remove_waiting_reader(pid);
+                }
+                KernelError::NoSuchPid
+            })?;
+        self.procs
+            .set_block_reason(pid, crate::proc::BlockReason::Syscall { request_id });
+        Ok(())
+    }
+
+    /// Complete a parked pipe read after bytes arrive or the final
+    /// writer closes. If another reader consumed the available bytes
+    /// first, the caller remains parked on the pipe.
+    fn wake_parked_pipe_reader(&mut self, pid: Pid, pipe_id: PipeId) -> bool {
+        let Some(parker) = self.parked_pipe_readers.remove(&pid) else {
+            return false;
+        };
+        if parker.pipe_id != pipe_id {
+            self.parked_pipe_readers.insert(pid, parker);
+            return false;
+        }
+
+        let mut bytes = alloc::vec![0u8; parker.max_len as usize];
+        let read_result = self.ipc.read_pipe(pipe_id, &mut bytes);
+        let (response, heap) = match read_result {
+            Ok(crate::ipc::PipeReadResult::Read(n)) => {
+                bytes.truncate(n);
+                let response = abi::ring::Response {
+                    request_id: parker.req_id,
+                    status: 0,
+                    value: n as i64,
+                    extra_len: n as u32,
+                    _pad: [0u8; 12],
+                };
+                let heap = Some(PendingHeap {
+                    heap_ptr: parker.heap_ptr,
+                    bytes,
+                });
+                (response, heap)
+            }
+            Ok(crate::ipc::PipeReadResult::Eof) => {
+                (abi::ring::Response::ok(parker.req_id, 0), None)
+            }
+            Ok(crate::ipc::PipeReadResult::WouldBlock) => {
+                if let Ok(pipe) = self.ipc.pipe_mut(pipe_id) {
+                    pipe.park_reader(pid);
+                }
+                self.parked_pipe_readers.insert(pid, parker);
+                return false;
+            }
+            Err(_) => (
+                abi::ring::Response::err(parker.req_id, abi::errno::EBADF),
+                None,
+            ),
+        };
+        self.pending_wakes.push((pid, response, heap));
+        let _ = self.procs.transition(pid, ProcState::Ready);
+        self.procs.clear_block_reason(pid);
+        true
+    }
+
+    /// Interrupt a pipe read parked by `pid`, queueing `EINTR` and
+    /// removing the waiter from both the kernel and pipe tables.
+    pub fn interrupt_parked_pipe_read(&mut self, pid: Pid) -> bool {
+        let Some(parker) = self.parked_pipe_readers.remove(&pid) else {
+            return false;
+        };
+        if let Ok(pipe) = self.ipc.pipe_mut(parker.pipe_id) {
+            pipe.remove_waiting_reader(pid);
+        }
+        self.pending_wakes.push((
+            pid,
+            abi::ring::Response::err(parker.req_id, abi::errno::EINTR),
+            None,
+        ));
+        let _ = self.procs.transition(pid, ProcState::Ready);
+        self.procs.clear_block_reason(pid);
+        true
+    }
+
+    /// Test helper: true iff `pid` is waiting in a blocking pipe read.
+    #[doc(hidden)]
+    pub fn parked_pipe_readers_contains(&self, pid: Pid) -> bool {
+        self.parked_pipe_readers.contains_key(&pid)
+    }
+
     /// Bind `fd` (which must refer to an unbound socket) to `path`.
     /// The path is a kernel-visible string, not a filesystem path —
     /// it lives in a separate bindings table on `IpcTable`, not in
     /// the VFS.
     pub fn ipc_bind(&mut self, pid: Pid, fd: u32, path: &str) -> Result<(), KernelError> {
+        if path == abi::ext::host_file::ENDPOINT {
+            return Err(KernelError::AddressInUse);
+        }
+        if path == DISPLAY_SOCKET_PATH {
+            // `/run/display` is not an ordinary abstract IPC binding. Keeping
+            // it exclusive to DISPLAY_BIND makes the privileged entry point
+            // auditable and prevents an unprivileged listener from racing or
+            // impersonating the display server.
+            return Err(KernelError::NotCapable);
+        }
         let socket_id = self.socket_id_from_fd(pid, fd)?;
         self.ipc.bind_socket(socket_id, path)?;
         Ok(())
     }
 
-    /// Transition a bound socket fd to listening with a caller-
-    /// supplied backlog. Only meaningful for stream sockets; dgram
-    /// sockets skip `listen` entirely and go straight to `recv`.
+    /// Transition a bound stream-socket fd to listening with a caller-
+    /// supplied backlog.
     pub fn ipc_listen(&mut self, pid: Pid, fd: u32, backlog: usize) -> Result<(), KernelError> {
         let socket_id = self.socket_id_from_fd(pid, fd)?;
         self.ipc.listen_socket(socket_id, backlog)?;
@@ -1391,9 +1881,95 @@ impl Kernel {
     /// plumbing is needed on the Rust side.
     pub fn ipc_connect(&mut self, pid: Pid, fd: u32, path: &str) -> Result<(), KernelError> {
         let socket_id = self.socket_id_from_fd(pid, fd)?;
+        let caps = self.caps.list(pid)?;
+        if path == DISPLAY_SOCKET_PATH {
+            // DISPLAY_CONNECT is the only public route into the compositor.
+            // Reject the generic alias even for a capable caller so every
+            // access is visible at the dedicated, capability-gated opcode.
+            return Err(KernelError::NotCapable);
+        }
+        if path == abi::ext::host_file::ENDPOINT {
+            if !caps.contains(Cap::HostTransfer) {
+                return Err(KernelError::NotCapable);
+            }
+            let listener_id = self.ensure_host_file_listener()?;
+            // This kernel-owned service accepts synchronously, which requires
+            // one additional server endpoint beyond the client and hidden
+            // listener. Preflight that slot before connect_socket changes the
+            // client to Connecting or appends it to the backlog.
+            if !self.ipc.has_socket_capacity(1) {
+                return Err(KernelError::ResourceLimit);
+            }
+            self.ipc.set_socket_credentials(
+                socket_id,
+                SocketCredentials {
+                    pid,
+                    capabilities: caps,
+                },
+            )?;
+            let parker = self.ipc.connect_socket(socket_id, path)?;
+            debug_assert!(parker.is_none(), "kernel endpoint never parks accept");
+            let server_id = self.ipc.accept_socket(listener_id)?;
+            self.ipc.set_socket_credentials(
+                server_id,
+                SocketCredentials {
+                    pid: 0,
+                    capabilities: CapSet::EMPTY,
+                },
+            )?;
+            self.host_file_subscribers.push(server_id);
+            self.deliver_unassigned_host_files();
+            return Ok(());
+        }
+        self.ipc.set_socket_credentials(
+            socket_id,
+            SocketCredentials {
+                pid,
+                capabilities: caps,
+            },
+        )?;
         let parker = self.ipc.connect_socket(socket_id, path)?;
         self.wake_parked_acceptor_if_any(parker)?;
         Ok(())
+    }
+
+    fn ensure_host_file_listener(&mut self) -> Result<SocketId, KernelError> {
+        if let Some(listener) = self.host_file_listener {
+            return Ok(listener);
+        }
+        let listener = self.ipc.create_socket(SocketType::Stream)?;
+        self.ipc.set_socket_credentials(
+            listener,
+            SocketCredentials {
+                pid: 0,
+                capabilities: CapSet::EMPTY,
+            },
+        )?;
+        self.ipc
+            .bind_socket(listener, abi::ext::host_file::ENDPOINT)?;
+        self.ipc.listen_socket(listener, 16)?;
+        self.host_file_listener = Some(listener);
+        Ok(listener)
+    }
+
+    /// Return the capability snapshot of the process at the other
+    /// end of a connected IPC socket. Possession of `fd` is the only
+    /// authority required, matching `SO_PEERCRED`: the caller cannot
+    /// name an arbitrary pid, and the result comes exclusively from
+    /// credentials the kernel captured during connect/accept.
+    pub fn ipc_peer_caps(&self, pid: Pid, fd: u32) -> Result<CapSet, KernelError> {
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        let credentials = self.ipc.peer_credentials(socket_id)?;
+        Ok(credentials.capabilities)
+    }
+
+    /// Return the pid snapshot of the process at the other end of a
+    /// connected IPC socket. The fd scopes the query and the kernel's
+    /// connection-time credentials are the only source of the result.
+    pub fn ipc_peer_pid(&self, pid: Pid, fd: u32) -> Result<Pid, KernelError> {
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        let credentials = self.ipc.peer_credentials(socket_id)?;
+        Ok(credentials.pid)
     }
 
     /// `ipc_send(pid, fd, buf, fd_to_pass)` — send `buf` (and an
@@ -1406,7 +1982,7 @@ impl Kernel {
     ///   `fd_to_pass` (queued on the peer's ancillary-fd queue for a
     ///   future `ipc_recv` to drain).
     /// * [`FdObject::PipeWrite`] — bytes go through
-    ///   [`Pipe::try_write`]. Pipes are byte streams without an
+    ///   [`IpcTable::write_pipe`]. Pipes are byte streams without an
     ///   ancillary channel, so `fd_to_pass.is_some()` on a pipe is
     ///   rejected as [`KernelError::InvalidArgument`] before any
     ///   write is attempted.
@@ -1416,14 +1992,11 @@ impl Kernel {
     ///   EINVAL, distinguishing the IPC opcodes from the more
     ///   generic FD_WRITE arm that uses EINVAL).
     ///
-    /// `fd_to_pass` validity is checked BEFORE the send — an invalid
-    /// ancillary fd causes EBADF without enqueuing the bytes (the
-    /// spec mandates the receiver gets nothing on this failure).
-    /// Validation is "fd exists in the caller's table"; the value
-    /// itself is shipped as a u32 to be re-installed by the eventual
-    /// IPC_RECV slice. v1's per-socket `rx_fds` queue stores the
-    /// number alone — translation into a fresh receiver-side
-    /// FdEntry is the IPC_RECV slice's job, not this one.
+    /// `fd_to_pass` is resolved to an [`FdObject`] and retained BEFORE
+    /// the send. The socket queue owns that snapshot until receive or
+    /// teardown, so sender close/reuse cannot alter it. Unsupported
+    /// single-owner object kinds return [`KernelError::UnsupportedAncillary`]
+    /// before any byte or descriptor is enqueued.
     ///
     /// Pipe-broken outcomes additionally post [`Signal::Pipe`] to
     /// the caller's signal inbox via [`Self::post_sigpipe`], same
@@ -1443,27 +2016,39 @@ impl Kernel {
             .ok_or(KernelError::NoSuchPid)?
             .get(fd)
             .ok_or(KernelError::BadFd)?;
-        if let Some(ancillary) = fd_to_pass {
-            // Verify the ancillary fd exists in the caller's table
-            // BEFORE enqueuing any bytes. A bad ancillary fd must
-            // not produce a partial send (the receiver would otherwise
-            // observe payload bytes without the promised fd).
-            let table = self.fds.get(&pid).ok_or(KernelError::NoSuchPid)?;
-            if table.get(ancillary).is_none() {
-                return Err(KernelError::BadFd);
-            }
-        }
+        // Snapshot the underlying object at send time. This removes the
+        // close/reuse race inherent in queueing a sender-local fd number.
+        let ancillary_object = match fd_to_pass {
+            Some(ancillary) => Some(
+                self.fds
+                    .get(&pid)
+                    .ok_or(KernelError::NoSuchPid)?
+                    .get(ancillary)
+                    .ok_or(KernelError::BadFd)?
+                    .object,
+            ),
+            None => None,
+        };
+        let mut pipe_reader_wakes = Vec::new();
+        let mut written_pipe = None;
         let result: Result<usize, KernelError> = match entry.object {
             FdObject::Socket(id) => {
-                let passed = match fd_to_pass {
-                    Some(f) => alloc::vec![f],
-                    None => Vec::new(),
-                };
+                if let Some(object) = ancillary_object {
+                    self.retain_ancillary_object(object)?;
+                }
+                let passed = ancillary_object.into_iter().collect();
                 let r = self
                     .ipc
                     .send_on_socket(SocketId(id), buf, passed)
                     .map_err(KernelError::from);
-                if r.is_ok() {
+                if r.is_err() {
+                    if let Some(object) = ancillary_object {
+                        // The queue never acquired ownership, so undo the
+                        // send-time retain without touching receiver state.
+                        self.release_object(object);
+                    }
+                }
+                if matches!(r, Ok(written) if written > 0 || ancillary_object.is_some()) {
                     // Bytes / fds landed on the peer's rx side — if
                     // any pid is parked on a blocking ipc_recv
                     // against the peer socket, wake it now with the
@@ -1479,9 +2064,16 @@ impl Kernel {
                     return Err(KernelError::InvalidArgument);
                 }
                 use crate::ipc::{PipeId, PipeWriteResult};
-                match self.ipc.pipe_mut(PipeId(id)) {
-                    Ok(pipe) => match pipe.try_write(buf) {
-                        PipeWriteResult::Wrote(n) => Ok(n),
+                match self.ipc.write_pipe(PipeId(id), buf) {
+                    Ok(result) => match result {
+                        PipeWriteResult::Wrote(n) => {
+                            if n > 0 {
+                                let pipe = self.ipc.pipe_mut(PipeId(id))?;
+                                pipe_reader_wakes = pipe.drain_waiting_readers();
+                                written_pipe = Some(PipeId(id));
+                            }
+                            Ok(n)
+                        }
                         PipeWriteResult::Broken => Err(KernelError::PipeBroken),
                         PipeWriteResult::WouldBlock => Err(KernelError::WouldBlock),
                     },
@@ -1492,6 +2084,11 @@ impl Kernel {
         };
         if matches!(result, Err(KernelError::PipeBroken)) {
             self.post_sigpipe(pid);
+        }
+        if let Some(pipe_id) = written_pipe {
+            for reader_pid in pipe_reader_wakes {
+                self.wake_parked_pipe_reader(reader_pid, pipe_id);
+            }
         }
         result
     }
@@ -1531,29 +2128,11 @@ impl Kernel {
     /// matches POSIX `recvmsg(2)` with `msg_control = NULL` —
     /// ancillary data stays queued until a caller asks for it.
     ///
-    /// fd-translation: when `want_fd = true` and the rx_fds queue
-    /// has at least one entry, the kernel dequeues ONE u32 number
-    /// via [`IpcTable::recv_on_socket`] and tries to translate it
-    /// into a fresh receiver-side [`FdEntry`]:
-    ///
-    ///   1. Find the peer's `SocketId` from the receive-side
-    ///      socket's `peer` field.
-    ///   2. Scan `self.fds` for the pid whose fd table contains an
-    ///      `FdObject::Socket(peer_id)` entry — that's the sender.
-    ///   3. Look up the queued u32 in the sender's fd table to get
-    ///      the underlying `FdObject`.
-    ///   4. Allocate a new fd in the receiver's fd table installing
-    ///      a clone of that object.
-    ///
-    /// If any step of the translation fails (sender process exited
-    /// between send and recv, sender closed the fd before recv,
-    /// peer pointer became `None`), the queued u32 is silently
-    /// dropped and the receiver gets `Ok((bytes, None))`. This is
-    /// a deliberate v1 degradation: a more rigorous impl would
-    /// resolve the underlying object at SEND time and queue the
-    /// `FdObject` directly (eliminating the dangling-fd race), but
-    /// the IPC_SEND slice committed to queueing only the u32 number
-    /// — changing that is a separate IPC-table refactor.
+    /// When `want_fd = true`, the kernel checks fd-table capacity before
+    /// consuming any receive state. `OutOfFds` therefore leaves both bytes
+    /// and the queue-owned [`FdObject`] snapshot intact for retry. A successful
+    /// allocation transfers that retained reference directly into the new
+    /// [`FdEntry`] without consulting the sender or its current fd table.
     pub fn ipc_recv(
         &mut self,
         pid: Pid,
@@ -1562,6 +2141,12 @@ impl Kernel {
         want_fd: bool,
     ) -> Result<(Vec<u8>, Option<u32>), KernelError> {
         let socket_id = self.socket_id_from_fd(pid, fd)?;
+        // If an fd is waiting, reserve fd-table capacity before draining
+        // either bytes or ancillary state. EMFILE therefore leaves the
+        // complete receive record queued and retryable.
+        if want_fd && self.ipc.socket_has_ancillary(socket_id)? && !self.fds(pid)?.has_capacity(1) {
+            return Err(KernelError::OutOfFds);
+        }
         let max_fds = if want_fd { 1 } else { 0 };
         let mut buf = alloc::vec![0u8; max_len];
         let (n, fds) = self
@@ -1570,55 +2155,30 @@ impl Kernel {
             .map_err(KernelError::from)?;
         buf.truncate(n);
 
-        let new_fd = if let Some(&sender_fd_num) = fds.first() {
-            self.translate_passed_fd(socket_id, pid, sender_fd_num)
-        } else {
-            None
-        };
-
-        Ok((buf, new_fd))
-    }
-
-    /// Resolve a queued u32 fd-number into a receiver-side
-    /// [`FdEntry`]. Returns `Some(new_fd)` on success, `None` if
-    /// any step fails (sender exited, peer cleared, sender's fd
-    /// closed, or fd-table install errored).
-    ///
-    /// Encapsulated as a separate method so [`Self::ipc_recv`]
-    /// reads as a single linear flow — the lookup-and-install dance
-    /// is enough machinery to deserve its own name.
-    fn translate_passed_fd(
-        &mut self,
-        receiver_socket: SocketId,
-        receiver_pid: Pid,
-        sender_fd_num: u32,
-    ) -> Option<u32> {
-        let peer_id = self.ipc.sockets_get(receiver_socket)?.peer?;
-        let sender_pid = self.find_pid_owning_socket(peer_id)?;
-        let sender_object = self.fds.get(&sender_pid)?.get(sender_fd_num)?.object;
-        let table = self.fds.get_mut(&receiver_pid)?;
-        table.alloc(FdEntry::new(sender_object)).ok()
-    }
-
-    /// Linear scan helper: find the pid whose fd table contains an
-    /// `FdObject::Socket(socket_id)` entry. v1 invariant: each
-    /// socket id is referenced by at most one process's fd table.
-    /// Returns `None` if no process owns the socket — this is the
-    /// "sender exited between send and recv" path for
-    /// [`Self::translate_passed_fd`]. O(P * F) but P and F are
-    /// small in v1 (handful of processes, soft-limit ~1024 fds);
-    /// a reverse index would optimise this when it matters.
-    fn find_pid_owning_socket(&self, socket_id: SocketId) -> Option<Pid> {
-        for (pid, table) in &self.fds {
-            for (_fd, entry) in table.iter() {
-                if let FdObject::Socket(id) = entry.object {
-                    if id == socket_id.0 {
-                        return Some(*pid);
+        let new_fd = match fds.first().copied() {
+            Some(object) => {
+                // `object` already owns the reference retained by the sender;
+                // successful allocation transfers that ownership from the
+                // socket queue into the receiver's fd table.
+                match self
+                    .fds
+                    .get_mut(&pid)
+                    .ok_or(KernelError::NoSuchPid)?
+                    .alloc(FdEntry::new(object))
+                {
+                    Ok(fd) => Some(fd),
+                    Err(error) => {
+                        // Capacity was checked above, so this is defensive
+                        // rollback for a violated fd-table invariant.
+                        self.release_object(object);
+                        return Err(error.into());
                     }
                 }
             }
-        }
-        None
+            None => None,
+        };
+
+        Ok((buf, new_fd))
     }
 
     /// Helper: look up `fd` in `pid`'s fd table and return the
@@ -1646,6 +2206,40 @@ impl Kernel {
         fd: u32,
     ) -> Result<crate::ipc::SocketId, KernelError> {
         self.socket_id_from_fd(pid, fd)
+    }
+
+    /// Apply a socket half-close and release every unread ancillary snapshot
+    /// discarded by a read shutdown.
+    pub fn shutdown_socket_fd(
+        &mut self,
+        pid: Pid,
+        fd: u32,
+        read: bool,
+        write: bool,
+    ) -> Result<(), KernelError> {
+        let socket_id = self.socket_id_from_fd(pid, fd)?;
+        let peer_id = self
+            .ipc
+            .sockets_get(socket_id)
+            .and_then(|socket| socket.peer);
+        let ancillary = self.ipc.shutdown_socket(socket_id, read, write)?;
+        for object in ancillary {
+            self.release_object(object);
+        }
+        if read {
+            // A shared endpoint (where present in legacy state) blocked in
+            // recv now observes the local read shutdown as EOF.
+            let _ = self.wake_parked_recver_if_any(socket_id);
+        }
+        if write {
+            // The peer's empty receive side transitions to EOF immediately on
+            // SHUT_WR. A custom blocking IPC_RECV parker is separate from the
+            // poll table and must be completed explicitly.
+            if let Some(peer_id) = peer_id {
+                let _ = self.wake_parked_recver_if_any(peer_id);
+            }
+        }
+        Ok(())
     }
 
     /// Test helper: True iff `pending_wakes` is empty.
@@ -1699,27 +2293,31 @@ impl Kernel {
             })
             .collect();
         for id in orphans {
-            // Mirror release_object's recv-parker drain: wake any
-            // parked recver on this socket (or its peer) with EBADF
-            // BEFORE closing the socket, so the parker observes
-            // the error path rather than sitting parked forever.
-            self.wake_parked_recvers_on_socket_close(id);
-            match self.ipc.close_socket(id) {
-                Ok(Some((parker_pid, req_id))) => {
-                    self.pending_wakes.push((
-                        parker_pid,
-                        abi::ring::Response::err(req_id, abi::errno::EBADF),
-                        None,
-                    ));
-                    let _ = self.procs.transition(parker_pid, ProcState::Ready);
-                    self.procs.clear_block_reason(parker_pid);
-                }
-                _ => {}
+            if let Ok(Some((parker_pid, req_id))) = self.close_ipc_socket(id) {
+                self.pending_wakes.push((
+                    parker_pid,
+                    abi::ring::Response::err(req_id, abi::errno::EBADF),
+                    None,
+                ));
+                let _ = self.procs.transition(parker_pid, ProcState::Ready);
+                self.procs.clear_block_reason(parker_pid);
             }
+            self.wake_terminal_parked_recvers_after_socket_close();
         }
     }
 
     // --- Private helpers -----------------------------------------
+
+    /// Remove a socket and release queue-owned ancillary references after the
+    /// `IpcTable` borrow ends. Ancillary admission rejects sockets and other
+    /// single-owner objects, so this cannot recursively close another socket.
+    fn close_ipc_socket(&mut self, id: SocketId) -> Result<Option<(Pid, u32)>, IpcError> {
+        let cleanup = self.ipc.close_socket(id)?;
+        for object in cleanup.ancillary {
+            self.release_object(object);
+        }
+        Ok(cleanup.parked_acceptor)
+    }
 
     /// Release any per-fd-object resources on the kernel side.
     /// Currently a no-op for every variant except the two we
@@ -1731,17 +2329,15 @@ impl Kernel {
                 let _ = self.ipc.drop_pipe_reader(crate::ipc::PipeId(id));
             }
             FdObject::PipeWrite(id) => {
-                let _ = self.ipc.drop_pipe_writer(crate::ipc::PipeId(id));
+                let pipe_id = crate::ipc::PipeId(id);
+                if let Ok(readers) = self.ipc.drop_pipe_writer(pipe_id) {
+                    for reader_pid in readers {
+                        self.wake_parked_pipe_reader(reader_pid, pipe_id);
+                    }
+                }
             }
             FdObject::Socket(id) => {
-                // Wake any blocking-recv parker waiting on this
-                // socket BEFORE the close — their socket is going
-                // away, so the wake response is EBADF (the fd they
-                // were parked on no longer exists). Mirror of the
-                // close_socket parker drain that handles the accept
-                // side.
-                self.wake_parked_recvers_on_socket_close(crate::ipc::SocketId(id));
-                match self.ipc.close_socket(crate::ipc::SocketId(id)) {
+                match self.close_ipc_socket(crate::ipc::SocketId(id)) {
                     Ok(Some((parker_pid, req_id))) => {
                         self.pending_wakes.push((
                             parker_pid,
@@ -1754,6 +2350,17 @@ impl Kernel {
                     Ok(None) => {}
                     Err(_) => {}
                 }
+                // Complete every recv parker whose condition became terminal
+                // because of this close. A parker on the destroyed descriptor
+                // gets EBADF; a surviving connected peer gets successful EOF;
+                // and a queued client refused by listener teardown gets
+                // ECONNREFUSED. `wake_parked_recver_if_any` derives those
+                // outcomes from the post-close socket state.
+                self.wake_terminal_parked_recvers_after_socket_close();
+                // `/run/host-files` owns the server side without an fd. If
+                // its client closes, the peer loses its link and must be
+                // pruned here rather than waiting for another host drop.
+                self.prune_host_file_subscribers();
             }
             FdObject::Watch { watch_id } => {
                 // Unregister the watch from the VFS notifier so future
@@ -1771,8 +2378,13 @@ impl Kernel {
                 // slice. A close on a token that never had a recv
                 // (or a token whose state was already drained) is a
                 // silent no-op — `BTreeMap::remove` returns None.
-                let _ = self.host_file_fds.remove(&token);
+                if let Some(file) = self.host_file_fds.remove(&token) {
+                    self.host_file_live_bytes_total = self
+                        .host_file_live_bytes_total
+                        .saturating_sub(file.file.bytes.len());
+                }
             }
+            FdObject::HostDownload { id } => self.cancel_host_download(id),
             FdObject::Vnode { .. }
             | FdObject::CharDevice(_)
             | FdObject::DisplayConn(_)
@@ -1780,41 +2392,29 @@ impl Kernel {
         }
     }
 
-    /// Drain any parked-recver entries whose `socket_id` matches
-    /// `socket_id` (or whose `socket_id` matches the peer of
-    /// `socket_id` — closing one end of a connected pair makes the
-    /// peer effectively unreadable). For each match, queue a
-    /// `Response::err(req_id, -EBADF)` wake on `pending_wakes`,
-    /// transition the parker Ready, clear `block_reason`, drop the
-    /// parker slot.
-    ///
-    /// Mirror of `IpcTable::close_socket`'s parked-acceptor drain
-    /// for the recv side. v1's one-parker-per-pid invariant means
-    /// at most one match per side, but the implementation walks
-    /// the map anyway in case future slices lift that invariant.
-    fn wake_parked_recvers_on_socket_close(&mut self, socket_id: crate::ipc::SocketId) {
-        // Identify the peer (if any) so a close on one end of a
-        // connected pair wakes a parker on the other end too.
-        let peer_id = self.ipc.sockets_get(socket_id).and_then(|s| s.peer);
-        let to_wake: alloc::vec::Vec<(Pid, u32)> = self
+    /// Complete recv parkers whose socket reached a terminal state after a
+    /// close. The regular wake helper performs the receive against post-close
+    /// state, preserving the distinct public outcomes: local destroyed fd is
+    /// EBADF, a surviving peer is EOF, and a refused connecting client is
+    /// ECONNREFUSED.
+    fn wake_terminal_parked_recvers_after_socket_close(&mut self) {
+        let to_wake: alloc::vec::Vec<crate::ipc::SocketId> = self
             .parked_recvers
-            .iter()
-            .filter_map(|(pid, parker)| {
-                let matches = parker.socket_id == socket_id
-                    || peer_id.map(|p| p == parker.socket_id).unwrap_or(false);
-                if matches {
-                    Some((*pid, parker.req_id))
-                } else {
-                    None
+            .values()
+            .filter_map(|parker| match self.ipc.sockets_get(parker.socket_id) {
+                None => Some(parker.socket_id),
+                Some(socket)
+                    if socket.state == crate::ipc::SocketState::Closed
+                        || (socket.state == crate::ipc::SocketState::Connected
+                            && socket.peer.is_none()) =>
+                {
+                    Some(parker.socket_id)
                 }
+                Some(_) => None,
             })
             .collect();
-        for (parker_pid, req_id) in to_wake {
-            self.parked_recvers.remove(&parker_pid);
-            let resp = abi::ring::Response::err(req_id, abi::errno::EBADF);
-            self.pending_wakes.push((parker_pid, resp, None));
-            let _ = self.procs.transition(parker_pid, ProcState::Ready);
-            self.procs.clear_block_reason(parker_pid);
+        for socket_id in to_wake {
+            let _ = self.wake_parked_recver_if_any(socket_id);
         }
     }
 
@@ -1855,18 +2455,12 @@ impl Kernel {
     /// already-empty fd table and is effectively a pid-table +
     /// cap-table + signal-inbox sweep.
     pub fn proc_exit(&mut self, pid: Pid, status: ExitStatus) -> Result<(), KernelError> {
-        self.sched.remove(pid);
-        // If this pid is parked on any listener, clear the slot so
-        // the listener doesn't hold a stale reference after the
-        // process dies.
-        self.ipc.clear_parked_acceptor_for_pid(pid);
-        // If the exiting pid is itself parked on a blocking
-        // proc_wait, clear the slot so the exit-time sweep
-        // mirrors the ipc_accept side.
-        self.parked_waiters.remove(&pid);
-        // Same surgical sweep for the blocking ipc_recv parker
-        // slot — an exiting pid can't observe a recv wake.
-        self.parked_recvers.remove(&pid);
+        let ppid = match self.procs.get(pid) {
+            Some(process) if !matches!(process.state, ProcState::Zombie | ProcState::Dead) => {
+                process.ppid
+            }
+            _ => return Err(KernelError::NoSuchPid),
+        };
         // Best-effort persistence barrier: dirty filesystems get
         // their `sync` hook before the process loses ownership of
         // its descriptors. Exit must still complete if a flush
@@ -1878,10 +2472,7 @@ impl Kernel {
         // last_flush_ns advances) even when the periodic threshold
         // hasn't fired yet. proc_exit is a hard barrier — the
         // process is going away, flush regardless of policy.
-        let now = crate::platform::current().now_realtime_ns();
-        let _ = self.flush_policy.flush_now(&mut self.vfs, now);
-        self.release_fd_table_resources(pid);
-        let ppid = self.procs.get(pid).map(|p| p.ppid).unwrap_or(0);
+        self.prepare_process_exit(pid);
         self.procs
             .exit(pid, status)
             .map_err(|_| KernelError::NoSuchPid)?;
@@ -1909,6 +2500,64 @@ impl Kernel {
         }
     }
 
+    /// Remove every source of runnable or owned state for `pid`
+    /// before its process-table entry becomes terminal. Both
+    /// voluntary exit and SIGKILL use this barrier so their cleanup
+    /// semantics cannot drift apart.
+    fn prepare_process_exit(&mut self, pid: Pid) {
+        self.sched.remove(pid);
+        self.ipc.clear_parked_acceptor_for_pid(pid);
+        self.parked_waiters.remove(&pid);
+        self.parked_recvers.remove(&pid);
+        self.take_parked_poll(pid);
+        // A blocking operation may already have published its delayed
+        // response and made the process Ready before an exit/signal reaches
+        // this barrier. Terminal publication wins: never leave a stale wake
+        // capable of resuming a dead Worker (or retaining its heap payload).
+        self.pending_wakes
+            .retain(|(wake_pid, _, _)| *wake_pid != pid);
+        if let Some(parker) = self.parked_pipe_readers.remove(&pid) {
+            if let Ok(pipe) = self.ipc.pipe_mut(parker.pipe_id) {
+                pipe.remove_waiting_reader(pid);
+            }
+        }
+        let now = crate::platform::current().now_realtime_ns();
+        let _ = self.flush_policy.flush_now(&mut self.vfs, now);
+        self.release_fd_table_resources(pid);
+    }
+
+    pub fn poll_admission_class(&self, pid: Pid) -> Result<PollAdmissionClass, KernelError> {
+        let caps = self.caps.list(pid)?;
+        Ok(if caps.contains(Cap::DisplayServer) {
+            PollAdmissionClass::DisplayServer
+        } else if caps.contains(Cap::Shell) {
+            PollAdmissionClass::Shell
+        } else {
+            PollAdmissionClass::Ordinary
+        })
+    }
+
+    /// Remove one parked poll and release its global subscription admission.
+    /// All wake, signal, and exit paths use this helper so accounting cannot
+    /// drift when a request completes without returning through its caller.
+    pub(crate) fn take_parked_poll(&mut self, pid: Pid) -> Option<PollParker> {
+        let parker = self.parked_polls.remove(&pid)?;
+        let charge = parker.subscriptions.len();
+        self.parked_poll_subscriptions = self
+            .parked_poll_subscriptions
+            .checked_sub(charge)
+            .expect("parked poll admission accounting underflow");
+        let class_counter = match parker.admission_class {
+            PollAdmissionClass::Ordinary => &mut self.parked_poll_ordinary_subscriptions,
+            PollAdmissionClass::DisplayServer => &mut self.parked_poll_display_subscriptions,
+            PollAdmissionClass::Shell => &mut self.parked_poll_shell_subscriptions,
+        };
+        *class_counter = class_counter
+            .checked_sub(charge)
+            .expect("parked poll class accounting underflow");
+        Some(parker)
+    }
+
     /// Drain the named process's fd table, releasing every
     /// object-side resource (pipe ref, socket, display conn)
     /// held by the open fds. The fd table itself is left in
@@ -1928,6 +2577,41 @@ impl Kernel {
 
     // --- Spawn / wait / kill -------------------------------------
 
+    /// Install an already-resolved parent fd object into a newly spawned
+    /// child at an explicit descriptor number.
+    ///
+    /// `PROC_SPAWN` uses this after the base process entry and stdio are
+    /// created but before the host Worker is published. Descriptors 0..=4 are
+    /// reserved for stdio, the WASI root preopen, and the signal channel;
+    /// explicit mappings start at [`abi::fd::FIRST_DYNAMIC`].
+    pub fn install_spawn_extra_fd(
+        &mut self,
+        child_pid: Pid,
+        child_fd: u32,
+        object: FdObject,
+    ) -> Result<(), KernelError> {
+        if child_fd < well_known_fd::FIRST_DYNAMIC || child_fd as usize >= crate::fd::FD_SOFT_LIMIT
+        {
+            return Err(KernelError::InvalidArgument);
+        }
+        if self.fds(child_pid)?.is_open(child_fd) {
+            return Err(KernelError::InvalidArgument);
+        }
+        if matches!(
+            object,
+            FdObject::Watch { .. } | FdObject::HostFile { .. } | FdObject::HostDownload { .. }
+        ) {
+            return Err(KernelError::NotSupportedOnFd);
+        }
+        if matches!(object, FdObject::Socket(_)) {
+            return Err(KernelError::UnsupportedAncillary);
+        }
+        self.inherit_object(object);
+        self.fds_mut(child_pid)?
+            .install_at(child_fd, FdEntry::new(object))?;
+        Ok(())
+    }
+
     /// Spawn a fresh child process. Creates the pid, installs its
     /// cap set (must be a subset of `parent_pid`'s own cap set —
     /// the privilege-escalation guard), copies stdin/stdout/stderr
@@ -1946,6 +2630,31 @@ impl Kernel {
         let parent_caps = self.caps.list(parent_pid)?;
         if !parent_caps.is_superset_of(args.caps) {
             return Err(KernelError::NotCapable);
+        }
+        if [args.stdin, args.stdout, args.stderr].iter().any(|object| {
+            matches!(
+                object,
+                FdObject::Watch { .. } | FdObject::HostFile { .. } | FdObject::HostDownload { .. }
+            )
+        }) {
+            return Err(KernelError::NotSupportedOnFd);
+        }
+        if [args.stdin, args.stdout, args.stderr]
+            .iter()
+            .any(|object| matches!(object, FdObject::Socket(_)))
+        {
+            return Err(KernelError::UnsupportedAncillary);
+        }
+
+        // Resolve the root before allocating any child state so a malformed
+        // mount table cannot leave a half-created process behind.
+        let root_preopen = self.root_preopen_object()?;
+
+        // Capacity is checked only after validating the parent and manifest,
+        // but before consuming a pid or allocating the child's process, fd,
+        // capability, signal, scheduler, or host-Worker state.
+        if !self.procs.has_spawn_capacity(parent_pid) {
+            return Err(KernelError::ProcessLimit);
         }
 
         // Allocate + construct the child process.
@@ -1970,18 +2679,22 @@ impl Kernel {
                 .expect("stdio install within soft limit");
         }
 
-        // Auto-install the per-process signal channel at fd 3.
-        // Matches the POSIX signalfd convention referenced in
-        // `crates/kernel/src/proc/signal.rs` ("a `fd_read` on
-        // fd 3 drains pending signals"): every proc_spawn'd
-        // child can observe its own signal stream via fd_read +
-        // POLL_ONEOFF on fd 3 without an explicit install step.
+        // WASI libc discovers directory preopens starting at fd 3. Expose the
+        // real VFS root there so portable `std::fs` code can resolve absolute
+        // and relative paths through the standard preview-1 interface.
+        let table = self.fds.get_mut(&child_pid).unwrap();
+        table
+            .install_at(well_known_fd::ROOT_PREOPEN, FdEntry::new(root_preopen))
+            .expect("root preopen install within soft limit");
+
+        // The PMos signal inbox follows the standard preopen at fd 4. Keeping
+        // it out of fd 3 avoids colliding with libc's mandatory preopen scan.
         // Processes built via `register_process` (a lower-level
         // test primitive) do NOT get the auto-install — that
         // primitive is deliberately minimal.
         let table = self.fds.get_mut(&child_pid).unwrap();
         table
-            .install_at(3, FdEntry::new(FdObject::SignalChannel))
+            .install_at(well_known_fd::SIGNAL, FdEntry::new(FdObject::SignalChannel))
             .expect("signal channel install within soft limit");
 
         // Child is ready to run.
@@ -1990,6 +2703,70 @@ impl Kernel {
             .map_err(|_| KernelError::NoSuchPid)?;
         self.sched.enqueue(child_pid);
         Ok(child_pid)
+    }
+
+    /// Resolve an executable for `proc_spawn`.
+    ///
+    /// `/bin/*` and `/usr/bin/*` are immutable bundled namespaces and return
+    /// `None` for browser-host registry lookup. Dynamic bytes may come only
+    /// from a normalised `/opt/*` path; every other namespace fails closed.
+    /// Resolution remains confined beneath `/opt` across symlinks.
+    pub fn load_vfs_executable(&mut self, path: &str) -> Result<Option<Vec<u8>>, KernelError> {
+        let normalised = crate::vfs::path::normalize(path);
+        if normalised.starts_with("/bin/") || normalised.starts_with("/usr/bin/") {
+            // These namespaces name release-pinned browser-registry binaries.
+            // Ignoring writable VFS shadows prevents a process with the root
+            // preopen from replacing a later privileged init launch. Dynamic
+            // package executables continue to load from `/opt`.
+            return Ok(None);
+        }
+        if !normalised.starts_with("/opt/") {
+            return Err(FsError::PermissionDenied.into());
+        }
+        let (mount_id, ino) = match self.vfs.resolve_beneath(&normalised, "/opt") {
+            Ok(resolved) => resolved,
+            // A missing dynamic program is terminal: only the two bundled
+            // namespaces above may fall back to the host registry.
+            Err(FsError::NotFound) => return Err(FsError::NotFound.into()),
+            Err(error) => return Err(error.into()),
+        };
+        let stat = self.vfs.stat_ino(mount_id, ino)?;
+        if !stat.ty.is_regular() {
+            return Err(FsError::PermissionDenied.into());
+        }
+        if stat.mode & 0o111 == 0 {
+            return Err(FsError::PermissionDenied.into());
+        }
+        let size = usize::try_from(stat.size).map_err(|_| KernelError::FileTooLarge)?;
+        if size > abi::ext::spawn_v1::MAX_EXECUTABLE_BYTES {
+            return Err(KernelError::FileTooLarge);
+        }
+        let mut bytes = alloc::vec![0u8; size];
+        let mut offset = 0usize;
+        while offset < size {
+            let read = self
+                .vfs
+                .read_ino(mount_id, ino, offset as u64, &mut bytes[offset..])?;
+            if read == 0 {
+                return Err(FsError::Io.into());
+            }
+            offset += read;
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Apply POSIX permission bits to an existing guest VFS path.
+    /// PMos v1 is single-user and has no uid/gid ownership model; path access
+    /// follows the same root-preopen authority as ordinary WASI file mutation.
+    pub fn fs_chmod(&mut self, pid: Pid, path: &str, mode: u32) -> Result<(), KernelError> {
+        if !self.procs.is_alive(pid) {
+            return Err(KernelError::NoSuchPid);
+        }
+        if mode & !0o777 != 0 {
+            return Err(KernelError::InvalidArgument);
+        }
+        self.vfs.set_mode(path, mode)?;
+        Ok(())
     }
 
     /// Wait on a child. Non-blocking: returns `WouldBlock` when
@@ -2212,11 +2989,9 @@ impl Kernel {
         true
     }
 
-    /// Deliver `signal` to `target_pid`. The v1 kernel only
-    /// actually terminates on `Kill`; other signals succeed
-    /// syntactically (cap checks apply) but are otherwise
-    /// buffered for a later slice that wires up the per-process
-    /// signal inbox.
+    /// Deliver `signal` to `target_pid`. `Kill` terminates
+    /// synchronously; every catchable v1 signal is queued in the
+    /// target's bounded per-process signal inbox.
     ///
     /// Cap rules: the sender must either be the target's parent
     /// OR hold `Cap::ProcKillAny`. This mirrors the POSIX
@@ -2231,11 +3006,17 @@ impl Kernel {
         // Sender must exist.
         let sender_caps = self.caps.list(sender_pid)?;
 
-        // Target must exist and must not already be reaped.
-        let target = self.procs.get(target_pid).ok_or(KernelError::NoSuchPid)?;
-        let is_parent = target.ppid == sender_pid;
+        // Target must exist and must not already be terminal. A
+        // duplicate SIGKILL against a Zombie must not re-run exit
+        // side effects or ask the host to terminate its Worker twice.
+        let (target_ppid, target_state) = self
+            .procs
+            .get(target_pid)
+            .map(|target| (target.ppid, target.state))
+            .ok_or(KernelError::NoSuchPid)?;
+        let is_parent = target_ppid == sender_pid;
         let is_self = sender_pid == target_pid;
-        if target.state == ProcState::Dead {
+        if matches!(target_state, ProcState::Zombie | ProcState::Dead) {
             return Err(KernelError::NoSuchPid);
         }
 
@@ -2254,34 +3035,17 @@ impl Kernel {
         // that already has Term pending do not grow the queue.
         match signal {
             Signal::Kill => {
-                // Remove from the scheduler immediately so no
-                // pick_next can resurrect the pid after it's
-                // been marked zombie.
-                self.sched.remove(target_pid);
-                // If the SIGKILL'd pid is parked on any listener,
-                // clear the slot so the listener doesn't hold a
-                // stale reference after the pid transitions Zombie.
-                // Mirror of `proc_exit`'s equivalent sweep — the
-                // SIGKILL path bypasses `proc_exit` entirely and
-                // so needs its own call. No EINTR wake is queued
-                // here (the pid is dead, not interrupted).
-                self.ipc.clear_parked_acceptor_for_pid(target_pid);
-                // Same surgical sweep for parked_waiters. A
-                // SIGKILL'd parent parked on wait is dead, not
-                // interrupted — no EINTR wake is queued (that's
-                // `interrupt_parked_wait`'s job from the
-                // catchable-signal arm). This just clears the
-                // stale slot.
-                self.parked_waiters.remove(&target_pid);
-                // Same surgical sweep for parked_recvers. SIGKILL
-                // takes the parker out without an EINTR wake — the
-                // process is dead, no userland will observe the
-                // wake response.
-                self.parked_recvers.remove(&target_pid);
-                let target_ppid = target.ppid;
+                // Reclaim scheduler, parker, persistence, and fd/
+                // IPC ownership before publishing the Zombie. This
+                // is the same exit barrier used by voluntary exits.
+                self.prepare_process_exit(target_pid);
                 self.procs
                     .exit(target_pid, ExitStatus::Signaled(signal.number()))
                     .map_err(|_| KernelError::NoSuchPid)?;
+                // The process-table transition is authoritative.
+                // Host teardown is best-effort: a broken transport
+                // cannot make a SIGKILL'd process runnable again.
+                let _ = crate::platform::current().terminate_process(target_pid);
                 // POSIX: the parent observes the child's death
                 // via SIGCHLD regardless of whether the child
                 // called proc_exit voluntarily or was killed.
@@ -2312,7 +3076,7 @@ impl Kernel {
 
     /// POSIX `kill(pid, 0)` — the existence + permission probe.
     /// Runs every precondition `proc_kill` would run (sender
-    /// exists, target exists, target not Dead, sender permitted
+    /// exists, target exists, target not terminal, sender permitted
     /// to signal target via parent/self/ProcKillAny) but
     /// delivers no signal. Returns `Ok(())` if a real
     /// `proc_kill(sender, target, ...)` would succeed on this
@@ -2326,7 +3090,7 @@ impl Kernel {
     pub fn proc_check_signal(&self, sender_pid: Pid, target_pid: Pid) -> Result<(), KernelError> {
         let sender_caps = self.caps.list(sender_pid)?;
         let target = self.procs.get(target_pid).ok_or(KernelError::NoSuchPid)?;
-        if target.state == ProcState::Dead {
+        if matches!(target.state, ProcState::Zombie | ProcState::Dead) {
             return Err(KernelError::NoSuchPid);
         }
         let is_parent = target.ppid == sender_pid;
@@ -2503,6 +3267,13 @@ impl Kernel {
         if normalised == "/" {
             return Err(KernelError::InvalidArgument);
         }
+        // Select the v1 filesystem factory before consulting the target.
+        // Besides making the error precedence deterministic, this ensures an
+        // unsupported filesystem type cannot trigger dynamic-filesystem
+        // projection or other target-side work.
+        if fstype != "tmpfs" {
+            return Err(KernelError::InvalidArgument);
+        }
         // Already-a-mount detection runs FIRST: if `normalised`
         // already exists in the mount table, `Vfs::open(normalised)`
         // would route into the mounted fs's root (a freshly-empty
@@ -2528,10 +3299,8 @@ impl Kernel {
         // Fstype factory: v1 only knows "tmpfs". Other fstypes are
         // either kernel-singleton (devfs/procfs) or boot-only
         // (opfs); see the §3.5 method-doc above.
-        let fs: alloc::boxed::Box<dyn crate::vfs::Filesystem> = match fstype {
-            "tmpfs" => alloc::boxed::Box::new(crate::fs::tmpfs::TmpFs::new()),
-            _ => return Err(KernelError::InvalidArgument),
-        };
+        let fs: alloc::boxed::Box<dyn crate::vfs::Filesystem> =
+            alloc::boxed::Box::new(crate::fs::tmpfs::TmpFs::new());
         let mount_id = self.vfs.mount(&normalised, fs).map_err(KernelError::from)?;
         // Persist the requested flag bitset on the new entry. The
         // initial insert defaults flags to 0 (see MountTable::insert);
@@ -2650,6 +3419,9 @@ impl Kernel {
                 }
             }
         }
+        if self.vfs.watches().has_mount(mount_id) {
+            return Err(KernelError::WouldBlock);
+        }
         self.vfs
             .umount(&normalised)
             .map(|_| ())
@@ -2675,6 +3447,14 @@ impl Kernel {
     ///   VFS registry on this path so a failed install doesn't
     ///   leak a watch slot the caller has no fd for.
     pub fn fs_watch(&mut self, pid: Pid, abs_path: &str, mask: u32) -> Result<u32, KernelError> {
+        let table = self.fds.get(&pid).ok_or(KernelError::NoSuchPid)?;
+        let owned = table
+            .iter()
+            .filter(|(_, entry)| matches!(entry.object, FdObject::Watch { .. }))
+            .count();
+        if owned >= crate::vfs::MAX_WATCHES_PER_PID {
+            return Err(KernelError::ResourceLimit);
+        }
         let watch_id = self.vfs.register_watch(abs_path, mask)?;
         let table = match self.fds.get_mut(&pid) {
             Some(t) => t,
@@ -2692,6 +3472,111 @@ impl Kernel {
                 Err(e.into())
             }
         }
+    }
+
+    /// Begin a bounded, chunked browser-to-kernel import. Reserving the
+    /// declared size before accepting bytes keeps concurrent imports within
+    /// the kernel-wide 32 MiB budget.
+    pub fn host_file_drop_begin(
+        &mut self,
+        token: u32,
+        name: &str,
+        mime: &str,
+        expected_size: usize,
+    ) -> Result<(), KernelError> {
+        if !valid_host_metadata(name, mime)
+            || expected_size > abi::ext::host_file::MAX_IMPORT_BYTES
+            || self.host_files.contains_key(&token)
+            || self.host_file_imports.contains_key(&token)
+            || self.host_file_fds.contains_key(&token)
+        {
+            return Err(if expected_size > abi::ext::host_file::MAX_IMPORT_BYTES {
+                KernelError::FileTooLarge
+            } else {
+                KernelError::InvalidArgument
+            });
+        }
+        if self.host_file_imports.len() + self.host_files.len() + self.host_file_fds.len()
+            >= abi::ext::host_file::MAX_LIVE_IMPORTS
+        {
+            return Err(KernelError::FileTooLarge);
+        }
+        let Some(reserved) = self
+            .host_file_import_reserved_total
+            .checked_add(expected_size)
+        else {
+            return Err(KernelError::FileTooLarge);
+        };
+        if self
+            .host_file_live_bytes_total
+            .checked_add(reserved)
+            .map(|total| total > abi::ext::host_file::MAX_IMPORT_BYTES_TOTAL)
+            .unwrap_or(true)
+        {
+            return Err(KernelError::FileTooLarge);
+        }
+        self.host_file_import_reserved_total = reserved;
+        self.host_file_imports
+            .insert(token, HostImport::new(name, mime, expected_size));
+        Ok(())
+    }
+
+    pub fn host_file_drop_chunk(&mut self, token: u32, bytes: &[u8]) -> Result<(), KernelError> {
+        let import = self
+            .host_file_imports
+            .get_mut(&token)
+            .ok_or(KernelError::BadFd)?;
+        let Some(next_size) = import.bytes.len().checked_add(bytes.len()) else {
+            return Err(KernelError::FileTooLarge);
+        };
+        if next_size > import.expected_size {
+            return Err(KernelError::FileTooLarge);
+        }
+        import.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub fn host_file_drop_end(&mut self, token: u32) -> Result<(), KernelError> {
+        let import = self
+            .host_file_imports
+            .get(&token)
+            .ok_or(KernelError::BadFd)?;
+        if import.bytes.len() != import.expected_size {
+            return Err(KernelError::InvalidArgument);
+        }
+        let import = self.host_file_imports.remove(&token).unwrap();
+        self.host_file_import_reserved_total = self
+            .host_file_import_reserved_total
+            .saturating_sub(import.expected_size);
+        self.host_file_dropped(token, HostFile::new(import.name, import.mime, import.bytes))
+    }
+
+    pub fn host_file_drop_abort(&mut self, token: u32) {
+        if let Some(import) = self.host_file_imports.remove(&token) {
+            self.host_file_import_reserved_total = self
+                .host_file_import_reserved_total
+                .saturating_sub(import.expected_size);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn host_file_import_count(&self) -> usize {
+        self.host_file_imports.len()
+    }
+
+    #[doc(hidden)]
+    pub fn host_file_import_reserved_bytes(&self) -> usize {
+        self.host_file_import_reserved_total
+    }
+
+    #[doc(hidden)]
+    pub fn host_file_live_bytes(&self) -> usize {
+        self.host_file_live_bytes_total
+    }
+
+    #[doc(hidden)]
+    pub fn host_file_live_count(&self) -> usize {
+        self.host_file_imports.len() + self.host_files.len() + self.host_file_fds.len()
     }
 
     /// Register a host-imported file under `token`. Called by the
@@ -2714,8 +3599,129 @@ impl Kernel {
     /// ability to call this method directly (it doesn't today — only
     /// the kernel-side bootstrap notification path will), the cap
     /// check would belong on the entry to that path, not here.
-    pub fn host_file_dropped(&mut self, token: u32, file: HostFile) {
+    pub fn host_file_dropped(&mut self, token: u32, file: HostFile) -> Result<(), KernelError> {
+        if !valid_host_metadata(&file.name, &file.mime)
+            || file.bytes.len() > abi::ext::host_file::MAX_IMPORT_BYTES
+            || self.host_file_imports.contains_key(&token)
+            || self.host_file_fds.contains_key(&token)
+        {
+            return Err(
+                if file.bytes.len() > abi::ext::host_file::MAX_IMPORT_BYTES {
+                    KernelError::FileTooLarge
+                } else {
+                    KernelError::InvalidArgument
+                },
+            );
+        }
+        let prior_len = self
+            .host_files
+            .get(&token)
+            .map(|prior| prior.bytes.len())
+            .unwrap_or(0);
+        if !self.host_files.contains_key(&token)
+            && self.host_file_live_count() >= abi::ext::host_file::MAX_LIVE_IMPORTS
+        {
+            return Err(KernelError::FileTooLarge);
+        }
+        let base = self.host_file_live_bytes_total.saturating_sub(prior_len);
+        let Some(next_total) = base.checked_add(file.bytes.len()) else {
+            return Err(KernelError::FileTooLarge);
+        };
+        if next_total > abi::ext::host_file::MAX_IMPORT_BYTES_TOTAL {
+            return Err(KernelError::FileTooLarge);
+        }
+        self.host_file_assignments.remove(&token);
         self.host_files.insert(token, file);
+        self.host_file_live_bytes_total = next_total;
+        self.deliver_unassigned_host_files();
+        Ok(())
+    }
+
+    fn deliver_unassigned_host_files(&mut self) {
+        self.prune_host_file_subscribers();
+        let tokens: Vec<u32> = self
+            .host_files
+            .keys()
+            .filter(|token| !self.host_file_assignments.contains_key(token))
+            .copied()
+            .collect();
+        for token in tokens {
+            let Some(frame) = self
+                .host_files
+                .get(&token)
+                .and_then(|file| file.notification_frame(token))
+            else {
+                continue;
+            };
+            let subscribers = self.host_file_subscribers.clone();
+            for subscriber in subscribers {
+                if !self.host_subscriber_has_capacity(subscriber, frame.len()) {
+                    continue;
+                }
+                match self
+                    .ipc
+                    .send_on_socket(subscriber, &frame, alloc::vec::Vec::new())
+                {
+                    Ok(written) if written == frame.len() => {
+                        // The host endpoint writes directly through the IPC
+                        // table rather than through `fd_write`/`ipc_send`.
+                        // Mirror those public send paths here: a subscriber
+                        // may already be parked in a blocking receive, and
+                        // merely filling its rx buffer does not make the
+                        // process runnable.
+                        if let Some(peer_id) = self
+                            .ipc
+                            .sockets_get(subscriber)
+                            .and_then(|socket| socket.peer)
+                        {
+                            let _ = self.wake_parked_recver_if_any(peer_id);
+                        }
+                        self.host_file_assignments.insert(token, subscriber);
+                        break;
+                    }
+                    Ok(_) | Err(IpcError::WouldBlock) => {}
+                    Err(_) => {
+                        self.remove_host_file_subscriber(subscriber);
+                    }
+                }
+            }
+        }
+    }
+
+    fn host_subscriber_has_capacity(&self, subscriber: SocketId, len: usize) -> bool {
+        let Some(server) = self.ipc.sockets_get(subscriber) else {
+            return false;
+        };
+        if server.closed {
+            return false;
+        }
+        let Some(peer_id) = server.peer else {
+            return false;
+        };
+        let Some(peer) = self.ipc.sockets_get(peer_id) else {
+            return false;
+        };
+        !peer.closed && peer.rx_cap.saturating_sub(peer.rx_len()) >= len
+    }
+
+    fn prune_host_file_subscribers(&mut self) {
+        let stale: Vec<SocketId> = self
+            .host_file_subscribers
+            .iter()
+            .copied()
+            .filter(|subscriber| !self.host_subscriber_has_capacity(*subscriber, 0))
+            .collect();
+        for subscriber in stale {
+            self.remove_host_file_subscriber(subscriber);
+        }
+    }
+
+    fn remove_host_file_subscriber(&mut self, subscriber: SocketId) {
+        self.host_file_subscribers
+            .retain(|candidate| *candidate != subscriber);
+        self.host_file_assignments
+            .retain(|_, assigned| *assigned != subscriber);
+        let _ = self.close_ipc_socket(subscriber);
     }
 
     /// Snapshot of all currently-pending host-file tokens. Test-
@@ -2784,6 +3790,9 @@ impl Kernel {
         // the token lookup so an unknown-pid attack can't enumerate
         // pending tokens by observing a different errno.
         self.fds(pid)?;
+        if !self.caps.check(pid, Cap::HostTransfer)? {
+            return Err(KernelError::NotCapable);
+        }
         let Some(file) = self.host_files.remove(&token) else {
             return Err(KernelError::BadFd);
         };
@@ -2791,6 +3800,7 @@ impl Kernel {
         match table.alloc(FdEntry::new(FdObject::HostFile { token })) {
             Ok(fd) => {
                 self.host_file_fds.insert(token, HostFileFd::new(file));
+                self.host_file_assignments.remove(&token);
                 Ok(fd)
             }
             Err(e) => {
@@ -2803,6 +3813,118 @@ impl Kernel {
                 Err(e.into())
             }
         }
+    }
+
+    /// Ask the browser to show its native picker. The platform hook is
+    /// reachable only after a kernel capability check; ordinary applications
+    /// cannot synthesize DOM picker requests.
+    pub fn host_file_pick(&self, pid: Pid) -> Result<(), KernelError> {
+        if !self.caps.check(pid, Cap::HostTransfer)? {
+            return Err(KernelError::NotCapable);
+        }
+        crate::platform::current()
+            .request_host_file_picker()
+            .map_err(|_| KernelError::Dev(DevError::DriverFailed))
+    }
+
+    /// Allocate a write-only host download fd. Bytes remain kernel-owned until
+    /// explicit close; every implicit release path cancels the staging object.
+    pub fn host_file_send(&mut self, pid: Pid, name: &str, mime: &str) -> Result<u32, KernelError> {
+        if !self.caps.check(pid, Cap::HostTransfer)? {
+            return Err(KernelError::NotCapable);
+        }
+        if !valid_host_metadata(name, mime) {
+            return Err(KernelError::InvalidArgument);
+        }
+
+        let id = self.next_host_download_id;
+        self.next_host_download_id = self
+            .next_host_download_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or(KernelError::OutOfFds)?;
+        let fd = self
+            .fds
+            .get_mut(&pid)
+            .ok_or(KernelError::NoSuchPid)?
+            .alloc(FdEntry::new(FdObject::HostDownload { id }))?;
+        self.host_downloads
+            .insert(id, HostDownload::new(name, mime));
+        Ok(fd)
+    }
+
+    fn append_host_download(&mut self, id: u32, bytes: &[u8]) -> Result<usize, KernelError> {
+        let Some(download) = self.host_downloads.get_mut(&id) else {
+            return Err(KernelError::BadFd);
+        };
+        let next_file_size = download.bytes.len().checked_add(bytes.len());
+        let next_total_size = self.host_download_bytes_total.checked_add(bytes.len());
+        if next_file_size
+            .map(|size| size > abi::ext::host_file::MAX_DOWNLOAD_BYTES)
+            .unwrap_or(true)
+            || next_total_size
+                .map(|size| size > abi::ext::host_file::MAX_DOWNLOAD_BYTES_TOTAL)
+                .unwrap_or(true)
+        {
+            download.failed = true;
+            return Err(KernelError::FileTooLarge);
+        }
+        download.bytes.extend_from_slice(bytes);
+        self.host_download_bytes_total += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn finalize_host_download(&mut self, id: u32) -> Result<(), KernelError> {
+        let Some(download) = self.host_downloads.remove(&id) else {
+            return Err(KernelError::BadFd);
+        };
+        self.host_download_bytes_total = self
+            .host_download_bytes_total
+            .saturating_sub(download.bytes.len());
+        if download.failed {
+            return Ok(());
+        }
+        crate::platform::current()
+            .download_host_file(&download.name, &download.mime, &download.bytes)
+            .map_err(|_| KernelError::Dev(DevError::DriverFailed))
+    }
+
+    fn cancel_host_download(&mut self, id: u32) {
+        if let Some(download) = self.host_downloads.remove(&id) {
+            self.host_download_bytes_total = self
+                .host_download_bytes_total
+                .saturating_sub(download.bytes.len());
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn host_download_count(&self) -> usize {
+        self.host_downloads.len()
+    }
+
+    #[doc(hidden)]
+    pub fn host_download_bytes_total(&self) -> usize {
+        self.host_download_bytes_total
+    }
+
+    #[doc(hidden)]
+    pub fn host_download_size(&self, id: u32) -> Option<u64> {
+        self.host_downloads
+            .get(&id)
+            .map(|download| download.bytes.len() as u64)
+    }
+
+    #[doc(hidden)]
+    pub fn host_download_remaining(&self, id: u32) -> Option<usize> {
+        let download = self.host_downloads.get(&id)?;
+        if download.failed {
+            return Some(0);
+        }
+        let file_remaining =
+            abi::ext::host_file::MAX_DOWNLOAD_BYTES.saturating_sub(download.bytes.len());
+        let global_remaining = abi::ext::host_file::MAX_DOWNLOAD_BYTES_TOTAL
+            .saturating_sub(self.host_download_bytes_total);
+        Some(file_remaining.min(global_remaining))
     }
 
     /// VFS-mutation wrapper: create a regular file at `abs_path`
@@ -2828,6 +3950,30 @@ impl Kernel {
         if let Ok((mount_id, parent_ino, _)) = self.vfs.resolve_parent(abs_path) {
             self.vfs.notify(
                 mount_id,
+                parent_ino,
+                WatchEvent {
+                    mask: abi::ext::WATCH_CREATE,
+                    inode: new_ino as u32,
+                },
+            );
+        }
+        Ok(new_ino)
+    }
+
+    fn vfs_create_at(
+        &mut self,
+        mount_id: MountId,
+        dir_ino: Ino,
+        relative_path: &str,
+        mode: u32,
+    ) -> Result<Ino, FsError> {
+        let new_ino = self.vfs.create_at(mount_id, dir_ino, relative_path, mode)?;
+        self.flush_policy.record_dirty();
+        if let Ok((parent_mount, parent_ino, _)) =
+            self.vfs.resolve_parent_at(mount_id, dir_ino, relative_path)
+        {
+            self.vfs.notify(
+                parent_mount,
                 parent_ino,
                 WatchEvent {
                     mask: abi::ext::WATCH_CREATE,
@@ -2872,7 +4018,7 @@ impl Kernel {
     /// watcher actually exists.
     pub fn vfs_unlink(&mut self, abs_path: &str) -> Result<(), FsError> {
         let pre_inode = if !self.vfs.watches().is_empty() {
-            self.vfs.resolve(abs_path).ok()
+            self.vfs.resolve_nofollow(abs_path).ok()
         } else {
             None
         };
@@ -2891,6 +4037,142 @@ impl Kernel {
             );
         }
         Ok(())
+    }
+
+    /// Unlink a path relative to `dir_fd`. Absolute paths preserve the v1
+    /// global namespace behaviour and ignore the fd.
+    pub fn vfs_unlink_at(&mut self, pid: Pid, dir_fd: u32, path: &str) -> Result<(), KernelError> {
+        if path.starts_with('/') {
+            return self.vfs_unlink(path).map_err(KernelError::Fs);
+        }
+        let (mount_id, dir_ino) = self.directory_vnode_for_fd(pid, dir_fd)?;
+        let pre_inode = if !self.vfs.watches().is_empty() {
+            self.vfs.resolve_at_nofollow(mount_id, dir_ino, path).ok()
+        } else {
+            None
+        };
+        let parent = if pre_inode.is_some() {
+            self.vfs.resolve_parent_at(mount_id, dir_ino, path).ok()
+        } else {
+            None
+        };
+        self.vfs.unlink_at(mount_id, dir_ino, path)?;
+        self.flush_policy.record_dirty();
+        if let (Some((child_mount, child_ino)), Some((parent_mount, parent_ino, _))) =
+            (pre_inode, parent)
+        {
+            debug_assert_eq!(child_mount, parent_mount);
+            self.vfs.notify(
+                parent_mount,
+                parent_ino,
+                WatchEvent {
+                    mask: abi::ext::WATCH_DELETE,
+                    inode: child_ino as u32,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Rename a path and notify stable parent-directory watches. Replacement
+    /// reports the moved source leaving its old parent, the replaced inode
+    /// leaving the destination parent, then the moved source arriving there.
+    pub fn vfs_rename(&mut self, from: &str, to: &str) -> Result<(), FsError> {
+        let source = self.vfs.resolve_nofollow(from).ok();
+        let destination = self.vfs.resolve_nofollow(to).ok();
+        if source.is_some() && source == destination {
+            return Ok(());
+        }
+        let notification = match (
+            source,
+            self.vfs.resolve_parent(from),
+            self.vfs.resolve_parent(to),
+        ) {
+            (
+                Some((mount_id, moved_ino)),
+                Ok((from_mount, from_parent, _)),
+                Ok((to_mount, to_parent, _)),
+            ) if mount_id == from_mount && mount_id == to_mount => Some((
+                mount_id,
+                moved_ino,
+                from_parent,
+                to_parent,
+                destination.map(|(_, ino)| ino),
+            )),
+            _ => None,
+        };
+        self.vfs.rename(from, to)?;
+        self.flush_policy.record_dirty();
+        if let Some((mount_id, moved_ino, from_parent, to_parent, replaced_ino)) = notification {
+            self.vfs.notify(
+                mount_id,
+                from_parent,
+                WatchEvent {
+                    mask: abi::ext::WATCH_DELETE,
+                    inode: moved_ino as u32,
+                },
+            );
+            if let Some(replaced_ino) = replaced_ino {
+                self.vfs.notify(
+                    mount_id,
+                    to_parent,
+                    WatchEvent {
+                        mask: abi::ext::WATCH_DELETE,
+                        inode: replaced_ino as u32,
+                    },
+                );
+            }
+            self.vfs.notify(
+                mount_id,
+                to_parent,
+                WatchEvent {
+                    mask: abi::ext::WATCH_CREATE,
+                    inode: moved_ino as u32,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Create a hardlink and report the new destination-directory entry.
+    pub fn vfs_link(&mut self, from: &str, to: &str) -> Result<(), FsError> {
+        let source = self.vfs.resolve_nofollow(from).ok();
+        let parent = self.vfs.resolve_parent(to).ok();
+        self.vfs.link(from, to)?;
+        self.flush_policy.record_dirty();
+        if let (Some((source_mount, source_ino)), Some((parent_mount, parent_ino, _))) =
+            (source, parent)
+        {
+            if source_mount == parent_mount {
+                self.vfs.notify(
+                    parent_mount,
+                    parent_ino,
+                    WatchEvent {
+                        mask: abi::ext::WATCH_CREATE,
+                        inode: source_ino as u32,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a symlink and report its newly allocated inode to the parent.
+    pub fn vfs_symlink(&mut self, target: &str, link_path: &str) -> Result<Ino, FsError> {
+        let parent = self.vfs.resolve_parent(link_path).ok();
+        let inode = self.vfs.symlink(target, link_path)?;
+        self.flush_policy.record_dirty();
+        if let Some((mount_id, parent_ino, _)) = parent {
+            self.vfs.notify(
+                mount_id,
+                parent_ino,
+                WatchEvent {
+                    mask: abi::ext::WATCH_CREATE,
+                    inode: inode as u32,
+                },
+            );
+        }
+        Ok(inode)
     }
 
     /// VFS-mutation wrapper: remove the empty directory at
@@ -2920,6 +4202,41 @@ impl Kernel {
         Ok(())
     }
 
+    /// Remove an empty directory relative to `dir_fd`. See
+    /// [`Self::vfs_unlink_at`] for absolute-path handling.
+    pub fn vfs_rmdir_at(&mut self, pid: Pid, dir_fd: u32, path: &str) -> Result<(), KernelError> {
+        if path.starts_with('/') {
+            return self.vfs_rmdir(path).map_err(KernelError::Fs);
+        }
+        let (mount_id, dir_ino) = self.directory_vnode_for_fd(pid, dir_fd)?;
+        let pre_inode = if !self.vfs.watches().is_empty() {
+            self.vfs.resolve_at(mount_id, dir_ino, path).ok()
+        } else {
+            None
+        };
+        let parent = if pre_inode.is_some() {
+            self.vfs.resolve_parent_at(mount_id, dir_ino, path).ok()
+        } else {
+            None
+        };
+        self.vfs.rmdir_at(mount_id, dir_ino, path)?;
+        self.flush_policy.record_dirty();
+        if let (Some((child_mount, child_ino)), Some((parent_mount, parent_ino, _))) =
+            (pre_inode, parent)
+        {
+            debug_assert_eq!(child_mount, parent_mount);
+            self.vfs.notify(
+                parent_mount,
+                parent_ino,
+                WatchEvent {
+                    mask: abi::ext::WATCH_DELETE,
+                    inode: child_ino as u32,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Notify any watchers on `(mount_id, ino)` that a write just
     /// landed on that inode with `WATCH_MODIFY`. Called from
     /// [`Self::fd_write`]'s `Vnode` arm AFTER the underlying
@@ -2938,11 +4255,66 @@ impl Kernel {
         );
     }
 
+    /// Truncate a vnode and publish MODIFY only after the resize succeeds.
+    pub fn vfs_truncate_ino(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+        new_size: u64,
+    ) -> Result<(), FsError> {
+        if self.vfs.truncate_ino(mount_id, ino, new_size)? {
+            self.notify_modify(mount_id, ino);
+            self.flush_policy.record_dirty();
+        }
+        Ok(())
+    }
+
+    /// Positional write boundary shared by fd_write and fd_pwrite so both
+    /// dirty accounting and watch notification have identical semantics.
+    pub fn vfs_write_at(
+        &mut self,
+        mount_id: MountId,
+        ino: Ino,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<usize, FsError> {
+        let written = self.vfs.write_ino(mount_id, ino, offset, bytes)?;
+        if written > 0 {
+            self.notify_modify(mount_id, ino);
+            self.flush_policy.record_dirty();
+        }
+        Ok(written)
+    }
+
     /// Borrow a watch by id. Used by tests + the FS_WATCH opcode
     /// handler's introspection paths to confirm a register/unregister
     /// round-trip.
     pub fn watch_get(&self, id: WatchId) -> Option<&crate::vfs::Watch> {
         self.vfs.watches().watches.get(&id)
+    }
+
+    /// Acquire the queue-owned reference for an ancillary descriptor
+    /// snapshot. Only object kinds with dup-equivalent ownership are
+    /// transferable in v1. Single-owner and per-process objects fail before
+    /// any payload or descriptor is enqueued.
+    fn retain_ancillary_object(&mut self, object: FdObject) -> Result<(), KernelError> {
+        match object {
+            FdObject::Vnode { .. } | FdObject::CharDevice(_) => Ok(()),
+            FdObject::PipeRead(id) => {
+                self.ipc.pipe_mut(PipeId(id))?.dup_reader();
+                Ok(())
+            }
+            FdObject::PipeWrite(id) => {
+                self.ipc.pipe_mut(PipeId(id))?.dup_writer();
+                Ok(())
+            }
+            FdObject::Socket(_)
+            | FdObject::DisplayConn(_)
+            | FdObject::SignalChannel
+            | FdObject::Watch { .. }
+            | FdObject::HostFile { .. }
+            | FdObject::HostDownload { .. } => Err(KernelError::UnsupportedAncillary),
+        }
     }
 
     /// Bump the kernel-side refcount on a pipe-ended fd object.
@@ -2969,7 +4341,8 @@ impl Kernel {
             | FdObject::DisplayConn(_)
             | FdObject::SignalChannel
             | FdObject::Watch { .. }
-            | FdObject::HostFile { .. } => {}
+            | FdObject::HostFile { .. }
+            | FdObject::HostDownload { .. } => {}
         }
     }
 }
@@ -2978,4 +4351,18 @@ impl Default for Kernel {
     fn default() -> Self {
         Kernel::new()
     }
+}
+
+fn valid_host_metadata(name: &str, mime: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= abi::ext::host_file::MAX_NAME_BYTES
+        && !name
+            .bytes()
+            .any(|byte| byte == b'/' || byte == b'\\' || byte == 0)
+        && mime.len() <= abi::ext::host_file::MAX_MIME_BYTES
+        && !mime
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
 }

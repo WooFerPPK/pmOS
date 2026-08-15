@@ -87,7 +87,12 @@ mod tests {
         r.record_spawn(1_000_000_000);
         // 0.5 seconds later — half the interval remaining.
         let d = r.should_respawn(1_500_000_000);
-        assert_eq!(d, RespawnDecision::Wait { wait_ns: 500_000_000 });
+        assert_eq!(
+            d,
+            RespawnDecision::Wait {
+                wait_ns: 500_000_000
+            }
+        );
     }
 
     #[test]
@@ -105,7 +110,12 @@ mod tests {
         r.record_spawn(MIN_INTERVAL_NS);
         // After the second spawn at t=1s, t=1.4s should still be Wait.
         let d = r.should_respawn(MIN_INTERVAL_NS + 400_000_000);
-        assert_eq!(d, RespawnDecision::Wait { wait_ns: 600_000_000 });
+        assert_eq!(
+            d,
+            RespawnDecision::Wait {
+                wait_ns: 600_000_000
+            }
+        );
     }
 
     #[test]

@@ -53,20 +53,15 @@ pub const BUTTON_VPAD: u32 = 8;
 /// Visual state of a [`Button`]. Controls which fill
 /// colour the button paints with when [`Button::draw`] is
 /// called.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum ButtonState {
     /// Resting: pointer is not over the button.
+    #[default]
     Resting,
     /// Pointer is hovering over the button.
     Hover,
     /// Pointer is down on the button.
     Pressed,
-}
-
-impl Default for ButtonState {
-    fn default() -> Self {
-        ButtonState::Resting
-    }
 }
 
 /// A rectangular button with a fill, a 1-pixel border, a

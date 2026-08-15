@@ -30,21 +30,22 @@
 //!
 //! Exit codes:
 //!
-//!   * 0  = success
-//!   * 10 = `display_connect` poll loop exhausted (no server
-//!          bound `/run/display` in time)
-//!   * 11 = `fd_write` on the client fd failed or short-wrote
-//!   * 12 = `display_connect` returned a non-ECONNREFUSED error
-//!          (e.g. missing `DisplayClient` cap)
+//! * 0  = success
+//! * 10 = `display_connect` poll loop exhausted (no server
+//!   bound `/run/display` in time)
+//! * 11 = `fd_write` on the client fd failed or short-wrote
+//! * 12 = `display_connect` returned a non-ECONNREFUSED error
+//!   (e.g. missing `DisplayClient` cap)
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
+    fn poll_oneoff(
+        subscriptions: *const u8,
+        events: *mut u8,
+        nsubscriptions: u32,
+        nevents: *mut u32,
     ) -> i32;
 }
 
@@ -74,32 +75,76 @@ const PIXELS: [u8; 16] = [
 ];
 
 #[cfg(target_arch = "wasm32")]
+const SUBSCRIPTION_SIZE: usize = 48;
+#[cfg(target_arch = "wasm32")]
+const EVENT_SIZE: usize = 32;
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn wait_clock(timeout_ns: u64) -> Result<(), i32> {
+    let mut subscription = [0u8; SUBSCRIPTION_SIZE];
+    subscription[8] = 0;
+    subscription[16..20].copy_from_slice(&1u32.to_le_bytes());
+    subscription[24..32].copy_from_slice(&timeout_ns.to_le_bytes());
+    wait_subscription(&subscription, false)
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn wait_writable(fd: i32) -> Result<(), i32> {
+    let mut subscription = [0u8; SUBSCRIPTION_SIZE];
+    subscription[8] = 2;
+    subscription[16..20].copy_from_slice(&(fd as u32).to_le_bytes());
+    wait_subscription(&subscription, true)
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn wait_subscription(
+    subscription: &[u8; SUBSCRIPTION_SIZE],
+    check_hangup: bool,
+) -> Result<(), i32> {
+    let mut event = [0u8; EVENT_SIZE];
+    let mut nevents = 0u32;
+    let errno = poll_oneoff(subscription.as_ptr(), event.as_mut_ptr(), 1, &mut nevents);
+    if errno != 0 {
+        return Err(errno);
+    }
+    if nevents != 1 {
+        return Err(29 /* EIO */);
+    }
+    let event_errno = u16::from_le_bytes([event[8], event[9]]) as i32;
+    if event_errno != 0 {
+        return Err(event_errno);
+    }
+    if check_hangup && u16::from_le_bytes([event[24], event[25]]) & 1 != 0 {
+        return Err(64 /* EPIPE */);
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
 fn main() {
     println!("display-client-demo starting");
 
     // ECONNREFUSED is positive `abi::errno::ECONNREFUSED = 14`.
     // PMos extension syscalls negate into `-errno` on error.
     const ECONNREFUSED: i32 = 14;
-    // EINVAL (positive 28) is what `fd_write` returns while the
-    // client socket is still `Connecting` (the server hasn't
-    // called `ipc_accept` yet). WASI syscalls surface errno
-    // positive on error; PMos extension syscalls negate.
-    const EINVAL: i32 = 28;
-    // Safety valve: bounded iteration count so the vitest
-    // in-process composition test doesn't spin forever when no
-    // server exists. Real Playwright lands a connection within
-    // the first handful of passes.
-    const MAX_POLLS: u32 = 10_000;
+    // WASI fd I/O returns EAGAIN while an asynchronously connected
+    // socket is still waiting for the server's `ipc_accept`.
+    const CONNECT_RETRIES: u32 = 500;
+    const CONNECT_RETRY_NS: u64 = 10_000_000;
+    const EAGAIN: i32 = 6;
 
     unsafe {
         let mut client: i32 = -1;
-        for _ in 0..MAX_POLLS {
+        for _ in 0..CONNECT_RETRIES {
             let rc = display_connect();
             if rc >= 0 {
                 client = rc;
                 break;
             }
             if rc == -ECONNREFUSED {
+                if wait_clock(CONNECT_RETRY_NS).is_err() {
+                    std::process::exit(10);
+                }
                 continue;
             }
             std::process::exit(12);
@@ -108,32 +153,25 @@ fn main() {
             std::process::exit(10);
         }
 
-        let write_iov = Ciovec {
-            buf: PIXELS.as_ptr(),
-            buf_len: PIXELS.len() as u32,
-        };
-        let mut nwritten: u32 = 0;
-        // Small EINVAL retry loop covers the narrow race where
-        // this process's `fd_write` reaches the dispatcher before
-        // display-server's `ipc_accept` has promoted the client
-        // socket from `Connecting` to `Connected`. In practice
-        // Worker wake-up latency keeps dispatch ordering stable
-        // (accept lands several passes before this write), but
-        // bounding the retry is cheap insurance.
-        let mut wrote = false;
-        for _ in 0..MAX_POLLS {
+        let mut offset = 0usize;
+        while offset < PIXELS.len() {
+            let remaining = &PIXELS[offset..];
+            let write_iov = Ciovec {
+                buf: remaining.as_ptr(),
+                buf_len: remaining.len() as u32,
+            };
+            let mut nwritten = 0u32;
             let rc = fd_write(client, &write_iov, 1, &mut nwritten);
-            if rc == 0 && nwritten == PIXELS.len() as u32 {
-                wrote = true;
-                break;
-            }
-            if rc == EINVAL {
-                nwritten = 0;
+            if rc == 0 && nwritten > 0 {
+                offset += nwritten as usize;
                 continue;
             }
-            std::process::exit(11);
-        }
-        if !wrote {
+            if rc == EAGAIN || (rc == 0 && nwritten == 0) {
+                if wait_writable(client).is_err() {
+                    std::process::exit(11);
+                }
+                continue;
+            }
             std::process::exit(11);
         }
     }

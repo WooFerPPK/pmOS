@@ -100,13 +100,7 @@ fn encode_into_short_output_fails() {
 
 #[test]
 fn try_new_rejects_oversized_messages() {
-    let err = MessageHeader::try_new(
-        ObjectId::DISPLAY,
-        1,
-        u16::MAX as usize,
-        0,
-    )
-    .unwrap_err();
+    let err = MessageHeader::try_new(ObjectId::DISPLAY, 1, u16::MAX as usize, 0).unwrap_err();
     assert_eq!(err, WireError::Overflow);
 }
 

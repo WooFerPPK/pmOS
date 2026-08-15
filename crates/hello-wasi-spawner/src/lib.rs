@@ -36,12 +36,7 @@
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
 }
 
@@ -83,9 +78,7 @@ pub extern "C" fn _start() {
     //    registered with CAPSET_ALL, every cap is permitted.
     const HELLO_PATH: &[u8] = b"/usr/bin/hello";
     let caps: u64 = u64::MAX;
-    let rc = unsafe {
-        proc_spawn(HELLO_PATH.as_ptr(), HELLO_PATH.len() as u32, caps)
-    };
+    let rc = unsafe { proc_spawn(HELLO_PATH.as_ptr(), HELLO_PATH.len() as u32, caps) };
     if rc < 0 {
         // Propagate the errno to the test harness via proc_exit's
         // code. rc is already negative, which means we exit with

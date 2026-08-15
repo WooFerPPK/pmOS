@@ -20,12 +20,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-wc-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-wc-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -61,7 +56,11 @@ fn dash_l_emits_lines_only() {
     let dir = scratch_dir("lonly");
     let path = write_file(&dir, "a.txt", b"alpha\nbeta\ngamma\n");
 
-    let out = Command::new(WC).arg("-l").arg(&path).output().expect("spawn wc");
+    let out = Command::new(WC)
+        .arg("-l")
+        .arg(&path)
+        .output()
+        .expect("spawn wc");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -76,7 +75,11 @@ fn dash_w_emits_words_only() {
     let dir = scratch_dir("wonly");
     let path = write_file(&dir, "a.txt", b"the quick brown fox\n");
 
-    let out = Command::new(WC).arg("-w").arg(&path).output().expect("spawn wc");
+    let out = Command::new(WC)
+        .arg("-w")
+        .arg(&path)
+        .output()
+        .expect("spawn wc");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -91,7 +94,11 @@ fn dash_c_emits_bytes_only() {
     let dir = scratch_dir("conly");
     let path = write_file(&dir, "a.txt", b"hello\n");
 
-    let out = Command::new(WC).arg("-c").arg(&path).output().expect("spawn wc");
+    let out = Command::new(WC)
+        .arg("-c")
+        .arg(&path)
+        .output()
+        .expect("spawn wc");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -174,7 +181,11 @@ fn dash_lc_combines_lines_and_bytes() {
     let dir = scratch_dir("lc");
     let path = write_file(&dir, "a.txt", b"foo\nbar\n");
 
-    let out = Command::new(WC).arg("-lc").arg(&path).output().expect("spawn wc");
+    let out = Command::new(WC)
+        .arg("-lc")
+        .arg(&path)
+        .output()
+        .expect("spawn wc");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);

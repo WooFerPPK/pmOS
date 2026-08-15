@@ -20,12 +20,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn scratch_dir(tag: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "pmos-head-{}-{}-{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    let dir = env::temp_dir().join(format!("pmos-head-{}-{}-{}", tag, std::process::id(), n));
     fs::create_dir_all(&dir).expect("create scratch dir");
     dir
 }
@@ -50,13 +45,11 @@ fn default_prints_first_ten_lines() {
     }
     let path = write_file(&dir, "input.txt", content.as_bytes());
 
-    let out = Command::new(HEAD)
-        .arg(&path)
-        .output()
-        .expect("spawn head");
+    let out = Command::new(HEAD).arg(&path).output().expect("spawn head");
 
     assert!(out.status.success(), "exit status: {:?}", out.status);
-    let expected = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n";
+    let expected =
+        "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n";
     assert_eq!(out.stdout, expected.as_bytes());
     assert!(out.stderr.is_empty(), "stderr = {:?}", out.stderr);
     cleanup(&dir);

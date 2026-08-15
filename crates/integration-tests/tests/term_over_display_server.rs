@@ -82,6 +82,7 @@ fn make_session() -> Session<MemoryConnection> {
 ///   2. Server advertises compositor + shm via emit_global.
 ///   3. Session auto-binds both.
 ///   4. Session calls `create_surface()`.
+///
 /// Returns the booted session, the server, and the
 /// server-side client id so the caller can reach into the
 /// server's client view for further assertions.
@@ -95,15 +96,8 @@ fn boot_term_session() -> (
 
     let mut server = DisplayServerState::new();
     let server_client_id = server.accept_with_caps(APP_CAPS);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
-    server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
+    server.client_mut(server_client_id).unwrap().drain_journal();
 
     let registry_id = session.registry_id().unwrap();
     {
@@ -112,23 +106,12 @@ fn boot_term_session() -> (
         c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
     }
     pump_events_into_term(&mut server, server_client_id, &mut session);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     session.create_surface().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
-    server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    server.client_mut(server_client_id).unwrap().drain_journal();
 
     (session, server, server_client_id)
 }
@@ -144,10 +127,7 @@ fn term_session_start_reaches_display_server_as_get_registry() {
     let dispatched = pump_requests_into_server(&mut server, server_client_id, bytes);
     assert_eq!(dispatched, 1);
 
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].interface, Interface::Display);
     assert_eq!(journal[0].opcode_name, "get_registry");
@@ -166,11 +146,7 @@ fn term_auto_binds_compositor_and_shm_but_not_shell_manager() {
 
     let mut server = DisplayServerState::new();
     let server_client_id = server.accept_with_caps(APP_CAPS);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     let registry_id = session.registry_id().unwrap();
     // Server advertises all three — shell_manager should be
@@ -179,7 +155,8 @@ fn term_auto_binds_compositor_and_shm_but_not_shell_manager() {
         let c = server.client_mut(server_client_id).unwrap();
         c.emit_global(registry_id, 1, "pmd_compositor", 1).unwrap();
         c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
-        c.emit_global(registry_id, 3, "pmd_shell_manager", 1).unwrap();
+        c.emit_global(registry_id, 3, "pmd_shell_manager", 1)
+            .unwrap();
     }
     let step = pump_events_into_term(&mut server, server_client_id, &mut session);
 
@@ -194,11 +171,7 @@ fn term_auto_binds_compositor_and_shm_but_not_shell_manager() {
 
     // Ship the binds to the server; both should succeed
     // because they're not cap-gated.
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     assert!(session.interfaces_ready());
     assert!(!session.is_ready(), "surface not yet created");
@@ -212,11 +185,7 @@ fn term_create_surface_reaches_server_as_compositor_create_surface() {
 
     let mut server = DisplayServerState::new();
     let server_client_id = server.accept_with_caps(APP_CAPS);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // Advertise compositor + shm so the session auto-binds.
     let registry_id = session.registry_id().unwrap();
@@ -226,31 +195,17 @@ fn term_create_surface_reaches_server_as_compositor_create_surface() {
         c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
     }
     pump_events_into_term(&mut server, server_client_id, &mut session);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
-    server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
+    server.client_mut(server_client_id).unwrap().drain_journal();
 
     // Create the surface.
     let surface_id = session.create_surface().unwrap();
     assert_eq!(session.surface_id(), Some(surface_id));
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // Server's journal shows one new entry: create_surface
     // against the compositor object.
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].interface, Interface::Compositor);
     assert_eq!(journal[0].opcode_name, "create_surface");
@@ -298,16 +253,9 @@ fn term_commit_after_create_surface_reaches_server_as_surface_commit() {
     let surface_id = session.surface_id().unwrap();
 
     session.commit().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].interface, Interface::Surface);
     assert_eq!(journal[0].opcode_name, "commit");
@@ -338,10 +286,7 @@ fn term_feed_key_drives_embedded_shell_without_touching_server() {
 
     // Nothing was sent on the wire — the server's journal
     // is still empty.
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert!(journal.is_empty());
 
     // Scrollback shows the banner, the committed input, and
@@ -364,16 +309,9 @@ fn term_full_cycle_eval_plus_commit() {
     }
     let _ = session.feed_key(Key::Enter);
     session.commit().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].opcode_name, "commit");
 
@@ -415,16 +353,9 @@ fn term_create_pool_reaches_server_as_shm_create_pool() {
     let (mut session, mut server, server_client_id) = boot_term_session();
 
     let pool_id = session.create_pool(320 * 240 * 4).unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].interface, Interface::Shm);
     assert_eq!(journal[0].opcode_name, "create_pool");
@@ -452,16 +383,9 @@ fn term_create_buffer_on_a_pool_reaches_server_as_pool_create_buffer() {
             display_proto::buffer_format::ARGB8888,
         )
         .unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert_eq!(journal.len(), 2);
     assert_eq!(journal[0].opcode_name, "create_pool");
     assert_eq!(journal[1].interface, Interface::ShmPool);
@@ -507,27 +431,14 @@ fn term_present_round_trips_attach_damage_commit_in_order() {
     // Fire attach + damage + commit via the convenience
     // wrapper.
     session.present(buffer_id, 320, 240).unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // Server's journal shows the full pipeline in order.
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
     assert_eq!(
         names,
-        vec![
-            "create_pool",
-            "create_buffer",
-            "attach",
-            "damage",
-            "commit",
-        ]
+        vec!["create_pool", "create_buffer", "attach", "damage", "commit",]
     );
 }
 
@@ -543,26 +454,13 @@ fn term_attach_damage_commit_separately_is_equivalent_to_present() {
     session.attach(buffer_id, 3, 5).unwrap();
     session.damage(0, 0, 1, 1).unwrap();
     session.commit().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
     assert_eq!(
         names,
-        vec![
-            "create_pool",
-            "create_buffer",
-            "attach",
-            "damage",
-            "commit",
-        ]
+        vec!["create_pool", "create_buffer", "attach", "damage", "commit",]
     );
     // attach payload is (u32 buffer_id, i32 x, i32 y) = 12 bytes.
     let attach_entry = &journal[2];
@@ -588,36 +486,22 @@ fn term_multiple_frames_share_one_pool_and_buffer() {
         .unwrap();
     // Drain the pool+buffer journal so the assert below
     // only sees the frames.
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
-    server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
+    server.client_mut(server_client_id).unwrap().drain_journal();
 
     for _ in 0..3 {
         session.present(buffer_id, 2, 2).unwrap();
     }
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
-    let journal = server
-        .client_mut(server_client_id)
-        .unwrap()
-        .drain_journal();
+    let journal = server.client_mut(server_client_id).unwrap().drain_journal();
     assert_eq!(journal.len(), 9); // 3 frames × (attach + damage + commit)
     let names: Vec<&str> = journal.iter().map(|r| r.opcode_name).collect();
     assert_eq!(
         names,
         vec![
-            "attach", "damage", "commit", "attach", "damage", "commit", "attach",
-            "damage", "commit",
+            "attach", "damage", "commit", "attach", "damage", "commit", "attach", "damage",
+            "commit",
         ]
     );
 }
@@ -659,11 +543,7 @@ fn server_pool_storage_round_trips_pixels_through_buffer_view() {
     let buffer_id = session
         .create_buffer(pool_id, 0, 2, 2, 8, display_proto::buffer_format::ARGB8888)
         .unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // The pool exists on the server side as zero-filled
     // bytes. Simulate a client SAB write: a 2x2 checkerboard.
@@ -681,11 +561,7 @@ fn server_pool_storage_round_trips_pixels_through_buffer_view() {
 
     // Present the frame.
     session.present(buffer_id, 2, 2).unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // The server reads the pixels back through the buffer
     // view, confirming the whole pipeline observed the
@@ -713,7 +589,14 @@ fn server_rejects_create_buffer_that_does_not_fit_in_its_pool() {
 
     let _pool_id = session.create_pool(16).unwrap();
     let _oversized_buffer = session
-        .create_buffer(_pool_id, 0, 4, 4, 16, display_proto::buffer_format::ARGB8888)
+        .create_buffer(
+            _pool_id,
+            0,
+            4,
+            4,
+            16,
+            display_proto::buffer_format::ARGB8888,
+        )
         .unwrap(); // client-side allocation still succeeds — the
                    // rejection happens server-side on dispatch.
 
@@ -731,11 +614,11 @@ fn server_rejects_create_buffer_that_does_not_fit_in_its_pool() {
         .dispatch_request(server_client_id, &msg2)
         .expect_err("create_buffer dispatch must fail");
     match err {
-        display_server::ServerError::Client(
-            display_server::ClientError::BufferOutOfPool {
-                pool_size, byte_end, ..
-            },
-        ) => {
+        display_server::ServerError::Client(display_server::ClientError::BufferOutOfPool {
+            pool_size,
+            byte_end,
+            ..
+        }) => {
             assert_eq!(pool_size, 16);
             assert_eq!(byte_end, 64);
         }
@@ -759,11 +642,7 @@ fn server_framebuffer_receives_committed_pixels_on_surface_commit() {
 
     let mut session = make_session();
     session.start().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     let registry_id = session.registry_id().unwrap();
     {
         let c = server.client_mut(server_client_id).unwrap();
@@ -771,21 +650,13 @@ fn server_framebuffer_receives_committed_pixels_on_surface_commit() {
         c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
     }
     pump_events_into_term(&mut server, server_client_id, &mut session);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     session.create_surface().unwrap();
     let pool_id = session.create_pool(4 * 4 * 4).unwrap();
     let buffer_id = session
         .create_buffer(pool_id, 0, 2, 2, 8, display_proto::buffer_format::ARGB8888)
         .unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // Pre-paint the framebuffer so we can detect the blit.
     server.framebuffer_mut().clear(0xFF00_0000); // black
@@ -807,11 +678,7 @@ fn server_framebuffer_receives_committed_pixels_on_surface_commit() {
     session.attach(buffer_id, 1, 1).unwrap();
     session.damage(0, 0, 2, 2).unwrap();
     session.commit().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // The server's framebuffer now carries the quad at
     // (1..3, 1..3) with the rest still black.
@@ -837,11 +704,7 @@ fn server_framebuffer_gets_new_pixels_on_each_commit_cycle() {
     let server_client_id = server.accept_with_caps(APP_CAPS);
     let mut session = make_session();
     session.start().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     let registry_id = session.registry_id().unwrap();
     {
         let c = server.client_mut(server_client_id).unwrap();
@@ -849,21 +712,13 @@ fn server_framebuffer_gets_new_pixels_on_each_commit_cycle() {
         c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
     }
     pump_events_into_term(&mut server, server_client_id, &mut session);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     session.create_surface().unwrap();
     let pool_id = session.create_pool(16).unwrap();
     let buffer_id = session
         .create_buffer(pool_id, 0, 2, 2, 8, display_proto::buffer_format::ARGB8888)
         .unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     for frame in 0..4u8 {
         // Paint every pixel the same ramp value for this
@@ -880,11 +735,7 @@ fn server_framebuffer_gets_new_pixels_on_each_commit_cycle() {
             px[3] = 0xFF;
         }
         session.present(buffer_id, 2, 2).unwrap();
-        pump_requests_into_server(
-            &mut server,
-            server_client_id,
-            session.drain_outbound(),
-        );
+        pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
         // Every pixel on the server's framebuffer is now
         // this frame's ramp value.
@@ -924,11 +775,7 @@ fn term_rasterize_into_pool_and_present_paints_framebuffer_with_text_pixels() {
     });
     let mut session = term::Session::new(MemoryConnection::new(), terminal);
     session.start().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     let registry_id = session.registry_id().unwrap();
     {
         let c = server.client_mut(server_client_id).unwrap();
@@ -936,11 +783,7 @@ fn term_rasterize_into_pool_and_present_paints_framebuffer_with_text_pixels() {
         c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
     }
     pump_events_into_term(&mut server, server_client_id, &mut session);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     session.create_surface().unwrap();
     let pool_size = fb_w * fb_h * 4;
     let pool_id = session.create_pool(pool_size).unwrap();
@@ -954,11 +797,7 @@ fn term_rasterize_into_pool_and_present_paints_framebuffer_with_text_pixels() {
             display_proto::buffer_format::ARGB8888,
         )
         .unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // Drive some input through the embedded shell so
     // there's something visible to rasterize.
@@ -988,11 +827,7 @@ fn term_rasterize_into_pool_and_present_paints_framebuffer_with_text_pixels() {
     // commit and blits the buffer into the server's
     // framebuffer.
     session.present(buffer_id, fb_w, fb_h).unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // The framebuffer pixels should match the rasterized
     // bytes exactly (since the pool is the full
@@ -1028,11 +863,7 @@ fn server_commit_without_attach_does_not_touch_framebuffer() {
     let server_client_id = server.accept_with_caps(APP_CAPS);
     let mut session = make_session();
     session.start().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     let registry_id = session.registry_id().unwrap();
     {
         let c = server.client_mut(server_client_id).unwrap();
@@ -1040,11 +871,7 @@ fn server_commit_without_attach_does_not_touch_framebuffer() {
         c.emit_global(registry_id, 2, "pmd_shm", 1).unwrap();
     }
     pump_events_into_term(&mut server, server_client_id, &mut session);
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
     session.create_surface().unwrap();
 
     // Paint the framebuffer a distinctive colour.
@@ -1052,11 +879,7 @@ fn server_commit_without_attach_does_not_touch_framebuffer() {
 
     // Commit without an attach.
     session.commit().unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     // Framebuffer is unchanged.
     let fb = server.framebuffer();
@@ -1085,11 +908,7 @@ fn server_pool_storage_persists_across_multiple_present_cycles() {
     let buffer_id = session
         .create_buffer(pool_id, 0, 1, 1, 4, display_proto::buffer_format::ARGB8888)
         .unwrap();
-    pump_requests_into_server(
-        &mut server,
-        server_client_id,
-        session.drain_outbound(),
-    );
+    pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
     for frame in 0..5u8 {
         // "SAB write" — simulate the client writing one
@@ -1102,11 +921,7 @@ fn server_pool_storage_persists_across_multiple_present_cycles() {
         bytes.copy_from_slice(&[frame, frame, frame, 0xff]);
 
         session.present(buffer_id, 1, 1).unwrap();
-        pump_requests_into_server(
-            &mut server,
-            server_client_id,
-            session.drain_outbound(),
-        );
+        pump_requests_into_server(&mut server, server_client_id, session.drain_outbound());
 
         // After commit, the buffer view carries this
         // frame's bytes.

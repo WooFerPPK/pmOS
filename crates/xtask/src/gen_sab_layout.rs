@@ -88,7 +88,11 @@ fn render() -> String {
     push_const(&mut s, "OFF_USER_WAIT_SLOT", OFF_USER_WAIT_SLOT as u64);
     push_const(&mut s, "OFF_KERNEL_WAIT_SLOT", OFF_KERNEL_WAIT_SLOT as u64);
     push_const(&mut s, "OFF_USER_BLOCK_COUNT", OFF_USER_BLOCK_COUNT as u64);
-    push_const(&mut s, "OFF_KERNEL_BLOCK_COUNT", OFF_KERNEL_BLOCK_COUNT as u64);
+    push_const(
+        &mut s,
+        "OFF_KERNEL_BLOCK_COUNT",
+        OFF_KERNEL_BLOCK_COUNT as u64,
+    );
     push_const(&mut s, "OFF_HEADER_FLAGS", OFF_HEADER_FLAGS as u64);
     push_const(&mut s, "OFF_REQ_RING", OFF_REQ_RING as u64);
     push_const(&mut s, "REQ_RING_BYTES", REQ_RING_BYTES as u64);

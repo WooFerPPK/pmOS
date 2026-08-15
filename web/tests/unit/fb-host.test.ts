@@ -6,8 +6,10 @@
 // worker.
 
 import { describe, expect, it } from "vitest";
+import { FramebufferDriver, OP_PRESENT_FENCE } from "../../src/drivers/fb";
+import type { DriverHost } from "../../src/drivers/types";
 import { FbHost } from "../../src/fb-host";
-import type { FbFrame, FbMode } from "../../src/fb-host";
+import type { FbFrame, FbMode, FbPatch, FbPatchBatch } from "../../src/fb-host";
 import type { WorkerLike } from "../../src/console-host";
 import type { KernelToMain, MainToKernel } from "../../src/shared/worker-proto";
 
@@ -41,11 +43,12 @@ function makeFakeWorker(): FakeWorker {
 }
 
 describe("FbHost", () => {
-  it("starts with no mode and zero blits", () => {
+  it("starts with no mode and zero blits or patches", () => {
     const w = makeFakeWorker();
     const host = new FbHost({ worker: w });
     expect(host.mode).toBeNull();
     expect(host.blitsObserved).toBe(0);
+    expect(host.patchesObserved).toBe(0);
   });
 
   it("fb:set-mode updates `mode` and fires every mode handler in order", () => {
@@ -85,6 +88,71 @@ describe("FbHost", () => {
       w.emit({ kind: "fb:blit", width: 1, height: 1, rgba: new Uint8Array(4) });
     }
     expect(host.blitsObserved).toBe(5);
+    expect(host.patchesObserved).toBe(0);
+  });
+
+  it("fb:patch increments its own counter and fans out in registration order", () => {
+    const w = makeFakeWorker();
+    const host = new FbHost({ worker: w });
+    const patches: FbPatch[] = [];
+    host.onPatch((patch) => patches.push(patch));
+    host.onPatch((patch) => patches.push({ ...patch, x: patch.x + 1 }));
+    const rgba = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+
+    w.emit({
+      kind: "fb:patch",
+      x: 7,
+      y: 9,
+      width: 2,
+      height: 1,
+      rgba,
+    });
+
+    expect(host.patchesObserved).toBe(1);
+    expect(host.blitsObserved).toBe(0);
+    expect(patches).toEqual([
+      { x: 7, y: 9, width: 2, height: 1, rgba },
+      { x: 8, y: 9, width: 2, height: 1, rgba },
+    ]);
+  });
+
+  it("fb:patch-batch fans out once while counting every rectangle", () => {
+    const w = makeFakeWorker();
+    const host = new FbHost({ worker: w });
+    const batches: FbPatchBatch[] = [];
+    host.onPatchBatch((batch) => batches.push(batch));
+    const patches = [
+      { x: 0, y: 0, width: 1, height: 1, rgba: new Uint8Array([1, 2, 3, 4]) },
+      { x: 2, y: 3, width: 1, height: 1, rgba: new Uint8Array([5, 6, 7, 8]) },
+    ];
+
+    w.emit({ kind: "fb:patch-batch", patches });
+
+    expect(host.patchesObserved).toBe(2);
+    expect(batches).toEqual([{ patches }]);
+  });
+
+  it("routes OP_PRESENT_FENCE from the framebuffer driver through FbHost", () => {
+    const w = makeFakeWorker();
+    const host = new FbHost({ worker: w });
+    const observed: number[] = [];
+    host.onPresentFence((serial) => observed.push(serial));
+    const driverHost: DriverHost = {
+      postToMain(message): void {
+        w.emit(message as KernelToMain);
+      },
+      pushInputToKernel(): void {},
+    };
+    const driver = new FramebufferDriver();
+    driver.init(driverHost);
+    const payload = new Uint8Array(4);
+    new DataView(payload.buffer).setUint32(0, 42, true);
+
+    expect(driver.call(OP_PRESENT_FENCE, payload)).toEqual({
+      ok: true,
+      value: 4,
+    });
+    expect(observed).toEqual([42]);
   });
 
   it("ignores console:write, ready, panic and any other message kinds", () => {
@@ -92,8 +160,10 @@ describe("FbHost", () => {
     const host = new FbHost({ worker: w });
     const frames: FbFrame[] = [];
     const modes: FbMode[] = [];
+    const fences: number[] = [];
     host.onFrame((f) => frames.push(f));
     host.onModeChange((m) => modes.push(m));
+    host.onPresentFence((serial) => fences.push(serial));
 
     w.emit({ kind: "ready" });
     w.emit({
@@ -101,24 +171,35 @@ describe("FbHost", () => {
       bytes: new TextEncoder().encode("hello\n"),
     });
     w.emit({ kind: "panic", message: "nope" });
+    w.emit({
+      kind: "console:write",
+      bytes: new TextEncoder().encode(
+        "shell: desktop ready\nalt-shell: desktop ready\n",
+      ),
+    });
 
     expect(frames).toHaveLength(0);
     expect(modes).toHaveLength(0);
+    expect(fences).toHaveLength(0);
     expect(host.mode).toBeNull();
     expect(host.blitsObserved).toBe(0);
+    expect(host.patchesObserved).toBe(0);
   });
 
-  it("mode handler is NOT called for blits; frame handler is NOT called for mode changes", () => {
+  it("mode, full-frame, and patch subscriptions remain independent", () => {
     const w = makeFakeWorker();
     const host = new FbHost({ worker: w });
     let frameHits = 0;
     let modeHits = 0;
+    let patchHits = 0;
     host.onFrame(() => (frameHits += 1));
+    host.onPatch(() => (patchHits += 1));
     host.onModeChange(() => (modeHits += 1));
 
     w.emit({ kind: "fb:set-mode", width: 320, height: 240 });
     expect(frameHits).toBe(0);
     expect(modeHits).toBe(1);
+    expect(patchHits).toBe(0);
 
     w.emit({
       kind: "fb:blit",
@@ -128,6 +209,19 @@ describe("FbHost", () => {
     });
     expect(frameHits).toBe(1);
     expect(modeHits).toBe(1);
+    expect(patchHits).toBe(0);
+
+    w.emit({
+      kind: "fb:patch",
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      rgba: new Uint8Array(4),
+    });
+    expect(frameHits).toBe(1);
+    expect(modeHits).toBe(1);
+    expect(patchHits).toBe(1);
   });
 
   it("posts nothing back on its own — FbHost is receive-only", () => {

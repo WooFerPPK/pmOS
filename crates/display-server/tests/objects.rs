@@ -37,14 +37,8 @@ fn display_object_has_error_and_delete_id_events() {
 
 #[test]
 fn registry_has_bind_request_and_global_event() {
-    assert_eq!(
-        Interface::Registry.lookup_request(1).unwrap().name,
-        "bind"
-    );
-    assert_eq!(
-        Interface::Registry.lookup_event(1).unwrap().name,
-        "global"
-    );
+    assert_eq!(Interface::Registry.lookup_request(1).unwrap().name, "bind");
+    assert_eq!(Interface::Registry.lookup_event(1).unwrap().name, "global");
     assert_eq!(
         Interface::Registry.lookup_event(2).unwrap().name,
         "global_remove"
@@ -67,10 +61,7 @@ fn shm_pool_has_create_buffer_resize_destroy() {
         Interface::ShmPool.lookup_request(1).unwrap().name,
         "create_buffer"
     );
-    assert_eq!(
-        Interface::ShmPool.lookup_request(2).unwrap().name,
-        "resize"
-    );
+    assert_eq!(Interface::ShmPool.lookup_request(2).unwrap().name, "resize");
     assert_eq!(
         Interface::ShmPool.lookup_request(3).unwrap().name,
         "destroy"
@@ -78,7 +69,7 @@ fn shm_pool_has_create_buffer_resize_destroy() {
 }
 
 #[test]
-fn surface_has_the_seven_v1_requests() {
+fn surface_has_the_eight_v1_requests() {
     for (op, name) in [
         (1, "destroy"),
         (2, "attach"),
@@ -87,6 +78,7 @@ fn surface_has_the_seven_v1_requests() {
         (5, "set_opaque_region"),
         (6, "set_input_region"),
         (7, "commit"),
+        (8, "patch_current"),
     ] {
         let o = Interface::Surface.lookup_request(op).unwrap();
         assert_eq!(o.name, name, "opcode {op}");
@@ -98,14 +90,8 @@ fn surface_has_the_seven_v1_requests() {
 
 #[test]
 fn buffer_has_destroy_request_and_release_event() {
-    assert_eq!(
-        Interface::Buffer.lookup_request(1).unwrap().name,
-        "destroy"
-    );
-    assert_eq!(
-        Interface::Buffer.lookup_event(1).unwrap().name,
-        "release"
-    );
+    assert_eq!(Interface::Buffer.lookup_request(1).unwrap().name, "destroy");
+    assert_eq!(Interface::Buffer.lookup_event(1).unwrap().name, "release");
 }
 
 #[test]

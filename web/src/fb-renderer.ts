@@ -2,26 +2,17 @@
 // `FbHost` mode + frame events and writes pixels into a
 // `<canvas>` element.
 //
-// Two render paths, picked by feature detection at
-// construction time:
+// Full frames paint directly through visible-canvas `putImageData`.
+// An OffscreenCanvas factory is still probed at mode-set time for the
+// existing capability diagnostic, but its context is not retained or used:
+// the former transferToImageBitmap path produced striped partial-frame
+// artifacts in Chromium.
 //
-//   * **Fast path (production)** — an offscreen `OffscreenCanvas`
-//     is created with the same backing-store geometry as the
-//     visible canvas. Each frame is composed offscreen with
-//     `putImageData`, then snapshot via `transferToImageBitmap`
-//     and drawn onto the visible canvas via `drawImage`. The
-//     bitmap transfer is zero-copy on Chrome/Firefox, and the
-//     visible canvas's compositor only sees one drawImage per
-//     frame instead of a putImageData (which forces a full
-//     CPU→GPU upload on most browsers).
+// Rectangular patches always use one rect-sized `ImageData` and one
+// visible-canvas `putImageData(x, y)`. They do not allocate or copy a
+// full framebuffer and do not snapshot the offscreen full-frame surface.
 //
-//   * **Fallback** — when `OffscreenCanvas` or
-//     `transferToImageBitmap` is unavailable (older Safari,
-//     jsdom, the early bootstrap path before T080 settled),
-//     paint directly via `putImageData` onto the visible
-//     canvas's 2D context.
-//
-// Either way, after every paint completes the renderer fires a
+// After every full-frame, patch, or atomic patch-batch paint completes the renderer fires a
 // `present_complete` event so callers (a future
 // frame-rate-aware compositor) can pace their next blit
 // request. The event is fire-and-forget; multiple subscribers
@@ -29,6 +20,7 @@
 //
 // The renderer is independent of `FbHost` — callers wire
 // `host.onFrame(renderer.paintFrame.bind(renderer))` and
+// `host.onPatch(renderer.paintPatch.bind(renderer))`, and
 // `host.onModeChange(renderer.setMode.bind(renderer))` to
 // connect them.
 
@@ -79,11 +71,7 @@ export interface FbRendererOptions {
    * Visible canvas to paint onto.
    */
   readonly canvas: CanvasLike;
-  /**
-   * Override the offscreen-canvas factory. Defaults to
-   * `globalThis.OffscreenCanvas` when present, else returns
-   * null (fallback path engages).
-   */
+  /** Override the factory used for the OffscreenCanvas capability probe. */
   readonly offscreenCanvasFactory?: OffscreenCanvasFactory;
   /**
    * Override the `ImageData` constructor. Defaults to the
@@ -96,12 +84,24 @@ export interface FbRendererOptions {
 
 export type PresentCompleteHandler = () => void;
 
+export interface FramebufferPatch {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly rgba: Uint8Array;
+}
+
+interface PreparedPatch {
+  readonly x: number;
+  readonly y: number;
+  readonly imageData: ImageDataLike;
+}
+
 export class FbRenderer {
   private readonly canvas: CanvasLike;
   private readonly offscreenFactory: OffscreenCanvasFactory;
   private readonly imageDataFactory: ImageDataFactory;
-  private offscreen: OffscreenCanvasLike | null = null;
-  private offscreenCtx: OffscreenCanvasRenderingContextLike | null = null;
   private readonly handlers: PresentCompleteHandler[] = [];
   private currentMode: { width: number; height: number } | null = null;
   /**
@@ -110,11 +110,7 @@ export class FbRenderer {
    * without needing a canvas-pixel comparison.
    */
   presentsCompleted = 0;
-  /**
-   * Tracks whether the renderer is using the OffscreenCanvas
-   * fast path. Read by tests; the value is decided by
-   * `setMode` based on the factory's return value.
-   */
+  /** Legacy diagnostic reporting whether OffscreenCanvas 2D is available. */
   usingFastPath = false;
 
   constructor(options: FbRendererOptions) {
@@ -131,9 +127,8 @@ export class FbRenderer {
   }
 
   /**
-   * Resize the canvas + (re-)create the offscreen surface for
-   * the new mode. Idempotent: passing the same geometry as the
-   * current mode is a no-op.
+   * Resize the canvas and refresh the OffscreenCanvas capability probe.
+   * Idempotent: passing the same geometry as the current mode is a no-op.
    */
   setMode(mode: { width: number; height: number }): void {
     if (
@@ -147,15 +142,8 @@ export class FbRenderer {
     this.canvas.width = mode.width;
     this.canvas.height = mode.height;
     const offscreen = this.offscreenFactory(mode.width, mode.height);
-    if (offscreen !== null) {
-      this.offscreen = offscreen;
-      this.offscreenCtx = offscreen.getContext("2d");
-      this.usingFastPath = this.offscreenCtx !== null;
-    } else {
-      this.offscreen = null;
-      this.offscreenCtx = null;
-      this.usingFastPath = false;
-    }
+    const offscreenCtx = offscreen?.getContext("2d") ?? null;
+    this.usingFastPath = offscreenCtx !== null;
   }
 
   /**
@@ -181,16 +169,113 @@ export class FbRenderer {
     );
     const imageData = this.imageDataFactory(rgba, frame.width, frame.height);
 
-    // Direct putImageData on the visible canvas. The
-    // OffscreenCanvas + transferToImageBitmap fast path
-    // exhibited row-stride / partial-paint artifacts on
-    // some Chromium builds that produced striped rendering;
-    // the slow path is straightforward and visibly correct.
+    // Paint full frames directly on the visible canvas. The
+    // OffscreenCanvas + transferToImageBitmap path previously produced
+    // reproducible row-stride/partial-paint artifacts in Chromium. Steady-
+    // state performance comes from the rectangular patch path below, so
+    // there is no reason to trade full-frame correctness for that fast path.
     const ctx = this.canvas.getContext("2d");
     if (ctx !== null) {
       ctx.putImageData(imageData, 0, 0);
     }
 
+    this.finishPresent();
+  }
+
+  /**
+   * Paint one tightly packed RGBA8 rectangle into the current mode.
+   * Invalid, empty, out-of-bounds, or byte-count-mismatched patches
+   * are dropped without firing a present-complete notification.
+   *
+   * The visible context is updated directly, keeping work proportional to
+   * the damage rectangle. Full frames use the same visible-canvas path.
+   */
+  paintPatch(patch: FramebufferPatch): void {
+    const ctx = this.canvas.getContext("2d");
+    if (ctx === null) {
+      return;
+    }
+    const prepared = this.preparePatch(patch);
+    if (prepared === null) {
+      return;
+    }
+    ctx.putImageData(prepared.imageData, prepared.x, prepared.y);
+    this.finishPresent();
+  }
+
+  /**
+   * Validate every rectangle before painting any of them, then update the
+   * visible canvas and emit exactly one completion. Canvas writes happen in
+   * one main-thread task, so no partially updated batch is observable.
+   */
+  paintPatchBatch(patches: readonly FramebufferPatch[]): void {
+    if (patches.length === 0) {
+      return;
+    }
+    const ctx = this.canvas.getContext("2d");
+    if (ctx === null) {
+      return;
+    }
+    const prepared: PreparedPatch[] = [];
+    for (const patch of patches) {
+      const next = this.preparePatch(patch);
+      if (next === null) {
+        return;
+      }
+      prepared.push(next);
+    }
+    for (const patch of prepared) {
+      ctx.putImageData(patch.imageData, patch.x, patch.y);
+    }
+    this.finishPresent();
+  }
+
+  private preparePatch(patch: FramebufferPatch): PreparedPatch | null {
+    const mode = this.currentMode;
+    if (mode === null) {
+      return null;
+    }
+    if (
+      !Number.isSafeInteger(patch.x) ||
+      !Number.isSafeInteger(patch.y) ||
+      !Number.isSafeInteger(patch.width) ||
+      !Number.isSafeInteger(patch.height) ||
+      patch.x < 0 ||
+      patch.y < 0 ||
+      patch.width <= 0 ||
+      patch.height <= 0
+    ) {
+      return null;
+    }
+    const right = patch.x + patch.width;
+    const bottom = patch.y + patch.height;
+    const pixelCount = patch.width * patch.height;
+    const pixelBytes = pixelCount * 4;
+    if (
+      !Number.isSafeInteger(right) ||
+      !Number.isSafeInteger(bottom) ||
+      !Number.isSafeInteger(pixelCount) ||
+      !Number.isSafeInteger(pixelBytes) ||
+      right > mode.width ||
+      bottom > mode.height ||
+      pixelBytes !== patch.rgba.byteLength
+    ) {
+      return null;
+    }
+    const rgba = new Uint8ClampedArray(
+      patch.rgba.buffer,
+      patch.rgba.byteOffset,
+      patch.rgba.byteLength,
+    );
+    const imageData = this.imageDataFactory(
+      rgba,
+      patch.width,
+      patch.height,
+    );
+    return { x: patch.x, y: patch.y, imageData };
+  }
+
+  private finishPresent(): void {
     this.presentsCompleted += 1;
     for (const h of this.handlers) {
       h();

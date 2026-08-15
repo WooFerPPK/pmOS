@@ -18,10 +18,10 @@ import { describe, expect, it } from "vitest";
 import * as layout from "../../src/shared/sab-layout";
 
 describe("sab-layout", () => {
-  it("ABI_VERSION matches the v1.1 contract from contracts/syscalls.md §5", () => {
+  it("ABI_VERSION matches the v1.2 contract from contracts/syscalls.md §5", () => {
     expect(layout.ABI_MAJOR).toBe(1);
-    expect(layout.ABI_MINOR).toBe(1);
-    expect(layout.ABI_VERSION).toEqual([1, 1]);
+    expect(layout.ABI_MINOR).toBe(2);
+    expect(layout.ABI_VERSION).toEqual([1, 2]);
   });
 
   it("SAB is 64 KiB and split into the documented regions", () => {

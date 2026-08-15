@@ -29,6 +29,14 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::ExitCode;
 
+#[derive(Copy, Clone)]
+struct ScanOptions {
+    case_insensitive: bool,
+    with_line_numbers: bool,
+    invert: bool,
+    count_only: bool,
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut case_insensitive = false;
@@ -61,7 +69,10 @@ fn main() -> ExitCode {
     }
 
     let Some((pattern, files)) = rest.split_first() else {
-        let _ = writeln!(io::stderr(), "usage: grep [-i] [-n] [-v] [-c] <pattern> [file ...]");
+        let _ = writeln!(
+            io::stderr(),
+            "usage: grep [-i] [-n] [-v] [-c] <pattern> [file ...]"
+        );
         return ExitCode::from(2);
     };
     let stdout = io::stdout();
@@ -69,17 +80,27 @@ fn main() -> ExitCode {
     let mut matched = false;
     let mut had_open_error = false;
     let multi = files.len() > 1;
-    let needle = if case_insensitive { pattern.to_lowercase() } else { pattern.clone() };
+    let needle = if case_insensitive {
+        pattern.to_lowercase()
+    } else {
+        pattern.clone()
+    };
+    let options = ScanOptions {
+        case_insensitive,
+        with_line_numbers,
+        invert,
+        count_only,
+    };
 
     if files.is_empty() {
         let stdin = io::stdin();
-        matched |= scan(stdin.lock(), &needle, case_insensitive, None, with_line_numbers, invert, count_only, &mut out);
+        matched |= scan(stdin.lock(), &needle, None, options, &mut out);
     } else {
         for path in files {
             match File::open(path) {
                 Ok(f) => {
                     let prefix = if multi { Some(path.as_str()) } else { None };
-                    matched |= scan(BufReader::new(f), &needle, case_insensitive, prefix, with_line_numbers, invert, count_only, &mut out);
+                    matched |= scan(BufReader::new(f), &needle, prefix, options, &mut out);
                 }
                 Err(e) => {
                     let _ = writeln!(io::stderr(), "grep: {path}: {e}");
@@ -101,11 +122,8 @@ fn main() -> ExitCode {
 fn scan<R: BufRead, W: Write>(
     r: R,
     needle: &str,
-    case_insensitive: bool,
     prefix: Option<&str>,
-    with_line_numbers: bool,
-    invert: bool,
-    count_only: bool,
+    options: ScanOptions,
     out: &mut W,
 ) -> bool {
     let mut any = false;
@@ -116,7 +134,7 @@ fn scan<R: BufRead, W: Write>(
             Ok(b) => b,
             Err(e) => {
                 let _ = writeln!(io::stderr(), "grep: {label}: {e}");
-                if count_only {
+                if options.count_only {
                     emit_count(out, prefix, count);
                 }
                 return any;
@@ -124,18 +142,18 @@ fn scan<R: BufRead, W: Write>(
         };
         match std::str::from_utf8(&bytes) {
             Ok(s) => {
-                let hit = if case_insensitive {
+                let hit = if options.case_insensitive {
                     s.to_lowercase().contains(needle)
                 } else {
                     s.contains(needle)
                 };
-                if hit != invert {
+                if hit != options.invert {
                     any = true;
-                    if count_only {
+                    if options.count_only {
                         count += 1;
                     } else {
                         let lineno = n + 1;
-                        match (prefix, with_line_numbers) {
+                        match (prefix, options.with_line_numbers) {
                             (Some(p), true) => {
                                 let _ = writeln!(out, "{p}:{lineno}:{s}");
                             }
@@ -153,11 +171,15 @@ fn scan<R: BufRead, W: Write>(
                 }
             }
             Err(_) => {
-                let _ = writeln!(io::stderr(), "grep: {label}: invalid utf-8 at line {}", n + 1);
+                let _ = writeln!(
+                    io::stderr(),
+                    "grep: {label}: invalid utf-8 at line {}",
+                    n + 1
+                );
             }
         }
     }
-    if count_only {
+    if options.count_only {
         emit_count(out, prefix, count);
     }
     any

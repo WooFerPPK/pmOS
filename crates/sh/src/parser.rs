@@ -151,9 +151,7 @@ impl Pipeline {
     /// REPL to short-circuit the redirection-aware path
     /// when nothing about the pipeline calls for it.
     pub fn is_simple(&self) -> bool {
-        !self.background
-            && self.stages.len() == 1
-            && self.stages[0].redirs.is_empty()
+        !self.background && self.stages.len() == 1 && self.stages[0].redirs.is_empty()
     }
 }
 
@@ -217,10 +215,7 @@ impl ParseError {
 /// The split lets the parser distinguish a bare `|` from a
 /// quoted `'|'` — both have the same `assembled` value but
 /// different [`WordKind`]s.
-pub fn parse_pipeline(
-    kinds: &[WordKind],
-    assembled: &[String],
-) -> Result<Pipeline, ParseError> {
+pub fn parse_pipeline(kinds: &[WordKind], assembled: &[String]) -> Result<Pipeline, ParseError> {
     debug_assert_eq!(kinds.len(), assembled.len());
 
     let mut pipeline = Pipeline::default();
@@ -251,9 +246,7 @@ pub fn parse_pipeline(
                         return Err(ParseError::MissingRedirTarget(op.to_string()));
                     }
                     if matches!(kinds[next_idx], WordKind::Operator) {
-                        return Err(ParseError::UnexpectedOperator(
-                            assembled[next_idx].clone(),
-                        ));
+                        return Err(ParseError::UnexpectedOperator(assembled[next_idx].clone()));
                     }
                     current.redirs.push(Redirection {
                         op: redir_op,
@@ -330,7 +323,14 @@ mod tests {
 
     #[test]
     fn pipeline_two_stages() {
-        let p = parse(vec![argv("echo"), argv("hi"), op("|"), argv("grep"), argv("hi")]).unwrap();
+        let p = parse(vec![
+            argv("echo"),
+            argv("hi"),
+            op("|"),
+            argv("grep"),
+            argv("hi"),
+        ])
+        .unwrap();
         assert_eq!(p.stages.len(), 2);
         assert_eq!(p.stages[0].argv, vec!["echo", "hi"]);
         assert_eq!(p.stages[1].argv, vec!["grep", "hi"]);

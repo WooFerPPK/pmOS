@@ -8,7 +8,8 @@
 //
 // Per-process lifetime: receive exactly one `boot {pid, sab,
 // wasmBytes}` message; instantiate the user wasm against a
-// `SabBackend` over the SAB; run `_start`; post `{kind:"exited",
+// `SabBackend` over the SAB; acknowledge `{kind:"booted"}`; run
+// `_start`; post `{kind:"exited",
 // pid, code}` (or `code:-1, trap:<msg>` on a non-`UserProcessExited`
 // error); then the Worker exits. All subsequent main-thread
 // messages are ignored — this Worker is single-shot.
@@ -140,11 +141,22 @@ async function runOnce(
     ...(options.serviceHook ? { serviceHook: options.serviceHook } : {}),
     ...(kernelWakeSlot !== undefined ? { kernelWakeSlot } : {}),
   });
-  const runtime = new UserWasmRuntime(boot.wasmBytes, backend, {
+  // WebAssembly.instantiate accepts a plain BufferSource, not a
+  // SharedArrayBuffer. The worker protocol permits ArrayBufferLike
+  // because its SAB fields genuinely are shared, so normalize the
+  // immutable module bytes at this boundary.
+  const wasmBytes = new Uint8Array(boot.wasmBytes.byteLength);
+  wasmBytes.set(new Uint8Array(boot.wasmBytes));
+  const runtime = new UserWasmRuntime(wasmBytes.buffer, backend, {
     onMemorySizeBytes: (bytes) => {
       messaging.postMessage({ kind: "memory", pid: boot.pid, bytes });
     },
   });
+  // Main publishes this process's SAB to the kernel only after this
+  // acknowledgement. If Worker creation, message delivery, or the
+  // per-process backend setup fails, no runnable route is published
+  // and main reports a synthetic proc:exited for kernel rollback.
+  messaging.postMessage({ kind: "booted", pid: boot.pid });
   try {
     const code = await runtime.run();
     const memoryBytes = runtime.memorySizeBytes();

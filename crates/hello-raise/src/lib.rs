@@ -1,6 +1,6 @@
 //! Self-raises SIGTERM via WASI `proc_raise(15)` — the POSIX
 //! `raise(sig)` equivalent — then drains the queued signum from
-//! fd 3 (the auto-installed `FdObject::SignalChannel`) and echoes
+//! fd 4 (the auto-installed `FdObject::SignalChannel`) and echoes
 //! the 2-byte u16 LE record plus a trailing newline to
 //! `/dev/console`. Proves the WASI `proc_raise` path (cbe8959's
 //! self-signal arm) through a real `wasm32-wasip1` user binary —
@@ -9,11 +9,11 @@
 //!
 //! Origin difference from hello-sigchld: hello-sigchld observes
 //! SIGTERM queued by its parent's `PROC_KILL`; hello-raise observes
-//! SIGTERM queued by its own `proc_raise` call. The fd 3 drain
+//! SIGTERM queued by its own `proc_raise` call. The fd 4 drain
 //! path is identical in both cases — the asymmetry is purely in
 //! how the signal lands in the inbox.
 //!
-//! fd 3 is installed automatically by proc_spawn (9fbe708) as the
+//! fd 4 is installed automatically by proc_spawn as the
 //! per-process signal channel — no explicit path_open is needed.
 //! Because proc_raise is synchronous (the signal is queued on the
 //! caller's inbox before the shim returns), no EAGAIN polling is
@@ -22,31 +22,21 @@
 //!
 //! Exit codes:
 //!
-//!   * 0   = success — drained 2 bytes, echoed + newline
-//!   * 10  = proc_raise returned non-zero errno
-//!   * 11  = fd_read returned non-zero errno
-//!   * 12  = fd_read returned 0 bytes (unexpected — inbox always
-//!           holds 2-byte records after a successful raise)
-//!   * 13  = fd_write to stdout failed or short-wrote
-//!   * 101 = panic
+//! * 0   = success — drained 2 bytes, echoed + newline
+//! * 10  = proc_raise returned non-zero errno
+//! * 11  = fd_read returned non-zero errno
+//! * 12  = fd_read returned 0 bytes (unexpected — inbox always
+//!   holds 2-byte records after a successful raise)
+//! * 13  = fd_write to stdout failed or short-wrote
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
-    fn fd_read(
-        fd: i32,
-        iovs_ptr: *const Iovec,
-        iovs_len: i32,
-        nread_ptr: *mut u32,
-    ) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_read(fd: i32, iovs_ptr: *const Iovec, iovs_len: i32, nread_ptr: *mut u32) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
     fn proc_raise(signum: i32) -> i32;
 }
@@ -81,7 +71,7 @@ pub extern "C" fn _start() {
             buf_len: buf.len() as u32,
         };
         let mut nread: u32 = 0;
-        let read_rc = fd_read(3, &read_iov, 1, &mut nread);
+        let read_rc = fd_read(4, &read_iov, 1, &mut nread);
         if read_rc != 0 {
             proc_exit(11);
         }

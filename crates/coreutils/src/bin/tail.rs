@@ -157,7 +157,7 @@ fn main() -> ExitCode {
                 Ok(bytes) => {
                     if multi {
                         let leading = if i == 0 { "" } else { "\n" };
-                        if let Err(e) = write!(out, "{leading}==> {path} <==\n") {
+                        if let Err(e) = writeln!(out, "{leading}==> {path} <==") {
                             let _ = writeln!(io::stderr(), "tail: {path}: {e}");
                             had_error = true;
                             continue;
@@ -176,7 +176,11 @@ fn main() -> ExitCode {
         }
     }
 
-    if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
 }
 
 fn parse_count_arg(arg: &str) -> Option<Result<u64, String>> {
@@ -184,7 +188,7 @@ fn parse_count_arg(arg: &str) -> Option<Result<u64, String>> {
     if body.is_empty() {
         return None;
     }
-    let after_sign = if body.starts_with('-') { &body[1..] } else { body };
+    let after_sign = body.strip_prefix('-').unwrap_or(body);
     if !after_sign.is_empty() && after_sign.chars().all(|c| c.is_ascii_digit()) {
         if body.starts_with('-') {
             return Some(Err(arg.to_string()));
@@ -201,9 +205,7 @@ fn parse_count_arg(arg: &str) -> Option<Result<u64, String>> {
                 Err(_) => Some(Err(arg.to_string())),
             };
         }
-        if rest.starts_with('-')
-            && rest.len() > 1
-            && rest[1..].chars().all(|c| c.is_ascii_digit())
+        if rest.starts_with('-') && rest.len() > 1 && rest[1..].chars().all(|c| c.is_ascii_digit())
         {
             return Some(Err(arg.to_string()));
         }

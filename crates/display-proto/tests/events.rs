@@ -180,7 +180,15 @@ fn shm_format_round_trips_both_formats() {
 #[test]
 fn write_string_matches_read_string_for_round_trip() {
     use display_proto::decode::read_string;
-    for s in ["", "a", "ab", "abc", "abcd", "hello world", "pmd_compositor"] {
+    for s in [
+        "",
+        "a",
+        "ab",
+        "abc",
+        "abcd",
+        "hello world",
+        "pmd_compositor",
+    ] {
         let mut out = Vec::new();
         write_string(&mut out, s);
         let (got, consumed) = read_string(&out, 0).unwrap();
@@ -247,6 +255,7 @@ fn pointer_motion_payload_is_exactly_twelve_bytes() {
 #[test]
 fn pointer_button_round_trips_with_press_state() {
     let original = PointerButton {
+        serial: 0x1020_3040,
         surface_id: ObjectId::new(11),
         x: 100,
         y: 50,
@@ -263,6 +272,7 @@ fn pointer_button_round_trips_with_press_state() {
 #[test]
 fn pointer_button_round_trips_with_release_state() {
     let original = PointerButton {
+        serial: 77,
         surface_id: ObjectId::new(11),
         x: 0,
         y: 0,
@@ -277,9 +287,10 @@ fn pointer_button_round_trips_with_release_state() {
 }
 
 #[test]
-fn pointer_button_payload_is_exactly_twenty_bytes() {
+fn pointer_button_payload_is_exactly_twenty_four_bytes() {
     let mut buf = Vec::new();
     PointerButton {
+        serial: 1,
         surface_id: ObjectId::new(1),
         x: 0,
         y: 0,
@@ -287,7 +298,7 @@ fn pointer_button_payload_is_exactly_twenty_bytes() {
         state: 0,
     }
     .encode(&mut buf);
-    assert_eq!(buf.len(), 20);
+    assert_eq!(buf.len(), 24);
 }
 
 #[test]

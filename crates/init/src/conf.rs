@@ -23,6 +23,14 @@
 
 use std::collections::BTreeMap;
 
+use abi::cap::Cap;
+
+/// Privileged boot services are resolved from the immutable browser binary
+/// registry.  `/etc/init.conf` may select between the two shipped shells, but
+/// it may not redirect PID 1's privileged grants to an arbitrary VFS binary.
+pub const TRUSTED_DISPLAY_SERVER_PATH: &str = "/usr/bin/display-server";
+pub const TRUSTED_SHELL_PATHS: &[&str] = &["/usr/bin/shell", "/usr/bin/alt-shell"];
+
 /// Parsed `/etc/init.conf` view used by init's spawn loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitConfig {
@@ -55,13 +63,42 @@ impl InitConfig {
     /// The contract's documented defaults — what init uses when
     /// `/etc/init.conf` is missing or unparseable.
     pub fn builtin_defaults() -> Self {
+        let mut capabilities = BTreeMap::new();
+        capabilities.insert(
+            String::from("display-server"),
+            [Cap::DisplayServer, Cap::DevBlock]
+                .into_iter()
+                .map(|cap| cap.name().to_string())
+                .collect(),
+        );
+        capabilities.insert(
+            String::from("shell"),
+            [
+                Cap::DisplayClient,
+                Cap::Shell,
+                Cap::ProcEnumerate,
+                Cap::ProcKillAny,
+                Cap::KeymapAdmin,
+                Cap::HostTransfer,
+            ]
+            .into_iter()
+            .map(|cap| cap.name().to_string())
+            .collect(),
+        );
+        capabilities.insert(
+            String::from("sysmon"),
+            [Cap::DisplayClient, Cap::ProcEnumerate, Cap::ProcKillAny]
+                .into_iter()
+                .map(|cap| cap.name().to_string())
+                .collect(),
+        );
         InitConfig {
             boot: Boot {
-                display_server: String::from("/usr/bin/display-server"),
-                shell: String::from("/usr/bin/shell"),
+                display_server: String::from(TRUSTED_DISPLAY_SERVER_PATH),
+                shell: String::from(TRUSTED_SHELL_PATHS[0]),
                 autostart: Vec::new(),
             },
-            capabilities: BTreeMap::new(),
+            capabilities,
             env: BTreeMap::new(),
             debug: Debug {
                 kernel_log_level: String::from("info"),
@@ -76,6 +113,10 @@ impl InitConfig {
     /// [`builtin_defaults`] on any error.
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         let mut out = Self::builtin_defaults();
+        // A present configuration owns its complete capability policy. The
+        // built-in grants above are only the missing/unparseable-file fallback;
+        // omitting a section from a valid file yields no grant for that role.
+        out.capabilities.clear();
         let mut current_section: Vec<String> = Vec::new();
         for (idx, raw_line) in input.lines().enumerate() {
             let line_no = idx + 1;
@@ -107,6 +148,44 @@ impl InitConfig {
             apply_assignment(&mut out, &current_section, &key, value, line_no)?;
         }
         Ok(out)
+    }
+
+    /// Resolve one `[capabilities.<role>]` list into ABI bits. Unknown names
+    /// are returned for an actionable init warning and otherwise ignored, as
+    /// required by the init configuration contract.
+    pub fn capability_bits(&self, role: &str) -> (u64, Vec<String>) {
+        let mut bits = 0u64;
+        let mut unknown = Vec::new();
+        for name in self.capabilities.get(role).into_iter().flatten() {
+            if let Some(cap) = Cap::from_name(name) {
+                bits |= cap.bit();
+            } else {
+                unknown.push(name.clone());
+            }
+        }
+        (bits, unknown)
+    }
+
+    /// Resolve a capability section while enforcing the trusted role's
+    /// compile-time ceiling.  PID 1 owns every capability, so merely checking
+    /// the spawn-time subset rule is insufficient: mutable configuration must
+    /// never be able to turn that authority into a wider child grant.
+    pub fn bounded_capability_bits(
+        &self,
+        role: &str,
+        ceiling: u64,
+    ) -> (u64, Vec<String>, Vec<String>) {
+        let mut bits = 0u64;
+        let mut unknown = Vec::new();
+        let mut denied = Vec::new();
+        for name in self.capabilities.get(role).into_iter().flatten() {
+            match Cap::from_name(name) {
+                Some(cap) if ceiling & cap.bit() != 0 => bits |= cap.bit(),
+                Some(_) => denied.push(name.clone()),
+                None => unknown.push(name.clone()),
+            }
+        }
+        (bits, unknown, denied)
     }
 }
 
@@ -144,11 +223,25 @@ fn apply_assignment(
 fn apply_boot(boot: &mut Boot, key: &str, value: &str, line_no: usize) -> Result<(), ParseError> {
     match key {
         "display_server" => {
-            boot.display_server = parse_string(value, line_no)?;
+            let path = parse_string(value, line_no)?;
+            if path != TRUSTED_DISPLAY_SERVER_PATH {
+                return Err(ParseError::new(
+                    line_no,
+                    "boot.display_server must name the bundled /usr/bin/display-server",
+                ));
+            }
+            boot.display_server = path;
             Ok(())
         }
         "shell" => {
-            boot.shell = parse_string(value, line_no)?;
+            let path = parse_string(value, line_no)?;
+            if !TRUSTED_SHELL_PATHS.contains(&path.as_str()) {
+                return Err(ParseError::new(
+                    line_no,
+                    "boot.shell must name bundled /usr/bin/shell or /usr/bin/alt-shell",
+                ));
+            }
+            boot.shell = path;
             Ok(())
         }
         "autostart" => {
@@ -173,7 +266,10 @@ fn apply_debug(
                     debug.kernel_log_level = v;
                     Ok(())
                 }
-                _ => Err(ParseError::new(line_no, "kernel_log_level must be one of trace|debug|info|warn|error")),
+                _ => Err(ParseError::new(
+                    line_no,
+                    "kernel_log_level must be one of trace|debug|info|warn|error",
+                )),
             }
         }
         "serial_shell" => {
@@ -220,7 +316,10 @@ fn parse_bool(value: &str, line_no: usize) -> Result<bool, ParseError> {
     match value.trim() {
         "true" => Ok(true),
         "false" => Ok(false),
-        _ => Err(ParseError::new(line_no, "boolean value must be `true` or `false`")),
+        _ => Err(ParseError::new(
+            line_no,
+            "boolean value must be `true` or `false`",
+        )),
     }
 }
 
@@ -275,16 +374,25 @@ mod tests {
         assert_eq!(d.boot.display_server, "/usr/bin/display-server");
         assert_eq!(d.boot.shell, "/usr/bin/shell");
         assert!(d.boot.autostart.is_empty());
-        assert!(d.capabilities.is_empty());
+        assert_eq!(
+            d.capability_bits("display-server").0,
+            abi::cap::initial::DISPLAY_SERVER.0
+        );
+        assert_eq!(
+            d.capability_bits("shell").0,
+            abi::cap::initial::DESKTOP_SHELL.0
+        );
+        assert_eq!(d.capability_bits("sysmon").0, abi::cap::initial::SYSMON.0);
         assert!(d.env.is_empty());
         assert_eq!(d.debug.kernel_log_level, "info");
         assert!(!d.debug.serial_shell);
     }
 
     #[test]
-    fn parse_empty_input_returns_defaults() {
+    fn parse_empty_input_keeps_boot_defaults_but_grants_nothing() {
         let cfg = InitConfig::parse("").unwrap();
-        assert_eq!(cfg, InitConfig::builtin_defaults());
+        assert_eq!(cfg.boot, InitConfig::builtin_defaults().boot);
+        assert!(cfg.capabilities.is_empty());
     }
 
     #[test]
@@ -299,7 +407,7 @@ autostart      = ["sysmon", "settings"]
 grant = ["DISPLAY_SERVER", "DEV_BLOCK"]
 
 [capabilities.shell]
-grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE", "KEYMAP_ADMIN"]
+grant = ["DISPLAY_CLIENT", "SHELL", "PROC_ENUMERATE", "PROC_KILL_ANY", "KEYMAP_ADMIN", "HOST_TRANSFER"]
 
 [env]
 PATH = "/bin:/usr/bin"
@@ -323,18 +431,43 @@ serial_shell     = false
     }
 
     #[test]
+    fn capability_bits_decodes_known_names_and_reports_unknown_names() {
+        let cfg = InitConfig::parse(
+            "[capabilities.shell]\ngrant = [\"DISPLAY_CLIENT\", \"SHELL\", \"FUTURE_CAP\"]\n",
+        )
+        .unwrap();
+        let (bits, unknown) = cfg.capability_bits("shell");
+        assert_eq!(bits, Cap::DisplayClient.bit() | Cap::Shell.bit());
+        assert_eq!(unknown, vec!["FUTURE_CAP"]);
+        assert_eq!(cfg.capability_bits("missing"), (0, Vec::new()));
+    }
+
+    #[test]
+    fn bounded_capability_bits_refuses_known_caps_above_role_ceiling() {
+        let cfg = InitConfig::parse(
+            "[capabilities.shell]\ngrant = [\"DISPLAY_CLIENT\", \"CAP_GRANT\", \"FUTURE_CAP\"]\n",
+        )
+        .unwrap();
+        let (bits, unknown, denied) =
+            cfg.bounded_capability_bits("shell", abi::cap::initial::DESKTOP_SHELL.0);
+        assert_eq!(bits, Cap::DisplayClient.bit());
+        assert_eq!(unknown, vec!["FUTURE_CAP"]);
+        assert_eq!(denied, vec!["CAP_GRANT"]);
+    }
+
+    #[test]
     fn comments_and_blank_lines_are_ignored() {
         let input = r#"
 # top-level comment
 
 [boot]
 # inline-section comment
-shell = "/usr/bin/sh"   # trailing comment after a value
+        shell = "/usr/bin/alt-shell"   # trailing comment after a value
 
 # blank line above
 "#;
         let cfg = InitConfig::parse(input).unwrap();
-        assert_eq!(cfg.boot.shell, "/usr/bin/sh");
+        assert_eq!(cfg.boot.shell, "/usr/bin/alt-shell");
     }
 
     #[test]
@@ -375,28 +508,19 @@ shell = "/usr/bin/sh"   # trailing comment after a value
 
     #[test]
     fn invalid_kernel_log_level_rejected() {
-        let err = InitConfig::parse(
-            "[debug]\nkernel_log_level = \"loud\"",
-        )
-        .unwrap_err();
+        let err = InitConfig::parse("[debug]\nkernel_log_level = \"loud\"").unwrap_err();
         assert!(err.message.contains("kernel_log_level"));
     }
 
     #[test]
     fn invalid_boolean_rejected() {
-        let err = InitConfig::parse(
-            "[debug]\nserial_shell = nope",
-        )
-        .unwrap_err();
+        let err = InitConfig::parse("[debug]\nserial_shell = nope").unwrap_err();
         assert!(err.message.contains("boolean"));
     }
 
     #[test]
     fn capabilities_only_accepts_grant_key() {
-        let err = InitConfig::parse(
-            "[capabilities.shell]\nrevoke = [\"X\"]",
-        )
-        .unwrap_err();
+        let err = InitConfig::parse("[capabilities.shell]\nrevoke = [\"X\"]").unwrap_err();
         assert!(err.message.contains("grant"));
     }
 
@@ -417,13 +541,13 @@ ALPHA = "a"
 
     #[test]
     fn single_quoted_strings_round_trip() {
-        let cfg = InitConfig::parse("[boot]\nshell = '/usr/bin/sh'").unwrap();
-        assert_eq!(cfg.boot.shell, "/usr/bin/sh");
+        let cfg = InitConfig::parse("[boot]\nshell = '/usr/bin/alt-shell'").unwrap();
+        assert_eq!(cfg.boot.shell, "/usr/bin/alt-shell");
     }
 
     #[test]
     fn line_numbers_in_errors_point_at_the_offending_line() {
-        let input = "[boot]\nshell = \"/x\"\nbroken_line";
+        let input = "[boot]\nshell = \"/usr/bin/shell\"\nbroken_line";
         let err = InitConfig::parse(input).unwrap_err();
         assert_eq!(err.line, 3);
     }
@@ -464,5 +588,18 @@ shell = "/usr/bin/alt-shell"
         assert_eq!(cfg1.boot.shell, "/usr/bin/shell");
         assert_eq!(cfg2.boot.shell, "/usr/bin/alt-shell");
         assert_ne!(cfg1.boot.shell, cfg2.boot.shell);
+    }
+
+    #[test]
+    fn privileged_boot_paths_cannot_be_redirected_to_mutable_vfs_code() {
+        let display = InitConfig::parse("[boot]\ndisplay_server = \"/opt/evil/bin/server.wasm\"\n")
+            .unwrap_err();
+        assert_eq!(display.line, 2);
+        assert!(display.message.contains("bundled"));
+
+        let shell =
+            InitConfig::parse("[boot]\nshell = \"/opt/evil/bin/shell.wasm\"\n").unwrap_err();
+        assert_eq!(shell.line, 2);
+        assert!(shell.message.contains("bundled"));
     }
 }

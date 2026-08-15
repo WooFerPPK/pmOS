@@ -53,12 +53,7 @@
 extern "C" {
     /// WASI preview 1 `fd_write`. Writes a scatter-gather list
     /// of buffers to `fd`. Returns an errno (0 = success).
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
 
     /// WASI preview 1 `proc_exit`. Terminates the process with
     /// exit code `rval` and never returns.

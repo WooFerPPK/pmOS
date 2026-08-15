@@ -19,8 +19,11 @@
 // bump the shared kernel-wake slot + `Atomics.notify`, then park on
 // `Atomics.wait(user_wait_slot, REQUESTED)`. The kernel Worker
 // wakes, services the request via `serviceSab`, sets `user_wait_slot
-// = READY`, and `Atomics.notify`s. The user wakes and reads the
-// response.
+// = READY`, and `Atomics.notify`s. The user waits in a condition loop
+// until the response ring is non-empty, then reads the response. The
+// loop matters because the wait slot is reused: a late notify for the
+// previous syscall may otherwise wake the next syscall before its
+// response has been published.
 //
 // For T231 the wake slots stay untouched. The constructor accepts
 // an optional `serviceHook` callback that runs synchronously between
@@ -108,10 +111,12 @@ export interface SabBackendOptions {
    *   3. `Atomics.add(kernelWakeSlot, 0, 1) +
    *      Atomics.notify(kernelWakeSlot, 0)` — wake the kernel's
    *      `Atomics.waitAsync` parker.
-   *   4. `Atomics.wait(header, OFF_USER_WAIT_SLOT/4, STATUS_REQUESTED)`
-   *      — block the user Worker thread until the kernel writes
-   *      `STATUS_READY` + notifies (or returns immediately if the
-   *      kernel already wrote `STATUS_READY` in step 3 above).
+   *   4. While the response ring is empty, reset the wait slot to
+   *      `STATUS_REQUESTED`, re-check the ring, then call
+   *      `Atomics.wait(header, OFF_USER_WAIT_SLOT/4, STATUS_REQUESTED)`.
+   *      The condition loop rejects a late notification belonging to
+   *      the previous syscall; the re-check closes the publish-vs-park
+   *      race for the current syscall.
    *   5. Pop the response from the SAB response ring (existing path).
    *
    * `Atomics.notify` and the synchronous `Atomics.wait` only work
@@ -146,6 +151,39 @@ export class SabBackend implements KernelBackend {
    * `KernelWasmHost.create` and the per-pid SAB by the main-thread
    * router, so a partial fallback is possible. */
   private readonly wakeSlotIsShared: boolean;
+
+  private responseRingIsEmpty(): boolean {
+    return (
+      Atomics.load(this.header, OFF_RES_HEAD / 4) ===
+      Atomics.load(this.header, OFF_RES_TAIL / 4)
+    );
+  }
+
+  /**
+   * Park until this process's response ring contains an entry.
+   *
+   * `OFF_USER_WAIT_SLOT` is one reusable futex rather than a generation
+   * counter. The kernel publishes in the required order (response, READY,
+   * notify), but the user can observe READY and start its next syscall in
+   * the small interval before the previous notify executes. That stale
+   * notify is allowed to wake the new wait even though its response is not
+   * ready. Treating the ring state as the condition and waiting in a loop
+   * makes that ABA harmless.
+   */
+  private waitForResponse(): void {
+    while (this.responseRingIsEmpty()) {
+      Atomics.store(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+
+      // A response may have landed before the store above, or between the
+      // store and this load. In both cases consuming it is safe and waiting
+      // would risk missing the already-completed notification.
+      if (!this.responseRingIsEmpty()) {
+        return;
+      }
+
+      Atomics.wait(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+    }
+  }
 
   constructor(options: SabBackendOptions) {
     if (options.sab.byteLength < SAB_SIZE) {
@@ -262,12 +300,10 @@ export class SabBackend implements KernelBackend {
         Atomics.notify(this.kernelWakeSlot, 0);
       }
       if (this.headerIsShared) {
-        // `Atomics.wait` is sync — legal in dedicated Worker scope (the
-        // user-worker bundle's runtime). Returns when the kernel writes
-        // any value other than `STATUS_REQUESTED` to the wait slot;
-        // returns "not-equal" immediately if the kernel already wrote
-        // such a value before we reached this call.
-        Atomics.wait(this.header, OFF_USER_WAIT_SLOT / 4, STATUS_REQUESTED);
+        // `Atomics.wait` is sync and legal in dedicated Worker scope. Wait
+        // on the actual ring condition rather than trusting one wake: the
+        // shared futex can receive a late notify from the prior syscall.
+        this.waitForResponse();
       }
       // No wait possible on a plain ArrayBuffer header — fall through
       // to the response pop, which will throw "ring empty" if the
@@ -280,11 +316,10 @@ export class SabBackend implements KernelBackend {
 
     // Consumer-pop. Mirrors `ring::Sab::try_pop_response`. The user
     // is the only consumer for this pid's response ring, so an
-    // empty ring at this point means the kernel never published —
-    // in T231 that means the `serviceHook` neglected to service
-    // (a test harness bug); in T233+ it means the wait spuriously
-    // woke without a kernel-side notify (impossible per the wake
-    // protocol, so still a bug).
+    // empty ring at this point means the synchronous service hook did not
+    // publish, or the caller supplied no usable shared wait protocol. The
+    // production SharedArrayBuffer path above cannot get here merely because
+    // an old notification woke the reusable futex.
     const resHead = Atomics.load(this.header, OFF_RES_HEAD / 4);
     const resTail = Atomics.load(this.header, OFF_RES_TAIL / 4);
     if (resHead === resTail) {

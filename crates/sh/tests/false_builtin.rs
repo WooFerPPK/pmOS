@@ -67,8 +67,7 @@ fn false_with_extra_args_still_exits_one() {
     // output. Same two-prompt shape as the bare-false case.
     // The exit-1 status is still produced internally but
     // dropped before observable surfacing.
-    let (status, stdout, stderr, _env) =
-        drive("false foo bar baz\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("false foo bar baz\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(stdout, "$ $ ");
@@ -82,8 +81,7 @@ fn false_in_sequence_continues_to_next_command() {
     // assertion: it pins that the dispatch arm uses the
     // non-terminating `Status(1)` variant rather than the
     // REPL-terminating `Exit(1)` variant.
-    let (status, stdout, stderr, _env) =
-        drive("false\necho still here\nexit\n", BTreeMap::new());
+    let (status, stdout, stderr, _env) = drive("false\necho still here\nexit\n", BTreeMap::new());
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert!(

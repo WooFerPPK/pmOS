@@ -30,6 +30,12 @@ pub enum DecodeError {
     StringOverrun { offset: usize, claimed: usize },
     /// A wire string was not valid UTF-8.
     InvalidUtf8 { offset: usize },
+    /// A request with an inline byte array declared an exact payload length
+    /// that did not match the bytes present on the wire.
+    PayloadLengthMismatch { expected: u64, actual: usize },
+    /// Geometry-derived inline payload length overflowed the wire decoder's
+    /// `u64` accounting domain.
+    PayloadLengthOverflow,
 }
 
 /// Read a little-endian `u32` at `offset`.
@@ -61,6 +67,31 @@ pub fn read_object_id(payload: &[u8], offset: usize) -> Result<ObjectId, DecodeE
     Ok(ObjectId::new(read_u32(payload, offset)?))
 }
 
+/// Read only a wire string's declared content length after proving that the
+/// content bytes are present. This performs no UTF-8 validation or allocation,
+/// allowing resource admission to reject oversized retained metadata before a
+/// request is fully parsed into an owned string.
+pub fn read_string_byte_len(payload: &[u8], offset: usize) -> Result<usize, DecodeError> {
+    let length = read_u32(payload, offset)? as usize;
+    let content_start = offset.checked_add(4).ok_or(DecodeError::StringOverrun {
+        offset,
+        claimed: length,
+    })?;
+    let content_end = content_start
+        .checked_add(length)
+        .ok_or(DecodeError::StringOverrun {
+            offset,
+            claimed: length,
+        })?;
+    if content_end > payload.len() {
+        return Err(DecodeError::StringOverrun {
+            offset,
+            claimed: length,
+        });
+    }
+    Ok(length)
+}
+
 /// Read a length-prefixed UTF-8 string at `offset`. Returns
 /// the string and the number of payload bytes consumed
 /// (length field + content + padding).
@@ -68,15 +99,9 @@ pub fn read_object_id(payload: &[u8], offset: usize) -> Result<ObjectId, DecodeE
 /// Layout: `u32 byte_length`, `byte_length` bytes of UTF-8,
 /// then zero padding to the next 4-byte boundary.
 pub fn read_string(payload: &[u8], offset: usize) -> Result<(&str, usize), DecodeError> {
-    let length = read_u32(payload, offset)? as usize;
+    let length = read_string_byte_len(payload, offset)?;
     let content_start = offset + 4;
     let content_end = content_start + length;
-    if content_end > payload.len() {
-        return Err(DecodeError::StringOverrun {
-            offset,
-            claimed: length,
-        });
-    }
     let content = &payload[content_start..content_end];
     let s = str::from_utf8(content).map_err(|_| DecodeError::InvalidUtf8 { offset })?;
     // Advance over trailing zero padding.

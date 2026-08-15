@@ -13,6 +13,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use core::cmp::Reverse;
 
 use super::{Filesystem, FsError};
 
@@ -83,7 +84,7 @@ impl MountTable {
             flags: 0,
         });
         self.mounts
-            .sort_by(|a, b| b.mountpoint.len().cmp(&a.mountpoint.len()));
+            .sort_by_key(|mount| Reverse(mount.mountpoint.len()));
         Ok(id)
     }
 

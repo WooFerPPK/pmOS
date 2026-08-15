@@ -31,6 +31,7 @@ pub mod client;
 pub mod compositor;
 pub mod protocol;
 pub mod server;
+pub mod transport;
 
 // Re-export the shared protocol types so existing callers
 // (`display_server::wire::MessageHeader`, etc.) keep working.
@@ -38,24 +39,90 @@ pub use display_proto::{ids, objects, wire};
 
 pub use client::{
     interface_required_cap, BufferAttachment, BufferInfo, Client, ClientError, ClientId,
-    DamageRect, Pool, Surface, Toplevel, AUTO_LAYOUT_STEP, MAX_POOL_SIZE,
+    ClientLimits, ClientResource, DamageRect, Pool, Surface, Toplevel, AUTO_LAYOUT_STEP,
+    MAX_CLIENT_BUFFERS, MAX_CLIENT_OBJECTS, MAX_CLIENT_POOLS, MAX_CLIENT_POOL_BYTES,
+    MAX_CLIENT_SURFACES, MAX_CLIENT_TOPLEVELS, MAX_CLIENT_TOPLEVEL_METADATA_BYTES,
+    MAX_JOURNAL_ENTRIES, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES, MAX_POOL_SIZE,
+    MAX_SURFACE_DAMAGE_RECTS, MAX_TOPLEVEL_METADATA_BYTES,
 };
 pub use compositor::{Framebuffer, BYTES_PER_PIXEL, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 pub use display_proto::{
-    IdAllocator, IdError, IdKind, Interface, MessageHeader, ObjectId,
-    ObjectIdAllocationError, Opcode, OpcodeError, WireError, HEADER_SIZE,
+    IdAllocator, IdError, IdKind, Interface, MessageHeader, ObjectId, ObjectIdAllocationError,
+    Opcode, OpcodeError, WireError, HEADER_SIZE,
 };
-pub use server::{HitResult, Server, ServerError};
+pub use server::{
+    HitResult, Server, ServerError, ServerLimits, WindowId,
+    MAX_FRAME_CALLBACK_COMPLETIONS_PER_TURN, MAX_SERVER_CLIENTS, MAX_SERVER_ORDINARY_CLIENTS,
+    MAX_SERVER_POOL_BYTES, MAX_SERVER_SHELL_CLIENTS, MAX_SERVER_TOPLEVELS,
+    MAX_SERVER_TOPLEVEL_METADATA_BYTES, MAX_SERVER_WINDOW_SNAPSHOT_BYTES,
+    SHELL_FULL_OUTPUT_POOL_BYTES, SHELL_METADATA_BYTES_RESERVED_PER_CLIENT,
+    SHELL_TOPLEVELS_RESERVED_PER_CLIENT,
+};
+pub use transport::{OutboundQueue, OutboundQueueFull, MAX_CONN_OUTBOUND_BYTES};
+
+/// The only pre-protocol raw-blit payload still accepted by the
+/// production display server. Freezing the compatibility path to
+/// this exact fixture prevents arbitrary malformed protocol bytes
+/// from being reinterpreted as framebuffer writes.
+pub const LEGACY_RAW_BLIT_PIXELS: [u8; 16] = [
+    0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
+/// Classification of the bytes accumulated at the start of a new
+/// display connection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InitialStreamClassification {
+    /// More bytes are required to distinguish a fragmented protocol
+    /// header from the frozen 16-byte legacy fixture.
+    NeedMore,
+    /// The prefix has a syntactically valid protocol header. The
+    /// first message itself may still be fragmented.
+    Protocol,
+    /// The bytes exactly equal [`LEGACY_RAW_BLIT_PIXELS`].
+    LegacyRawBlit,
+    /// Neither a valid protocol header nor the exact compatibility
+    /// payload. These bytes must never reach the framebuffer.
+    Invalid,
+}
+
+/// Classify an accumulated connection prefix without assuming that
+/// one transport read contains a complete protocol message.
+pub fn classify_initial_stream(bytes: &[u8]) -> InitialStreamClassification {
+    use InitialStreamClassification::{Invalid, LegacyRawBlit, NeedMore, Protocol};
+
+    if bytes.len() <= LEGACY_RAW_BLIT_PIXELS.len()
+        && LEGACY_RAW_BLIT_PIXELS[..bytes.len()] == *bytes
+    {
+        return if bytes.len() == LEGACY_RAW_BLIT_PIXELS.len() {
+            LegacyRawBlit
+        } else {
+            NeedMore
+        };
+    }
+    if bytes.len() < HEADER_SIZE {
+        return NeedMore;
+    }
+
+    // MessageHeader::decode intentionally requires the complete
+    // declared message, so classification reads only the framing
+    // fields that can be validated from a complete header.
+    let length = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+    let reserved = bytes[9];
+    if reserved == 0 && length >= HEADER_SIZE {
+        Protocol
+    } else {
+        Invalid
+    }
+}
 
 /// Best-effort check: does `bytes` parse as a complete protocol
 /// message? Returns `Some(total_len)` if a header decodes AND the
 /// header's `length` field equals `bytes.len()`. Anything else
 /// (truncated header, short buffer, mismatched length, malformed
-/// flags) returns `None` so a caller can fall back to a non-
-/// protocol byte path. Used by the binary's main loop to route
-/// the legacy demo client's 16-byte raw RGBA payload through a
-/// raw-blit code path while sending real protocol messages
-/// through `Server::dispatch_request`.
+/// flags) returns `None`. Retained as a compatibility helper for
+/// callers and tests that already hold a complete byte sequence;
+/// the production stream reader uses [`classify_initial_stream`]
+/// so fragmented headers cannot fall through to a pixel path.
 pub fn detect_protocol_message(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < HEADER_SIZE {
         return None;
@@ -69,8 +136,7 @@ pub fn detect_protocol_message(bytes: &[u8]) -> Option<usize> {
     // shaped. The legacy 16-byte raw-RGBA payload from
     // `display-client-demo` falls out of this walk on the
     // first header decode (its length field doesn't match
-    // any boundary we can recover), routing the chunk to
-    // the binary's raw-blit fallback.
+    // any boundary we can recover).
     let mut offset = 0usize;
     while offset + HEADER_SIZE <= bytes.len() {
         let header = MessageHeader::decode(&bytes[offset..]).ok()?;
@@ -130,9 +196,22 @@ pub mod kbd_key_state {
 /// changes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DecodedMouseEvent {
-    Motion { x: i32, y: i32 },
-    Button { x: i32, y: i32, button: u32, state: u32 },
-    Wheel { x: i32, y: i32, delta_x: i32, delta_y: i32 },
+    Motion {
+        x: i32,
+        y: i32,
+    },
+    Button {
+        x: i32,
+        y: i32,
+        button: u32,
+        state: u32,
+    },
+    Wheel {
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
+    },
 }
 
 /// Decode one packed mouse event off the front of `bytes`,
@@ -157,12 +236,22 @@ pub fn decode_mouse_event(bytes: &[u8]) -> Option<(DecodedMouseEvent, usize)> {
             if state != mouse_button_state::RELEASED && state != mouse_button_state::PRESSED {
                 return None;
             }
-            DecodedMouseEvent::Button { x, y, button, state }
+            DecodedMouseEvent::Button {
+                x,
+                y,
+                button,
+                state,
+            }
         }
         mouse_event_kind::WHEEL => {
             let delta_x = i32::from_le_bytes(bytes[12..16].try_into().ok()?);
             let delta_y = i32::from_le_bytes(bytes[16..20].try_into().ok()?);
-            DecodedMouseEvent::Wheel { x, y, delta_x, delta_y }
+            DecodedMouseEvent::Wheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            }
         }
         _ => return None,
     };
@@ -193,8 +282,11 @@ pub fn decode_kbd_event(bytes: &[u8]) -> Option<(DecodedKbdEvent, usize)> {
 }
 
 /// Drain every complete mouse event from `bytes` and inject
-/// each into `server`. Returns the number of events
-/// successfully injected. Stops at the first malformed event
+/// each into `server`. Consecutive motion packets are coalesced
+/// to their final coordinates; button boundaries remain exact
+/// because their packets carry authoritative coordinates.
+/// Returns the number of events successfully decoded. Stops at
+/// the first malformed event
 /// (kind out of range, state out of range, etc.) — the
 /// caller decides whether to also log/restart the input
 /// stream. Trailing partial bytes (less than
@@ -202,18 +294,33 @@ pub fn decode_kbd_event(bytes: &[u8]) -> Option<(DecodedKbdEvent, usize)> {
 pub fn drain_mouse_events_into(bytes: &[u8], server: &mut Server) -> usize {
     let mut consumed = 0usize;
     let mut count = 0usize;
+    let mut pending_motion = None;
     while consumed + MOUSE_EVENT_SIZE <= bytes.len() {
         let Some((event, used)) = decode_mouse_event(&bytes[consumed..]) else {
             break;
         };
         match event {
             DecodedMouseEvent::Motion { x, y } => {
-                server.inject_pointer_motion(x, y);
+                pending_motion = Some((x, y));
             }
-            DecodedMouseEvent::Button { button, state, .. } => {
+            DecodedMouseEvent::Button {
+                x,
+                y,
+                button,
+                state,
+            } => {
+                // Button packets carry an authoritative pointer position. A
+                // browser may coalesce or delay the preceding motion event,
+                // so update the server cursor before hit-testing the press or
+                // release instead of acting on stale coordinates.
+                pending_motion = None;
+                server.inject_pointer_motion(x, y);
                 server.inject_pointer_button(button, state);
             }
             DecodedMouseEvent::Wheel { .. } => {
+                if let Some((x, y)) = pending_motion.take() {
+                    server.inject_pointer_motion(x, y);
+                }
                 // v1 doesn't route wheel events to clients yet;
                 // the shell's window manager will pick this up
                 // in a future slice. Dropping the event keeps
@@ -223,6 +330,9 @@ pub fn drain_mouse_events_into(bytes: &[u8], server: &mut Server) -> usize {
         }
         consumed += used;
         count += 1;
+    }
+    if let Some((x, y)) = pending_motion {
+        server.inject_pointer_motion(x, y);
     }
     count
 }
@@ -258,6 +368,64 @@ mod detect_tests {
         let mut buf = vec![0u8; HEADER_SIZE];
         header.encode(&mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn fragmented_protocol_prefix_is_never_classified_as_legacy_raw_blit() {
+        let mut bytes = encode_header(ObjectId::DISPLAY, 2, 14);
+        bytes.extend_from_slice(&ObjectId::new(3).raw().to_le_bytes());
+        for split in 0..HEADER_SIZE {
+            assert_eq!(
+                classify_initial_stream(&bytes[..split]),
+                InitialStreamClassification::NeedMore,
+                "split at byte {split}"
+            );
+        }
+        assert_eq!(
+            classify_initial_stream(&bytes[..HEADER_SIZE]),
+            InitialStreamClassification::Protocol,
+            "a complete header locks the connection to protocol mode even when its payload is pending"
+        );
+        assert_eq!(
+            classify_initial_stream(&bytes),
+            InitialStreamClassification::Protocol
+        );
+    }
+
+    #[test]
+    fn fragmented_legacy_fixture_waits_for_all_sixteen_bytes() {
+        for split in 0..LEGACY_RAW_BLIT_PIXELS.len() {
+            assert_eq!(
+                classify_initial_stream(&LEGACY_RAW_BLIT_PIXELS[..split]),
+                InitialStreamClassification::NeedMore,
+                "split at byte {split}"
+            );
+        }
+        assert_eq!(
+            classify_initial_stream(&LEGACY_RAW_BLIT_PIXELS),
+            InitialStreamClassification::LegacyRawBlit
+        );
+    }
+
+    #[test]
+    fn malformed_nonlegacy_prefix_is_rejected_instead_of_bypassing_protocol() {
+        let mut bytes = [0x55u8; 16];
+        bytes[9] = 1; // reserved framing byte must be zero
+        assert_eq!(
+            classify_initial_stream(&bytes),
+            InitialStreamClassification::Invalid
+        );
+    }
+
+    #[test]
+    fn complete_protocol_message_with_sixteen_bytes_is_not_misclassified() {
+        let mut bytes = encode_header(ObjectId::DISPLAY, 2, 16);
+        bytes.extend_from_slice(&[0u8; 6]);
+        assert_eq!(bytes.len(), LEGACY_RAW_BLIT_PIXELS.len());
+        assert_eq!(
+            classify_initial_stream(&bytes),
+            InitialStreamClassification::Protocol
+        );
     }
 
     #[test]

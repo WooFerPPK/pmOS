@@ -51,12 +51,7 @@ extern "C" {
         fdflags: i32,
         fd_out_ptr: *mut u32,
     ) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
 }
 
@@ -112,8 +107,14 @@ pub extern "C" fn _start() {
         let h_bytes = u32_le(2);
         let set_mode: [u8; 9] = [
             OP_SET_MODE,
-            w_bytes[0], w_bytes[1], w_bytes[2], w_bytes[3],
-            h_bytes[0], h_bytes[1], h_bytes[2], h_bytes[3],
+            w_bytes[0],
+            w_bytes[1],
+            w_bytes[2],
+            w_bytes[3],
+            h_bytes[0],
+            h_bytes[1],
+            h_bytes[2],
+            h_bytes[3],
         ];
         let iov = Ciovec {
             buf: set_mode.as_ptr(),

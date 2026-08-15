@@ -93,8 +93,7 @@ fn set_x_traces_expanded_token_not_original() {
     // (the user already knows what they typed; what they
     // need to see is the expanded form). The export line
     // itself traces under xtrace too (`+ export X=hello`).
-    let (status, stdout, stderr, _flags) =
-        drive("set -x\nexport X=hello\necho $X\nexit\n");
+    let (status, stdout, stderr, _flags) = drive("set -x\nexport X=hello\necho $X\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ echo hello"),
@@ -117,8 +116,7 @@ fn set_x_traces_export_then_other_commands() {
     // fires per dispatch iteration, not just on the first
     // command. The export line also traces because xtrace
     // is on at its trace point.
-    let (status, _stdout, stderr, _flags) =
-        drive("set -x\nexport X=1\necho $X\nexit\n");
+    let (status, _stdout, stderr, _flags) = drive("set -x\nexport X=1\necho $X\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ export X=1"),
@@ -140,8 +138,7 @@ fn set_x_with_long_form_o_xtrace() {
     // identical to `set -x`. Same trace behaviour applies.
     // Pins the `-o NAME` parser path AND the shared
     // `flags.xtrace = true` mutation.
-    let (status, stdout, stderr, flags) =
-        drive("set -o xtrace\necho hi\nexit\n");
+    let (status, stdout, stderr, flags) = drive("set -o xtrace\necho hi\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ echo hi"),
@@ -167,8 +164,7 @@ fn set_plus_x_clears_flag() {
     // false. Pins both polarities AND the asymmetric
     // ordering between `set -x` (doesn't trace itself)
     // and `set +x` (does trace itself).
-    let (status, stdout, stderr, flags) =
-        drive("set -x\nset +x\necho not_traced\nexit\n");
+    let (status, stdout, stderr, flags) = drive("set -x\nset +x\necho not_traced\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ set +x"),
@@ -196,8 +192,7 @@ fn set_x_blank_line_does_not_trace() {
     // NOT produce a trace `+ ` with an empty argument
     // list — POSIX-aligned because no command ran. The
     // `+ echo hi` line still appears for the third line.
-    let (status, _stdout, stderr, _flags) =
-        drive("set -x\n\necho hi\nexit\n");
+    let (status, _stdout, stderr, _flags) = drive("set -x\n\necho hi\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("+ echo hi"),
@@ -222,8 +217,7 @@ fn set_x_quote_error_does_not_trace() {
     // `+ echo ...` trace. Pins that recoverable parse
     // errors don't get accidentally traced before being
     // reported.
-    let (status, _stdout, stderr, _flags) =
-        drive("set -x\necho 'unclosed\nexit\n");
+    let (status, _stdout, stderr, _flags) = drive("set -x\necho 'unclosed\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stderr.contains("unterminated single quote"),
@@ -250,8 +244,7 @@ fn set_x_expansion_error_does_not_trace() {
     // flags (`set -ux` would be parsed as one invalid
     // option), so we issue the two flags on separate
     // lines.
-    let (status, _stdout, stderr, _flags) =
-        drive("set -u\nset -x\necho $UNSET\n");
+    let (status, _stdout, stderr, _flags) = drive("set -u\nset -x\necho $UNSET\n");
     assert_eq!(status, ExitStatus::Exit(1));
     assert!(
         stderr.contains("parameter not set"),
@@ -272,8 +265,7 @@ fn set_x_traces_to_stderr_not_stdout() {
     // Pin both halves: stdout has the echo output but
     // NOT the trace; stderr has the trace but not the
     // echo output.
-    let (status, stdout, stderr, _flags) =
-        drive("set -x\necho hello\nexit\n");
+    let (status, stdout, stderr, _flags) = drive("set -x\necho hello\nexit\n");
     assert_eq!(status, ExitStatus::Exit(0));
     assert!(
         stdout.contains("hello\n"),

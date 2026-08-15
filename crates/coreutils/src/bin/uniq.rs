@@ -132,7 +132,11 @@ fn main() -> ExitCode {
         i = j;
     }
 
-    if had_error { ExitCode::from(1) } else { ExitCode::from(0) }
+    if had_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
 }
 
 fn split_lines(text: &str) -> Vec<&str> {

@@ -54,14 +54,24 @@ cache friendliness.
 ### 1.1 Request submission (user side)
 
 ```
-1. write Request into request ring at offset (req_head % ring_size)
-2. increment req_head atomically
-3. Atomics.store(user_wait_slot, REQUESTED)    // magic u32 values
-4. Atomics.notify(kernel_wait_slot, 1)
-5. Atomics.wait(user_wait_slot, REQUESTED)     // blocks until kernel signals
+1. Atomics.store(user_wait_slot, REQUESTED)    // stage before publication
+2. write Request into request ring at offset (req_head % ring_size)
+3. increment req_head atomically
+4. increment kernel_wait_slot and Atomics.notify(kernel_wait_slot, 1)
+5. while res_head == res_tail:
+   a. Atomics.store(user_wait_slot, REQUESTED)
+   b. re-check res_head != res_tail and continue if a response landed
+   c. Atomics.wait(user_wait_slot, REQUESTED)
 6. read Response from response ring at offset (res_tail % ring_size)
 7. increment res_tail atomically
 ```
+
+The response-ring predicate, not one `Atomics.wait` return, is authoritative.
+`user_wait_slot` is reused for consecutive syscalls: a process may observe
+`READY`, consume response A, and begin waiting for B before the kernel executes
+A's following `Atomics.notify`. That late notification may legally wake B. The
+condition loop treats it as stale and parks again; the store-plus-re-check closes
+the corresponding response-publication versus park race.
 
 Magic values (defined in `abi::ring`):
 
@@ -97,11 +107,38 @@ offset. The kernel uses the same region for large responses.
 
 ### 1.4 Lifecycle
 
-The SAB is created by the kernel Worker before spawning the user
-Worker, and passed to the user Worker in the `postMessage` that
-starts it. On process exit, the kernel reclaims the SAB by
-dropping its JS reference; the user Worker is terminated by the
-kernel so nothing can touch the SAB afterwards.
+The main thread creates the per-pid SAB and user Worker after the
+kernel Worker publishes `proc:spawn`. It sends the SAB in the user
+Worker's one `boot` message, but MUST NOT publish `proc:sab` to the
+kernel Worker until the user Worker replies `booted`. If Worker
+construction or boot delivery fails first, main sends
+`proc:exited(pid, -1, trap)` instead; the kernel reconciles and
+removes the tentative process so no unreachable live pid remains.
+
+The kernel Worker resolves program identity before publishing that message.
+Normalised `/bin/*` and `/usr/bin/*` paths bypass writable VFS shadows and use
+only the immutable registry. Other executable paths (canonically dynamic
+packages under `/opt`) may come from the VFS when regular, executable, and at
+most 16 MiB. The resulting
+`proc:spawn` message always carries owned `wasmBytes`; main never reads OPFS or
+performs a runtime network fetch to resolve a program.
+
+The kernel admits at most 256 non-reaped processes globally and 64 non-reaped
+children per parent, returning `EAGAIN` before consuming a pid or allocating
+child state. Main independently limits the spawn router to 256 live user
+Workers and checks the bound before SAB or Worker construction.
+
+Every host-observed Worker return, trap, or script error produces one
+`proc:exited` notification. The kernel treats that notification as an
+idempotent acknowledgement when the process already called
+`proc_exit`, and otherwise performs the authoritative exit transition,
+resource release, `SIGCHLD`, and parked-parent wake/reap.
+
+For SIGKILL, the kernel first makes the process terminal, then emits
+`proc:terminate(pid, signal=9)` to main. Main terminates the backing
+Worker, drops its pid/SAB routing entry, and replies `proc:exited` as
+an idempotent teardown acknowledgement. Once all references are
+dropped, the SAB is reclaimed by the host GC.
 
 ---
 
@@ -127,17 +164,34 @@ All control messages are structured-cloneable objects with a
 type ToDriver =
   | { kind: "device_open"; dev: DevId; flags: number; token: u32 }
   | { kind: "device_close"; dev: DevId; token: u32 }
-  | { kind: "device_ioctl"; dev: DevId; op: u32; arg: ArrayBufferLike; token: u32 }
-  | { kind: "attach_data_ring"; dev: DevId; sab: SharedArrayBuffer; layout: RingLayoutId; token: u32 };
+  | {
+      kind: "device_ioctl";
+      dev: DevId;
+      op: u32;
+      arg: ArrayBufferLike;
+      token: u32;
+    }
+  | {
+      kind: "attach_data_ring";
+      dev: DevId;
+      sab: SharedArrayBuffer;
+      layout: RingLayoutId;
+      token: u32;
+    };
 
 type FromDriver =
   | { kind: "device_open_ok"; token: u32; handle: u32 }
   | { kind: "device_open_err"; token: u32; errno: number }
   | { kind: "device_close_ok"; token: u32 }
-  | { kind: "device_ioctl_ok"; token: u32; result: u32; extra?: ArrayBufferLike }
+  | {
+      kind: "device_ioctl_ok";
+      token: u32;
+      result: u32;
+      extra?: ArrayBufferLike;
+    }
   | { kind: "device_ioctl_err"; token: u32; errno: number }
   | { kind: "attach_data_ring_ok"; token: u32 }
-  | { kind: "driver_event"; dev: DevId; event: DriverEvent };  // unsolicited
+  | { kind: "driver_event"; dev: DevId; event: DriverEvent }; // unsolicited
 ```
 
 `token` is a kernel-assigned correlation id. Every request carries
@@ -184,11 +238,96 @@ via `device_ioctl(SET_POOL, sab_handle)`.
 
 ### ioctls
 
-| op              | arg            | returns           | notes                                     |
-|-----------------|----------------|-------------------|-------------------------------------------|
-| `SET_POOL`      | sab_handle, size | ok               | set the shared framebuffer pool           |
-| `GET_MODE`      | —              | width, height, refresh_hz | the canvas current size/DPR        |
-| `SET_CURSOR`    | cursor buffer  | ok                | upload a cursor bitmap                    |
+| op           | arg              | returns                   | notes                           |
+| ------------ | ---------------- | ------------------------- | ------------------------------- |
+| `SET_POOL`   | sab_handle, size | ok                        | set the shared framebuffer pool |
+| `GET_MODE`   | —                | width, height, refresh_hz | the canvas current size/DPR     |
+| `SET_CURSOR` | cursor buffer    | ok                        | upload a cursor bitmap          |
+
+### Framed write opcodes
+
+The current WASI path writes framebuffer commands to `/dev/fb0`. Byte 0 is
+the opcode and the remaining bytes are its payload:
+
+| opcode | name                      | payload                                                                                                                                           |
+| ------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `SET_MODE`                | `width:u32, height:u32`                                                                                                                           |
+| `0x02` | `BLIT`                    | `width:u32, height:u32, rgba:RGBA8[]`                                                                                                             |
+| `0x03` | `BLIT_BEGIN`              | `width:u32, height:u32`                                                                                                                           |
+| `0x04` | `BLIT_CHUNK`              | `offset:u32, rgba_chunk:u8[]`                                                                                                                     |
+| `0x05` | `BLIT_END`                | empty                                                                                                                                             |
+| `0x06` | `PATCH`                   | `x:u32, y:u32, width:u32, height:u32, rgba:RGBA8[]`                                                                                               |
+| `0x07` | `PATCH_RLE`               | `x:u32, y:u32, width:u32, height:u32, runs:(count:u32, rgba:[u8;4])[]`                                                                            |
+| `0x08` | `PATCH_PALETTE_RLE_BATCH` | `rect_count:u8, palette_count_minus_one:u8, palette:RGBA8[], rects:{x:u32, y:u32, width:u32, height:u32, runs:(count:u16, palette_index:u8)[]}[]` |
+| `0x09` | `PRESENT_FENCE`           | `serial:u32`                                                                                                                                      |
+
+All integers are little-endian. `PATCH` pixels are tightly packed,
+row-major RGBA8 with exactly `width * height * 4` bytes; width and height
+MUST be non-zero. The rectangle MUST fit the active framebuffer mode and
+its coordinates/extents MUST NOT overflow their u32 representation.
+
+One user-process `fd_write` is limited by the 32 KiB SAB heap-scratch
+window. Therefore a complete patch, including its one-byte opcode and
+16-byte rectangle header, MUST be at most `0x8000` bytes. The maximum RGBA
+body is 32,751 bytes (8,187 pixels). Larger damaged areas are split into
+independently paintable horizontal strips; no patch assembly state exists
+in the browser driver.
+
+For a compressible rectangle, `PATCH_RLE` may replace those raw strips. Runs
+are row-major and may cross scanline boundaries. Each count is non-zero and
+the checked sum of all counts MUST equal `width * height`; the run stream has
+no padding or trailing bytes. Before allocating decoded pixels or posting any
+message, the driver validates the complete stream, verifies the rectangle is
+inside the current `SET_MODE` geometry, and bounds decoded bytes by that
+framebuffer size. Malformed input produces no partial presentation. The
+display server selects RLE only when the complete command fits the same 32 KiB
+write limit and is strictly smaller than the equivalent raw patch; otherwise
+it falls back to `PATCH` strips.
+
+When one scene changes two through eight vertically disjoint scanline bands,
+`PATCH_PALETTE_RLE_BATCH` may carry them in one atomic write. The palette count
+is `palette_count_minus_one + 1`, giving a range of one through 256 shared RGBA8
+colors. Each rectangle has positive in-mode geometry and is followed by
+row-major runs until exactly `width * height` pixels have been produced; run
+counts are non-zero and palette indexes MUST be in range. The complete command
+MUST fit the same 32 KiB write ceiling. The driver validates the entire stream,
+requires no trailing bytes, and bounds the sum of all decoded rectangle areas
+to the active framebuffer pixel count before allocating or posting anything.
+If the palette, run stream, geometry, or command budget cannot satisfy these
+rules, the display server uses the existing per-band `PATCH_RLE`/`PATCH` path
+without changing damage. Band detection remains capped at eight; more
+fragmented damage coalesces to one conservative bounding rectangle rather than
+creating an attacker-controlled number of rectangles or writes.
+
+After validation, the TypeScript driver copies ownership of the RGBA bytes
+and emits the typed main-thread message
+`fb:patch { x, y, width, height, rgba }`. `PATCH_RLE` expands to that same
+single typed message, so it produces one presentation sequence event rather
+than one event per run. A valid `PATCH_PALETTE_RLE_BATCH` expands to one
+`fb:patch-batch { patches }` message. Main validates every decoded rectangle
+before changing the canvas, paints the batch in one main-thread task, and emits
+exactly one presentation-complete event after all rectangles land. Full
+`fb:blit` messages remain supported for boot splashes, compatibility fixtures,
+and complete redraws.
+
+`PRESENT_FENCE` is a generic ordering marker, not a drawing command and not a
+desktop-ready policy primitive. Its payload is exactly one little-endian `u32`
+serial; the production display server allocates non-zero serials that advance
+monotonically, wrapping from `u32::MAX` to 1. The driver rejects any other
+payload length without emitting a main-thread message. A valid command changes
+neither framebuffer mode nor pixels and emits the typed message
+`fb:present-fence { serial }`; it does not advance the ordinary
+presentation-complete sequence by itself.
+
+The display server writes a fence only after every causally preceding scene
+update has either been submitted successfully to `/dev/fb0` or compared equal
+to the last successfully submitted pixel shadow. Framebuffer messages and the
+fence leave the kernel worker through the same FIFO channel. Main-thread frame,
+patch, and patch-batch handlers paint synchronously, so handling
+`fb:present-fence` proves that all preceding visible updates have completed.
+This ordering also covers the no-damage case without manufacturing a redundant
+pixel upload. The framebuffer driver remains unaware of which higher-level
+protocol or userland policy requested the fence.
 
 ### Events
 
@@ -205,7 +344,12 @@ the display server Worker so the server can paint into it directly;
 the main-thread driver's only job becomes `commit` + request
 animation frames. Where OffscreenCanvas is not available, the
 driver receives `ImageData` over a SAB copy and calls
-`putImageData` itself.
+`putImageData` itself. A rectangular patch is converted directly into a
+rect-sized `ImageData` and painted at `(x, y)`; it MUST NOT allocate or copy
+a full-frame pixel buffer. An atomic patch batch uses one rect-sized `ImageData`
+per member and one completion after the complete batch. Full blits, patches,
+and patch batches produce the same presentation-complete notification after
+painting.
 
 ---
 
@@ -230,6 +374,12 @@ The input driver listens on the canvas element for `keydown`,
 browser key codes to a stable internal set) and pushes them into
 the ring. It also raises a `driver_event: input_available` so the
 kernel can wake any process blocked on reading the device.
+
+Every normalised mouse button event carries the pointer's current framebuffer
+coordinates. Those coordinates are authoritative for that press or release:
+the display input boundary updates its pointer position from the button record
+before hit-testing. Correct click routing therefore does not depend on a
+separate browser motion event surviving coalescing or scheduling delay.
 
 ### Key code space
 
@@ -270,6 +420,12 @@ passes it to the block driver. Block numbers are 4 KiB.
 - `WRITE` writes `count * 4096` bytes from `buf` to LBA.
 - `FLUSH` calls `SyncAccessHandle.flush()` on all open handles.
 - `TRIM` is a no-op in v1.
+- `IMAGE_STATE` reports whether the image was newly created by this open or
+  already existed. Filesystem contents are not used to infer this state.
+
+`WRITE` is successful only if `SyncAccessHandle.write()` returns the full
+requested byte count. A short write is reported as `EIO` and must not be
+reported to the kernel as a completed block write.
 
 All operations are synchronous inside the block driver Worker —
 OPFS gives us `read`/`write`/`flush` as blocking calls when
@@ -278,32 +434,65 @@ one request at a time; the kernel serialises requests.
 
 ### OPFS layout (driver side)
 
-The driver opens four `SyncAccessHandle`s at boot, one per OPFS
-file listed in `data-model.md §3.3`:
-
-- `pmos.img/superblock`
-- `pmos.img/inodes.segment`
-- `pmos.img/data.segment.0`
-- `pmos.img/journal`
-
-LBAs are translated to (file, offset) by a simple partition table
-stored in the superblock: block 0..N₀ is the superblock, blocks
-N₀..N₁ are inode segment, etc. When the data segment grows past
-its current file, the driver lazily creates
-`pmos.img/data.segment.1` and updates the partition table.
+The driver opens one `SyncAccessHandle` for `pmos.img`. LBA `n` maps to byte
+offset `n * 4096`. The superblock at LBA 0 records the contiguous journal,
+inode-table, and data ranges used by the kernel filesystem implementation.
 
 ### First-boot bootstrap
 
-On first boot, the block driver finds no `pmos.img/superblock`
-file. It creates the four files, writes a zeroed superblock, and
-reports "uninitialised" to the kernel. The kernel then runs a
-`mkfs` routine that writes the v1 superblock, allocates root inode
+On first boot, the block driver finds no `pmos.img` image. It creates the
+image, pre-sizes it, and reports `NewlyCreated` to the kernel. Only a
+`NotFoundError` while opening the image authorises this state. The kernel then
+runs a `mkfs` routine that writes the v1 superblock, allocates root inode
 1, creates `/bin`, `/etc`, `/usr`, `/usr/bin`, `/usr/share`,
 `/usr/share/applications`, `/opt`, `/home`, `/home/user`, `/dev`,
 `/proc`, `/run`, `/tmp`, and copies the bundled binaries (from
 the read-only initramfs embedded in the kernel WASM) into `/bin`
-and `/usr/bin`. On subsequent boots the driver reads an existing
-superblock and the kernel skips `mkfs`.
+and `/usr/bin`. On subsequent boots the driver reports the image as existing,
+including when it is zero-length, all-zero, incompatible, or corrupt. The
+kernel attempts a mount and skips `mkfs` even when that mount fails, preserving
+the existing bytes for recovery.
+
+A successfully formatted or mounted OPFS filesystem is installed as `/`, not
+as a secondary mount. The kernel then overlays volatile filesystems at `/tmp`
+and `/run`, devfs at `/dev`, and procfs at `/proc`. Userland always uses the
+canonical `/home/user`, `/etc`, and `/usr` paths; `/persist` is not provided as
+an alias. If the block device is unavailable or an existing image cannot be
+mounted, the kernel may prepare a volatile tmpfs recovery root and
+`/proc/storage` reports `0 0 0`, but main MUST NOT expose that root as an
+ordinary interactive desktop by default. An invalid existing image is never
+rewritten as part of this fallback.
+
+### Degraded-storage boot protocol
+
+Both failure boundaries publish the same typed kernel-Worker-to-main event:
+
+```ts
+type StorageDegraded = {
+  kind: "storage:degraded";
+  reason:
+    | "opfs-open-failed"
+    | "persistent-root-unavailable"
+    | "persistent-root-invalid";
+  detail: string;
+  existingImagePreserved: true;
+};
+```
+
+The Worker emits `opfs-open-failed` when `BlockDriver.openInOpfs()` rejects.
+If the driver opened but Rust rejects or cannot install the root image, the
+Worker translates the kernel's preserved-image fallback diagnostic into
+`persistent-root-invalid` or `persistent-root-unavailable`. Only one event is
+emitted per boot even when both boundaries observe the same failure.
+
+Main installs a full interaction gate before acknowledging an ordinary
+desktop. The gate has no automatic dismissal. `Retry persistent storage`
+reloads the boot path while remaining blocked; the only way to use the
+prepared tmpfs root is the explicit choice `Continue temporary session — files
+will be lost on reload`. Keyboard, pointer, and host-file interaction remain
+blocked until the kernel is ready and either persistence succeeded or that
+choice was made. The temporary choice never formats, truncates, deletes, or
+replaces an existing `pmos.img`.
 
 ---
 
@@ -311,14 +500,14 @@ superblock and the kernel skips `mkfs`.
 
 ### ioctls
 
-| op              | arg                 | returns        | notes                  |
-|-----------------|---------------------|----------------|------------------------|
-| `FETCH_BEGIN`   | request metadata    | handle         | POST, GET, headers     |
-| `FETCH_POLL`    | handle              | state, bytes   | non-blocking read      |
-| `WS_OPEN`       | url                 | handle         | WebSocket open         |
-| `WS_SEND`       | handle, bytes       | ok             |                        |
-| `WS_RECV`       | handle              | bytes          |                        |
-| `WS_CLOSE`      | handle              | ok             |                        |
+| op            | arg              | returns      | notes              |
+| ------------- | ---------------- | ------------ | ------------------ |
+| `FETCH_BEGIN` | request metadata | handle       | POST, GET, headers |
+| `FETCH_POLL`  | handle           | state, bytes | non-blocking read  |
+| `WS_OPEN`     | url              | handle       | WebSocket open     |
+| `WS_SEND`     | handle, bytes    | ok           |                    |
+| `WS_RECV`     | handle           | bytes        |                    |
+| `WS_CLOSE`    | handle           | ok           |                    |
 
 No shared-memory ring for v1; the net driver uses plain
 postMessage because network syscall throughput is not a hot path.
@@ -337,6 +526,13 @@ A very simple serial-style character device:
 
 - Writes go to `console.log` (and optionally a ring buffer the
   test harness reads via Playwright).
+- Complete lines are forwarded immediately. The kernel retains at most 16 KiB
+  of an unterminated line; excess leading bytes are discarded and the newest
+  diagnostic tail is preserved.
+- Main mirrors console output to `console.log` unchanged. Its visible DOM
+  transcript is a rolling tail capped independently at 512 lines and 256 KiB
+  of UTF-8 text. Each render assigns that bounded private tail; it MUST NOT use
+  an unbounded `textContent += chunk` read/copy/write loop.
 - Reads block until a hidden `<textarea>` element receives input
   (or the harness injects input for tests).
 
@@ -352,7 +548,58 @@ Used for:
 
 ---
 
-## 8. Driver lifecycle and error recovery
+## 8. Host file bridge
+
+Host file transfer is a cold-path browser-substrate service, not a userland DOM
+shortcut. Main owns picker and download browser APIs; the kernel Worker owns
+capability checks, token publication, byte limits, and fd lifecycle.
+
+Main → kernel uses the structured-clone message
+`{ kind: "host:dropped", token, name, mime, bytes }`. One message carries at
+most 16 MiB. The Worker reserves the declared size, copies metadata once, then
+copies bytes through repeated kernel heap-scratch chunks. Concurrent incomplete
+imports reserve at most 32 MiB; failure calls the abort export and publishes no
+token.
+
+Before calling `File.arrayBuffer()`, main reads the browser-owned immutable
+`File.size` and rejects an individual file above 16 MiB. One picker/drop batch
+is admitted only when it contains at most 64 files and at most 32 MiB in
+aggregate, matching the kernel's exact live-import ceilings. Picker and drop
+batches share one bounded FIFO and file bodies are read sequentially, so
+overlapping gestures cannot materialize multiple bodies concurrently or retain
+an unbounded queue of `File` objects. Main verifies the returned byte length
+still equals `File.size` and remains within 16 MiB before posting it; the Worker
+and kernel repeat their authoritative checks.
+
+The storage-recovery interaction predicate gates both entry points. An
+authorized `host:pick` mounts at most one browser-substrate confirmation;
+the native picker opens synchronously only from that control's trusted click,
+because activation is not assumed to survive the Worker round trip. Browser
+keyboard routing leaves the focused confirmation's keydown and keyup events to
+native button semantics rather than forwarding them into the guest. The
+confirmation MUST NOT open the browser picker while normal interaction is
+blocked, and a global drop MUST prevent browser navigation but MUST NOT read or
+deliver files. The predicate is checked again at confirmation and when a
+delayed picker selection or queued batch is about to read, preventing a
+selection made before a degraded transition from becoming a hidden import
+afterward.
+
+Kernel → main uses:
+
+```ts
+type HostControl =
+  | { kind: "host:pick" }
+  | { kind: "host:download"; name: string; mime: string; bytes: Uint8Array };
+```
+
+`host:pick` is emitted only after the calling process passes the
+`HOST_TRANSFER` check. `host:download` is emitted only when a write-only
+download fd is explicitly closed successfully. Exit, signal teardown, fd
+replacement, a failed write, or browser transport failure cancels staging.
+Main copies the download bytes before asynchronous DOM work so kernel linear
+memory is never retained by a browser callback.
+
+## 9. Driver lifecycle and error recovery
 
 - A driver that fails to initialise at boot reports an error via
   `postMessage` and the kernel marks the device unavailable.
@@ -366,7 +613,7 @@ Used for:
 
 ---
 
-## 9. Testability contract
+## 10. Testability contract
 
 Every driver module exports a `createDriver(options?)` factory so
 that:

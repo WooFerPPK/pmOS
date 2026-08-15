@@ -143,7 +143,7 @@ fn fault_on_journal_header_rolls_back_to_pre_txn_state() {
     // SAB-side writes run mount→ generation-bump (1 SB write), so
     // we install the fault AFTER mount completes.
     let device: super::block::DynBlockDevice = dev;
-    let mut fs = OpfsFs::mount(device).expect("remount");
+    let fs = OpfsFs::mount(device).expect("remount");
 
     let mut dev = cast_mock(fs.into_device());
     // Pre-arm: the next mutation packs payloads+header. With
@@ -152,7 +152,7 @@ fn fault_on_journal_header_rolls_back_to_pre_txn_state() {
     // We want the header write to fail → schedule crash_after(1)
     // so the second write of the next session faults.
     dev.crash_after(1);
-    let mut fs = OpfsFs::mount(dev).expect("remount2");
+    let fs = OpfsFs::mount(dev).expect("remount2");
     // mount itself writes the superblock once (generation bump),
     // consuming the fault. Re-arm again, this time targeted at the
     // header inside the upcoming write transaction.
@@ -283,14 +283,8 @@ fn replay_is_idempotent_across_repeated_remounts() {
         // Pull two stable blocks from inside the filesystem.
         let inode_lba = fs.superblock().inode_table_start;
         let data_start_lba = fs.superblock().data_start;
-        let inode_block = read_raw(
-            cast_mock_ref(fs.device_mut_for_test()),
-            inode_lba,
-        );
-        let data_block = read_raw(
-            cast_mock_ref(fs.device_mut_for_test()),
-            data_start_lba,
-        );
+        let inode_block = read_raw(cast_mock_ref(fs.device_mut_for_test()), inode_lba);
+        let data_block = read_raw(cast_mock_ref(fs.device_mut_for_test()), data_start_lba);
         let mut combined = [0u8; BLOCK_SIZE];
         for i in 0..BLOCK_SIZE / 2 {
             combined[i] = inode_block[i];
@@ -320,7 +314,8 @@ fn many_committed_txns_replay_in_order() {
     for i in 0..16 {
         let name = std::format!("f{i}.txt");
         let ino = fs.create(ROOT_INO, &name, 0o644).unwrap();
-        fs.write(ino, 0, std::format!("payload {i}").as_bytes()).unwrap();
+        fs.write(ino, 0, std::format!("payload {i}").as_bytes())
+            .unwrap();
     }
     // No final sync: rely on every commit_and_apply path having
     // already made each txn durable.

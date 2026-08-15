@@ -3,7 +3,7 @@
 //! `web/tests/unit/terminal.test.ts` plus the extra surface
 //! that comes from owning an embedded `sh::Shell`.
 
-use term::{Key, KeyFeedResult, LineKind, Terminal, TerminalOptions};
+use term::{Key, KeyFeedResult, LineKind, Terminal, TerminalOptions, MAX_PENDING_OUTPUT_BYTES};
 
 fn opts() -> TerminalOptions {
     TerminalOptions::default()
@@ -252,6 +252,57 @@ fn append_output_handles_multiple_newlines_in_one_chunk() {
     assert_eq!(snap.lines[0].text, "a");
     assert_eq!(snap.lines[1].text, "b");
     assert_eq!(snap.lines[2].text, "c");
+}
+
+#[test]
+fn newline_dense_pipe_turn_keeps_only_the_bounded_scrollback_tail() {
+    let mut term = Terminal::new(TerminalOptions {
+        max_lines: 1024,
+        ..opts()
+    });
+    let output = b"x\n".repeat(32 * 1024);
+
+    term.append_output(&output);
+
+    let snapshot = term.snapshot();
+    assert_eq!(snapshot.lines.len(), 1024);
+    assert!(snapshot
+        .lines
+        .iter()
+        .all(|line| line.kind == LineKind::Output && line.text == "x"));
+}
+
+#[test]
+fn newline_free_stream_is_published_in_bounded_visual_chunks() {
+    let mut term = Terminal::new(TerminalOptions {
+        max_lines: 10,
+        ..opts()
+    });
+    let output = vec![b'z'; MAX_PENDING_OUTPUT_BYTES * 3 + 7];
+
+    term.append_output(&output);
+    let partial = term.snapshot();
+    assert_eq!(partial.lines.len(), 3);
+    assert!(partial
+        .lines
+        .iter()
+        .all(|line| line.text.len() == MAX_PENDING_OUTPUT_BYTES));
+
+    term.finish_external_output();
+    let complete = term.snapshot();
+    assert_eq!(complete.lines.len(), 4);
+    assert!(complete
+        .lines
+        .iter()
+        .all(|line| line.text.len() <= MAX_PENDING_OUTPUT_BYTES));
+    assert_eq!(
+        complete
+            .lines
+            .iter()
+            .map(|line| line.text.len())
+            .sum::<usize>(),
+        output.len(),
+    );
 }
 
 #[test]

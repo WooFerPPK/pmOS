@@ -16,24 +16,19 @@
 //!
 //! Exit codes:
 //!
-//!   * 0   = success — wrote the 5-byte record cleanly
-//!   * 12  = sched_yield returned a non-zero value (the kernel
-//!           handler always returns 0, so any non-zero signals
-//!           shim or dispatcher breakage)
-//!   * 13  = fd_write to stdout failed or short-wrote
-//!   * 101 = panic
+//! * 0   = success — wrote the 5-byte record cleanly
+//! * 12  = sched_yield returned a non-zero value (the kernel
+//!   handler always returns 0, so any non-zero signals
+//!   shim or dispatcher breakage)
+//! * 13  = fd_write to stdout failed or short-wrote
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
     fn sched_yield() -> i32;
 }

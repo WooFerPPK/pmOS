@@ -118,7 +118,10 @@ fn row_layout_places_label_button_label_at_expected_positions() {
             found_left_glyph = true;
         }
     }
-    assert!(found_left_glyph, "label_left must draw at least one 'l' glyph pixel");
+    assert!(
+        found_left_glyph,
+        "label_left must draw at least one 'l' glyph pixel"
+    );
 
     // Button's border corners should be at the button rect's corners
     // in the button_border theme colour.
@@ -150,8 +153,7 @@ fn row_layout_places_label_button_label_at_expected_positions() {
     // (28 - 12)/2 = 8 → origin at button_rect.x + 8.
     let button_text = rgba(Theme::LIGHT.button_text);
     let button_text_origin_x = button_rect.x + 8;
-    let button_text_origin_y =
-        button_rect.y + ((button_rect.height - GLYPH_HEIGHT) / 2) as i32;
+    let button_text_origin_y = button_rect.y + ((button_rect.height - GLYPH_HEIGHT) / 2) as i32;
     let glyph_o = glyph_for('o');
     let mut found_button_glyph = false;
     for row_i in 0..GLYPH_HEIGHT {
@@ -165,7 +167,10 @@ fn row_layout_places_label_button_label_at_expected_positions() {
             found_button_glyph = true;
         }
     }
-    assert!(found_button_glyph, "button must draw at least one 'o' glyph pixel");
+    assert!(
+        found_button_glyph,
+        "button must draw at least one 'o' glyph pixel"
+    );
 
     // Right-aligned label: "right   " is 48 px of text in a
     // 52-wide rect (label_right_w = 48 + LABEL_HPAD(4)). The
@@ -173,8 +178,7 @@ fn row_layout_places_label_button_label_at_expected_positions() {
     // which is exactly LABEL_HPAD — the pad becomes a gutter
     // on the *left* for a right-aligned preferred-sized label.
     let right_text_origin_x = label_right_rect.x + LABEL_HPAD as i32;
-    let right_text_y =
-        label_right_rect.y + ((label_right_rect.height - GLYPH_HEIGHT) / 2) as i32;
+    let right_text_y = label_right_rect.y + ((label_right_rect.height - GLYPH_HEIGHT) / 2) as i32;
     let glyph_r = glyph_for('r');
     let mut found_right_glyph = false;
     for row_i in 0..GLYPH_HEIGHT {
@@ -192,7 +196,10 @@ fn row_layout_places_label_button_label_at_expected_positions() {
             found_right_glyph = true;
         }
     }
-    assert!(found_right_glyph, "label_right must draw at least one 'r' glyph pixel");
+    assert!(
+        found_right_glyph,
+        "label_right must draw at least one 'r' glyph pixel"
+    );
 
     // ---- nothing has been drawn in the padding gutter --------
 
@@ -201,7 +208,11 @@ fn row_layout_places_label_button_label_at_expected_positions() {
     let bg = [0xf2, 0xf2, 0xf2, 0xff];
     let gap_x = label_left_rect.right() + (SPACING as i32) / 2;
     let gap_y = label_left_rect.y + 5;
-    assert_eq!(px(&canvas, gap_x, gap_y), bg, "inter-child gap must be background");
+    assert_eq!(
+        px(&canvas, gap_x, gap_y),
+        bg,
+        "inter-child gap must be background"
+    );
 
     // The top padding strip (y = 0) is also still background.
     assert_eq!(px(&canvas, 200, 0), bg);

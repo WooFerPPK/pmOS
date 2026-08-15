@@ -94,12 +94,9 @@ mod bump {
                 return;
             }
             let base = &__heap_base as *const u8 as usize;
-            let _ = self.cursor.compare_exchange(
-                0,
-                base,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+            let _ = self
+                .cursor
+                .compare_exchange(0, base, Ordering::Relaxed, Ordering::Relaxed);
             let end_ptr = self.end.get();
             if *end_ptr == 0 {
                 let mem_pages = core::arch::wasm32::memory_size(0);
@@ -128,7 +125,7 @@ mod bump {
                 let end_val = *end_ptr;
                 if new_cursor > end_val {
                     let extra_bytes = new_cursor - end_val;
-                    let extra_pages = (extra_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+                    let extra_pages = extra_bytes.div_ceil(PAGE_SIZE);
                     let prev_pages = core::arch::wasm32::memory_grow(0, extra_pages);
                     if prev_pages == usize::MAX {
                         return core::ptr::null_mut();

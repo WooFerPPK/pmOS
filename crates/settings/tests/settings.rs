@@ -9,19 +9,7 @@
 use std::fs;
 use std::process::Command;
 
-fn settings_bin() -> std::path::PathBuf {
-    // Find the settings binary built by `cargo test -p settings`.
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .ancestors()
-                .nth(2)
-                .unwrap()
-                .join("target")
-        });
-    target_dir.join("debug").join("settings")
-}
+const SETTINGS: &str = env!("CARGO_BIN_EXE_settings");
 
 fn tempdir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -39,11 +27,6 @@ fn tempdir(prefix: &str) -> std::path::PathBuf {
 
 #[test]
 fn settings_round_trip_via_set_subcommands() {
-    let bin = settings_bin();
-    if !bin.exists() {
-        eprintln!("skipping: build settings binary first ({})", bin.display());
-        return;
-    }
     let tmp = tempdir("settings-rollup");
     let cfg = tmp.join("preferences.toml");
 
@@ -54,7 +37,7 @@ fn settings_round_trip_via_set_subcommands() {
         ("set-timezone", "America/New_York"),
     ];
     for (sub, value) in runs {
-        let out = Command::new(&bin)
+        let out = Command::new(SETTINGS)
             .args([sub, value, "--config", cfg.to_str().unwrap()])
             .output()
             .expect("run settings");

@@ -50,8 +50,101 @@
 
 extern crate alloc;
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 use core::str;
+
+/// Canonical VFS location shared by every preference reader and writer.
+pub const DEFAULT_PATH: &str = "/etc/preferences.toml";
+
+/// Canonical names of the keyboard layouts bundled with PMos v1.
+///
+/// Settings uses this list for its finite picker and the display server uses
+/// [`KeyboardLayout::from_name`] when normalising the persisted preference.
+/// Keeping the names here prevents the writer and live reader from drifting.
+pub const KEYBOARD_LAYOUT_NAMES: &[&str] = &["us-qwerty", "uk-qwerty", "dvorak"];
+
+/// Canonical terminal font names bundled with PMos v1, safe default first.
+pub const TERMINAL_FONT_NAMES: &[&str] = &["unifont-mono-14.pbm", "pc-vga-16.pbm"];
+
+/// Safe timezone used when the preference is absent, malformed, or outside
+/// the v1 bundle.
+pub const DEFAULT_TIMEZONE_NAME: &str = "UTC";
+
+/// Canonical IANA timezone names bundled with PMos v1, safe default first.
+///
+/// Consumers must normalize persisted values through
+/// [`normalize_timezone_name`] before using them as an environment value or
+/// constructing a zoneinfo asset path.
+pub const TIMEZONE_NAMES: &[&str] = &[
+    DEFAULT_TIMEZONE_NAME,
+    "America/New_York",
+    "Europe/London",
+    "Asia/Tokyo",
+];
+
+/// Return the canonical bundled timezone matching `name`, or UTC when the
+/// value is absent or unsupported.
+pub fn normalize_timezone_name(name: Option<&str>) -> &'static str {
+    match name {
+        Some("America/New_York") => TIMEZONE_NAMES[1],
+        Some("Europe/London") => TIMEZONE_NAMES[2],
+        Some("Asia/Tokyo") => TIMEZONE_NAMES[3],
+        Some("UTC") | None | Some(_) => DEFAULT_TIMEZONE_NAME,
+    }
+}
+
+/// Parse one preference-file snapshot and return its normalized spawn-time
+/// timezone. Missing or malformed bytes select UTC.
+pub fn timezone_from_preferences_bytes(bytes: Option<&[u8]>) -> &'static str {
+    bytes
+        .and_then(|bytes| Preferences::parse(bytes).ok())
+        .map_or(DEFAULT_TIMEZONE_NAME, |prefs| prefs.normalized_timezone())
+}
+
+/// Clone a baseline environment and apply the spawn-time timezone whitelist.
+/// Existing `TZ` entries are removed before the validated value is appended,
+/// so the result contains exactly one authoritative timezone entry.
+pub fn spawn_environment_with_timezone(
+    baseline: &[(String, String)],
+    preference_bytes: Option<&[u8]>,
+) -> Vec<(String, String)> {
+    let timezone = timezone_from_preferences_bytes(preference_bytes);
+    let mut environment = baseline
+        .iter()
+        .filter(|(key, _)| key != "TZ")
+        .cloned()
+        .collect::<Vec<_>>();
+    environment.push((String::from("TZ"), String::from(timezone)));
+    environment
+}
+
+/// A keyboard layout whose binary map is bundled with PMos v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyboardLayout {
+    #[default]
+    UsQwerty,
+    UkQwerty,
+    Dvorak,
+}
+
+impl KeyboardLayout {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KeyboardLayout::UsQwerty => "us-qwerty",
+            KeyboardLayout::UkQwerty => "uk-qwerty",
+            KeyboardLayout::Dvorak => "dvorak",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "us-qwerty" => Some(KeyboardLayout::UsQwerty),
+            "uk-qwerty" => Some(KeyboardLayout::UkQwerty),
+            "dvorak" => Some(KeyboardLayout::Dvorak),
+            _ => None,
+        }
+    }
+}
 
 /// Parsed `/etc/preferences.toml` snapshot.
 ///
@@ -81,6 +174,10 @@ pub enum PreferencesError {
     /// or empty name). Kept distinct from `MalformedLine` so
     /// callers that care can report it specifically.
     MalformedSection(u32),
+    /// A value cannot be represented by the deliberately narrow
+    /// quoted-string format. The field name identifies which value
+    /// contained a quote or line break.
+    InvalidValue(&'static str),
 }
 
 impl Preferences {
@@ -96,6 +193,11 @@ impl Preferences {
             timezone_iana: None,
             terminal_font: None,
         }
+    }
+
+    /// Normalize the persisted timezone against the finite v1 bundle.
+    pub fn normalized_timezone(&self) -> &'static str {
+        normalize_timezone_name(self.timezone_iana.as_deref())
     }
 
     /// Parse the contents of `/etc/preferences.toml`.
@@ -169,6 +271,77 @@ impl Preferences {
 
         Ok(out)
     }
+
+    /// Serialize this snapshot into the canonical preference format.
+    ///
+    /// Sections are emitted in stable schema order and absent sections
+    /// are omitted. The parser and serializer intentionally support plain
+    /// quoted strings rather than TOML escape sequences, so values with a
+    /// quote or line break are rejected instead of producing a file that
+    /// cannot be read back.
+    pub fn to_toml(&self) -> Result<String, PreferencesError> {
+        let mut out = String::new();
+
+        emit_section(
+            &mut out,
+            "theme",
+            &[
+                ("name", "theme.name", self.theme_name.as_deref()),
+                ("fit", "theme.fit", self.theme_fit.as_deref()),
+            ],
+        )?;
+        emit_section(
+            &mut out,
+            "wallpaper",
+            &[("name", "wallpaper.name", self.wallpaper_name.as_deref())],
+        )?;
+        emit_section(
+            &mut out,
+            "keyboard",
+            &[("layout", "keyboard.layout", self.keyboard_layout.as_deref())],
+        )?;
+        emit_section(
+            &mut out,
+            "timezone",
+            &[("iana", "timezone.iana", self.timezone_iana.as_deref())],
+        )?;
+        emit_section(
+            &mut out,
+            "terminal",
+            &[("font", "terminal.font", self.terminal_font.as_deref())],
+        )?;
+
+        Ok(out)
+    }
+}
+
+fn emit_section(
+    out: &mut String,
+    section: &str,
+    values: &[(&str, &'static str, Option<&str>)],
+) -> Result<(), PreferencesError> {
+    if values.iter().all(|(_, _, value)| value.is_none()) {
+        return Ok(());
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push('[');
+    out.push_str(section);
+    out.push_str("]\n");
+    for (key, field, value) in values {
+        let Some(value) = value else {
+            continue;
+        };
+        if value.contains(['"', '\n', '\r']) {
+            return Err(PreferencesError::InvalidValue(field));
+        }
+        out.push_str(key);
+        out.push_str(" = \"");
+        out.push_str(value);
+        out.push_str("\"\n");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

@@ -6,13 +6,13 @@
 //!   `/dev/input_kbd` input ring → user wasm `fd_read` →
 //!   `fd_write(1, ...)` → `onConsoleWrite`.
 //!
-//! The binary polls `fd_read` on EAGAIN so it survives the race where
+//! The binary parks in WASI `poll_oneoff` on EAGAIN so it survives the race where
 //! input arrives after the process starts — the browser keydown path
 //! injects bytes asynchronously, and the user Worker may run `fd_read`
 //! before the first keypress reaches the kernel. Existing in-process
 //! composition tests inject bytes BEFORE spawning, so their first
 //! `fd_read` finds the ring non-empty and returns immediately; the
-//! polling loop is a no-op in that path.
+//! readiness wait is a no-op in that path.
 //!
 //! Exit codes:
 //!
@@ -38,19 +38,28 @@ extern "C" {
         fdflags: i32,
         fd_out_ptr: *mut u32,
     ) -> i32;
-    fn fd_read(
-        fd: i32,
-        iovs_ptr: *const Iovec,
-        iovs_len: i32,
-        nread_ptr: *mut u32,
-    ) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
+    fn fd_read(fd: i32, iovs_ptr: *const Iovec, iovs_len: i32, nread_ptr: *mut u32) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
+    fn poll_oneoff(
+        subscriptions: *const u8,
+        events: *mut u8,
+        nsubscriptions: u32,
+        nevents: *mut u32,
     ) -> i32;
     fn proc_exit(rval: i32) -> !;
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const SUBSCRIPTION_SIZE: usize = 48;
+#[cfg(target_arch = "wasm32")]
+const EVENT_SIZE: usize = 32;
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn readable_subscription(fd: i32) -> [u8; SUBSCRIPTION_SIZE] {
+    let mut subscription = [0u8; SUBSCRIPTION_SIZE];
+    subscription[8] = 1;
+    subscription[16..20].copy_from_slice(&(fd as u32).to_le_bytes());
+    subscription
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -65,6 +74,31 @@ struct Ciovec {
 struct Iovec {
     buf: *mut u8,
     buf_len: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+unsafe fn wait_readable(fd: i32) -> Result<(), i32> {
+    const EIO: i32 = 29;
+    const EPIPE: i32 = 64;
+    let subscription = readable_subscription(fd);
+    let mut event = [0u8; EVENT_SIZE];
+    let mut nevents = 0u32;
+    let errno = poll_oneoff(subscription.as_ptr(), event.as_mut_ptr(), 1, &mut nevents);
+    if errno != 0 {
+        return Err(errno);
+    }
+    if nevents != 1 {
+        return Err(EIO);
+    }
+    let event_errno = u16::from_le_bytes([event[8], event[9]]) as i32;
+    if event_errno != 0 {
+        return Err(event_errno);
+    }
+    let flags = u16::from_le_bytes([event[24], event[25]]);
+    if flags & 1 != 0 {
+        return Err(EPIPE);
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -98,7 +132,7 @@ pub extern "C" fn _start() {
         // EAGAIN is errno 6 per `abi::errno` — keeping the literal here
         // avoids pulling in an extra crate for a single constant in a
         // no_std cdylib. The kernel returns EAGAIN on an empty input
-        // ring; the loop retries until bytes land.
+        // ring; poll_oneoff parks the Worker until bytes land.
         const EAGAIN: i32 = 6;
         let mut nread: u32 = 0;
         loop {
@@ -108,6 +142,9 @@ pub extern "C" fn _start() {
             }
             if rc == 0 || rc == EAGAIN {
                 nread = 0;
+                if wait_readable(kbd_fd as i32).is_err() {
+                    proc_exit(11);
+                }
                 continue;
             }
             proc_exit(11);
@@ -125,6 +162,23 @@ pub extern "C" fn _start() {
         }
 
         proc_exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readable_subscription;
+
+    #[test]
+    fn keyboard_wait_uses_one_exact_fd_read_subscription() {
+        let subscription = readable_subscription(27);
+        assert_eq!(subscription[8], 1);
+        assert_eq!(
+            u32::from_le_bytes(subscription[16..20].try_into().unwrap()),
+            27,
+        );
+        assert!(subscription[..8].iter().all(|byte| *byte == 0));
+        assert!(subscription[20..].iter().all(|byte| *byte == 0));
     }
 }
 

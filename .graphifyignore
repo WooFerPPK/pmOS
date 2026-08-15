@@ -1,0 +1,5 @@
+# Generated distribution bundles duplicate source files under web/ and crates/.
+dist/
+
+# Never index local development TLS material.
+certs/

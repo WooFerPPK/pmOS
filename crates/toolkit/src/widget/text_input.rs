@@ -48,22 +48,17 @@ pub const TEXT_INPUT_PADDING_X: u32 = 4;
 /// Visual state of a [`TextInput`]. Controls which fill
 /// colour the widget paints with and whether the caret is
 /// drawn.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum TextInputState {
     /// Resting: pointer is not over the widget and the
     /// widget does not have keyboard focus.
+    #[default]
     Idle,
     /// Pointer is hovering over the widget.
     Hover,
     /// Widget has keyboard focus. Cursor paints; key events
     /// mutate the text + caret.
     Focused,
-}
-
-impl Default for TextInputState {
-    fn default() -> Self {
-        TextInputState::Idle
-    }
 }
 
 /// Outcome of a [`TextInput::handle_key`] call. Lets the
@@ -345,9 +340,7 @@ impl TextInput {
             return;
         }
         let interior_h = self.bounds.height.saturating_sub(2);
-        let text_y = self.bounds.y
-            + 1
-            + ((interior_h.saturating_sub(GLYPH_HEIGHT)) / 2) as i32;
+        let text_y = self.bounds.y + 1 + ((interior_h.saturating_sub(GLYPH_HEIGHT)) / 2) as i32;
         let text_x = self.bounds.x + 1 + TEXT_INPUT_PADDING_X as i32;
 
         let use_placeholder = self.text.is_empty() && self.state != TextInputState::Focused;

@@ -21,8 +21,9 @@
 //! `RANDOM_GET`, etc. is one `match` arm + one handler function +
 //! isolation tests.
 
-use abi::errno::{EBADF, EINVAL, ENOSYS, ENOTSUP};
+use abi::errno::{EBADF, EINVAL, ENAMETOOLONG, ENOSYS, ENOTSUP};
 use abi::ext::Pid;
+use abi::fd as well_known_fd;
 use abi::ring::{Request, Response};
 use abi::wasi as op;
 use abi::wasi::filestat as fs_off;
@@ -30,10 +31,14 @@ use abi::wasi::filestat as fs_off;
 use crate::fd::{FdFlags, FdObject};
 use crate::platform;
 use crate::proc::{ExitStatus, Signal};
-use crate::sys::{Kernel, KernelError};
+use crate::sys::{
+    Kernel, KernelError, PathOpenOptions, PendingHeap, PollAdmissionClass, PollClock, PollParker,
+    PollSubscription, POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT, POLL_GLOBAL_SUBSCRIPTION_LIMIT,
+    POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT, POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT,
+};
 use crate::vfs::NodeType;
 
-use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno};
+use super::dispatch::{args_u32, args_u64, heap_in, heap_out_mut, kerr_to_errno, ServiceOutcome};
 
 /// WASI lookupflags bit that requests symlink dereferencing on the
 /// final path component. Intermediate components always follow
@@ -43,10 +48,20 @@ const LOOKUP_SYMLINK_FOLLOW: u32 = 0x1;
 
 /// Dispatch a request whose opcode is in the WASI preview 1 range.
 /// The caller has already guarded with [`abi::wasi::is_wasi`].
-pub fn dispatch_wasi(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
-    match req.opcode {
+pub fn dispatch_wasi(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> ServiceOutcome {
+    if req.opcode == op::FD_READ {
+        return handle_fd_read(kernel, pid, req, heap);
+    }
+    if req.opcode == op::POLL_ONEOFF {
+        return handle_poll_oneoff(kernel, pid, req, heap);
+    }
+    ServiceOutcome::Done(match req.opcode {
         op::FD_WRITE => handle_fd_write(kernel, pid, req, heap),
-        op::FD_READ => handle_fd_read(kernel, pid, req, heap),
         op::FD_SEEK => handle_fd_seek(kernel, pid, req),
         op::FD_TELL => handle_fd_tell(kernel, pid, req),
         op::FD_ADVISE => handle_fd_advise(kernel, pid, req),
@@ -88,11 +103,10 @@ pub fn dispatch_wasi(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u
         op::SOCK_ACCEPT => handle_sock_accept(kernel, pid, req),
         op::SOCK_SHUTDOWN => handle_sock_shutdown(kernel, pid, req),
         op::FD_READDIR => handle_fd_readdir(kernel, pid, req, heap),
-        op::POLL_ONEOFF => handle_poll_oneoff(kernel, pid, req, heap),
-        op::FD_PRESTAT_GET => handle_fd_prestat_get(req),
-        op::FD_PRESTAT_DIR_NAME => handle_fd_prestat_dir_name(req),
+        op::FD_PRESTAT_GET => handle_fd_prestat_get(kernel, pid, req),
+        op::FD_PRESTAT_DIR_NAME => handle_fd_prestat_dir_name(kernel, pid, req, heap),
         _ => Response::err(req.request_id, ENOSYS),
-    }
+    })
 }
 
 // ---- fd_write ----------------------------------------------------------
@@ -134,21 +148,33 @@ fn handle_fd_write(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) ->
 //                 of the heap window was populated without
 //                 looking at `value` first
 
-fn handle_fd_read(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
+fn handle_fd_read(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> ServiceOutcome {
     let fd = args_u32(req, 0);
     let max_len = req.heap_len as usize;
     let Some(buf) = heap_out_mut(req, heap, max_len) else {
-        return Response::err(req.request_id, EINVAL);
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     };
+    if max_len == 0 {
+        return ServiceOutcome::Done(Response::ok(req.request_id, 0));
+    }
     match kernel.fd_read(pid, fd, buf) {
-        Ok(n) => Response {
+        Ok(n) => ServiceOutcome::Done(Response {
             request_id: req.request_id,
             status: 0,
             value: n as i64,
             extra_len: n as u32,
             _pad: [0u8; 12],
-        },
-        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
+        }),
+        Err(KernelError::WouldBlock) => {
+            match kernel.park_on_pipe_read(pid, fd, req.request_id, req.heap_len, req.heap_ptr) {
+                Ok(()) => ServiceOutcome::Parked,
+                Err(KernelError::WouldBlock | KernelError::NotSupportedOnFd) => {
+                    ServiceOutcome::Done(Response::err(req.request_id, abi::errno::EAGAIN))
+                }
+                Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
+            }
+        }
+        Err(e) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(e))),
     }
 }
 
@@ -444,6 +470,7 @@ fn handle_fd_close(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
 //                 the final component is flag-governed —
 //                 intermediate symlinks always follow via
 //                 [`Vfs::resolve`].
+//   args[12..16] = directory fd (u32; base for relative paths)
 //   heap_ptr    = start of UTF-8 path
 //   heap_len    = path length in bytes
 // Response:
@@ -472,13 +499,24 @@ fn handle_path_open(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -
         u16::from_le_bytes([bytes[0], bytes[1]])
     };
     let lookup_flags = args_u32(req, 8);
+    let dir_fd = args_u32(req, 12);
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.path_open(pid, path, lookup_flags, oflags, mode, flags) {
+    match kernel.path_open_at(
+        pid,
+        dir_fd,
+        path,
+        PathOpenOptions {
+            lookup_flags,
+            oflags,
+            mode,
+            flags,
+        },
+    ) {
         Ok(fd) => Response::ok(req.request_id, fd as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
@@ -741,11 +779,13 @@ fn handle_sched_yield(req: &Request) -> Response {
 // not need to know the user's argv array address, only deliver the
 // flat byte stream).
 
-fn argv_buf_size(argv: &alloc::vec::Vec<alloc::string::String>) -> u32 {
+fn argv_buf_size(argv: &[alloc::string::String]) -> u32 {
     argv.iter().map(|s| s.len() as u32 + 1).sum()
 }
 
-fn envp_buf_size(envp: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>) -> u32 {
+fn envp_buf_size(
+    envp: &alloc::collections::BTreeMap<alloc::string::String, alloc::string::String>,
+) -> u32 {
     envp.iter()
         .map(|(k, v)| k.len() as u32 + 1 + v.len() as u32 + 1)
         .sum()
@@ -813,12 +853,7 @@ fn handle_args_get(kernel: &Kernel, pid: Pid, req: &Request, heap: &mut [u8]) ->
     }
 }
 
-fn handle_environ_sizes_get(
-    kernel: &Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> Response {
+fn handle_environ_sizes_get(kernel: &Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let Some(proc) = kernel.procs.get(pid) else {
         return Response::err(req.request_id, abi::errno::ESRCH);
     };
@@ -909,7 +944,9 @@ use abi::wasi::filetype as ft;
 
 fn filetype_for(object: FdObject) -> u8 {
     match object {
-        FdObject::Vnode { .. } | FdObject::HostFile { .. } => ft::REGULAR_FILE,
+        FdObject::Vnode { .. } | FdObject::HostFile { .. } | FdObject::HostDownload { .. } => {
+            ft::REGULAR_FILE
+        }
         FdObject::CharDevice(_) => ft::CHARACTER_DEVICE,
         FdObject::Socket(_) | FdObject::DisplayConn(_) => ft::SOCKET_STREAM,
         FdObject::PipeRead(_)
@@ -933,14 +970,22 @@ fn filetype_from_nodetype(ty: NodeType) -> u8 {
 
 fn handle_fd_fdstat_get(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let fd = args_u32(req, 0);
-    let table = match kernel.fds(pid) {
-        Ok(t) => t,
+    let entry = match kernel.fds(pid) {
+        Ok(t) => match t.get(fd) {
+            Some(entry) => *entry,
+            None => return Response::err(req.request_id, EBADF),
+        },
         Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
-    let Some(entry) = table.get(fd) else {
-        return Response::err(req.request_id, EBADF);
+    let filetype = match entry.object {
+        FdObject::Vnode { mount_id, ino } => match kernel.vfs.stat_ino(mount_id, ino) {
+            Ok(stat) => filetype_from_nodetype(stat.ty),
+            Err(error) => {
+                return Response::err(req.request_id, kerr_to_errno(KernelError::Fs(error)))
+            }
+        },
+        object => filetype_for(object),
     };
-    let filetype = filetype_for(entry.object);
 
     let Some(buf) = heap_out_mut(req, heap, 24) else {
         return Response::err(req.request_id, EINVAL);
@@ -1053,6 +1098,16 @@ fn handle_fd_filestat_get(
                 .unwrap_or(0);
             (ft::REGULAR_FILE, 0, token as u64, size, 1, 0, 0, 0)
         }
+        FdObject::HostDownload { id } => (
+            ft::REGULAR_FILE,
+            0,
+            id as u64,
+            kernel.host_download_size(id).unwrap_or(0),
+            1,
+            0,
+            0,
+            0,
+        ),
     };
 
     let Some(buf) = heap_out_mut(req, heap, fs_off::SIZE) else {
@@ -1082,8 +1137,8 @@ fn handle_fd_filestat_get(
 // ---- path_filestat_get ------------------------------------------------
 //
 // Layout:
-//   args[0..4] = dir_fd (u32, ignored — v1 has no preopens, every
-//                path is treated as absolute)
+//   args[0..4] = dir_fd (u32; v1 exposes only the `/` preopen, so
+//                path resolution is root-relative)
 //   args[4..8] = lookup flags (u32; the only defined bit is
 //                LOOKUP_SYMLINK_FOLLOW=0x1. When set, the final
 //                path component is dereferenced if it's a symlink
@@ -1111,16 +1166,16 @@ fn handle_fd_filestat_get(
 // ENOENT via [`kerr_to_errno`]).
 //
 // Userland std code compiled for wasm32-wasip1 lowers
-// `std::fs::metadata(path)` through this opcode; PMos has no
-// preopens, so the path that arrives at the kernel is already the
-// absolute form the caller wrote in its source.
+// `std::fs::metadata(path)` through this opcode. libc resolves the
+// path against PMos's `/` preopen before dispatch.
 fn handle_path_filestat_get(
     kernel: &mut Kernel,
     _pid: Pid,
     req: &Request,
     heap: &mut [u8],
 ) -> Response {
-    // dir_fd still unused in v1 (no preopens). lookup_flags drives
+    // The only preopen is `/`, so dir_fd does not alter the root-relative
+    // path. lookup_flags drives
     // symlink-follow behaviour per WASI: bit 0 set → follow final
     // symlink (stat), unset → don't (lstat). Intermediate
     // symlinks always follow regardless — that's implicit in
@@ -1175,7 +1230,7 @@ fn handle_path_filestat_get(
 // ---- path_filestat_set_times -----------------------------------------
 //
 // Layout:
-//   args[0..4]    = dir_fd (u32, ignored — v1 has no preopens)
+//   args[0..4]    = dir_fd (u32; only the `/` preopen exists in v1)
 //   args[4..8]    = lookup_flags (u32, ignored — v1 doesn't follow
 //                   symlinks either way)
 //   args[8..12]   = fstflags (u32; low 4 bits: SET_ATIM=0x1,
@@ -1377,39 +1432,65 @@ fn handle_path_filestat_set_times(
 // Layout:
 //   args[0..4] = fd (u32)
 // Response:
-//   status    = -EBADF (always)
+//   value     = byte length of the preopen name (`/` = 1)
 //
-// WASI's preopen-dir discovery loop starts at fd 3 and walks up
-// until the runtime returns EBADF; that's how libcs know there are
-// no more preopens. PMos doesn't expose any preopen directories
-// (every path resolves through the VFS by absolute name), so the
-// honest answer for every fd is EBADF. Returning that turns a Rust
-// std binary's startup probe into a two-iteration loop that exits
-// cleanly.
+// PMos exposes exactly one directory preopen: the VFS root at fd 3.
+// WASI libc discovers it before translating absolute or relative
+// `std::fs` paths into `path_*` calls. fd 4 is the PMos signal channel,
+// so probing it returns EBADF and terminates the consecutive-fd scan.
 
-fn handle_fd_prestat_get(req: &Request) -> Response {
-    Response::err(req.request_id, EBADF)
+fn is_root_preopen(kernel: &Kernel, pid: Pid, fd: u32) -> bool {
+    if fd != well_known_fd::ROOT_PREOPEN {
+        return false;
+    }
+    kernel
+        .fds(pid)
+        .ok()
+        .and_then(|table| table.get(fd))
+        .map(|entry| matches!(entry.object, FdObject::Vnode { .. }))
+        .unwrap_or(false)
+}
+
+fn handle_fd_prestat_get(kernel: &Kernel, pid: Pid, req: &Request) -> Response {
+    let fd = args_u32(req, 0);
+    if !is_root_preopen(kernel, pid, fd) {
+        return Response::err(req.request_id, EBADF);
+    }
+    Response::ok(req.request_id, 1)
 }
 
 // ---- fd_prestat_dir_name ---------------------------------------------
 //
 // Layout:
-//   args[0..4] = fd (u32; ignored — same EBADF for every fd)
-//   heap       = caller's output buffer (ignored — nothing is written
-//                on the EBADF path)
+//   args[0..4] = fd (u32)
+//   heap       = caller's output buffer
 // Response:
-//   status    = -EBADF (always)
-//
-// Companion to fd_prestat_get. Userland's preopen-discovery loops
-// iterate fd 3/4/5 calling both fd_prestat_get and fd_prestat_dir_name
-// until both return EBADF. Pre-slice, v1 returned EBADF from get but
-// ENOSYS from dir_name, which broke the loop — callers saw "no
-// preopens" for get and "this syscall doesn't exist" for dir_name,
-// which is inconsistent. Post-slice, both agree on EBADF and the
-// loop terminates cleanly.
+//   value/extra_len = bytes written (1 for `/`)
 
-fn handle_fd_prestat_dir_name(req: &Request) -> Response {
-    Response::err(req.request_id, EBADF)
+fn handle_fd_prestat_dir_name(
+    kernel: &Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> Response {
+    let fd = args_u32(req, 0);
+    if !is_root_preopen(kernel, pid, fd) {
+        return Response::err(req.request_id, EBADF);
+    }
+    if req.heap_len < 1 {
+        return Response::err(req.request_id, ENAMETOOLONG);
+    }
+    let Some(buf) = heap_out_mut(req, heap, 1) else {
+        return Response::err(req.request_id, EINVAL);
+    };
+    buf[0] = b'/';
+    Response {
+        request_id: req.request_id,
+        status: 0,
+        value: 1,
+        extra_len: 1,
+        _pad: [0; 12],
+    }
 }
 
 // ---- fd_readdir ------------------------------------------------------
@@ -1516,8 +1597,7 @@ fn handle_fd_readdir(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u
 // ---- path_unlink_file ------------------------------------------------
 //
 // Layout:
-//   args[0..4]  = dir_fd (u32, ignored — v1 has no preopens, every
-//                 path is treated as absolute)
+//   args[0..4]  = dir_fd (u32; base directory for relative paths)
 //   heap_ptr    = offset of UTF-8 path bytes
 //   heap_len    = length of the path
 // Response:
@@ -1527,7 +1607,7 @@ fn handle_fd_readdir(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u
 // a directory returns EISDIR (the caller should use
 // path_remove_directory instead). This is the first write-side
 // filesystem-mutation WASI opcode in PMos's surface: the handler
-// threads the path through `Vfs::unlink`, which in turn calls
+// threads the path through `Kernel::vfs_unlink_at`, which in turn calls
 // `Filesystem::unlink` on the mount owning the path. tmpfs overrides
 // with the real removal path; devfs / procfs inherit the default
 // (returns NotSupported → ENOTSUP). A future OPFS slice will
@@ -1535,27 +1615,27 @@ fn handle_fd_readdir(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u
 
 fn handle_path_unlink_file(
     kernel: &mut Kernel,
-    _pid: Pid,
+    pid: Pid,
     req: &Request,
     heap: &mut [u8],
 ) -> Response {
-    let _dir_fd = args_u32(req, 0);
+    let dir_fd = args_u32(req, 0);
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs_unlink(path) {
+    match kernel.vfs_unlink_at(pid, dir_fd, path) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 
 // ---- path_rename -----------------------------------------------------
 //
 // Layout:
-//   args[0..4]   = from_dir_fd (u32, ignored — v1 has no preopens)
+//   args[0..4]   = from_dir_fd (u32; only the `/` preopen exists in v1)
 //   args[4..8]   = to_dir_fd   (u32, ignored)
 //   args[8..12]  = old_len (u32; split point in the heap window —
 //                  heap[0..old_len] is the old UTF-8 path,
@@ -1602,7 +1682,7 @@ fn handle_path_rename(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut 
     let Ok(new_path) = core::str::from_utf8(new_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs.rename(old_path, new_path) {
+    match kernel.vfs_rename(old_path, new_path) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
@@ -1611,7 +1691,7 @@ fn handle_path_rename(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut 
 // ---- path_link -------------------------------------------------------
 //
 // Layout:
-//   args[0..4]   = old_fd      (u32; ignored in v1 — no preopens)
+//   args[0..4]   = old_fd      (u32; only the `/` preopen exists in v1)
 //   args[4..8]   = old_flags   (u32; lookup flags — ignored in v1,
 //                               symlinks aren't followed by the path
 //                               resolver regardless)
@@ -1661,7 +1741,7 @@ fn handle_path_link(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut [u
     let Ok(new_path) = core::str::from_utf8(new_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs.link(old_path, new_path) {
+    match kernel.vfs_link(old_path, new_path) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
@@ -1720,7 +1800,7 @@ fn handle_path_symlink(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut
     let Ok(new_path) = core::str::from_utf8(new_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs.symlink(target, new_path) {
+    match kernel.vfs_symlink(target, new_path) {
         Ok(_ino) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
@@ -1729,7 +1809,7 @@ fn handle_path_symlink(kernel: &mut Kernel, _pid: Pid, req: &Request, heap: &mut
 // ---- path_readlink --------------------------------------------------
 //
 // Layout:
-//   args[0..4] = dir_fd (u32; ignored in v1 — no preopens)
+//   args[0..4] = dir_fd (u32; only the `/` preopen exists in v1)
 //   args[4..8] = path_len (u32; the first path_len bytes of heap are
 //                the UTF-8 input path; the full heap_len doubles as
 //                the output buffer capacity)
@@ -1791,7 +1871,7 @@ fn handle_path_readlink(
 // ---- path_create_directory / path_remove_directory ----------------
 //
 // mkdir + rmdir wire layout (both identical to path_unlink_file's):
-//   args[0..4]  = dir_fd (u32, ignored — v1 has no preopens)
+//   args[0..4]  = dir_fd (u32; only the `/` preopen exists in v1)
 //   heap_ptr    = offset of UTF-8 path bytes
 //   heap_len    = length of the path
 // Response:
@@ -1830,20 +1910,20 @@ fn handle_path_create_directory(
 
 fn handle_path_remove_directory(
     kernel: &mut Kernel,
-    _pid: Pid,
+    pid: Pid,
     req: &Request,
     heap: &mut [u8],
 ) -> Response {
-    let _dir_fd = args_u32(req, 0);
+    let dir_fd = args_u32(req, 0);
     let Some(path_bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
     let Ok(path) = core::str::from_utf8(path_bytes) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs_rmdir(path) {
+    match kernel.vfs_rmdir_at(pid, dir_fd, path) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 
@@ -1968,7 +2048,7 @@ fn handle_fd_filestat_set_size(kernel: &mut Kernel, pid: Pid, req: &Request) -> 
         FdObject::Vnode { mount_id, ino } => (mount_id, ino),
         _ => return Response::err(req.request_id, EINVAL),
     };
-    match kernel.vfs.truncate_ino(mount_id, ino, new_size) {
+    match kernel.vfs_truncate_ino(mount_id, ino, new_size) {
         Ok(()) => Response::ok(req.request_id, 0),
         Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
@@ -2053,7 +2133,7 @@ fn handle_fd_pwrite(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -
     let Some(bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.vfs.write_ino(mount_id, ino, offset, bytes) {
+    match kernel.vfs_write_at(mount_id, ino, offset, bytes) {
         Ok(n) => Response::ok(req.request_id, n as i64),
         Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::Fs(e))),
     }
@@ -2064,33 +2144,38 @@ fn handle_fd_pwrite(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -
 // WASI socket aliases of FD_WRITE / FD_READ on Socket fds. Wire:
 //
 //   SOCK_SEND: args[0..4] = fd (u32)
-//              args[4..8] = si_flags (u16 in the low bits; v1 ignores)
+//              args[4..8] = si_flags (u16 in the low bits; must be zero)
 //              heap_in    = bytes to send
 //   SOCK_RECV: args[0..4] = fd (u32)
-//              args[4..8] = ri_flags (u16 in the low bits; v1 ignores)
+//              args[4..8] = ri_flags (u16 in the low bits)
 //              heap_out   = destination buffer, heap_len = capacity
 //
 // Both reject non-Socket FdObject with EINVAL — PMos has no
 // ENOTSOCK errno; EINVAL matches the non-Vnode guard shape used by
 // every other fd-type-specific opcode. Unopened fd is EBADF. The
-// handlers reuse kernel.ipc.send_on_socket / kernel.ipc.recv_on_socket
-// directly; IpcError converts to KernelError via the existing
-// From<IpcError> impl and then to errno via kerr_to_errno. An
+// send routes through `Kernel::ipc_send` so custom blocking `IPC_RECV`
+// parkers and SIGPIPE are handled identically to the extension opcode;
+// receive uses the same IpcTable receive primitive. IpcError converts to
+// KernelError via the existing From<IpcError> impl and then to errno. An
 // InvalidState IpcError (e.g. sending on an unconnected socket)
 // surfaces as EINVAL, a ConnectionRefused surfaces as ECONNREFUSED,
 // etc. — the mapping is consistent with what FD_READ / FD_WRITE
 // report on the same fd.
 //
-// The si_flags / ri_flags WASI fields encode out-of-band data bits,
-// MSG_PEEK, MSG_DONTWAIT etc. None of those are meaningful on v1's
-// single-threaded kernel with memory-backed socket buffers, so the
-// handler accepts whatever low 16 bits the caller supplies and
-// discards them — a userland caller that asks for SO_OOB gets a
-// plain in-band send, no error.
+// WASI preview 1 defines no send flags and defines PEEK/WAITALL for receive.
+// PMos v1 does not implement those receive modes, so it returns ENOTSUP before
+// touching socket state. Unknown bits are malformed and return EINVAL. It is
+// never correct to silently consume bytes for a requested PEEK.
 
 fn handle_sock_send(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -> Response {
     let fd = args_u32(req, 0);
-    let _si_flags = args_u32(req, 4) & 0xFFFF;
+    let si_flags = args_u32(req, 4);
+    if si_flags > u16::MAX as u32 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if si_flags != 0 {
+        return Response::err(req.request_id, ENOTSUP);
+    }
 
     let entry = match kernel.fds(pid) {
         Ok(t) => match t.get(fd) {
@@ -2099,26 +2184,16 @@ fn handle_sock_send(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -
         },
         Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
-    let socket_id = match entry.object {
-        FdObject::Socket(id) => id,
+    match entry.object {
+        FdObject::Socket(_) => {}
         _ => return Response::err(req.request_id, EINVAL),
-    };
+    }
     let Some(bytes) = heap_in(req, heap) else {
         return Response::err(req.request_id, EINVAL);
     };
-    match kernel.ipc.send_on_socket(
-        crate::ipc::SocketId(socket_id),
-        bytes,
-        alloc::vec::Vec::new(),
-    ) {
+    match kernel.ipc_send(pid, fd, bytes, None) {
         Ok(n) => Response::ok(req.request_id, n as i64),
-        Err(e) => {
-            let kerr = KernelError::from(e);
-            if matches!(kerr, KernelError::PipeBroken) {
-                kernel.post_sigpipe(pid);
-            }
-            Response::err(req.request_id, kerr_to_errno(kerr))
-        }
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 
@@ -2173,7 +2248,7 @@ fn handle_sock_send(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &[u8]) -
 
 fn handle_sock_shutdown(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let fd = args_u32(req, 0);
-    let how = args_u32(req, 4) & 0xFF;
+    let how = args_u32(req, 4);
 
     let entry = match kernel.fds(pid) {
         Ok(t) => match t.get(fd) {
@@ -2182,10 +2257,10 @@ fn handle_sock_shutdown(kernel: &mut Kernel, pid: Pid, req: &Request) -> Respons
         },
         Err(e) => return Response::err(req.request_id, kerr_to_errno(e)),
     };
-    let socket_id = match entry.object {
-        FdObject::Socket(id) => id,
+    match entry.object {
+        FdObject::Socket(_) => {}
         _ => return Response::err(req.request_id, EINVAL),
-    };
+    }
 
     let rd = abi::wasi::sdflags::RD as u32;
     let wr = abi::wasi::sdflags::WR as u32;
@@ -2195,18 +2270,23 @@ fn handle_sock_shutdown(kernel: &mut Kernel, pid: Pid, req: &Request) -> Respons
     }
     let read = (how & rd) != 0;
     let write = (how & wr) != 0;
-    match kernel
-        .ipc
-        .shutdown_socket(crate::ipc::SocketId(socket_id), read, write)
-    {
+    match kernel.shutdown_socket_fd(pid, fd, read, write) {
         Ok(()) => Response::ok(req.request_id, 0),
-        Err(e) => Response::err(req.request_id, kerr_to_errno(KernelError::from(e))),
+        Err(e) => Response::err(req.request_id, kerr_to_errno(e)),
     }
 }
 
 fn handle_sock_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response {
     let listener_fd = args_u32(req, 0);
     let wasi_fdflags = args_u32(req, 4);
+    let known_fdflags = (abi::wasi::fdflags::APPEND
+        | abi::wasi::fdflags::DSYNC
+        | abi::wasi::fdflags::NONBLOCK
+        | abi::wasi::fdflags::RSYNC
+        | abi::wasi::fdflags::SYNC) as u32;
+    if (wasi_fdflags & !known_fdflags) != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
 
     let new_fd = match kernel.accept_socket(pid, listener_fd) {
         Ok(fd) => fd,
@@ -2229,7 +2309,17 @@ fn handle_sock_accept(kernel: &mut Kernel, pid: Pid, req: &Request) -> Response 
 
 fn handle_sock_recv(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
     let fd = args_u32(req, 0);
-    let _ri_flags = args_u32(req, 4) & 0xFFFF;
+    let ri_flags = args_u32(req, 4);
+    if ri_flags > u16::MAX as u32 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    let supported_mask = (abi::wasi::riflags::RECV_PEEK | abi::wasi::riflags::RECV_WAITALL) as u32;
+    if (ri_flags & !supported_mask) != 0 {
+        return Response::err(req.request_id, EINVAL);
+    }
+    if ri_flags != 0 {
+        return Response::err(req.request_id, ENOTSUP);
+    }
 
     let entry = match kernel.fds(pid) {
         Ok(t) => match t.get(fd) {
@@ -2280,29 +2370,12 @@ fn handle_sock_recv(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8
 //   extra_len = same (mirrored so the shim can read it without
 //               reinterpreting `value` as BigInt)
 //
-// ## v1 semantics: non-blocking only
-//
-// The real POSIX `poll()` sleeps the calling thread until at least one
-// subscription fires or a timeout elapses. PMos's kernel is strictly
-// single-threaded — the dispatcher runs each request to completion
-// before picking up the next one — so a handler that blocks would
-// stall every process sharing the kernel Worker. Instead, this
-// handler does a one-shot readiness check and returns immediately:
-//
-//   * CLOCK subscriptions fire only if the target time has already
-//     been reached. `ABSTIME` with a timeout in the past is ready;
-//     a relative timeout of 0 is ready; any relative non-zero
-//     timeout is reported as "not ready yet".
-//   * FD_READ / FD_WRITE subscriptions fire only if the corresponding
-//     operation would make progress right now — rx_buf non-empty for
-//     a readable socket, peer_closed for EOF, available bytes < size
-//     for a Vnode, etc.
-//
-// Userland is expected to spin: repeatedly call poll_oneoff until at
-// least one event fires. This is the documented weaker-than-POSIX
-// contract; a future slice that introduces real blocking (parking
-// the process on the subscription's target condition and waking via
-// the scheduler) keeps the same opcode shape and wire layout.
+// When no subscription is immediately ready, the handler records a bounded,
+// normalized copy and parks only the calling process. Relative clock timeouts
+// become absolute deadlines at registration. Kernel state-change hooks and
+// the Worker timer service re-check parked sets and queue the normal response
+// through `pending_wakes`; the single kernel Worker itself never blocks inside
+// this handler.
 //
 // ## Per-subscription errors vs syscall-level errors
 //
@@ -2322,7 +2395,7 @@ use crate::fd::FdEntry;
 use crate::fs::devfs::{
     DEV_CONSOLE, DEV_FB0, DEV_INPUT_KBD, DEV_INPUT_MOUSE, DEV_NULL, DEV_RANDOM, DEV_ZERO,
 };
-use crate::ipc::{SocketId, SocketState};
+use crate::ipc::{PipeId, SocketId, SocketState};
 use abi::errno::ENOENT;
 use abi::wasi::eventrwflags::FD_READWRITE_HANGUP;
 use abi::wasi::eventtype as et;
@@ -2386,13 +2459,10 @@ fn fd_readiness(
             if !is_read {
                 return (false, 0, 0, Some(EINVAL));
             }
-            let n_events = kernel
-                .vfs
-                .watches()
-                .watches
-                .get(&watch_id)
-                .map(|w| w.events.len())
-                .unwrap_or(0);
+            let Some(watch) = kernel.vfs.watches().watches.get(&watch_id) else {
+                return (false, 0, 0, Some(EBADF));
+            };
+            let n_events = watch.events.len();
             if n_events == 0 {
                 (false, 0, 0, None)
             } else {
@@ -2421,11 +2491,19 @@ fn fd_readiness(
                 (true, total - state.offset, 0, None)
             }
         }
-        FdObject::PipeRead(_) | FdObject::PipeWrite(_) | FdObject::DisplayConn(_) => {
-            // v1 doesn't wire these through fd_read / fd_write; poll
-            // on them is meaningless → per-subscription EINVAL.
-            (false, 0, 0, Some(EINVAL))
+        FdObject::HostDownload { id } => {
+            if is_read {
+                return (false, 0, 0, Some(EINVAL));
+            }
+            match kernel.host_download_remaining(id) {
+                Some(remaining) if remaining > 0 => (true, remaining as u64, 0, None),
+                Some(_) => (false, 0, 0, Some(abi::errno::EFBIG)),
+                None => (false, 0, 0, Some(EBADF)),
+            }
         }
+        FdObject::PipeRead(id) => pipe_readiness(kernel, PipeId(id), is_read, true),
+        FdObject::PipeWrite(id) => pipe_readiness(kernel, PipeId(id), is_read, false),
+        FdObject::DisplayConn(_) => (false, 0, 0, Some(EINVAL)),
     }
 }
 
@@ -2471,10 +2549,14 @@ fn char_device_readiness(
                     (false, 0, 0, None)
                 }
             }
-            // No public length accessor for the input rings; report
-            // not-ready. A future slice can expose a length on
-            // DeviceDispatcher and wire them here.
-            DEV_INPUT_KBD | DEV_INPUT_MOUSE => (false, 0, 0, None),
+            DEV_INPUT_KBD => {
+                let len = kernel.devs.input_kbd_len();
+                (len > 0, len as u64, 0, None)
+            }
+            DEV_INPUT_MOUSE => {
+                let len = kernel.devs.input_mouse_len();
+                (len > 0, len as u64, 0, None)
+            }
             // fb0 is write-only.
             DEV_FB0 => (false, 0, 0, Some(EINVAL)),
             _ => (false, 0, 0, Some(EINVAL)),
@@ -2494,59 +2576,143 @@ fn socket_readiness(
     id: SocketId,
     is_read: bool,
 ) -> (bool, u64, u16, Option<i32>) {
+    let global_free = kernel.ipc.buffered_byte_capacity_remaining();
     // Snapshot the fields we need under a scoped mut borrow so we
     // can release the borrow before looking at the peer.
-    let (state, peer_opt, rx_len) = {
+    let (state, peer_opt, rx_len, rx_fd_count, shutdown_read, shutdown_write) = {
         let sock = match kernel.ipc.socket_mut(id) {
             Ok(s) => s,
             Err(_) => return (false, 0, 0, Some(EBADF)),
         };
-        (sock.state, sock.peer, sock.rx_buf.len())
+        (
+            sock.state,
+            sock.peer,
+            sock.rx_buf.len(),
+            sock.rx_fds.len(),
+            sock.shutdown_read,
+            sock.shutdown_write,
+        )
     };
+    if state == SocketState::Listening {
+        if !is_read {
+            return (false, 0, 0, Some(EINVAL));
+        }
+        let backlog = kernel
+            .ipc
+            .sockets_get(id)
+            .map(|socket| socket.backlog.len())
+            .unwrap_or(0);
+        return (backlog > 0, backlog as u64, 0, None);
+    }
+    if state == SocketState::Connecting {
+        // `connect` has queued this endpoint on a live listener but accept has
+        // not paired it yet. Both directions can make progress only after the
+        // listener accepts, so this is a legitimate not-ready state rather
+        // than a per-subscription EINVAL.
+        return (false, 0, 0, None);
+    }
+    if state == SocketState::Closed {
+        return (true, 0, FD_READWRITE_HANGUP, None);
+    }
     if state != SocketState::Connected {
         return (false, 0, 0, Some(EINVAL));
     }
-    let (peer_closed, peer_free) = match peer_opt {
+    let (peer_closed, peer_shutdown_read, peer_shutdown_write, peer_free) = match peer_opt {
         Some(peer_id) => match kernel.ipc.socket_mut(peer_id) {
-            Ok(p) => (p.closed, p.rx_cap.saturating_sub(p.rx_buf.len())),
-            Err(_) => (true, 0),
+            Ok(p) => (
+                p.closed,
+                p.shutdown_read,
+                p.shutdown_write,
+                p.rx_cap.saturating_sub(p.rx_buf.len()),
+            ),
+            Err(_) => (true, false, false, 0),
         },
-        None => (true, 0),
+        None => (true, false, false, 0),
     };
     if is_read {
-        if rx_len > 0 {
+        // Mirror `recv_on_socket`: local SHUT_RD is unconditional EOF and
+        // takes precedence even over queued bytes/ancillary refs.
+        if shutdown_read {
+            (true, 0, FD_READWRITE_HANGUP, None)
+        } else if rx_len > 0 || rx_fd_count > 0 {
             (true, rx_len as u64, 0, None)
-        } else if peer_closed {
+        } else if peer_closed || peer_shutdown_write {
             (true, 0, FD_READWRITE_HANGUP, None)
         } else {
             (false, 0, 0, None)
         }
-    } else if peer_closed {
+    } else if shutdown_write || peer_closed || peer_shutdown_read {
         (true, 0, FD_READWRITE_HANGUP, None)
-    } else if peer_free > 0 {
-        (true, peer_free as u64, 0, None)
     } else {
-        (false, 0, 0, None)
+        let writable = core::cmp::min(peer_free, global_free);
+        if writable > 0 {
+            (true, writable as u64, 0, None)
+        } else {
+            (false, 0, 0, None)
+        }
     }
 }
 
-fn handle_poll_oneoff(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> Response {
+fn pipe_readiness(
+    kernel: &mut Kernel,
+    id: PipeId,
+    is_read: bool,
+    read_endpoint: bool,
+) -> (bool, u64, u16, Option<i32>) {
+    if is_read != read_endpoint {
+        return (false, 0, 0, Some(EINVAL));
+    }
+    let global_free = kernel.ipc.buffered_byte_capacity_remaining();
+    let pipe = match kernel.ipc.pipe_mut(id) {
+        Ok(pipe) => pipe,
+        Err(_) => return (false, 0, 0, Some(EBADF)),
+    };
+    if read_endpoint {
+        if !pipe.is_empty() {
+            (true, pipe.len() as u64, 0, None)
+        } else if pipe.writer_closed() {
+            (true, 0, FD_READWRITE_HANGUP, None)
+        } else {
+            (false, 0, 0, None)
+        }
+    } else if pipe.reader_closed() {
+        (true, 0, FD_READWRITE_HANGUP, None)
+    } else {
+        let local_free = pipe.capacity().saturating_sub(pipe.len());
+        let free = core::cmp::min(local_free, global_free);
+        (free > 0, free as u64, 0, None)
+    }
+}
+
+fn handle_poll_oneoff(
+    kernel: &mut Kernel,
+    pid: Pid,
+    req: &Request,
+    heap: &mut [u8],
+) -> ServiceOutcome {
     let n_subs = args_u32(req, 0);
     let n_events_cap = args_u32(req, 4);
-    if n_subs == 0 {
-        return Response::err(req.request_id, EINVAL);
+    let admission_class = match kernel.poll_admission_class(pid) {
+        Ok(class) => class,
+        Err(error) => {
+            return ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(error)))
+        }
+    };
+    let per_call_limit = admission_class.per_call_limit();
+    if n_subs == 0
+        || n_subs as usize > per_call_limit
+        || n_events_cap == 0
+        || n_events_cap as usize > per_call_limit
+    {
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
     let subs_bytes = match (n_subs as usize).checked_mul(pl::SUBSCRIPTION_SIZE) {
         Some(n) => n,
-        None => return Response::err(req.request_id, EINVAL),
+        None => return ServiceOutcome::Done(Response::err(req.request_id, EINVAL)),
     };
     let events_bytes = match (n_events_cap as usize).checked_mul(pl::EVENT_SIZE) {
         Some(n) => n,
-        None => return Response::err(req.request_id, EINVAL),
-    };
-    let total_bytes = match subs_bytes.checked_add(events_bytes) {
-        Some(n) => n,
-        None => return Response::err(req.request_id, EINVAL),
+        None => return ServiceOutcome::Done(Response::err(req.request_id, EINVAL)),
     };
     let heap_len = req.heap_len as usize;
     let heap_ptr = req.heap_ptr as usize;
@@ -2561,115 +2727,395 @@ fn handle_poll_oneoff(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [
     // cleanly when the events window doesn't fit.
     let needed = core::cmp::max(subs_bytes, events_bytes);
     if heap_len < needed {
-        return Response::err(req.request_id, EINVAL);
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
-    let _ = total_bytes; // silence unused — kept for future growth.
     let heap_end = match heap_ptr.checked_add(needed) {
         Some(n) => n,
-        None => return Response::err(req.request_id, EINVAL),
+        None => return ServiceOutcome::Done(Response::err(req.request_id, EINVAL)),
     };
     if heap_end > heap.len() {
-        return Response::err(req.request_id, EINVAL);
+        return ServiceOutcome::Done(Response::err(req.request_id, EINVAL));
     }
 
-    // Copy the subscription bytes out before we touch the output
-    // region, so writing events doesn't alias the input reads.
-    let mut subs: Vec<[u8; pl::SUBSCRIPTION_SIZE]> = Vec::with_capacity(n_subs as usize);
+    let monotonic_now = platform::current().now_ns();
+    let realtime_now = platform::current().now_realtime_ns();
+    let mut subscriptions = Vec::with_capacity(n_subs as usize);
     for i in 0..(n_subs as usize) {
         let base = heap_ptr + i * pl::SUBSCRIPTION_SIZE;
-        let mut arr = [0u8; pl::SUBSCRIPTION_SIZE];
-        arr.copy_from_slice(&heap[base..base + pl::SUBSCRIPTION_SIZE]);
-        subs.push(arr);
+        subscriptions.push(normalize_subscription(
+            &heap[base..base + pl::SUBSCRIPTION_SIZE],
+            monotonic_now,
+            realtime_now,
+        ));
     }
 
-    let mut events: Vec<[u8; pl::EVENT_SIZE]> = Vec::with_capacity(n_subs as usize);
-    for sub in &subs {
-        if events.len() >= n_events_cap as usize {
+    let event_cap = core::cmp::min(n_events_cap as usize, per_call_limit);
+    let events = ready_poll_events(
+        kernel,
+        pid,
+        &subscriptions,
+        event_cap,
+        monotonic_now,
+        realtime_now,
+    );
+
+    if !events.is_empty() {
+        write_poll_events(heap, heap_ptr, &events);
+        return ServiceOutcome::Done(poll_response(req.request_id, events.len()));
+    }
+
+    let parker = PollParker {
+        req_id: req.request_id,
+        heap_ptr: req.heap_ptr,
+        event_cap,
+        subscriptions,
+        admission_class,
+    };
+    match kernel.park_on_poll(pid, parker) {
+        Ok(()) => ServiceOutcome::Parked,
+        Err(KernelError::WouldBlock) => {
+            ServiceOutcome::Done(Response::err(req.request_id, abi::errno::EAGAIN))
+        }
+        Err(error) => ServiceOutcome::Done(Response::err(req.request_id, kerr_to_errno(error))),
+    }
+}
+
+fn normalize_subscription(sub: &[u8], monotonic_now: u64, realtime_now: u64) -> PollSubscription {
+    let userdata = read_u64(sub, pl::SUB_OFF_USERDATA);
+    let event_type = sub[pl::SUB_OFF_TAG];
+    match event_type {
+        et::CLOCK => {
+            let clock_id = read_u32(sub, pl::SUB_CLOCK_OFF_ID);
+            let timeout = read_u64(sub, pl::SUB_CLOCK_OFF_TIMEOUT);
+            let flags = read_u16(sub, pl::SUB_CLOCK_OFF_FLAGS);
+            if flags & !ABSTIME != 0 {
+                return PollSubscription::Error {
+                    userdata,
+                    event_type,
+                    errno: EINVAL as u16,
+                };
+            }
+            let (clock, now) = match clock_id {
+                abi::wasi::CLOCKID_MONOTONIC => (PollClock::Monotonic, monotonic_now),
+                abi::wasi::CLOCKID_REALTIME => (PollClock::Realtime, realtime_now),
+                abi::wasi::CLOCKID_PROCESS_CPUTIME_ID | abi::wasi::CLOCKID_THREAD_CPUTIME_ID => {
+                    return PollSubscription::Error {
+                        userdata,
+                        event_type,
+                        errno: ENOTSUP as u16,
+                    };
+                }
+                _ => {
+                    return PollSubscription::Error {
+                        userdata,
+                        event_type,
+                        errno: EINVAL as u16,
+                    };
+                }
+            };
+            let deadline_ns = if flags & ABSTIME != 0 {
+                timeout
+            } else {
+                now.saturating_add(timeout)
+            };
+            PollSubscription::Clock {
+                userdata,
+                clock,
+                deadline_ns,
+            }
+        }
+        et::FD_READ => PollSubscription::FdRead {
+            userdata,
+            fd: read_u32(sub, pl::SUB_FDRW_OFF_FD),
+        },
+        et::FD_WRITE => PollSubscription::FdWrite {
+            userdata,
+            fd: read_u32(sub, pl::SUB_FDRW_OFF_FD),
+        },
+        _ => PollSubscription::Error {
+            userdata,
+            event_type,
+            errno: EINVAL as u16,
+        },
+    }
+}
+
+fn ready_poll_events(
+    kernel: &mut Kernel,
+    pid: Pid,
+    subscriptions: &[PollSubscription],
+    event_cap: usize,
+    monotonic_now: u64,
+    realtime_now: u64,
+) -> Vec<[u8; pl::EVENT_SIZE]> {
+    let mut events = Vec::with_capacity(core::cmp::min(subscriptions.len(), event_cap));
+    for subscription in subscriptions {
+        if events.len() >= event_cap {
             break;
         }
-        let mut ud_bytes = [0u8; 8];
-        ud_bytes.copy_from_slice(&sub[pl::SUB_OFF_USERDATA..pl::SUB_OFF_USERDATA + 8]);
-        let userdata = u64::from_le_bytes(ud_bytes);
-        let tag = sub[pl::SUB_OFF_TAG];
-        match tag {
-            et::CLOCK => {
-                let mut cid_bytes = [0u8; 4];
-                cid_bytes.copy_from_slice(&sub[pl::SUB_CLOCK_OFF_ID..pl::SUB_CLOCK_OFF_ID + 4]);
-                let clock_id = u32::from_le_bytes(cid_bytes);
-                let mut to_bytes = [0u8; 8];
-                to_bytes.copy_from_slice(
-                    &sub[pl::SUB_CLOCK_OFF_TIMEOUT..pl::SUB_CLOCK_OFF_TIMEOUT + 8],
-                );
-                let timeout = u64::from_le_bytes(to_bytes);
-                let mut fl_bytes = [0u8; 2];
-                fl_bytes
-                    .copy_from_slice(&sub[pl::SUB_CLOCK_OFF_FLAGS..pl::SUB_CLOCK_OFF_FLAGS + 2]);
-                let flags = u16::from_le_bytes(fl_bytes);
-                let now_opt = match clock_id {
-                    abi::wasi::CLOCKID_MONOTONIC => Some(platform::current().now_ns()),
-                    abi::wasi::CLOCKID_REALTIME => Some(platform::current().now_realtime_ns()),
-                    abi::wasi::CLOCKID_PROCESS_CPUTIME_ID
-                    | abi::wasi::CLOCKID_THREAD_CPUTIME_ID => {
-                        events.push(build_event(userdata, ENOTSUP as u16, et::CLOCK, 0, 0));
-                        continue;
-                    }
-                    _ => {
-                        events.push(build_event(userdata, EINVAL as u16, et::CLOCK, 0, 0));
-                        continue;
-                    }
+        match *subscription {
+            PollSubscription::Clock {
+                userdata,
+                clock,
+                deadline_ns,
+            } => {
+                let now = match clock {
+                    PollClock::Monotonic => monotonic_now,
+                    PollClock::Realtime => realtime_now,
                 };
-                let now = now_opt.unwrap();
-                let is_ready = if flags & ABSTIME != 0 {
-                    now >= timeout
-                } else {
-                    timeout == 0
-                };
-                if is_ready {
+                if now >= deadline_ns {
                     events.push(build_event(userdata, 0, et::CLOCK, 0, 0));
                 }
             }
-            et::FD_READ | et::FD_WRITE => {
-                let mut fd_bytes = [0u8; 4];
-                fd_bytes.copy_from_slice(&sub[pl::SUB_FDRW_OFF_FD..pl::SUB_FDRW_OFF_FD + 4]);
-                let fd = u32::from_le_bytes(fd_bytes);
-                let entry_opt = match kernel.fds(pid) {
-                    Ok(t) => t.get(fd).copied(),
-                    Err(_) => None,
+            PollSubscription::FdRead { userdata, fd }
+            | PollSubscription::FdWrite { userdata, fd } => {
+                let event_type = match subscription {
+                    PollSubscription::FdRead { .. } => et::FD_READ,
+                    PollSubscription::FdWrite { .. } => et::FD_WRITE,
+                    _ => unreachable!(),
                 };
-                let Some(entry) = entry_opt else {
-                    events.push(build_event(userdata, EBADF as u16, tag, 0, 0));
+                let entry = kernel
+                    .fds(pid)
+                    .ok()
+                    .and_then(|table| table.get(fd).copied());
+                let Some(entry) = entry else {
+                    events.push(build_event(userdata, EBADF as u16, event_type, 0, 0));
                     continue;
                 };
-                let (ready, nbytes, rwflags, err_opt) =
-                    fd_readiness(kernel, pid, &entry, tag == et::FD_READ);
-                if let Some(errno_code) = err_opt {
-                    events.push(build_event(userdata, errno_code as u16, tag, 0, 0));
+                let (ready, nbytes, rwflags, error) =
+                    fd_readiness(kernel, pid, &entry, event_type == et::FD_READ);
+                if let Some(errno) = error {
+                    events.push(build_event(userdata, errno as u16, event_type, 0, 0));
                 } else if ready {
-                    events.push(build_event(userdata, 0, tag, nbytes, rwflags));
+                    events.push(build_event(userdata, 0, event_type, nbytes, rwflags));
                 }
             }
-            _ => {
-                events.push(build_event(userdata, EINVAL as u16, tag, 0, 0));
-            }
+            PollSubscription::Error {
+                userdata,
+                event_type,
+                errno,
+            } => events.push(build_event(userdata, errno, event_type, 0, 0)),
         }
     }
+    events
+}
 
-    // Write events sequentially starting at `heap_ptr + 0`,
-    // overwriting the subscription window (which is no longer live
-    // because `subs` holds the copy). The caller's shim reads the
-    // events straight out of the same heap region.
-    let n_events = events.len();
-    for (i, e) in events.iter().enumerate() {
-        let start = heap_ptr + i * pl::EVENT_SIZE;
-        let end = start + pl::EVENT_SIZE;
-        heap[start..end].copy_from_slice(e);
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn write_poll_events(heap: &mut [u8], heap_ptr: usize, events: &[[u8; pl::EVENT_SIZE]]) {
+    for (index, event) in events.iter().enumerate() {
+        let start = heap_ptr + index * pl::EVENT_SIZE;
+        heap[start..start + pl::EVENT_SIZE].copy_from_slice(event);
+    }
+}
+
+fn poll_response(request_id: u32, event_count: usize) -> Response {
+    Response {
+        request_id,
+        status: 0,
+        value: event_count as i64,
+        extra_len: (event_count * pl::EVENT_SIZE) as u32,
+        _pad: [0u8; 12],
+    }
+}
+
+impl Kernel {
+    /// Register one normalized poll set and transition the caller to the
+    /// syscall-blocked state. The caller performs its readiness check directly
+    /// before this call, so check + registration are one indivisible kernel
+    /// Worker operation.
+    pub fn park_on_poll(&mut self, pid: Pid, parker: PollParker) -> Result<(), KernelError> {
+        if self.parked_polls.contains_key(&pid) {
+            return Err(KernelError::WouldBlock);
+        }
+        if parker.subscriptions.is_empty()
+            || parker.subscriptions.len() > parker.admission_class.per_call_limit()
+            || parker.event_cap == 0
+            || parker.event_cap > parker.admission_class.per_call_limit()
+        {
+            return Err(KernelError::InvalidArgument);
+        }
+        if self.poll_admission_class(pid)? != parker.admission_class {
+            return Err(KernelError::InvalidArgument);
+        }
+        let admitted = self
+            .parked_poll_subscriptions
+            .checked_add(parker.subscriptions.len())
+            .ok_or(KernelError::WouldBlock)?;
+        if admitted > POLL_GLOBAL_SUBSCRIPTION_LIMIT {
+            return Err(KernelError::WouldBlock);
+        }
+        let charge = parker.subscriptions.len();
+        let (class_admitted, class_limit) = match parker.admission_class {
+            PollAdmissionClass::Ordinary => (
+                self.parked_poll_ordinary_subscriptions.checked_add(charge),
+                POLL_ORDINARY_GLOBAL_SUBSCRIPTION_LIMIT,
+            ),
+            PollAdmissionClass::DisplayServer => (
+                self.parked_poll_display_subscriptions.checked_add(charge),
+                POLL_DISPLAY_GLOBAL_SUBSCRIPTION_LIMIT,
+            ),
+            PollAdmissionClass::Shell => (
+                self.parked_poll_shell_subscriptions.checked_add(charge),
+                POLL_SHELL_GLOBAL_SUBSCRIPTION_LIMIT,
+            ),
+        };
+        let class_admitted = class_admitted.ok_or(KernelError::WouldBlock)?;
+        if class_admitted > class_limit {
+            return Err(KernelError::WouldBlock);
+        }
+        let request_id = parker.req_id;
+        match parker.admission_class {
+            PollAdmissionClass::Ordinary => {
+                self.parked_poll_ordinary_subscriptions = class_admitted
+            }
+            PollAdmissionClass::DisplayServer => {
+                self.parked_poll_display_subscriptions = class_admitted
+            }
+            PollAdmissionClass::Shell => self.parked_poll_shell_subscriptions = class_admitted,
+        }
+        self.parked_polls.insert(pid, parker);
+        self.parked_poll_subscriptions = admitted;
+        self.procs
+            .transition(pid, crate::proc::ProcState::BlockedOnSyscall)
+            .map_err(|_| {
+                self.take_parked_poll(pid);
+                KernelError::NoSuchPid
+            })?;
+        self.procs
+            .set_block_reason(pid, crate::proc::BlockReason::Syscall { request_id });
+        Ok(())
     }
 
-    Response {
-        request_id: req.request_id,
-        status: 0,
-        value: n_events as i64,
-        extra_len: (n_events * pl::EVENT_SIZE) as u32,
-        _pad: [0u8; 12],
+    /// Re-check every parked poll set against current kernel state and queue a
+    /// normal delayed response for each set with at least one ready event.
+    /// The scan is bounded by [`POLL_GLOBAL_SUBSCRIPTION_LIMIT`].
+    pub fn service_poll_waiters(&mut self) -> usize {
+        let monotonic_now = platform::current().now_ns();
+        let realtime_now = platform::current().now_realtime_ns();
+        self.service_poll_waiters_at(monotonic_now, realtime_now)
+    }
+
+    /// Deterministic-clock form used by isolation tests and the production
+    /// wrapper above.
+    #[doc(hidden)]
+    pub fn service_poll_waiters_at(&mut self, monotonic_now: u64, realtime_now: u64) -> usize {
+        let pids: Vec<Pid> = self.parked_polls.keys().copied().collect();
+        let mut woken = 0;
+        for pid in pids {
+            let Some(parker) = self.parked_polls.get(&pid).cloned() else {
+                continue;
+            };
+            let events = ready_poll_events(
+                self,
+                pid,
+                &parker.subscriptions,
+                parker.event_cap,
+                monotonic_now,
+                realtime_now,
+            );
+            if events.is_empty() {
+                continue;
+            }
+            self.take_parked_poll(pid);
+            if self
+                .procs
+                .transition(pid, crate::proc::ProcState::Ready)
+                .is_err()
+            {
+                continue;
+            }
+            self.procs.clear_block_reason(pid);
+            let mut bytes = Vec::with_capacity(events.len() * pl::EVENT_SIZE);
+            for event in &events {
+                bytes.extend_from_slice(event);
+            }
+            let response = poll_response(parker.req_id, events.len());
+            self.pending_wakes.push((
+                pid,
+                response,
+                Some(PendingHeap {
+                    heap_ptr: parker.heap_ptr,
+                    bytes,
+                }),
+            ));
+            woken += 1;
+        }
+        woken
+    }
+
+    /// Duration until the nearest parked clock subscription, or `None` when
+    /// every parked set is fd-only. A ready clock returns zero.
+    pub fn next_poll_timeout_ns(&self) -> Option<u64> {
+        let monotonic_now = platform::current().now_ns();
+        let realtime_now = platform::current().now_realtime_ns();
+        self.next_poll_timeout_ns_at(monotonic_now, realtime_now)
+    }
+
+    #[doc(hidden)]
+    pub fn next_poll_timeout_ns_at(&self, monotonic_now: u64, realtime_now: u64) -> Option<u64> {
+        self.parked_polls
+            .values()
+            .flat_map(|parker| parker.subscriptions.iter())
+            .filter_map(|subscription| match *subscription {
+                PollSubscription::Clock {
+                    clock, deadline_ns, ..
+                } => {
+                    let now = match clock {
+                        PollClock::Monotonic => monotonic_now,
+                        PollClock::Realtime => realtime_now,
+                    };
+                    Some(deadline_ns.saturating_sub(now))
+                }
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Interrupt a parked poll with `EINTR`. Used for the same catchable
+    /// signals that interrupt the kernel's other blocking operations.
+    pub fn interrupt_parked_poll(&mut self, pid: Pid) -> bool {
+        let Some(parker) = self.take_parked_poll(pid) else {
+            return false;
+        };
+        self.pending_wakes
+            .push((pid, Response::err(parker.req_id, abi::errno::EINTR), None));
+        let _ = self.procs.transition(pid, crate::proc::ProcState::Ready);
+        self.procs.clear_block_reason(pid);
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn parked_polls_contains(&self, pid: Pid) -> bool {
+        self.parked_polls.contains_key(&pid)
+    }
+
+    #[doc(hidden)]
+    pub fn parked_poll_subscription_count(&self) -> usize {
+        self.parked_poll_subscriptions
     }
 }

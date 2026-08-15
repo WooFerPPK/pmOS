@@ -16,8 +16,8 @@
 //! the two apart — and shouldn't need to.
 
 use abi::errno::{
-    self, EACCES, EAGAIN, EBADF, ECONNREFUSED, EEXIST, EINVAL, EIO, EISDIR, EMFILE, ENODEV,
-    ENOENT, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, ENOTSUP, EROFS, ESRCH,
+    self, EACCES, EAGAIN, EBADF, ECONNREFUSED, EEXIST, EINVAL, EIO, EISDIR, EMFILE, ENODEV, ENOENT,
+    ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, ENOTSUP, EROFS, ESRCH,
 };
 use abi::ext::{is_ext, Pid};
 use abi::ring::{Request, Response};
@@ -104,19 +104,73 @@ impl<'k> Dispatcher<'k> {
 /// assert that a given request shape produces a given response
 /// shape. [`Dispatcher::service_one`] wraps this with the ring
 /// pop/push pair.
-pub fn dispatch(
-    kernel: &mut Kernel,
-    pid: Pid,
-    req: &Request,
-    heap: &mut [u8],
-) -> ServiceOutcome {
-    if is_wasi(req.opcode) {
-        ServiceOutcome::Done(super::wasi::dispatch_wasi(kernel, pid, req, heap))
+pub fn dispatch(kernel: &mut Kernel, pid: Pid, req: &Request, heap: &mut [u8]) -> ServiceOutcome {
+    let outcome = if is_wasi(req.opcode) {
+        super::wasi::dispatch_wasi(kernel, pid, req, heap)
     } else if is_ext(req.opcode) {
         super::ext::dispatch_ext(kernel, pid, req, heap)
     } else {
         ServiceOutcome::Done(Response::err(req.request_id, ENOSYS))
+    };
+    // Re-scan only after calls that can mutate poll-visible state. Host-side
+    // input/file completions have their own explicit hooks, and the Worker
+    // performs a final double-check before parking. This avoids charging
+    // read-only clock/stat/capability syscalls for a global readiness scan.
+    if syscall_may_change_poll_readiness(req.opcode) {
+        kernel.service_poll_waiters();
     }
+    outcome
+}
+
+/// Whether servicing `opcode` can change readiness observed by a process
+/// other than the caller (or must close poll registration's no-lost-wake
+/// window). Keep this deliberately conservative: a false positive costs one
+/// bounded scan, while a false negative can strand a parked process until the
+/// next host event or timer deadline.
+fn syscall_may_change_poll_readiness(opcode: u16) -> bool {
+    use abi::ext;
+    use abi::wasi;
+
+    matches!(
+        opcode,
+        wasi::FD_ALLOCATE
+            | wasi::FD_CLOSE
+            | wasi::FD_FILESTAT_SET_SIZE
+            | wasi::FD_FILESTAT_SET_TIMES
+            | wasi::FD_PWRITE
+            | wasi::FD_READ
+            | wasi::FD_RENUMBER
+            | wasi::FD_WRITE
+            | wasi::PATH_CREATE_DIRECTORY
+            | wasi::PATH_FILESTAT_SET_TIMES
+            | wasi::PATH_LINK
+            | wasi::PATH_OPEN
+            | wasi::PATH_REMOVE_DIRECTORY
+            | wasi::PATH_RENAME
+            | wasi::PATH_SYMLINK
+            | wasi::PATH_UNLINK_FILE
+            | wasi::POLL_ONEOFF
+            | wasi::PROC_EXIT
+            | wasi::PROC_RAISE
+            | wasi::SOCK_ACCEPT
+            | wasi::SOCK_RECV
+            | wasi::SOCK_SEND
+            | wasi::SOCK_SHUTDOWN
+            | ext::IPC_BIND
+            | ext::IPC_LISTEN
+            | ext::IPC_CONNECT
+            | ext::IPC_ACCEPT
+            | ext::IPC_SEND
+            | ext::IPC_RECV
+            | ext::PROC_KILL
+            | ext::DISPLAY_CONNECT
+            | ext::DISPLAY_BIND
+            | ext::MOUNT
+            | ext::UMOUNT
+            | ext::FS_CHMOD
+            | ext::HOST_FILE_RECV
+            | ext::HOST_FILE_SEND
+    )
 }
 
 // ---- shared decoding helpers -------------------------------------------
@@ -219,12 +273,17 @@ pub fn kerr_to_errno(err: KernelError) -> i32 {
         KernelError::NoSuchPid => ESRCH,
         KernelError::BadFd => EBADF,
         KernelError::OutOfFds => EMFILE,
+        KernelError::ProcessLimit => EAGAIN,
         KernelError::NotSupportedOnFd => EINVAL,
+        KernelError::UnsupportedAncillary => ENOTSUP,
+        KernelError::UnsupportedSocketType => ENOTSUP,
         KernelError::InvalidArgument => EINVAL,
+        KernelError::FileTooLarge => errno::EFBIG,
         KernelError::NotCapable => errno::ENOTCAPABLE,
         KernelError::WouldBlock => EAGAIN,
         KernelError::ConnectionRefused => ECONNREFUSED,
         KernelError::AddressInUse => errno::EADDRINUSE,
+        KernelError::ResourceLimit => errno::ENOSPC,
         KernelError::PipeBroken => errno::EPIPE,
         KernelError::Fs(fs_err) => fs_err_to_errno(fs_err),
         KernelError::Dev(dev_err) => dev_err_to_errno(dev_err),

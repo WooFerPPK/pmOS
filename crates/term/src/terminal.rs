@@ -14,12 +14,18 @@
 //! decoding and splits on `\n` into scrollback lines — the
 //! same behaviour as the TS-side `Terminal.appendOutput`.
 
+use std::collections::VecDeque;
+
 use sh::{Shell, ShellOutput};
 
 /// Default number of scrollback lines kept before old ones
 /// fall off the top. The `term` bin driver can override this
 /// via [`TerminalOptions::max_lines`].
 pub const DEFAULT_MAX_LINES: usize = 512;
+/// Maximum bytes retained for one unterminated streaming output line. Longer
+/// streams are published as bounded visual chunks so a child cannot grow the
+/// terminal Worker indefinitely while withholding `\n`.
+pub const MAX_PENDING_OUTPUT_BYTES: usize = 16 * 1024;
 
 /// One rendered line in the scrollback buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,11 +125,28 @@ pub enum KeyFeedResult {
     },
 }
 
+/// Completed command returned by an out-of-process shell session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandRunResult {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub status: i32,
+    pub exited: bool,
+}
+
+/// Command transport used by the production terminal.
+///
+/// Native state-machine tests keep using the embedded [`Shell`]; PMos uses a
+/// persistent, isolated `/bin/sh` Worker connected through kernel pipes.
+pub trait CommandRunner {
+    fn run_command(&mut self, line: &str) -> CommandRunResult;
+}
+
 /// The terminal state machine.
 pub struct Terminal {
     max_lines: usize,
     prompt: String,
-    lines: Vec<TerminalLine>,
+    lines: VecDeque<TerminalLine>,
     input_buffer: String,
     /// Streaming partial-line buffer used by
     /// [`Terminal::append_output`]. Shell output bypasses this
@@ -145,7 +168,7 @@ impl Terminal {
         let mut term = Terminal {
             max_lines: options.max_lines,
             prompt: options.prompt,
-            lines: Vec::new(),
+            lines: VecDeque::new(),
             input_buffer: String::new(),
             pending_output: Vec::new(),
             shell: Shell::new(),
@@ -197,7 +220,7 @@ impl Terminal {
     /// Frozen view of the terminal suitable for rendering.
     pub fn snapshot(&self) -> TerminalSnapshot {
         TerminalSnapshot {
-            lines: self.lines.clone(),
+            lines: self.lines.iter().cloned().collect(),
             input_buffer: self.input_buffer.clone(),
             prompt: self.prompt.clone(),
         }
@@ -232,6 +255,23 @@ impl Terminal {
         }
     }
 
+    /// Consume a key using an isolated command runner on Enter.
+    ///
+    /// Editing behaviour is identical to [`Terminal::feed_key`]. Only the
+    /// committed-line evaluator changes, so production can keep shell state
+    /// in one persistent child process without weakening native isolation
+    /// tests for the terminal state machine.
+    pub fn feed_key_with_runner(
+        &mut self,
+        key: Key,
+        runner: &mut dyn CommandRunner,
+    ) -> KeyFeedResult {
+        match key {
+            Key::Enter => self.commit_line_with_runner(runner),
+            other => self.feed_key(other),
+        }
+    }
+
     /// Append raw output bytes from an external streaming
     /// source. Bytes are decoded as lossy UTF-8 and split on
     /// `\n` into [`LineKind::Output`] entries. Partial lines
@@ -239,12 +279,51 @@ impl Terminal {
     /// a later call completes them.
     pub fn append_output(&mut self, bytes: &[u8]) {
         self.pending_output.extend_from_slice(bytes);
-        while let Some(pos) = self.pending_output.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.pending_output.drain(..=pos).collect();
+        let mut start = 0;
+        let mut completed = VecDeque::new();
+        for (index, byte) in self.pending_output.iter().copied().enumerate() {
+            if byte != b'\n' {
+                continue;
+            }
+            if completed.len() == self.max_lines {
+                completed.pop_front();
+            }
+            completed.push_back((start, index));
+            start = index + 1;
+        }
+        for (line_start, line_end) in completed {
             let text =
-                String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]).into_owned();
+                String::from_utf8_lossy(&self.pending_output[line_start..line_end]).into_owned();
             self.push_line(TerminalLine {
                 text,
+                kind: LineKind::Output,
+            });
+        }
+        if start > 0 {
+            self.pending_output.drain(..start);
+        }
+        self.flush_overlong_pending_output();
+    }
+
+    /// Commit the current input line without synchronously evaluating it.
+    /// The production terminal uses this before handing the command to its
+    /// stepwise child-shell transport.
+    pub fn begin_external_command(&mut self) -> String {
+        let line = std::mem::take(&mut self.input_buffer);
+        self.push_input_line(&line);
+        line
+    }
+
+    /// Flush a final unterminated streaming line when the child reports its
+    /// prompt marker or exits.
+    pub fn finish_external_output(&mut self) {
+        if self.pending_output.is_empty() {
+            return;
+        }
+        let bytes = core::mem::take(&mut self.pending_output);
+        for chunk in bytes.chunks(MAX_PENDING_OUTPUT_BYTES) {
+            self.push_line(TerminalLine {
+                text: String::from_utf8_lossy(chunk).into_owned(),
                 kind: LineKind::Output,
             });
         }
@@ -264,32 +343,49 @@ impl Terminal {
     fn commit_line(&mut self) -> KeyFeedResult {
         let line = std::mem::take(&mut self.input_buffer);
 
+        let output = self.shell.eval(&line);
+        let exited = self.shell.has_exited();
+        self.finish_commit(line, output, exited)
+    }
+
+    fn commit_line_with_runner(&mut self, runner: &mut dyn CommandRunner) -> KeyFeedResult {
+        let line = std::mem::take(&mut self.input_buffer);
+        let result = runner.run_command(&line);
+        let output = ShellOutput {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_code: result.exited.then_some(result.status),
+        };
+        self.finish_commit(line, output, result.exited)
+    }
+
+    fn finish_commit(&mut self, line: String, output: ShellOutput, exited: bool) -> KeyFeedResult {
         // Push the typed line into scrollback, prefixed with
         // the prompt, so the user can scroll back and see
         // what they ran.
-        let mut display = String::with_capacity(self.prompt.len() + line.len());
-        display.push_str(&self.prompt);
-        display.push_str(&line);
-        self.push_line(TerminalLine {
-            text: display,
-            kind: LineKind::Input,
-        });
+        self.push_input_line(&line);
 
-        // Evaluate the line through the embedded shell. The
-        // `exit` builtin flips the shell's exit flag.
-        let output = self.shell.eval(&line);
         if !output.stdout.is_empty() {
             self.push_bytes_as_lines(&output.stdout, LineKind::Output);
         }
         if !output.stderr.is_empty() {
             self.push_bytes_as_lines(&output.stderr, LineKind::Error);
         }
-        let exited = self.shell.has_exited();
         KeyFeedResult::Committed {
             line,
             output,
             exited,
         }
+    }
+
+    fn push_input_line(&mut self, line: &str) {
+        let mut display = String::with_capacity(self.prompt.len() + line.len());
+        display.push_str(&self.prompt);
+        display.push_str(line);
+        self.push_line(TerminalLine {
+            text: display,
+            kind: LineKind::Input,
+        });
     }
 
     /// Split `bytes` on `\n` and push each piece as a
@@ -317,9 +413,29 @@ impl Terminal {
     }
 
     fn push_line(&mut self, line: TerminalLine) {
-        self.lines.push(line);
+        self.lines.push_back(line);
         while self.lines.len() > self.max_lines {
-            self.lines.remove(0);
+            self.lines.pop_front();
+        }
+    }
+
+    fn flush_overlong_pending_output(&mut self) {
+        if self.pending_output.len() <= MAX_PENDING_OUTPUT_BYTES {
+            return;
+        }
+        let complete_bytes =
+            (self.pending_output.len() - 1) / MAX_PENDING_OUTPUT_BYTES * MAX_PENDING_OUTPUT_BYTES;
+        let tail = self.pending_output.split_off(complete_bytes);
+        let complete = core::mem::replace(&mut self.pending_output, tail);
+        let skip_chunks = complete
+            .len()
+            .div_ceil(MAX_PENDING_OUTPUT_BYTES)
+            .saturating_sub(self.max_lines);
+        for chunk in complete.chunks(MAX_PENDING_OUTPUT_BYTES).skip(skip_chunks) {
+            self.push_line(TerminalLine {
+                text: String::from_utf8_lossy(chunk).into_owned(),
+                kind: LineKind::Output,
+            });
         }
     }
 }

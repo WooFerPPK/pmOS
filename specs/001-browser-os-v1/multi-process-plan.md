@@ -146,8 +146,10 @@ calls `new Worker(…)`. Instead, when `Kernel::proc_spawn` succeeds,
 the WasmPlatform's `pmos_host_spawn_process` host call triggers
 `onSpawnProcess`, which posts a `proc:spawn` message to the main
 thread. The main thread creates the user Worker, allocates the SAB,
-hands everything to the new Worker, and informs the kernel Worker of
-the new (pid → SAB) pair via `proc:sab`.
+hands everything to the new Worker, and waits for a `booted`
+acknowledgement before informing the kernel Worker of the new
+(pid → SAB) pair via `proc:sab`. A construction/boot failure is
+returned as `proc:exited` so the tentative kernel pid is reconciled.
 
 **Alternatives considered**:
 
@@ -173,15 +175,21 @@ the new (pid → SAB) pair via `proc:sab`.
 already an asynchronous callback boundary — the kernel gets back a
 `SpawnOutcome` synchronously and the actual Worker doesn't need to be
 alive yet. The kernel polls the new pid's SAB after the handler
-returns; if main hasn't finished setting up the Worker yet, the first
-polls see empty rings and move on. No new synchronisation is needed.
+returns; the kernel does not poll the pid until main receives the
+Worker's `booted` acknowledgement and publishes `proc:sab`.
 
 **Worker death**: user Worker emits `exit` message (normal path) or
 the main thread observes an `error` event (trap / script error). In
 both cases main posts `proc:exited(pid, code)` to the kernel Worker,
 which routes it to `Kernel::proc_exit(pid, ExitStatus)` and the
-process-table reaper. Main then calls `worker.terminate()` and drops
+process-table reaper. Reconciliation is idempotent when the process
+already called `proc_exit`. Main then calls `worker.terminate()` and drops
 the entry. The SAB itself is GC'd when all references die.
+
+For SIGKILL, the kernel publishes `proc:terminate(pid, 9)` after the
+authoritative terminal transition. Main terminates and drops the
+Worker route, then sends the same idempotent `proc:exited` teardown
+acknowledgement.
 
 **Kernel Worker death**: the existing `panic` channel handles the
 display side. New addition: before loading the overlay and reloading,
@@ -209,7 +217,8 @@ is 1 under normal load and 510 is 508-slot safety margin.
 `proc:spawn` receipt time. The `SharedArrayBuffer` is then posted to:
 
 - the new user Worker as `{kind: "boot", pid, sab, wasmBytes}`,
-- the kernel Worker as `{kind: "proc:sab", pid, sab}`.
+- after the user Worker replies `booted`, the kernel Worker as
+  `{kind: "proc:sab", pid, sab}`.
 
 After that both ends speak to it directly via `Int32Array` /
 `Uint8Array` views and atomic operations.
@@ -236,15 +245,14 @@ kernel Worker.
 **Decision**: a separate dedicated 32-byte "kernel-wake SAB" held by
 the kernel Worker, allocated at boot, shared with main and every user
 Worker. Every notifier does `Atomics.add(wakeSlot, 0, 1); Atomics.
-notify(wakeSlot, 0)`. The kernel Worker's main loop does
-`Atomics.wait(wakeSlot, 0, last_value, timeout_ms)`. When it wakes,
-it scans every live pid's request ring and main-thread message queue,
-services a batch, then waits again.
-
-**Timeout value**: 50 ms. Chosen so that even if a notify is lost
-(which Atomics.notify under contention cannot technically lose, but
-belt-and-suspenders), syscall latency stays within the Principle IX
-input budget. Tunable; the perf harness (T220) will measure.
+notify(wakeSlot, 0)`. The kernel Worker's main loop snapshots that
+counter before scanning and then uses `Atomics.waitAsync` against the
+snapshot. Fd-only waits have no timeout; a `poll_oneoff` clock supplies
+the nearest real deadline. Every external-work publisher increments the
+counter before notifying, so a notifier racing the scan makes the wait
+return `not-equal` instead of requiring a periodic recovery timeout. When
+the Worker wakes, it scans every live pid's request ring and services a
+bounded batch before waiting again.
 
 ## 3. Syscall marshaling
 
@@ -263,8 +271,9 @@ changes is which `KernelBackend` the Worker entry instantiates:
   `host.dispatch(pid, request, heapIn)` synchronously.
 - **user Worker runtime path (new)**: `SabBackend` — writes the
   request into the SAB, copies `heapIn` into the heap scratch
-  region, parks on `Atomics.wait(userWaitSlot, REQUESTED)`, wakes on
-  `READY`, reads the response + heap scratch, returns.
+  region, waits in a response-ring condition loop around
+  `Atomics.wait(userWaitSlot, REQUESTED)`, reads the response + heap
+  scratch, and returns.
 
 **Wire format on the SAB** (unchanged from `abi::ring`):
 
@@ -284,12 +293,18 @@ changes is which `KernelBackend` the Worker entry instantiates:
    one; drop-on-full is not allowed.
 2. User sets `user_wait_slot = REQUESTED`.
 3. User bumps the shared `kernel_wake_slot` + Atomics.notify.
-4. User `Atomics.wait(user_wait_slot, REQUESTED)`.
+4. While the response ring is empty, user resets
+   `user_wait_slot = REQUESTED`, re-checks the response ring, then
+   calls `Atomics.wait(user_wait_slot, REQUESTED)`. A wake with an
+   empty response ring is stale and the loop waits again.
 5. Kernel Worker wakes on the shared wake slot, polls this pid's
    ring, pops request, services via `Dispatcher::service_one`,
    `Sab::try_push_response`, sets `user_wait_slot = READY`,
    `Atomics.notify(user_wait_slot)`.
-6. User wakes, reads response + heap scratch, continues.
+6. User observes the non-empty response ring, reads response + heap
+   scratch, and continues. The ring predicate is authoritative because
+   the reused wait slot can receive the preceding syscall's delayed
+   notification after the next syscall has started waiting.
 
 **Wasm's synchronous view is preserved**: `Atomics.wait` inside a
 Worker blocks that Worker's thread. From the user wasm's point of
@@ -312,15 +327,20 @@ kernel Worker boot:
   kernel_init()
   pidMap = new Map<pid, SharedArrayBuffer>()
   wakeSlot = shared 32-byte SAB (provided in the boot message)
-  forever:
-    Atomics.wait(wakeSlot, 0, lastValue, 50)
-    drain port messages (inject_input_kbd, inject_input_mouse, inject_console_input, proc:sab, proc:exited, halt)
+  until halted:
+    observedWake = Atomics.load(wakeSlot, 0)
     for pid in pidMap (round-robin):
       budget = 8
       while budget-- > 0:
-        rc = kernel_service_sab(pid, sabPtr, sabLen, scratchPtr, scratchLen)
+        rc = serviceSab(pid, sab)
         if rc == 1: break (ring empty)
         if rc < 0: post panic (corrupt ring) and break
+    service expired poll_oneoff deadlines
+    if no request or poll wake was serviced:
+      timeout = nearest poll deadline, or undefined for fd-only waits
+      await Atomics.waitAsync(wakeSlot, 0, observedWake, timeout)
+    after four passes:
+      await reusableMessageChannelTask()
 ```
 
 **Round-robin budget**: per-loop-iteration cap of 8 requests per pid
@@ -341,10 +361,19 @@ kernel's existing dispatcher is unchanged.
 `injectInput` messages today. Multi-process adds `proc:sab` (register a
 new SAB) and `proc:exited` (retire a pid) handlers. `halt` remains.
 
-**Yielding between batches**: the `Atomics.wait` with 50 ms timeout is
-the yield. When all rings are empty and no main-thread message is
-pending, the Worker parks on the wake slot and uses zero CPU until
-somebody notifies.
+**Yielding between batches**: when all rings are empty, the Worker parks on
+the wake slot with the pre-scan wake epoch. Fd-only waits are indefinite;
+clock-backed `poll_oneoff` waits use the nearest kernel deadline. A separate
+bounded fairness rule applies to every dispatch pass: after four round-robin
+passes the loop awaits a reusable `MessageChannel` delivery before resuming.
+The channel is scoped to one loop invocation and both ports close when the
+loop exits. The bound includes continuously busy rings and repeated idle scans
+whose `Atomics.waitAsync` resolves synchronously with `not-equal`. A
+promise/microtask-only yield is insufficient because `proc:sab`,
+`proc:exited`, input, and host-transfer deliveries are Worker message tasks.
+The MessageChannel yield gives other queued tasks an opportunity to run even
+when display or application processes continuously refill their SAB rings or
+the wake epoch races every park attempt.
 
 ## 5. Driver routing across threads
 
@@ -367,9 +396,10 @@ on `/dev/input_kbd` still returns `EAGAIN` when no bytes are queued,
 because that is how the kernel's DeviceDispatcher works in v1. The
 user Worker either spins with backoff (fine for short waits) or uses
 a future blocking read syscall (not in this milestone). The v1 term
-binary — which is the primary consumer of keyboard input — already
-has the right shape: a main loop that polls stdin. Polling on a
-dedicated Worker with yield-via-`setTimeout(0)` is acceptable.
+binary — which is the primary consumer of keyboard input — folds its
+nonblocking streams into the display/pipeline wait set. Kernel-side
+`poll_oneoff` waits park on the shared wake epoch; dispatcher task fairness
+uses the reusable `MessageChannel` path described above rather than timers.
 
 **User → main (direct)**: not allowed. User wasm goes through the
 kernel; there is no user-Worker-to-main postMessage channel. This is
@@ -390,7 +420,8 @@ multiplexes clients.
 - **`onSpawnProcess` default callback** posts `proc:spawn` to the main
   thread and returns the new pid. No in-process wasm execution.
 - **Main thread** receives `proc:spawn`, allocates SAB, creates user
-  Worker, posts boot message to it. Posts `proc:sab` to kernel.
+  Worker, and posts boot. It publishes `proc:sab` only after the
+  Worker's `booted` acknowledgement.
 - **Kernel Worker** starts polling the new pid's SAB on its next wake.
 - **Kernel Worker's main loop** runs until `shouldHalt` — triggered
   when all spawned pids have exited and init has exited. Then
@@ -417,22 +448,32 @@ user pids), where N = the deepest live process tree at any moment.
 
 - Worker created at `proc:spawn` on main thread.
 - SAB + wasm bytes + pid sent to Worker as `boot` message.
+- Worker installs its SAB backend and replies `booted`; main then
+  publishes `proc:sab` to the kernel Worker.
 - Worker runs `UserWasmRuntime` against `SabBackend`.
-- Worker terminates itself after `proc_exit` by posting `exited` and
-  calling `close()`.
+- Worker posts `exited` after return, `proc_exit`, or trap; main owns
+  termination and route removal.
 - On Worker `error` event, main treats it as a trap, posts
   `proc:exited(pid, -1)` to kernel, then `worker.terminate()`.
+- On kernel `proc:terminate` (SIGKILL), main terminates the Worker and
+  posts an idempotent `proc:exited` acknowledgement.
 
 ## 7. Error handling
 
 **User wasm panic / trap**: JS side observes the thrown `RuntimeError`
 in `UserWasmRuntime.start()`. The user Worker posts `{kind: "exited",
 pid, code: -1, trap: errorMsg}` to main and closes. Main reports
-`proc:exited` to the kernel Worker. Kernel reaps.
+`proc:exited` to the kernel Worker. The kernel performs the exit once,
+wakes/reaps a matching parked parent, and ignores duplicate callbacks.
 
 **User Worker script error** (broken bundle, etc.): main sees the
 `error` event on the Worker object. Same treatment: `proc:exited(pid,
 -1)`, terminate, reap.
+
+**Worker construction / boot failure**: main terminates any partially
+created Worker and posts `proc:exited` without ever publishing
+`proc:sab`. The kernel reconciles the Ready pid, so its dispatch loop
+does not wait forever for a route that can never appear.
 
 **`proc_exit(code)` call**: `UserWasmRuntime` catches the
 `UserProcessExited` unwind sentinel, posts `{kind: "exited", pid,
@@ -476,7 +517,8 @@ failure in the kernel Worker panics the Worker → existing panic path.
   captures `postMessage` and exposes a `receiveMessage` trigger, used
   to drive the `bootstrap.ts` spawn choreography without a real
   Worker. Asserts on message ordering: `proc:spawn` → allocate SAB
-  → `boot` message to Worker → `proc:sab` to kernel.
+  → `boot` message to Worker → `booted` acknowledgement → `proc:sab`
+  to kernel, plus rollback and SIGKILL termination cases.
 
 **Playwright integration coverage** (only where vitest cannot reach):
 

@@ -27,7 +27,9 @@ use toolkit::protocol::MemoryConnection;
 use toolkit::widget::frame::{
     BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE, TITLEBAR_HEIGHT,
 };
-use toolkit::{App, DecoratedPointerOutcome, DecoratedWindow, HEADER_SIZE, MessageHeader, ObjectId};
+use toolkit::{
+    App, DecoratedPointerOutcome, DecoratedWindow, MessageHeader, ObjectId, HEADER_SIZE,
+};
 
 /// The toolkit's id allocator hands the registry id out
 /// first: `get_registry` always lands at raw id 3.
@@ -44,8 +46,7 @@ fn build_global_event(name: u32, interface: &str, version: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     event.encode(&mut payload);
     let mut out = vec![0u8; HEADER_SIZE + payload.len()];
-    let header =
-        MessageHeader::try_new(REGISTRY_ID, 1 /* global */, payload.len(), 0).unwrap();
+    let header = MessageHeader::try_new(REGISTRY_ID, 1 /* global */, payload.len(), 0).unwrap();
     header.encode(&mut out[..HEADER_SIZE]).unwrap();
     out[HEADER_SIZE..].copy_from_slice(&payload);
     out
@@ -165,8 +166,9 @@ fn resize_re_anchors_the_close_button_to_new_top_right() {
     let cb_b = dw.frame().close_button_rect();
     // After resize, the close button should sit ~CLOSE_BUTTON_MARGIN
     // from the right edge of the new bounds (400).
-    let expected_x =
-        bounds_b.x + (bounds_b.width as i32) - (CLOSE_BUTTON_MARGIN as i32) - (CLOSE_BUTTON_SIZE as i32);
+    let expected_x = bounds_b.x + (bounds_b.width as i32)
+        - (CLOSE_BUTTON_MARGIN as i32)
+        - (CLOSE_BUTTON_SIZE as i32);
     assert_eq!(cb_b.x, expected_x);
     assert_eq!(cb_b.width, CLOSE_BUTTON_SIZE);
 }
@@ -275,7 +277,10 @@ fn bottom_left_corner_click_returns_resize_edge_bottom_left() {
     let cx = bounds.x + 1;
     let cy = bounds.bottom() - 1;
     let outcome = dw.handle_pointer_down(cx, cy);
-    assert_eq!(outcome, DecoratedPointerOutcome::ResizeEdge(edge::BOTTOM_LEFT));
+    assert_eq!(
+        outcome,
+        DecoratedPointerOutcome::ResizeEdge(edge::BOTTOM_LEFT)
+    );
 }
 
 #[test]
@@ -287,7 +292,10 @@ fn bottom_right_corner_click_returns_resize_edge_bottom_right() {
     let cx = bounds.right() - 1;
     let cy = bounds.bottom() - 1;
     let outcome = dw.handle_pointer_down(cx, cy);
-    assert_eq!(outcome, DecoratedPointerOutcome::ResizeEdge(edge::BOTTOM_RIGHT));
+    assert_eq!(
+        outcome,
+        DecoratedPointerOutcome::ResizeEdge(edge::BOTTOM_RIGHT)
+    );
 }
 
 #[test]
@@ -345,5 +353,6 @@ fn request_resize_forwards_to_window_no_panic() {
     let mut app = build_app();
     let bounds = Rect::new(0, 0, 200, 100);
     let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
-    dw.request_resize(99, edge::BOTTOM_RIGHT).expect("request_resize");
+    dw.request_resize(99, edge::BOTTOM_RIGHT)
+        .expect("request_resize");
 }

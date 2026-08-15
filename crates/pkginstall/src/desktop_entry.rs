@@ -39,9 +39,7 @@ fn main() -> ExitCode {
         }
     }
     let Some(manifest_path) = manifest_path else {
-        eprintln!(
-            "usage: pkginstall-desktop-entry [--app-dir DIR] <path/to/manifest.toml>"
-        );
+        eprintln!("usage: pkginstall-desktop-entry [--app-dir DIR] <path/to/manifest.toml>");
         return ExitCode::from(2);
     };
     match run(&manifest_path, &app_dir) {
@@ -57,14 +55,14 @@ fn main() -> ExitCode {
 }
 
 fn run(manifest_path: &str, app_dir: &str) -> Result<String, String> {
-    let bytes = std::fs::read(manifest_path)
-        .map_err(|e| format!("read {manifest_path}: {e}"))?;
+    let bytes = std::fs::read(manifest_path).map_err(|e| format!("read {manifest_path}: {e}"))?;
     let manifest = pkg::parse_manifest(&bytes).map_err(|e| e.to_string())?;
+    pkg::validate_install_capabilities(&manifest).map_err(|error| error.to_string())?;
     let install_dir = PathBuf::from(manifest_path)
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let desktop = build_entry(&manifest, &install_dir);
+    let desktop = pkginstall::build_desktop_entry(&manifest, &install_dir);
     let dest = PathBuf::from(app_dir).join(format!("{}.desktop", manifest.name));
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -72,24 +70,4 @@ fn run(manifest_path: &str, app_dir: &str) -> Result<String, String> {
     }
     std::fs::write(&dest, desktop).map_err(|e| format!("write {}: {}", dest.display(), e))?;
     Ok(manifest.name)
-}
-
-fn build_entry(m: &pkg::Manifest, install_dir: &std::path::Path) -> String {
-    let mut s = String::new();
-    s.push_str("[Desktop Entry]\n");
-    s.push_str("Type=Application\n");
-    s.push_str(&format!("Name={}\n", m.display_name));
-    s.push_str(&format!("Exec={}\n", install_dir.join(&m.binary).display()));
-    if let Some(icon) = &m.icon {
-        s.push_str(&format!("Icon={}\n", install_dir.join(icon).display()));
-    }
-    s.push_str(&format!("Summary={}\n", m.summary));
-    if !m.mime_types.is_empty() {
-        s.push_str(&format!("MimeType={};\n", m.mime_types.join(";")));
-    }
-    if !m.categories.is_empty() {
-        s.push_str(&format!("Categories={};\n", m.categories.join(";")));
-    }
-    s.push_str(&format!("X-PMos-Caps={}\n", m.caps_required.join(";")));
-    s
 }

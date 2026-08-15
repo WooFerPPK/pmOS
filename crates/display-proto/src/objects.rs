@@ -72,6 +72,9 @@ pub enum Interface {
     /// `pmd_keyboard` — per-client keyboard event object,
     /// created via `pmd_seat.get_keyboard(new_id)`.
     Keyboard,
+    /// One-shot ordering or frame callback created by
+    /// `pmd_display.sync` or `pmd_surface.frame`.
+    Callback,
 }
 
 impl Interface {
@@ -92,6 +95,7 @@ impl Interface {
             Interface::Seat => "pmd_seat",
             Interface::Pointer => "pmd_pointer",
             Interface::Keyboard => "pmd_keyboard",
+            Interface::Callback => "pmd_callback",
         }
     }
 
@@ -118,6 +122,7 @@ impl Interface {
             "pmd_seat" => Some(Interface::Seat),
             "pmd_pointer" => Some(Interface::Pointer),
             "pmd_keyboard" => Some(Interface::Keyboard),
+            "pmd_callback" => Some(Interface::Callback),
             _ => None,
         }
     }
@@ -209,6 +214,7 @@ impl Interface {
             Interface::Seat => SEAT_REQUESTS,
             Interface::Pointer => POINTER_REQUESTS,
             Interface::Keyboard => KEYBOARD_REQUESTS,
+            Interface::Callback => CALLBACK_REQUESTS,
         }
     }
 
@@ -227,6 +233,7 @@ impl Interface {
             Interface::Seat => SEAT_EVENTS,
             Interface::Pointer => POINTER_EVENTS,
             Interface::Keyboard => KEYBOARD_EVENTS,
+            Interface::Callback => CALLBACK_EVENTS,
         }
     }
 }
@@ -240,42 +247,93 @@ impl Interface {
 // can replace linear search later without a correctness risk.
 
 const DISPLAY_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "sync" },
-    Opcode { number: 2, direction: Direction::Request, name: "get_registry" },
+    Opcode {
+        number: 1,
+        direction: Direction::Request,
+        name: "sync",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Request,
+        name: "get_registry",
+    },
 ];
 
 const DISPLAY_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "error" },
-    Opcode { number: 2, direction: Direction::Event, name: "delete_id" },
+    Opcode {
+        number: 1,
+        direction: Direction::Event,
+        name: "error",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Event,
+        name: "delete_id",
+    },
 ];
 
-const REGISTRY_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "bind" },
-];
+const CALLBACK_REQUESTS: &[Opcode] = &[];
+const CALLBACK_EVENTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Event,
+    name: "done",
+}];
+
+const REGISTRY_REQUESTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Request,
+    name: "bind",
+}];
 
 const REGISTRY_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "global" },
-    Opcode { number: 2, direction: Direction::Event, name: "global_remove" },
+    Opcode {
+        number: 1,
+        direction: Direction::Event,
+        name: "global",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Event,
+        name: "global_remove",
+    },
 ];
 
-const COMPOSITOR_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "create_surface" },
-];
+const COMPOSITOR_REQUESTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Request,
+    name: "create_surface",
+}];
 
 const COMPOSITOR_EVENTS: &[Opcode] = &[];
 
-const SHM_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "create_pool" },
-];
+const SHM_REQUESTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Request,
+    name: "create_pool",
+}];
 
-const SHM_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "format" },
-];
+const SHM_EVENTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Event,
+    name: "format",
+}];
 
 const SHM_POOL_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "create_buffer" },
-    Opcode { number: 2, direction: Direction::Request, name: "resize" },
-    Opcode { number: 3, direction: Direction::Request, name: "destroy" },
+    Opcode {
+        number: 1,
+        direction: Direction::Request,
+        name: "create_buffer",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Request,
+        name: "resize",
+    },
+    Opcode {
+        number: 3,
+        direction: Direction::Request,
+        name: "destroy",
+    },
     // pmd_shm_pool.write(offset, bytes) — v1 affordance for
     // transferring pixel data from client to server. Wayland
     // proper passes an fd at create_pool time and both ends
@@ -284,27 +342,73 @@ const SHM_POOL_REQUESTS: &[Opcode] = &[
     // fills the server-side pool storage at `offset` with
     // the inline `bytes`. Toolkit's BufferPool calls this
     // after every paint, before commit_and_swap.
-    Opcode { number: 4, direction: Direction::Request, name: "write" },
+    Opcode {
+        number: 4,
+        direction: Direction::Request,
+        name: "write",
+    },
+    Opcode {
+        number: 5,
+        direction: Direction::Request,
+        name: "write_rows",
+    },
 ];
 
 const SHM_POOL_EVENTS: &[Opcode] = &[];
 
-const BUFFER_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "destroy" },
-];
+const BUFFER_REQUESTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Request,
+    name: "destroy",
+}];
 
-const BUFFER_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "release" },
-];
+const BUFFER_EVENTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Event,
+    name: "release",
+}];
 
 const SURFACE_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "destroy" },
-    Opcode { number: 2, direction: Direction::Request, name: "attach" },
-    Opcode { number: 3, direction: Direction::Request, name: "damage" },
-    Opcode { number: 4, direction: Direction::Request, name: "frame" },
-    Opcode { number: 5, direction: Direction::Request, name: "set_opaque_region" },
-    Opcode { number: 6, direction: Direction::Request, name: "set_input_region" },
-    Opcode { number: 7, direction: Direction::Request, name: "commit" },
+    Opcode {
+        number: 1,
+        direction: Direction::Request,
+        name: "destroy",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Request,
+        name: "attach",
+    },
+    Opcode {
+        number: 3,
+        direction: Direction::Request,
+        name: "damage",
+    },
+    Opcode {
+        number: 4,
+        direction: Direction::Request,
+        name: "frame",
+    },
+    Opcode {
+        number: 5,
+        direction: Direction::Request,
+        name: "set_opaque_region",
+    },
+    Opcode {
+        number: 6,
+        direction: Direction::Request,
+        name: "set_input_region",
+    },
+    Opcode {
+        number: 7,
+        direction: Direction::Request,
+        name: "commit",
+    },
+    Opcode {
+        number: 8,
+        direction: Direction::Request,
+        name: "patch_current",
+    },
 ];
 
 const SURFACE_EVENTS: &[Opcode] = &[];
@@ -313,25 +417,119 @@ const SURFACE_EVENTS: &[Opcode] = &[];
 // (requires Cap::Shell) that lets the desktop shell observe
 // + control the open-window list.
 const SHELL_MANAGER_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "subscribe_windows" },
-    Opcode { number: 2, direction: Direction::Request, name: "focus_window" },
-    Opcode { number: 3, direction: Direction::Request, name: "close_window" },
-    Opcode { number: 4, direction: Direction::Request, name: "minimize_window" },
+    Opcode {
+        number: 1,
+        direction: Direction::Request,
+        name: "subscribe_windows",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Request,
+        name: "focus_window",
+    },
+    Opcode {
+        number: 3,
+        direction: Direction::Request,
+        name: "close_window",
+    },
+    Opcode {
+        number: 4,
+        direction: Direction::Request,
+        name: "minimize_window",
+    },
+    Opcode {
+        number: 5,
+        direction: Direction::Request,
+        name: "unminimize_window",
+    },
+    Opcode {
+        number: 6,
+        direction: Direction::Request,
+        name: "set_work_area_bottom",
+    },
+    Opcode {
+        number: 7,
+        direction: Direction::Request,
+        name: "toggle_maximized_window",
+    },
+    Opcode {
+        number: 8,
+        direction: Direction::Request,
+        name: "desktop_ready",
+    },
+    Opcode {
+        number: 9,
+        direction: Direction::Request,
+        name: "subscribe_window_state",
+    },
+    Opcode {
+        number: 10,
+        direction: Direction::Request,
+        name: "begin_restore",
+    },
+    Opcode {
+        number: 11,
+        direction: Direction::Request,
+        name: "place_restored_window",
+    },
+    Opcode {
+        number: 12,
+        direction: Direction::Request,
+        name: "end_restore",
+    },
 ];
 
 const SHELL_MANAGER_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "window_created" },
-    Opcode { number: 2, direction: Direction::Event, name: "window_destroyed" },
-    Opcode { number: 3, direction: Direction::Event, name: "window_focused" },
-    Opcode { number: 4, direction: Direction::Event, name: "window_title_changed" },
+    Opcode {
+        number: 1,
+        direction: Direction::Event,
+        name: "window_created",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Event,
+        name: "window_destroyed",
+    },
+    Opcode {
+        number: 3,
+        direction: Direction::Event,
+        name: "window_focused",
+    },
+    Opcode {
+        number: 4,
+        direction: Direction::Event,
+        name: "window_title_changed",
+    },
+    Opcode {
+        number: 5,
+        direction: Direction::Event,
+        name: "window_created_v2",
+    },
+    Opcode {
+        number: 6,
+        direction: Direction::Event,
+        name: "window_state_changed",
+    },
+    Opcode {
+        number: 7,
+        direction: Direction::Event,
+        name: "window_snapshot_done",
+    },
+    Opcode {
+        number: 8,
+        direction: Direction::Event,
+        name: "restore_finished",
+    },
 ];
 
 // pmd_xdg_shell — narrowed Wayland xdg-shell. A single
 // request in v1: promote a surface to a toplevel. Events
 // come later (configure handshake, close request, etc.).
-const XDG_SHELL_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "get_toplevel" },
-];
+const XDG_SHELL_REQUESTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Request,
+    name: "get_toplevel",
+}];
 
 const XDG_SHELL_EVENTS: &[Opcode] = &[];
 
@@ -353,27 +551,75 @@ const XDG_SHELL_EVENTS: &[Opcode] = &[];
 // interface. The toolkit `Window` facade parses this merged
 // payload and replies with `ack_configure`.
 const XDG_TOPLEVEL_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "set_title" },
-    Opcode { number: 2, direction: Direction::Request, name: "set_app_id" },
-    Opcode { number: 3, direction: Direction::Request, name: "destroy" },
-    Opcode { number: 4, direction: Direction::Request, name: "ack_configure" },
-    Opcode { number: 5, direction: Direction::Request, name: "set_maximized" },
-    Opcode { number: 6, direction: Direction::Request, name: "unset_maximized" },
-    Opcode { number: 7, direction: Direction::Request, name: "move" },
-    Opcode { number: 8, direction: Direction::Request, name: "resize" },
+    Opcode {
+        number: 1,
+        direction: Direction::Request,
+        name: "set_title",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Request,
+        name: "set_app_id",
+    },
+    Opcode {
+        number: 3,
+        direction: Direction::Request,
+        name: "destroy",
+    },
+    Opcode {
+        number: 4,
+        direction: Direction::Request,
+        name: "ack_configure",
+    },
+    Opcode {
+        number: 5,
+        direction: Direction::Request,
+        name: "set_maximized",
+    },
+    Opcode {
+        number: 6,
+        direction: Direction::Request,
+        name: "unset_maximized",
+    },
+    Opcode {
+        number: 7,
+        direction: Direction::Request,
+        name: "move",
+    },
+    Opcode {
+        number: 8,
+        direction: Direction::Request,
+        name: "resize",
+    },
 ];
 
 const XDG_TOPLEVEL_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "configure" },
-    Opcode { number: 2, direction: Direction::Event, name: "close" },
+    Opcode {
+        number: 1,
+        direction: Direction::Event,
+        name: "configure",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Event,
+        name: "close",
+    },
 ];
 
 // pmd_seat — narrowed Wayland wl_seat. Clients bind the
 // global and then derive per-capability objects via
 // `get_pointer` / `get_keyboard`.
 const SEAT_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "get_pointer" },
-    Opcode { number: 2, direction: Direction::Request, name: "get_keyboard" },
+    Opcode {
+        number: 1,
+        direction: Direction::Request,
+        name: "get_pointer",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Request,
+        name: "get_keyboard",
+    },
 ];
 
 const SEAT_EVENTS: &[Opcode] = &[];
@@ -383,20 +629,34 @@ const SEAT_EVENTS: &[Opcode] = &[];
 // surface id so the client knows which of its surfaces
 // the event applies to. No enter/leave state machine in
 // v1 — every event is self-contained.
-const POINTER_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "release" },
-];
+const POINTER_REQUESTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Request,
+    name: "release",
+}];
 
 const POINTER_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "motion" },
-    Opcode { number: 2, direction: Direction::Event, name: "button" },
+    Opcode {
+        number: 1,
+        direction: Direction::Event,
+        name: "motion",
+    },
+    Opcode {
+        number: 2,
+        direction: Direction::Event,
+        name: "button",
+    },
 ];
 
 // pmd_keyboard — per-client keyboard event object.
-const KEYBOARD_REQUESTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Request, name: "release" },
-];
+const KEYBOARD_REQUESTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Request,
+    name: "release",
+}];
 
-const KEYBOARD_EVENTS: &[Opcode] = &[
-    Opcode { number: 1, direction: Direction::Event, name: "key" },
-];
+const KEYBOARD_EVENTS: &[Opcode] = &[Opcode {
+    number: 1,
+    direction: Direction::Event,
+    name: "key",
+}];

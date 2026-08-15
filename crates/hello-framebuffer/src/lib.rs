@@ -33,11 +33,11 @@
 //!
 //! ## Exit codes (for test diagnostics)
 //!
-//!   * 0  = success
-//!   * 10 = `path_open("/dev/fb0")` failed (missing cap,
-//!          missing device, bad path resolution)
-//!   * 11 = `fd_write(fb_fd, pixels)` failed
-//!   * 101 = panic
+//! * 0  = success
+//! * 10 = `path_open("/dev/fb0")` failed (missing cap,
+//!   missing device, bad path resolution)
+//! * 11 = `fd_write(fb_fd, pixels)` failed
+//! * 101 = panic
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
@@ -55,12 +55,7 @@ extern "C" {
         fdflags: i32,
         fd_out_ptr: *mut u32,
     ) -> i32;
-    fn fd_write(
-        fd: i32,
-        iovs_ptr: *const Ciovec,
-        iovs_len: i32,
-        nwritten_ptr: *mut u32,
-    ) -> i32;
+    fn fd_write(fd: i32, iovs_ptr: *const Ciovec, iovs_len: i32, nwritten_ptr: *mut u32) -> i32;
     fn proc_exit(rval: i32) -> !;
 }
 

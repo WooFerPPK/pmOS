@@ -1,14 +1,10 @@
-//! `/usr/bin/settings` — CLI preview of `/etc/preferences.toml` + About pane
-//! + write subcommands (T184 partial + T192 partial).
+//! `/usr/bin/settings` — tabbed graphical preference editor plus CLI/About
+//! diagnostics (T184 partial + T192 partial).
 //!
-//! The tabbed graphical UI (T184..T192) is blocked on the toolkit
-//! `Container` widget and T110's display-server protocol dispatch,
-//! so this slice ships a debugging CLI. Subcommand dispatch is a
-//! deliberate single hand-rolled `match` on `argv[1]` rather than a
-//! `clap` dep — established by T192 (cbbebf6) when `about` was added,
-//! and extended here by T184 to add `set-theme`. The two-arm match
-//! grew to three arms without reaching the size where clap would
-//! pay for itself.
+//! A desktop launch with no arguments opens the graphical UI. Explicit
+//! subcommands retain the host-testable diagnostic and scripting surface.
+//! Dispatch remains a small hand-rolled `match` rather than adding a command
+//! parser dependency to this system utility.
 //!
 //! Invocations:
 //!   settings                              # dump /etc/preferences.toml
@@ -43,9 +39,8 @@
 //! base-1024 B / KB / MB / GB with one decimal place above 1 KB
 //! (`files` stays as a raw integer count either way).
 //!
-//! Deferred T184 scope: valid-theme allow-list. `set-theme` accepts
-//! any non-empty string; the GUI will enforce the allow-list when it
-//! ships. Empty strings are rejected so the TOML round-trip cannot
+//! CLI setters deliberately accept forward-compatible values; the graphical
+//! UI enforces its bundled allow-lists. Empty strings are rejected so the TOML round-trip cannot
 //! silently erase the field. `set-wallpaper` writes the
 //! `wallpaper.name` field — the only field on the `[wallpaper]`
 //! section in the v1 schema (see `crates/preferences/src/lib.rs`
@@ -60,6 +55,9 @@
 
 use std::process::ExitCode;
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod gui;
+
 /// PMos userland-visible version string (T192 partial).
 ///
 /// Hardcoded for v1 because `/proc/version` is not yet a stable
@@ -71,8 +69,8 @@ const PMOS_VERSION: &str = "v0.1.0-alpha";
 /// Default directory for bundled docs, mounted by mkfs at T193.
 const DEFAULT_DOC_ROOT: &str = "/usr/share/doc/pmos/";
 
-/// Default preferences path, used by both dump and `set-theme`.
-const DEFAULT_CONFIG: &str = "/etc/preferences.toml";
+/// Default preferences path shared with init and the desktop shell.
+const DEFAULT_CONFIG: &str = preferences::DEFAULT_PATH;
 
 /// Default `/proc/storage` path. Populated by the kernel's procfs
 /// module (T169) once the block-driver counter source is installed.
@@ -83,13 +81,51 @@ const DEFAULT_PROC_STORAGE: &str = "/proc/storage";
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The desktop-launched `settings` binary boots straight
+        // into the GUI when no args are passed. The shell or a
+        // human running `settings <subcommand>` from a terminal
+        // takes the CLI dispatch below.
+        if args.is_empty() {
+            return run_gui_wasm();
+        }
+        if args.first().map(String::as_str) == Some("gui") {
+            return run_gui_wasm();
+        }
+    }
+
     match args.first().map(String::as_str) {
         Some("about") => run_about(&args[1..]),
         Some("set-theme") => run_set_theme(&args[1..]),
         Some("set-wallpaper") => run_set_wallpaper(&args[1..]),
         Some("set-keyboard") => run_set_keyboard(&args[1..]),
         Some("set-timezone") => run_set_timezone(&args[1..]),
+        Some("gui") => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                eprintln!("settings: gui subcommand is only available in the wasm build");
+                ExitCode::from(2)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                run_gui_wasm()
+            }
+        }
         _ => run_preferences(args.first().map(String::as_str).unwrap_or(DEFAULT_CONFIG)),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run_gui_wasm() -> ExitCode {
+    extern crate alloc;
+    let conn = match toolkit::wasi::FdConnection::connect() {
+        Ok(connection) => connection,
+        Err(errno) => return ExitCode::from(errno as u8),
+    };
+    match gui::run(conn, DEFAULT_CONFIG) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
     }
 }
 
@@ -211,8 +247,8 @@ fn run_about(rest: &[String]) -> ExitCode {
 
 /// Format a byte count using base-1024 thresholds.
 ///
-/// Values >= 1 GiB render as `<x.x> GB`, >= 1 MiB as `<x.x> MB`,
-/// >= 1 KiB as `<x.x> KB`, otherwise `<n> B`. The unit suffixes
+/// Values at or above 1 GiB render as `<x.x> GB`, at or above 1 MiB as
+/// `<x.x> MB`, at or above 1 KiB as `<x.x> KB`, otherwise `<n> B`. The suffixes
 /// keep the familiar KB/MB/GB letters even though the multiplier
 /// is binary — matches the convention the existing `du`/`df`
 /// userland uses for quick human reads. One decimal place is
@@ -298,18 +334,9 @@ fn read_proc_storage(path: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// `set-theme <name> [--config <path>]` — read-modify-write
-/// `theme.name` on the preferences file, preserving every other
-/// field.
-///
-/// Read-modify-write rather than a naive overwrite so the other
-/// five preference fields survive untouched. We hand-serialise
-/// because the `preferences` crate is intentionally parse-only and
-/// `#![no_std]`; widening it to emit TOML would pull serialisation
-/// concerns into init's `no_std + alloc` universe for no gain
-/// today (only `settings` writes the file in v1). The canonical
-/// emitter here is the inverse of the crate's parser: quoted
-/// plain-string values, five sections in a fixed order, blank
-/// lines between sections.
+/// `theme.name` on the preferences file, preserving every other field. The
+/// shared preferences crate serializes the complete snapshot and Settings
+/// atomically renames it into place.
 fn run_set_theme(rest: &[String]) -> ExitCode {
     let mut name: Option<&str> = None;
     let mut config_path: &str = DEFAULT_CONFIG;
@@ -347,9 +374,7 @@ fn run_set_theme(rest: &[String]) -> ExitCode {
     }
 
     if name.contains('"') || name.contains('\n') {
-        eprintln!(
-            "settings: set-theme: theme name must not contain quotes or newlines"
-        );
+        eprintln!("settings: set-theme: theme name must not contain quotes or newlines");
         return ExitCode::from(1);
     }
 
@@ -364,23 +389,16 @@ fn run_set_theme(rest: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            preferences::Preferences::empty()
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => preferences::Preferences::empty(),
         Err(e) => {
-            eprintln!(
-                "settings: set-theme: failed to open {}: {}",
-                config_path, e
-            );
+            eprintln!("settings: set-theme: failed to open {}: {}", config_path, e);
             return ExitCode::from(1);
         }
     };
 
     prefs.theme_name = Some(name.to_string());
 
-    let serialised = serialise_preferences(&prefs);
-
-    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+    if let Err(e) = write_preferences(config_path, &prefs) {
         eprintln!(
             "settings: set-theme: failed to write {}: {}",
             config_path, e
@@ -442,9 +460,7 @@ fn run_set_wallpaper(rest: &[String]) -> ExitCode {
     }
 
     if value.contains('"') || value.contains('\n') {
-        eprintln!(
-            "settings: set-wallpaper: wallpaper value must not contain quotes or newlines"
-        );
+        eprintln!("settings: set-wallpaper: wallpaper value must not contain quotes or newlines");
         return ExitCode::from(1);
     }
 
@@ -459,9 +475,7 @@ fn run_set_wallpaper(rest: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            preferences::Preferences::empty()
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => preferences::Preferences::empty(),
         Err(e) => {
             eprintln!(
                 "settings: set-wallpaper: failed to open {}: {}",
@@ -473,9 +487,7 @@ fn run_set_wallpaper(rest: &[String]) -> ExitCode {
 
     prefs.wallpaper_name = Some(value.to_string());
 
-    let serialised = serialise_preferences(&prefs);
-
-    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+    if let Err(e) = write_preferences(config_path, &prefs) {
         eprintln!(
             "settings: set-wallpaper: failed to write {}: {}",
             config_path, e
@@ -534,9 +546,7 @@ fn run_set_keyboard(rest: &[String]) -> ExitCode {
     }
 
     if layout.contains('"') || layout.contains('\n') {
-        eprintln!(
-            "settings: set-keyboard: keyboard layout must not contain quotes or newlines"
-        );
+        eprintln!("settings: set-keyboard: keyboard layout must not contain quotes or newlines");
         return ExitCode::from(1);
     }
 
@@ -551,9 +561,7 @@ fn run_set_keyboard(rest: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            preferences::Preferences::empty()
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => preferences::Preferences::empty(),
         Err(e) => {
             eprintln!(
                 "settings: set-keyboard: failed to open {}: {}",
@@ -565,9 +573,7 @@ fn run_set_keyboard(rest: &[String]) -> ExitCode {
 
     prefs.keyboard_layout = Some(layout.to_string());
 
-    let serialised = serialise_preferences(&prefs);
-
-    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+    if let Err(e) = write_preferences(config_path, &prefs) {
         eprintln!(
             "settings: set-keyboard: failed to write {}: {}",
             config_path, e
@@ -626,9 +632,7 @@ fn run_set_timezone(rest: &[String]) -> ExitCode {
     }
 
     if name.contains('"') || name.contains('\n') {
-        eprintln!(
-            "settings: set-timezone: timezone name must not contain quotes or newlines"
-        );
+        eprintln!("settings: set-timezone: timezone name must not contain quotes or newlines");
         return ExitCode::from(1);
     }
 
@@ -643,9 +647,7 @@ fn run_set_timezone(rest: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            preferences::Preferences::empty()
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => preferences::Preferences::empty(),
         Err(e) => {
             eprintln!(
                 "settings: set-timezone: failed to open {}: {}",
@@ -657,9 +659,7 @@ fn run_set_timezone(rest: &[String]) -> ExitCode {
 
     prefs.timezone_iana = Some(name.to_string());
 
-    let serialised = serialise_preferences(&prefs);
-
-    if let Err(e) = std::fs::write(config_path, serialised.as_bytes()) {
+    if let Err(e) = write_preferences(config_path, &prefs) {
         eprintln!(
             "settings: set-timezone: failed to write {}: {}",
             config_path, e
@@ -670,58 +670,81 @@ fn run_set_timezone(rest: &[String]) -> ExitCode {
     ExitCode::from(0)
 }
 
-/// Emit a TOML document that round-trips through `preferences::Preferences::parse`.
-///
-/// Sections are emitted in the canonical order used throughout the
-/// spec: theme, wallpaper, keyboard, timezone, terminal. Empty
-/// sections (all fields `None`) are skipped so the resulting file
-/// stays minimal. Values are plain ASCII-quoted strings; callers
-/// must reject names that contain embedded `"` or newlines before
-/// calling here.
-fn serialise_preferences(prefs: &preferences::Preferences) -> String {
-    let mut out = String::new();
+/// Persist a complete preference snapshot without exposing readers to a
+/// truncated intermediate file. The temporary file lives beside the target,
+/// so the final rename stays within one VFS directory and is atomic.
+pub(crate) fn write_preferences(
+    path: &str,
+    prefs: &preferences::Preferences,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let theme_pairs: &[(&str, Option<&str>)] = &[
-        ("name", prefs.theme_name.as_deref()),
-        ("fit", prefs.theme_fit.as_deref()),
-    ];
-    emit_section(&mut out, "theme", theme_pairs);
-
-    let wallpaper_pairs: &[(&str, Option<&str>)] =
-        &[("name", prefs.wallpaper_name.as_deref())];
-    emit_section(&mut out, "wallpaper", wallpaper_pairs);
-
-    let keyboard_pairs: &[(&str, Option<&str>)] =
-        &[("layout", prefs.keyboard_layout.as_deref())];
-    emit_section(&mut out, "keyboard", keyboard_pairs);
-
-    let timezone_pairs: &[(&str, Option<&str>)] =
-        &[("iana", prefs.timezone_iana.as_deref())];
-    emit_section(&mut out, "timezone", timezone_pairs);
-
-    let terminal_pairs: &[(&str, Option<&str>)] =
-        &[("font", prefs.terminal_font.as_deref())];
-    emit_section(&mut out, "terminal", terminal_pairs);
-
-    out
-}
-
-fn emit_section(out: &mut String, name: &str, pairs: &[(&str, Option<&str>)]) {
-    if pairs.iter().all(|(_, v)| v.is_none()) {
-        return;
+    let serialised = prefs
+        .to_toml()
+        .map_err(|error| Error::new(ErrorKind::InvalidInput, format!("{error:?}")))?;
+    let target = Path::new(path);
+    let parent = target.parent().filter(|dir| !dir.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)?;
     }
-    if !out.is_empty() {
-        out.push('\n');
+
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "preference path has no file name"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut temporary_file = None;
+    for attempt in 0..32_u32 {
+        let temporary_name = format!(".{file_name}.{nonce}.{attempt}.tmp");
+        let temporary = match parent {
+            Some(parent) => parent.join(temporary_name),
+            None => temporary_name.into(),
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => {
+                temporary_file = Some((temporary, file));
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
-    out.push('[');
-    out.push_str(name);
-    out.push_str("]\n");
-    for (key, value) in pairs {
-        if let Some(v) = value {
-            out.push_str(key);
-            out.push_str(" = \"");
-            out.push_str(v);
-            out.push_str("\"\n");
+    let Some((temporary, mut file)) = temporary_file else {
+        return Err(Error::new(
+            ErrorKind::AlreadyExists,
+            "could not allocate a unique preferences temporary file",
+        ));
+    };
+    if let Err(error) = file
+        .write_all(serialised.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+
+    match std::fs::rename(&temporary, target) {
+        Ok(()) => {
+            // A successful Apply means durable, not merely visible through
+            // this kernel instance. `sync_all` stays on the standard WASI
+            // surface and flushes the OPFS mount after the atomic rename, so
+            // an immediate browser reload observes the committed snapshot.
+            std::fs::File::open(target)?.sync_all()
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
         }
     }
 }

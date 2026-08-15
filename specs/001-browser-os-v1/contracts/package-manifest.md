@@ -25,6 +25,9 @@ assets/...              (optional)
 Paths inside the archive MUST be relative (no leading `/`), MUST
 NOT contain `..` segments, and MUST NOT be symlinks. A bundle
 that violates any of these rules is rejected at install time.
+Regular-file paths MUST be unique. Link entries and archive types other than
+regular files/directories are rejected. The installer verifies each tar header
+checksum before trusting its path or size.
 
 **File name of the archive**: `<name>-<version>.pmpkg.tar`. The
 extension is informative; the launcher identifies bundles by
@@ -59,6 +62,11 @@ categories = ["Utility"]           # OPTIONAL; free-form tags, informational
 [capabilities]
 required = ["DISPLAY_CLIENT"]      # REQUIRED array; may be empty
 optional = []                      # OPTIONAL; install-time policy decides
+
+# REQUIRED in the packaged manifest. `xtask package` generates this section
+# from the final payload bytes; source `pkg.toml` files omit it.
+[integrity]
+sha256 = { "bin/edit.wasm" = "<64 lowercase hex characters>" }
 ```
 
 ### 2.1 Field details
@@ -78,6 +86,7 @@ optional = []                      # OPTIONAL; install-time policy decides
 | `ui.categories`          | [string]      | free-form                                      |
 | `capabilities.required`  | [string]      | capability names (see `data-model.md §5`)      |
 | `capabilities.optional`  | [string]      | capability names                               |
+| `integrity.sha256`       | {path→string} | every non-manifest file mapped to lowercase SHA-256 |
 
 ### 2.2 Unknown keys
 
@@ -90,18 +99,27 @@ add new keys, and existing installers MUST not choke on them.
 The installer performs these checks, in order. Failure at any step
 aborts the install and reports a distinct error:
 
-1. The archive is well-formed tar and contains `manifest.toml` at
-   the root.
+1. The archive is well-formed tar, every header checksum is valid,
+   paths are unique, and it contains `manifest.toml` at the root.
 2. `manifest.toml` is well-formed TOML.
 3. All REQUIRED fields are present.
 4. `package.name` matches `[a-z0-9_-]+` and length.
 5. `package.version` parses as semver.
-6. `exec.binary` resolves to a file inside the bundle that begins
-   with the WASM magic `\0asm`.
-7. `ui.icon`, if present, resolves to a PNG file.
-8. Every capability in `capabilities.required` and
+6. `package.display_name`, `package.author`, and `package.summary` are
+   non-empty, within their character limits, and contain no control characters.
+7. `exec.binary` and `ui.icon`, if present, resolve to regular files
+   inside the bundle; the icon has a PNG signature/IHDR and square dimensions
+   in the declared 32..256 px range.
+8. `integrity.sha256` names every non-manifest regular file exactly
+   once, names no missing file, and every digest matches the payload.
+9. `exec.binary` begins with the WASM magic `\0asm`.
+10. Every capability in `capabilities.required` and
    `capabilities.optional` is a known capability name.
-9. A package with the same `package.name` is not already
+11. For a v1 third-party install, every required capability is
+    `DISPLAY_CLIENT`; privileged required capabilities are rejected before
+    any filesystem mutation. Optional capabilities remain metadata only and
+    are never copied into the v1 desktop entry.
+12. A package with the same `package.name` is not already
    installed, OR the installer was invoked with `--upgrade`.
 
 ---
@@ -112,6 +130,14 @@ Installing means extracting the bundle under `/opt/<name>/` and
 writing the desktop entry. It is scriptable from userland — the
 launcher's "install" flow is just a wrapper around the same
 operations a terminal user could do by hand.
+
+`pkginstall` validates the complete archive before mutation, writes files to a
+hidden sibling staging directory, syncs every file, sets the manifest executable
+to mode `0755` (other payload files to `0644`), and publishes the application
+directory before the desktop entry. Upgrades retain the previous
+application and desktop entry as sibling backups until both new paths are
+published. Any extraction, sync, rename, or desktop-entry failure rolls back
+both paths; a failed install cannot remove or partially expose the live version.
 
 ### 3.1 Desktop entry file
 
@@ -138,14 +164,15 @@ its app list. Each desktop entry maps 1:1 to a bundled app.
 A user who opens the terminal can install an app like this:
 
 ```
-$ tar -xf /home/user/Downloads/myapp-1.0.0.pmpkg.tar -C /opt/myapp
-$ pkginstall-desktop-entry /opt/myapp/manifest.toml
+$ pkginstall /home/user/Downloads/myapp-1.0.0.pmpkg.tar
 ```
 
-`pkginstall-desktop-entry` is a small bundled tool that reads a
-manifest and writes the `.desktop` file. The launcher picks up
-the new entry within 5 seconds (its watcher polls
-`/usr/share/applications/`).
+This is the supported safe path because it performs integrity validation and
+transactional publication. `pkginstall-desktop-entry` remains a low-level
+recovery tool for an already-validated/extracted tree; it enforces the same v1
+required-capability policy. The launcher's filesystem watch on
+`/usr/share/applications/` wakes it after the published directory mutation; it
+reloads the catalog without a periodic idle timer.
 
 ### 3.3 Install via the file manager
 
@@ -172,13 +199,17 @@ The launcher is a userland program that:
 
 1. At startup, reads `/usr/share/applications/*.desktop` and
    builds its app list.
-2. Polls `/usr/share/applications/` every 5 seconds for
-   additions/removals (v1 poller; v2 could use inotify-equivalent
-   if the VFS grows one).
+2. Watches `/usr/share/applications/` for create/delete/modify readiness and
+   reloads the catalog after each bounded watch drain. It does not periodically
+   wake an otherwise idle desktop.
 3. On user selection, spawns the app using `proc_spawn` with
    argv from the desktop entry's `Exec=`, env inherited from the
    launcher's own environment (plus `XDG_*` additions), and caps
    read from `X-PMos-Caps`.
+
+The executable path remains the installed VFS path (for example,
+`/opt/edit/bin/edit.wasm`). Loading it through a prebundled `/bin` alias is not
+conformant: the Worker must execute the bytes that passed package validation.
 
 The launcher **MUST NOT** grant caps the desktop entry does not
 declare. It **MUST NOT** grant caps the launcher itself does not
@@ -188,17 +219,46 @@ app — only init can. In v1 this is fine because the only
 `SHELL`-capable program (the desktop shell itself) is launched by
 init, not by the user-facing launcher.
 
+### 4.1 File-manager default application dispatch
+
+For v1 text MIME associations, Files resolves the selected extension to
+`text/plain` or `text/markdown`, then reads the installed
+`/usr/share/applications/edit.desktop` entry through its ordinary WASI root
+preopen. Files validates a bounded UTF-8 `[Desktop Entry]` section, requires
+`Type=Application` and a matching `MimeType=`, parses `Exec=` into direct argv
+without invoking a command shell, and passes the selected absolute path as
+`%f` or as the final argument when `%f` is absent. Unsupported field codes,
+ambiguous duplicate security-sensitive keys, relative executable paths,
+unknown capabilities, and malformed quoting are rejected before spawn.
+
+Files calls the documented `proc_spawn_manifest` extension itself. The child
+is therefore an ordinary isolated child of Files, not a shell-owned UI
+shortcut. `X-PMos-Caps` must be a subset of both the documented Files role
+caps and the live set returned by `cap_list`; the kernel repeats the mandatory
+subset check. Files inherits argv-independent environment and stdio through
+the spawn manifest and reaps exited children. Keyboard Open/Enter and bounded
+pointer double-activation use this path. Preview remains a separate explicit,
+read-only Files action.
+
+Once Edit opens an existing document it retains the read/write WASI fd for
+the lifetime of that binding. Normal Save seeks, writes, truncates, and syncs
+through that fd, so a concurrent Files rename changes only the directory entry
+and Save continues to update the same inode without recreating the stale name.
+New documents and Save As have no pre-existing inode identity to preserve;
+they continue to use a synced temporary sibling plus atomic pathname rename,
+then bind a newly opened fd for subsequent normal Saves.
+
 ---
 
 ## 5. Capability declaration policy
 
 An app declares the caps it needs in `capabilities.required`.
 
-- **At install time**: the installer MAY warn the user if the
-  cap list includes something outside `DISPLAY_CLIENT` (the
-  default), but v1 has no sandboxing GUI for cap review. The
-  installer SHOULD print the cap list to the terminal or file
-  manager pane.
+- **At install time**: v1 has no trusted/elevated third-party package
+  class and no capability-consent GUI. `required` is therefore confined to
+  `DISPLAY_CLIENT`; any other required capability is a distinct, atomic
+  install failure. `optional` may name known capabilities for forward
+  compatibility, but v1 never writes optional caps into `X-PMos-Caps`.
 - **At spawn time**: the kernel verifies that the launcher
   (the parent) holds every cap it tries to pass into the
   child. A cap the parent does not hold yields
@@ -221,9 +281,11 @@ app installation).
 
 ## 7. Non-goals for v1 (explicitly)
 
-- **No package signing**: v1 makes no attempt to verify bundle
-  authenticity or integrity. Users install what they trust.
-  Signing is a v2 amendment.
+- **No package signing/authenticity**: v1 verifies declared SHA-256 payload
+  integrity to detect corruption and incomplete/tampered transfers, but the
+  digest is stored in the same unsigned archive. It does not establish who
+  authored the package. Users still install only sources they trust; signing
+  is a v2 amendment.
 - **No version conflict resolution**: installing a package
   `name=X version=2` over an existing `name=X version=1`
   requires `--upgrade` and blindly replaces; no migration

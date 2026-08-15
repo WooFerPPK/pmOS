@@ -38,8 +38,7 @@ fn text_input_new_has_empty_text_idle_state() {
 
 #[test]
 fn with_placeholder_stores_placeholder_without_touching_text() {
-    let input = TextInput::new(Rect::new(0, 0, 120, 18))
-        .with_placeholder("type here");
+    let input = TextInput::new(Rect::new(0, 0, 120, 18)).with_placeholder("type here");
     assert_eq!(input.placeholder(), "type here");
     assert_eq!(input.text(), "");
     assert_eq!(input.state(), TextInputState::Idle);
@@ -89,7 +88,11 @@ fn text_input_pointer_down_outside_does_not_change_state() {
     assert!(!input.pointer_down(0, 0));
     assert_eq!(input.state(), TextInputState::Idle);
     // Caret was not at the end before; still unchanged after a miss.
-    assert_eq!(input.caret(), 5, "set_text pins caret at end; miss does not touch it");
+    assert_eq!(
+        input.caret(),
+        5,
+        "set_text pins caret at end; miss does not touch it"
+    );
 
     // A miss while focused must still not transition back to Idle.
     input.set_focus(true);
@@ -281,7 +284,11 @@ fn text_input_paint_produces_deterministic_pixels_for_known_text() {
             found_lit_a = true;
             let x = text_x + col as i32;
             let y = text_y + row as i32;
-            assert_eq!(px(&canvas, x as u32, y as u32), fg, "'a' glyph ({col},{row})");
+            assert_eq!(
+                px(&canvas, x as u32, y as u32),
+                fg,
+                "'a' glyph ({col},{row})"
+            );
         }
     }
     assert!(found_lit_a, "'a' has lit pixels");
@@ -382,7 +389,7 @@ fn text_input_paint_no_caret_when_not_focused() {
     let fill = rgba(theme.text_input_bg);
     for row in 0..GLYPH_HEIGHT {
         assert_eq!(
-            px(&canvas, 17, (5 + row) as u32),
+            px(&canvas, 17, 5 + row),
             fill,
             "no caret when not focused (row {row})",
         );

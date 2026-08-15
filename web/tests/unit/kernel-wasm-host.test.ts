@@ -23,6 +23,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { KernelWasmHost, type SpawnOutcome } from "../../src/kernel-wasm-host";
 import { Devnum } from "../../src/shared/platform-constants";
+import { resolveCargoTargetDirectory } from "../helpers/cargo-target";
 import {
   OFF_HEAP_SCRATCH,
   OFF_REQ_HEAD,
@@ -40,7 +41,6 @@ import {
   CAPSET_ORDINARY_APP,
   CAPSET_DESKTOP_SHELL,
   CLOCKID,
-  DEV,
   DIRENT_OFF,
   decodeResponse,
   encodeRequest,
@@ -72,9 +72,13 @@ import {
 let wasmBytes: ArrayBuffer;
 
 beforeAll(() => {
-  const wasmPath = path.resolve(
-    __dirname,
-    "../../../target/wasm32-unknown-unknown/release/kernel.wasm",
+  const cargoTargetDirectory = resolveCargoTargetDirectory(
+    path.resolve(__dirname, "../../.."),
+    process.env.CARGO_TARGET_DIR,
+  );
+  const wasmPath = path.join(
+    cargoTargetDirectory,
+    "wasm32-unknown-unknown/release/kernel.wasm",
   );
   if (!fs.existsSync(wasmPath)) {
     throw new Error(
@@ -95,16 +99,155 @@ beforeAll(() => {
   ) as ArrayBuffer;
 });
 
+describe("KernelWasmHost host transfer", () => {
+  it("imports files larger than kernel scratch through bounded chunks", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    const body = Uint8Array.from(
+      { length: 96 * 1024 + 17 },
+      (_, index) => (index * 31) & 0xff,
+    );
+
+    expect(
+      host.hostFileDropped(
+        0x1234,
+        "large.bin",
+        "application/octet-stream",
+        body,
+      ),
+    ).toBe(true);
+
+    const args = new Uint8Array(16);
+    new DataView(args.buffer).setUint32(0, 0x1234, true);
+    const recv = host.dispatch(pid, {
+      opcode: OP_EXT.HOST_FILE_RECV,
+      requestId: 7990,
+      args,
+    });
+    expect(recv.response!.status).toBe(0);
+    const fd = Number(recv.response!.value);
+    const actual = new Uint8Array(body.length);
+    let offset = 0;
+    while (offset < actual.length) {
+      const read = host.dispatch(pid, {
+        opcode: OP_WASI.FD_READ,
+        requestId: 7991 + offset,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: Math.min(16 * 1024, actual.length - offset),
+      });
+      expect(read.response!.status).toBe(0);
+      const n = Number(read.response!.value);
+      expect(n).toBeGreaterThan(0);
+      actual.set(read.heapOut!.subarray(0, n), offset);
+      offset += n;
+    }
+    expect(actual).toEqual(body);
+  });
+
+  it("gates picker/download and emits bytes only after explicit close", async () => {
+    const fixture = await freshHost();
+    const { host, hostPickerCalls, hostDownloads } = fixture;
+    const allowed = host.registerProcess(CAPSET_ALL);
+    host.markRunning(allowed);
+    const denied = host.registerProcess(CAPSET_ORDINARY_APP);
+    host.markRunning(denied);
+
+    expect(
+      host.dispatch(denied, {
+        opcode: OP_EXT.HOST_FILE_PICK,
+        requestId: 8001,
+      }).response!.status,
+    ).toBe(-ERRNO.ENOTCAPABLE);
+    expect(
+      host.dispatch(allowed, {
+        opcode: OP_EXT.HOST_FILE_PICK,
+        requestId: 8002,
+      }).response!.status,
+    ).toBe(0);
+    expect(hostPickerCalls.count).toBe(1);
+
+    const name = new TextEncoder().encode("notes.txt");
+    const mime = new TextEncoder().encode("text/plain");
+    const metadata = new Uint8Array(name.length + mime.length);
+    metadata.set(name, 0);
+    metadata.set(mime, name.length);
+    const args = new Uint8Array(16);
+    const argsView = new DataView(args.buffer);
+    argsView.setUint32(0, name.length, true);
+    argsView.setUint32(4, mime.length, true);
+
+    expect(
+      host.dispatch(
+        denied,
+        {
+          opcode: OP_EXT.HOST_FILE_SEND,
+          requestId: 8003,
+          args,
+          heapPtr: 0,
+          heapLen: metadata.length,
+        },
+        metadata,
+      ).response!.status,
+    ).toBe(-ERRNO.ENOTCAPABLE);
+    const send = host.dispatch(
+      allowed,
+      {
+        opcode: OP_EXT.HOST_FILE_SEND,
+        requestId: 8004,
+        args,
+        heapPtr: 0,
+        heapLen: metadata.length,
+      },
+      metadata,
+    );
+    expect(send.response!.status).toBe(0);
+    const fd = Number(send.response!.value);
+    const body = new TextEncoder().encode("hello from PMos");
+    expect(
+      host.dispatch(
+        allowed,
+        {
+          opcode: OP_WASI.FD_WRITE,
+          requestId: 8005,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: body.length,
+        },
+        body,
+      ).response!.status,
+    ).toBe(0);
+    expect(hostDownloads).toHaveLength(0);
+    expect(
+      host.dispatch(allowed, {
+        opcode: OP_WASI.FD_CLOSE,
+        requestId: 8006,
+        arg0: fd,
+      }).response!.status,
+    ).toBe(0);
+    expect(hostDownloads).toHaveLength(1);
+    expect(hostDownloads[0]!.name).toBe("notes.txt");
+    expect(hostDownloads[0]!.mime).toBe("text/plain");
+    expect(hostDownloads[0]!.bytes).toEqual(body);
+  });
+});
+
 interface SpawnRecord {
   readonly pid: number;
   readonly path: string;
+  readonly executable?: Uint8Array;
 }
 
 interface TestFixture {
   host: KernelWasmHost;
+  bootConsoleWrites: Uint8Array[];
   consoleWrites: Uint8Array[];
   panics: string[];
   spawnCalls: SpawnRecord[];
+  terminateCalls: number[];
+  hostPickerCalls: { count: number };
+  hostDownloads: Array<{ name: string; mime: string; bytes: Uint8Array }>;
 }
 
 interface FreshHostOptions {
@@ -125,9 +268,9 @@ interface FreshHostOptions {
    */
   readonly nowRealtimeNs?: () => bigint;
   /**
-   * Optional `BlockDriver` for the OPFS mount. T084 tests pass a
+   * Optional `BlockDriver` for the persistent root. T084 tests pass a
    * `BlockDriver.withHandle(MemSyncAccessHandle)` so `kernel_init`'s
-   * `/persist` mount path is exercised end-to-end without touching
+   * OPFS-root path is exercised end-to-end without touching
    * the real browser OPFS.
    */
   readonly blockDriver?: import("../../src/drivers/types").Driver;
@@ -139,9 +282,9 @@ interface FreshHostOptions {
  * `MemSyncAccessHandle` in `block.test.ts` but inlined here so
  * neither test file imports the other.
  */
-function makeMemSyncAccessHandle(): import(
-  "../../src/drivers/block"
-).SyncAccessHandle & { getSize(): number } {
+function makeMemSyncAccessHandle(): import("../../src/drivers/block").SyncAccessHandle & {
+  getSize(): number;
+} {
   let buf = new Uint8Array(1 << 24);
   let size = 0;
   return {
@@ -183,6 +326,13 @@ async function freshHost(opts: FreshHostOptions = {}): Promise<TestFixture> {
   const consoleWrites: Uint8Array[] = [];
   const panics: string[] = [];
   const spawnCalls: SpawnRecord[] = [];
+  const terminateCalls: number[] = [];
+  const hostPickerCalls = { count: 0 };
+  const hostDownloads: Array<{
+    name: string;
+    mime: string;
+    bytes: Uint8Array;
+  }> = [];
   const host = await KernelWasmHost.create(wasmBytes, {
     onConsoleWrite: (bytes) => {
       consoleWrites.push(bytes);
@@ -190,18 +340,43 @@ async function freshHost(opts: FreshHostOptions = {}): Promise<TestFixture> {
     onPanic: (message) => {
       panics.push(message);
     },
-    onSpawnProcess: (pid, path) => {
-      spawnCalls.push({ pid, path });
-      return opts.spawnOutcome
-        ? opts.spawnOutcome(pid, path)
-        : { ok: true };
+    onSpawnProcess: (pid, path, executable) => {
+      spawnCalls.push({
+        pid,
+        path,
+        ...(executable !== undefined
+          ? { executable: new Uint8Array(executable) }
+          : {}),
+      });
+      return opts.spawnOutcome ? opts.spawnOutcome(pid, path) : { ok: true };
+    },
+    onTerminateProcess: (pid) => {
+      terminateCalls.push(pid);
+    },
+    onHostFilePicker: () => {
+      hostPickerCalls.count += 1;
+    },
+    onHostDownload: (name, mime, bytes) => {
+      hostDownloads.push({ name, mime, bytes });
     },
     // Deterministic clock so tests never race with wall-clock changes.
     nowNs: opts.nowNs ?? (() => 0n),
     nowRealtimeNs: opts.nowRealtimeNs ?? (() => 0n),
-    blockDriver: opts.blockDriver,
+    ...(opts.blockDriver !== undefined
+      ? { blockDriver: opts.blockDriver }
+      : {}),
   });
-  return { host, consoleWrites, panics, spawnCalls };
+  const bootConsoleWrites = consoleWrites.splice(0);
+  return {
+    host,
+    bootConsoleWrites,
+    consoleWrites,
+    panics,
+    spawnCalls,
+    terminateCalls,
+    hostPickerCalls,
+    hostDownloads,
+  };
 }
 
 // ---- construction ---------------------------------------------------
@@ -252,7 +427,7 @@ describe("process lifecycle", () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
-    const pathBytes = new TextEncoder().encode("/tmp/persist");
+    const pathBytes = new TextEncoder().encode("/tmp/sync-marker");
     host.dispatch(
       pid,
       {
@@ -349,6 +524,101 @@ describe("process lifecycle", () => {
     expect(text).toContain("VmSize:\t0 kB\n");
     expect(text).toContain("VmPeak:\t0 kB\n");
     expect(text).toContain("Threads:\t1\n");
+    expect(text).toContain("FDCount:\t1\n");
+
+    host.installConsoleFd(pid, 1);
+    const reopened = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4103,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(reopened.response!.status).toBe(0);
+    const reopenedFd = Number(reopened.response!.value);
+    const reread = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 4104,
+      arg0: reopenedFd,
+      heapPtr: 0,
+      heapLen: 512,
+    });
+    expect(reread.response!.status).toBe(0);
+    const refreshedText = new TextDecoder().decode(
+      reread.heapOut!.slice(0, Number(reread.response!.value)),
+    );
+    expect(refreshedText).toContain("FDCount:\t3\n");
+  });
+
+  it("prepares a live procfs status snapshot through a tmpfs symlink", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+
+    const tmpPath = new TextEncoder().encode("/tmp");
+    const openedTmp = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4109,
+        args: encodePathOpenArgs(0, 0x0002, 0),
+        heapPtr: 0,
+        heapLen: tmpPath.length,
+      },
+      tmpPath,
+    );
+    expect(openedTmp.response!.status).toBe(0);
+    const tmpFd = Number(openedTmp.response!.value);
+
+    const target = "/proc";
+    const linkPath = "/tmp/p";
+    const linkHeap = encodePathSymlinkHeap(target, linkPath);
+    const created = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_SYMLINK,
+        requestId: 4110,
+        args: encodePathSymlinkArgs(new TextEncoder().encode(target).length),
+        heapPtr: 0,
+        heapLen: linkHeap.length,
+      },
+      linkHeap,
+    );
+    expect(created.response!.status).toBe(0);
+
+    const pathBytes = new TextEncoder().encode(`p/${pid}/status`);
+    const openArgs = encodePathOpenArgs(0, 0, 0);
+    new DataView(openArgs.buffer).setUint32(12, tmpFd, true);
+    const opened = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 4111,
+        args: openArgs,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(opened.response!.status).toBe(0);
+
+    const read = host.dispatch(pid, {
+      opcode: OP_WASI.FD_READ,
+      requestId: 4112,
+      arg0: Number(opened.response!.value),
+      heapPtr: 0,
+      heapLen: 512,
+    });
+    expect(read.response!.status).toBe(0);
+    const text = new TextDecoder().decode(
+      read.heapOut!.slice(0, Number(read.response!.value)),
+    );
+    expect(text).toContain(`Pid:\t${pid}\n`);
+    expect(text).toContain("FDCount:\t2\n");
   });
 
   it("/proc/loadavg surfaces live running/total/last_pid via the live procfs source", async () => {
@@ -457,6 +727,67 @@ describe("process lifecycle", () => {
     expect(lastPid).toMatch(/^\d+\n$/);
   });
 
+  it("does not commit a projected load average for a malformed procfs request", async () => {
+    let now = 0n;
+    const { host } = await freshHost({ nowNs: () => now });
+    const first = host.registerProcess(CAPSET_ALL);
+    host.markRunning(first);
+    const pathBytes = new TextEncoder().encode("/proc/loadavg");
+
+    const readLoadavg = (requestId: number): string => {
+      const open = host.dispatch(
+        first,
+        {
+          opcode: OP_WASI.PATH_OPEN,
+          requestId,
+          arg0: 0,
+          heapPtr: 0,
+          heapLen: pathBytes.length,
+        },
+        pathBytes,
+      );
+      expect(open.response!.status).toBe(0);
+      const read = host.dispatch(first, {
+        opcode: OP_WASI.FD_READ,
+        requestId: requestId + 1,
+        arg0: Number(open.response!.value),
+        heapPtr: 0,
+        heapLen: 64,
+      });
+      expect(read.response!.status).toBe(0);
+      return new TextDecoder().decode(
+        read.heapOut!.slice(0, Number(read.response!.value)),
+      );
+    };
+
+    expect(readLoadavg(0x5308)).toMatch(/^0\.00 0\.00 0\.00 1\/1 /);
+    now = 5_000_000_000n;
+
+    // PATH_FILESTAT_GET needs a 64-byte output window, but this request's
+    // shared heap contains only the path. Resolution reaches procfs before
+    // the handler rejects the malformed output window. Snapshot preparation
+    // must therefore remain provisional.
+    const malformed = host.dispatch(
+      first,
+      {
+        opcode: OP_WASI.PATH_FILESTAT_GET,
+        requestId: 0x530a,
+        arg0: 0,
+        heapPtr: 64 * 1024 - pathBytes.length,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(malformed.response!.status).toBe(-ERRNO.EINVAL);
+
+    const second = host.registerProcess(CAPSET_ALL);
+    host.markRunning(second);
+    // One five-second sample with two runnable processes is 0.16. If the
+    // rejected request had committed its one-process projection, this would
+    // incorrectly remain 0.08 at the same timestamp.
+    expect(readLoadavg(0x530b)).toMatch(/^0\.16 0\.03 0\.01 2\/2 /);
+  });
+
   it("/proc/uptime surfaces a live monotonic seconds-since-boot via the live procfs source", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
@@ -496,18 +827,22 @@ describe("process lifecycle", () => {
     expect(text).toMatch(/^\d+ 0\n$/);
   });
 
-  it("kernel_init mounts OPFS at /persist when a BlockDriver is wired (T084)", async () => {
-    const { BlockDriver, BLOCK_SIZE } = await import("../../src/drivers/block");
+  it("kernel_init mounts OPFS at / when a BlockDriver is wired (T084)", async () => {
+    const { BlockDriver, BlockImageState, BLOCK_SIZE } =
+      await import("../../src/drivers/block");
     const handle = makeMemSyncAccessHandle();
-    const blockDriver = BlockDriver.withHandle(handle, 4096);
-    const { host } = await freshHost({ blockDriver });
+    const blockDriver = BlockDriver.withHandle(
+      handle,
+      4096,
+      BlockImageState.NewlyCreated,
+    );
+    const { host, bootConsoleWrites } = await freshHost({ blockDriver });
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // PATH_OPEN /persist as a directory. If mkfs ran successfully
-    // during kernel_init, this resolves to the OPFS root. If the
-    // OPFS mount didn't happen, PATH_OPEN /persist returns ENOENT.
-    const pathBytes = new TextEncoder().encode("/persist");
+    // `/home/user` comes from mkfs and therefore distinguishes the
+    // persistent root from the deliberately empty tmpfs fallback.
+    const pathBytes = new TextEncoder().encode("/home/user");
     const open = host.dispatch(
       pid,
       {
@@ -521,21 +856,39 @@ describe("process lifecycle", () => {
     );
     expect(open.response!.status).toBe(0);
 
+    // There is no compatibility mount: userland must use canonical
+    // paths so ordinary writes cannot accidentally target a second,
+    // surprising namespace.
+    const legacyPath = new TextEncoder().encode("/persist");
+    const legacyOpen = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 5002,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: legacyPath.length,
+      },
+      legacyPath,
+    );
+    expect(legacyOpen.response!.status).toBe(-ERRNO.ENOENT);
+
     // The handle must have grown to at least one block (mkfs writes
     // the superblock + zeros the inode table + journal).
     expect(handle.getSize()).toBeGreaterThanOrEqual(BLOCK_SIZE);
+    expect(
+      bootConsoleWrites.map((bytes) => new TextDecoder().decode(bytes)),
+    ).toContain("[pmos] persistent OPFS root mounted at /\n");
   });
 
-  it("first-boot mkfs end-to-end produces the FR-013a starter kit under /persist (T135)", async () => {
+  it("first-boot mkfs exposes the FR-013a starter kit at canonical root paths (T135)", async () => {
     // T135: end-to-end verification that the block-driver mkfs
     // path runs when OPFS is empty.
     //
-    // A freshly-allocated MemSyncAccessHandle starts at size=0, so
-    // the kernel's first read of LBA 0 returns zeros, OpfsFs::mount
-    // surfaces FsError::Io, and kernel_init falls through to
-    // mkfs(device). The mkfs path produces the FR-013a starter kit
-    // at /home/user — but in the kernel /persist mount, that's
-    // /persist/home/user.
+    // The test explicitly marks this freshly-allocated handle as a
+    // newly-created image. That provenance, rather than the bytes in
+    // LBA 0, authorises kernel_init to run mkfs. The mkfs path produces
+    // the FR-013a starter kit directly at /home/user.
     //
     // This test pins the spec.md FR-013a contract: every directory
     // and every file the FR enumerates must be openable through the
@@ -544,11 +897,16 @@ describe("process lifecycle", () => {
     // test fails. If mkfs didn't run at all (e.g. boot policy
     // changed and the empty-OPFS branch was lost), every PATH_OPEN
     // returns ENOENT and the test fails on the first one.
-    const { BlockDriver } = await import("../../src/drivers/block");
+    const { BlockDriver, BlockImageState } =
+      await import("../../src/drivers/block");
     const handle = makeMemSyncAccessHandle();
     expect(handle.getSize()).toBe(0); // truly empty before mkfs
 
-    const blockDriver = BlockDriver.withHandle(handle, 4096);
+    const blockDriver = BlockDriver.withHandle(
+      handle,
+      4096,
+      BlockImageState.NewlyCreated,
+    );
     const { host } = await freshHost({ blockDriver });
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
@@ -571,24 +929,23 @@ describe("process lifecycle", () => {
       return Number(r.response!.value);
     }
 
-    // FR-013a starter kit paths (under /persist because that's where
-    // the OPFS mounts; mkfs wrote /home/user/... in the OPFS root).
+    // FR-013a starter kit paths at their user-facing locations.
     const starterDirs = [
-      "/persist",
-      "/persist/home",
-      "/persist/home/user",
-      "/persist/home/user/Downloads",
-      "/persist/home/user/Documents",
-      "/persist/home/user/Pictures",
+      "/",
+      "/home",
+      "/home/user",
+      "/home/user/Downloads",
+      "/home/user/Documents",
+      "/home/user/Pictures",
     ];
     for (const [i, dir] of starterDirs.entries()) {
       openOk(dir, 7100 + i);
     }
 
     const starterFiles = [
-      "/persist/home/user/README.md",
-      "/persist/home/user/Documents/welcome.txt",
-      "/persist/home/user/Documents/editing.md",
+      "/home/user/README.md",
+      "/home/user/Documents/welcome.txt",
+      "/home/user/Documents/editing.md",
     ];
     for (const [i, f] of starterFiles.entries()) {
       const fd = openOk(f, 7200 + i);
@@ -602,51 +959,54 @@ describe("process lifecycle", () => {
         heapLen: 256,
       });
       expect(r.response!.status, `FD_READ ${f}`).toBe(0);
-      expect(Number(r.response!.value), `${f} should be non-empty`).toBeGreaterThan(0);
+      expect(
+        Number(r.response!.value),
+        `${f} should be non-empty`,
+      ).toBeGreaterThan(0);
     }
 
     // System tree paths mkfs writes alongside the starter kit. These
     // are not part of FR-013a strictly, but they're part of the
     // mkfs contract — the v1 system layout.
     const systemDirs = [
-      "/persist/bin",
-      "/persist/dev",
-      "/persist/etc",
-      "/persist/home",
-      "/persist/opt",
-      "/persist/proc",
-      "/persist/run",
-      "/persist/tmp",
-      "/persist/usr",
-      "/persist/usr/bin",
-      "/persist/usr/share",
-      "/persist/usr/share/applications",
+      "/bin",
+      "/dev",
+      "/etc",
+      "/home",
+      "/opt",
+      "/proc",
+      "/run",
+      "/tmp",
+      "/usr",
+      "/usr/bin",
+      "/usr/share",
+      "/usr/share/applications",
     ];
     for (const [i, dir] of systemDirs.entries()) {
       openOk(dir, 7400 + i);
     }
 
     // /etc/init.conf — mkfs's installed default for T096.
-    openOk("/persist/etc/init.conf", 7500);
+    openOk("/etc/init.conf", 7500);
 
     // /usr/share/applications/*.desktop — mkfs's installed defaults
     // for T125.
     const desktopFiles = [
-      "/persist/usr/share/applications/terminal.desktop",
-      "/persist/usr/share/applications/files.desktop",
-      "/persist/usr/share/applications/edit.desktop",
-      "/persist/usr/share/applications/settings.desktop",
-      "/persist/usr/share/applications/sysmon.desktop",
+      "/usr/share/applications/terminal.desktop",
+      "/usr/share/applications/files.desktop",
+      "/usr/share/applications/edit.desktop",
+      "/usr/share/applications/settings.desktop",
+      "/usr/share/applications/sysmon.desktop",
     ];
     for (const [i, f] of desktopFiles.entries()) {
       openOk(f, 7600 + i);
     }
 
     // /usr/share/doc/pmos/{LICENSE.txt,CREDITS.txt} — T193 docs.
-    openOk("/persist/usr/share/doc", 7700);
-    openOk("/persist/usr/share/doc/pmos", 7701);
-    openOk("/persist/usr/share/doc/pmos/LICENSE.txt", 7702);
-    openOk("/persist/usr/share/doc/pmos/CREDITS.txt", 7703);
+    openOk("/usr/share/doc", 7700);
+    openOk("/usr/share/doc/pmos", 7701);
+    openOk("/usr/share/doc/pmos/LICENSE.txt", 7702);
+    openOk("/usr/share/doc/pmos/CREDITS.txt", 7703);
   });
 
   it("second boot against the same OPFS image skips mkfs (mount succeeds without re-init)", async () => {
@@ -659,16 +1019,21 @@ describe("process lifecycle", () => {
     // same file during boot 2 and read it back. If mkfs had run a
     // second time, it would have rewritten the inode table from
     // scratch and the custom file would be gone.
-    const { BlockDriver } = await import("../../src/drivers/block");
+    const { BlockDriver, BlockImageState } =
+      await import("../../src/drivers/block");
     const handle = makeMemSyncAccessHandle();
 
-    // Boot 1: write /persist/marker.txt.
+    // Boot 1: write a marker in the canonical user home.
     {
-      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const blockDriver = BlockDriver.withHandle(
+        handle,
+        4096,
+        BlockImageState.NewlyCreated,
+      );
       const { host } = await freshHost({ blockDriver });
       const pid = host.registerProcess(CAPSET_ALL);
       host.markRunning(pid);
-      const path = new TextEncoder().encode("/persist/marker.txt");
+      const path = new TextEncoder().encode("/home/user/marker.txt");
       const open = host.dispatch(
         pid,
         {
@@ -700,11 +1065,15 @@ describe("process lifecycle", () => {
 
     // Boot 2: same handle. mkfs MUST NOT run; the marker survives.
     {
-      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const blockDriver = BlockDriver.withHandle(
+        handle,
+        4096,
+        BlockImageState.Existing,
+      );
       const { host } = await freshHost({ blockDriver });
       const pid = host.registerProcess(CAPSET_ALL);
       host.markRunning(pid);
-      const path = new TextEncoder().encode("/persist/marker.txt");
+      const path = new TextEncoder().encode("/home/user/marker.txt");
       const open = host.dispatch(
         pid,
         {
@@ -733,18 +1102,23 @@ describe("process lifecycle", () => {
     }
   });
 
-  it("file written under /persist persists across kernel re-mount (FR-013a)", async () => {
-    const { BlockDriver } = await import("../../src/drivers/block");
+  it("/home/user content survives a full kernel re-instantiation (FR-013)", async () => {
+    const { BlockDriver, BlockImageState } =
+      await import("../../src/drivers/block");
     const handle = makeMemSyncAccessHandle();
 
-    // Boot 1: mount OPFS, create + write /persist/notes.txt, flush.
+    // Boot 1: mount OPFS at /, create + write a user file, flush.
     {
-      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const blockDriver = BlockDriver.withHandle(
+        handle,
+        4096,
+        BlockImageState.NewlyCreated,
+      );
       const { host } = await freshHost({ blockDriver });
       const pid = host.registerProcess(CAPSET_ALL);
       host.markRunning(pid);
 
-      const pathBytes = new TextEncoder().encode("/persist/notes.txt");
+      const pathBytes = new TextEncoder().encode("/home/user/notes.txt");
       const open = host.dispatch(
         pid,
         {
@@ -782,14 +1156,18 @@ describe("process lifecycle", () => {
     // Boot 2: same handle, fresh kernel + driver. The kernel's
     // OpfsFs::mount reads back the superblock written by boot 1
     // (correct magic + checksum) so this time mkfs is NOT called.
-    // Reading back /persist/notes.txt round-trips the bytes.
+    // Reading back the canonical home path round-trips the bytes.
     {
-      const blockDriver = BlockDriver.withHandle(handle, 4096);
+      const blockDriver = BlockDriver.withHandle(
+        handle,
+        4096,
+        BlockImageState.Existing,
+      );
       const { host } = await freshHost({ blockDriver });
       const pid = host.registerProcess(CAPSET_ALL);
       host.markRunning(pid);
 
-      const pathBytes = new TextEncoder().encode("/persist/notes.txt");
+      const pathBytes = new TextEncoder().encode("/home/user/notes.txt");
       const open = host.dispatch(
         pid,
         {
@@ -819,14 +1197,16 @@ describe("process lifecycle", () => {
     }
   });
 
-  it("kernel_init skips the /persist mount when no BlockDriver is wired (default)", async () => {
+  it("kernel_init seeds a usable volatile root when no BlockDriver is wired", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    // /persist does NOT exist when the block driver is absent.
-    // PATH_OPEN on /persist returns ENOENT.
-    const pathBytes = new TextEncoder().encode("/persist");
+    // The tmpfs fallback is deliberately seeded with the same coherent
+    // system tree and starter home applications expect. Its volatility is
+    // reported separately through /proc/storage; absence of /home/user is
+    // no longer the persistence discriminator.
+    const pathBytes = new TextEncoder().encode("/home/user");
     const open = host.dispatch(
       pid,
       {
@@ -838,13 +1218,67 @@ describe("process lifecycle", () => {
       },
       pathBytes,
     );
-    expect(open.response!.status).toBe(-ERRNO.ENOENT);
+    expect(open.response!.status).toBe(0);
   });
 
-  it("/proc/storage reads the live OPFS quota counters when /persist is mounted (T084 + T169)", async () => {
-    const { BlockDriver } = await import("../../src/drivers/block");
+  it("a corrupt existing image is preserved while the volatile fallback is usable", async () => {
+    const { BlockDriver, BlockImageState, BLOCK_SIZE } =
+      await import("../../src/drivers/block");
     const handle = makeMemSyncAccessHandle();
-    const blockDriver = BlockDriver.withHandle(handle, 4096);
+    const corruptSuperblock = new Uint8Array(BLOCK_SIZE).fill(0xa5);
+    const sentinel = new Uint8Array(BLOCK_SIZE).fill(0x3c);
+    handle.write(corruptSuperblock, { at: 0 });
+    handle.write(sentinel, { at: 73 * BLOCK_SIZE });
+
+    const blockDriver = BlockDriver.withHandle(
+      handle,
+      4096,
+      BlockImageState.Existing,
+    );
+    const { host, bootConsoleWrites } = await freshHost({ blockDriver });
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.markRunning(pid);
+    // Mount failure selects a separately seeded tmpfs root. The canonical
+    // home therefore remains usable without implying that corrupt media was
+    // mounted, repaired, or reformatted.
+    const path = new TextEncoder().encode("/home/user");
+    const open = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 5003,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(open.response!.status).toBe(0);
+
+    const superblockAfter = new Uint8Array(BLOCK_SIZE);
+    const sentinelAfter = new Uint8Array(BLOCK_SIZE);
+    expect(handle.read(superblockAfter, { at: 0 })).toBe(BLOCK_SIZE);
+    expect(handle.read(sentinelAfter, { at: 73 * BLOCK_SIZE })).toBe(
+      BLOCK_SIZE,
+    );
+    expect(superblockAfter).toEqual(corruptSuperblock);
+    expect(sentinelAfter).toEqual(sentinel);
+    expect(
+      bootConsoleWrites.map((bytes) => new TextDecoder().decode(bytes)),
+    ).toContain(
+      "[pmos] persistent root unavailable or invalid; storage left untouched; using volatile tmpfs root\n",
+    );
+  });
+
+  it("/proc/storage reads the live persistent-root quota counters (T084 + T169)", async () => {
+    const { BlockDriver, BlockImageState } =
+      await import("../../src/drivers/block");
+    const handle = makeMemSyncAccessHandle();
+    const blockDriver = BlockDriver.withHandle(
+      handle,
+      4096,
+      BlockImageState.NewlyCreated,
+    );
     const { host } = await freshHost({ blockDriver });
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
@@ -897,7 +1331,7 @@ describe("process lifecycle", () => {
     expect(files).toBeGreaterThanOrEqual(1);
   });
 
-  it("/proc/storage falls back to '0 0 0' when no OPFS is mounted at /persist", async () => {
+  it("/proc/storage falls back to '0 0 0' with a volatile root", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
@@ -968,7 +1402,9 @@ describe("process lifecycle", () => {
       read.heapOut!.slice(0, Number(read.response!.value)),
     );
     // Single line: 1 MiB region with rw-p, [wasm-memory] tag.
-    expect(text).toMatch(/^00000000-00100000 rw-p 00000000 00:00 0 +\[wasm-memory\]\n$/);
+    expect(text).toMatch(
+      /^00000000-00100000 rw-p 00000000 00:00 0 +\[wasm-memory\]\n$/,
+    );
   });
 
   it("/proc/<pid>/fd lists installed file descriptors via the live procfs source", async () => {
@@ -1013,7 +1449,11 @@ describe("process lifecycle", () => {
     const names: string[] = [];
     let off = 0;
     while (off + POLL_DIRENT_HEADER_SIZE <= buf.length) {
-      const v = new DataView(buf.buffer, buf.byteOffset + off, POLL_DIRENT_HEADER_SIZE);
+      const v = new DataView(
+        buf.buffer,
+        buf.byteOffset + off,
+        POLL_DIRENT_HEADER_SIZE,
+      );
       const namlen = v.getUint32(DIRENT_OFF.D_NAMLEN, true);
       if (namlen === 0) break;
       const nameBytes = buf.subarray(
@@ -1129,15 +1569,12 @@ describe("dispatch: FD_WRITE → /dev/console → onConsoleWrite", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.FD_WRITE,
-        requestId: 11,
-        arg0: 99,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_WRITE,
+      requestId: 11,
+      arg0: 99,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.EBADF);
     expect(consoleWrites).toHaveLength(0);
   });
@@ -1174,12 +1611,20 @@ describe("dispatch: injectInput → FD_READ round trip", () => {
 
   it("injectInput accepts Devnum.Console, Devnum.InputKbd, Devnum.InputMouse", async () => {
     const { host } = await freshHost();
+    const wakeBefore = Atomics.load(host.wakeSlot, 0);
     // All three wired input paths accept injection without throwing.
     // (The behavioural effect is covered separately by the
     // user-wasm-runtime tests; here we just prove the routing map.)
-    expect(() => host.injectInput(Devnum.Console, new Uint8Array([1, 2, 3]))).not.toThrow();
-    expect(() => host.injectInput(Devnum.InputKbd, new Uint8Array([1, 2, 3]))).not.toThrow();
-    expect(() => host.injectInput(Devnum.InputMouse, new Uint8Array([1, 2, 3]))).not.toThrow();
+    expect(() =>
+      host.injectInput(Devnum.Console, new Uint8Array([1, 2, 3])),
+    ).not.toThrow();
+    expect(() =>
+      host.injectInput(Devnum.InputKbd, new Uint8Array([1, 2, 3])),
+    ).not.toThrow();
+    expect(() =>
+      host.injectInput(Devnum.InputMouse, new Uint8Array([1, 2, 3])),
+    ).not.toThrow();
+    expect(Atomics.load(host.wakeSlot, 0)).toBe(wakeBefore + 3);
   });
 
   it("injectInput rejects unrouted devnums", async () => {
@@ -1187,12 +1632,14 @@ describe("dispatch: injectInput → FD_READ round trip", () => {
     // Fb0 (Devnum.Fb0 = 10) is write-only from the user side — no
     // input-ring path. The rejection message names the three wired
     // device nodes so a reader knows what IS supported.
-    expect(() => host.injectInput(Devnum.Fb0, new Uint8Array([1, 2, 3]))).toThrow(/not supported/);
+    expect(() =>
+      host.injectInput(Devnum.Fb0, new Uint8Array([1, 2, 3])),
+    ).toThrow(/not supported/);
   });
 
   it("injectInput rejects payloads larger than the heap scratch capacity", async () => {
     const { host } = await freshHost();
-    const tooMuch = new Uint8Array(4097); // heap scratch is 4096
+    const tooMuch = new Uint8Array(64 * 1024 + 1);
     expect(() => host.injectInput(Devnum.Console, tooMuch)).toThrow(/capacity/);
   });
 });
@@ -1459,7 +1906,10 @@ describe("dispatch: PATH_OPEN oflags", () => {
       pathBytes,
     );
     expect(st!.status).toBe(0);
-    const size = new DataView(heapOut.buffer, heapOut.byteOffset).getBigUint64(32, true);
+    const size = new DataView(heapOut.buffer, heapOut.byteOffset).getBigUint64(
+      32,
+      true,
+    );
     expect(size).toBe(0n);
   });
 });
@@ -1525,16 +1975,13 @@ describe("dispatch: PATH_OPEN lookup_flags", () => {
     expect(response!.status).toBe(0);
     const fd = Number(response!.value);
 
-    const { response: stat, heapOut } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.FD_FILESTAT_GET,
-        requestId: 1403,
-        arg0: fd,
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response: stat, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_GET,
+      requestId: 1403,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(stat!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.DIRECTORY);
   });
@@ -1587,16 +2034,13 @@ describe("dispatch: PATH_OPEN lookup_flags", () => {
 
     // Stat the opened fd: filetype should be SYMBOLIC_LINK (7),
     // not DIRECTORY (3).
-    const { response: stat, heapOut } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.FD_FILESTAT_GET,
-        requestId: 1407,
-        arg0: fd,
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response: stat, heapOut } = host.dispatch(pid, {
+      opcode: OP_WASI.FD_FILESTAT_GET,
+      requestId: 1407,
+      arg0: fd,
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(stat!.status).toBe(0);
     expect(heapOut[16]).toBe(FILETYPE.SYMBOLIC_LINK);
   });
@@ -2028,8 +2472,9 @@ describe("dispatch: PATH_FILESTAT_GET", () => {
     expect(response!.extraLen).toBe(64);
     const st = decodeFilestat(heapOut);
     expect(st.filetype).toBe(FILETYPE.DIRECTORY);
-    // Root directory's nlink is 1 in tmpfs; size is 0 (directory).
-    expect(st.size).toBe(0n);
+    // Tmpfs directory size is its direct-child count. The seeded fallback
+    // root has bin, dev, etc, home, opt, proc, run, tmp, and usr.
+    expect(st.size).toBe(9n);
   });
 });
 
@@ -2052,7 +2497,11 @@ describe("dispatch: PATH_FILESTAT_GET", () => {
 // ... → actually it can, through a PATH_OPEN + FD_FILESTAT_GET
 // fold, but the Rust tests already pin this exhaustively).
 
-function encodeSetTimesHeap(atim: bigint, mtim: bigint, path: string): Uint8Array {
+function encodeSetTimesHeap(
+  atim: bigint,
+  mtim: bigint,
+  path: string,
+): Uint8Array {
   const pathBytes = new TextEncoder().encode(path);
   const buf = new Uint8Array(16 + pathBytes.length);
   const view = new DataView(buf.buffer);
@@ -2334,15 +2783,99 @@ describe("dispatch: FD_READDIR", () => {
 
     // Decode one entry — the first one — and verify the header
     // fields + name round-trip cleanly.
-    const v = new DataView(heapOut.buffer, heapOut.byteOffset, POLL_DIRENT_HEADER_SIZE);
+    const v = new DataView(
+      heapOut.buffer,
+      heapOut.byteOffset,
+      POLL_DIRENT_HEADER_SIZE,
+    );
     const dNext = v.getBigUint64(DIRENT_OFF.D_NEXT, true);
     const dNamlen = v.getUint32(DIRENT_OFF.D_NAMLEN, true);
     expect(dNext).toBe(1n);
     expect(dNamlen).toBeGreaterThan(0);
     const name = new TextDecoder().decode(
-      heapOut.subarray(POLL_DIRENT_HEADER_SIZE, POLL_DIRENT_HEADER_SIZE + dNamlen),
+      heapOut.subarray(
+        POLL_DIRENT_HEADER_SIZE,
+        POLL_DIRENT_HEADER_SIZE + dNamlen,
+      ),
     );
     expect(name.length).toBe(dNamlen);
+  });
+});
+
+describe("dispatch: MOUNT over live procfs state", () => {
+  it("does not mistake a nonempty /proc/<pid>/fd directory for empty", async () => {
+    const { host } = await freshHost();
+    const pid = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(pid, 7);
+    host.markRunning(pid);
+
+    const target = new TextEncoder().encode(`/proc/${pid}/fd`);
+    const fstype = new TextEncoder().encode("tmpfs");
+    const heap = new Uint8Array(target.length + fstype.length);
+    heap.set(target, 0);
+    heap.set(fstype, target.length);
+    const args = new Uint8Array(16);
+    const view = new DataView(args.buffer);
+    view.setUint32(0, 0, true);
+    view.setUint32(4, target.length, true);
+    view.setUint32(8, target.length, true);
+    view.setUint32(12, fstype.length, true);
+
+    const rejected = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.MOUNT,
+        requestId: 9050,
+        args,
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(rejected.response!.status).toBe(-ERRNO.EINVAL);
+
+    // Prime the live procfs projection above, then prove an unsupported
+    // filesystem type is rejected before the target is consulted. A skipped
+    // projection must not make this result depend on stale procfs state.
+    const unsupported = new TextEncoder().encode("ext4");
+    const unsupportedHeap = new Uint8Array(target.length + unsupported.length);
+    unsupportedHeap.set(target, 0);
+    unsupportedHeap.set(unsupported, target.length);
+    const unsupportedArgs = new Uint8Array(args);
+    const unsupportedView = new DataView(unsupportedArgs.buffer);
+    unsupportedView.setUint32(12, unsupported.length, true);
+    const unsupportedResult = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.MOUNT,
+        requestId: 9051,
+        args: unsupportedArgs,
+        heapPtr: 0,
+        heapLen: unsupportedHeap.length,
+      },
+      unsupportedHeap,
+    );
+    expect(unsupportedResult.response!.status).toBe(-ERRNO.EINVAL);
+
+    const closed = host.dispatch(pid, {
+      opcode: OP_WASI.FD_CLOSE,
+      requestId: 9052,
+      arg0: 7,
+    });
+    expect(closed.response!.status).toBe(0);
+
+    const mounted = host.dispatch(
+      pid,
+      {
+        opcode: OP_EXT.MOUNT,
+        requestId: 9053,
+        args,
+        heapPtr: 0,
+        heapLen: heap.length,
+      },
+      heap,
+    );
+    expect(mounted.response!.status).toBe(0);
   });
 });
 
@@ -2852,7 +3385,10 @@ describe("dispatch: PATH_SYMLINK", () => {
 // return the right filetype. Also pins ELOOP end-to-end on a self-
 // referential symlink (`/a → /a`) with follow requested.
 
-function encodePathFilestatArgs(dirFd: number, lookupFlags: number): Uint8Array {
+function encodePathFilestatArgs(
+  dirFd: number,
+  lookupFlags: number,
+): Uint8Array {
   const args = new Uint8Array(16);
   const v = new DataView(args.buffer);
   v.setUint32(0, dirFd, true);
@@ -3030,7 +3566,11 @@ describe("dispatch: PATH_FILESTAT_GET symlink-follow lookup flags", () => {
       dirPath,
     );
 
-    for (const [target, link] of [["/target", "/c"], ["/c", "/b"], ["/b", "/a"]] as const) {
+    for (const [target, link] of [
+      ["/target", "/c"],
+      ["/c", "/b"],
+      ["/b", "/a"],
+    ] as const) {
       const heap = encodePathSymlinkHeap(target, link);
       host.dispatch(
         pid,
@@ -3305,30 +3845,35 @@ describe("dispatch: PATH_READLINK", () => {
 
 // ---- dispatch: FD_PRESTAT_DIR_NAME ---------------------------------
 //
-// Companion to fd_prestat_get. v1 has no preopens so the kernel
-// always returns -EBADF, matching fd_prestat_get's semantic. Pinning
-// the consistency invariant here keeps the libc preopen-discovery
-// loop working — the loop iterates fd 3/4/5 calling both opcodes
-// until both return EBADF. Pre-slice, dir_name returned ENOSYS which
-// broke the loop; post-slice both agree on EBADF.
+// Companion to fd_prestat_get. PMos installs `/` at fd 3, then libc's
+// scan terminates when fd 4 reports EBADF (it is a signal channel, not
+// another directory preopen).
 
 describe("dispatch: FD_PRESTAT_DIR_NAME", () => {
-  it("returns -EBADF for any fd (no preopens in v1)", async () => {
+  it("writes the root preopen name", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
+    host.installRootPreopenFd(pid, 3);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(pid, {
-      opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
-      requestId: 1040,
-      arg0: 3,
-      heapPtr: 0,
-      heapLen: 64,
-    });
-    expect(response!.status).toBe(-ERRNO.EBADF);
+    const { response, heapOut } = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.FD_PRESTAT_DIR_NAME,
+        requestId: 1040,
+        arg0: 3,
+        heapPtr: 0,
+        heapLen: 1,
+      },
+      new Uint8Array(1),
+    );
+    expect(response!.status).toBe(0);
+    expect(response!.value).toBe(1n);
+    expect(response!.extraLen).toBe(1);
+    expect(new TextDecoder().decode(heapOut)).toBe("/");
   });
 
-  it("returns -EBADF even for an installed fd", async () => {
+  it("returns -EBADF for an installed non-preopen fd", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.installConsoleFd(pid, 3);
@@ -3583,10 +4128,7 @@ describe("dispatch: PATH_REMOVE_DIRECTORY", () => {
 // invariant and the clear-on-zero semantics that require direct
 // FdTable inspection.
 
-function encodeFdFdstatSetFlagsArgs(
-  fd: number,
-  fdflags: number,
-): Uint8Array {
+function encodeFdFdstatSetFlagsArgs(fd: number, fdflags: number): Uint8Array {
   const args = new Uint8Array(16);
   const v = new DataView(args.buffer);
   v.setUint32(0, fd, true);
@@ -3650,10 +4192,7 @@ describe("dispatch: FD_FDSTAT_SET_FLAGS", () => {
 // with CREAT is not wired yet), so that branch is covered by the
 // Rust tests only.
 
-function encodeFdFilestatSetSizeArgs(
-  fd: number,
-  newSize: bigint,
-): Uint8Array {
+function encodeFdFilestatSetSizeArgs(fd: number, newSize: bigint): Uint8Array {
   const args = new Uint8Array(16);
   const v = new DataView(args.buffer);
   v.setUint32(0, fd, true);
@@ -4769,7 +5308,10 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       {
         opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
         requestId: 862,
-        args: encodeFdSetTimesArgs(99, FSTFLAGS.SET_ATIM | FSTFLAGS.SET_ATIM_NOW),
+        args: encodeFdSetTimesArgs(
+          99,
+          FSTFLAGS.SET_ATIM | FSTFLAGS.SET_ATIM_NOW,
+        ),
         heapPtr: 0,
         heapLen: heap.length,
       },
@@ -4789,7 +5331,10 @@ describe("dispatch: FD_FILESTAT_SET_TIMES", () => {
       {
         opcode: OP_WASI.FD_FILESTAT_SET_TIMES,
         requestId: 863,
-        args: encodeFdSetTimesArgs(99, FSTFLAGS.SET_MTIM | FSTFLAGS.SET_MTIM_NOW),
+        args: encodeFdSetTimesArgs(
+          99,
+          FSTFLAGS.SET_MTIM | FSTFLAGS.SET_MTIM_NOW,
+        ),
         heapPtr: 0,
         heapLen: heap.length,
       },
@@ -4904,7 +5449,11 @@ interface DecodedEvent {
 }
 
 function decodeEvent(heap: Uint8Array, offset: number): DecodedEvent {
-  const v = new DataView(heap.buffer, heap.byteOffset + offset, POLL_EVENT_SIZE);
+  const v = new DataView(
+    heap.buffer,
+    heap.byteOffset + offset,
+    POLL_EVENT_SIZE,
+  );
   return {
     userdata: v.getBigUint64(POLL_EVENT_OFF.USERDATA, true),
     error: v.getUint16(POLL_EVENT_OFF.ERROR, true),
@@ -4956,6 +5505,62 @@ describe("dispatch: POLL_ONEOFF", () => {
     expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
+  it("rejects an oversized ordinary poll before preparing procfs targets", async () => {
+    let nowCalls = 0;
+    const { host } = await freshHost({
+      nowNs: () => {
+        nowCalls += 1;
+        return 0n;
+      },
+    });
+    const pid = host.registerProcess(CAPSET_ORDINARY_APP);
+    host.markRunning(pid);
+    const count = 33;
+    const oversizedPoll = (fd: number, requestId: number) => {
+      const heap = new Uint8Array(count * POLL_SUBSCRIPTION_SIZE);
+      for (let index = 0; index < count; index += 1) {
+        heap.set(
+          packSubFdRw(BigInt(index), EVENTTYPE.FD_READ, fd),
+          index * POLL_SUBSCRIPTION_SIZE,
+        );
+      }
+      return host.dispatch(
+        pid,
+        {
+          opcode: OP_WASI.POLL_ONEOFF,
+          requestId,
+          args: packPollArgs(count, count),
+          heapPtr: 0,
+          heapLen: heap.length,
+        },
+        heap,
+      );
+    };
+
+    const beforeBaseline = nowCalls;
+    expect(oversizedPoll(0, 0x833f).response!.status).toBe(-ERRNO.EINVAL);
+    const baselineClockReads = nowCalls - beforeBaseline;
+
+    const path = new TextEncoder().encode("/proc/loadavg");
+    const opened = host.dispatch(
+      pid,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 0x8340,
+        arg0: 0,
+        heapPtr: 0,
+        heapLen: path.length,
+      },
+      path,
+    );
+    expect(opened.response!.status).toBe(0);
+    const fd = Number(opened.response!.value);
+    const callsBeforePoll = nowCalls;
+    const poll = oversizedPoll(fd, 0x8341);
+    expect(poll.response!.status).toBe(-ERRNO.EINVAL);
+    expect(nowCalls - callsBeforePoll).toBe(baselineClockReads);
+  });
+
   it("CLOCK monotonic with ABSTIME in the past fires one ready event", async () => {
     const { host } = await freshHost({ nowNs: () => 1_000_000_000n });
     const pid = host.registerProcess(CAPSET_ALL);
@@ -4989,8 +5594,10 @@ describe("dispatch: POLL_ONEOFF", () => {
     expect(ev.type).toBe(EVENTTYPE.CLOCK);
   });
 
-  it("CLOCK monotonic with ABSTIME far in the future emits zero events", async () => {
-    const { host } = await freshHost({ nowNs: () => 1_000n });
+  it("CLOCK monotonic with future ABSTIME parks and wakes exactly at the deadline", async () => {
+    let now = 1_000n;
+    const deadline = 2_000n;
+    const { host } = await freshHost({ nowNs: () => now });
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
@@ -4998,11 +5605,11 @@ describe("dispatch: POLL_ONEOFF", () => {
     const sub = packSubClock(
       7n,
       CLOCKID.MONOTONIC,
-      0xFFFF_FFFF_FFFF_FFFFn,
+      deadline,
       SUBCLOCKFLAGS.ABSTIME,
     );
     heap.set(sub, 0);
-    const { response } = host.dispatch(
+    const result = host.dispatch(
       pid,
       {
         opcode: OP_WASI.POLL_ONEOFF,
@@ -5013,9 +5620,30 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response!.status).toBe(0);
-    expect(response!.value).toBe(0n);
-    expect(response!.extraLen).toBe(0);
+    expect(result.parked).toBe(true);
+    expect(result.response).toBeUndefined();
+    expect(host.nextPollTimeoutNs()).toBe(deadline - now);
+    expect(host.takeNextWakeForPidWithHeap(pid)).toBeNull();
+
+    now = deadline - 1n;
+    expect(host.servicePollWaiters()).toBe(0);
+    expect(host.nextPollTimeoutNs()).toBe(1n);
+    expect(host.takeNextWakeForPidWithHeap(pid)).toBeNull();
+
+    now = deadline;
+    expect(host.servicePollWaiters()).toBe(1);
+    const wake = host.takeNextWakeForPidWithHeap(pid);
+    expect(wake).not.toBeNull();
+    expect(wake!.response.requestId).toBe(833);
+    expect(wake!.response.status).toBe(0);
+    expect(wake!.response.value).toBe(1n);
+    expect(wake!.response.extraLen).toBe(POLL_EVENT_SIZE);
+    expect(wake!.heapBytes).not.toBeNull();
+    const ev = decodeEvent(wake!.heapBytes!, 0);
+    expect(ev.userdata).toBe(7n);
+    expect(ev.error).toBe(0);
+    expect(ev.type).toBe(EVENTTYPE.CLOCK);
+    expect(host.takeNextWakeForPidWithHeap(pid)).toBeNull();
   });
 
   it("CLOCK with relative timeout 0 is ready (non-blocking semantics)", async () => {
@@ -5143,7 +5771,7 @@ describe("dispatch: POLL_ONEOFF", () => {
     expect(ev.rwflags).toBe(0);
   });
 
-  it("FD_READ on an empty /dev/console is not yet ready (zero events)", async () => {
+  it("FD_READ on an empty /dev/console parks and injected input wakes it", async () => {
     const { host } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.installConsoleFd(pid, 0);
@@ -5151,7 +5779,7 @@ describe("dispatch: POLL_ONEOFF", () => {
 
     const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
     heap.set(packSubFdRw(6n, EVENTTYPE.FD_READ, 0), 0);
-    const { response } = host.dispatch(
+    const result = host.dispatch(
       pid,
       {
         opcode: OP_WASI.POLL_ONEOFF,
@@ -5162,8 +5790,26 @@ describe("dispatch: POLL_ONEOFF", () => {
       },
       heap,
     );
-    expect(response!.status).toBe(0);
-    expect(response!.value).toBe(0n);
+    expect(result.parked).toBe(true);
+    expect(result.response).toBeUndefined();
+    expect(host.nextPollTimeoutNs()).toBe(0xffff_ffff_ffff_ffffn);
+    expect(host.takeNextWakeForPidWithHeap(pid)).toBeNull();
+
+    host.injectInput(Devnum.Console, new TextEncoder().encode("hi"));
+    const wake = host.takeNextWakeForPidWithHeap(pid);
+    expect(wake).not.toBeNull();
+    expect(wake!.response.requestId).toBe(839);
+    expect(wake!.response.status).toBe(0);
+    expect(wake!.response.value).toBe(1n);
+    expect(wake!.response.extraLen).toBe(POLL_EVENT_SIZE);
+    expect(wake!.heapBytes).not.toBeNull();
+    const ev = decodeEvent(wake!.heapBytes!, 0);
+    expect(ev.userdata).toBe(6n);
+    expect(ev.error).toBe(0);
+    expect(ev.type).toBe(EVENTTYPE.FD_READ);
+    expect(ev.nbytes).toBe(2n);
+    expect(ev.rwflags).toBe(0);
+    expect(host.takeNextWakeForPidWithHeap(pid)).toBeNull();
   });
 
   it("events_cap clamps the output when more subs are ready than the cap allows", async () => {
@@ -5176,7 +5822,10 @@ describe("dispatch: POLL_ONEOFF", () => {
     // events — events overwrite subs in place).
     const heap = new Uint8Array(3 * POLL_SUBSCRIPTION_SIZE);
     heap.set(packSubClock(1n, CLOCKID.MONOTONIC, 0n, 0), 0);
-    heap.set(packSubClock(2n, CLOCKID.MONOTONIC, 0n, 0), POLL_SUBSCRIPTION_SIZE);
+    heap.set(
+      packSubClock(2n, CLOCKID.MONOTONIC, 0n, 0),
+      POLL_SUBSCRIPTION_SIZE,
+    );
     heap.set(
       packSubClock(3n, CLOCKID.REALTIME, 0n, 0),
       2 * POLL_SUBSCRIPTION_SIZE,
@@ -5203,7 +5852,7 @@ describe("dispatch: POLL_ONEOFF", () => {
     host.markRunning(pid);
 
     const heap = new Uint8Array(POLL_SUBSCRIPTION_SIZE);
-    const ud = 0xDEAD_BEEF_CAFE_BABEn;
+    const ud = 0xdead_beef_cafe_baben;
     heap.set(packSubClock(ud, CLOCKID.MONOTONIC, 0n, 0), 0);
     const { response, heapOut } = host.dispatch(
       pid,
@@ -5631,16 +6280,13 @@ describe("dispatch: PROC_WAIT", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_WAIT,
-        requestId: 1300,
-        args: encodeProcWaitArgs(-1, 0),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 1300,
+      args: encodeProcWaitArgs(-1, 0),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.ECHILD);
   });
 
@@ -5649,16 +6295,13 @@ describe("dispatch: PROC_WAIT", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_WAIT,
-        requestId: 1301,
-        args: encodeProcWaitArgs(pid, 0),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 1301,
+      args: encodeProcWaitArgs(pid, 0),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.ECHILD);
   });
 
@@ -5667,16 +6310,13 @@ describe("dispatch: PROC_WAIT", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_WAIT,
-        requestId: 1302,
-        args: encodeProcWaitArgs(-42, 0),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 1302,
+      args: encodeProcWaitArgs(-42, 0),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 });
@@ -5800,6 +6440,44 @@ describe("dispatch: PROC_WAIT blocking", () => {
     expect(host.takeNextWakeForPidWithHeap(parent)).toBeNull();
   });
 
+  it("host-observed trap reconciles once and wakes a parked parent as Crashed", async () => {
+    const { host } = await freshHost();
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+    const child = host.spawnChildForTest(parent, "trapped-child");
+
+    const waitResult = host.dispatch(parent, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 0x2c13,
+      args: encodeProcWaitArgs(-1, 0),
+      heapPtr: 0,
+      heapLen: 4,
+    });
+    expect(waitResult.parked).toBe(true);
+
+    expect(host.reconcileProcessExit(child, -1, true)).toBe(true);
+    const wake = host.takeNextWakeForPidWithHeap(parent);
+    expect(wake?.response.requestId).toBe(0x2c13);
+    expect(wake?.response.status).toBe(0);
+    expect(wake?.response.value).toBe(BigInt(0x04) << BigInt(40));
+    expect(wake?.heapBytes).not.toBeNull();
+    expect(
+      new DataView(
+        wake!.heapBytes!.buffer,
+        wake!.heapBytes!.byteOffset,
+        4,
+      ).getUint32(0, true),
+    ).toBe(child);
+
+    // Parent reaped the child inline while waking, so a duplicate
+    // host callback is stale and cannot publish a second wake.
+    expect(host.reconcileProcessExit(child, 0, false)).toBe(false);
+    expect(host.takeNextWakeForPid(parent)).toBeNull();
+  });
+
   it("SIGTERM wakes parked parent with EINTR", async () => {
     const { host } = await freshHost();
 
@@ -5817,7 +6495,7 @@ describe("dispatch: PROC_WAIT blocking", () => {
 
     // Parent needs a child of its own so the proc_wait doesn't
     // hit the NoChildren → ECHILD early-reject.
-    const _child = host.spawnChildForTest(parent, "child");
+    host.spawnChildForTest(parent, "child");
 
     // Parent parks on PROC_WAIT(target=-1, options=0).
     const waitArgs = new Uint8Array(16);
@@ -5882,16 +6560,13 @@ describe("dispatch: PROC_CAPS_GET", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_CAPS_GET,
-        requestId: 1320,
-        args: encodeProcCapsGetArgs(pid),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_CAPS_GET,
+      requestId: 1320,
+      args: encodeProcCapsGetArgs(pid),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
     // CAPSET_ALL = u64::MAX. As an i64 that's -1; bit-pattern
     // round-trips through the value field.
@@ -5903,16 +6578,13 @@ describe("dispatch: PROC_CAPS_GET", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_CAPS_GET,
-        requestId: 1321,
-        args: encodeProcCapsGetArgs(9999),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_CAPS_GET,
+      requestId: 1321,
+      args: encodeProcCapsGetArgs(9999),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.ESRCH);
   });
 });
@@ -5938,16 +6610,13 @@ describe("dispatch: PROC_KILL", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1310,
-        args: encodeProcKillArgs(pid, 77),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1310,
+      args: encodeProcKillArgs(pid, 77),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
@@ -5956,16 +6625,13 @@ describe("dispatch: PROC_KILL", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1311,
-        args: encodeProcKillArgs(9999, 15),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1311,
+      args: encodeProcKillArgs(9999, 15),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.ESRCH);
   });
 
@@ -5976,16 +6642,13 @@ describe("dispatch: PROC_KILL", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1312,
-        args: encodeProcKillArgs(pid, 2),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1312,
+      args: encodeProcKillArgs(pid, 2),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
   });
 
@@ -6000,16 +6663,13 @@ describe("dispatch: PROC_KILL", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1313,
-        args: encodeProcKillArgs(pid, 0),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1313,
+      args: encodeProcKillArgs(pid, 0),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
   });
 
@@ -6018,16 +6678,13 @@ describe("dispatch: PROC_KILL", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1314,
-        args: encodeProcKillArgs(9999, 0),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1314,
+      args: encodeProcKillArgs(9999, 0),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.ESRCH);
   });
 
@@ -6042,16 +6699,13 @@ describe("dispatch: PROC_KILL", () => {
     host.markRunning(sender);
     host.markRunning(target);
 
-    const { response } = host.dispatch(
-      sender,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1315,
-        args: encodeProcKillArgs(target, 0),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(sender, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1315,
+      args: encodeProcKillArgs(target, 0),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.ENOTCAPABLE);
   });
 
@@ -6065,16 +6719,13 @@ describe("dispatch: PROC_KILL", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1316,
-        args: encodeProcKillArgs(pid, 13),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1316,
+      args: encodeProcKillArgs(pid, 13),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
   });
 
@@ -6083,16 +6734,13 @@ describe("dispatch: PROC_KILL", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_EXT.PROC_KILL,
-        requestId: 1317,
-        args: encodeProcKillArgs(pid, 17),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_EXT.PROC_KILL,
+      requestId: 1317,
+      args: encodeProcKillArgs(pid, 17),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
   });
 });
@@ -6119,16 +6767,13 @@ describe("dispatch: PROC_RAISE", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.PROC_RAISE,
-        requestId: 1320,
-        args: encodeProcRaiseArgs(77),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.PROC_RAISE,
+      requestId: 1320,
+      args: encodeProcRaiseArgs(77),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(-ERRNO.EINVAL);
   });
 
@@ -6139,16 +6784,13 @@ describe("dispatch: PROC_RAISE", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.PROC_RAISE,
-        requestId: 1321,
-        args: encodeProcRaiseArgs(2),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.PROC_RAISE,
+      requestId: 1321,
+      args: encodeProcRaiseArgs(2),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
   });
 
@@ -6157,21 +6799,19 @@ describe("dispatch: PROC_RAISE", () => {
     // returns success; the dispatcher has already written the
     // response before the caller's Worker is torn down on the next
     // dispatch pass.
-    const { host } = await freshHost();
+    const { host, terminateCalls } = await freshHost();
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.PROC_RAISE,
-        requestId: 1322,
-        args: encodeProcRaiseArgs(9),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.PROC_RAISE,
+      requestId: 1322,
+      args: encodeProcRaiseArgs(9),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
+    expect(terminateCalls).toEqual([pid]);
   });
 
   // Signums 13 (SIGPIPE) and 17 (SIGCHLD) were added to the
@@ -6185,16 +6825,13 @@ describe("dispatch: PROC_RAISE", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.PROC_RAISE,
-        requestId: 1323,
-        args: encodeProcRaiseArgs(13),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.PROC_RAISE,
+      requestId: 1323,
+      args: encodeProcRaiseArgs(13),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
   });
 
@@ -6203,16 +6840,13 @@ describe("dispatch: PROC_RAISE", () => {
     const pid = host.registerProcess(CAPSET_ALL);
     host.markRunning(pid);
 
-    const { response } = host.dispatch(
-      pid,
-      {
-        opcode: OP_WASI.PROC_RAISE,
-        requestId: 1324,
-        args: encodeProcRaiseArgs(17),
-        heapPtr: 0,
-        heapLen: 0,
-      },
-    );
+    const { response } = host.dispatch(pid, {
+      opcode: OP_WASI.PROC_RAISE,
+      requestId: 1324,
+      args: encodeProcRaiseArgs(17),
+      heapPtr: 0,
+      heapLen: 0,
+    });
     expect(response!.status).toBe(0);
   });
 });
@@ -6742,6 +7376,123 @@ describe("dispatch: PROC_SPAWN", () => {
     });
   });
 
+  it("rejects a procfs executable without leaking a tentative child", async () => {
+    const { host, spawnCalls } = await freshHost();
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    const manifest = encodeSpawnManifest({
+      path: `/proc/${parent}/status`,
+      caps: CAPSET_ALL,
+    });
+    const spawn = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 0x4f10,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+
+    // Executables may come only from the immutable bundled namespaces or
+    // executable files beneath /opt. Procfs is live here, but never an
+    // executable namespace, so the authoritative loader rejects it.
+    expect(spawn.response?.status).toBe(-ERRNO.EACCES);
+    expect(spawnCalls).toHaveLength(0);
+
+    const wait = host.dispatch(parent, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 0x4f11,
+      args: encodeProcWaitArgs(-1, 1),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(wait.response?.status).toBe(-ERRNO.ECHILD);
+  });
+
+  it("passes exact executable bytes when the spawn path exists in the VFS", async () => {
+    const { host, spawnCalls } = await freshHost();
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+
+    const programPath = "/opt/dynamic.wasm";
+    const pathBytes = new TextEncoder().encode(programPath);
+    const program = new Uint8Array([
+      0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0xaa, 0xbb,
+    ]);
+    const open = host.dispatch(
+      parent,
+      {
+        opcode: OP_WASI.PATH_OPEN,
+        requestId: 405,
+        args: encodePathOpenArgs(0, OFLAG_CREAT | OFLAG_EXCL, 0o644),
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(open.response!.status).toBe(0);
+    const fd = Number(open.response!.value);
+    const write = host.dispatch(
+      parent,
+      {
+        opcode: OP_WASI.FD_WRITE,
+        requestId: 406,
+        arg0: fd,
+        heapPtr: 0,
+        heapLen: program.length,
+      },
+      program,
+    );
+    expect(write.response!.status).toBe(0);
+
+    const chmodArgs = new Uint8Array(16);
+    const chmodView = new DataView(chmodArgs.buffer);
+    chmodView.setUint32(0, pathBytes.length, true);
+    chmodView.setUint32(4, 0o755, true);
+    const chmod = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.FS_CHMOD,
+        requestId: 407,
+        args: chmodArgs,
+        heapPtr: 0,
+        heapLen: pathBytes.length,
+      },
+      pathBytes,
+    );
+    expect(chmod.response!.status).toBe(0);
+
+    const manifest = encodeSpawnManifest({
+      path: programPath,
+      caps: CAPSET_ALL,
+    });
+    const spawn = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 408,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawn.response!.status).toBe(0);
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.path).toBe(programPath);
+    expect(spawnCalls[0]!.executable).toEqual(program);
+  });
+
   it("spawn with argv + envp threads them through to ARGS_GET / ENVIRON_GET on the child", async () => {
     const { host } = await freshHost();
     const parent = host.registerProcess(CAPSET_ALL);
@@ -6789,7 +7540,9 @@ describe("dispatch: PROC_SPAWN", () => {
       argsSizes.heapOut!.byteOffset,
     );
     expect(argsSizesView.getUint32(0, true)).toBe(3);
-    expect(argsSizesView.getUint32(4, true)).toBe("echo\0hello\0world\0".length);
+    expect(argsSizesView.getUint32(4, true)).toBe(
+      "echo\0hello\0world\0".length,
+    );
 
     // ARGS_GET writes the NUL-terminated argv concatenated.
     const argsGet = host.dispatch(child, {
@@ -6830,7 +7583,9 @@ describe("dispatch: PROC_SPAWN", () => {
     });
     expect(envGet.response!.status).toBe(0);
     const envBytes = envGet.heapOut!.subarray(0, envGet.response!.extraLen);
-    expect(new TextDecoder().decode(envBytes)).toBe("LANG=C\0PATH=/bin:/usr/bin\0");
+    expect(new TextDecoder().decode(envBytes)).toBe(
+      "LANG=C\0PATH=/bin:/usr/bin\0",
+    );
   });
 
   it("rolls back the new pid when onSpawnProcess rejects", async () => {
@@ -6892,6 +7647,55 @@ describe("dispatch: PROC_SPAWN", () => {
     expect(retry.response!.status).toBeLessThan(0);
   });
 
+  it("rolls back when publishing proc:spawn throws", async () => {
+    const host = await KernelWasmHost.create(wasmBytes, {
+      binaryRegistry: new Map<string, BufferSource>([
+        ["/usr/bin/hello", new Uint8Array([0x00]).buffer],
+      ]),
+      kernelWorkerChannel: {
+        postMessage: (): void => {
+          throw new Error("kernel Worker channel closed");
+        },
+      },
+      nowNs: () => 0n,
+      nowRealtimeNs: () => 0n,
+    });
+    const parent = host.registerProcess(CAPSET_ALL);
+    host.installConsoleFd(parent, 0);
+    host.installConsoleFd(parent, 1);
+    host.installConsoleFd(parent, 2);
+    host.markRunning(parent);
+    const manifest = encodeSpawnManifest({
+      path: "/usr/bin/hello",
+      caps: CAPSET_ALL,
+    });
+
+    const spawn = host.dispatch(
+      parent,
+      {
+        opcode: OP_EXT.PROC_SPAWN,
+        requestId: 0x4f01,
+        args: manifest.args,
+        heapPtr: 0,
+        heapLen: manifest.heap.length,
+      },
+      manifest.heap,
+    );
+    expect(spawn.response?.status).toBe(-29); // abi::errno::EIO
+
+    // Rollback removed the tentative child; the parent has nothing
+    // left to wait for even though pid allocation itself stays
+    // monotonic for the rest of the boot.
+    const wait = host.dispatch(parent, {
+      opcode: OP_EXT.PROC_WAIT,
+      requestId: 0x4f02,
+      args: encodeProcWaitArgs(-1, 1),
+      heapPtr: 0,
+      heapLen: 0,
+    });
+    expect(wait.response?.status).toBe(-ERRNO.ECHILD);
+  });
+
   it("rejects spawn from a parent missing stdio with -EINVAL", async () => {
     const { host, spawnCalls } = await freshHost();
     const parent = host.registerProcess(CAPSET_ALL);
@@ -6925,7 +7729,7 @@ describe("dispatch: PROC_SPAWN", () => {
     const { host, spawnCalls } = await freshHost();
     // An ordinary-app parent only holds DisplayClient. Spawning a
     // child with CAPSET_DESKTOP_SHELL (which includes SHELL,
-    // ProcEnumerate, KeymapAdmin) violates the subset rule — the
+    // ProcEnumerate, ProcKillAny, KeymapAdmin) violates the subset rule — the
     // Rust-side `Kernel::proc_spawn` rejects it as NotCapable.
     const parent = host.registerProcess(CAPSET_ORDINARY_APP);
     host.installConsoleFd(parent, 0);
@@ -6965,7 +7769,7 @@ describe("dispatch: heap overflow", () => {
     host.installConsoleFd(pid, 1);
     host.markRunning(pid);
 
-    const huge = new Uint8Array(5000); // > 4096 heap scratch
+    const huge = new Uint8Array(64 * 1024 + 1);
     huge.fill(0x41);
     expect(() =>
       host.dispatch(
@@ -7029,7 +7833,9 @@ function seedRequest(
   new Uint8Array(sab.buffer, OFF_REQ_RING, SAB_SLOT_SIZE).set(reqBytes);
   if (heap !== undefined && heap.length > 0) {
     const offset = request.heapPtr ?? 0;
-    new Uint8Array(sab.buffer, OFF_HEAP_SCRATCH + offset, heap.length).set(heap);
+    new Uint8Array(sab.buffer, OFF_HEAP_SCRATCH + offset, heap.length).set(
+      heap,
+    );
   }
   const header = new Int32Array(sab.buffer, 0, OFF_HEAP_SCRATCH / 4);
   Atomics.store(header, OFF_REQ_HEAD / 4, 1);

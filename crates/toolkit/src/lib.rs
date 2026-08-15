@@ -25,15 +25,24 @@ pub mod draw;
 pub mod layout;
 pub mod protocol;
 pub mod theme;
+pub mod wasi;
 pub mod widget;
 pub mod window;
 
 pub use app::App;
 pub use decorated_window::{DecoratedPointerOutcome, DecoratedWindow};
-pub use draw::BufferPool;
-pub use protocol::{
-    Client, ClientError, ClientEvent, ClientEventWithPayload, Connection, MemoryConnection,
+pub use draw::{
+    BufferPool, CommitProgress, CurrentPatch, MAX_DAMAGE_REGIONS, SHM_WRITE_CHUNK_BYTES,
 };
+pub use protocol::{
+    Client, ClientError, ClientEvent, ClientEventWithPayload, Connection, MemoryConnection, WaitFd,
+    WaitInterest,
+};
+pub use theme::{watch_theme, Theme, ThemeWatcher};
+#[cfg(target_arch = "wasm32")]
+pub use wasi::wait_fd;
+#[cfg(target_arch = "wasm32")]
+pub use wasi::{FdConnection, FsWatch, PathWatch};
 pub use window::Window;
 
 // Re-export the shared protocol types so toolkit callers get
@@ -41,6 +50,6 @@ pub use window::Window;
 // etc.) without having to also depend on `display-proto`
 // directly.
 pub use display_proto::{
-    Direction, IdAllocator, IdError, IdKind, Interface, MessageHeader, ObjectId,
-    Opcode, OpcodeError, WireError, HEADER_SIZE,
+    Direction, IdAllocator, IdError, IdKind, Interface, MessageHeader, ObjectId, Opcode,
+    OpcodeError, WireError, HEADER_SIZE,
 };

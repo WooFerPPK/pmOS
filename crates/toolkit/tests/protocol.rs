@@ -8,11 +8,18 @@
 //! bind/create/commit sequence to prove the two sides stay
 //! in sync on the identical wire format from `display-proto`.
 
-use toolkit::protocol::{Client, ClientError, MemoryConnection};
-use toolkit::{HEADER_SIZE, Interface, MessageHeader, ObjectId};
+use toolkit::protocol::{Client, ClientError, Connection, MemoryConnection};
+use toolkit::{Interface, MessageHeader, ObjectId, HEADER_SIZE};
 
 fn boot() -> Client<MemoryConnection> {
     Client::new(MemoryConnection::new())
+}
+
+#[test]
+fn in_memory_transport_default_wait_is_immediate_success() {
+    let mut connection = MemoryConnection::new();
+    assert_eq!(connection.wait(None), Ok(()));
+    assert_eq!(connection.wait_with(&[], None), Ok(()));
 }
 
 #[test]
@@ -77,9 +84,7 @@ fn drop_object_removes_binding_and_second_drop_is_false() {
 #[test]
 fn send_request_on_unknown_object_is_unknown_object() {
     let mut c = boot();
-    let err = c
-        .send_request(ObjectId::new(99), 1, &[])
-        .unwrap_err();
+    let err = c.send_request(ObjectId::new(99), 1, &[]).unwrap_err();
     assert_eq!(
         err,
         ClientError::UnknownObject {
@@ -135,6 +140,88 @@ fn send_request_encodes_a_header_into_the_outbound_queue() {
 }
 
 #[test]
+fn surface_patch_current_encodes_one_bounded_typed_request() {
+    let mut c = boot();
+    let surface = c.bind_new(Interface::Surface).unwrap();
+    let pixels = vec![0x5a; 2 * 2 * 4];
+
+    c.surface_patch_current(surface, 3, 4, 2, 2, &pixels)
+        .expect("valid current patch");
+
+    let bytes = c.drain_outbound();
+    let header = MessageHeader::decode(&bytes).expect("patch header");
+    assert_eq!(header.object_id, surface);
+    assert_eq!(header.opcode, 8);
+    assert_eq!(header.payload_len(), 16 + pixels.len());
+    let patch = display_proto::SurfacePatchCurrent::decode(&bytes[HEADER_SIZE..])
+        .expect("typed current patch");
+    assert_eq!((patch.x, patch.y, patch.width, patch.height), (3, 4, 2, 2));
+    assert_eq!(patch.pixels, pixels);
+}
+
+#[test]
+fn surface_patch_current_rejects_invalid_shape_before_sending() {
+    let mut c = boot();
+    let surface = c.bind_new(Interface::Surface).unwrap();
+
+    for (x, y, width, height, pixels) in [
+        (-1, 0, 1, 1, vec![0; 4]),
+        (0, -1, 1, 1, vec![0; 4]),
+        (0, 0, 0, 1, vec![]),
+        (0, 0, 2, 2, vec![0; 15]),
+        (
+            0,
+            0,
+            (display_proto::MAX_SURFACE_PATCH_BYTES / 4 + 1) as u32,
+            1,
+            vec![0; display_proto::MAX_SURFACE_PATCH_BYTES + 4],
+        ),
+    ] {
+        assert!(matches!(
+            c.surface_patch_current(surface, x, y, width, height, &pixels),
+            Err(ClientError::InvalidSurfacePatch { .. })
+        ));
+    }
+    assert!(c.drain_outbound().is_empty());
+}
+
+#[test]
+fn surface_frame_binds_typed_callback_and_encodes_exact_request() {
+    let mut client = boot();
+    let surface = client.bind_new(Interface::Surface).unwrap();
+
+    let callback = client.surface_frame(surface).unwrap();
+
+    assert_eq!(client.get(callback), Some(Interface::Callback));
+    let bytes = client.drain_outbound();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!((header.object_id, header.opcode), (surface, 4));
+    assert_eq!(header.length as usize, HEADER_SIZE + 4);
+    assert_eq!(
+        display_proto::SurfaceFrame::decode(&bytes[HEADER_SIZE..])
+            .unwrap()
+            .new_id,
+        callback
+    );
+}
+
+#[test]
+fn surface_frame_rolls_back_callback_binding_when_send_validation_fails() {
+    let mut client = boot();
+    let object_count = client.object_count();
+
+    assert_eq!(
+        client.surface_frame(ObjectId::new(99)),
+        Err(ClientError::UnknownObject {
+            id: ObjectId::new(99)
+        })
+    );
+    assert_eq!(client.object_count(), object_count);
+    assert_eq!(client.get(ObjectId::new(3)), None);
+    assert!(client.drain_outbound().is_empty());
+}
+
+#[test]
 fn get_registry_binds_a_fresh_id_and_sends_the_framed_request() {
     let mut c = boot();
     let reg = c.get_registry().unwrap();
@@ -168,6 +255,41 @@ fn build_event_bytes(object_id: ObjectId, opcode: u16, payload: &[u8]) -> Vec<u8
     h.encode(&mut out[..HEADER_SIZE]).unwrap();
     out[HEADER_SIZE..].copy_from_slice(payload);
     out
+}
+
+#[test]
+fn destroyed_object_is_inbound_only_until_delete_id_acknowledgement() {
+    let mut c = boot();
+    let buffer = c.bind_new(Interface::Buffer).unwrap();
+    assert_eq!(c.object_count(), 2);
+
+    c.buffer_destroy(buffer).expect("destroy request queues");
+    assert_eq!(c.object_count(), 1);
+    assert_eq!(c.get(buffer), None);
+    assert!(c.is_retired(buffer));
+    assert_eq!(
+        c.send_request(buffer, 1, &[]),
+        Err(ClientError::UnknownObject { id: buffer }),
+        "a tombstone has no outbound authority",
+    );
+
+    let release = build_event_bytes(buffer, 1, &[]);
+    let (events, consumed) = c
+        .push_received_with_payload(&release)
+        .expect("an event queued before destroy remains dispatchable");
+    assert_eq!(consumed, release.len());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].interface, Interface::Buffer);
+    assert_eq!(events[0].opcode_name, "release");
+
+    assert!(c.acknowledge_delete_id(buffer));
+    assert!(!c.is_retired(buffer));
+    assert_eq!(
+        c.push_received_with_payload(&release),
+        Err(ClientError::UnknownObject { id: buffer }),
+        "delete_id ends inbound dispatch authority",
+    );
+    assert!(!c.acknowledge_delete_id(buffer));
 }
 
 #[test]
@@ -361,15 +483,9 @@ fn push_received_with_payload_parses_multiple_back_to_back_events() {
     assert_eq!(events.len(), 3);
 
     assert_eq!(events[0].opcode_name, "error");
-    assert_eq!(
-        DisplayError::decode(&events[0].payload).unwrap(),
-        err
-    );
+    assert_eq!(DisplayError::decode(&events[0].payload).unwrap(), err);
     assert_eq!(events[1].opcode_name, "global");
-    assert_eq!(
-        RegistryGlobal::decode(&events[1].payload).unwrap(),
-        global
-    );
+    assert_eq!(RegistryGlobal::decode(&events[1].payload).unwrap(), global);
     assert_eq!(events[2].opcode_name, "global_remove");
     assert_eq!(
         RegistryGlobalRemove::decode(&events[2].payload).unwrap(),

@@ -14,10 +14,7 @@ fn whitespace_only_input_yields_empty_vector() {
 
 #[test]
 fn splits_on_whitespace() {
-    assert_eq!(
-        tokenize("echo hello world"),
-        vec!["echo", "hello", "world"]
-    );
+    assert_eq!(tokenize("echo hello world"), vec!["echo", "hello", "world"]);
 }
 
 #[test]
@@ -72,10 +69,7 @@ fn double_quotes_honour_backslash_escapes() {
 
 #[test]
 fn backslash_outside_quotes_escapes_the_next_char() {
-    assert_eq!(
-        tokenize(r"echo hello\ world"),
-        vec!["echo", "hello world"]
-    );
+    assert_eq!(tokenize(r"echo hello\ world"), vec!["echo", "hello world"]);
 }
 
 #[test]
@@ -88,10 +82,7 @@ fn empty_quoted_strings_yield_empty_tokens_but_are_discarded_if_alone() {
 
 #[test]
 fn adjacent_quoted_and_bare_segments_form_one_token() {
-    assert_eq!(
-        tokenize("echo pre'mid'post"),
-        vec!["echo", "premidpost"]
-    );
+    assert_eq!(tokenize("echo pre'mid'post"), vec!["echo", "premidpost"]);
 }
 
 #[test]

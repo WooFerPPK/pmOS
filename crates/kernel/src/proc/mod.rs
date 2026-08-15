@@ -20,7 +20,7 @@ pub mod table;
 
 pub use sched::Scheduler;
 pub use signal::{Signal, SignalInbox};
-pub use table::{PidAllocator, ProcessTable};
+pub use table::{PidAllocator, ProcessTable, PROCESS_LIMIT_GLOBAL, PROCESS_LIMIT_PER_PARENT};
 
 /// Exit status returned by `proc_wait`.
 ///
@@ -142,6 +142,7 @@ pub struct Process {
 impl Process {
     /// Create a new Process in `Starting` state. Used by
     /// `proc_spawn` before the Worker signals "ready".
+    #[allow(clippy::too_many_arguments)]
     pub fn new_starting(
         pid: Pid,
         ppid: Pid,
@@ -191,6 +192,7 @@ impl Process {
     /// transition is illegal (e.g. Dead -> Running). The kernel's
     /// syscall dispatch uses this to refuse stale wake events for
     /// a process that has already exited.
+    #[allow(clippy::result_unit_err)]
     pub fn transition(&mut self, to: ProcState) -> Result<(), ()> {
         if !is_legal_transition(self.state, to) {
             return Err(());
