@@ -33,10 +33,14 @@ use toolkit::draw::font::GLYPH_HEIGHT;
 #[cfg(target_arch = "wasm32")]
 use toolkit::draw::{Color, Rect};
 #[cfg(target_arch = "wasm32")]
-use toolkit::{App, BufferPool, WaitFd, Window};
+use toolkit::theme::Theme;
+#[cfg(target_arch = "wasm32")]
+use toolkit::widget::frame::{PointerOutcome as ChromePointerOutcome, WindowFrame};
+#[cfg(target_arch = "wasm32")]
+use toolkit::{App, BufferPool, WaitFd, Window, WindowFramePatch, WindowFramePatchProgress};
 
 #[cfg(any(target_arch = "wasm32", test))]
-const TITLEBAR_HEIGHT: u32 = 22;
+const TITLEBAR_HEIGHT: u32 = toolkit::widget::frame::TITLEBAR_HEIGHT;
 #[cfg(any(target_arch = "wasm32", test))]
 const FILE_MENU_HEIGHT: u32 = 18;
 
@@ -410,11 +414,19 @@ fn run_window<C: toolkit::protocol::Connection>(connection: C) -> Result<(), too
     let mut mods = Modifiers::default();
     let mut needs_paint = true;
     let mut configured_once = false;
-    let (w, h) = (640u32, 420u32);
+    let normal_size = (640u32, 420u32);
+    let mut size = normal_size;
+    let mut was_maximized = false;
+    let mut was_activated = false;
     let mut pool: Option<BufferPool> = None;
+    let mut chrome_patch: Option<WindowFramePatch> = None;
 
     loop {
         let events = window.dispatch()?;
+        let focus_changed = window.is_activated() != was_activated;
+        if focus_changed {
+            was_activated = window.is_activated();
+        }
         if window.take_close_requested() {
             if handle_editor_input(
                 &mut session,
@@ -478,8 +490,45 @@ fn run_window<C: toolkit::protocol::Connection>(connection: C) -> Result<(), too
                     if button.button != 1 || button.state != pointer_button_state::PRESSED {
                         continue;
                     }
-                    let Some(input) = file_menu_input(button.x, button.y, w) else {
-                        continue;
+                    let title = format!(
+                        "Editor — {}{}",
+                        session.document_label(),
+                        if session.buffer().dirty() { "*" } else { "" }
+                    );
+                    let mut chrome = editor_window_frame(
+                        size.0,
+                        size.1,
+                        title,
+                        window.is_activated(),
+                        window.is_maximized(),
+                    );
+                    let input = match chrome.pointer_down(button.x, button.y) {
+                        ChromePointerOutcome::Minimize => {
+                            window.set_minimized()?;
+                            continue;
+                        }
+                        ChromePointerOutcome::ToggleMaximize => {
+                            if window.is_maximized() {
+                                window.unset_maximized()?;
+                            } else {
+                                window.set_maximized()?;
+                            }
+                            continue;
+                        }
+                        ChromePointerOutcome::Close => EditorInput::RequestClose,
+                        ChromePointerOutcome::Titlebar => {
+                            if !window.is_maximized() {
+                                window.request_move(button.serial)?;
+                            }
+                            continue;
+                        }
+                        ChromePointerOutcome::Content => {
+                            let Some(input) = file_menu_input(button.x, button.y, size.0) else {
+                                continue;
+                            };
+                            input
+                        }
+                        ChromePointerOutcome::Outside => continue,
                     };
                     if handle_editor_input(
                         &mut session,
@@ -507,17 +556,69 @@ fn run_window<C: toolkit::protocol::Connection>(connection: C) -> Result<(), too
 
         if !configured_once && window.is_configured() {
             configured_once = true;
-            BufferPool::replace(&mut pool, window.app_mut(), w, h)?;
+            BufferPool::replace(&mut pool, window.app_mut(), size.0, size.1)?;
             needs_paint = true;
+        }
+
+        if configured_once
+            && window.is_maximized() != was_maximized
+            && !pool.as_ref().is_some_and(BufferPool::commit_pending)
+        {
+            was_maximized = window.is_maximized();
+            let offered = window.configured_size();
+            size = if was_maximized && offered.0 > 0 && offered.1 > 0 {
+                offered
+            } else {
+                normal_size
+            };
+            BufferPool::replace(&mut pool, window.app_mut(), size.0, size.1)?;
+            needs_paint = true;
+        }
+
+        if needs_paint {
+            chrome_patch = None;
+        } else {
+            if focus_changed && configured_once {
+                let title = format!(
+                    "Editor — {}{}",
+                    session.document_label(),
+                    if session.buffer().dirty() { "*" } else { "" }
+                );
+                chrome_patch = Some(WindowFramePatch::new(&editor_window_frame(
+                    size.0,
+                    size.1,
+                    title,
+                    was_activated,
+                    window.is_maximized(),
+                )));
+            }
+            if let (Some(patch), Some(buffers)) = (chrome_patch.as_mut(), pool.as_mut()) {
+                match patch.progress(buffers, &mut window)? {
+                    WindowFramePatchProgress::Complete => chrome_patch = None,
+                    WindowFramePatchProgress::Unavailable => {
+                        chrome_patch = None;
+                        needs_paint = true;
+                    }
+                    WindowFramePatchProgress::Deferred | WindowFramePatchProgress::Pending => {}
+                }
+            }
         }
 
         if needs_paint && configured_once {
             let p = pool.as_mut().expect("pool initialised");
             if let Some(mut canvas) = p.acquire_back_canvas() {
-                paint_editor(&mut canvas, w, h, &session);
+                paint_editor(
+                    &mut canvas,
+                    size.0,
+                    size.1,
+                    &session,
+                    was_activated,
+                    window.is_maximized(),
+                );
                 drop(canvas);
                 let _ = p.commit_and_swap(&mut window)?;
                 needs_paint = false;
+                chrome_patch = None;
             }
         }
         window.flush_outbound()?;
@@ -562,7 +663,9 @@ fn run_window<C: toolkit::protocol::Connection>(connection: C) -> Result<(), too
         if document_progress {
             continue;
         }
-        if pool.as_ref().is_some_and(BufferPool::commit_pending) && !window.outbound_pending() {
+        if (pool.as_ref().is_some_and(BufferPool::commit_pending) || chrome_patch.is_some())
+            && !window.outbound_pending()
+        {
             continue;
         }
         if let Some(wait) = document_wait {
@@ -635,19 +738,26 @@ fn draw_file_menu_button(
 }
 
 #[cfg(target_arch = "wasm32")]
-fn paint_editor(canvas: &mut toolkit::draw::Canvas<'_>, w: u32, h: u32, session: &EditorSession) {
+fn paint_editor(
+    canvas: &mut toolkit::draw::Canvas<'_>,
+    w: u32,
+    h: u32,
+    session: &EditorSession,
+    focused: bool,
+    maximized: bool,
+) {
     let path = session.document_label();
     let buffer = session.buffer();
     let mode = session.mode();
-    let bg = Color::rgb(0xfa, 0xfa, 0xfa);
-    let titlebar = Color::rgb(0x6a, 0x4a, 0x8a);
-    let menu_bar = Color::rgb(0xe0, 0xe0, 0xe4);
-    let menu_button = Color::rgb(0xcb, 0xcb, 0xd2);
-    let gutter_bg = Color::rgb(0xee, 0xee, 0xf2);
-    let gutter_fg = Color::rgb(0x80, 0x80, 0x90);
-    let status_bg = Color::rgb(0xe0, 0xe0, 0xe4);
-    let text_fg = Color::rgb(0x10, 0x10, 0x10);
-    let cursor_color = Color::rgb(0x10, 0x10, 0x10);
+    let theme = Theme::LIGHT;
+    let bg = theme.window_background;
+    let menu_bar = theme.titlebar_inactive;
+    let menu_button = theme.button_fill;
+    let gutter_bg = Color::rgb(0xe9, 0xe9, 0xe9);
+    let gutter_fg = theme.text_input_placeholder_fg;
+    let status_bg = theme.titlebar_inactive;
+    let text_fg = theme.label_text;
+    let cursor_color = theme.border_active;
     let titlebar_h = TITLEBAR_HEIGHT;
     let menubar_h = FILE_MENU_HEIGHT;
     let status_h = 18u32;
@@ -663,23 +773,8 @@ fn paint_editor(canvas: &mut toolkit::draw::Canvas<'_>, w: u32, h: u32, session:
         },
         bg,
     );
-    canvas.fill_rect(
-        Rect {
-            x: 0,
-            y: 0,
-            width: w,
-            height: titlebar_h,
-        },
-        titlebar,
-    );
     let dirty_marker = if buffer.dirty() { "*" } else { "" };
     let title = format!("Editor — {}{}", path, dirty_marker);
-    canvas.draw_text(
-        8,
-        ((titlebar_h as i32 - GLYPH_HEIGHT as i32) / 2).max(0),
-        &title,
-        Color::rgb(0xff, 0xff, 0xff),
-    );
 
     canvas.fill_rect(
         Rect {
@@ -700,8 +795,8 @@ fn paint_editor(canvas: &mut toolkit::draw::Canvas<'_>, w: u32, h: u32, session:
         w as i32 - 58,
         52,
         "Close",
-        Color::rgb(0xd8, 0xb8, 0xb8),
-        text_fg,
+        theme.close_button_hover,
+        Color::rgb(0xff, 0xff, 0xff),
     );
 
     let content_y_top = (titlebar_h + menubar_h) as i32 + 6;
@@ -865,6 +960,24 @@ fn paint_editor(canvas: &mut toolkit::draw::Canvas<'_>, w: u32, h: u32, session:
             );
         }
     }
+
+    let frame = editor_window_frame(w, h, title, focused, maximized);
+    frame.draw(canvas);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn editor_window_frame(
+    width: u32,
+    height: u32,
+    title: impl Into<String>,
+    focused: bool,
+    maximized: bool,
+) -> WindowFrame {
+    let mut frame = WindowFrame::new(Rect::new(0, 0, width, height), title);
+    frame.set_theme(Theme::LIGHT);
+    frame.set_focused(focused);
+    frame.set_maximized(maximized);
+    frame
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -31,9 +31,10 @@ use display_proto::requests::{
 
 use toolkit::draw::{Rect, BYTES_PER_PIXEL};
 use toolkit::protocol::Connection;
+use toolkit::widget::WindowFrame;
 use toolkit::{
     App, BufferPool, CommitProgress, CurrentPatch, Interface, MessageHeader, ObjectId, Window,
-    HEADER_SIZE,
+    WindowFramePatch, WindowFramePatchProgress, HEADER_SIZE,
 };
 
 /// Bidirectional in-memory [`Connection`] — same shape as
@@ -218,6 +219,168 @@ const HEIGHT: u32 = 2;
 /// Per-buffer size in bytes for the shared WIDTH x HEIGHT:
 /// 4 * 2 * 4 = 32 bytes per buffer.
 const PER_BUFFER_BYTES: u32 = WIDTH * HEIGHT * BYTES_PER_PIXEL as u32;
+
+#[test]
+fn focus_chrome_patch_is_capped_ordered_and_latest_state_wins() {
+    const FRAME_WIDTH: u32 = 720;
+    const FRAME_HEIGHT: u32 = 480;
+
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window must create");
+    let surface_id = window.surface();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+    let mut pool =
+        BufferPool::new(window.app_mut(), FRAME_WIDTH, FRAME_HEIGHT).expect("pool must create");
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+
+    {
+        let mut canvas = pool.acquire_back_canvas().expect("initial canvas");
+        canvas.clear(toolkit::draw::Color::rgb(0x20, 0x20, 0x20));
+    }
+    assert_eq!(
+        pool.commit_and_swap(&mut window).expect("initial frame"),
+        CommitProgress::Committed
+    );
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+    let initial_current = pool.current_index();
+    let initial_back = pool.back_index();
+
+    // Production transport semantics: one queued request makes a second
+    // patch defer until the explicit flush/drain boundary.
+    window.app_mut().client_mut().connection_mut().incremental = true;
+    let mut inactive_frame =
+        WindowFrame::new(Rect::new(0, 0, FRAME_WIDTH, FRAME_HEIGHT), "Terminal");
+    inactive_frame.set_theme(toolkit::Theme::DARK);
+    inactive_frame.set_focused(false);
+    let mut patch = WindowFramePatch::new(&inactive_frame);
+    assert_eq!(patch.remaining_tiles(), 6);
+    assert_eq!(patch.total_pixel_bytes(), 69_896);
+
+    assert_eq!(
+        patch.progress(&mut pool, &mut window).expect("first tile"),
+        WindowFramePatchProgress::Pending
+    );
+    assert_eq!(patch.completed_tiles(), 1);
+    let first = parse_requests(
+        &window
+            .app_mut()
+            .client_mut()
+            .connection_mut()
+            .drain_outbound(),
+    );
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].object_id, surface_id);
+    assert_eq!(first[0].opcode, 8 /* patch_current */);
+    let first_patch = SurfacePatchCurrent::decode(&first[0].payload).expect("first patch");
+    assert_eq!(
+        (
+            first_patch.x,
+            first_patch.y,
+            first_patch.width,
+            first_patch.height
+        ),
+        (0, 0, FRAME_WIDTH, 8),
+        "the first request carries the complete focused top edge"
+    );
+    assert!(first_patch.pixels.len() <= display_proto::MAX_SURFACE_PATCH_BYTES);
+
+    window
+        .set_title("queued before patch")
+        .expect("queue request");
+    let before_defer = patch.remaining_tiles();
+    assert_eq!(
+        patch.progress(&mut pool, &mut window).expect("defer"),
+        WindowFramePatchProgress::Deferred
+    );
+    assert_eq!(patch.remaining_tiles(), before_defer);
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+
+    // A newer activation configure replaces a partially-applied old target
+    // and restarts with the latest full-width top tile.
+    let mut active_frame = WindowFrame::new(Rect::new(0, 0, FRAME_WIDTH, FRAME_HEIGHT), "Terminal");
+    active_frame.set_theme(toolkit::Theme::DARK);
+    active_frame.set_focused(true);
+    patch.replace(&active_frame);
+    assert_eq!(patch.completed_tiles(), 0);
+
+    let mut request_count = 0usize;
+    while !patch.is_complete() {
+        let progress = patch
+            .progress(&mut pool, &mut window)
+            .expect("bounded patch");
+        let turn = parse_requests(
+            &window
+                .app_mut()
+                .client_mut()
+                .connection_mut()
+                .drain_outbound(),
+        );
+        assert_eq!(turn.len(), 1, "each turn queues exactly one request");
+        let decoded = SurfacePatchCurrent::decode(&turn[0].payload).expect("patch payload");
+        assert!(decoded.pixels.len() <= display_proto::MAX_SURFACE_PATCH_BYTES);
+        if request_count == 0 {
+            assert_eq!(&decoded.pixels[..4], &[0x60, 0xcd, 0xff, 0xff]);
+        }
+        request_count += 1;
+        assert_eq!(
+            progress == WindowFramePatchProgress::Complete,
+            patch.is_complete()
+        );
+    }
+    assert_eq!(request_count, 6);
+    assert_eq!(pool.current_index(), initial_current);
+    assert_eq!(pool.back_index(), initial_back);
+}
+
+#[test]
+fn focus_chrome_patch_requires_an_attached_current_buffer() {
+    let mut app = connected_app();
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window must create");
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+    let mut pool = BufferPool::new(window.app_mut(), 320, 200).expect("pool must create");
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+    let frame = WindowFrame::new(Rect::new(0, 0, 320, 200), "Hello");
+    let mut patch = WindowFramePatch::new(&frame);
+    assert_eq!(
+        patch.progress(&mut pool, &mut window).expect("unavailable"),
+        WindowFramePatchProgress::Unavailable
+    );
+    assert_eq!(patch.completed_tiles(), 0);
+    assert!(window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound()
+        .is_empty());
+}
 
 #[test]
 fn buffer_pool_new_sends_shm_create_pool_and_two_buffers() {

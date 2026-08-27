@@ -266,7 +266,7 @@ export async function acknowledgeTerminalFocus(
       () =>
         lines
           .slice(focusStart)
-          .some((line) => line === `[real-kernel] ${focusMarker}`),
+          .some((line) => line.includes(`[real-kernel] ${focusMarker}`)),
       {
         timeout,
         message: `Terminal did not execute its focus acknowledgement:\n${lines

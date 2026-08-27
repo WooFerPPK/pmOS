@@ -58,9 +58,7 @@ pub struct Theme {
     /// 1-pixel window border for an unfocused window.
     pub border_inactive: Color,
 
-    /// Default close-button fill. The close button is drawn
-    /// as a filled square on the titlebar; this is the
-    /// resting colour.
+    /// Resting fill available to titlebar close controls.
     pub close_button: Color,
     /// Close-button fill when the pointer is hovering over
     /// it. The hover-state setter on [`crate::widget::frame::WindowFrame`]
@@ -69,8 +67,7 @@ pub struct Theme {
     /// the display server's job — today tests toggle it
     /// directly.
     pub close_button_hover: Color,
-    /// Colour of the "X" glyph drawn on top of the close
-    /// button.
+    /// Colour of the "X" glyph drawn on top of the close button.
     pub close_button_glyph: Color,
 
     /// Default text colour for [`crate::widget::label::Label`]
@@ -115,35 +112,33 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The bundled light theme. Neutral greys with a subtle
-    /// blue accent for focused chrome. Chosen so that black
-    /// body text on [`Self::window_background`] stays
-    /// legible without forcing a specific content palette
-    /// on the app.
+    /// The bundled light theme. The neutral layered surfaces, restrained
+    /// borders, and blue focus accent follow a modern desktop vocabulary while
+    /// remaining PMos-owned artwork rather than copying platform assets.
     pub const LIGHT: Theme = Theme {
         name: "light",
-        window_background: Color::rgb(0xf2, 0xf2, 0xf2),
-        titlebar_active: Color::rgb(0xd8, 0xdc, 0xe4),
-        titlebar_inactive: Color::rgb(0xec, 0xec, 0xec),
-        titlebar_text_active: Color::rgb(0x1a, 0x1a, 0x1a),
-        titlebar_text_inactive: Color::rgb(0x6a, 0x6a, 0x6a),
-        border_active: Color::rgb(0x3b, 0x5b, 0x8d),
-        border_inactive: Color::rgb(0xa8, 0xa8, 0xa8),
-        close_button: Color::rgb(0xd8, 0xdc, 0xe4),
-        close_button_hover: Color::rgb(0xe8, 0x4a, 0x4a),
-        close_button_glyph: Color::rgb(0x1a, 0x1a, 0x1a),
-        label_text: Color::rgb(0x20, 0x20, 0x20),
-        button_fill: Color::rgb(0xe2, 0xe4, 0xea),
-        button_fill_hover: Color::rgb(0xec, 0xee, 0xf4),
-        button_fill_pressed: Color::rgb(0xc2, 0xc6, 0xcf),
-        button_border: Color::rgb(0x8a, 0x8e, 0x96),
-        button_text: Color::rgb(0x1a, 0x1a, 0x1a),
+        window_background: Color::rgb(0xf3, 0xf3, 0xf3),
+        titlebar_active: Color::rgb(0xf9, 0xf9, 0xf9),
+        titlebar_inactive: Color::rgb(0xed, 0xed, 0xed),
+        titlebar_text_active: Color::rgb(0x1b, 0x1b, 0x1b),
+        titlebar_text_inactive: Color::rgb(0x6d, 0x6d, 0x6d),
+        border_active: Color::rgb(0x00, 0x67, 0xc0),
+        border_inactive: Color::rgb(0xc6, 0xc6, 0xc6),
+        close_button: Color::rgb(0xf9, 0xf9, 0xf9),
+        close_button_hover: Color::rgb(0xc4, 0x2b, 0x1c),
+        close_button_glyph: Color::rgb(0x1b, 0x1b, 0x1b),
+        label_text: Color::rgb(0x1b, 0x1b, 0x1b),
+        button_fill: Color::rgb(0xfb, 0xfb, 0xfb),
+        button_fill_hover: Color::rgb(0xe9, 0xe9, 0xe9),
+        button_fill_pressed: Color::rgb(0xda, 0xda, 0xda),
+        button_border: Color::rgb(0xd0, 0xd0, 0xd0),
+        button_text: Color::rgb(0x1b, 0x1b, 0x1b),
         text_input_bg: Color::rgb(0xff, 0xff, 0xff),
-        text_input_bg_hover: Color::rgb(0xf8, 0xf9, 0xfc),
+        text_input_bg_hover: Color::rgb(0xf9, 0xf9, 0xf9),
         text_input_bg_focused: Color::rgb(0xff, 0xff, 0xff),
-        text_input_fg: Color::rgb(0x1a, 0x1a, 0x1a),
-        text_input_placeholder_fg: Color::rgb(0x8a, 0x8a, 0x8a),
-        text_input_border: Color::rgb(0x8a, 0x8e, 0x96),
+        text_input_fg: Color::rgb(0x1b, 0x1b, 0x1b),
+        text_input_placeholder_fg: Color::rgb(0x7a, 0x7a, 0x7a),
+        text_input_border: Color::rgb(0x8a, 0x8a, 0x8a),
     };
 
     /// Bundled dark theme used by Settings-aware applications. The red close
@@ -151,28 +146,28 @@ impl Theme {
     /// retains one recognizable accent across palettes.
     pub const DARK: Theme = Theme {
         name: "dark",
-        window_background: Color::rgb(0x1c, 0x1f, 0x26),
-        titlebar_active: Color::rgb(0x2b, 0x31, 0x3d),
-        titlebar_inactive: Color::rgb(0x22, 0x26, 0x2e),
-        titlebar_text_active: Color::rgb(0xec, 0xec, 0xec),
-        titlebar_text_inactive: Color::rgb(0x7a, 0x7a, 0x7a),
-        border_active: Color::rgb(0x5b, 0x7c, 0xc2),
-        border_inactive: Color::rgb(0x3a, 0x3e, 0x46),
-        close_button: Color::rgb(0x2b, 0x31, 0x3d),
-        close_button_hover: Color::rgb(0xe8, 0x4a, 0x4a),
-        close_button_glyph: Color::rgb(0xec, 0xec, 0xec),
-        label_text: Color::rgb(0xe6, 0xe6, 0xe6),
-        button_fill: Color::rgb(0x32, 0x36, 0x3e),
-        button_fill_hover: Color::rgb(0x3e, 0x44, 0x4c),
-        button_fill_pressed: Color::rgb(0x22, 0x26, 0x2e),
-        button_border: Color::rgb(0x54, 0x58, 0x60),
-        button_text: Color::rgb(0xec, 0xec, 0xec),
-        text_input_bg: Color::rgb(0x14, 0x17, 0x1c),
-        text_input_bg_hover: Color::rgb(0x1a, 0x1d, 0x24),
-        text_input_bg_focused: Color::rgb(0x20, 0x24, 0x2c),
-        text_input_fg: Color::rgb(0xec, 0xec, 0xec),
-        text_input_placeholder_fg: Color::rgb(0x6a, 0x6a, 0x6a),
-        text_input_border: Color::rgb(0x54, 0x58, 0x60),
+        window_background: Color::rgb(0x20, 0x20, 0x20),
+        titlebar_active: Color::rgb(0x20, 0x20, 0x20),
+        titlebar_inactive: Color::rgb(0x2b, 0x2b, 0x2b),
+        titlebar_text_active: Color::rgb(0xf5, 0xf5, 0xf5),
+        titlebar_text_inactive: Color::rgb(0x9a, 0x9a, 0x9a),
+        border_active: Color::rgb(0x60, 0xcd, 0xff),
+        border_inactive: Color::rgb(0x45, 0x45, 0x45),
+        close_button: Color::rgb(0x20, 0x20, 0x20),
+        close_button_hover: Color::rgb(0xc4, 0x2b, 0x1c),
+        close_button_glyph: Color::rgb(0xf5, 0xf5, 0xf5),
+        label_text: Color::rgb(0xf5, 0xf5, 0xf5),
+        button_fill: Color::rgb(0x2d, 0x2d, 0x2d),
+        button_fill_hover: Color::rgb(0x3a, 0x3a, 0x3a),
+        button_fill_pressed: Color::rgb(0x18, 0x18, 0x18),
+        button_border: Color::rgb(0x50, 0x50, 0x50),
+        button_text: Color::rgb(0xf5, 0xf5, 0xf5),
+        text_input_bg: Color::rgb(0x1c, 0x1c, 0x1c),
+        text_input_bg_hover: Color::rgb(0x24, 0x24, 0x24),
+        text_input_bg_focused: Color::rgb(0x2a, 0x2a, 0x2a),
+        text_input_fg: Color::rgb(0xf5, 0xf5, 0xf5),
+        text_input_placeholder_fg: Color::rgb(0x9a, 0x9a, 0x9a),
+        text_input_border: Color::rgb(0x5c, 0x5c, 0x5c),
     };
 
     /// Normalize a persisted v1 theme name. Unknown and absent names use the

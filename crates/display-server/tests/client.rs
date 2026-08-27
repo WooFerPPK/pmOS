@@ -597,18 +597,128 @@ fn dispatch_registry_bind_shell_manager_without_cap_shell_is_permission_denied()
 }
 
 #[test]
-fn dispatch_registry_bind_shell_manager_with_cap_shell_succeeds() {
+fn dispatch_registry_bind_shell_manager_accepts_and_retains_supported_versions() {
     use abi::cap::{Cap, CapSet};
-    let caps = CapSet::from_caps(&[Cap::Shell]);
-    let mut c = Client::new_with_caps(ClientId(1), caps);
-    let registry_id = ObjectId::new(3);
-    c.install_client_object(registry_id, Interface::Registry)
-        .unwrap();
+    for version in [1, 2] {
+        let caps = CapSet::from_caps(&[Cap::Shell]);
+        let mut client = Client::new_with_caps(ClientId(version), caps);
+        let registry_id = ObjectId::new(3);
+        let manager_id = ObjectId::new(5);
+        client
+            .install_client_object(registry_id, Interface::Registry)
+            .unwrap();
 
-    let payload = registry_bind_payload(1, "pmd_shell_manager", 1, ObjectId::new(5));
-    let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
-    c.dispatch_request(header, &payload).unwrap();
-    assert_eq!(c.get(ObjectId::new(5)), Some(Interface::ShellManager));
+        let payload = registry_bind_payload(5, "pmd_shell_manager", version, manager_id);
+        let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+        client.dispatch_request(header, &payload).unwrap();
+        assert_eq!(client.get(manager_id), Some(Interface::ShellManager));
+        assert_eq!(client.shell_manager_id, Some(manager_id));
+        assert_eq!(client.shell_manager_version, Some(version));
+    }
+}
+
+#[test]
+fn dispatch_registry_bind_rejects_unsupported_shell_manager_versions_atomically() {
+    use abi::cap::{Cap, CapSet};
+    for requested in [0, 3] {
+        let caps = CapSet::from_caps(&[Cap::Shell]);
+        let mut client = Client::new_with_caps(ClientId(requested + 1), caps);
+        let registry_id = ObjectId::new(3);
+        let manager_id = ObjectId::new(5);
+        client
+            .install_client_object(registry_id, Interface::Registry)
+            .unwrap();
+
+        let payload = registry_bind_payload(5, "pmd_shell_manager", requested, manager_id);
+        let header = MessageHeader::try_new(registry_id, 1, payload.len(), 0).unwrap();
+        assert_eq!(
+            client.dispatch_request(header, &payload),
+            Err(ClientError::UnsupportedBindVersion {
+                interface: Interface::ShellManager,
+                requested,
+                supported: 2,
+                new_id: manager_id,
+            })
+        );
+        assert_eq!(client.get(manager_id), None);
+        assert_eq!(client.shell_manager_id, None);
+        assert_eq!(client.shell_manager_version, None);
+        assert_eq!(client.journal_len(), 0);
+        assert_eq!(client.pending_events_len(), 0);
+    }
+}
+
+#[test]
+fn explicit_v1_shell_manager_rejects_every_v2_request_without_state_or_events() {
+    use abi::cap::{Cap, CapSet};
+    let mut client = Client::new_with_caps(ClientId(1), CapSet::from_caps(&[Cap::Shell]));
+    let registry_id = ObjectId::new(3);
+    let manager_id = ObjectId::new(5);
+    client
+        .install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+    let bind = registry_bind_payload(5, "pmd_shell_manager", 1, manager_id);
+    client
+        .dispatch_request(
+            MessageHeader::try_new(registry_id, 1, bind.len(), 0).unwrap(),
+            &bind,
+        )
+        .unwrap();
+    let journal_before = client.journal_len();
+
+    for (opcode, payload_len) in [(9, 4), (10, 8), (11, 32), (12, 8)] {
+        let payload = vec![0; payload_len];
+        let header = MessageHeader::try_new(manager_id, opcode, payload.len(), 0).unwrap();
+        assert_eq!(
+            client.dispatch_request(header, &payload),
+            Err(ClientError::RequestRequiresVersion {
+                interface: Interface::ShellManager,
+                object_id: manager_id,
+                opcode,
+                negotiated: 1,
+                required: 2,
+            })
+        );
+        assert_eq!(client.journal_len(), journal_before);
+        assert_eq!(client.shell_manager_state_snapshot_id, None);
+        assert_eq!(client.pending_events_len(), 0);
+    }
+}
+
+#[test]
+fn second_shell_manager_bind_cannot_replace_the_negotiated_version() {
+    use abi::cap::{Cap, CapSet};
+    let mut client = Client::new_with_caps(ClientId(1), CapSet::from_caps(&[Cap::Shell]));
+    let registry_id = ObjectId::new(3);
+    let first_id = ObjectId::new(5);
+    let second_id = ObjectId::new(7);
+    client
+        .install_client_object(registry_id, Interface::Registry)
+        .unwrap();
+    let first = registry_bind_payload(5, "pmd_shell_manager", 2, first_id);
+    client
+        .dispatch_request(
+            MessageHeader::try_new(registry_id, 1, first.len(), 0).unwrap(),
+            &first,
+        )
+        .unwrap();
+    let second = registry_bind_payload(5, "pmd_shell_manager", 1, second_id);
+    let error = client
+        .dispatch_request(
+            MessageHeader::try_new(registry_id, 1, second.len(), 0).unwrap(),
+            &second,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ClientError::ShellManagerAlreadyBound {
+            existing: first_id,
+            new_id: second_id,
+        }
+    );
+    assert_eq!(client.get(second_id), None);
+    assert_eq!(client.shell_manager_id, Some(first_id));
+    assert_eq!(client.shell_manager_version, Some(2));
 }
 
 #[test]

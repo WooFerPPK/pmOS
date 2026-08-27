@@ -800,6 +800,7 @@ impl FreeSession {
                         .map_err(|_| SessionError::MalformedEvent("pmd_xdg_toplevel.configure"))?;
                     self.client
                         .xdg_toplevel_ack_configure(object_id, configure.serial)?;
+                    self.ensure_plain_outbound_completion();
                     self.configured = true;
                     signals.push(SessionSignal::Configured {
                         serial: configure.serial,
@@ -1014,6 +1015,14 @@ impl FreeSession {
             return Ok(());
         }
         self.queue_clean_shutdown()
+    }
+
+    fn ensure_plain_outbound_completion(&mut self) {
+        // A configure can arrive while an earlier frame phase is in flight.
+        // Its ACK then starts the next outbound batch and needs its own tag.
+        if self.queued_completion.is_none() {
+            self.queued_completion = Some(OutboundCompletion::Plain);
+        }
     }
 }
 

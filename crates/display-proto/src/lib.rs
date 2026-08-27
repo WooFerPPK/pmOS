@@ -31,9 +31,9 @@ pub use decode::DecodeError;
 pub use events::{
     error_code, key_state, pointer_button_state, xdg_toplevel_state, BufferRelease, CallbackDone,
     DisplayDeleteId, DisplayError, KeyboardKey, PointerButton, PointerMotion, RegistryGlobal,
-    RegistryGlobalRemove, ShellRestoreFinished, ShellWindowCreated, ShellWindowDestroyed,
-    ShellWindowFocused, ShellWindowSnapshotDone, ShellWindowState, ShellWindowTitleChanged,
-    ShmFormat, XdgToplevelClose, XdgToplevelConfigure,
+    RegistryGlobalRemove, ShellCloseShortcut, ShellRestoreFinished, ShellWindowCreated,
+    ShellWindowDestroyed, ShellWindowFocused, ShellWindowSnapshotDone, ShellWindowState,
+    ShellWindowTitleChanged, ShmFormat, XdgToplevelClose, XdgToplevelConfigure,
 };
 pub use ids::{IdAllocator, IdError, IdKind, ObjectId, ObjectIdAllocationError};
 pub use objects::{Direction, Interface, Opcode, OpcodeError};
@@ -48,6 +48,6 @@ pub use requests::{
     ShmPoolCreateBuffer, ShmPoolResize, ShmPoolWrite, ShmPoolWriteRows, SurfaceAttach,
     SurfaceDamage, SurfaceFrame, SurfacePatchCurrent, XdgShellGetToplevel, XdgToplevelAckConfigure,
     XdgToplevelMove, XdgToplevelResize, XdgToplevelSetAppId, XdgToplevelSetMaximized,
-    XdgToplevelSetTitle, XdgToplevelUnsetMaximized,
+    XdgToplevelSetMinimized, XdgToplevelSetTitle, XdgToplevelUnsetMaximized,
 };
 pub use wire::{MessageHeader, WireError, HEADER_SIZE, MAX_MESSAGE_SIZE};

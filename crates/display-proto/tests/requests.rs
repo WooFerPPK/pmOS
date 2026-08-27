@@ -9,7 +9,7 @@ use display_proto::requests::{
     buffer_format, CompositorCreateSurface, DisplayGetRegistry, RegistryBind, SeatGetKeyboard,
     SeatGetPointer, ShmCreatePool, ShmPoolCreateBuffer, ShmPoolResize, ShmPoolWriteRows,
     SurfaceAttach, SurfaceDamage, SurfaceFrame, SurfacePatchCurrent, XdgShellGetToplevel,
-    XdgToplevelSetAppId, XdgToplevelSetTitle,
+    XdgToplevelSetAppId, XdgToplevelSetMinimized, XdgToplevelSetTitle,
 };
 use display_proto::ObjectId;
 
@@ -338,6 +338,21 @@ fn xdg_toplevel_set_app_id_round_trips_a_string() {
 fn xdg_toplevel_set_title_rejects_truncated_payload() {
     let err = XdgToplevelSetTitle::decode(&[0u8; 2]).unwrap_err();
     assert!(matches!(err, DecodeError::Truncated { .. }));
+}
+
+#[test]
+fn xdg_toplevel_set_minimized_requires_an_empty_payload() {
+    assert_eq!(
+        XdgToplevelSetMinimized::decode(&[]),
+        Ok(XdgToplevelSetMinimized)
+    );
+    assert_eq!(
+        XdgToplevelSetMinimized::decode(&[0]).unwrap_err(),
+        DecodeError::PayloadLengthMismatch {
+            expected: 0,
+            actual: 1,
+        }
+    );
 }
 
 #[test]

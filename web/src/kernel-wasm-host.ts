@@ -1669,8 +1669,10 @@ export class KernelWasmHost implements Kernel {
     );
     const parkFn =
       args.parkFn ??
-      ((observedWake: number, timeoutMs: number | undefined): Promise<void> =>
-        this.defaultPark(observedWake, timeoutMs));
+      ((
+        observedWake: number,
+        timeoutMs: number | undefined,
+      ): Promise<boolean> => this.defaultPark(observedWake, timeoutMs));
     const taskYielder =
       args.taskYieldFn === undefined ? new WorkerTaskYielder() : undefined;
     const taskYieldFn = args.taskYieldFn ?? (() => taskYielder!.nextTask());
@@ -1772,6 +1774,7 @@ export class KernelWasmHost implements Kernel {
         if (this.nextPollTimeoutNs() === 0n && this.servicePollWaiters() > 0) {
           anyServiced = true;
         }
+        let parkedAsynchronously = false;
         if (!anyServiced) {
           // A clock may have expired during the ring scan, and a host-side
           // mutation may have made an fd ready without publishing a user SAB
@@ -1782,8 +1785,18 @@ export class KernelWasmHost implements Kernel {
           } else {
             const timeoutNs = this.nextPollTimeoutNs();
             const timeoutMs = pollTimeoutMs(timeoutNs);
-            await parkFn(observedWake, timeoutMs);
+            parkedAsynchronously =
+              (await parkFn(observedWake, timeoutMs)) === true;
           }
+        }
+        // A genuine waitAsync park already released the Worker event loop, so
+        // queued message tasks had an opportunity to run. Do not spend the
+        // cooperative task-yield budget again on the causal syscall pass that
+        // resumes it. Synchronous `not-equal` parks and syscall-active passes
+        // still count, preserving the starvation bound under continuous work.
+        if (parkedAsynchronously) {
+          passesSinceTaskYield = 0;
+          continue;
         }
         passesSinceTaskYield += 1;
         if (passesSinceTaskYield >= passesBeforeTaskYield) {
@@ -1808,7 +1821,7 @@ export class KernelWasmHost implements Kernel {
   private async defaultPark(
     observedWake: number,
     timeoutMs: number | undefined,
-  ): Promise<void> {
+  ): Promise<boolean> {
     type WaitAsyncResult =
       | { readonly async: false; readonly value: "not-equal" | "timed-out" }
       | {
@@ -1837,7 +1850,9 @@ export class KernelWasmHost implements Kernel {
     const r = waitAsync(this.wakeView, 0, observedWake, timeoutMs);
     if (r.async) {
       await r.value;
+      return true;
     }
+    return false;
   }
 }
 
@@ -1857,7 +1872,10 @@ export interface StartDispatchLoopArgs {
    */
   readonly halted: () => boolean;
   /**
-   * Invoked when a pass completed without servicing any request.
+   * Invoked when a pass completed without servicing any request. Return
+   * `true` only when the park genuinely released the Worker event loop;
+   * `false`/`undefined` means it resolved synchronously and still consumes the
+   * cooperative task-yield budget.
    * Defaults to a shared-wake-slot `Atomics.waitAsync` with no timeout unless
    * the kernel reports a real poll clock deadline; tests pass a
    * microtask-yield stub so the loop never actually blocks.
@@ -1865,7 +1883,7 @@ export interface StartDispatchLoopArgs {
   readonly parkFn?: (
     observedWake: number,
     timeoutMs: number | undefined,
-  ) => Promise<void>;
+  ) => Promise<boolean | void>;
   /**
    * Maximum requests serviced per pid per pass. Defaults to 8; the
    * value keeps one chatty process from starving the others. Tuned

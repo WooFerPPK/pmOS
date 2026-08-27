@@ -1,8 +1,7 @@
 //! T130 — desktop shell's taskbar.
 //!
-//! `Taskbar` owns the open-window list (one entry per known
-//! toplevel) and routes pointer clicks to focus, restore,
-//! minimize, maximize/restore, or close the exact server-global window. The data
+//! `Taskbar` owns the visible application-window list and routes pointer clicks
+//! to restore, focus, or minimize the exact server-global window. The data
 //! model is driven by the `pmd_shell_manager.window_*` event
 //! stream emitted by the display server (spec §15) — the
 //! shell binds `pmd_shell_manager` after `App::connect`,
@@ -10,15 +9,15 @@
 //! through one of the `handle_*` methods on this struct.
 //!
 //! The visible strip is a fixed-height row anchored to the
-//! bottom of the framebuffer. Each entry is a labeled box
-//! showing the window's app_id (with the title as a fallback
-//! when app_id is empty); the focused entry paints with a
-//! highlight palette so the user can see which window has
-//! keyboard focus. Entries are layed out left-to-right in
-//! creation order with a small gap between them. A bounded page
-//! of entries is shown when the row is full; the overflow button
-//! cycles through the remaining pages without shrinking controls
-//! into overlapping one-pixel slivers.
+//! bottom of the framebuffer. Each ordinary application is a clean task button
+//! with a PMos-owned monogram mark and a title-first label. Focus is shown by a
+//! compact accent underline and minimized entries use the inactive palette.
+//! The shell's own desktop surface remains known privately so the launcher can
+//! raise it, but is never exposed as an application task. Entries are laid out
+//! left-to-right in creation order with a small gap between them. A bounded
+//! page of entries is shown when the row is full; the overflow button cycles
+//! through the remaining pages without shrinking tasks into overlapping
+//! one-pixel slivers.
 //!
 //! Click routing: a press inside an entry returns
 //! [`TaskbarClick`] from [`Taskbar::handle_pointer_down`];
@@ -26,14 +25,9 @@
 //! to do with it. Window identity remains the opaque global id
 //! supplied by the display server.
 //!
-//! * `Focus { window_id }` — the entry was clicked while
-//!   the window was already in the focused state, OR the
-//!   window was unfocused; either way the shell sends
-//!   `pmd_shell_manager.focus_window(window_id)` to bring
-//!   it forward.
-//!
-//! The main label area focuses/restores; the `_`, `[]`, and `x` controls
-//! minimize, toggle maximize/restore, and request a graceful close.
+//! * `Focus { window_id }` — an unfocused window should be raised.
+//! * `Restore { window_id }` — a minimized window should be restored.
+//! * `Minimize { window_id }` — the focused window should be minimized.
 
 use core::fmt;
 
@@ -56,7 +50,7 @@ pub const TASKBAR_HEIGHT: u32 = 32;
 pub const TASKBAR_ENTRY_WIDTH: u32 = 160;
 
 /// Smallest task entry width. Keeping a real lower bound leaves enough room
-/// for a clipped label plus three independently hit-testable controls.
+/// for a monogram and a useful clipped title.
 pub const TASKBAR_MIN_ENTRY_WIDTH: u32 = 112;
 
 /// Horizontal gap between adjacent taskbar entries, in pixels.
@@ -80,11 +74,25 @@ pub const TASKBAR_CLOCK_RIGHT_MARGIN: u32 = 6;
 /// in pixels.
 pub const TASKBAR_ENTRY_TEXT_MARGIN: u32 = 6;
 
-/// Width of each minimize/maximize/close control inside a task entry.
+/// Legacy width retained for source compatibility. Task buttons no longer
+/// expose embedded window controls.
 pub const TASKBAR_ENTRY_CONTROL_WIDTH: u32 = 20;
 
-/// Gap between the label and controls and between adjacent controls.
+/// Legacy gap retained for source compatibility. Task buttons no longer
+/// expose embedded window controls.
 pub const TASKBAR_ENTRY_CONTROL_GAP: u32 = 2;
+
+/// Size of the PMos-owned application mark inside each task button.
+pub const TASKBAR_APP_MARK_SIZE: u32 = 14;
+
+/// Gap between the application mark and its title.
+pub const TASKBAR_APP_MARK_GAP: u32 = 6;
+
+/// Width of the focused-window accent underline.
+pub const TASKBAR_FOCUS_INDICATOR_WIDTH: u32 = 20;
+
+/// Height of the focused-window accent underline.
+pub const TASKBAR_FOCUS_INDICATOR_HEIGHT: u32 = 2;
 
 /// Width reserved for the page-cycling overflow control.
 pub const TASKBAR_OVERFLOW_WIDTH: u32 = 42;
@@ -102,15 +110,14 @@ pub enum TaskbarClick {
     /// to bring it to the front.
     Focus { window_id: u32 },
     /// The clicked window is currently minimized. The shell
-    /// should call `Server::restore_toplevel(window_id)` (or
-    /// a future `pmd_shell_manager.restore_window` request)
-    /// to re-map it.
+    /// should send `pmd_shell_manager.unminimize_window(window_id)` to re-map
+    /// and focus it.
     Restore { window_id: u32 },
-    /// Explicit minimize control.
+    /// The focused task button was clicked and should be minimized.
     Minimize { window_id: u32 },
-    /// Toggle between maximized work-area geometry and restored geometry.
+    /// Legacy compatibility action. The modern task buttons never emit it.
     ToggleMaximize { window_id: u32 },
-    /// Explicit graceful-close control.
+    /// Legacy compatibility action. The modern task buttons never emit it.
     Close { window_id: u32 },
     /// Cycle to the next bounded page of task entries.
     CycleOverflow,
@@ -127,17 +134,21 @@ pub struct TaskbarEntry {
 }
 
 impl TaskbarEntry {
-    /// The label the entry paints in the taskbar — `app_id`
-    /// when set, falling back to `title` when not. Returns
+    /// The human-readable label painted in the taskbar — `title`
+    /// when set, falling back to `app_id`. Returns
     /// `"(untitled)"` if both are empty so the entry never
     /// paints with zero visible text.
     pub fn label(&self) -> &str {
-        if !self.app_id.is_empty() {
-            &self.app_id
-        } else if !self.title.is_empty() {
-            &self.title
+        let title = self.title.trim();
+        if !title.is_empty() {
+            title
         } else {
-            "(untitled)"
+            let app_id = self.app_id.trim();
+            if app_id.is_empty() {
+                "(untitled)"
+            } else {
+                app_id
+            }
         }
     }
 }
@@ -155,6 +166,9 @@ pub struct Taskbar {
     /// doesn't reorder entries on focus changes — only
     /// `focused` flips on the existing entries.
     entries: Vec<TaskbarEntry>,
+    /// Opaque server-global id of the desktop shell's own surface. It is kept
+    /// for launcher activation but deliberately excluded from `entries`.
+    shell_window_id: Option<u32>,
     /// Theme palette used for paint. Defaults to the
     /// bundled light theme; callers can swap via
     /// [`Taskbar::set_theme`].
@@ -195,6 +209,7 @@ impl Taskbar {
             fb_width,
             fb_height,
             entries: Vec::new(),
+            shell_window_id: None,
             theme: Theme::LIGHT,
             clock_text: String::new(),
             page_start: 0,
@@ -231,9 +246,24 @@ impl Taskbar {
         self.clamp_page();
     }
 
-    /// Read-only view of the entry list, in creation order.
+    /// Read-only view of visible application entries, in creation order. The
+    /// desktop shell's own surface is deliberately omitted.
     pub fn entries(&self) -> &[TaskbarEntry] {
         &self.entries
+    }
+
+    /// Server-global id of the authenticated desktop shell surface.
+    pub(crate) fn shell_window_id(&self) -> Option<u32> {
+        self.shell_window_id
+    }
+
+    /// Mark the exact server-global window whose owner PID matches the shell's
+    /// authenticated process identity. `app_id` is deliberately not used for
+    /// this decision because ordinary clients control that display metadata.
+    pub fn set_shell_window_id(&mut self, window_id: u32) {
+        self.shell_window_id = Some(window_id);
+        self.entries.retain(|entry| entry.window_id != window_id);
+        self.clamp_page();
     }
 
     /// Add a window to the taskbar. Idempotent: if a window
@@ -248,6 +278,9 @@ impl Taskbar {
     ) {
         let title = title.into();
         let app_id = app_id.into();
+        if self.shell_window_id == Some(window_id) {
+            return;
+        }
         if let Some(existing) = self.entries.iter_mut().find(|e| e.window_id == window_id) {
             existing.title = title;
             existing.app_id = app_id;
@@ -266,6 +299,9 @@ impl Taskbar {
     /// Remove a window from the taskbar. No-op if no entry
     /// matches `window_id`.
     pub fn remove_window(&mut self, window_id: u32) {
+        if self.shell_window_id == Some(window_id) {
+            self.shell_window_id = None;
+        }
         self.entries.retain(|e| e.window_id != window_id);
         self.clamp_page();
     }
@@ -280,8 +316,8 @@ impl Taskbar {
 
     /// Mark `window_id` as the currently-focused window;
     /// every other entry has its focused flag cleared. v1
-    /// taskbars surface focus via a highlight palette on the
-    /// focused entry.
+    /// taskbars surface focus via an accent underline on the
+    /// focused entry. Focusing the hidden shell clears all visible focus.
     pub fn set_focused_window(&mut self, window_id: u32) {
         let mut focused_idx = None;
         for (idx, entry) in self.entries.iter_mut().enumerate() {
@@ -397,9 +433,8 @@ impl Taskbar {
         x >= b.x && x < b.right() && y >= b.y && y < b.bottom()
     }
 
-    /// Route a pointer-down event through the taskbar.
-    /// Returns the click classification, or `None` if the
-    /// click missed every entry.
+    /// Route a pointer-down event through the taskbar. Minimized tasks restore,
+    /// unfocused tasks focus, and clicking the focused task minimizes it.
     pub fn handle_pointer_down(&self, x: i32, y: i32) -> Option<TaskbarClick> {
         if self
             .overflow_rect()
@@ -409,32 +444,12 @@ impl Taskbar {
         }
         let idx = self.hit_test_entry(x, y)?;
         let entry = &self.entries[idx];
-        if self
-            .close_rect(idx)
-            .is_some_and(|rect| rect_contains(rect, x, y))
-        {
-            return Some(TaskbarClick::Close {
-                window_id: entry.window_id,
-            });
-        }
-        if self
-            .minimize_rect(idx)
-            .is_some_and(|rect| rect_contains(rect, x, y))
-        {
-            return Some(TaskbarClick::Minimize {
-                window_id: entry.window_id,
-            });
-        }
-        if self
-            .maximize_rect(idx)
-            .is_some_and(|rect| rect_contains(rect, x, y))
-        {
-            return Some(TaskbarClick::ToggleMaximize {
-                window_id: entry.window_id,
-            });
-        }
         if entry.minimized {
             Some(TaskbarClick::Restore {
+                window_id: entry.window_id,
+            })
+        } else if entry.focused {
+            Some(TaskbarClick::Minimize {
                 window_id: entry.window_id,
             })
         } else {
@@ -444,19 +459,19 @@ impl Taskbar {
         }
     }
 
-    /// Paint the taskbar into `canvas`. Background fill +
-    /// each entry as a labeled box; the focused entry uses
-    /// a highlight palette and minimized entries use a
-    /// dimmed palette.
+    /// Paint the taskbar into `canvas`. Each entry is a quiet title-first task
+    /// button with an original PMos monogram, focused underline, and dimmed
+    /// minimized state.
     pub fn draw(&self, canvas: &mut Canvas<'_>) {
         let bounds = self.bounds();
         if bounds.is_empty() {
             return;
         }
-        // Taskbar uses the titlebar palette so its strip
-        // stands out against the (lighter) wallpaper.
         canvas.fill_rect(bounds, self.theme.titlebar_active);
-        canvas.stroke_rect(bounds, self.theme.border_active);
+        canvas.fill_rect(
+            Rect::new(bounds.x, bounds.y, bounds.width, 1),
+            self.theme.border_inactive,
+        );
         for idx in self.visible_range() {
             let Some(rect) = self.entry_rect(idx) else {
                 continue;
@@ -464,32 +479,37 @@ impl Taskbar {
             let entry = &self.entries[idx];
             let (fill, fg) = self.entry_palette(entry);
             canvas.fill_rect(rect, fill);
-            canvas.stroke_rect(rect, self.theme.border_active);
-            let minimize = self.minimize_rect(idx).expect("visible entry control");
-            let maximize = self.maximize_rect(idx).expect("visible entry control");
-            let close = self.close_rect(idx).expect("visible entry control");
-            let label_width = minimize
-                .x
-                .saturating_sub(rect.x)
-                .saturating_sub((TASKBAR_ENTRY_TEXT_MARGIN + TASKBAR_ENTRY_CONTROL_GAP) as i32)
+
+            let mark = app_mark_rect(rect);
+            let mark_identity = if entry.app_id.is_empty() {
+                entry.label()
+            } else {
+                &entry.app_id
+            };
+            draw_app_mark(canvas, mark, mark_identity, &self.theme, entry.minimized);
+            let text_x = mark.right() + TASKBAR_APP_MARK_GAP as i32;
+            let label_width = rect
+                .right()
+                .saturating_sub(text_x)
+                .saturating_sub(TASKBAR_ENTRY_TEXT_MARGIN as i32)
                 .max(0) as u32;
             let label = fitted_label(entry.label(), label_width);
-            let text_x = rect.x + TASKBAR_ENTRY_TEXT_MARGIN as i32;
             let text_y = rect.y
                 + ((rect.height as i32 - toolkit::draw::font::GLYPH_HEIGHT as i32) / 2).max(0);
             canvas.draw_text(text_x, text_y, &label, fg);
-
-            canvas.fill_rect(minimize, self.theme.button_fill);
-            canvas.stroke_rect(minimize, self.theme.button_border);
-            canvas.draw_text(minimize.x + 6, text_y, "_", self.theme.button_text);
-
-            canvas.fill_rect(maximize, self.theme.button_fill);
-            canvas.stroke_rect(maximize, self.theme.button_border);
-            canvas.draw_text(maximize.x + 2, text_y, "[]", self.theme.button_text);
-
-            canvas.fill_rect(close, self.theme.close_button);
-            canvas.stroke_rect(close, self.theme.button_border);
-            canvas.draw_text(close.x + 6, text_y, "x", self.theme.close_button_glyph);
+            if entry.focused {
+                let indicator_width = TASKBAR_FOCUS_INDICATOR_WIDTH.min(rect.width);
+                let indicator_x = rect.x + (rect.width.saturating_sub(indicator_width) / 2) as i32;
+                canvas.fill_rect(
+                    Rect::new(
+                        indicator_x,
+                        rect.bottom() - TASKBAR_FOCUS_INDICATOR_HEIGHT as i32,
+                        indicator_width,
+                        TASKBAR_FOCUS_INDICATOR_HEIGHT,
+                    ),
+                    self.theme.border_active,
+                );
+            }
         }
         if let Some(overflow) = self.overflow_rect() {
             canvas.fill_rect(overflow, self.theme.button_fill);
@@ -523,11 +543,17 @@ impl Taskbar {
     /// on its focused / minimized state.
     fn entry_palette(&self, entry: &TaskbarEntry) -> (Color, Color) {
         if entry.minimized {
-            (self.theme.button_fill, self.theme.button_text)
+            (
+                self.theme.titlebar_inactive,
+                self.theme.titlebar_text_inactive,
+            )
         } else if entry.focused {
-            (self.theme.button_fill_pressed, self.theme.button_text)
+            (
+                self.theme.button_fill_hover,
+                self.theme.titlebar_text_active,
+            )
         } else {
-            (self.theme.button_fill_hover, self.theme.button_text)
+            (self.theme.titlebar_active, self.theme.titlebar_text_active)
         }
     }
 
@@ -544,7 +570,7 @@ impl Taskbar {
             .max(TASKBAR_MIN_ENTRY_WIDTH.min(available))
     }
 
-    /// Number of entries that have full, non-overlapping controls on one page.
+    /// Number of entries that fit as full, non-overlapping task buttons.
     pub fn visible_capacity(&self) -> usize {
         if self.entries.is_empty() {
             return 0;
@@ -587,38 +613,6 @@ impl Taskbar {
         ))
     }
 
-    pub fn minimize_rect(&self, idx: usize) -> Option<Rect> {
-        let entry = self.entry_rect(idx)?;
-        let maximize = self.maximize_rect(idx)?;
-        Some(Rect::new(
-            maximize.x - TASKBAR_ENTRY_CONTROL_GAP as i32 - TASKBAR_ENTRY_CONTROL_WIDTH as i32,
-            entry.y,
-            TASKBAR_ENTRY_CONTROL_WIDTH,
-            entry.height,
-        ))
-    }
-
-    pub fn maximize_rect(&self, idx: usize) -> Option<Rect> {
-        let entry = self.entry_rect(idx)?;
-        let close = self.close_rect(idx)?;
-        Some(Rect::new(
-            close.x - TASKBAR_ENTRY_CONTROL_GAP as i32 - TASKBAR_ENTRY_CONTROL_WIDTH as i32,
-            entry.y,
-            TASKBAR_ENTRY_CONTROL_WIDTH,
-            entry.height,
-        ))
-    }
-
-    pub fn close_rect(&self, idx: usize) -> Option<Rect> {
-        let entry = self.entry_rect(idx)?;
-        Some(Rect::new(
-            entry.right() - TASKBAR_ENTRY_CONTROL_WIDTH as i32,
-            entry.y,
-            TASKBAR_ENTRY_CONTROL_WIDTH,
-            entry.height,
-        ))
-    }
-
     /// Advance one overflow page, wrapping to the first page.
     pub fn cycle_overflow(&mut self) {
         let capacity = self.visible_capacity();
@@ -657,6 +651,75 @@ impl Taskbar {
         if capacity > 0 && !self.visible_range().contains(&idx) {
             self.page_start = (idx / capacity) * capacity;
         }
+    }
+}
+
+fn app_mark_rect(entry: Rect) -> Rect {
+    Rect::new(
+        entry.x + TASKBAR_ENTRY_TEXT_MARGIN as i32,
+        entry.y + ((entry.height.saturating_sub(TASKBAR_APP_MARK_SIZE)) / 2) as i32,
+        TASKBAR_APP_MARK_SIZE.min(entry.width),
+        TASKBAR_APP_MARK_SIZE.min(entry.height),
+    )
+}
+
+/// Paint a compact, PMos-owned application monogram. Launcher rows share this
+/// primitive so built-ins remain recognizable even when no package icon exists.
+pub(crate) fn draw_app_mark(
+    canvas: &mut Canvas<'_>,
+    bounds: Rect,
+    identity: &str,
+    theme: &Theme,
+    dimmed: bool,
+) {
+    if bounds.is_empty() {
+        return;
+    }
+    let fill = if dimmed {
+        theme.border_inactive
+    } else {
+        theme.border_active
+    };
+    canvas.fill_rect(bounds, fill);
+
+    let glyph = identity
+        .rsplit('.')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(identity)
+        .chars()
+        .find(char::is_ascii_alphanumeric)
+        .map(|ch| ch.to_ascii_uppercase())
+        .unwrap_or('P');
+    let mut glyph_bytes = [0_u8; 4];
+    let glyph_text = glyph.encode_utf8(&mut glyph_bytes);
+    let glyph_width = text_width_px(glyph_text).min(bounds.width);
+    let text_x = bounds.x + (bounds.width.saturating_sub(glyph_width) / 2) as i32;
+    let text_y =
+        bounds.y + ((bounds.height as i32 - toolkit::draw::font::GLYPH_HEIGHT as i32) / 2).max(0);
+    canvas.draw_text(text_x, text_y, glyph_text, theme.window_background);
+}
+
+/// Paint the original PMos four-pane mark used by the Start control.
+pub(crate) fn draw_pmos_mark(canvas: &mut Canvas<'_>, bounds: Rect, color: Color) {
+    if bounds.width < 3 || bounds.height < 3 {
+        return;
+    }
+    let gap = 2_u32.min(bounds.width.saturating_sub(2));
+    let pane = ((bounds.width.min(bounds.height)).saturating_sub(gap) / 2).max(1);
+    let mark_width = pane.saturating_mul(2).saturating_add(gap);
+    let mark_height = mark_width;
+    let x = bounds.x + (bounds.width.saturating_sub(mark_width) / 2) as i32;
+    let y = bounds.y + (bounds.height.saturating_sub(mark_height) / 2) as i32;
+    for (column, row) in [(0_u32, 0_u32), (1, 0), (0, 1), (1, 1)] {
+        canvas.fill_rect(
+            Rect::new(
+                x + (column * (pane + gap)) as i32,
+                y + (row * (pane + gap)) as i32,
+                pane,
+                pane,
+            ),
+            color,
+        );
     }
 }
 

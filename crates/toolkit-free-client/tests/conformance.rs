@@ -13,9 +13,10 @@ use display_proto::{events::key_state, wire::MessageHeader, Interface, ObjectId}
 use display_server::Server;
 use toolkit_free_client::{
     FreeClient, OutboundTurn, SessionDriver, SessionDriverError, SessionSignal, WriteAttempt,
-    FRAME_ACCENT_RGBA, INITIAL_FRAME_RGBA, INPUT_FRAME_RGBA, OP_BUFFER_DESTROY,
-    OP_SHM_POOL_DESTROY, OP_SHM_POOL_WRITE, OP_SURFACE_ATTACH, OP_SURFACE_COMMIT,
-    OP_SURFACE_DAMAGE, OP_SURFACE_DESTROY, OP_XDG_TOPLEVEL_DESTROY, OUTBOUND_WRITE_MAX_BYTES,
+    FRAME_ACCENT_RGBA, FRAME_HEIGHT, FRAME_WIDTH, INITIAL_FRAME_RGBA, INPUT_FRAME_RGBA,
+    OP_BUFFER_DESTROY, OP_SHM_POOL_DESTROY, OP_SHM_POOL_WRITE, OP_SURFACE_ATTACH,
+    OP_SURFACE_COMMIT, OP_SURFACE_DAMAGE, OP_SURFACE_DESTROY, OP_XDG_TOPLEVEL_ACK_CONFIGURE,
+    OP_XDG_TOPLEVEL_DESTROY, OUTBOUND_WRITE_MAX_BYTES,
 };
 
 fn split_first_message(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -548,6 +549,73 @@ fn production_driver_defers_attach_damage_commit_until_upload_batch_is_complete(
     assert_eq!(commit_headers[2].object_id, surface);
     assert_eq!(commit_headers[2].opcode, OP_SURFACE_COMMIT);
     assert!(driver.session().is_presented());
+}
+
+#[test]
+fn activation_configure_after_initial_frame_batch_acks_and_session_keeps_running() {
+    let (mut server, server_client_id, mut driver, mut stream) = configured_driver();
+    let surface = driver.session().objects().surface.expect("surface id");
+    let toplevel = driver.session().objects().toplevel.expect("toplevel id");
+
+    // Dispatching the initial commit maps and focuses the real server window.
+    // The resulting activation configure is produced after the driver's frame
+    // completion has drained, just as it is between production outer-loop
+    // turns, so its ACK is the only request in the next outbound batch.
+    let initial_signals = flush_driver(&mut driver, &mut stream, &mut server, server_client_id);
+    assert!(initial_signals.contains(&SessionSignal::FramePresented {
+        input_response: false,
+    }));
+    let activation_events = drain_server(&mut server, server_client_id);
+    let activation_signals = driver
+        .push_server_bytes(&activation_events)
+        .expect("consume activation configure");
+    assert!(activation_signals.iter().any(|signal| matches!(
+        signal,
+        SessionSignal::Configured { width, height, .. }
+            if *width == FRAME_WIDTH as i32 && *height == FRAME_HEIGHT as i32
+    )));
+
+    let (ack_turn, ack_bytes) =
+        write_driver_turn_capture(&mut driver, &mut stream, &mut server, server_client_id);
+    assert!(ack_turn.attempted);
+    assert!(!ack_turn.pending);
+    assert!(ack_turn.signals.is_empty());
+    let ack_headers = decode_headers(&ack_bytes);
+    assert_eq!(ack_headers.len(), 1);
+    assert_eq!(ack_headers[0].object_id, toplevel);
+    assert_eq!(ack_headers[0].opcode, OP_XDG_TOPLEVEL_ACK_CONFIGURE);
+
+    assert_eq!(
+        server.inject_keyboard_key(0x15, key_state::PRESSED),
+        Some((server_client_id, surface))
+    );
+    let key_events = drain_server(&mut server, server_client_id);
+    let key_signals = driver
+        .push_server_bytes(&key_events)
+        .expect("consume keyboard event after repeated configure");
+    assert!(key_signals.contains(&SessionSignal::Key {
+        key: 0x15,
+        state: key_state::PRESSED,
+    }));
+    let input_signals = flush_driver(&mut driver, &mut stream, &mut server, server_client_id);
+    assert!(input_signals.contains(&SessionSignal::FramePresented {
+        input_response: true,
+    }));
+    assert!(driver.session().input_repainted());
+
+    server
+        .client_mut(server_client_id)
+        .expect("server client")
+        .emit_xdg_toplevel_close(toplevel)
+        .expect("emit close");
+    let close_events = drain_server(&mut server, server_client_id);
+    let close_signals = driver
+        .push_server_bytes(&close_events)
+        .expect("consume close after repeated configure");
+    assert!(close_signals.contains(&SessionSignal::CloseRequested));
+    assert!(flush_driver(&mut driver, &mut stream, &mut server, server_client_id).is_empty());
+    assert!(driver.shutdown_complete());
+    assert!(server.window_z_order().is_empty());
 }
 
 #[test]

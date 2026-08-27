@@ -27,6 +27,13 @@ type CausalEvidence =
       readonly kind: "pixel";
       readonly point: { readonly x: number; readonly y: number };
       readonly expected: readonly number[];
+    }
+  | {
+      readonly kind: "pixels";
+      readonly samples: readonly {
+        readonly point: { readonly x: number; readonly y: number };
+        readonly expected: readonly number[];
+      }[];
     };
 
 export interface ArmSampleOptions {
@@ -104,16 +111,18 @@ export async function armCausalSample(
         }
         const context = canvas.getContext("2d");
         if (context === null) throw new Error("framebuffer 2d context missing");
-        const current = Array.from(
-          context.getImageData(
-            sample.evidence.point.x,
-            sample.evidence.point.y,
-            1,
-            1,
-          ).data,
-        );
-        const expected = sample.evidence.expected;
-        return current.every((channel, index) => channel === expected[index]);
+        const probes =
+          sample.evidence.kind === "pixel"
+            ? [sample.evidence]
+            : sample.evidence.samples;
+        return probes.every((probe) => {
+          const current = Array.from(
+            context.getImageData(probe.point.x, probe.point.y, 1, 1).data,
+          );
+          return current.every(
+            (channel, index) => channel === probe.expected[index],
+          );
+        });
       };
 
       const onInput = (event: Event): void => {

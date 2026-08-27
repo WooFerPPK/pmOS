@@ -539,6 +539,34 @@ fn window_unset_maximized_sends_request_with_empty_payload() {
 }
 
 #[test]
+fn window_set_minimized_sends_owner_request_with_empty_payload() {
+    let mut conn = LoopbackConnection::new();
+    seed_registry(&mut conn);
+    let mut app = App::connect(conn).expect("bootstrap must succeed");
+    let _ = app.client_mut().connection_mut().drain_outbound();
+    let mut window = Window::new(&mut app).expect("window creation must succeed");
+    let toplevel_id = window.xdg_toplevel();
+    let _ = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+
+    window.set_minimized().expect("set_minimized must succeed");
+
+    let bytes = window
+        .app_mut()
+        .client_mut()
+        .connection_mut()
+        .drain_outbound();
+    let requests = parse_requests(&bytes);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].object_id, toplevel_id);
+    assert_eq!(requests[0].opcode, 9 /* set_minimized */);
+    assert!(requests[0].payload.is_empty());
+}
+
+#[test]
 fn window_maximize_restore_round_trip_via_state_bit() {
     use display_proto::xdg_toplevel_state;
     let mut conn = LoopbackConnection::new();

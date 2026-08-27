@@ -112,11 +112,15 @@ pub enum Scancode {
     Comma = 0x36,        // , / <
     Period = 0x37,       // . / >
     Slash = 0x38,        // / / ?
+    // Function keys used by display-server-owned desktop shortcut matching.
+    F4 = 0x3D,
     // Modifier keys (produce no codepoint; codepoints are 0)
     ShiftLeft = 0xE1,
     ShiftRight = 0xE5,
     ControlLeft = 0xE0,
     ControlRight = 0xE4,
+    AltLeft = 0xE2,
+    AltRight = 0xE6,
 }
 
 impl TryFrom<u8> for Scancode {
@@ -175,10 +179,13 @@ impl TryFrom<u8> for Scancode {
             0x36 => Ok(Scancode::Comma),
             0x37 => Ok(Scancode::Period),
             0x38 => Ok(Scancode::Slash),
+            0x3D => Ok(Scancode::F4),
             0xE0 => Ok(Scancode::ControlLeft),
             0xE1 => Ok(Scancode::ShiftLeft),
+            0xE2 => Ok(Scancode::AltLeft),
             0xE4 => Ok(Scancode::ControlRight),
             0xE5 => Ok(Scancode::ShiftRight),
+            0xE6 => Ok(Scancode::AltRight),
             other => Err(KeymapError::UnknownScancode(other)),
         }
     }

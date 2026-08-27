@@ -78,6 +78,16 @@ pub enum Interface {
 }
 
 impl Interface {
+    /// Highest protocol version implemented by this interface in the shipped
+    /// catalogue. Registry bindings negotiate one non-zero version no newer
+    /// than this value.
+    pub const fn supported_version(self) -> u32 {
+        match self {
+            Interface::ShellManager => 2,
+            _ => 1,
+        }
+    }
+
     /// Short human-readable name for diagnostics and
     /// `pmd_registry.global` events.
     pub const fn name(self) -> &'static str {
@@ -520,6 +530,11 @@ const SHELL_MANAGER_EVENTS: &[Opcode] = &[
         direction: Direction::Event,
         name: "restore_finished",
     },
+    Opcode {
+        number: 9,
+        direction: Direction::Event,
+        name: "close_shortcut",
+    },
 ];
 
 // pmd_xdg_shell — narrowed Wayland xdg-shell. A single
@@ -590,6 +605,11 @@ const XDG_TOPLEVEL_REQUESTS: &[Opcode] = &[
         number: 8,
         direction: Direction::Request,
         name: "resize",
+    },
+    Opcode {
+        number: 9,
+        direction: Direction::Request,
+        name: "set_minimized",
     },
 ];
 

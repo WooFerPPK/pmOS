@@ -23,9 +23,11 @@ use sysmon::{
     format_process_row, MonitorAction, MonitorKey, MonitorMode, MonitorState, PointerTarget,
     ProcessCollection, ProcessScanStep, ProcessScanner, RefreshSchedule,
 };
-use toolkit::draw::font::GLYPH_HEIGHT;
 use toolkit::draw::{Canvas, Color, Rect};
-use toolkit::{watch_theme, App, BufferPool, Theme, Window};
+use toolkit::widget::frame::{PointerOutcome as ChromePointerOutcome, WindowFrame};
+use toolkit::{
+    watch_theme, App, BufferPool, Theme, Window, WindowFramePatch, WindowFramePatchProgress,
+};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_main {
@@ -69,7 +71,7 @@ extern crate alloc;
 
 const DEFAULT_WIDTH: u32 = 720;
 const DEFAULT_HEIGHT: u32 = 440;
-const TITLEBAR_HEIGHT: u32 = 22;
+const TITLEBAR_HEIGHT: u32 = toolkit::widget::frame::TITLEBAR_HEIGHT;
 const TOOLBAR_Y: i32 = TITLEBAR_HEIGHT as i32;
 const TOOLBAR_HEIGHT: u32 = 28;
 const HEADER_Y: i32 = TOOLBAR_Y + TOOLBAR_HEIGHT as i32;
@@ -279,10 +281,17 @@ where
     let mut configured = false;
     let mut ready_logged = false;
     let mut pool: Option<BufferPool> = None;
+    let mut chrome_patch: Option<WindowFramePatch> = None;
     let mut size = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    let mut was_maximized = false;
+    let mut was_activated = false;
 
     loop {
         let events = window.dispatch()?;
+        let focus_changed = window.is_activated() != was_activated;
+        if focus_changed {
+            was_activated = window.is_activated();
+        }
         if window.take_close_requested() {
             return Ok(());
         }
@@ -311,6 +320,36 @@ where
                 (Interface::Pointer, 2) => {
                     if let Ok(button) = PointerButton::decode(&event.payload) {
                         if button.button == 1 && button.state == pointer_button_state::PRESSED {
+                            let mut chrome = sysmon_window_frame(
+                                size.0,
+                                size.1,
+                                theme,
+                                window.is_activated(),
+                                window.is_maximized(),
+                            );
+                            match chrome.pointer_down(button.x, button.y) {
+                                ChromePointerOutcome::Minimize => {
+                                    window.set_minimized()?;
+                                    continue;
+                                }
+                                ChromePointerOutcome::ToggleMaximize => {
+                                    if window.is_maximized() {
+                                        window.unset_maximized()?;
+                                    } else {
+                                        window.set_maximized()?;
+                                    }
+                                    continue;
+                                }
+                                ChromePointerOutcome::Close => return Ok(()),
+                                ChromePointerOutcome::Titlebar => {
+                                    if !window.is_maximized() {
+                                        window.request_move(button.serial)?;
+                                    }
+                                    continue;
+                                }
+                                ChromePointerOutcome::Content => {}
+                                ChromePointerOutcome::Outside => continue,
+                            }
                             if let Some(target) =
                                 pointer_target(&state, button.x, button.y, size.0, size.1)
                             {
@@ -351,6 +390,21 @@ where
                     height.clamp(320, DEFAULT_HEIGHT),
                 );
             }
+            BufferPool::replace(&mut pool, window.app_mut(), size.0, size.1)?;
+            needs_paint = true;
+        }
+
+        if configured
+            && window.is_maximized() != was_maximized
+            && !pool.as_ref().is_some_and(BufferPool::commit_pending)
+        {
+            was_maximized = window.is_maximized();
+            let offered = window.configured_size();
+            size = if was_maximized && offered.0 > 0 && offered.1 > 0 {
+                offered
+            } else {
+                (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            };
             BufferPool::replace(&mut pool, window.app_mut(), size.0, size.1)?;
             needs_paint = true;
         }
@@ -425,13 +479,46 @@ where
             println!("sysmon: theme changed {}", theme.name);
         }
 
+        if needs_paint {
+            chrome_patch = None;
+        } else {
+            if focus_changed && configured {
+                chrome_patch = Some(WindowFramePatch::new(&sysmon_window_frame(
+                    size.0,
+                    size.1,
+                    theme,
+                    was_activated,
+                    window.is_maximized(),
+                )));
+            }
+            if let (Some(patch), Some(buffers)) = (chrome_patch.as_mut(), pool.as_mut()) {
+                match patch.progress(buffers, &mut window)? {
+                    WindowFramePatchProgress::Complete => chrome_patch = None,
+                    WindowFramePatchProgress::Unavailable => {
+                        chrome_patch = None;
+                        needs_paint = true;
+                    }
+                    WindowFramePatchProgress::Deferred | WindowFramePatchProgress::Pending => {}
+                }
+            }
+        }
+
         if configured && needs_paint {
             let buffers = pool.as_mut().expect("buffer pool configured");
             if let Some(mut canvas) = buffers.acquire_back_canvas() {
-                paint_sysmon(&mut canvas, size.0, size.1, &state, theme);
+                paint_sysmon(
+                    &mut canvas,
+                    size.0,
+                    size.1,
+                    &state,
+                    theme,
+                    was_activated,
+                    window.is_maximized(),
+                );
                 drop(canvas);
                 let _ = buffers.commit_and_swap(&mut window)?;
                 needs_paint = false;
+                chrome_patch = None;
                 if !ready_logged {
                     println!(
                         "sysmon: ready processes={} terminate={}",
@@ -451,7 +538,8 @@ where
         process_logs.drain_turn(|message| println!("{message}"));
         if pending_refresh.is_some()
             || !process_logs.is_empty()
-            || (pool.as_ref().is_some_and(BufferPool::commit_pending) && !window.outbound_pending())
+            || ((pool.as_ref().is_some_and(BufferPool::commit_pending) || chrome_patch.is_some())
+                && !window.outbound_pending())
         {
             continue;
         }
@@ -569,7 +657,6 @@ fn pointer_target(
         return match x {
             6..=91 => Some(PointerTarget::Refresh),
             98..=201 => Some(PointerTarget::Terminate),
-            _ if x >= width as i32 - 62 && x < width as i32 - 6 => Some(PointerTarget::Close),
             _ => None,
         };
     }
@@ -596,9 +683,10 @@ fn paint_sysmon(
     height: u32,
     state: &MonitorState,
     theme: Theme,
+    focused: bool,
+    maximized: bool,
 ) {
     let background = theme.window_background;
-    let titlebar = theme.titlebar_active;
     let toolbar = theme.titlebar_inactive;
     let button = theme.button_fill;
     let selected = theme.border_active;
@@ -607,14 +695,6 @@ fn paint_sysmon(
     let muted = theme.text_input_placeholder_fg;
 
     canvas.fill_rect(Rect::new(0, 0, width, height), background);
-    canvas.fill_rect(Rect::new(0, 0, width, TITLEBAR_HEIGHT), titlebar);
-    canvas.draw_text(
-        8,
-        ((TITLEBAR_HEIGHT as i32 - GLYPH_HEIGHT as i32) / 2).max(0),
-        "System Monitor",
-        theme.titlebar_text_active,
-    );
-
     canvas.fill_rect(Rect::new(0, TOOLBAR_Y, width, TOOLBAR_HEIGHT), toolbar);
     draw_button(canvas, 6, 86, "Refresh (R)", button, text);
     draw_button(
@@ -632,14 +712,6 @@ fn paint_sysmon(
         } else {
             muted
         },
-    );
-    draw_button(
-        canvas,
-        width as i32 - 62,
-        56,
-        "Close",
-        theme.close_button,
-        text,
     );
 
     canvas.fill_rect(
@@ -726,6 +798,23 @@ fn paint_sysmon(
     if let MonitorMode::ConfirmTerminate { pid, name } = state.mode() {
         draw_confirm(canvas, width, height, *pid, name, theme);
     }
+
+    let frame = sysmon_window_frame(width, height, theme, focused, maximized);
+    frame.draw(canvas);
+}
+
+fn sysmon_window_frame(
+    width: u32,
+    height: u32,
+    theme: Theme,
+    focused: bool,
+    maximized: bool,
+) -> WindowFrame {
+    let mut frame = WindowFrame::new(Rect::new(0, 0, width, height), "System Monitor");
+    frame.set_theme(theme);
+    frame.set_focused(focused);
+    frame.set_maximized(maximized);
+    frame
 }
 
 fn draw_button(
@@ -925,8 +1014,8 @@ mod paint_tests {
         let mut light = Canvas::new(480, 320);
         let mut dark = Canvas::new(480, 320);
 
-        paint_sysmon(&mut light, 480, 320, &state, Theme::LIGHT);
-        paint_sysmon(&mut dark, 480, 320, &state, Theme::DARK);
+        paint_sysmon(&mut light, 480, 320, &state, Theme::LIGHT, true, false);
+        paint_sysmon(&mut dark, 480, 320, &state, Theme::DARK, true, false);
 
         assert_eq!(
             light.pixel(300, 10),

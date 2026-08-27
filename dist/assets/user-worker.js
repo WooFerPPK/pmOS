@@ -23,10 +23,14 @@ function encodeRequest(req) {
   view.setUint32(4, req.requestId, true);
   if (req.args !== void 0) {
     if (req.args.length !== 16) {
-      throw new Error(`syscall.encodeRequest: args must be 16 bytes, got ${req.args.length}`);
+      throw new Error(
+        `syscall.encodeRequest: args must be 16 bytes, got ${req.args.length}`
+      );
     }
     if (req.arg0 !== void 0) {
-      throw new Error("syscall.encodeRequest: pass either args or arg0, not both");
+      throw new Error(
+        "syscall.encodeRequest: pass either args or arg0, not both"
+      );
     }
     buf.set(req.args, 8);
   } else if (req.arg0 !== void 0) {
@@ -38,7 +42,9 @@ function encodeRequest(req) {
 }
 function decodeResponse(bytes) {
   if (bytes.length !== SLOT_SIZE) {
-    throw new Error(`syscall.decodeResponse: expected ${SLOT_SIZE} bytes, got ${bytes.length}`);
+    throw new Error(
+      `syscall.decodeResponse: expected ${SLOT_SIZE} bytes, got ${bytes.length}`
+    );
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, SLOT_SIZE);
   return {
@@ -323,6 +329,9 @@ var OP_EXT = {
   /** Kernel-authenticated capability snapshot for the process on the
    * other end of a connected IPC socket (`SO_PEERCRED` equivalent). */
   IPC_PEER_CAPS: 4104,
+  /** Kernel-authenticated pid snapshot for the process on the other
+   * end of a connected IPC socket (`SO_PEERCRED` equivalent). */
+  IPC_PEER_PID: 4105,
   PROC_SPAWN: 4352,
   PROC_SELF: 4355,
   PROC_PARENT: 4356,
@@ -333,6 +342,8 @@ var OP_EXT = {
   DISPLAY_BIND: 4609,
   CAP_CHECK: 4864,
   CAP_LIST: 4865,
+  MOUNT: 5120,
+  UMOUNT: 5121,
   FS_WATCH: 5122,
   FS_CHMOD: 5123,
   HOST_FILE_RECV: 5376,
@@ -340,6 +351,8 @@ var OP_EXT = {
   HOST_FILE_SEND: 5378
 };
 var ERRNO = {
+  /** Permission denied. */
+  EACCES: 2,
   EAGAIN: 6,
   EBADF: 8,
   /** No child processes. Returned by `proc_wait` when the caller
@@ -448,7 +461,9 @@ function encodeSpawnManifest(manifest) {
   );
   const envp = (manifest.envp ?? []).map(([key, value], index) => {
     if (key.includes("=")) {
-      throw new RangeError(`encodeSpawnManifest: envp[${index}] key contains '='`);
+      throw new RangeError(
+        `encodeSpawnManifest: envp[${index}] key contains '='`
+      );
     }
     return [
       encodeText(`envp[${index}] key`, key, false),
@@ -464,17 +479,23 @@ function encodeSpawnManifest(manifest) {
     validateFd("extra parent fd", parentFd);
     validateFd("extra child fd", childFd);
     if (childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT) {
-      throw new RangeError(`encodeSpawnManifest: reserved/out-of-range child fd ${childFd}`);
+      throw new RangeError(
+        `encodeSpawnManifest: reserved/out-of-range child fd ${childFd}`
+      );
     }
     if (childFds.has(childFd)) {
-      throw new RangeError(`encodeSpawnManifest: duplicate child fd ${childFd}`);
+      throw new RangeError(
+        `encodeSpawnManifest: duplicate child fd ${childFd}`
+      );
     }
     childFds.add(childFd);
   }
   const bodyLen = path.length + cwd.length + argv.reduce((sum, arg) => sum + 2 + arg.length, 0) + envp.reduce((sum, [key, value]) => sum + 4 + key.length + value.length, 0) + extraFds.length * 8;
   const totalLen = SPAWN_V1_HEADER_LEN + bodyLen;
   if (totalLen > SPAWN_V1_MAX_BYTES) {
-    throw new RangeError(`encodeSpawnManifest: blob size ${totalLen} exceeds ${SPAWN_V1_MAX_BYTES}`);
+    throw new RangeError(
+      `encodeSpawnManifest: blob size ${totalLen} exceeds ${SPAWN_V1_MAX_BYTES}`
+    );
   }
   const heap = new Uint8Array(totalLen);
   const header = new DataView(heap.buffer);
@@ -538,9 +559,11 @@ function encodeSpawnManifestBlob(blob) {
   return { args, heap: blob.slice() };
 }
 function isValidSpawnManifestBlob(blob) {
-  if (blob.length < SPAWN_V1_HEADER_LEN || blob.length > SPAWN_V1_MAX_BYTES) return false;
+  if (blob.length < SPAWN_V1_HEADER_LEN || blob.length > SPAWN_V1_MAX_BYTES)
+    return false;
   const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
-  if (view.getUint32(0, true) !== SPAWN_V1_MAGIC || view.getUint16(4, true) !== SPAWN_V1_VERSION || view.getUint32(8, true) !== blob.length || view.getUint16(22, true) !== 0 || view.getUint32(36, true) !== 0) return false;
+  if (view.getUint32(0, true) !== SPAWN_V1_MAGIC || view.getUint16(4, true) !== SPAWN_V1_VERSION || view.getUint32(8, true) !== blob.length || view.getUint16(22, true) !== 0 || view.getUint32(36, true) !== 0)
+    return false;
   const flags = view.getUint16(6, true);
   if ((flags & ~SPAWN_KNOWN_FLAGS) !== 0) return false;
   const pathLen = view.getUint16(12, true);
@@ -549,14 +572,16 @@ function isValidSpawnManifestBlob(blob) {
   const envc = view.getUint16(18, true);
   const extraCount = view.getUint16(20, true);
   if ((flags & SPAWN_FLAG_CWD) === 0 !== (cwdLen === 0)) return false;
-  if ((flags & SPAWN_FLAG_CAPS) === 0 && view.getBigUint64(40, true) !== 0n) return false;
+  if ((flags & SPAWN_FLAG_CAPS) === 0 && view.getBigUint64(40, true) !== 0n)
+    return false;
   for (const offset2 of [24, 28, 32]) {
     if (view.getInt32(offset2, true) < SPAWN_INHERIT_FD) return false;
   }
   const utf8 = new TextDecoder("utf-8", { fatal: true });
   let offset = SPAWN_V1_HEADER_LEN;
   const take = (length, allowEmpty) => {
-    if (!allowEmpty && length === 0 || offset + length > blob.length) return null;
+    if (!allowEmpty && length === 0 || offset + length > blob.length)
+      return null;
     const bytes = blob.subarray(offset, offset + length);
     offset += length;
     if (bytes.includes(0)) return null;
@@ -605,7 +630,8 @@ function isValidSpawnManifestBlob(blob) {
   for (let i = 0; i < extraCount; i++) {
     const parentFd = readU32();
     const childFd = readU32();
-    if (parentFd === null || childFd === null || childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT || childFds.has(childFd)) return false;
+    if (parentFd === null || childFd === null || childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT || childFds.has(childFd))
+      return false;
     childFds.add(childFd);
   }
   return offset === blob.length;
@@ -3099,6 +3125,39 @@ var UserWasmRuntime = class {
         memView.setBigUint64(
           capsOutPtr,
           BigInt.asUintN(64, response.value),
+          true
+        );
+        return 0;
+      },
+      // `ipc_peer_pid(fd: i32, pid_out_ptr: i32) -> i32`
+      //
+      // Fetch the immutable, kernel-authenticated connection-time
+      // pid for the process on the other end of `fd`. The guest can
+      // name only a connected fd it already owns; no peer-supplied
+      // payload participates in the result.
+      ipc_peer_pid: (fd, pidOutPtr) => {
+        if (pidOutPtr === 0 || this.memory === void 0) {
+          return -ERRNO.EINVAL;
+        }
+        if (!isGuestRange(this.memory, pidOutPtr, 4)) {
+          return -ERRNO.EFAULT;
+        }
+        const { response } = this.backend.dispatch({
+          opcode: OP_EXT.IPC_PEER_PID,
+          requestId: 0,
+          arg0: fd,
+          heapPtr: 0,
+          heapLen: 0
+        });
+        if (response.status !== 0) {
+          return pmosError(response.status);
+        }
+        if (response.value < BigInt(I32_MIN) || response.value > BigInt(I32_MAX)) {
+          return -ERRNO.EIO;
+        }
+        new DataView(this.memory.buffer).setInt32(
+          pidOutPtr,
+          Number(response.value),
           true
         );
         return 0;

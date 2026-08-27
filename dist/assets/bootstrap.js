@@ -1263,6 +1263,8 @@ function domCodeToScancode(code) {
       return 55;
     case "Slash":
       return 56;
+    case "F4":
+      return 61;
     case "Insert":
       return 73;
     case "Home":
@@ -1299,16 +1301,121 @@ function domCodeToScancode(code) {
       return null;
   }
 }
+function targetsBrowserSubstrateControl(event) {
+  const target = event.target;
+  if (typeof target?.closest !== "function") return false;
+  const recovery = target.closest("#pmos-storage-recovery");
+  const hostPicker = target.closest(`#${HOST_FILE_PICKER_CONFIRM_ID}`);
+  return recovery !== null && recovery !== void 0 || hostPicker !== null && hostPicker !== void 0;
+}
+function createBrowserControlKeyRouter(targetsControl = targetsBrowserSubstrateControl) {
+  const routeToGuest = /* @__PURE__ */ new Map();
+  return {
+    keydown(event) {
+      const existingRoute = routeToGuest.get(event.code);
+      if (existingRoute !== void 0) {
+        if (event.repeat === true) return existingRoute;
+        routeToGuest.delete(event.code);
+      }
+      const guest = !targetsControl(event);
+      routeToGuest.set(event.code, guest);
+      return guest;
+    },
+    keyup(event) {
+      const existingRoute = routeToGuest.get(event.code);
+      if (existingRoute !== void 0) {
+        routeToGuest.delete(event.code);
+        return existingRoute;
+      }
+      return !targetsControl(event);
+    }
+  };
+}
 function createGuiKeyboardInputHandler(kernelWorker, state) {
   return (event) => {
-    if (event.metaKey) return;
+    if (event.metaKey) return null;
     const scancode = domCodeToScancode(event.code);
-    if (scancode === null) return;
+    if (scancode === null) return null;
     event.preventDefault();
     kernelWorker.postMessage({
       kind: "input:kbd",
       bytes: packKbdEvent(scancode, state)
     });
+    return scancode;
+  };
+}
+function createGuiKeyboardInputBridge(kernelWorker, userInteractionAllowed = () => true, targetsControl = targetsBrowserSubstrateControl) {
+  const press = createGuiKeyboardInputHandler(
+    kernelWorker,
+    KbdKeyState.Pressed
+  );
+  const browserControlKeys = createBrowserControlKeyRouter(targetsControl);
+  const heldGuestKeys = /* @__PURE__ */ new Map();
+  const releasedForFocusLoss = /* @__PURE__ */ new Set();
+  const postRelease = (scancode) => {
+    kernelWorker.postMessage({
+      kind: "input:kbd",
+      bytes: packKbdEvent(scancode, KbdKeyState.Released)
+    });
+  };
+  return {
+    keydown(event) {
+      if (!browserControlKeys.keydown(event)) return;
+      if (releasedForFocusLoss.has(event.code)) {
+        if (event.repeat === true) {
+          event.preventDefault();
+          return;
+        }
+        releasedForFocusLoss.delete(event.code);
+      }
+      if (!userInteractionAllowed()) {
+        event.preventDefault();
+        return;
+      }
+      if (event.repeat !== true) {
+        const staleScancode = heldGuestKeys.get(event.code);
+        if (staleScancode !== void 0) {
+          postRelease(staleScancode);
+          heldGuestKeys.delete(event.code);
+        }
+      }
+      const scancode = press(event);
+      if (scancode !== null) heldGuestKeys.set(event.code, scancode);
+    },
+    keyup(event) {
+      if (!browserControlKeys.keyup(event)) return;
+      if (releasedForFocusLoss.delete(event.code)) {
+        event.preventDefault();
+        return;
+      }
+      const scancode = heldGuestKeys.get(event.code);
+      if (scancode !== void 0) {
+        event.preventDefault();
+        postRelease(scancode);
+        heldGuestKeys.delete(event.code);
+        return;
+      }
+      if (!userInteractionAllowed()) event.preventDefault();
+    },
+    releaseHeldKeys() {
+      for (const [code, scancode] of heldGuestKeys) {
+        postRelease(scancode);
+        releasedForFocusLoss.add(code);
+      }
+      heldGuestKeys.clear();
+    }
+  };
+}
+function installGuiKeyboardFocusLossHandlers(windowTarget, documentTarget, releaseHeldKeys) {
+  const onBlur = () => releaseHeldKeys();
+  const onVisibilityChange = () => {
+    if (documentTarget.hidden) releaseHeldKeys();
+  };
+  windowTarget.addEventListener("blur", onBlur);
+  documentTarget.addEventListener("visibilitychange", onVisibilityChange);
+  return () => {
+    windowTarget.removeEventListener("blur", onBlur);
+    documentTarget.removeEventListener("visibilitychange", onVisibilityChange);
   };
 }
 function keyToBytes(key) {
@@ -1518,6 +1625,7 @@ function runRealKernelMode(bootBinary) {
   const guiDesktopReady = isGuiBoot ? createGuiDesktopReadyLatch(() => {
     splash?.markStarted("Desktop ready");
     splash?.dismiss();
+    consoleEl.hidden = true;
   }) : null;
   const userInteractionAllowed = () => isBootInteractionAllowed({
     kernelReady,
@@ -1525,10 +1633,6 @@ function runRealKernelMode(bootBinary) {
     temporaryStorageAccepted,
     guiDesktopReady: guiDesktopReady?.ready ?? null
   });
-  const targetsStorageRecoveryControl = (event) => {
-    const recovery = document.getElementById("pmos-storage-recovery");
-    return event.target !== null && recovery?.contains(event.target) === true;
-  };
   if (splash) {
     splash.markStarted("Browser environment ready");
     splash.markStarted("Kernel worker spawned");
@@ -1627,28 +1731,21 @@ function runRealKernelMode(bootBinary) {
       canvas.addEventListener("contextmenu", (event) => {
         event.preventDefault();
       });
-      const guiKeyDown = createGuiKeyboardInputHandler(
+      const guiKeyboard = createGuiKeyboardInputBridge(
         worker,
-        KbdKeyState.Pressed
-      );
-      const guiKeyUp = createGuiKeyboardInputHandler(
-        worker,
-        KbdKeyState.Released
+        userInteractionAllowed
       );
       window.addEventListener("keydown", (event) => {
-        if (!userInteractionAllowed()) {
-          if (!targetsStorageRecoveryControl(event)) event.preventDefault();
-          return;
-        }
-        guiKeyDown(event);
+        guiKeyboard.keydown(event);
       });
       window.addEventListener("keyup", (event) => {
-        if (!userInteractionAllowed()) {
-          if (!targetsStorageRecoveryControl(event)) event.preventDefault();
-          return;
-        }
-        guiKeyUp(event);
+        guiKeyboard.keyup(event);
       });
+      installGuiKeyboardFocusLossHandlers(
+        window,
+        document,
+        guiKeyboard.releaseHeldKeys
+      );
     }
   }
   let kernelWakeSlot = null;
@@ -1797,7 +1894,7 @@ function runRealKernelMode(bootBinary) {
     const legacyKeyDown = createLegacyKeyboardInputHandler(worker);
     document.addEventListener("keydown", (event) => {
       if (!userInteractionAllowed()) {
-        if (!targetsStorageRecoveryControl(event)) event.preventDefault();
+        if (!targetsBrowserSubstrateControl(event)) event.preventDefault();
         return;
       }
       legacyKeyDown(event);
@@ -2344,7 +2441,26 @@ function installPagehideSync(kernelWorker, target = window) {
   target.addEventListener("pagehide", listener);
   return listener;
 }
-function browserHostFilePicker() {
+var HOST_FILE_PICKER_CONFIRM_ID = "pmos-host-file-picker-confirm";
+function confirmedHostFilePicker(picker, confirmation) {
+  return {
+    pick(onFiles, interactionAllowed = () => true) {
+      let consumed = false;
+      confirmation.request(() => {
+        if (consumed) return;
+        consumed = true;
+        if (!interactionAllowed()) {
+          console.warn(
+            "[pmos-bootstrap] host file picker blocked while storage recovery is active"
+          );
+          return;
+        }
+        picker.pick(onFiles, interactionAllowed);
+      });
+    }
+  };
+}
+function browserNativeHostFilePicker() {
   return {
     pick(onFiles) {
       const input = document.createElement("input");
@@ -2359,10 +2475,44 @@ function browserHostFilePicker() {
         },
         { once: true }
       );
+      input.addEventListener("cancel", () => input.remove(), { once: true });
       document.body.append(input);
       input.click();
     }
   };
+}
+function browserHostFilePickerConfirmation() {
+  return {
+    request(onConfirm) {
+      const existing = document.getElementById(HOST_FILE_PICKER_CONFIRM_ID);
+      if (existing instanceof HTMLButtonElement) {
+        existing.focus();
+        return;
+      }
+      existing?.remove();
+      const button = document.createElement("button");
+      button.id = HOST_FILE_PICKER_CONFIRM_ID;
+      button.type = "button";
+      button.textContent = "Choose files for PMos";
+      button.style.cssText = "position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:2147483647;padding:10px 16px;border:1px solid #365f84;border-radius:4px;background:#f4f5f7;color:#161b20;font:600 14px system-ui,sans-serif;box-shadow:0 3px 12px #0005;";
+      button.addEventListener(
+        "click",
+        () => {
+          button.remove();
+          onConfirm();
+        },
+        { once: true }
+      );
+      document.body.append(button);
+      button.focus();
+    }
+  };
+}
+function browserHostFilePicker() {
+  return confirmedHostFilePicker(
+    browserNativeHostFilePicker(),
+    browserHostFilePickerConfirmation()
+  );
 }
 function requestHostFilePicker(kernelWorker, picker = browserHostFilePicker(), interactionAllowed = () => true) {
   if (!interactionAllowed()) {
@@ -2379,7 +2529,7 @@ function requestHostFilePicker(kernelWorker, picker = browserHostFilePicker(), i
       return;
     }
     enqueueHostFileBatch(kernelWorker, files, interactionAllowed);
-  });
+  }, interactionAllowed);
 }
 function browserHostDownloadTarget() {
   return {
@@ -2720,10 +2870,14 @@ if (typeof document !== "undefined") {
   }
 }
 export {
+  HOST_FILE_PICKER_CONFIRM_ID,
   MAX_LIVE_USER_WORKERS,
   SAB_SIZE,
   classifyFatalConsoleText,
+  confirmedHostFilePicker,
+  createBrowserControlKeyRouter,
   createGuiDesktopReadyLatch,
+  createGuiKeyboardInputBridge,
   createGuiKeyboardInputHandler,
   createLegacyKeyboardInputHandler,
   createSpawnRouter,
@@ -2731,6 +2885,7 @@ export {
   hasAtomicsWaitAsync,
   hasOpfs,
   installBeforeUnloadSync,
+  installGuiKeyboardFocusLossHandlers,
   installHostFileDropHandler,
   installPagehideSync,
   installPeriodicSync,
@@ -2741,6 +2896,7 @@ export {
   saveHostDownload,
   serviceWorkerScriptUrl,
   showPanic,
+  targetsBrowserSubstrateControl,
   unsupportedBrowserReasons,
   wireFramebufferPresentations
 };

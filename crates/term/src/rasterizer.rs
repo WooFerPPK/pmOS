@@ -296,8 +296,28 @@ impl<'a> PbmCursor<'a> {
 /// arg count).
 struct Target<'a> {
     pixels: &'a mut [u8],
+    origin_x: u32,
+    origin_y: u32,
     width: u32,
     height: u32,
+}
+
+impl Target<'_> {
+    fn intersects(&self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        let Some(right) = x.checked_add(width) else {
+            return false;
+        };
+        let Some(bottom) = y.checked_add(height) else {
+            return false;
+        };
+        let Some(target_right) = self.origin_x.checked_add(self.width) else {
+            return false;
+        };
+        let Some(target_bottom) = self.origin_y.checked_add(self.height) else {
+            return false;
+        };
+        x < target_right && right > self.origin_x && y < target_bottom && bottom > self.origin_y
+    }
 }
 
 /// Border padding around the text grid, in pixels.
@@ -305,6 +325,26 @@ pub const PADDING: u32 = 4;
 
 /// Bytes per pixel in the output.
 pub const BYTES_PER_PIXEL: usize = 4;
+
+/// Densely packed crop requested from a full terminal snapshot.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RasterRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl RasterRegion {
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
 
 /// ARGB8888 colours used by the default [`Palette`].
 /// Each constant is `0xAARRGGBB` (the high byte is alpha),
@@ -391,17 +431,51 @@ pub fn rasterize_snapshot_with_palette_and_font(
     palette: Palette,
     font: &BitmapFont,
 ) -> Vec<u8> {
-    let pixels_total = (width as usize) * (height as usize) * BYTES_PER_PIXEL;
+    rasterize_snapshot_region_with_palette_and_font(
+        snapshot,
+        width,
+        height,
+        RasterRegion::new(0, 0, width, height),
+        palette,
+        font,
+    )
+    .unwrap_or_default()
+}
+
+/// Rasterize one tightly packed crop without allocating or painting the full
+/// terminal surface. The returned bytes are identical to the same rectangle
+/// cropped from [`rasterize_snapshot_with_palette_and_font`].
+///
+/// Returns `None` for an empty rectangle, arithmetic overflow, or a rectangle
+/// that is not wholly contained by `width × height`.
+pub fn rasterize_snapshot_region_with_palette_and_font(
+    snapshot: &TerminalSnapshot,
+    width: u32,
+    height: u32,
+    region: RasterRegion,
+    palette: Palette,
+    font: &BitmapFont,
+) -> Option<Vec<u8>> {
+    let right = region.x.checked_add(region.width)?;
+    let bottom = region.y.checked_add(region.height)?;
+    if region.width == 0 || region.height == 0 || right > width || bottom > height {
+        return None;
+    }
+    let pixels_total = (region.width as usize)
+        .checked_mul(region.height as usize)?
+        .checked_mul(BYTES_PER_PIXEL)?;
     let mut out = vec![0u8; pixels_total];
     let mut target = Target {
         pixels: &mut out,
-        width,
-        height,
+        origin_x: region.x,
+        origin_y: region.y,
+        width: region.width,
+        height: region.height,
     };
     fill_bg(&mut target, palette.bg);
 
     if width <= 2 * PADDING || height <= 2 * PADDING {
-        return out;
+        return Some(out);
     }
 
     let text_origin_x = PADDING;
@@ -411,7 +485,7 @@ pub fn rasterize_snapshot_with_palette_and_font(
     let cols = text_width / font.cell_width();
     let rows_total = text_height / font.cell_height();
     if cols == 0 || rows_total == 0 {
-        return out;
+        return Some(out);
     }
 
     // Reserve the bottom row for the active input line.
@@ -425,6 +499,14 @@ pub fn rasterize_snapshot_with_palette_and_font(
     let start = lines.len().saturating_sub(scrollback_rows as usize);
     for (row_idx, line) in lines[start..].iter().enumerate() {
         let pixel_y = text_origin_y + row_idx as u32 * font.cell_height();
+        if !target.intersects(
+            text_origin_x,
+            pixel_y,
+            cols * font.cell_width(),
+            font.cell_height(),
+        ) {
+            continue;
+        }
         let fg = palette.fg_for(line.kind);
         draw_line(
             &mut target,
@@ -470,7 +552,7 @@ pub fn rasterize_snapshot_with_palette_and_font(
         );
     }
 
-    out
+    Some(out)
 }
 
 fn fill_bg(target: &mut Target, argb: u32) {
@@ -498,6 +580,9 @@ fn draw_line(
             break;
         }
         let x0 = origin_x + col * font.cell_width();
+        if !target.intersects(x0, origin_y, font.glyph_width(), font.glyph_height()) {
+            continue;
+        }
         draw_glyph(target, font, ch, x0, origin_y, fg);
     }
 }
@@ -523,10 +608,16 @@ fn fill_rect(target: &mut Target, x0: u32, y0: u32, w: u32, h: u32, argb: u32) {
 }
 
 fn set_pixel(target: &mut Target, x: u32, y: u32, argb: u32) {
-    if x >= target.width || y >= target.height {
+    let Some(local_x) = x.checked_sub(target.origin_x) else {
+        return;
+    };
+    let Some(local_y) = y.checked_sub(target.origin_y) else {
+        return;
+    };
+    if local_x >= target.width || local_y >= target.height {
         return;
     }
-    let idx = ((y * target.width + x) as usize) * BYTES_PER_PIXEL;
+    let idx = ((local_y * target.width + local_x) as usize) * BYTES_PER_PIXEL;
     if idx + BYTES_PER_PIXEL > target.pixels.len() {
         return;
     }

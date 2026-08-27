@@ -307,6 +307,10 @@ fn parse_proc_name(bytes: &[u8]) -> Option<String> {
     Some(name.to_string())
 }
 
+fn is_shell_owned_state(state: &ShellWindowState) -> bool {
+    state.flags & shell_window_state_flags::SHELL_OWNED != 0
+}
+
 /// Shell session runtime. Legacy shell entry points do not construct this
 /// value, preserving their historical no-session fixture behaviour.
 pub struct SessionRuntime {
@@ -345,6 +349,12 @@ impl SessionRuntime {
             Box::<StdSessionFilesystem>::default(),
             own_pid,
         )
+    }
+
+    /// Kernel-authenticated PID of the shell process, when this runtime was
+    /// constructed for production or a production-shaped isolation test.
+    pub const fn own_pid(&self) -> Option<u32> {
+        self.own_pid
     }
 
     pub fn with_filesystem(
@@ -459,6 +469,25 @@ impl SessionRuntime {
     }
 
     pub fn observe_window_state(&mut self, state: ShellWindowState) {
+        if is_shell_owned_state(&state) {
+            let removed_owner = self
+                .live
+                .remove(&state.window_id)
+                .map(|removed| removed.owner_pid);
+            let focus_changed = self.focused_window == Some(state.window_id);
+            if focus_changed {
+                self.focused_window = None;
+            }
+            if let Some(owner_pid) = removed_owner {
+                self.prune_identity_if_unused(owner_pid);
+            }
+            if (removed_owner.is_some() || focus_changed)
+                && self.restore_phase == RestorePhase::Finished
+            {
+                self.mark_capture_dirty();
+            }
+            return;
+        }
         let changed = self.live.get(&state.window_id) != Some(&state);
         let previous_owner = self
             .live
@@ -979,9 +1008,9 @@ impl SessionRuntime {
             return;
         }
 
-        let replacement_has_apps = self.own_pid.is_some_and(|own_pid| {
+        let replacement_has_apps = self.own_pid.is_some_and(|_| {
             self.live.values().any(|state| {
-                state.owner_pid != own_pid && state.flags & shell_window_state_flags::MAPPED != 0
+                !is_shell_owned_state(state) && state.flags & shell_window_state_flags::MAPPED != 0
             })
         });
         if replacement_has_apps {
@@ -1082,6 +1111,7 @@ impl SessionRuntime {
         let mut states = self
             .live
             .values()
+            .filter(|state| !is_shell_owned_state(state))
             .filter(|state| state.flags & shell_window_state_flags::MAPPED != 0)
             .filter(|state| {
                 self.identities
@@ -1500,12 +1530,23 @@ mod tests {
                 exec: "/bin/term".into(),
             }];
             runtime.snapshot_done = true;
-            runtime.observe_window_state(live(90, 7, shell_window_state_flags::MAPPED));
+            runtime.observe_window_state(live(
+                90,
+                7,
+                shell_window_state_flags::MAPPED | shell_window_state_flags::SHELL_OWNED,
+            ));
+            runtime.observe_window_state(live(
+                89,
+                8,
+                shell_window_state_flags::MAPPED | shell_window_state_flags::SHELL_OWNED,
+            ));
             runtime.observe_window_state(live(91, 99, 0));
             runtime
         }
 
         let mut runtime = prepared(Some(restorable()));
+        assert!(!runtime.live.contains_key(&89));
+        assert!(!runtime.live.contains_key(&90));
         assert!(runtime.identities.is_empty());
         assert!(matches!(
             runtime.next_action(Duration::from_millis(25)),
@@ -1523,7 +1564,9 @@ mod tests {
         assert!(empty.identities.is_empty());
 
         let mut replacement = prepared(Some(restorable()));
-        replacement.observe_window_state(live(92, 42, shell_window_state_flags::MAPPED));
+        let mut spoof = live(92, 42, shell_window_state_flags::MAPPED);
+        spoof.app_id = "pmos.shell".into();
+        replacement.observe_window_state(spoof);
         assert_eq!(replacement.next_action(Duration::from_millis(25)), None);
         assert!(replacement.ready_for_desktop());
         assert_eq!(replacement.restore_phase, RestorePhase::Finished);
@@ -1539,6 +1582,35 @@ mod tests {
             replacement.ready_for_desktop(),
             "background procfs identity work cannot revoke readiness",
         );
+    }
+
+    #[test]
+    fn shell_owned_state_evicts_transient_live_capture_and_identity_state() {
+        let mut runtime =
+            SessionRuntime::with_filesystem_for_pid("/session", Box::new(NoopFilesystem), 7);
+        runtime.output_size = (800, 600);
+        runtime.restore_phase = RestorePhase::Finished;
+        runtime.observe_window_state(live(
+            90,
+            8,
+            shell_window_state_flags::MAPPED | shell_window_state_flags::FOCUSED,
+        ));
+        runtime.identities.insert(8, Some("shell-spoof".into()));
+        assert_eq!(runtime.focused_window, Some(90));
+        assert_eq!(runtime.build_snapshot().unwrap().windows.len(), 1);
+
+        runtime.observe_window_state(live(
+            90,
+            8,
+            shell_window_state_flags::MAPPED
+                | shell_window_state_flags::FOCUSED
+                | shell_window_state_flags::SHELL_OWNED,
+        ));
+
+        assert!(!runtime.live.contains_key(&90));
+        assert_eq!(runtime.focused_window, None);
+        assert!(!runtime.identities.contains_key(&8));
+        assert!(runtime.build_snapshot().unwrap().windows.is_empty());
     }
 
     #[test]

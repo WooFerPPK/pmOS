@@ -1208,10 +1208,14 @@ function encodeRequest(req) {
   view.setUint32(4, req.requestId, true);
   if (req.args !== void 0) {
     if (req.args.length !== 16) {
-      throw new Error(`syscall.encodeRequest: args must be 16 bytes, got ${req.args.length}`);
+      throw new Error(
+        `syscall.encodeRequest: args must be 16 bytes, got ${req.args.length}`
+      );
     }
     if (req.arg0 !== void 0) {
-      throw new Error("syscall.encodeRequest: pass either args or arg0, not both");
+      throw new Error(
+        "syscall.encodeRequest: pass either args or arg0, not both"
+      );
     }
     buf.set(req.args, 8);
   } else if (req.arg0 !== void 0) {
@@ -1223,7 +1227,9 @@ function encodeRequest(req) {
 }
 function decodeResponse(bytes) {
   if (bytes.length !== SLOT_SIZE) {
-    throw new Error(`syscall.decodeResponse: expected ${SLOT_SIZE} bytes, got ${bytes.length}`);
+    throw new Error(
+      `syscall.decodeResponse: expected ${SLOT_SIZE} bytes, got ${bytes.length}`
+    );
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, SLOT_SIZE);
   return {
@@ -1244,7 +1250,9 @@ function encodeResponse(res) {
 }
 function decodeRequest(bytes) {
   if (bytes.length !== SLOT_SIZE) {
-    throw new Error(`syscall.decodeRequest: expected ${SLOT_SIZE} bytes, got ${bytes.length}`);
+    throw new Error(
+      `syscall.decodeRequest: expected ${SLOT_SIZE} bytes, got ${bytes.length}`
+    );
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, SLOT_SIZE);
   return {
@@ -1282,6 +1290,9 @@ var OP_EXT = {
   /** Kernel-authenticated capability snapshot for the process on the
    * other end of a connected IPC socket (`SO_PEERCRED` equivalent). */
   IPC_PEER_CAPS: 4104,
+  /** Kernel-authenticated pid snapshot for the process on the other
+   * end of a connected IPC socket (`SO_PEERCRED` equivalent). */
+  IPC_PEER_PID: 4105,
   PROC_SPAWN: 4352,
   PROC_SELF: 4355,
   PROC_PARENT: 4356,
@@ -1292,6 +1303,8 @@ var OP_EXT = {
   DISPLAY_BIND: 4609,
   CAP_CHECK: 4864,
   CAP_LIST: 4865,
+  MOUNT: 5120,
+  UMOUNT: 5121,
   FS_WATCH: 5122,
   FS_CHMOD: 5123,
   HOST_FILE_RECV: 5376,
@@ -1299,6 +1312,8 @@ var OP_EXT = {
   HOST_FILE_SEND: 5378
 };
 var ERRNO = {
+  /** Permission denied. */
+  EACCES: 2,
   EAGAIN: 6,
   EBADF: 8,
   /** No child processes. Returned by `proc_wait` when the caller
@@ -1413,7 +1428,9 @@ function encodeSpawnManifest(manifest) {
   );
   const envp = (manifest.envp ?? []).map(([key, value], index) => {
     if (key.includes("=")) {
-      throw new RangeError(`encodeSpawnManifest: envp[${index}] key contains '='`);
+      throw new RangeError(
+        `encodeSpawnManifest: envp[${index}] key contains '='`
+      );
     }
     return [
       encodeText(`envp[${index}] key`, key, false),
@@ -1429,17 +1446,23 @@ function encodeSpawnManifest(manifest) {
     validateFd("extra parent fd", parentFd);
     validateFd("extra child fd", childFd);
     if (childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT) {
-      throw new RangeError(`encodeSpawnManifest: reserved/out-of-range child fd ${childFd}`);
+      throw new RangeError(
+        `encodeSpawnManifest: reserved/out-of-range child fd ${childFd}`
+      );
     }
     if (childFds.has(childFd)) {
-      throw new RangeError(`encodeSpawnManifest: duplicate child fd ${childFd}`);
+      throw new RangeError(
+        `encodeSpawnManifest: duplicate child fd ${childFd}`
+      );
     }
     childFds.add(childFd);
   }
   const bodyLen = path.length + cwd.length + argv.reduce((sum, arg) => sum + 2 + arg.length, 0) + envp.reduce((sum, [key, value]) => sum + 4 + key.length + value.length, 0) + extraFds.length * 8;
   const totalLen = SPAWN_V1_HEADER_LEN + bodyLen;
   if (totalLen > SPAWN_V1_MAX_BYTES) {
-    throw new RangeError(`encodeSpawnManifest: blob size ${totalLen} exceeds ${SPAWN_V1_MAX_BYTES}`);
+    throw new RangeError(
+      `encodeSpawnManifest: blob size ${totalLen} exceeds ${SPAWN_V1_MAX_BYTES}`
+    );
   }
   const heap = new Uint8Array(totalLen);
   const header = new DataView(heap.buffer);
@@ -1503,9 +1526,11 @@ function encodeSpawnManifestBlob(blob) {
   return { args, heap: blob.slice() };
 }
 function isValidSpawnManifestBlob(blob) {
-  if (blob.length < SPAWN_V1_HEADER_LEN || blob.length > SPAWN_V1_MAX_BYTES) return false;
+  if (blob.length < SPAWN_V1_HEADER_LEN || blob.length > SPAWN_V1_MAX_BYTES)
+    return false;
   const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
-  if (view.getUint32(0, true) !== SPAWN_V1_MAGIC || view.getUint16(4, true) !== SPAWN_V1_VERSION || view.getUint32(8, true) !== blob.length || view.getUint16(22, true) !== 0 || view.getUint32(36, true) !== 0) return false;
+  if (view.getUint32(0, true) !== SPAWN_V1_MAGIC || view.getUint16(4, true) !== SPAWN_V1_VERSION || view.getUint32(8, true) !== blob.length || view.getUint16(22, true) !== 0 || view.getUint32(36, true) !== 0)
+    return false;
   const flags = view.getUint16(6, true);
   if ((flags & ~SPAWN_KNOWN_FLAGS) !== 0) return false;
   const pathLen = view.getUint16(12, true);
@@ -1514,14 +1539,16 @@ function isValidSpawnManifestBlob(blob) {
   const envc = view.getUint16(18, true);
   const extraCount = view.getUint16(20, true);
   if ((flags & SPAWN_FLAG_CWD) === 0 !== (cwdLen === 0)) return false;
-  if ((flags & SPAWN_FLAG_CAPS) === 0 && view.getBigUint64(40, true) !== 0n) return false;
+  if ((flags & SPAWN_FLAG_CAPS) === 0 && view.getBigUint64(40, true) !== 0n)
+    return false;
   for (const offset2 of [24, 28, 32]) {
     if (view.getInt32(offset2, true) < SPAWN_INHERIT_FD) return false;
   }
   const utf8 = new TextDecoder("utf-8", { fatal: true });
   let offset = SPAWN_V1_HEADER_LEN;
   const take = (length, allowEmpty) => {
-    if (!allowEmpty && length === 0 || offset + length > blob.length) return null;
+    if (!allowEmpty && length === 0 || offset + length > blob.length)
+      return null;
     const bytes = blob.subarray(offset, offset + length);
     offset += length;
     if (bytes.includes(0)) return null;
@@ -1570,7 +1597,8 @@ function isValidSpawnManifestBlob(blob) {
   for (let i = 0; i < extraCount; i++) {
     const parentFd = readU32();
     const childFd = readU32();
-    if (parentFd === null || childFd === null || childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT || childFds.has(childFd)) return false;
+    if (parentFd === null || childFd === null || childFd < SPAWN_FIRST_DYNAMIC_FD || childFd >= SPAWN_FD_SOFT_LIMIT || childFds.has(childFd))
+      return false;
     childFds.add(childFd);
   }
   return offset === blob.length;
@@ -1586,6 +1614,75 @@ function pollTimeoutMs(timeoutNs) {
   if (timeoutNs === NO_POLL_TIMEOUT_NS) return void 0;
   return Math.max(0, Number(timeoutNs) / 1e6);
 }
+var WorkerTaskYielder = class {
+  channel;
+  pending;
+  closed = false;
+  constructor() {
+    if (typeof globalThis.MessageChannel !== "function") {
+      throw new Error(
+        "KernelWasmHost: task-yielding dispatcher requires MessageChannel"
+      );
+    }
+    const channel = new MessageChannel();
+    try {
+      channel.port1.onmessage = () => {
+        const pending = this.pending;
+        if (pending === void 0) return;
+        this.pending = void 0;
+        pending.resolve();
+      };
+      channel.port1.onmessageerror = () => {
+        const pending = this.pending;
+        if (pending === void 0) return;
+        this.pending = void 0;
+        pending.reject(
+          new Error("KernelWasmHost: MessageChannel task yield failed")
+        );
+      };
+      channel.port1.start();
+    } catch (error) {
+      channel.port1.close();
+      channel.port2.close();
+      throw error;
+    }
+    this.channel = channel;
+  }
+  nextTask() {
+    if (this.closed) {
+      return Promise.reject(
+        new Error("KernelWasmHost: task yielder is already closed")
+      );
+    }
+    if (this.pending !== void 0) {
+      return Promise.reject(
+        new Error("KernelWasmHost: task yield is already pending")
+      );
+    }
+    return new Promise((resolve, reject) => {
+      this.pending = { resolve, reject };
+      try {
+        this.channel.port2.postMessage(void 0);
+      } catch (error) {
+        this.pending = void 0;
+        reject(error);
+      }
+    });
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    const pending = this.pending;
+    this.pending = void 0;
+    this.channel.port1.onmessage = null;
+    this.channel.port1.onmessageerror = null;
+    this.channel.port1.close();
+    this.channel.port2.close();
+    pending?.reject(
+      new Error("KernelWasmHost: task yielder closed before delivery")
+    );
+  }
+};
 var KernelWasmHost = class _KernelWasmHost {
   // Note: the class deliberately does NOT retain the caller's
   // `KernelWasmHostOptions` past construction. Every field of that
@@ -1814,7 +1911,8 @@ var KernelWasmHost = class _KernelWasmHost {
           }
         },
         pmos_host_download_file: (namePtr, nameLen, mimePtr, mimeLen, bytesPtr, bytesLen) => {
-          if (memory === void 0 || resolvedOnHostDownload === void 0) return 1;
+          if (memory === void 0 || resolvedOnHostDownload === void 0)
+            return 1;
           try {
             const decoder = new TextDecoder("utf-8", { fatal: true });
             const name = decoder.decode(
@@ -1859,7 +1957,9 @@ var KernelWasmHost = class _KernelWasmHost {
   registerProcess(caps) {
     const pid = this.exports.kernel_register_process(caps);
     if (pid < 0) {
-      throw new Error(`KernelWasmHost.registerProcess: kernel_register_process returned ${pid}`);
+      throw new Error(
+        `KernelWasmHost.registerProcess: kernel_register_process returned ${pid}`
+      );
     }
     return pid;
   }
@@ -1870,14 +1970,18 @@ var KernelWasmHost = class _KernelWasmHost {
   installConsoleFd(pid, fd) {
     const rc = this.exports.kernel_install_console_fd(pid, fd);
     if (rc !== 0) {
-      throw new Error(`KernelWasmHost.installConsoleFd(${pid}, ${fd}): rc=${rc}`);
+      throw new Error(
+        `KernelWasmHost.installConsoleFd(${pid}, ${fd}): rc=${rc}`
+      );
     }
   }
   /** Install the WASI `/` directory preopen at `fd`. */
   installRootPreopenFd(pid, fd) {
     const rc = this.exports.kernel_install_root_preopen_fd(pid, fd);
     if (rc !== 0) {
-      throw new Error(`KernelWasmHost.installRootPreopenFd(${pid}, ${fd}): rc=${rc}`);
+      throw new Error(
+        `KernelWasmHost.installRootPreopenFd(${pid}, ${fd}): rc=${rc}`
+      );
     }
   }
   /**
@@ -1929,7 +2033,9 @@ var KernelWasmHost = class _KernelWasmHost {
   }
   recordProcessMemory(pid, bytes) {
     if (!Number.isFinite(bytes) || bytes < 0 || !Number.isSafeInteger(bytes)) {
-      throw new Error(`KernelWasmHost.recordProcessMemory: invalid byte count ${bytes}`);
+      throw new Error(
+        `KernelWasmHost.recordProcessMemory: invalid byte count ${bytes}`
+      );
     }
     const bytesLo = bytes >>> 0;
     const bytesHi = Math.floor(bytes / 4294967296) >>> 0;
@@ -2001,7 +2107,10 @@ var KernelWasmHost = class _KernelWasmHost {
       return false;
     }
     for (let offset = 0; offset < bytes.length; offset += heapLen) {
-      const chunk = bytes.subarray(offset, Math.min(offset + heapLen, bytes.length));
+      const chunk = bytes.subarray(
+        offset,
+        Math.min(offset + heapLen, bytes.length)
+      );
       view = new Uint8Array(this.exports.memory.buffer, heapPtr, chunk.length);
       view.set(chunk);
       const chunkRc = this.exports.kernel_host_file_drop_chunk(
@@ -2070,7 +2179,9 @@ var KernelWasmHost = class _KernelWasmHost {
       );
     }
     const heapPtr = this.exports.kernel_heap_ptr();
-    new Uint8Array(this.exports.memory.buffer, heapPtr, bytes.length).set(bytes);
+    new Uint8Array(this.exports.memory.buffer, heapPtr, bytes.length).set(
+      bytes
+    );
     return bytes.length;
   }
   // ---- syscall dispatch ---------------------------------------------
@@ -2108,11 +2219,15 @@ var KernelWasmHost = class _KernelWasmHost {
       return { heapOut: new Uint8Array(0), parked: true };
     }
     if (rc !== 0) {
-      throw new Error(`KernelWasmHost.dispatch: kernel_dispatch returned ${rc}`);
+      throw new Error(
+        `KernelWasmHost.dispatch: kernel_dispatch returned ${rc}`
+      );
     }
     const respBuf = this.exports.memory.buffer;
     const respPtr = this.exports.kernel_resp_ptr();
-    const respBytes = new Uint8Array(new Uint8Array(respBuf, respPtr, SLOT_SIZE));
+    const respBytes = new Uint8Array(
+      new Uint8Array(respBuf, respPtr, SLOT_SIZE)
+    );
     const response = decodeResponse(respBytes);
     let heapOut = new Uint8Array(0);
     if (response.extraLen > 0) {
@@ -2466,68 +2581,73 @@ var KernelWasmHost = class _KernelWasmHost {
       Math.trunc(args.passesBeforeTaskYield ?? 4)
     );
     const parkFn = args.parkFn ?? ((observedWake, timeoutMs) => this.defaultPark(observedWake, timeoutMs));
-    const taskYieldFn = args.taskYieldFn ?? (() => this.yieldToWorkerMessages());
+    const taskYielder = args.taskYieldFn === void 0 ? new WorkerTaskYielder() : void 0;
+    const taskYieldFn = args.taskYieldFn ?? (() => taskYielder.nextTask());
     const haveSharedArrayBuffer = typeof SharedArrayBuffer !== "undefined";
     let passesSinceTaskYield = 0;
-    while (!args.halted()) {
-      const observedWake = Atomics.load(this.wakeView, 0);
-      let anyServiced = false;
-      const pids = args.pidSource();
-      for (const [pid, sab] of pids) {
-        const view = new Uint8Array(sab);
-        const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
-        const sabIsShared = haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
-        for (let i = 0; i < budget; i++) {
-          const resHeadBefore = Atomics.load(header, OFF_RES_HEAD / 4);
-          const wakesPushed = this.drainWakesForPid(pid, view);
-          if (wakesPushed > 0) {
-            try {
-              this.markRunning(pid);
-            } catch {
+    try {
+      while (!args.halted()) {
+        const observedWake = Atomics.load(this.wakeView, 0);
+        let anyServiced = false;
+        const pids = args.pidSource();
+        for (const [pid, sab] of pids) {
+          const view = new Uint8Array(sab);
+          const header = new Int32Array(sab, 0, OFF_HEAP_SCRATCH / 4);
+          const sabIsShared = haveSharedArrayBuffer && sab instanceof SharedArrayBuffer;
+          for (let i = 0; i < budget; i++) {
+            const resHeadBefore = Atomics.load(header, OFF_RES_HEAD / 4);
+            const wakesPushed = this.drainWakesForPid(pid, view);
+            if (wakesPushed > 0) {
+              try {
+                this.markRunning(pid);
+              } catch {
+              }
             }
-          }
-          const rc = this.serviceSab(pid, view);
-          if (rc === 0) {
-            anyServiced = true;
-          }
-          const resHeadAfter = Atomics.load(header, OFF_RES_HEAD / 4);
-          const responsePushed = resHeadAfter !== resHeadBefore;
-          if (responsePushed) {
-            Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
-            if (sabIsShared) {
-              Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+            const rc = this.serviceSab(pid, view);
+            if (rc === 0) {
+              anyServiced = true;
             }
-            anyServiced = true;
-          }
-          if (rc === 1) {
-            break;
+            const resHeadAfter = Atomics.load(header, OFF_RES_HEAD / 4);
+            const responsePushed = resHeadAfter !== resHeadBefore;
+            if (responsePushed) {
+              Atomics.store(header, OFF_USER_WAIT_SLOT / 4, STATUS_READY);
+              if (sabIsShared) {
+                Atomics.notify(header, OFF_USER_WAIT_SLOT / 4);
+              }
+              anyServiced = true;
+            }
+            if (rc === 1) {
+              break;
+            }
           }
         }
-      }
-      if (args.halted()) return;
-      if (this.nextPollTimeoutNs() === 0n && this.servicePollWaiters() > 0) {
-        anyServiced = true;
-      }
-      if (!anyServiced) {
-        if (this.servicePollWaiters() > 0) {
+        if (args.halted()) return;
+        if (this.nextPollTimeoutNs() === 0n && this.servicePollWaiters() > 0) {
           anyServiced = true;
-        } else {
-          const timeoutNs = this.nextPollTimeoutNs();
-          const timeoutMs = pollTimeoutMs(timeoutNs);
-          await parkFn(observedWake, timeoutMs);
+        }
+        let parkedAsynchronously = false;
+        if (!anyServiced) {
+          if (this.servicePollWaiters() > 0) {
+            anyServiced = true;
+          } else {
+            const timeoutNs = this.nextPollTimeoutNs();
+            const timeoutMs = pollTimeoutMs(timeoutNs);
+            parkedAsynchronously = await parkFn(observedWake, timeoutMs) === true;
+          }
+        }
+        if (parkedAsynchronously) {
+          passesSinceTaskYield = 0;
+          continue;
+        }
+        passesSinceTaskYield += 1;
+        if (passesSinceTaskYield >= passesBeforeTaskYield) {
+          passesSinceTaskYield = 0;
+          await taskYieldFn();
         }
       }
-      passesSinceTaskYield += 1;
-      if (passesSinceTaskYield >= passesBeforeTaskYield) {
-        passesSinceTaskYield = 0;
-        await taskYieldFn();
-      }
+    } finally {
+      taskYielder?.close();
     }
-  }
-  async yieldToWorkerMessages() {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0);
-    });
   }
   /**
    * Default [`startDispatchLoop`] park. Fd-only waits have no timeout;
@@ -2544,7 +2664,9 @@ var KernelWasmHost = class _KernelWasmHost {
     const r = waitAsync(this.wakeView, 0, observedWake, timeoutMs);
     if (r.async) {
       await r.value;
+      return true;
     }
+    return false;
   }
 };
 
@@ -3536,9 +3658,10 @@ function installWorkerEntry(messaging, options = {}) {
 }
 function bootMockKernel(messaging, config) {
   const liveTerminal = config.liveTerminal === true && config.enableFramebuffer;
-  const initialScrollback = liveTerminal ? (config.terminalBanner ?? []).map(
-    (text) => ({ text, kind: "banner" })
-  ) : void 0;
+  const initialScrollback = liveTerminal ? (config.terminalBanner ?? []).map((text) => ({
+    text,
+    kind: "banner"
+  })) : void 0;
   const mock = new MockKernel({
     policy: { kind: "faux-shell" },
     emitSplashOnFirstInput: config.enableFramebuffer && !liveTerminal,

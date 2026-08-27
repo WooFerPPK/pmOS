@@ -911,7 +911,7 @@ function createKernelSession(): KernelSession {
  * scancode — the same `display_server::Scancode` enum the
  * display-server's `inject_keyboard_key` and the term's
  * `term::keymap::translate` both speak. Returns null for
- * unmapped codes (F-keys, IME composition keys, etc.)
+ * unmapped codes (most F-keys, IME composition keys, etc.)
  * so the caller can fall through to the browser's default
  * handling.
  */
@@ -962,6 +962,8 @@ function domCodeToScancode(code: string): number | null {
       return 0x37;
     case "Slash":
       return 0x38;
+    case "F4":
+      return 0x3d;
     case "Insert":
       return 0x49;
     case "Home":
@@ -1073,16 +1075,115 @@ export function createBrowserControlKeyRouter(
 export function createGuiKeyboardInputHandler(
   kernelWorker: { postMessage(msg: MainToKernel): void },
   state: KbdKeyStateValue,
-): (event: GuiKeyboardEvent) => void {
-  return (event: GuiKeyboardEvent): void => {
-    if (event.metaKey) return;
+): (event: GuiKeyboardEvent) => number | null {
+  return (event: GuiKeyboardEvent): number | null => {
+    if (event.metaKey) return null;
     const scancode = domCodeToScancode(event.code);
-    if (scancode === null) return;
+    if (scancode === null) return null;
     event.preventDefault();
     kernelWorker.postMessage({
       kind: "input:kbd",
       bytes: packKbdEvent(scancode, state),
     });
+    return scancode;
+  };
+}
+
+/** Graphical keyboard bridge with physical press/release ownership. Only keys
+ * whose press reached the guest are held, so focus-loss recovery cannot inject
+ * releases for browser-substrate controls or reserved host shortcuts. */
+export function createGuiKeyboardInputBridge(
+  kernelWorker: { postMessage(msg: MainToKernel): void },
+  userInteractionAllowed: () => boolean = () => true,
+  targetsControl: (event: GuiKeyboardEvent) => boolean =
+    targetsBrowserSubstrateControl,
+): {
+  keydown(event: GuiKeyboardEvent): void;
+  keyup(event: GuiKeyboardEvent): void;
+  releaseHeldKeys(): void;
+} {
+  const press = createGuiKeyboardInputHandler(
+    kernelWorker,
+    KbdKeyState.Pressed,
+  );
+  const browserControlKeys = createBrowserControlKeyRouter(targetsControl);
+  const heldGuestKeys = new Map<string, number>();
+  const releasedForFocusLoss = new Set<string>();
+  const postRelease = (scancode: number): void => {
+    kernelWorker.postMessage({
+      kind: "input:kbd",
+      bytes: packKbdEvent(scancode, KbdKeyState.Released),
+    });
+  };
+
+  return {
+    keydown(event): void {
+      if (!browserControlKeys.keydown(event)) return;
+
+      if (releasedForFocusLoss.has(event.code)) {
+        if (event.repeat === true) {
+          event.preventDefault();
+          return;
+        }
+        releasedForFocusLoss.delete(event.code);
+      }
+      if (!userInteractionAllowed()) {
+        event.preventDefault();
+        return;
+      }
+
+      if (event.repeat !== true) {
+        const staleScancode = heldGuestKeys.get(event.code);
+        if (staleScancode !== undefined) {
+          postRelease(staleScancode);
+          heldGuestKeys.delete(event.code);
+        }
+      }
+      const scancode = press(event);
+      if (scancode !== null) heldGuestKeys.set(event.code, scancode);
+    },
+    keyup(event): void {
+      if (!browserControlKeys.keyup(event)) return;
+      if (releasedForFocusLoss.delete(event.code)) {
+        event.preventDefault();
+        return;
+      }
+
+      const scancode = heldGuestKeys.get(event.code);
+      if (scancode !== undefined) {
+        event.preventDefault();
+        postRelease(scancode);
+        heldGuestKeys.delete(event.code);
+        return;
+      }
+      if (!userInteractionAllowed()) event.preventDefault();
+    },
+    releaseHeldKeys(): void {
+      for (const [code, scancode] of heldGuestKeys) {
+        postRelease(scancode);
+        releasedForFocusLoss.add(code);
+      }
+      heldGuestKeys.clear();
+    },
+  };
+}
+
+/** Release guest-owned keys when the browser can no longer promise matching
+ * DOM keyup events. The returned disposer exists for isolated hosts/tests. */
+export function installGuiKeyboardFocusLossHandlers(
+  windowTarget: EventTarget,
+  documentTarget: EventTarget & { readonly hidden: boolean },
+  releaseHeldKeys: () => void,
+): () => void {
+  const onBlur = (): void => releaseHeldKeys();
+  const onVisibilityChange = (): void => {
+    if (documentTarget.hidden) releaseHeldKeys();
+  };
+  windowTarget.addEventListener("blur", onBlur);
+  documentTarget.addEventListener("visibilitychange", onVisibilityChange);
+  return () => {
+    windowTarget.removeEventListener("blur", onBlur);
+    documentTarget.removeEventListener("visibilitychange", onVisibilityChange);
   };
 }
 
@@ -1462,6 +1563,12 @@ function runRealKernelMode(bootBinary: string): void {
     ? createGuiDesktopReadyLatch(() => {
         splash?.markStarted("Desktop ready");
         splash?.dismiss();
+        // The console is useful while the OS is booting (and remains visible
+        // if readiness never arrives), but a settled desktop should own the
+        // complete screen. Keep the populated node in the DOM for diagnostics
+        // and integration assertions without leaving developer chrome over
+        // ordinary application windows.
+        consoleEl.hidden = true;
       })
     : null;
   const userInteractionAllowed = (): boolean =>
@@ -1607,31 +1714,21 @@ function runRealKernelMode(bootBinary: string): void {
       // HID scancode (matching `display_server::Scancode`),
       // pack via `packKbdEvent`, and post on both keydown +
       // keyup so modifier transitions track on the term side.
-      const guiKeyDown = createGuiKeyboardInputHandler(
+      const guiKeyboard = createGuiKeyboardInputBridge(
         worker,
-        KbdKeyState.Pressed,
+        userInteractionAllowed,
       );
-      const guiKeyUp = createGuiKeyboardInputHandler(
-        worker,
-        KbdKeyState.Released,
-      );
-      const browserControlKeys = createBrowserControlKeyRouter();
       window.addEventListener("keydown", (event) => {
-        if (!browserControlKeys.keydown(event)) return;
-        if (!userInteractionAllowed()) {
-          event.preventDefault();
-          return;
-        }
-        guiKeyDown(event);
+        guiKeyboard.keydown(event);
       });
       window.addEventListener("keyup", (event) => {
-        if (!browserControlKeys.keyup(event)) return;
-        if (!userInteractionAllowed()) {
-          event.preventDefault();
-          return;
-        }
-        guiKeyUp(event);
+        guiKeyboard.keyup(event);
       });
+      installGuiKeyboardFocusLossHandlers(
+        window,
+        document,
+        guiKeyboard.releaseHeldKeys,
+      );
     }
   }
 
@@ -1886,9 +1983,8 @@ function runRealKernelMode(bootBinary: string): void {
  *   * `gui = false` (legacy demo + input-echo): canvas hidden,
  *     console pre fills the viewport with a dark-monospace look.
  *   * `gui = true` (init-desktop): canvas visible at 100vw×100vh,
- *     console pre overlays as a small transparent log at the
- *     top-right so boot trace stays observable without obscuring
- *     the desktop.
+ *     console pre overlays as a small transparent boot log at the
+ *     top-right, then hides at the trusted desktop-ready fence.
  */
 function mountRealKernelConsole(gui: boolean = false): HTMLPreElement {
   const existing = document.getElementById("pmos-real-console");

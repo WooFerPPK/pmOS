@@ -8,32 +8,24 @@ import {
   openLauncherMenuBefore,
   selectLauncherRowBefore,
 } from "./launcher-interaction";
+import {
+  DARK_ACTIVE_BORDER,
+  DARK_TITLEBAR,
+  LIGHT_ACTIVE_BORDER,
+  LIGHT_TITLEBAR,
+  TASKBAR_LIGHT_FOCUSED,
+  TASKBAR_LIGHT_UNFOCUSED,
+  taskbarEntryPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
-const FRAMEBUFFER_WIDTH = 1024;
-const TASKBAR_Y = 752;
-const TASKBAR_ENTRY_SAMPLE_Y = 762;
-const TASKBAR_LEFT_MARGIN = 4;
-const TASKBAR_LAUNCHER_RESERVED_WIDTH = 86;
-const TASKBAR_CLOCK_RESERVED_WIDTH = 68;
-const TASKBAR_RIGHT_MARGIN = 4;
-const TASKBAR_ENTRY_GAP = 2;
-const TASKBAR_ENTRY_WIDTH = 160;
-const TASKBAR_MIN_ENTRY_WIDTH = 112;
-const TASKBAR_FOCUSED = [0xc2, 0xc6, 0xcf, 0xff] as const;
-const TASKBAR_UNFOCUSED = [0xec, 0xee, 0xf4, 0xff] as const;
 const TERMINAL_BACKGROUND = [0x14, 0x0e, 0x0a] as const;
-const FILES_TITLEBAR = [0x35, 0x5f, 0x84] as const;
-const EDIT_TITLEBAR = [0x6a, 0x4a, 0x8a] as const;
-const SETTINGS_TITLEBAR = [0x40, 0x60, 0x70] as const;
-const ACTIVE_TITLEBAR_PALETTES = [
-  [0xd8, 0xdc, 0xe4, 0xff],
-  [0x2b, 0x31, 0x3d, 0xff],
-] as const;
+const ACTIVE_TITLEBAR_PALETTES = [LIGHT_TITLEBAR, DARK_TITLEBAR] as const;
 const SELECTED_ROW_PALETTES = [
-  [0x3b, 0x5b, 0x8d, 0xff],
-  [0x5b, 0x7c, 0xc2, 0xff],
+  LIGHT_ACTIVE_BORDER,
+  DARK_ACTIVE_BORDER,
 ] as const;
 const TASKBAR_REGION = { x: 90, y: 738, width: 862, height: 28 } as const;
 
@@ -139,43 +131,8 @@ async function waitForLineAfter(
   return lines.slice(start).find(predicate)!;
 }
 
-function taskbarEntryWidth(entryCount: number): number {
-  const available =
-    FRAMEBUFFER_WIDTH -
-    TASKBAR_LEFT_MARGIN -
-    TASKBAR_LAUNCHER_RESERVED_WIDTH -
-    TASKBAR_CLOCK_RESERVED_WIDTH -
-    TASKBAR_RIGHT_MARGIN;
-  const gaps = TASKBAR_ENTRY_GAP * Math.max(0, entryCount - 1);
-  return Math.max(
-    TASKBAR_MIN_ENTRY_WIDTH,
-    Math.min(TASKBAR_ENTRY_WIDTH, Math.floor((available - gaps) / entryCount)),
-  );
-}
-
-function taskbarEntryPoint(index: number, entryCount: number): Point {
-  const width = taskbarEntryWidth(entryCount);
-  return {
-    x:
-      TASKBAR_LEFT_MARGIN +
-      TASKBAR_LAUNCHER_RESERVED_WIDTH +
-      index * (width + TASKBAR_ENTRY_GAP) +
-      30,
-    y: TASKBAR_ENTRY_SAMPLE_Y,
-  };
-}
-
 function taskbarEntryClickPoint(index: number, entryCount: number): Point {
-  const width = taskbarEntryWidth(entryCount);
-  const labelWidth = width - 3 * 20 - 3 * TASKBAR_ENTRY_GAP;
-  return {
-    x:
-      TASKBAR_LEFT_MARGIN +
-      TASKBAR_LAUNCHER_RESERVED_WIDTH +
-      index * (width + TASKBAR_ENTRY_GAP) +
-      Math.max(12, Math.floor(labelWidth / 2)),
-    y: TASKBAR_Y,
-  };
+  return taskbarEntryPoint(index, entryCount);
 }
 
 async function waitForFocusedTaskEntry(
@@ -201,7 +158,9 @@ async function waitForFocusedTaskEntry(
         );
         return entries.every((actual, entryIndex) => {
           const expected =
-            entryIndex === index ? TASKBAR_FOCUSED : TASKBAR_UNFOCUSED;
+            entryIndex === index
+              ? TASKBAR_LIGHT_FOCUSED
+              : TASKBAR_LIGHT_UNFOCUSED;
           return actual.every(
             (channel, channelIndex) => channel === expected[channelIndex],
           );
@@ -251,8 +210,8 @@ async function launchBundledApp(
   );
   await waitForFocusedTaskEntry(
     page,
+    appIndex,
     appIndex + 1,
-    appIndex + 2,
     app.name,
     closeFrame,
   );
@@ -274,6 +233,12 @@ async function focusTaskEntry(
     (await canvas.getAttribute("data-pmos-frame-sequence")) ?? "0",
   );
   const point = taskbarEntryClickPoint(index, entryCount);
+  const current = await pixel(page, point);
+  const alreadyFocused = current.every(
+    (channel, channelIndex) =>
+      channel === TASKBAR_LIGHT_FOCUSED[channelIndex],
+  );
+  if (alreadyFocused) return;
   await clickFramebuffer(page, point.x, point.y);
   await waitForFocusedTaskEntry(page, index, entryCount, label, sequence);
 }
@@ -320,44 +285,24 @@ async function findSolidRun(
   );
 }
 
-async function findSysmonOriginFromTerminateButton(
-  page: Page,
-): Promise<Point | null> {
-  return page.locator("#pmos-fb").evaluate((canvas: HTMLCanvasElement) => {
-    const context = canvas.getContext("2d");
-    if (context === null) return null;
-    const { width, height } = canvas;
-    const bytes = context.getImageData(0, 0, width, height).data;
-    let minX = width;
-    let minY = height;
-    let maxX = -1;
-    let maxY = -1;
-    for (let y = 0; y < height; y += 1) {
-      for (let x = 0; x < width; x += 1) {
-        const offset = (y * width + x) * 4;
-        if (
-          bytes[offset] === 0xd6 &&
-          bytes[offset + 1] === 0xb4 &&
-          bytes[offset + 2] === 0xb4
-        ) {
-          minX = Math.min(minX, x);
-          minY = Math.min(minY, y);
-          maxX = Math.max(maxX, x);
-          maxY = Math.max(maxY, y);
-        }
-      }
-    }
-    if (maxX - minX + 1 < 80 || maxY - minY + 1 < 20) return null;
-    return { x: minX - 98, y: minY - 25 };
-  });
-}
-
 function matchesPalette(
   actual: readonly number[],
   palettes: readonly (readonly number[])[],
 ): boolean {
   return palettes.some((expected) =>
     expected.every((channel, index) => actual[index] === channel),
+  );
+}
+
+function observedProcessPids(
+  lines: readonly string[],
+  start: number,
+): Set<number> {
+  return new Set(
+    lines.slice(start).flatMap((line) => {
+      const match = line.match(/sysmon: (?:observed|updated) pid=(\d+) name=/);
+      return match === null ? [] : [Number(match[1])];
+    }),
   );
 }
 
@@ -418,12 +363,10 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
         "Edit initial mapped frame",
       );
     } else if (app.exec === "/bin/settings") {
-      await expect
-        .poll(() => findSolidRun(page, SETTINGS_TITLEBAR, 300), {
-          timeout: 5_000,
-          message: "Settings did not present its graphical window",
-        })
-        .not.toBeNull();
+      await waitForActiveWindowBounds(page, {
+        expectedWidth: 560,
+        message: "Settings did not present its graphical window",
+      });
     }
   }
   expect(sysmonLogStart).toBeGreaterThanOrEqual(0);
@@ -453,12 +396,7 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
     expect(Number(metrics![2]), row).toBeGreaterThan(0);
   }
 
-  const observedPids = new Set(
-    consoleLines.slice(sysmonLogStart).flatMap((line) => {
-      const match = line.match(/sysmon: (?:observed|updated) pid=(\d+) name=/);
-      return match === null ? [] : [Number(match[1])];
-    }),
-  );
+  const observedPids = observedProcessPids(consoleLines, sysmonLogStart);
   for (const pid of appPids.values()) expect(observedPids.has(pid)).toBe(true);
 
   const settingsPid = appPids.get("/bin/settings")!;
@@ -466,30 +404,34 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
   const settingsRowIndex = sortedPids.indexOf(settingsPid);
   expect(settingsRowIndex).toBeGreaterThanOrEqual(0);
 
-  // Sysmon is the sixth task entry after PMos and the four peer apps. Its
-  // focused task palette was already causally proven by launchBundledApp.
-  await expect
-    .poll(() => findSysmonOriginFromTerminateButton(page), {
-      timeout: 5_000,
-      message: "System Monitor terminate-button marker was not presented",
-    })
-    .not.toBeNull();
-  const sysmonOrigin = await findSysmonOriginFromTerminateButton(page);
-  if (sysmonOrigin === null) throw new Error("System Monitor marker vanished");
-  await clickFramebuffer(page, sysmonOrigin.x + 200, sysmonOrigin.y + 10);
+  // Sysmon is the fifth application task after the four peer apps. Retain the
+  // exact focused-frame bounds rather than deriving an origin from a colour
+  // that can also occur in wallpaper pixels.
+  const sysmonOrigin = await waitForActiveWindowBounds(page, {
+    expectedX: 128,
+    expectedY: 128,
+    expectedWidth: 720,
+    message: "System Monitor focused frame was not presented",
+  });
 
   const settingsRowProbe = {
     x: sysmonOrigin.x + 680,
     y: sysmonOrigin.y + 72 + settingsRowIndex * 18 + 9,
   };
-  await clickFramebuffer(page, sysmonOrigin.x + 300, settingsRowProbe.y);
   await expect
     .poll(
-      async () =>
-        matchesPalette(
-          await pixel(page, settingsRowProbe),
-          SELECTED_ROW_PALETTES,
-        ),
+      async () => {
+        if (
+          matchesPalette(
+            await pixel(page, settingsRowProbe),
+            SELECTED_ROW_PALETTES,
+          )
+        ) {
+          return true;
+        }
+        await clickFramebuffer(page, sysmonOrigin.x + 300, settingsRowProbe.y);
+        return false;
+      },
       {
         timeout: 3_000,
         message: `System Monitor did not select Settings PID ${settingsPid}`,
@@ -573,9 +515,9 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
   );
   await waitForFocusedTaskEntry(
     page,
+    3,
     4,
-    5,
-    "the four surviving apps plus PMos after Settings exits",
+    "the four surviving apps after Settings exits",
   );
   await expect
     .poll(
@@ -590,7 +532,16 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
 
   // Each survivor now receives app-specific input through its original window.
   // There is no relaunch: the exact launch PID remains the identity under test.
-  await focusTaskEntry(page, 1, 5, "surviving Terminal");
+  try {
+    await focusTaskEntry(page, 0, 4, "surviving Terminal");
+  } catch (cause) {
+    throw new Error(
+      `surviving Terminal focus failed; recent console:\n${consoleLines
+        .slice(-60)
+        .join("\n")}`,
+      { cause },
+    );
+  }
   await expect
     .poll(() => findSolidRun(page, TERMINAL_BACKGROUND, 320), {
       timeout: 5_000,
@@ -599,15 +550,13 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
     .not.toBeNull();
   await acknowledgeTerminalFocus(page, consoleLines, 8_000);
 
-  await focusTaskEntry(page, 2, 5, "surviving Files");
-  await expect
-    .poll(() => findSolidRun(page, FILES_TITLEBAR, 300), {
-      timeout: 5_000,
-      message: "surviving Files did not return to the front",
-    })
-    .not.toBeNull();
-  const filesOrigin = await findSolidRun(page, FILES_TITLEBAR, 300);
-  if (filesOrigin === null) throw new Error("Files titlebar vanished");
+  await focusTaskEntry(page, 1, 4, "surviving Files");
+  const filesOrigin = await waitForActiveWindowBounds(page, {
+    expectedX: 32,
+    expectedY: 32,
+    expectedWidth: 640,
+    message: "surviving Files did not return to the front",
+  });
   const filesInputStart = consoleLines.length;
   await clickFramebuffer(page, filesOrigin.x + 300, filesOrigin.y + 109);
   await waitForLineAfter(
@@ -618,15 +567,13 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
     5_000,
   );
 
-  await focusTaskEntry(page, 3, 5, "surviving Edit");
-  await expect
-    .poll(() => findSolidRun(page, EDIT_TITLEBAR, 300), {
-      timeout: 5_000,
-      message: "surviving Edit did not return to the front",
-    })
-    .not.toBeNull();
-  const editOrigin = await findSolidRun(page, EDIT_TITLEBAR, 300);
-  if (editOrigin === null) throw new Error("Edit titlebar vanished");
+  await focusTaskEntry(page, 2, 4, "surviving Edit");
+  const editOrigin = await waitForActiveWindowBounds(page, {
+    expectedX: 64,
+    expectedY: 64,
+    expectedWidth: 640,
+    message: "surviving Edit did not return to the front",
+  });
   const editContent = {
     x: editOrigin.x + 36,
     y: editOrigin.y + 44,
@@ -642,17 +589,13 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
     })
     .not.toBe(editBeforeInput);
 
-  await focusTaskEntry(page, 4, 5, "surviving System Monitor");
-  await expect
-    .poll(() => findSysmonOriginFromTerminateButton(page), {
-      timeout: 5_000,
-      message: "surviving System Monitor did not return to the front",
-    })
-    .not.toBeNull();
-  const survivingSysmonOrigin = await findSysmonOriginFromTerminateButton(page);
-  if (survivingSysmonOrigin === null) {
-    throw new Error("surviving System Monitor marker vanished");
-  }
+  await focusTaskEntry(page, 3, 4, "surviving System Monitor");
+  const survivingSysmonOrigin = await waitForActiveWindowBounds(page, {
+    expectedX: 128,
+    expectedY: 128,
+    expectedWidth: 720,
+    message: "surviving System Monitor did not return to the front",
+  });
   const postKillPids = sortedPids.filter((pid) => pid !== settingsPid);
   const termPid = appPids.get("/bin/term")!;
   const termRowIndex = postKillPids.indexOf(termPid);
@@ -661,15 +604,24 @@ test("System Monitor lists five exact graphical app PIDs, terminates one within 
     x: survivingSysmonOrigin.x + 680,
     y: survivingSysmonOrigin.y + 72 + termRowIndex * 18 + 9,
   };
-  await clickFramebuffer(
-    page,
-    survivingSysmonOrigin.x + 300,
-    termRowProbe.y,
-  );
   await expect
     .poll(
-      async () =>
-        matchesPalette(await pixel(page, termRowProbe), SELECTED_ROW_PALETTES),
+      async () => {
+        if (
+          matchesPalette(
+            await pixel(page, termRowProbe),
+            SELECTED_ROW_PALETTES,
+          )
+        ) {
+          return true;
+        }
+        await clickFramebuffer(
+          page,
+          survivingSysmonOrigin.x + 300,
+          termRowProbe.y,
+        );
+        return false;
+      },
       {
         timeout: 3_000,
         message: `surviving System Monitor did not select Terminal PID ${termPid}`,

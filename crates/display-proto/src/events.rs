@@ -331,8 +331,17 @@ pub mod shell_window_state_flags {
     /// already the exact effective size when placed, or a later surface commit
     /// advanced past the placement boundary with that exact size.
     pub const RESTORE_PLACEMENT_APPLIED: u32 = 1 << 5;
-    pub const ALL: u32 =
-        MAPPED | MINIMIZED | MAXIMIZED | FOCUSED | HIDDEN_FOR_RESTORE | RESTORE_PLACEMENT_APPLIED;
+    /// The owning display connection held the kernel-authenticated Shell
+    /// capability when accepted. Application-controlled metadata cannot set
+    /// this bit.
+    pub const SHELL_OWNED: u32 = 1 << 6;
+    pub const ALL: u32 = MAPPED
+        | MINIMIZED
+        | MAXIMIZED
+        | FOCUSED
+        | HIDDEN_FOR_RESTORE
+        | RESTORE_PLACEMENT_APPLIED
+        | SHELL_OWNED;
 }
 
 /// Full, server-authoritative state used by the v2 `window_created_v2` and
@@ -476,6 +485,33 @@ impl ShellRestoreFinished {
         write_u32(out, self.restore_id);
         write_u32(out, self.status);
         write_u32(out, self.placed);
+    }
+}
+
+/// `pmd_shell_manager.close_shortcut(window_id)` — the display server
+/// recognized the platform Alt+F4 chord for this authoritative focused
+/// ordinary toplevel. The shell applies desktop policy by replying with the
+/// existing authenticated `close_window(window_id)` request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ShellCloseShortcut {
+    pub window_id: u32,
+}
+
+impl ShellCloseShortcut {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if payload.len() != 4 {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 4,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            window_id: read_u32(payload, 0)?,
+        })
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        write_u32(out, self.window_id);
     }
 }
 

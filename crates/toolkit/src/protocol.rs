@@ -925,6 +925,13 @@ impl<C: Connection> Client<C> {
         self.send_request(toplevel_id, 8 /* resize */, &payload)
     }
 
+    /// Send `pmd_xdg_toplevel.set_minimized()` — ask the server to hide this
+    /// client-owned toplevel. Restoring remains shell-owned so taskbar
+    /// activation can restore, raise, and focus atomically.
+    pub fn xdg_toplevel_set_minimized(&mut self, toplevel_id: ObjectId) -> Result<(), ClientError> {
+        self.send_request(toplevel_id, 9 /* set_minimized */, &[])
+    }
+
     /// Parse as many complete server-bound events out of the
     /// input byte stream as possible. Stops at the first
     /// partial message (returning the events parsed so far

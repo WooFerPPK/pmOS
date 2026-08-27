@@ -59,10 +59,10 @@ static _KEEP_RUN_SHELL_WITH_TASKBAR: fn(
 #[cfg(target_arch = "wasm32")]
 mod wasm_main {
     use shell::{
-        encode_with_spawn_timezone, run_desktop_shell_with_runtimes_and_events, DesktopEventSource,
-        DesktopPreferenceRuntime, DesktopWake, FilesystemPreferenceSource, FilesystemStore,
-        Launcher, LauncherRuntime, PreferenceSource, SystemLauncherClock, SystemPreferenceClock,
-        Taskbar,
+        encode_with_spawn_timezone, run_desktop_shell_with_runtimes_events_and_session,
+        DesktopEventSource, DesktopPreferenceRuntime, DesktopWake, FilesystemPreferenceSource,
+        FilesystemStore, Launcher, LauncherRuntime, PreferenceSource, SessionRuntime,
+        SystemLauncherClock, SystemPreferenceClock, Taskbar,
     };
     use std::io;
     use toolkit::{FdConnection, FsWatch, PathWatch, WaitFd};
@@ -78,6 +78,8 @@ mod wasm_main {
         /// Spawn a child process. Returns a positive child
         /// pid on success, negative errno on failure.
         fn proc_spawn_manifest(manifest_ptr: *const u8, manifest_len: u32) -> i32;
+        /// Return this shell process's kernel-authenticated PID.
+        fn proc_self() -> i32;
         /// Reap a zombie child. With WNOHANG (options=1) returns
         /// -EAGAIN if no zombie matches the target. With
         /// target=-1 (WAIT_ANY) reaps any child.
@@ -268,7 +270,11 @@ mod wasm_main {
             AlternatePreferenceSource::new(preferences::DEFAULT_PATH),
             SystemPreferenceClock::new(),
         );
-        match run_desktop_shell_with_runtimes_and_events(
+        let own_pid = unsafe { proc_self() };
+        if own_pid <= 0 {
+            unsafe { proc_exit(EINVAL) };
+        }
+        match run_desktop_shell_with_runtimes_events_and_session(
             conn,
             u32::MAX,
             taskbar,
@@ -277,6 +283,7 @@ mod wasm_main {
             shell_reap_zombies,
             preferences,
             events,
+            SessionRuntime::production(own_pid as u32),
         ) {
             Ok(_) => unsafe { proc_exit(0) },
             Err(_) => unsafe { proc_exit(1) },

@@ -26,6 +26,8 @@
 //!   painting to an opaque `FnMut` closure.
 //! * [`list::List`] — scrollable single-column list with
 //!   pointer + keyboard selection.
+//! * [`tabs::TabStrip`] — stateless tab painting, hit-testing,
+//!   and keyboard navigation with application-owned selection.
 //!
 //! With `List` and `Container` landed, the "Widget trait +
 //! primitives" scope of T116 is complete. No `Widget` trait
@@ -39,15 +41,21 @@ pub mod container;
 pub mod frame;
 pub mod label;
 pub mod list;
+pub mod tabs;
 pub mod text_input;
 
 pub use alignment::Alignment;
 pub use button::{Button, ButtonState, BUTTON_HPAD, BUTTON_VPAD};
 pub use container::Container;
 pub use frame::{
-    PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
-    TITLEBAR_HEIGHT, TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP,
+    PointerOutcome, WindowControl, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN,
+    CLOSE_BUTTON_SIZE, TITLEBAR_HEIGHT, TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP,
+    WINDOW_CONTROL_WIDTH,
 };
 pub use label::{Label, LABEL_HPAD, LABEL_VPAD};
 pub use list::{List, ListDimensions, ListKey, ListKeyOutcome, LIST_HPAD, LIST_ROW_HEIGHT};
+pub use tabs::{
+    TabKey, TabKeyOutcome, TabStrip, TAB_STRIP_ACCENT_HEIGHT, TAB_STRIP_HEIGHT,
+    TAB_STRIP_TEXT_INSET,
+};
 pub use text_input::{Key, KeyOutcome, TextInput, TextInputState, TEXT_INPUT_PADDING_X};

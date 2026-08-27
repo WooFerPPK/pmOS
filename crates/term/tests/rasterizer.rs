@@ -7,9 +7,11 @@
 use std::cell::RefCell;
 
 use term::rasterizer::{
-    colors, default_font, load_startup_font_with, rasterize_snapshot, rasterize_snapshot_with_font,
-    BitmapFont, FontError, Palette, DEFAULT_FONT_NAME, FONT_DIR, MAX_FONT_BYTES,
-    MAX_PREFERENCES_BYTES, PADDING, VGA_FONT_NAME,
+    colors, default_font, load_startup_font_with, rasterize_snapshot,
+    rasterize_snapshot_region_with_palette_and_font, rasterize_snapshot_with_font,
+    rasterize_snapshot_with_palette_and_font, BitmapFont, FontError, Palette, RasterRegion,
+    BYTES_PER_PIXEL, DEFAULT_FONT_NAME, FONT_DIR, MAX_FONT_BYTES, MAX_PREFERENCES_BYTES, PADDING,
+    VGA_FONT_NAME,
 };
 use term::{Key, LineKind, Terminal, TerminalLine, TerminalOptions, TerminalSnapshot};
 use toolkit::draw::font::{glyph_for, glyph_pixel};
@@ -30,6 +32,17 @@ fn pixel(buffer: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         buffer[idx + 2],
         buffer[idx + 3],
     ]
+}
+
+fn crop(buffer: &[u8], frame_width: u32, region: RasterRegion) -> Vec<u8> {
+    let row_bytes = region.width as usize * BYTES_PER_PIXEL;
+    let stride = frame_width as usize * BYTES_PER_PIXEL;
+    let mut cropped = Vec::with_capacity(row_bytes * region.height as usize);
+    for row in 0..region.height as usize {
+        let start = (region.y as usize + row) * stride + region.x as usize * BYTES_PER_PIXEL;
+        cropped.extend_from_slice(&buffer[start..start + row_bytes]);
+    }
+    cropped
 }
 
 #[test]
@@ -89,6 +102,127 @@ fn rasterize_produces_buffer_of_requested_size() {
     let snap = TerminalSnapshot::default();
     let pixels = rasterize_snapshot(&snap, 64, 32);
     assert_eq!(pixels.len(), 64 * 32 * 4);
+}
+
+#[test]
+fn region_raster_matches_full_frame_crops_across_fonts_and_palettes() {
+    let compact = BitmapFont::parse_p1(COMPACT_FONT).expect("compact font parses");
+    let vga = BitmapFont::parse_p1(VGA_FONT).expect("VGA font parses");
+    let snapshot = TerminalSnapshot {
+        lines: vec![
+            TerminalLine {
+                text: "first line".to_string(),
+                kind: LineKind::Banner,
+            },
+            TerminalLine {
+                text: "second line".to_string(),
+                kind: LineKind::Error,
+            },
+        ],
+        input_buffer: "abc".to_string(),
+        prompt: "$ ".to_string(),
+    };
+    let alternate = Palette {
+        bg: 0xff11_2233,
+        banner: 0xff22_3344,
+        input: 0xff33_4455,
+        output: 0xff44_5566,
+        error: 0xff55_6677,
+        cursor: 0xff66_7788,
+    };
+    let width = 160;
+    let height = 80;
+
+    for font in [&compact, &vga] {
+        let rows = (height - 2 * PADDING) / font.cell_height();
+        let input_y = PADDING + rows.saturating_sub(1) * font.cell_height();
+        for palette in [Palette::default(), alternate] {
+            let full =
+                rasterize_snapshot_with_palette_and_font(&snapshot, width, height, palette, font);
+            for region in [
+                RasterRegion::new(PADDING + 3, PADDING, 37, font.cell_height()),
+                RasterRegion::new(PADDING + 7, input_y, 49, font.cell_height()),
+            ] {
+                let bounded = rasterize_snapshot_region_with_palette_and_font(
+                    &snapshot, width, height, region, palette, font,
+                )
+                .expect("contained crop");
+                assert_eq!(bounded, crop(&full, width, region));
+                assert_eq!(
+                    bounded.len(),
+                    region.width as usize * region.height as usize * BYTES_PER_PIXEL
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn region_raster_rejects_empty_overflowing_and_out_of_bounds_crops() {
+    let snapshot = TerminalSnapshot::default();
+    let font = default_font();
+    let raster = |region| {
+        rasterize_snapshot_region_with_palette_and_font(
+            &snapshot,
+            64,
+            32,
+            region,
+            Palette::default(),
+            font,
+        )
+    };
+    assert!(raster(RasterRegion::new(0, 0, 0, 1)).is_none());
+    assert!(raster(RasterRegion::new(0, 0, 1, 0)).is_none());
+    assert!(raster(RasterRegion::new(63, 0, 2, 1)).is_none());
+    assert!(raster(RasterRegion::new(0, 31, 1, 2)).is_none());
+    assert!(raster(RasterRegion::new(u32::MAX, 0, 2, 1)).is_none());
+    assert!(raster(RasterRegion::new(0, u32::MAX, 1, 2)).is_none());
+}
+
+#[test]
+fn region_raster_tiny_surface_is_an_exact_background_crop() {
+    let snapshot = TerminalSnapshot::default();
+    let region = RasterRegion::new(1, 1, 2, 2);
+    let full = rasterize_snapshot(&snapshot, 4, 4);
+    let bounded = rasterize_snapshot_region_with_palette_and_font(
+        &snapshot,
+        4,
+        4,
+        region,
+        Palette::default(),
+        default_font(),
+    )
+    .expect("tiny contained crop");
+    assert_eq!(bounded, crop(&full, 4, region));
+    assert!(bounded.chunks_exact(4).all(|pixel| pixel == bg_pixel()));
+}
+
+#[test]
+fn typical_input_region_allocates_only_the_transported_896_bytes() {
+    let snapshot = TerminalSnapshot {
+        lines: Vec::new(),
+        input_buffer: "a".to_string(),
+        prompt: "$ ".to_string(),
+    };
+    let width = 720;
+    let height = 457;
+    let region = RasterRegion::new(20, 438, 16, 14);
+    let bounded = rasterize_snapshot_region_with_palette_and_font(
+        &snapshot,
+        width,
+        height,
+        region,
+        Palette::default(),
+        default_font(),
+    )
+    .expect("typical input crop");
+
+    assert_eq!(bounded.len(), 896);
+    assert_eq!(
+        width as usize * height as usize * BYTES_PER_PIXEL,
+        1_316_160
+    );
+    assert!(bounded.capacity() < width as usize * height as usize * BYTES_PER_PIXEL);
 }
 
 #[test]

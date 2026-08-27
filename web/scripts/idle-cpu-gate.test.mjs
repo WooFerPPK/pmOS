@@ -7,7 +7,66 @@ import {
   latestSixAppDurableEvidence,
   parseSixAppDurableRecord,
   restoredSessionLifecycleEvidence,
+  taskbarPixelsMatchLayout,
 } from "./idle-cpu-gate.mjs";
+
+test("shell-only taskbar requires base chrome in the first app slot", () => {
+  const lightChrome = Array.from(
+    { length: 160 * 28 },
+    () => [249, 249, 249, 255],
+  );
+  const darkChrome = Array.from(
+    { length: 160 * 28 },
+    () => [32, 32, 32, 255],
+  );
+  assert.equal(
+    taskbarPixelsMatchLayout(lightChrome, 0, -1),
+    true,
+  );
+  assert.equal(
+    taskbarPixelsMatchLayout(darkChrome, 0, -1),
+    true,
+  );
+  assert.equal(
+    taskbarPixelsMatchLayout([[233, 233, 233, 255]], 0, -1),
+    false,
+    "an accidental focused task must not pass the shell-only gate",
+  );
+  assert.equal(
+    taskbarPixelsMatchLayout([[249, 249, 249, 255]], 0, -1),
+    false,
+    "one base pixel must not stand in for the empty task region",
+  );
+  assert.equal(
+    taskbarPixelsMatchLayout(
+      [
+        [249, 249, 249, 255],
+        [27, 27, 27, 255],
+      ],
+      0,
+      -1,
+    ),
+    false,
+    "an unfocused spoof task's mark or label must not pass as empty chrome",
+  );
+  assert.equal(
+    taskbarPixelsMatchLayout(
+      [
+        [249, 249, 249, 255],
+        [32, 32, 32, 255],
+      ],
+      0,
+      -1,
+    ),
+    false,
+    "one shell-only frame cannot mix light and dark base chrome",
+  );
+  assert.equal(
+    taskbarPixelsMatchLayout([], 0, -1),
+    false,
+    "the zero-entry check must not pass vacuously",
+  );
+});
 
 test("six-app durability evidence is exact, bounded, and selects the latest record", () => {
   const first =

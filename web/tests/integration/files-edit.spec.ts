@@ -1,4 +1,12 @@
 import { expect, test, type Page } from "@playwright/test";
+import {
+  LIGHT_TITLEBAR,
+  TASKBAR_DARK_FOCUSED,
+  TASKBAR_LIGHT_FOCUSED,
+  taskbarEntryPoint,
+  titlebarControlPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -134,38 +142,6 @@ function filesDialogBackground(filesOrigin: { x: number; y: number }): {
   };
 }
 
-async function findFramebufferColor(
-  page: Page,
-  rgb: readonly [number, number, number],
-): Promise<{ x: number; y: number } | null> {
-  return page.evaluate(([red, green, blue]) => {
-    const canvas = document.querySelector<HTMLCanvasElement>("#pmos-fb");
-    const context = canvas?.getContext("2d");
-    if (
-      canvas === null ||
-      canvas === undefined ||
-      context === null ||
-      context === undefined
-    ) {
-      return null;
-    }
-    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let y = 0; y < canvas.height; y += 2) {
-      for (let x = 0; x < canvas.width; x += 2) {
-        const offset = (y * canvas.width + x) * 4;
-        if (
-          pixels[offset] === red &&
-          pixels[offset + 1] === green &&
-          pixels[offset + 2] === blue
-        ) {
-          return { x, y };
-        }
-      }
-    }
-    return null;
-  }, rgb);
-}
-
 async function framebufferRgb(
   page: Page,
   x: number,
@@ -185,15 +161,55 @@ async function framebufferRgb(
 
 async function focusTaskbarEntry(
   page: Page,
-  clickX: number,
-  fillSampleX: number,
+  index: number,
+  entryCount: number,
 ): Promise<void> {
-  await clickFramebuffer(page, clickX, 752);
+  const point = taskbarEntryPoint(index, entryCount);
+  const alreadyFocused = await page.locator("#pmos-fb").evaluate(
+    (canvas: HTMLCanvasElement, sample) => {
+      const context = canvas.getContext("2d");
+      if (context === null) return false;
+      const rgba = Array.from(
+        context.getImageData(sample.point.x, sample.point.y, 1, 1).data,
+      );
+      return sample.palettes.some((palette) =>
+        palette.every((channel, offset) => rgba[offset] === channel),
+      );
+    },
+    {
+      point,
+      palettes: [TASKBAR_LIGHT_FOCUSED, TASKBAR_DARK_FOCUSED],
+    },
+  );
+  if (!alreadyFocused) await clickFramebuffer(page, point.x, point.y);
+  await waitForFocusedTaskbarEntry(page, index, entryCount);
+}
+
+async function waitForFocusedTaskbarEntry(
+  page: Page,
+  index: number,
+  entryCount: number,
+): Promise<void> {
+  const point = taskbarEntryPoint(index, entryCount);
   await expect
     .poll(
       async () => {
-        const rgb = await framebufferRgb(page, fillSampleX, 750);
-        return rgb === "194,198,207" || rgb === "34,38,46";
+        const rgba = await page.locator("#pmos-fb").evaluate(
+          (canvas: HTMLCanvasElement, sample) => {
+            const context = canvas.getContext("2d");
+            if (context === null) return [];
+            return Array.from(
+              context.getImageData(sample.x, sample.y, 1, 1).data,
+            );
+          },
+          point,
+        );
+        return [TASKBAR_LIGHT_FOCUSED, TASKBAR_DARK_FOCUSED].some(
+          (palette) =>
+            palette.every(
+              (channel, channelIndex) => rgba[channelIndex] === channel,
+            ),
+        );
       },
       { timeout: 5_000 },
     )
@@ -261,22 +277,18 @@ test("Files creates, navigates, pointer-selects, renames, deletes, and closes th
 
   // `files: ready` is emitted immediately after the client submits its first
   // surface commit. Wait until the compositor has actually presented Files'
-  // blue titlebar before sending a hit-tested pointer event to that surface.
-  await expect
-    .poll(() => findFramebufferColor(page, [0x35, 0x5f, 0x84]), {
-      timeout: 10_000,
-    })
-    .not.toBeNull();
-  const filesOrigin = await findFramebufferColor(page, [0x35, 0x5f, 0x84]);
-  expect(filesOrigin).not.toBeNull();
+  // focused shared frame before sending a hit-tested pointer event.
+  const filesOrigin = await waitForActiveWindowBounds(page, {
+    timeout: 10_000,
+  });
 
   const firstFrame = Number(
     (await page.locator("#pmos-fb").getAttribute("data-pmos-frame-sequence")) ??
       "0",
   );
 
-  // The new Files toplevel is deterministically cascaded to (32, 32). Click
-  // its first list row to focus the ordinary display client before typing.
+  // Click the resolved Files frame's first list row to focus the ordinary
+  // display client before typing.
   await clickFramebuffer(page, filesOrigin!.x + 88, filesOrigin!.y + 109);
 
   await page.keyboard.press("n");
@@ -315,7 +327,7 @@ test("Files creates, navigates, pointer-selects, renames, deletes, and closes th
       timeout: 3_000,
       message: "Files did not present the created-folder selection",
     })
-    .toBe("75,120,165");
+    .toBe("0,103,192");
   const frameBeforeClear = Number(
     (await page.locator("#pmos-fb").getAttribute("data-pmos-frame-sequence")) ??
       "0",
@@ -332,7 +344,7 @@ test("Files creates, navigates, pointer-selects, renames, deletes, and closes th
         return (
           frame > frameBeforeClear &&
           (await framebufferRgb(page, firstRowFill.x, firstRowFill.y)) ===
-            "244,245,247"
+            "243,243,243"
         );
       },
       {
@@ -363,7 +375,7 @@ test("Files creates, navigates, pointer-selects, renames, deletes, and closes th
         return (
           frame > frameBeforePointerSelection &&
           (await framebufferRgb(page, firstRowFill.x, firstRowFill.y)) ===
-            "75,120,165"
+            "0,103,192"
         );
       },
       {
@@ -505,14 +517,9 @@ test("Files resolves Edit's installed desktop entry and Edit saves through the r
   await waitForLine(consoleLines, (line) =>
     line.includes("files: ready /home/user"),
   );
-  await expect
-    .poll(() => findFramebufferColor(page, [0x35, 0x5f, 0x84]), {
-      timeout: 10_000,
-    })
-    .not.toBeNull();
-
-  const filesOrigin = await findFramebufferColor(page, [0x35, 0x5f, 0x84]);
-  expect(filesOrigin).not.toBeNull();
+  const filesOrigin = await waitForActiveWindowBounds(page, {
+    timeout: 10_000,
+  });
 
   // The background session writer may create .config before or after Files
   // scans the seeded home. Observe row zero causally, then select Documents'
@@ -574,33 +581,35 @@ test("Files resolves Edit's installed desktop entry and Edit saves through the r
   );
   const initialBytes = Number(ready.match(/bytes=(\d+)/)?.[1]);
   expect(initialBytes).toBeGreaterThan(0);
-  await expect
-    .poll(() => findFramebufferColor(page, [0x6a, 0x4a, 0x8a]), {
-      timeout: 10_000,
-    })
-    .not.toBeNull();
-  const editOrigin = await findFramebufferColor(page, [0x6a, 0x4a, 0x8a]);
-  expect(editOrigin).not.toBeNull();
+  const firstEditWindow = await waitForActiveWindowBounds(page, {
+    expectedX: filesOrigin.x + 32,
+    expectedY: filesOrigin.y + 32,
+    expectedWidth: 640,
+    timeout: 10_000,
+    message: "Edit did not present its focused cascaded frame",
+  });
   await expect
     .poll(() => liveWorkerCount(page), { timeout: 5_000 })
     .toBe(workersWithFiles + 1);
 
-  // The taskbar includes the shell's own full-output toplevel, followed by
-  // Files and then its Edit child. Rename while Edit keeps the document fd
-  // open, then save from the child.
+  // The taskbar contains only application windows: Files then its Edit child.
+  // Rename while Edit keeps the document fd open, then save from the child.
   const stackingMarker = {
     x: filesOrigin!.x + 450,
     y: filesOrigin!.y + 35,
   };
-  expect(await framebufferRgb(page, stackingMarker.x, stackingMarker.y)).toBe(
-    "106,74,138",
-  );
-  await focusTaskbarEntry(page, 270, 256);
+  await expect
+    .poll(() => framebufferRgb(page, stackingMarker.x, stackingMarker.y), {
+      timeout: 5_000,
+      message: "Edit did not paint its focused titlebar after mapping",
+    })
+    .toBe(LIGHT_TITLEBAR.slice(0, 3).join(","));
+  await focusTaskbarEntry(page, 0, 2);
   await expect
     .poll(() => framebufferRgb(page, stackingMarker.x, stackingMarker.y), {
       timeout: 5_000,
     })
-    .toBe("221,226,231");
+    .toBe("237,237,237");
   await page.keyboard.press("r");
   await typeDialog(page, "zz-editing-renamed.md", filesOrigin!);
   await waitForLine(
@@ -609,12 +618,12 @@ test("Files resolves Edit's installed desktop entry and Edit saves through the r
       line ===
       "[real-kernel] files: renamed /home/user/Documents/editing.md -> /home/user/Documents/zz-editing-renamed.md",
   );
-  await focusTaskbarEntry(page, 430, 418);
+  await focusTaskbarEntry(page, 1, 2);
   await expect
     .poll(() => framebufferRgb(page, stackingMarker.x, stackingMarker.y), {
       timeout: 5_000,
     })
-    .toBe("106,74,138");
+    .toBe(LIGHT_TITLEBAR.slice(0, 3).join(","));
   const beforeSave = consoleLines.length;
   await page.keyboard.type("X");
   await page.keyboard.press("Control+s");
@@ -633,12 +642,14 @@ test("Files resolves Edit's installed desktop entry and Edit saves through the r
     (line) => line.includes("files: reaped child pid="),
     5_000,
   );
-  await focusTaskbarEntry(page, 270, 256);
+  // Closing the focused child transfers focus back to Files. Clicking that
+  // already-focused task would exercise the Windows-style minimize toggle.
+  await waitForFocusedTaskbarEntry(page, 0, 1);
   await expect
     .poll(() => framebufferRgb(page, stackingMarker.x, stackingMarker.y), {
       timeout: 5_000,
     })
-    .toBe("221,226,231");
+    .toBe("237,237,237");
 
   // Reopen the renamed entry through Files. The exact +1 byte count proves
   // Save updated that inode. Renaming it back to the old pathname proves Save
@@ -657,12 +668,17 @@ test("Files resolves Edit's installed desktop entry and Edit saves through the r
       `edit: ready path=/home/user/Documents/zz-editing-renamed.md status=opened /home/user/Documents/zz-editing-renamed.md bytes=${initialBytes + 1}`,
     ),
   );
-  await focusTaskbarEntry(page, 430, 418);
+  // Reopening from Files maps and focuses the new Edit child already.
+  await waitForFocusedTaskbarEntry(page, 1, 2);
   const beforeSecondClose = consoleLines.length;
-  await clickFramebuffer(page, 563, 752);
-  await waitForLineAfter(consoleLines, beforeSecondClose, (line) =>
-    line.includes("shell: taskbar close requested window_id=4"),
-  );
+  const secondEditWindow = await waitForActiveWindowBounds(page, {
+    expectedX: firstEditWindow.x + 32,
+    expectedY: firstEditWindow.y + 32,
+    expectedWidth: 640,
+    message: "Edit window disappeared",
+  });
+  const secondEditClose = titlebarControlPoint(secondEditWindow, "close");
+  await clickFramebuffer(page, secondEditClose.x, secondEditClose.y);
   await expect
     .poll(() => liveWorkerCount(page), { timeout: 5_000 })
     .toBe(workersWithFiles);
@@ -672,12 +688,12 @@ test("Files resolves Edit's installed desktop entry and Edit saves through the r
     (line) => line.includes("files: reaped child pid="),
     5_000,
   );
-  await focusTaskbarEntry(page, 270, 256);
+  await waitForFocusedTaskbarEntry(page, 0, 1);
   await expect
     .poll(() => framebufferRgb(page, stackingMarker.x, stackingMarker.y), {
       timeout: 5_000,
     })
-    .toBe("221,226,231");
+    .toBe("237,237,237");
 
   const beforeFinalSelect = consoleLines.length;
   await clickFramebuffer(page, filesOrigin!.x + 88, filesOrigin!.y + 127);

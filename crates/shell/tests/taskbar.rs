@@ -12,6 +12,12 @@ use display_proto::events::{
     ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused, ShellWindowTitleChanged,
 };
 use shell::{Taskbar, TaskbarClick, TaskbarError};
+use toolkit::draw::{Canvas, Color};
+use toolkit::theme::Theme;
+
+fn rgba(color: Color) -> [u8; 4] {
+    [color.r(), color.g(), color.b(), color.a()]
+}
 
 fn build_window_created(window_id: u32, title: &str, app_id: &str) -> Vec<u8> {
     let event = ShellWindowCreated {
@@ -85,6 +91,32 @@ fn add_window_is_idempotent_updates_title_and_app_id_in_place() {
     tb.add_window(7, "Terminal v2", "pmos.term");
     assert_eq!(tb.entries().len(), 1);
     assert_eq!(tb.entries()[0].title, "Terminal v2");
+}
+
+#[test]
+fn desktop_shell_is_retained_outside_the_visible_task_list() {
+    let mut tb = Taskbar::new(800, 600);
+    tb.add_window(1, "PMos", "pmos.shell");
+    tb.set_shell_window_id(1);
+    assert!(tb.entries().is_empty());
+
+    tb.add_window(2, "Terminal", "pmos.term");
+    assert_eq!(tb.entries().len(), 1);
+    assert_eq!(tb.entries()[0].window_id, 2);
+
+    tb.remove_window(1);
+    assert_eq!(tb.entries().len(), 1);
+}
+
+#[test]
+fn untrusted_shell_app_id_remains_an_ordinary_visible_task() {
+    let mut tb = Taskbar::new(800, 600);
+    tb.set_shell_window_id(1);
+    tb.add_window(7, "Spoof", "pmos.shell");
+
+    assert_eq!(tb.entries().len(), 1);
+    assert_eq!(tb.entries()[0].window_id, 7);
+    assert_eq!(tb.entries()[0].app_id, "pmos.shell");
 }
 
 #[test]
@@ -254,26 +286,14 @@ fn handle_pointer_down_restore_for_minimized_entry() {
 }
 
 #[test]
-fn explicit_minimize_maximize_and_close_controls_have_distinct_hit_targets() {
+fn clicking_the_focused_task_minimizes_it_without_embedded_controls() {
     let mut tb = Taskbar::new(800, 600);
     tb.add_window(7, "A", "pmos.a");
-    let minimize = tb.minimize_rect(0).expect("minimize control");
-    let maximize = tb.maximize_rect(0).expect("maximize control");
-    let close = tb.close_rect(0).expect("close control");
-    assert!(minimize.right() <= maximize.x);
-    assert!(maximize.right() <= close.x);
-
+    tb.set_focused_window(7);
+    let task = tb.entry_rect(0).expect("task button");
     assert_eq!(
-        tb.handle_pointer_down(minimize.x + 1, minimize.y + 1),
+        tb.handle_pointer_down(task.right() - 2, task.y + 1),
         Some(TaskbarClick::Minimize { window_id: 7 }),
-    );
-    assert_eq!(
-        tb.handle_pointer_down(maximize.x + 1, maximize.y + 1),
-        Some(TaskbarClick::ToggleMaximize { window_id: 7 }),
-    );
-    assert_eq!(
-        tb.handle_pointer_down(close.x + 1, close.y + 1),
-        Some(TaskbarClick::Close { window_id: 7 }),
     );
 }
 
@@ -335,6 +355,13 @@ fn entry_label_falls_back_to_title_when_app_id_empty() {
 }
 
 #[test]
+fn entry_label_prefers_human_readable_title_over_app_id() {
+    let mut tb = Taskbar::new(800, 600);
+    tb.add_window(7, "Terminal — project", "pmos.term");
+    assert_eq!(tb.entries()[0].label(), "Terminal — project");
+}
+
+#[test]
 fn entry_label_falls_back_to_untitled_when_both_empty() {
     let mut tb = Taskbar::new(800, 600);
     tb.add_window(7, "", "");
@@ -353,4 +380,40 @@ fn set_framebuffer_size_re_anchors_taskbar() {
     assert_eq!(b2.width, 1024);
     // Entries survive the re-anchor.
     assert_eq!(tb.entries().len(), 1);
+}
+
+#[test]
+fn draw_uses_app_mark_focus_underline_and_minimized_palette() {
+    let mut tb = Taskbar::new(480, 64);
+    tb.set_theme(Theme::LIGHT);
+    tb.add_window(7, "Terminal", "pmos.term");
+    tb.add_window(8, "Files", "pmos.files");
+    tb.set_focused_window(7);
+    tb.set_window_minimized(8, true);
+
+    let first = tb.entry_rect(0).expect("focused task");
+    let second = tb.entry_rect(1).expect("minimized task");
+    let mut canvas = Canvas::new(480, 64);
+    tb.draw(&mut canvas);
+
+    let mark_x = first.x as u32 + shell::TASKBAR_ENTRY_TEXT_MARGIN;
+    let mark_y = first.y as u32 + (first.height.saturating_sub(shell::TASKBAR_APP_MARK_SIZE) / 2);
+    assert_eq!(
+        canvas.pixel(mark_x, mark_y),
+        Some(&rgba(Theme::LIGHT.border_active)[..]),
+    );
+
+    let underline_x = first.x as u32
+        + (first
+            .width
+            .saturating_sub(shell::TASKBAR_FOCUS_INDICATOR_WIDTH)
+            / 2);
+    assert_eq!(
+        canvas.pixel(underline_x, first.bottom() as u32 - 1),
+        Some(&rgba(Theme::LIGHT.border_active)[..]),
+    );
+    assert_eq!(
+        canvas.pixel(second.x as u32 + 1, second.y as u32 + 1),
+        Some(&rgba(Theme::LIGHT.titlebar_inactive)[..]),
+    );
 }

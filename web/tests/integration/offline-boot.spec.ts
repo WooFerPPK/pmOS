@@ -14,6 +14,11 @@ import {
   openLauncherMenuBefore,
   selectLauncherRowBefore,
 } from "./launcher-interaction";
+import {
+  TASKBAR_LIGHT_FOCUSED,
+  activeWindowBounds,
+  taskbarEntryPoint,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -31,11 +36,12 @@ interface BundledAppProbe {
   readonly exec: string;
   readonly rowY: number;
   readonly ready: (line: string) => boolean;
-  readonly marker: {
+  readonly marker?: {
     readonly rgb: readonly [number, number, number];
     readonly minimumWidth: number;
     readonly minimumHeight: number;
   };
+  readonly windowWidth?: number;
 }
 
 const BUNDLED_APPS: readonly BundledAppProbe[] = [
@@ -55,33 +61,21 @@ const BUNDLED_APPS: readonly BundledAppProbe[] = [
     exec: "/bin/files",
     rowY: 648,
     ready: (line) => line.includes("files: ready /home/user"),
-    marker: {
-      rgb: [0x35, 0x5f, 0x84],
-      minimumWidth: 300,
-      minimumHeight: 8,
-    },
+    windowWidth: 640,
   },
   {
     name: "Text Editor",
     exec: "/bin/edit",
     rowY: 672,
     ready: (line) => line.includes("edit: ready path="),
-    marker: {
-      rgb: [0x6a, 0x4a, 0x8a],
-      minimumWidth: 120,
-      minimumHeight: 8,
-    },
+    windowWidth: 640,
   },
   {
     name: "Settings",
     exec: "/bin/settings",
     rowY: 696,
     ready: (line) => /shell: launched \/bin\/settings pid=\d+/.test(line),
-    marker: {
-      rgb: [0x40, 0x60, 0x70],
-      minimumWidth: 300,
-      minimumHeight: 8,
-    },
+    windowWidth: 560,
   },
   {
     name: "System Monitor",
@@ -99,12 +93,12 @@ const BUNDLED_APPS: readonly BundledAppProbe[] = [
 
 async function findSolidMarker(
   page: Page,
-  marker: BundledAppProbe["marker"],
+  marker: NonNullable<BundledAppProbe["marker"]>,
 ): Promise<{ x: number; y: number } | null> {
   return page.locator("#pmos-fb").evaluate(
     (
       canvas: HTMLCanvasElement,
-      target: BundledAppProbe["marker"],
+      target: NonNullable<BundledAppProbe["marker"]>,
     ) => {
       const context = canvas.getContext("2d");
       if (context === null) return null;
@@ -164,9 +158,11 @@ async function launchBundledAppOffline(
   page: Page,
   lines: readonly string[],
   app: BundledAppProbe,
+  appIndex: number,
   launcherAlreadyOpen: boolean,
   closedLauncherFingerprint: number,
 ): Promise<void> {
+  const previouslyActive = await activeWindowBounds(page);
   if (!launcherAlreadyOpen) {
     await expect
       .poll(() => launcherMenuIsOpen(page), { timeout: 5_000 })
@@ -209,10 +205,37 @@ async function launchBundledAppOffline(
             .locator("#pmos-fb")
             .getAttribute("data-pmos-frame-sequence")) ?? "0",
         );
+        const taskPoint = taskbarEntryPoint(appIndex, appIndex + 1);
+        const taskPixel = await page.locator("#pmos-fb").evaluate(
+          (canvas: HTMLCanvasElement, point: { x: number; y: number }) => {
+            const context = canvas.getContext("2d");
+            if (context === null) return [];
+            return Array.from(
+              context.getImageData(point.x, point.y, 1, 1).data,
+            );
+          },
+          taskPoint,
+        );
+        const taskFocused = TASKBAR_LIGHT_FOCUSED.every(
+          (channel, index) => taskPixel[index] === channel,
+        );
+        const active =
+          app.windowWidth === undefined ? null : await activeWindowBounds(page);
+        const appMarkerPresented =
+          app.windowWidth !== undefined
+            ? active !== null &&
+              active.width === app.windowWidth &&
+              (previouslyActive === null ||
+                active.x !== previouslyActive.x ||
+                active.y !== previouslyActive.y ||
+                active.width !== previouslyActive.width)
+            : app.marker !== undefined &&
+              (await findSolidMarker(page, app.marker)) !== null;
         return (
           frameSequence > menuCloseFrame &&
           !(await launcherMenuIsOpen(page)) &&
-          (await findSolidMarker(page, app.marker)) !== null
+          taskFocused &&
+          appMarkerPresented
         );
       }, {
         timeout: 10_000,
@@ -231,7 +254,12 @@ async function launchBundledAppOffline(
       `${app.name} post-close map boundary failed; ` +
         `close_frame=${menuCloseFrame} final_frame=${frameSequence} ` +
         `menu_open=${await launcherMenuIsOpen(page)} ` +
-        `marker=${JSON.stringify(await findSolidMarker(page, app.marker))}`,
+        `active=${JSON.stringify(await activeWindowBounds(page))} ` +
+        `marker=${JSON.stringify(
+          app.marker === undefined
+            ? null
+            : await findSolidMarker(page, app.marker),
+        )}`,
       { cause },
     );
   }
@@ -413,6 +441,7 @@ test("offline warm boot reaches an interactive desktop within 3s", async ({
         offlinePage,
         linesOffline,
         app,
+        index,
         index === 0,
         closedLauncherFingerprint,
       );

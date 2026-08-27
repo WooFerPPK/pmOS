@@ -13,6 +13,14 @@ import {
   openLauncherMenuBefore,
   selectLauncherRowBefore,
 } from "./launcher-interaction";
+import {
+  LIGHT_ACTIVE_BORDER,
+  LIGHT_TITLEBAR,
+  TASKBAR_DARK,
+  taskbarEntryPoint,
+  taskbarEntryRegion,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 test.setTimeout(45_000);
@@ -20,7 +28,6 @@ test.setTimeout(45_000);
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
 const TASKBAR_Y = 752;
-const DARK_TASKBAR = [0x2b, 0x31, 0x3d, 0xff] as const;
 
 const DEFAULT_INIT_CONFIG = `[boot]
 display_server = "/usr/bin/display-server"
@@ -80,43 +87,6 @@ async function framebufferPixel(
     },
     { x, y },
   );
-}
-
-async function findFramebufferColor(
-  page: Page,
-  rgb: readonly [number, number, number],
-): Promise<{ x: number; y: number } | null> {
-  return page
-    .locator("#pmos-fb")
-    .evaluate(
-      (
-        canvas: HTMLCanvasElement,
-        target: readonly [number, number, number],
-      ) => {
-        const context = canvas.getContext("2d");
-        if (context === null) return null;
-        const pixels = context.getImageData(
-          0,
-          0,
-          canvas.width,
-          canvas.height,
-        ).data;
-        for (let y = 0; y < canvas.height; y += 1) {
-          for (let x = 0; x < canvas.width; x += 1) {
-            const offset = (y * canvas.width + x) * 4;
-            if (
-              pixels[offset] === target[0] &&
-              pixels[offset + 1] === target[1] &&
-              pixels[offset + 2] === target[2]
-            ) {
-              return { x, y };
-            }
-          }
-        }
-        return null;
-      },
-      rgb,
-    );
 }
 
 async function framebufferRegionFingerprint(
@@ -246,9 +216,11 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
   await expect(page.locator("#pmos-boot-splash")).toHaveCount(0, {
     timeout: 12_000,
   });
-  await waitForLineAfter(consoleLines, 0, (line) =>
+  const shellStartupLine = await waitForLineAfter(consoleLines, 0, (line) =>
     line.includes("init-desktop shell path=/usr/bin/shell"),
   );
+  const shellPid = Number(shellStartupLine.match(/ pid=(\d+)$/)?.[1]);
+  expect(shellPid, shellStartupLine).toBeGreaterThan(0);
   await waitForLineAfter(consoleLines, 0, (line) =>
     line.includes("shell: loaded 5 applications from /usr/share/applications"),
   );
@@ -303,6 +275,12 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
     consoleLines,
     "cp /home/user/alt-init.conf /etc/init.conf",
   );
+  const terminalWindow = await waitForActiveWindowBounds(page, {
+    expectedX: 32,
+    expectedY: 32,
+    expectedWidth: 720,
+    message: "Terminal frame vanished before launching Edit",
+  });
 
   // SC-008's third independent application is the bundled editor. Wait for
   // its first committed surface, not just its spawn log, before replacing the
@@ -329,18 +307,19 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
   await waitForLineAfter(consoleLines, editLaunchStart, (line) =>
     line.includes("edit: ready path="),
   );
-  await expect
-    .poll(() => findFramebufferColor(page, [0x6a, 0x4a, 0x8a]), {
-      timeout: 10_000,
-      message: "expected Edit's committed titlebar before shell replacement",
-    })
-    .not.toBeNull();
+  await waitForActiveWindowBounds(page, {
+    differentFrom: terminalWindow,
+    expectedX: 64,
+    expectedY: 64,
+    expectedWidth: 640,
+    timeout: 10_000,
+    message: "expected Edit's committed frame before shell replacement",
+  });
   expect(
     new Set([filesPid, terminalPid, editPid]).size,
     `application PIDs must be unique: Files=${filesPid}, Terminal=${terminalPid}, Edit=${editPid}`,
   ).toBe(3);
 
-  const workersBeforeReplacement = await workerCount(page);
   const termStartsBefore = consoleLines.filter((line) =>
     line.includes("term: starting"),
   ).length;
@@ -351,11 +330,69 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
     line.includes("edit: starting"),
   ).length;
 
-  // Entry zero is the current shell; its close control is x=230..249. This
-  // is a real display-protocol close request. PID 1 must re-read init.conf,
-  // wait out the crash-loop limiter, and spawn the new binary.
+  // Use System Monitor's capability-scoped process UI to stop the current
+  // shell now that the shell itself is deliberately omitted from app tasks.
+  // PID 1 must re-read init.conf, wait out the crash-loop limiter, and spawn
+  // the configured replacement binary.
+  const sysmonClosedFingerprint = await launcherMenuRegionFingerprint(page);
+  await openLauncherMenuBefore(page, Date.now() + 5_000);
+  const sysmonStart = consoleLines.length;
+  await selectLauncherRowBefore(
+    page,
+    100,
+    720,
+    Date.now() + 5_000,
+    sysmonClosedFingerprint,
+  );
+  await waitForLineAfter(consoleLines, sysmonStart, (line) =>
+    line.includes("sysmon: starting"),
+  );
+  await waitForLineAfter(consoleLines, sysmonStart, (line) =>
+    line.includes(`sysmon: observed pid=${shellPid} name=/usr/bin/shell `),
+  );
+  const sysmonOrigin = await waitForActiveWindowBounds(page, {
+    expectedX: 96,
+    expectedY: 96,
+    expectedWidth: 720,
+    message: "System Monitor frame vanished",
+  });
+  const observedPids = consoleLines.slice(sysmonStart).flatMap((line) => {
+    const match = line.match(/sysmon: (?:observed|updated) pid=(\d+) name=/);
+    return match === null ? [] : [Number(match[1])];
+  });
+  const sortedPids = [...new Set(observedPids)].sort(
+    (left, right) => left - right,
+  );
+  const shellRow = sortedPids.indexOf(shellPid);
+  expect(shellRow).toBeGreaterThanOrEqual(0);
+  const workersBeforeReplacement = await workerCount(page);
+  const shellRowY = sysmonOrigin.y + 81 + shellRow * 18;
+  await expect
+    .poll(async () => {
+      const selected = await framebufferPixel(
+        page,
+        sysmonOrigin.x + 680,
+        shellRowY,
+      );
+      if (
+        LIGHT_ACTIVE_BORDER.every(
+          (channel, index) => selected[index] === channel,
+        )
+      ) {
+        return selected;
+      }
+      await clickFramebuffer(page, sysmonOrigin.x + 300, shellRowY);
+      return [];
+    })
+    .toEqual([...LIGHT_ACTIVE_BORDER]);
+  await page.keyboard.press("k");
+  await expect
+    .poll(() =>
+      framebufferPixel(page, sysmonOrigin.x + 620, sysmonOrigin.y + 170),
+    )
+    .toEqual([...LIGHT_TITLEBAR]);
   start = consoleLines.length;
-  await clickFramebuffer(page, 240, TASKBAR_Y);
+  await page.keyboard.press("Enter");
   await waitForLineAfter(consoleLines, start, (line) =>
     line.includes("init-desktop shell exited"),
   );
@@ -376,7 +413,7 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
   // the live Worker count back to the same value after the old shell exits.
   await expect
     .poll(() => framebufferPixel(page, 800, 760), { timeout: 10_000 })
-    .toEqual(DARK_TASKBAR);
+    .toEqual([...TASKBAR_DARK]);
   await expect
     .poll(() => workerCount(page), { timeout: 10_000 })
     .toBe(workersBeforeReplacement);
@@ -390,16 +427,17 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
     consoleLines.filter((line) => line.includes("edit: starting")),
   ).toHaveLength(editStartsBefore);
 
-  // The replacement enumerates the current bottom-to-top z-order: itself,
-  // Files, Terminal, then Edit. Each exact label click must yield a distinct
+  // The replacement enumerates only application windows: Files, Terminal,
+  // Edit, then System Monitor. Each exact label click must yield a distinct
   // server-global window id and an app-specific input response.
-  const filesTaskEntry = { x: 252, y: 738, width: 160, height: 28 };
-  const terminalTaskEntry = { x: 414, y: 738, width: 160, height: 28 };
-  const editTaskEntry = { x: 576, y: 738, width: 160, height: 28 };
+  const filesTaskEntry = taskbarEntryRegion(0, 4);
+  const terminalTaskEntry = taskbarEntryRegion(1, 4);
+  const editTaskEntry = taskbarEntryRegion(2, 4);
+  const terminalTask = taskbarEntryPoint(1, 4);
   const terminalWindowId = await focusReplacementTask(
     page,
     consoleLines,
-    460,
+    terminalTask.x,
     terminalTaskEntry,
   );
   await runTerminalCommand(
@@ -412,7 +450,7 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
   const filesWindowId = await focusReplacementTask(
     page,
     consoleLines,
-    300,
+    taskbarEntryPoint(0, 4).x,
     filesTaskEntry,
   );
   start = consoleLines.length;
@@ -424,7 +462,7 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
   const editWindowId = await focusReplacementTask(
     page,
     consoleLines,
-    620,
+    taskbarEntryPoint(2, 4).x,
     editTaskEntry,
   );
   start = consoleLines.length;
@@ -442,7 +480,7 @@ test("replaces the shell while Files, Terminal, and Edit survive", async ({
   const restoredTerminalWindowId = await focusReplacementTask(
     page,
     consoleLines,
-    460,
+    terminalTask.x,
     terminalTaskEntry,
   );
   expect(restoredTerminalWindowId).toBe(terminalWindowId);

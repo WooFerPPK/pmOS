@@ -674,7 +674,7 @@ fn cold_first_edit_and_alternating_edits_use_one_atomic_current_patch_each() {
     for patch in patches {
         assert_eq!(
             (patch.x, patch.y, patch.width, patch.height),
-            (20, 452, 16, 14)
+            (20, 460, 16, 14)
         );
         assert_eq!(patch.pixels.len(), 896);
         assert!(patch.pixels.len() <= display_proto::MAX_SURFACE_PATCH_BYTES);
@@ -686,6 +686,82 @@ fn cold_first_edit_and_alternating_edits_use_one_atomic_current_patch_each() {
         parse_surface_patches(&waits[0]).len(),
         1,
         "after flush drains the full-commit suffix, local InputEdit must patch before READ park",
+    );
+}
+
+#[test]
+fn activation_patches_the_top_edge_then_terminal_input_preempts_remaining_chrome() {
+    let mut conn = MockConnection::new();
+    conn.incremental = true;
+    seed_full_registry(&mut conn);
+    let pool_id = ObjectId::new(23);
+    conn.push_inbound_on_request(
+        SURFACE_ID,
+        SURFACE_OPCODE_COMMIT,
+        build_configure_event(1, 720, 480),
+    );
+    let mut activate_and_type = build_configure_event_with_states(
+        2,
+        720,
+        480,
+        display_proto::xdg_toplevel_state::ACTIVATED,
+    );
+    activate_and_type.extend(build_keyboard_key_event(KEY_E, KEY_PRESSED));
+    conn.wait_inbound.push_back(activate_and_type);
+
+    let recorded = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+    let connection = RecordingConnection {
+        inner: conn,
+        recorded: recorded.clone(),
+    };
+    assert_eq!(
+        run_term_with_options(connection, 80, quiet_options()).expect("term run succeeds"),
+        TermExit::IterationLimit,
+    );
+
+    let bytes = recorded.borrow();
+    let patches = parse_surface_patches(&bytes);
+    assert_eq!(patches.len(), 7, "six chrome tiles plus one input patch");
+    assert_eq!(
+        (
+            patches[0].x,
+            patches[0].y,
+            patches[0].width,
+            patches[0].height,
+        ),
+        (0, 0, 720, 8),
+        "the complete active top edge is the first visible focus evidence",
+    );
+    assert_eq!(
+        (
+            patches[1].x,
+            patches[1].y,
+            patches[1].width,
+            patches[1].height,
+        ),
+        (20, 460, 16, 14),
+        "input must preempt the five remaining cosmetic chrome tiles",
+    );
+    assert!(patches
+        .iter()
+        .all(|patch| patch.pixels.len() <= display_proto::MAX_SURFACE_PATCH_BYTES));
+
+    let headers = parse_request_headers(&bytes);
+    assert_eq!(
+        headers
+            .iter()
+            .filter(|(object, opcode, _)| *object == pool_id && *opcode == 4)
+            .count(),
+        57,
+        "activation must not upload the alternate full buffer",
+    );
+    assert_eq!(
+        headers
+            .iter()
+            .filter(|(object, opcode, _)| *object == SURFACE_ID && *opcode == 2)
+            .count(),
+        1,
+        "activation and input patch the attached buffer without swapping",
     );
 }
 

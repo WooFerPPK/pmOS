@@ -32,12 +32,14 @@
 //!      The exact frozen legacy fixture is relayed as a raw blit.
 //!   5. Park on listener/input/watch/signal plus exact client READ and
 //!      pending-output WRITE interests only when no local work remains.
-//!   6. On SIGTERM, `println!("display-server fb blit ok")` and
-//!      fall off the end of `main` (std emits `proc_exit(0)`).
+//!   6. On SIGTERM, drain immediately ready transport, then use a bounded
+//!      transport-only grace poll to catch late kernel routing. Exit at
+//!      quiescence after the grace deadline or the fixed total turn cap,
+//!      print `display-server fb blit ok`, and fall off the end of `main`.
 //!
 //! Exit codes:
 //!
-//!   * 0  = success (outer loop broke on SIGTERM)
+//!   * 0  = success (the bounded post-SIGTERM transport drain completed)
 //!   * 10 = `display_bind` failed
 //!   * 12 = `ipc_accept` returned an unexpected negative rc
 //!   * 14 = `fd_read` returned a non-EAGAIN error or read 0 bytes
@@ -262,6 +264,14 @@ const CLIENT_WRITE_ATTEMPTS_PER_TURN: usize = 4;
 const CLIENT_EVENT_BYTES_PER_TURN: usize = display_server::MAX_CONN_OUTBOUND_BYTES;
 #[cfg(any(target_arch = "wasm32", test))]
 const CLIENT_DISCONNECTS_PER_TURN: usize = 1;
+/// A graceful shutdown may spend one turn retiring each admitted client, but
+/// a peer that keeps the listener or a stream ready cannot postpone exit.
+#[cfg(any(target_arch = "wasm32", test))]
+const SHUTDOWN_DRAIN_TURNS: usize = display_server::MAX_SERVER_CLIENTS;
+/// Give already-completed peer sends time to become visible to this worker.
+/// The wait set contains only the listener and connected client transport.
+#[cfg(any(target_arch = "wasm32", test))]
+const SHUTDOWN_QUIESCENCE_GRACE_MS: u64 = 100;
 /// A fence is a real `/dev/fb0` write. Cap it globally, even though at most two
 /// authenticated shell connections can have a one-shot marker queued.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -378,6 +388,79 @@ const fn pending_event_can_make_local_progress(
 #[cfg(any(target_arch = "wasm32", test))]
 const fn should_park_after_request_round(local_pending_work: bool) -> bool {
     !local_pending_work
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum ShutdownTurnDecision {
+    #[default]
+    Continue,
+    WaitForDeadline(u64),
+    Finish,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct ShutdownDrain {
+    requested: bool,
+    listener_drained: bool,
+    turns_remaining: usize,
+    deadline_ms: u64,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ShutdownDrain {
+    fn request(&mut self, now_ms: u64) {
+        if !self.requested {
+            self.requested = true;
+            self.listener_drained = false;
+            self.turns_remaining = SHUTDOWN_DRAIN_TURNS;
+            self.deadline_ms = now_ms.saturating_add(SHUTDOWN_QUIESCENCE_GRACE_MS);
+        }
+    }
+
+    fn observe_accept_result(&mut self, result: Result<usize, i32>) {
+        if self.requested {
+            self.listener_drained = matches!(result, Err(rc) if rc == -abi::errno::EAGAIN);
+        }
+    }
+
+    const fn requested(self) -> bool {
+        self.requested
+    }
+
+    fn finish_turn(
+        &mut self,
+        now_ms: u64,
+        local_pending_work: bool,
+        client_transport_ready: bool,
+    ) -> ShutdownTurnDecision {
+        if !self.requested {
+            return ShutdownTurnDecision::Continue;
+        }
+        self.turns_remaining = self.turns_remaining.saturating_sub(1);
+        if self.turns_remaining == 0 {
+            return ShutdownTurnDecision::Finish;
+        }
+        if !self.listener_drained || local_pending_work || client_transport_ready {
+            return ShutdownTurnDecision::Continue;
+        }
+        if now_ms >= self.deadline_ms {
+            ShutdownTurnDecision::Finish
+        } else {
+            ShutdownTurnDecision::WaitForDeadline(self.deadline_ms - now_ms)
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const fn client_transport_can_make_local_progress(
+    read_ready: bool,
+    write_ready: bool,
+    outbound_pending: bool,
+    disconnect_pending: bool,
+) -> bool {
+    read_ready || disconnect_pending || (write_ready && outbound_pending)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -512,7 +595,7 @@ unsafe fn poll_for_activity(
             ..base + abi::wasi::poll::SUB_CLOCK_OFF_TIMEOUT + 8]
             .copy_from_slice(&timeout_ns.to_le_bytes());
         // A zero relative timeout is an exact readiness snapshot; a positive
-        // one is the active restore transaction's sole hard-deadline wakeup.
+        // one is either the restore deadline or bounded shutdown grace wakeup.
         // Userdata zero is reserved for this synthetic clock and filtered.
     }
     let mut events = vec![0u8; subscription_count * abi::wasi::poll::EVENT_SIZE];
@@ -530,6 +613,19 @@ unsafe fn poll_for_activity(
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct PollReadiness {
+    listener_read_ready: bool,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn summarize_poll_readiness(listener: i32, ready: &[(i32, u8)]) -> PollReadiness {
+    PollReadiness {
+        listener_read_ready: ready.contains(&(listener, abi::wasi::eventtype::FD_READ)),
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
 fn build_wait_interests(
     listener: i32,
     signal: i32,
@@ -537,22 +633,25 @@ fn build_wait_interests(
     keyboard: Option<i32>,
     watch_fds: &[i32],
     clients: &[(i32, bool)],
+    transport_only: bool,
 ) -> Result<Vec<(i32, u8)>, i32> {
     let mut interests = Vec::with_capacity(4 + watch_fds.len() + clients.len() * 2);
     interests.push((listener, abi::wasi::eventtype::FD_READ));
-    interests.push((signal, abi::wasi::eventtype::FD_READ));
-    if let Some(fd) = mouse {
-        interests.push((fd, abi::wasi::eventtype::FD_READ));
+    if !transport_only {
+        interests.push((signal, abi::wasi::eventtype::FD_READ));
+        if let Some(fd) = mouse {
+            interests.push((fd, abi::wasi::eventtype::FD_READ));
+        }
+        if let Some(fd) = keyboard {
+            interests.push((fd, abi::wasi::eventtype::FD_READ));
+        }
+        interests.extend(
+            watch_fds
+                .iter()
+                .copied()
+                .map(|fd| (fd, abi::wasi::eventtype::FD_READ)),
+        );
     }
-    if let Some(fd) = keyboard {
-        interests.push((fd, abi::wasi::eventtype::FD_READ));
-    }
-    interests.extend(
-        watch_fds
-            .iter()
-            .copied()
-            .map(|fd| (fd, abi::wasi::eventtype::FD_READ)),
-    );
     for (fd, outbound_pending) in clients.iter().copied() {
         interests.push((fd, abi::wasi::eventtype::FD_READ));
         if outbound_pending {
@@ -619,8 +718,10 @@ impl display_server::protocol::keymap::KeymapPreferenceClock for SystemKeymapPre
 /// Drain every available input event from the kernel's
 /// `/dev/input/{mouse,kbd}` rings and inject each into
 /// `server`. Returns true when at least one event was
-/// processed (the caller can use this as a "pixels may be
-/// dirty" hint and re-present).
+/// processed. Routing an event is not itself framebuffer
+/// damage: direct pointer-driven scene changes advance the
+/// server's recomposition serial, while client reactions are
+/// presented after their later surface commits.
 #[cfg(target_arch = "wasm32")]
 unsafe fn drain_input_events(
     server: &mut display_server::Server,
@@ -788,8 +889,33 @@ fn changed_bounds(previous: &[u8], current: &[u8], width: u32, height: u32) -> O
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+fn rows_equal_u64(previous: &[u8], current: &[u8]) -> bool {
+    if previous.len() != current.len() {
+        return false;
+    }
+    let mut offset = 0usize;
+    while offset + 8 <= previous.len() {
+        let left = u64::from_ne_bytes(
+            previous[offset..offset + 8]
+                .try_into()
+                .expect("exact word slice"),
+        );
+        let right = u64::from_ne_bytes(
+            current[offset..offset + 8]
+                .try_into()
+                .expect("exact word slice"),
+        );
+        if left != right {
+            return false;
+        }
+        offset += 8;
+    }
+    previous[offset..] == current[offset..]
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
 fn changed_row_bounds(previous: &[u8], current: &[u8], width: u32) -> Option<(u32, u32)> {
-    if previous == current {
+    if rows_equal_u64(previous, current) {
         return None;
     }
     let mut left = 0u32;
@@ -905,6 +1031,125 @@ fn changed_bands(
             bands.push(band);
         } else {
             fragmented = true;
+        }
+    }
+    if fragmented {
+        global.into_iter().collect()
+    } else {
+        bands
+    }
+}
+
+/// Compare only server-validated output-space candidates. Full-scene
+/// recomposition still ran before this function; the candidates merely bound
+/// the equality proof against the last presented shadow.
+#[cfg(any(target_arch = "wasm32", test))]
+fn changed_bands_bounded(
+    previous: &[u8],
+    current: &[u8],
+    width: u32,
+    height: u32,
+    candidates: &[display_server::OutputDamageRect],
+    max_bands: usize,
+) -> Vec<DamageRect> {
+    let Some(expected) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return Vec::new();
+    };
+    if expected == 0 {
+        return Vec::new();
+    }
+    if previous.len() != expected || current.len() != expected {
+        return vec![DamageRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }];
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let framebuffer_row_bytes = width as usize * 4;
+    let mut bands = Vec::with_capacity(max_bands.min(8));
+    let mut global: Option<DamageRect> = None;
+    let mut fragmented = max_bands == 0;
+    for candidate in candidates {
+        let x = candidate.x.min(width);
+        let y = candidate.y.min(height);
+        let right = candidate.x.saturating_add(candidate.width).min(width);
+        let bottom = candidate.y.saturating_add(candidate.height).min(height);
+        if right <= x || bottom <= y {
+            continue;
+        }
+        let candidate_width = right - x;
+        let x_bytes = x as usize * 4;
+        let candidate_row_bytes = candidate_width as usize * 4;
+        let mut current_band: Option<DamageRect> = None;
+        for row in y..bottom {
+            let start = row as usize * framebuffer_row_bytes + x_bytes;
+            let Some((local_left, local_right)) = changed_row_bounds(
+                &previous[start..start + candidate_row_bytes],
+                &current[start..start + candidate_row_bytes],
+                candidate_width,
+            ) else {
+                if let Some(band) = current_band.take() {
+                    if bands.len() < max_bands {
+                        bands.push(band);
+                    } else {
+                        fragmented = true;
+                    }
+                }
+                continue;
+            };
+            let left = x + local_left;
+            let right = x + local_right;
+            global = Some(match global {
+                Some(bounds) => {
+                    let union_x = bounds.x.min(left);
+                    let union_right = (bounds.x + bounds.width).max(right);
+                    DamageRect {
+                        x: union_x,
+                        y: bounds.y.min(row),
+                        width: union_right - union_x,
+                        height: (bounds.y + bounds.height).max(row + 1) - bounds.y.min(row),
+                    }
+                }
+                None => DamageRect {
+                    x: left,
+                    y: row,
+                    width: right - left,
+                    height: 1,
+                },
+            });
+            current_band = Some(match current_band {
+                Some(band) => {
+                    let union_x = band.x.min(left);
+                    let union_right = (band.x + band.width).max(right);
+                    DamageRect {
+                        x: union_x,
+                        y: band.y,
+                        width: union_right - union_x,
+                        height: row + 1 - band.y,
+                    }
+                }
+                None => DamageRect {
+                    x: left,
+                    y: row,
+                    width: right - left,
+                    height: 1,
+                },
+            });
+        }
+        if let Some(band) = current_band {
+            if bands.len() < max_bands {
+                bands.push(band);
+            } else {
+                fragmented = true;
+            }
         }
     }
     if fragmented {
@@ -1219,7 +1464,19 @@ unsafe fn present_framebuffer(
     let height = fb.height();
     let pixels = fb.pixels();
     const MAX_PRESENT_BANDS: usize = 8;
-    let damages = changed_bands(presented, pixels, width, height, MAX_PRESENT_BANDS);
+    let damages = match server.presentation_damage() {
+        display_server::PresentationDamage::Full => {
+            changed_bands(presented, pixels, width, height, MAX_PRESENT_BANDS)
+        }
+        display_server::PresentationDamage::Bounded(candidates) => changed_bands_bounded(
+            presented,
+            pixels,
+            width,
+            height,
+            candidates,
+            MAX_PRESENT_BANDS,
+        ),
+    };
     if damages.is_empty() {
         return true;
     }
@@ -1384,6 +1641,7 @@ struct PresentationSchedule {
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl PresentationSchedule {
+    #[cfg(test)]
     fn mark_frame_dirty(&mut self) {
         self.frame_dirty = true;
     }
@@ -1434,6 +1692,7 @@ fn complete_successful_frame_presentation(
     if deferred {
         return Ok(0);
     }
+    server.clear_presentation_damage();
     server.mark_frame_callbacks_presented(callback_data);
     Ok(server.complete_presented_frame_callbacks(remaining))
 }
@@ -1625,36 +1884,43 @@ fn main() {
             disconnect_pending: bool,
         }
         let mut conns: Vec<Conn> = Vec::new();
-        let poll_client_readiness =
-            |conns: &mut [Conn], watch_fds: &[i32], timeout_ms: Option<u64>| -> Result<(), i32> {
-                let clients = conns
-                    .iter()
-                    .map(|conn| (conn.server_fd, !conn.outbound.is_empty()))
-                    .collect::<Vec<_>>();
-                let interests = build_wait_interests(
-                    listener,
-                    SIGNAL_FD,
-                    (mouse_fd >= 0).then_some(mouse_fd),
-                    (kbd_fd >= 0).then_some(kbd_fd),
-                    watch_fds,
-                    &clients,
-                )?;
-                let timeout_ns = timeout_ms.map(|ms| ms.saturating_mul(1_000_000));
-                for (fd, event_type) in poll_for_activity(&interests, timeout_ns)? {
-                    let Some(conn) = conns.iter_mut().find(|conn| conn.server_fd == fd) else {
-                        continue;
-                    };
-                    match event_type {
-                        abi::wasi::eventtype::FD_READ => conn.read_ready = true,
-                        abi::wasi::eventtype::FD_WRITE => conn.write_ready = true,
-                        _ => {}
-                    }
+        let poll_client_readiness = |conns: &mut [Conn],
+                                     watch_fds: &[i32],
+                                     timeout_ms: Option<u64>,
+                                     transport_only: bool|
+         -> Result<PollReadiness, i32> {
+            let clients = conns
+                .iter()
+                .map(|conn| (conn.server_fd, !conn.outbound.is_empty()))
+                .collect::<Vec<_>>();
+            let interests = build_wait_interests(
+                listener,
+                SIGNAL_FD,
+                (mouse_fd >= 0).then_some(mouse_fd),
+                (kbd_fd >= 0).then_some(kbd_fd),
+                watch_fds,
+                &clients,
+                transport_only,
+            )?;
+            let timeout_ns = timeout_ms.map(|ms| ms.saturating_mul(1_000_000));
+            let ready = poll_for_activity(&interests, timeout_ns)?;
+            let readiness = summarize_poll_readiness(listener, &ready);
+            for (fd, event_type) in ready {
+                let Some(conn) = conns.iter_mut().find(|conn| conn.server_fd == fd) else {
+                    continue;
+                };
+                match event_type {
+                    abi::wasi::eventtype::FD_READ => conn.read_ready = true,
+                    abi::wasi::eventtype::FD_WRITE => conn.write_ready = true,
+                    _ => {}
                 }
-                Ok(())
-            };
+            }
+            Ok(readiness)
+        };
         let mut request_cursor = 0usize;
         let mut transport_cursor = 0usize;
         let mut presentation = PresentationSchedule::default();
+        let mut shutdown_drain = ShutdownDrain::default();
         let mut input_priority_used = false;
         let mut recv_buf = [0u8; 32 * 1024];
         let read_iov = Iovec {
@@ -1664,7 +1930,8 @@ fn main() {
 
         'outer: loop {
             if poll_sigterm() {
-                break 'outer;
+                shutdown_drain
+                    .request(restore_clock.elapsed().as_millis().min(u64::MAX as u128) as u64);
             }
             let mut present_fence_writes_remaining = PRESENT_FENCE_WRITES_PER_TURN;
             let mut frame_callback_lifecycle_remaining =
@@ -1685,8 +1952,8 @@ fn main() {
             // machinery and the click-to-focus path; geometry-
             // dirtying events trigger a re-present after the
             // poll cycle.
-            if (mouse_fd >= 0 || kbd_fd >= 0) && drain_input_events(&mut server, mouse_fd, kbd_fd) {
-                presentation.mark_frame_dirty();
+            if !shutdown_drain.requested() && (mouse_fd >= 0 || kbd_fd >= 0) {
+                let _ = drain_input_events(&mut server, mouse_fd, kbd_fd);
             }
             if server.recomposition_serial() != input_recomposition_serial && !input_priority_used {
                 presentation.mark_scene_if(server.finish_recomposition_batch());
@@ -1718,8 +1985,8 @@ fn main() {
                 // Pending protocol events remain ordered and are serviced on
                 // the next input-first turn.
                 input_priority_used = true;
-                match poll_client_readiness(&mut conns, &keymap_watch.wait_fds(), Some(0)) {
-                    Ok(()) => {}
+                match poll_client_readiness(&mut conns, &keymap_watch.wait_fds(), Some(0), false) {
+                    Ok(_) => {}
                     Err(errno) if errno == EINTR => {}
                     Err(_) => std::process::exit(18),
                 }
@@ -1786,11 +2053,14 @@ fn main() {
                 Err(rc) if rc == -EAGAIN => {}
                 Err(rc) if rc == -EINTR => {
                     if poll_sigterm() {
-                        break 'outer;
+                        shutdown_drain.request(
+                            restore_clock.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        );
                     }
                 }
                 Err(_) => std::process::exit(12),
             }
+            shutdown_drain.observe_accept_result(accept_result);
 
             // Service clients in rotating order. A client with already-framed
             // local work is never allowed to append another 32 KiB read until
@@ -2169,15 +2439,48 @@ fn main() {
                 frame_callback_lifecycle_requires_local_turn(&server, completed_after_transport);
             input_priority_used = false;
 
-            if !should_park_after_request_round(local_pending_work) {
+            if shutdown_drain.requested() || !should_park_after_request_round(local_pending_work) {
                 // Buffered local work must not blind the server to readiness
                 // changes on other clients. Refresh the exact fd set with a
-                // zero-deadline poll before starting the next input-first
-                // turn; only the no-local-work path below blocks.
-                match poll_client_readiness(&mut conns, &keymap_watch.wait_fds(), Some(0)) {
-                    Ok(()) => {}
-                    Err(errno) if errno == EINTR => {}
+                // zero-deadline poll before starting the next input-first turn.
+                // Shutdown uses the same snapshot to drain bytes queued before
+                // SIGTERM without waiting on idle clients or trusting hostile
+                // transport readiness beyond its fixed total turn cap.
+                let transport_only = shutdown_drain.requested();
+                let readiness = match poll_client_readiness(
+                    &mut conns,
+                    &keymap_watch.wait_fds(),
+                    Some(0),
+                    transport_only,
+                ) {
+                    Ok(readiness) => Some(readiness),
+                    Err(errno) if errno == EINTR => None,
                     Err(_) => std::process::exit(18),
+                };
+                let client_transport_ready = conns.iter().any(|conn| {
+                    client_transport_can_make_local_progress(
+                        conn.read_ready,
+                        conn.write_ready,
+                        !conn.outbound.is_empty(),
+                        conn.disconnect_pending,
+                    )
+                });
+                let transport_ready = readiness.is_none()
+                    || readiness.is_some_and(|snapshot| snapshot.listener_read_ready)
+                    || client_transport_ready;
+                if shutdown_drain.requested() {
+                    let now_ms = restore_clock.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    match shutdown_drain.finish_turn(now_ms, local_pending_work, transport_ready) {
+                        ShutdownTurnDecision::Continue => {}
+                        ShutdownTurnDecision::Finish => break 'outer,
+                        ShutdownTurnDecision::WaitForDeadline(timeout_ms) => {
+                            match poll_client_readiness(&mut conns, &[], Some(timeout_ms), true) {
+                                Ok(_) => {}
+                                Err(errno) if errno == EINTR => {}
+                                Err(_) => std::process::exit(18),
+                            }
+                        }
+                    }
                 }
                 continue 'outer;
             }
@@ -2188,8 +2491,13 @@ fn main() {
             // keep both READ and WRITE interests, preventing full-duplex
             // deadlock while preserving the server's 64-client maximum.
             let restore_timeout_ms = server.restore_poll_timeout_ms();
-            match poll_client_readiness(&mut conns, &keymap_watch.wait_fds(), restore_timeout_ms) {
-                Ok(()) => {}
+            match poll_client_readiness(
+                &mut conns,
+                &keymap_watch.wait_fds(),
+                restore_timeout_ms,
+                false,
+            ) {
+                Ok(_) => {}
                 Err(errno) if errno == EINTR => {}
                 Err(_) => std::process::exit(18),
             }
@@ -2213,19 +2521,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_presented_damage, build_wait_interests, changed_bands, changed_bounds,
-        decode_ready_interests, drain_accepts_bounded, drain_protocol_requests_bounded,
-        drain_ready_present_fences_bounded, drain_watch_records_bounded,
-        encode_palette_rle_patch_batch, encode_present_fence, encode_rle_patch,
-        frame_callback_lifecycle_requires_local_turn, pending_event_can_make_local_progress,
-        priority_first, rotating_indices, should_park_after_request_round,
-        take_ready_present_fence, take_ready_present_fence_with_deferred, DamageRect,
-        PresentationSchedule, ACCEPTS_PER_TURN, CLIENT_DISCONNECTS_PER_TURN,
+        advance_presented_damage, build_wait_interests, changed_bands, changed_bands_bounded,
+        changed_bounds, client_transport_can_make_local_progress, decode_ready_interests,
+        drain_accepts_bounded, drain_protocol_requests_bounded, drain_ready_present_fences_bounded,
+        drain_watch_records_bounded, encode_palette_rle_patch_batch, encode_present_fence,
+        encode_rle_patch, frame_callback_lifecycle_requires_local_turn,
+        pending_event_can_make_local_progress, priority_first, rotating_indices, rows_equal_u64,
+        should_park_after_request_round, summarize_poll_readiness, take_ready_present_fence,
+        take_ready_present_fence_with_deferred, DamageRect, PresentationSchedule, ShutdownDrain,
+        ShutdownTurnDecision, ACCEPTS_PER_TURN, CLIENT_DISCONNECTS_PER_TURN,
         CLIENT_EVENT_BYTES_PER_TURN, CLIENT_READ_ATTEMPTS_PER_TURN,
         CLIENT_SOCKET_WRITE_QUANTUM_BYTES, CLIENT_WRITE_ATTEMPTS_PER_TURN, FB_MAX_COMMAND_BYTES,
         FB_OP_PATCH_PALETTE_RLE_BATCH, FB_OP_PATCH_RLE, FB_OP_PRESENT_FENCE,
         MAX_NON_INPUT_TRANSPORT_SYSCALLS_PER_TURN, PRESENT_FENCE_WRITES_PER_TURN,
-        REQUESTS_PER_CLIENT_PER_TURN, REQUESTS_PER_TURN, WATCH_READS_PER_TURN,
+        REQUESTS_PER_CLIENT_PER_TURN, REQUESTS_PER_TURN, SHUTDOWN_DRAIN_TURNS,
+        SHUTDOWN_QUIESCENCE_GRACE_MS, WATCH_READS_PER_TURN,
     };
     use display_proto::{MessageHeader, ObjectId, HEADER_SIZE};
 
@@ -2389,6 +2699,200 @@ mod tests {
     }
 
     #[test]
+    fn sigterm_drain_requires_accept_and_client_transport_quiescence() {
+        let mut shutdown = ShutdownDrain::default();
+        shutdown.request(10);
+        assert!(shutdown.requested());
+        let mut backlog = std::collections::VecDeque::from([20, 21]);
+        let mut clients = Vec::new();
+
+        let first = drain_accepts_bounded(
+            || backlog.pop_front().unwrap_or(-abi::errno::EAGAIN),
+            |fd| clients.push((fd, true)),
+        );
+        shutdown.observe_accept_result(first);
+        assert_eq!(first, Ok(ACCEPTS_PER_TURN));
+        assert_eq!(
+            shutdown.finish_turn(10, false, false),
+            ShutdownTurnDecision::Continue,
+        );
+
+        let second = drain_accepts_bounded(
+            || backlog.pop_front().unwrap_or(-abi::errno::EAGAIN),
+            |fd| clients.push((fd, true)),
+        );
+        shutdown.observe_accept_result(second);
+        assert_eq!(second, Err(-abi::errno::EAGAIN));
+        assert!(clients.iter().any(|(_, read_ready)| *read_ready));
+        assert_eq!(
+            shutdown.finish_turn(10, false, true),
+            ShutdownTurnDecision::Continue,
+        );
+
+        for (_, read_ready) in &mut clients {
+            *read_ready = false;
+        }
+        assert_eq!(
+            shutdown.finish_turn(10, false, false),
+            ShutdownTurnDecision::WaitForDeadline(SHUTDOWN_QUIESCENCE_GRACE_MS),
+        );
+        assert_eq!(
+            shutdown.finish_turn(109, false, false),
+            ShutdownTurnDecision::WaitForDeadline(1),
+        );
+        assert_eq!(
+            shutdown.finish_turn(110, false, false),
+            ShutdownTurnDecision::Finish,
+        );
+    }
+
+    #[test]
+    fn sigterm_drain_does_not_wait_on_idle_or_backpressured_clients() {
+        let mut shutdown = ShutdownDrain::default();
+        shutdown.request(500);
+        shutdown.observe_accept_result(Err(-abi::errno::EAGAIN));
+
+        assert!(!client_transport_can_make_local_progress(
+            false, false, false, false,
+        ));
+        assert!(!client_transport_can_make_local_progress(
+            false, true, false, false,
+        ));
+        assert!(!client_transport_can_make_local_progress(
+            false, false, true, false,
+        ));
+        assert_eq!(
+            shutdown.finish_turn(500, false, false),
+            ShutdownTurnDecision::WaitForDeadline(SHUTDOWN_QUIESCENCE_GRACE_MS),
+        );
+
+        assert!(client_transport_can_make_local_progress(
+            true, false, false, false,
+        ));
+        assert!(client_transport_can_make_local_progress(
+            false, false, false, true,
+        ));
+        assert!(client_transport_can_make_local_progress(
+            false, true, true, false,
+        ));
+        assert_eq!(
+            shutdown.finish_turn(500, true, false),
+            ShutdownTurnDecision::Continue,
+        );
+        assert_eq!(
+            shutdown.finish_turn(500, false, true),
+            ShutdownTurnDecision::Continue,
+        );
+
+        shutdown.observe_accept_result(Err(-abi::errno::EINTR));
+        assert_eq!(
+            shutdown.finish_turn(500, false, false),
+            ShutdownTurnDecision::Continue,
+        );
+    }
+
+    #[test]
+    fn sigterm_grace_rechecks_early_wakes_and_late_client_readiness() {
+        let mut shutdown = ShutdownDrain::default();
+        shutdown.request(1_000);
+        shutdown.observe_accept_result(Err(-abi::errno::EAGAIN));
+
+        assert_eq!(
+            shutdown.finish_turn(1_000, false, false),
+            ShutdownTurnDecision::WaitForDeadline(100),
+        );
+        assert_eq!(
+            shutdown.finish_turn(1_025, false, false),
+            ShutdownTurnDecision::WaitForDeadline(75),
+            "an early unrelated wake cannot satisfy the grace deadline",
+        );
+        assert_eq!(
+            shutdown.finish_turn(1_075, false, true),
+            ShutdownTurnDecision::Continue,
+            "client bytes becoming ready during grace must be drained",
+        );
+        assert_eq!(
+            shutdown.finish_turn(1_099, false, false),
+            ShutdownTurnDecision::WaitForDeadline(1),
+        );
+        assert_eq!(
+            shutdown.finish_turn(1_100, false, false),
+            ShutdownTurnDecision::Finish,
+        );
+
+        shutdown.request(2_000);
+        assert_eq!(
+            shutdown.finish_turn(1_100, false, false),
+            ShutdownTurnDecision::Finish,
+            "a repeated signal cannot move the original deadline",
+        );
+    }
+
+    #[test]
+    fn sigterm_listener_wake_at_deadline_forces_another_accept_turn() {
+        let mut shutdown = ShutdownDrain::default();
+        shutdown.request(0);
+        shutdown.observe_accept_result(Err(-abi::errno::EAGAIN));
+
+        let readiness = summarize_poll_readiness(
+            10,
+            &[
+                (10, abi::wasi::eventtype::FD_READ),
+                (20, abi::wasi::eventtype::FD_READ),
+            ],
+        );
+        assert!(readiness.listener_read_ready);
+        assert_eq!(
+            shutdown.finish_turn(100, false, readiness.listener_read_ready),
+            ShutdownTurnDecision::Continue,
+            "a connect after EAGAIN must survive the deadline boundary",
+        );
+
+        let unrelated = summarize_poll_readiness(
+            10,
+            &[
+                (4, abi::wasi::eventtype::FD_READ),
+                (20, abi::wasi::eventtype::FD_READ),
+            ],
+        );
+        assert!(!unrelated.listener_read_ready);
+        shutdown.observe_accept_result(Err(-abi::errno::EAGAIN));
+        assert_eq!(
+            shutdown.finish_turn(100, false, unrelated.listener_read_ready),
+            ShutdownTurnDecision::Finish,
+        );
+    }
+
+    #[test]
+    fn sigterm_drain_has_a_total_bound_under_perpetual_transport_readiness() {
+        let mut shutdown = ShutdownDrain::default();
+        shutdown.request(0);
+
+        for turn in 1..SHUTDOWN_DRAIN_TURNS {
+            shutdown.observe_accept_result(Ok(ACCEPTS_PER_TURN));
+            assert!(client_transport_can_make_local_progress(
+                true, false, false, false,
+            ));
+            assert!(
+                shutdown.finish_turn(0, true, true) == ShutdownTurnDecision::Continue,
+                "shutdown ended before the total drain bound on turn {turn}",
+            );
+        }
+        shutdown.observe_accept_result(Ok(ACCEPTS_PER_TURN));
+        assert_eq!(
+            shutdown.finish_turn(0, true, true),
+            ShutdownTurnDecision::Finish,
+        );
+
+        // Repeated signals cannot replenish the exhausted grace budget.
+        shutdown.request(1_000);
+        assert_eq!(
+            shutdown.finish_turn(0, true, true),
+            ShutdownTurnDecision::Finish,
+        );
+    }
+
+    #[test]
     fn watch_drain_is_bounded_under_refill_and_drains_finite_queue() {
         let mut perpetual_reads = 0;
         assert_eq!(
@@ -2435,14 +2939,23 @@ mod tests {
     #[test]
     fn sixty_four_full_duplex_clients_fit_one_bounded_wait_set() {
         let clients = (0..64).map(|index| (100 + index, true)).collect::<Vec<_>>();
-        let interests = build_wait_interests(10, 4, Some(11), Some(12), &[13, 14], &clients)
+        let interests = build_wait_interests(10, 4, Some(11), Some(12), &[13, 14], &clients, false)
             .expect("listener/input/watch plus 64 read+write clients fit cap 256");
         assert_eq!(interests.len(), 6 + 64 * 2);
-        for (fd, _) in clients {
-            assert!(interests.contains(&(fd, abi::wasi::eventtype::FD_READ)));
-            assert!(interests.contains(&(fd, abi::wasi::eventtype::FD_WRITE)));
+        for (fd, _) in &clients {
+            assert!(interests.contains(&(*fd, abi::wasi::eventtype::FD_READ)));
+            assert!(interests.contains(&(*fd, abi::wasi::eventtype::FD_WRITE)));
         }
         assert!(interests.len() <= abi::wasi::poll::MAX_SUBSCRIPTIONS);
+
+        let shutdown_interests =
+            build_wait_interests(10, 4, Some(11), Some(12), &[13, 14], &clients, true)
+                .expect("shutdown listener and client transport fit the wait set");
+        assert_eq!(shutdown_interests.len(), 1 + 64 * 2);
+        assert!(shutdown_interests.contains(&(10, abi::wasi::eventtype::FD_READ)));
+        for excluded in [4, 11, 12, 13, 14] {
+            assert!(!shutdown_interests.iter().any(|(fd, _)| *fd == excluded));
+        }
     }
 
     #[test]
@@ -2626,6 +3139,55 @@ mod tests {
     }
 
     #[test]
+    fn pending_recomposition_cannot_consume_scene_or_damage_before_materialization() {
+        let (mut server, client, callback) = server_with_awaiting_frame_callback();
+        let mut schedule = PresentationSchedule::default();
+        schedule.mark_scene_if(true);
+        let generation = server.scene_generation();
+
+        server.begin_recomposition_batch();
+        server
+            .dispatch_request(client, &protocol_request(ObjectId::new(5), 7, &[]))
+            .unwrap();
+        assert_eq!(server.scene_generation(), generation);
+        assert!(server.presentation_deferred());
+        assert!(!schedule.take_scene_ready(server.presentation_deferred()));
+        assert_eq!(
+            server.presentation_damage(),
+            &display_server::PresentationDamage::Full,
+        );
+        assert_eq!(
+            server
+                .client(client)
+                .unwrap()
+                .awaiting_present_frame_callback_count(),
+            1,
+        );
+
+        assert!(server.finish_recomposition_batch());
+        assert!(!server.presentation_deferred());
+        assert!(schedule.take_scene_ready(server.presentation_deferred()));
+        let mut budget = display_server::MAX_FRAME_CALLBACK_COMPLETIONS_PER_TURN;
+        assert_eq!(
+            super::complete_successful_frame_presentation(
+                &mut server,
+                true,
+                false,
+                77,
+                &mut budget,
+            ),
+            Ok(1),
+        );
+        assert_eq!(
+            server.presentation_damage(),
+            &display_server::PresentationDamage::Bounded(Vec::new()),
+        );
+        let events = server.drain_client_events(client).unwrap();
+        let done = MessageHeader::decode(&events).unwrap();
+        assert_eq!((done.object_id, done.opcode), (callback, 1));
+    }
+
+    #[test]
     fn frame_only_dirty_waits_for_end_of_turn_presentation() {
         let mut schedule = PresentationSchedule::default();
         schedule.mark_frame_dirty();
@@ -2669,6 +3231,10 @@ mod tests {
     fn frame_callback_crosses_only_a_successful_nondeferred_present_boundary() {
         let (mut server, client, callback) = server_with_awaiting_frame_callback();
         let mut budget = display_server::MAX_FRAME_CALLBACK_COMPLETIONS_PER_TURN;
+        assert_eq!(
+            server.presentation_damage(),
+            &display_server::PresentationDamage::Full,
+        );
 
         assert_eq!(
             super::complete_successful_frame_presentation(
@@ -2687,6 +3253,11 @@ mod tests {
                 .awaiting_present_frame_callback_count(),
             1
         );
+        assert_eq!(
+            server.presentation_damage(),
+            &display_server::PresentationDamage::Full,
+            "a failed write cannot retire the pending comparison bound",
+        );
         assert!(server.drain_client_events(client).unwrap().is_empty());
 
         assert_eq!(
@@ -2700,6 +3271,11 @@ mod tests {
                 .awaiting_present_frame_callback_count(),
             1
         );
+        assert_eq!(
+            server.presentation_damage(),
+            &display_server::PresentationDamage::Full,
+            "a deferred boundary cannot retire presentation damage",
+        );
         assert!(server.drain_client_events(client).unwrap().is_empty());
 
         let completed = super::complete_successful_frame_presentation(
@@ -2711,6 +3287,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(completed, 1);
+        assert_eq!(
+            server.presentation_damage(),
+            &display_server::PresentationDamage::Bounded(Vec::new()),
+        );
         let events = server.drain_client_events(client).unwrap();
         let done = MessageHeader::decode(&events).unwrap();
         assert_eq!((done.object_id, done.opcode), (callback, 1));
@@ -2989,6 +3569,109 @@ mod tests {
                 width: 1,
                 height: 5,
             }]
+        );
+    }
+
+    #[test]
+    fn wordwise_row_equality_matches_slice_equality_for_words_and_tails() {
+        for len in 0usize..40 {
+            let previous = (0..len).map(|index| index as u8).collect::<Vec<_>>();
+            let mut current = previous.clone();
+            assert!(rows_equal_u64(&previous, &current));
+            for changed in 0..len {
+                current[changed] ^= 0xff;
+                assert!(!rows_equal_u64(&previous, &current));
+                current[changed] ^= 0xff;
+            }
+        }
+        assert!(!rows_equal_u64(&[1, 2, 3], &[1, 2]));
+    }
+
+    #[test]
+    fn bounded_scan_reports_only_changes_inside_validated_candidates() {
+        let previous = frame(4, 4);
+        let mut current = previous.clone();
+        current[0] = 1;
+        current[(2 * 4 + 2) * 4] = 2;
+        let candidates = [display_server::OutputDamageRect {
+            x: 2,
+            y: 2,
+            width: 1,
+            height: 1,
+        }];
+        assert_eq!(
+            changed_bands_bounded(&previous, &current, 4, 4, &candidates, 8),
+            vec![DamageRect {
+                x: 2,
+                y: 2,
+                width: 1,
+                height: 1,
+            }],
+        );
+    }
+
+    #[test]
+    fn bounded_scan_clips_candidates_and_missing_shadow_still_falls_back_full() {
+        let previous = frame(4, 4);
+        let mut current = previous.clone();
+        current[(3 * 4 + 3) * 4] = 1;
+        let candidates = [display_server::OutputDamageRect {
+            x: 3,
+            y: 3,
+            width: 20,
+            height: 20,
+        }];
+        assert_eq!(
+            changed_bands_bounded(&previous, &current, 4, 4, &candidates, 8),
+            vec![DamageRect {
+                x: 3,
+                y: 3,
+                width: 1,
+                height: 1,
+            }],
+        );
+        assert_eq!(
+            changed_bands_bounded(&[], &current, 4, 4, &candidates, 8),
+            vec![DamageRect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }],
+        );
+    }
+
+    #[test]
+    fn bounded_shadow_advancement_never_claims_unwritten_pixels() {
+        let mut presented = frame(4, 4);
+        let mut current = presented.clone();
+        current[0] = 1;
+        current[(2 * 4 + 2) * 4] = 2;
+        let candidates = [display_server::OutputDamageRect {
+            x: 2,
+            y: 2,
+            width: 1,
+            height: 1,
+        }];
+        let damages = changed_bands_bounded(&presented, &current, 4, 4, &candidates, 8);
+        assert_eq!(damages.len(), 1);
+        assert!(advance_presented_damage(
+            &mut presented,
+            &current,
+            4,
+            damages[0],
+        ));
+        assert_eq!(presented[(2 * 4 + 2) * 4], 2);
+        assert_eq!(presented[0], 0, "outside-candidate shadow stays untouched");
+        assert_eq!(
+            changed_bands(&presented, &current, 4, 4, 8),
+            vec![DamageRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+            "a later full fallback still discovers outside-candidate divergence",
         );
     }
 

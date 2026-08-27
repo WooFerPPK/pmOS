@@ -1,13 +1,16 @@
 //! Top-level `Server` tests.
 
 use display_proto::events::{
-    key_state, pointer_button_state, KeyboardKey, PointerButton, PointerMotion, ShellWindowFocused,
+    key_state, pointer_button_state, KeyboardKey, PointerButton, PointerMotion, ShellCloseShortcut,
+    ShellWindowFocused,
 };
 use display_proto::wire::MessageHeader as ProtoHeader;
 use display_server::client::ClientError;
 use display_server::ids::ObjectId;
 use display_server::objects::Interface;
-use display_server::server::{HitResult, Server, ServerError};
+use display_server::server::{
+    HitResult, OutputDamageRect, PresentationDamage, Server, ServerError,
+};
 use display_server::wire::{MessageHeader, WireError, HEADER_SIZE};
 use preferences::KeyboardLayout;
 
@@ -601,6 +604,83 @@ fn promote_to_toplevel_and_commit_red(
         .unwrap();
 }
 
+fn bind_active_shortcut_shell(
+    server: &mut Server,
+) -> (display_server::ClientId, ObjectId, ObjectId) {
+    bind_active_shortcut_shell_version(server, 2)
+}
+
+fn bind_active_shortcut_shell_version(
+    server: &mut Server,
+    version: u32,
+) -> (display_server::ClientId, ObjectId, ObjectId) {
+    use abi::cap::{Cap, CapSet};
+
+    let shell = server.accept_with_caps(CapSet::from_caps(&[Cap::Shell]));
+    let registry = ObjectId::new(3);
+    let manager = ObjectId::new(5);
+    server
+        .dispatch_request(
+            shell,
+            &encode_request_bytes(ObjectId::DISPLAY, 2, &registry.raw().to_le_bytes()),
+        )
+        .unwrap();
+    server
+        .dispatch_request(
+            shell,
+            &encode_request_bytes(
+                registry,
+                1,
+                &registry_bind_payload(5, "pmd_shell_manager", version, manager),
+            ),
+        )
+        .unwrap();
+    server
+        .dispatch_request(
+            shell,
+            &encode_request_bytes(manager, 6, &32_u32.to_le_bytes()),
+        )
+        .unwrap();
+    let _ = server.drain_client_events(shell);
+    (shell, registry, manager)
+}
+
+fn keyboard_events(bytes: &[u8], keyboard: ObjectId) -> Vec<KeyboardKey> {
+    let mut decoded = Vec::new();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let header = ProtoHeader::decode(remaining).expect("valid event header");
+        let length = header.length as usize;
+        assert!(length <= remaining.len(), "complete event frame");
+        if header.object_id == keyboard && header.opcode == 1 {
+            decoded.push(
+                KeyboardKey::decode(&remaining[HEADER_SIZE..length])
+                    .expect("keyboard event payload"),
+            );
+        }
+        remaining = &remaining[length..];
+    }
+    decoded
+}
+
+fn close_shortcut_events(bytes: &[u8], shell_manager: ObjectId) -> Vec<ShellCloseShortcut> {
+    let mut decoded = Vec::new();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let header = ProtoHeader::decode(remaining).expect("valid event header");
+        let length = header.length as usize;
+        assert!(length <= remaining.len(), "complete event frame");
+        if header.object_id == shell_manager && header.opcode == 9 {
+            decoded.push(
+                ShellCloseShortcut::decode(&remaining[HEADER_SIZE..length])
+                    .expect("close shortcut payload"),
+            );
+        }
+        remaining = &remaining[length..];
+    }
+    decoded
+}
+
 #[test]
 fn patch_current_publishes_one_atomic_scene_mutation_without_release() {
     let (mut s, c, compositor_id, shm_id, _, _) = boot_server_and_bind_everything();
@@ -635,6 +715,7 @@ fn patch_current_publishes_one_atomic_scene_mutation_without_release() {
     assert!(s.drain_client_events(c).unwrap().is_empty());
     assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &red);
     assert_eq!(s.framebuffer().pixel(1, 0).unwrap(), &red);
+    s.clear_presentation_damage();
 
     let generation = s.scene_generation();
     let serial = s.recomposition_serial();
@@ -660,6 +741,15 @@ fn patch_current_publishes_one_atomic_scene_mutation_without_release() {
     let patch = surface_patch_payload(1, 0, 1, 1, &blue);
     s.dispatch_request(c, &encode_request_bytes(surface_id, 8, &patch))
         .unwrap();
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![OutputDamageRect {
+            x: 1,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]),
+    );
     assert_eq!(s.recomposition_serial(), serial + 1);
     assert_eq!(s.scene_generation(), generation + 1);
     assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &red);
@@ -673,6 +763,357 @@ fn patch_current_publishes_one_atomic_scene_mutation_without_release() {
         2
     );
     assert!(s.drain_client_events(c).unwrap().is_empty());
+}
+
+#[test]
+fn same_geometry_commit_uses_its_complete_declared_damage() {
+    let (mut s, c, compositor, shm, xdg_shell, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell, surface, pool, buffer, toplevel);
+    s.clear_presentation_damage();
+
+    let mut damage = Vec::new();
+    for value in [0i32, 0, 1, 2] {
+        damage.extend_from_slice(&value.to_le_bytes());
+    }
+    s.dispatch_request(c, &encode_request_bytes(surface, 3, &damage))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![OutputDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 2,
+        }]),
+    );
+}
+
+#[test]
+fn same_geometry_alternate_buffer_swap_uses_declared_damage() {
+    let (mut s, c, compositor, shm, xdg_shell, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let first = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    let alternate = ObjectId::new(21);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, first);
+    s.dispatch_request(c, &encode_request_bytes(pool, 2, &32u32.to_le_bytes()))
+        .unwrap();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            pool,
+            1,
+            &shm_pool_create_buffer_payload(alternate, 16, 2, 2, 8, 0),
+        ),
+    )
+    .unwrap();
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell, surface, pool, first, toplevel);
+
+    let red = [0, 0, 0xff, 0xff];
+    let green = [0, 0xff, 0, 0xff];
+    let mut write = Vec::new();
+    write.extend_from_slice(&16u32.to_le_bytes());
+    write.extend_from_slice(&green);
+    for _ in 0..3 {
+        write.extend_from_slice(&red);
+    }
+    s.dispatch_request(c, &encode_request_bytes(pool, 4, &write))
+        .unwrap();
+    s.clear_presentation_damage();
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface, 2, &surface_attach_payload(alternate, 0, 0)),
+    )
+    .unwrap();
+    let mut damage = Vec::new();
+    for value in [0i32, 0, 1, 1] {
+        damage.extend_from_slice(&value.to_le_bytes());
+    }
+    s.dispatch_request(c, &encode_request_bytes(surface, 3, &damage))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+
+    assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &green);
+    assert_eq!(s.framebuffer().pixel(1, 1).unwrap(), &red);
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![OutputDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]),
+    );
+}
+
+#[test]
+fn omitted_or_invalid_commit_damage_falls_back_to_full_output() {
+    let (mut s, c, compositor, shm, xdg_shell, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell, surface, pool, buffer, toplevel);
+
+    s.clear_presentation_damage();
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+    assert_eq!(s.presentation_damage(), &PresentationDamage::Full);
+
+    s.clear_presentation_damage();
+    s.dispatch_request(c, &encode_request_bytes(surface, 3, &[0; 16]))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+    assert_eq!(s.presentation_damage(), &PresentationDamage::Full);
+}
+
+#[test]
+fn invalid_overflow_damage_cannot_be_normalized_into_a_bounded_hint() {
+    let (mut s, c, compositor, shm, xdg_shell, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell, surface, pool, buffer, toplevel);
+    s.clear_presentation_damage();
+
+    let mut valid = Vec::new();
+    for value in [0i32, 0, 1, 1] {
+        valid.extend_from_slice(&value.to_le_bytes());
+    }
+    for _ in 0..display_server::MAX_SURFACE_DAMAGE_RECTS {
+        s.dispatch_request(c, &encode_request_bytes(surface, 3, &valid))
+            .unwrap();
+    }
+    // Coalescing signed extents would normalize this to the valid [0, 1)
+    // interval. The raw invalidity must survive that bounded storage step.
+    let mut invalid = Vec::new();
+    for value in [1i32, 0, -1, 1] {
+        invalid.extend_from_slice(&value.to_le_bytes());
+    }
+    s.dispatch_request(c, &encode_request_bytes(surface, 3, &invalid))
+        .unwrap();
+    let pending = s.client(c).unwrap().surface(surface).unwrap();
+    assert_eq!(pending.pending_damage.len(), 1);
+    assert!(pending.pending_damage_unprovable);
+
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+    assert_eq!(s.presentation_damage(), &PresentationDamage::Full);
+}
+
+#[test]
+fn attachment_origin_change_ignores_declared_damage_and_falls_back() {
+    let (mut s, c, compositor, shm, xdg_shell, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell, surface, pool, buffer, toplevel);
+    s.clear_presentation_damage();
+
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface, 2, &surface_attach_payload(buffer, 1, 0)),
+    )
+    .unwrap();
+    let mut damage = Vec::new();
+    for value in [0i32, 0, 1, 1] {
+        damage.extend_from_slice(&value.to_le_bytes());
+    }
+    s.dispatch_request(c, &encode_request_bytes(surface, 3, &damage))
+        .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+
+    assert_eq!(s.presentation_damage(), &PresentationDamage::Full);
+}
+
+#[test]
+fn patch_current_damage_is_clipped_to_the_output() {
+    let (mut s, c, compositor, shm, _, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, buffer);
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface, 2, &surface_attach_payload(buffer, 63, 63)),
+    )
+    .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+    s.clear_presentation_damage();
+
+    let patch = surface_patch_payload(0, 0, 2, 2, &[7; 16]);
+    s.dispatch_request(c, &encode_request_bytes(surface, 8, &patch))
+        .unwrap();
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![OutputDamageRect {
+            x: 63,
+            y: 63,
+            width: 1,
+            height: 1,
+        }]),
+    );
+}
+
+#[test]
+fn adjacent_exact_patches_union_without_becoming_full_output() {
+    let (mut s, c, compositor, shm, _, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, buffer);
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(surface, 2, &surface_attach_payload(buffer, 0, 0)),
+    )
+    .unwrap();
+    s.dispatch_request(c, &encode_request_bytes(surface, 7, &[]))
+        .unwrap();
+    s.clear_presentation_damage();
+
+    for (x, value) in [(0, 1u8), (1, 2u8)] {
+        let patch = surface_patch_payload(x, 0, 1, 1, &[value; 4]);
+        s.dispatch_request(c, &encode_request_bytes(surface, 8, &patch))
+            .unwrap();
+    }
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![OutputDamageRect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        }]),
+    );
+}
+
+#[test]
+fn hidden_surface_patch_stays_invisible_and_uses_the_safe_fallback() {
+    let (mut s, c, compositor, shm, xdg_shell, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut s, c, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell, surface, pool, buffer, toplevel);
+    let window = s.window_id(c, toplevel).unwrap();
+    assert!(s.set_window_minimized(window, true));
+    assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &[0, 0, 0, 0]);
+    s.clear_presentation_damage();
+
+    let patch = surface_patch_payload(0, 0, 1, 1, &[0, 0xff, 0, 0xff]);
+    s.dispatch_request(c, &encode_request_bytes(surface, 8, &patch))
+        .unwrap();
+    assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &[0, 0, 0, 0]);
+    assert_eq!(s.presentation_damage(), &PresentationDamage::Full);
+}
+
+#[test]
+fn occluded_patch_candidate_may_compare_equal_without_exposing_lower_pixels() {
+    let (mut s, c, compositor, shm, xdg_shell, _) = boot_server_and_bind_everything();
+    let lower_surface = ObjectId::new(13);
+    let lower_pool = ObjectId::new(15);
+    let lower_buffer = ObjectId::new(17);
+    let lower_toplevel = ObjectId::new(19);
+    make_surface_with_buffer(
+        &mut s,
+        c,
+        compositor,
+        shm,
+        lower_surface,
+        lower_pool,
+        lower_buffer,
+    );
+    promote_to_toplevel_and_commit_red(
+        &mut s,
+        c,
+        xdg_shell,
+        lower_surface,
+        lower_pool,
+        lower_buffer,
+        lower_toplevel,
+    );
+    let upper_surface = ObjectId::new(21);
+    let upper_pool = ObjectId::new(23);
+    let upper_buffer = ObjectId::new(25);
+    let upper_toplevel = ObjectId::new(27);
+    make_surface_with_buffer(
+        &mut s,
+        c,
+        compositor,
+        shm,
+        upper_surface,
+        upper_pool,
+        upper_buffer,
+    );
+    promote_to_toplevel_and_commit_red(
+        &mut s,
+        c,
+        xdg_shell,
+        upper_surface,
+        upper_pool,
+        upper_buffer,
+        upper_toplevel,
+    );
+    {
+        let upper = s
+            .client_mut(c)
+            .unwrap()
+            .toplevels
+            .get_mut(&upper_toplevel)
+            .unwrap();
+        upper.x = 0;
+        upper.y = 0;
+    }
+    s.dispatch_request(c, &encode_request_bytes(upper_surface, 7, &[]))
+        .unwrap();
+    let blue = [0xff, 0, 0, 0xff];
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(
+            upper_surface,
+            8,
+            &surface_patch_payload(0, 0, 2, 2, &blue.repeat(4)),
+        ),
+    )
+    .unwrap();
+    assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &blue);
+    s.clear_presentation_damage();
+
+    let green = [0, 0xff, 0, 0xff];
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(lower_surface, 8, &surface_patch_payload(0, 0, 1, 1, &green)),
+    )
+    .unwrap();
+    assert_eq!(s.framebuffer().pixel(0, 0).unwrap(), &blue);
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![OutputDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]),
+    );
 }
 
 #[test]
@@ -1008,11 +1449,16 @@ fn focus_and_click_raise_the_explicit_global_z_order_and_recompose_overlap() {
     // (2,0) belongs only to B. Clicking it must raise B, which
     // changes the colour in the overlap at (1,0).
     assert_eq!(s.inject_pointer_motion(2, 0).unwrap().surface_id, surface_b);
+    let recomposition_before_click = s.recomposition_serial();
     assert_eq!(
         s.inject_pointer_button(1, pointer_button_state::PRESSED)
             .unwrap()
             .surface_id,
         surface_b
+    );
+    assert!(
+        s.recomposition_serial() > recomposition_before_click,
+        "a pointer focus that changes z-order must retain its direct scene-dirty signal",
     );
     assert_eq!(
         s.window_z_order()
@@ -1137,6 +1583,244 @@ fn inject_pointer_button_sets_keyboard_focus_on_press() {
         remaining = &remaining[msg_len..];
     }
     assert!(saw_button, "expected a button event");
+}
+
+#[test]
+fn focus_switch_configures_old_and_new_toplevels_with_composed_state() {
+    use display_proto::events::XdgToplevelConfigure;
+    use display_proto::xdg_toplevel_state;
+
+    let (mut s, c, compositor_id, shm_id, xdg_shell_id, _) = boot_server_and_bind_everything();
+    let surface_a = ObjectId::new(13);
+    let pool_a = ObjectId::new(15);
+    let buffer_a = ObjectId::new(17);
+    let top_a = ObjectId::new(19);
+    make_surface_with_buffer(
+        &mut s,
+        c,
+        compositor_id,
+        shm_id,
+        surface_a,
+        pool_a,
+        buffer_a,
+    );
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell_id, surface_a, pool_a, buffer_a, top_a);
+
+    let surface_b = ObjectId::new(21);
+    let pool_b = ObjectId::new(23);
+    let buffer_b = ObjectId::new(25);
+    let top_b = ObjectId::new(27);
+    make_surface_with_buffer(
+        &mut s,
+        c,
+        compositor_id,
+        shm_id,
+        surface_b,
+        pool_b,
+        buffer_b,
+    );
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell_id, surface_b, pool_b, buffer_b, top_b);
+    assert_eq!(s.keyboard_focus(), Some((c, surface_b)));
+    let _ = s.drain_client_events(c);
+
+    s.dispatch_request(c, &encode_request_bytes(top_b, 5 /* set_maximized */, &[]))
+        .unwrap();
+    let maximized_bytes = s.drain_client_events(c).unwrap();
+    let maximized_header = ProtoHeader::decode(&maximized_bytes).unwrap();
+    let maximized = XdgToplevelConfigure::decode(
+        &maximized_bytes[display_proto::wire::HEADER_SIZE..maximized_header.length as usize],
+    )
+    .unwrap();
+    assert_eq!((maximized.width, maximized.height), (64, 64));
+    assert_eq!(
+        maximized.states,
+        xdg_toplevel_state::MAXIMIZED | xdg_toplevel_state::ACTIVATED
+    );
+
+    s.set_keyboard_focus(Some((c, surface_a)));
+    let bytes = s.drain_client_events(c).unwrap();
+    let mut remaining = bytes.as_slice();
+    let mut configures = Vec::new();
+    while !remaining.is_empty() {
+        let header = ProtoHeader::decode(remaining).unwrap();
+        let message_len = header.length as usize;
+        let payload = &remaining[display_proto::wire::HEADER_SIZE..message_len];
+        if header.opcode == 1 && (header.object_id == top_a || header.object_id == top_b) {
+            configures.push((
+                header.object_id,
+                XdgToplevelConfigure::decode(payload).unwrap(),
+            ));
+        }
+        remaining = &remaining[message_len..];
+    }
+    assert_eq!(configures.len(), 2);
+    let old = configures
+        .iter()
+        .find(|(id, _)| *id == top_b)
+        .map(|(_, configure)| configure)
+        .unwrap();
+    assert_eq!((old.width, old.height), (64, 64));
+    assert_eq!(old.states, xdg_toplevel_state::MAXIMIZED);
+    let new = configures
+        .iter()
+        .find(|(id, _)| *id == top_a)
+        .map(|(_, configure)| configure)
+        .unwrap();
+    assert_eq!((new.width, new.height), (2, 2));
+    assert_eq!(new.states, xdg_toplevel_state::ACTIVATED);
+}
+
+#[test]
+fn minimizing_focused_toplevel_emits_activation_clear_configure() {
+    use display_proto::events::XdgToplevelConfigure;
+
+    let (mut s, c, compositor_id, shm_id, xdg_shell_id, _) = boot_server_and_bind_everything();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut s, c, compositor_id, shm_id, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell_id, surface, pool, buffer, toplevel);
+    assert_eq!(s.keyboard_focus(), Some((c, surface)));
+    let _ = s.drain_client_events(c);
+
+    let window_id = s.window_id(c, toplevel).unwrap();
+    assert!(s.set_window_minimized(window_id, true));
+    assert_eq!(s.keyboard_focus(), None);
+    let bytes = s.drain_client_events(c).unwrap();
+    let header = ProtoHeader::decode(&bytes).unwrap();
+    assert_eq!(header.object_id, toplevel);
+    assert_eq!(header.opcode, 1);
+    let configure = XdgToplevelConfigure::decode(
+        &bytes[display_proto::wire::HEADER_SIZE..header.length as usize],
+    )
+    .unwrap();
+    assert_eq!((configure.width, configure.height), (2, 2));
+    assert_eq!(configure.states, 0);
+}
+
+#[test]
+fn destroying_focused_toplevel_activates_topmost_survivor_before_removal() {
+    use display_proto::events::XdgToplevelConfigure;
+    use display_proto::xdg_toplevel_state;
+
+    let (mut s, c, compositor_id, shm_id, xdg_shell_id, _) = boot_server_and_bind_everything();
+    let surface_a = ObjectId::new(13);
+    let pool_a = ObjectId::new(15);
+    let buffer_a = ObjectId::new(17);
+    let top_a = ObjectId::new(19);
+    make_surface_with_buffer(
+        &mut s,
+        c,
+        compositor_id,
+        shm_id,
+        surface_a,
+        pool_a,
+        buffer_a,
+    );
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell_id, surface_a, pool_a, buffer_a, top_a);
+    let surface_b = ObjectId::new(21);
+    let pool_b = ObjectId::new(23);
+    let buffer_b = ObjectId::new(25);
+    let top_b = ObjectId::new(27);
+    make_surface_with_buffer(
+        &mut s,
+        c,
+        compositor_id,
+        shm_id,
+        surface_b,
+        pool_b,
+        buffer_b,
+    );
+    promote_to_toplevel_and_commit_red(&mut s, c, xdg_shell_id, surface_b, pool_b, buffer_b, top_b);
+    assert_eq!(s.keyboard_focus(), Some((c, surface_b)));
+    let _ = s.drain_client_events(c);
+
+    s.dispatch_request(c, &encode_request_bytes(top_b, 3 /* destroy */, &[]))
+        .unwrap();
+    assert_eq!(s.keyboard_focus(), Some((c, surface_a)));
+
+    let bytes = s.drain_client_events(c).unwrap();
+    let mut remaining = bytes.as_slice();
+    let mut old_states = None;
+    let mut new_states = None;
+    while !remaining.is_empty() {
+        let header = ProtoHeader::decode(remaining).unwrap();
+        let message_len = header.length as usize;
+        let payload = &remaining[display_proto::wire::HEADER_SIZE..message_len];
+        if header.opcode == 1 && header.object_id == top_b {
+            old_states = Some(XdgToplevelConfigure::decode(payload).unwrap().states);
+        } else if header.opcode == 1 && header.object_id == top_a {
+            new_states = Some(XdgToplevelConfigure::decode(payload).unwrap().states);
+        }
+        remaining = &remaining[message_len..];
+    }
+    assert_eq!(old_states, Some(0));
+    assert_eq!(new_states, Some(xdg_toplevel_state::ACTIVATED));
+}
+
+#[test]
+fn destroying_explicitly_focused_roleless_surface_activates_mapped_fallback() {
+    use display_proto::events::XdgToplevelConfigure;
+    use display_proto::xdg_toplevel_state;
+
+    let (mut s, c, compositor_id, shm_id, xdg_shell_id, _) = boot_server_and_bind_everything();
+    let mapped_surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(
+        &mut s,
+        c,
+        compositor_id,
+        shm_id,
+        mapped_surface,
+        pool,
+        buffer,
+    );
+    promote_to_toplevel_and_commit_red(
+        &mut s,
+        c,
+        xdg_shell_id,
+        mapped_surface,
+        pool,
+        buffer,
+        toplevel,
+    );
+    let roleless_surface = ObjectId::new(21);
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(compositor_id, 1, &roleless_surface.raw().to_le_bytes()),
+    )
+    .unwrap();
+    s.set_keyboard_focus(Some((c, roleless_surface)));
+    let _ = s.drain_client_events(c);
+
+    s.dispatch_request(
+        c,
+        &encode_request_bytes(roleless_surface, 1 /* destroy */, &[]),
+    )
+    .unwrap();
+    assert_eq!(s.keyboard_focus(), Some((c, mapped_surface)));
+
+    let bytes = s.drain_client_events(c).unwrap();
+    let mut remaining = bytes.as_slice();
+    let mut activated = None;
+    while !remaining.is_empty() {
+        let header = ProtoHeader::decode(remaining).unwrap();
+        let message_len = header.length as usize;
+        if header.object_id == toplevel && header.opcode == 1 {
+            activated = Some(
+                XdgToplevelConfigure::decode(
+                    &remaining[display_proto::wire::HEADER_SIZE..message_len],
+                )
+                .unwrap()
+                .states,
+            );
+        }
+        remaining = &remaining[message_len..];
+    }
+    assert_eq!(activated, Some(xdg_toplevel_state::ACTIVATED));
 }
 
 #[test]
@@ -1275,6 +1959,8 @@ fn reserved_shell_focus_coalesces_target_raise_with_shell_commit() {
     let shell_window = s.window_id(shell, shell_toplevel).unwrap();
     let app_window = s.window_id(app, app_toplevel).unwrap();
     let before_focus_generation = s.scene_generation();
+    s.clear_presentation_damage();
+    s.begin_recomposition_batch();
     s.dispatch_request(
         shell,
         &encode_request_bytes(shell_manager, 2, &shell_window.to_le_bytes()),
@@ -1284,9 +1970,43 @@ fn reserved_shell_focus_coalesces_target_raise_with_shell_commit() {
     assert_eq!(s.window_z_order().last().unwrap().0, shell_window);
     assert_eq!(s.scene_generation(), before_focus_generation);
     assert!(s.presentation_deferred());
+    let shell_origin = s
+        .client(shell)
+        .unwrap()
+        .toplevels
+        .get(&shell_toplevel)
+        .map(|toplevel| (toplevel.x, toplevel.y))
+        .unwrap();
+    let raised_footprint = OutputDamageRect {
+        x: shell_origin.0 as u32,
+        y: shell_origin.1 as u32,
+        width: 2,
+        height: 2,
+    };
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![raised_footprint]),
+    );
 
+    let mut damage = Vec::new();
+    for value in [0i32, 0, 1, 1] {
+        damage.extend_from_slice(&value.to_le_bytes());
+    }
+    s.dispatch_request(shell, &encode_request_bytes(shell_surface, 3, &damage))
+        .unwrap();
     s.dispatch_request(shell, &encode_request_bytes(shell_surface, 7, &[]))
         .unwrap();
+    assert!(
+        s.presentation_deferred(),
+        "the shell commit clears the focus owner but remains unpresentable until the batch is composed",
+    );
+    assert_eq!(s.scene_generation(), before_focus_generation);
+    assert_eq!(
+        s.presentation_damage(),
+        &PresentationDamage::Bounded(vec![raised_footprint]),
+        "the exact shell damage stays inside the already-conservative raise footprint",
+    );
+    assert!(s.finish_recomposition_batch());
     assert!(!s.presentation_deferred());
     assert!(s.scene_generation() > before_focus_generation);
 
@@ -1350,8 +2070,14 @@ fn inject_keyboard_key_routes_to_the_focused_client() {
     s.set_keyboard_focus(Some((c, surface)));
     let _ = s.drain_client_events(c);
 
+    let recomposition_before_key = s.recomposition_serial();
     let routed = s.inject_keyboard_key(0x1e, key_state::PRESSED).unwrap();
     assert_eq!(routed, (c, surface));
+    assert_eq!(
+        s.recomposition_serial(),
+        recomposition_before_key,
+        "routing a key event must not manufacture framebuffer damage",
+    );
 
     let bytes = s.drain_client_events(c).unwrap();
     let header = ProtoHeader::decode(&bytes).unwrap();
@@ -1362,6 +2088,393 @@ fn inject_keyboard_key_routes_to_the_focused_client() {
     assert_eq!(event.surface_id, surface);
     assert_eq!(event.key, 0x1e);
     assert_eq!(event.state, key_state::PRESSED);
+}
+
+#[test]
+fn alt_f4_emits_one_exact_shell_shortcut_and_consumes_the_f4_pair() {
+    let (mut server, app, compositor, shm, xdg_shell, seat) = boot_server_and_bind_everything();
+    let keyboard = ObjectId::new(33);
+    server
+        .dispatch_request(
+            app,
+            &encode_request_bytes(seat, 2, &new_id_payload(keyboard)),
+        )
+        .unwrap();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut server, app, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(
+        &mut server,
+        app,
+        xdg_shell,
+        surface,
+        pool,
+        buffer,
+        toplevel,
+    );
+    server.set_keyboard_focus(Some((app, surface)));
+    let target_window = server.window_id(app, toplevel).unwrap();
+    let (shell, _, shell_manager) = bind_active_shortcut_shell(&mut server);
+    let _ = server.drain_client_events(app);
+
+    // Releasing only left Alt must leave right Alt active. The first F4 press
+    // becomes one shell event; browser repeats and the physical release are
+    // consumed so the app sees neither half of the shortcut key.
+    server.inject_keyboard_key(0xE2, key_state::PRESSED);
+    server.inject_keyboard_key(0xE6, key_state::PRESSED);
+    server.inject_keyboard_key(0xE2, key_state::RELEASED);
+    server.inject_keyboard_key(0x3D, key_state::PRESSED);
+    server.inject_keyboard_key(0x3D, key_state::PRESSED);
+    server.inject_keyboard_key(0x3D, key_state::RELEASED);
+    server.inject_keyboard_key(0xE6, key_state::RELEASED);
+
+    assert_eq!(
+        close_shortcut_events(&server.drain_client_events(shell).unwrap(), shell_manager,),
+        vec![ShellCloseShortcut {
+            window_id: target_window,
+        }],
+    );
+    let app_keys = keyboard_events(&server.drain_client_events(app).unwrap(), keyboard);
+    assert_eq!(
+        app_keys
+            .iter()
+            .map(|event| (event.key, event.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (0xE2, key_state::PRESSED),
+            (0xE6, key_state::PRESSED),
+            (0xE2, key_state::RELEASED),
+            (0xE6, key_state::RELEASED),
+        ],
+    );
+
+    // The release reset the latch: an unmodified F4 remains ordinary app
+    // input and does not produce another privileged event.
+    server.inject_keyboard_key(0x3D, key_state::PRESSED);
+    server.inject_keyboard_key(0x3D, key_state::RELEASED);
+    assert_eq!(
+        keyboard_events(&server.drain_client_events(app).unwrap(), keyboard)
+            .iter()
+            .map(|event| (event.key, event.state))
+            .collect::<Vec<_>>(),
+        vec![(0x3D, key_state::PRESSED), (0x3D, key_state::RELEASED),],
+    );
+    assert!(server.drain_client_events(shell).unwrap().is_empty());
+}
+
+#[test]
+fn alt_f4_routes_normally_when_no_authenticated_shell_can_receive_it() {
+    let (mut server, app, compositor, shm, xdg_shell, seat) = boot_server_and_bind_everything();
+    let keyboard = ObjectId::new(33);
+    server
+        .dispatch_request(
+            app,
+            &encode_request_bytes(seat, 2, &new_id_payload(keyboard)),
+        )
+        .unwrap();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut server, app, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(
+        &mut server,
+        app,
+        xdg_shell,
+        surface,
+        pool,
+        buffer,
+        toplevel,
+    );
+    server.set_keyboard_focus(Some((app, surface)));
+    let _ = server.drain_client_events(app);
+
+    for (key, state) in [
+        (0xE2, key_state::PRESSED),
+        (0x3D, key_state::PRESSED),
+        (0x3D, key_state::RELEASED),
+        (0xE2, key_state::RELEASED),
+    ] {
+        server.inject_keyboard_key(key, state);
+    }
+
+    assert_eq!(
+        keyboard_events(&server.drain_client_events(app).unwrap(), keyboard)
+            .iter()
+            .map(|event| (event.key, event.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (0xE2, key_state::PRESSED),
+            (0x3D, key_state::PRESSED),
+            (0x3D, key_state::RELEASED),
+            (0xE2, key_state::RELEASED),
+        ],
+    );
+}
+
+#[test]
+fn alt_f4_routes_normally_for_an_explicit_v1_shell_manager_binding() {
+    let (mut server, app, compositor, shm, xdg_shell, seat) = boot_server_and_bind_everything();
+    let keyboard = ObjectId::new(33);
+    server
+        .dispatch_request(
+            app,
+            &encode_request_bytes(seat, 2, &new_id_payload(keyboard)),
+        )
+        .unwrap();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut server, app, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(
+        &mut server,
+        app,
+        xdg_shell,
+        surface,
+        pool,
+        buffer,
+        toplevel,
+    );
+    server.set_keyboard_focus(Some((app, surface)));
+    let (shell, _, shell_manager) = bind_active_shortcut_shell_version(&mut server, 1);
+    assert_eq!(server.client(shell).unwrap().shell_manager_version, Some(1));
+    let _ = server.drain_client_events(app);
+
+    for (key, state) in [
+        (0xE2, key_state::PRESSED),
+        (0x3D, key_state::PRESSED),
+        (0x3D, key_state::RELEASED),
+        (0xE2, key_state::RELEASED),
+    ] {
+        server.inject_keyboard_key(key, state);
+    }
+
+    assert!(
+        close_shortcut_events(&server.drain_client_events(shell).unwrap(), shell_manager,)
+            .is_empty()
+    );
+    assert_eq!(
+        keyboard_events(&server.drain_client_events(app).unwrap(), keyboard)
+            .iter()
+            .map(|event| (event.key, event.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (0xE2, key_state::PRESSED),
+            (0x3D, key_state::PRESSED),
+            (0x3D, key_state::RELEASED),
+            (0xE2, key_state::RELEASED),
+        ],
+    );
+}
+
+#[test]
+fn explicit_v1_shell_manager_cannot_invoke_v2_state_or_restore_requests() {
+    let mut server = Server::new();
+    let (shell, _, manager) = bind_active_shortcut_shell_version(&mut server, 1);
+
+    for (opcode, payload) in [
+        (9, 7_u32.to_le_bytes().to_vec()),
+        (10, [1_u32.to_le_bytes(), 250_u32.to_le_bytes()].concat()),
+        (11, vec![0; 32]),
+        (12, vec![0; 8]),
+    ] {
+        assert_eq!(
+            server.dispatch_request(shell, &encode_request_bytes(manager, opcode, &payload)),
+            Err(ServerError::Client(ClientError::RequestRequiresVersion {
+                interface: Interface::ShellManager,
+                object_id: manager,
+                opcode,
+                negotiated: 1,
+                required: 2,
+            }))
+        );
+        assert_eq!(server.restore_transaction_owner(), None);
+        assert_eq!(
+            server
+                .client(shell)
+                .unwrap()
+                .shell_manager_state_snapshot_id,
+            None
+        );
+        assert!(server.drain_client_events(shell).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn negotiated_v2_shell_manager_accepts_the_authoritative_subscription() {
+    let mut server = Server::new();
+    let (shell, _, manager) = bind_active_shortcut_shell_version(&mut server, 2);
+    server
+        .dispatch_request(
+            shell,
+            &encode_request_bytes(manager, 9, &7_u32.to_le_bytes()),
+        )
+        .unwrap();
+
+    assert_eq!(
+        server
+            .client(shell)
+            .unwrap()
+            .shell_manager_state_snapshot_id,
+        Some(7)
+    );
+    let bytes = server.drain_client_events(shell).unwrap();
+    let header = ProtoHeader::decode(&bytes).expect("snapshot terminator event");
+    assert_eq!(header.object_id, manager);
+    assert_eq!(header.opcode, 7 /* window_snapshot_done */);
+}
+
+#[test]
+fn alt_f4_does_not_target_no_focus_hidden_or_minimized_windows() {
+    let (mut server, app, compositor, shm, xdg_shell, seat) = boot_server_and_bind_everything();
+    let keyboard = ObjectId::new(33);
+    server
+        .dispatch_request(
+            app,
+            &encode_request_bytes(seat, 2, &new_id_payload(keyboard)),
+        )
+        .unwrap();
+    let surface = ObjectId::new(13);
+    let pool = ObjectId::new(15);
+    let buffer = ObjectId::new(17);
+    let toplevel = ObjectId::new(19);
+    make_surface_with_buffer(&mut server, app, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(
+        &mut server,
+        app,
+        xdg_shell,
+        surface,
+        pool,
+        buffer,
+        toplevel,
+    );
+    let (shell, _, shell_manager) = bind_active_shortcut_shell(&mut server);
+    let _ = server.drain_client_events(app);
+
+    let press_chord = |server: &mut Server| {
+        server.inject_keyboard_key(0xE2, key_state::PRESSED);
+        server.inject_keyboard_key(0x3D, key_state::PRESSED);
+        server.inject_keyboard_key(0x3D, key_state::RELEASED);
+        server.inject_keyboard_key(0xE2, key_state::RELEASED);
+    };
+
+    server.set_keyboard_focus(None);
+    press_chord(&mut server);
+    assert!(
+        close_shortcut_events(&server.drain_client_events(shell).unwrap(), shell_manager,)
+            .is_empty()
+    );
+
+    server.set_keyboard_focus(Some((app, surface)));
+    server
+        .client_mut(app)
+        .unwrap()
+        .toplevels
+        .get_mut(&toplevel)
+        .unwrap()
+        .hidden_for_restore = true;
+    press_chord(&mut server);
+    assert!(
+        close_shortcut_events(&server.drain_client_events(shell).unwrap(), shell_manager,)
+            .is_empty()
+    );
+
+    server
+        .client_mut(app)
+        .unwrap()
+        .toplevels
+        .get_mut(&toplevel)
+        .unwrap()
+        .hidden_for_restore = false;
+    server
+        .client_mut(app)
+        .unwrap()
+        .toplevels
+        .get_mut(&toplevel)
+        .unwrap()
+        .minimized = true;
+    press_chord(&mut server);
+    assert!(
+        close_shortcut_events(&server.drain_client_events(shell).unwrap(), shell_manager,)
+            .is_empty()
+    );
+}
+
+#[test]
+fn alt_f4_never_exposes_a_shell_desktop_window_as_the_close_target() {
+    let (mut server, _app, _, _, _, _) = boot_server_and_bind_everything();
+    let (shell, registry, shell_manager) = bind_active_shortcut_shell(&mut server);
+    let compositor = ObjectId::new(7);
+    let shm = ObjectId::new(9);
+    let xdg_shell = ObjectId::new(11);
+    let seat = ObjectId::new(13);
+    for (name, interface, object) in [
+        (1, "pmd_compositor", compositor),
+        (2, "pmd_shm", shm),
+        (3, "pmd_xdg_shell", xdg_shell),
+        (4, "pmd_seat", seat),
+    ] {
+        server
+            .dispatch_request(
+                shell,
+                &encode_request_bytes(
+                    registry,
+                    1,
+                    &registry_bind_payload(name, interface, 1, object),
+                ),
+            )
+            .unwrap();
+    }
+    let keyboard = ObjectId::new(15);
+    server
+        .dispatch_request(
+            shell,
+            &encode_request_bytes(seat, 2, &new_id_payload(keyboard)),
+        )
+        .unwrap();
+    let surface = ObjectId::new(17);
+    let pool = ObjectId::new(19);
+    let buffer = ObjectId::new(21);
+    let toplevel = ObjectId::new(23);
+    make_surface_with_buffer(&mut server, shell, compositor, shm, surface, pool, buffer);
+    promote_to_toplevel_and_commit_red(
+        &mut server,
+        shell,
+        xdg_shell,
+        surface,
+        pool,
+        buffer,
+        toplevel,
+    );
+    server.set_keyboard_focus(Some((shell, surface)));
+    let _ = server.drain_client_events(shell);
+
+    for (key, state) in [
+        (0xE2, key_state::PRESSED),
+        (0x3D, key_state::PRESSED),
+        (0x3D, key_state::RELEASED),
+        (0xE2, key_state::RELEASED),
+    ] {
+        server.inject_keyboard_key(key, state);
+    }
+
+    let events = server.drain_client_events(shell).unwrap();
+    assert!(close_shortcut_events(&events, shell_manager).is_empty());
+    assert_eq!(
+        keyboard_events(&events, keyboard)
+            .iter()
+            .map(|event| (event.key, event.state))
+            .collect::<Vec<_>>(),
+        vec![
+            (0xE2, key_state::PRESSED),
+            (0x3D, key_state::PRESSED),
+            (0x3D, key_state::RELEASED),
+            (0xE2, key_state::RELEASED),
+        ],
+    );
 }
 
 #[test]
@@ -1924,7 +3037,7 @@ fn shell_toggle_maximize_routes_exact_owner_and_honors_work_area() {
         XdgToplevelConfigure::decode(&bytes[PROTO_HEADER_SIZE..header.length as usize]).unwrap();
     assert_eq!(
         (configure.width, configure.height, configure.states),
-        (0, 0, 0)
+        (0, 0, xdg_toplevel_state::ACTIVATED)
     );
 
     s.dispatch_request(
@@ -2216,7 +3329,12 @@ fn move_detach_and_toplevel_destroy_recompose_without_pixel_trails() {
         &encode_request_bytes(toplevel, 7 /* move */, &1u32.to_le_bytes()),
     )
     .unwrap();
+    let recomposition_before_drag = s.recomposition_serial();
     s.inject_pointer_motion(3, 0);
+    assert!(
+        s.recomposition_serial() > recomposition_before_drag,
+        "interactive pointer motion must retain its direct scene-dirty signal",
+    );
     assert_eq!(
         s.framebuffer().pixel(0, 0).unwrap(),
         &[0, 0, 0, 0],
@@ -2651,17 +3769,20 @@ fn resize_request_emits_resizing_configures_during_drag_and_final_configure_on_r
     let configure = XdgToplevelConfigure::decode(p).unwrap();
     assert_eq!(configure.width, 14);
     assert_eq!(configure.height, 7);
-    assert_eq!(configure.states, xdg_toplevel_state::RESIZING);
+    assert_eq!(
+        configure.states,
+        xdg_toplevel_state::RESIZING | xdg_toplevel_state::ACTIVATED
+    );
 
     // Release ends the drag + emits a final configure with
-    // states = 0.
+    // RESIZING clears while activation remains composed.
     s.inject_pointer_button(1, display_proto::events::pointer_button_state::RELEASED);
     assert!(!s.is_dragging());
     let bytes = s.drain_client_events(c).unwrap();
     let header = display_proto::wire::MessageHeader::decode(&bytes).unwrap();
     let p = &bytes[PROTO_HEADER_SIZE..header.length as usize];
     let configure = XdgToplevelConfigure::decode(p).unwrap();
-    assert_eq!(configure.states, 0);
+    assert_eq!(configure.states, xdg_toplevel_state::ACTIVATED);
 }
 
 #[test]

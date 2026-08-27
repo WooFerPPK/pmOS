@@ -8,6 +8,11 @@
 // from the persistent VFS preference rather than live test state.
 
 import { expect, test, type Page } from "@playwright/test";
+import {
+  TASKBAR_LIGHT_FOCUSED,
+  taskbarEntryPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 test.setTimeout(60_000);
@@ -15,15 +20,6 @@ test.setTimeout(60_000);
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
 const TASKBAR_Y = 752;
-const TASKBAR_ENTRY_SAMPLE_Y = 762;
-const TASKBAR_LEFT_MARGIN = 4;
-const TASKBAR_LAUNCHER_RESERVED_WIDTH = 86;
-const TASKBAR_CLOCK_RESERVED_WIDTH = 68;
-const TASKBAR_RIGHT_MARGIN = 4;
-const TASKBAR_ENTRY_GAP = 2;
-const TASKBAR_ENTRY_WIDTH = 160;
-const TASKBAR_MIN_ENTRY_WIDTH = 112;
-const TASKBAR_FOCUSED = [194, 198, 207, 255] as const;
 // `Color::rgb(0x0a, 0x0e, 0x14)` is stored in the guest's ARGB8888 buffer;
 // the browser's ImageData view presents those bytes as RGBA in B/G/R order.
 const TERMINAL_BACKGROUND = [0x14, 0x0e, 0x0a, 0xff] as const;
@@ -34,7 +30,7 @@ const TERMINAL_BACKGROUND = [0x14, 0x0e, 0x0a, 0xff] as const;
 // 5x7 glyphs; matching them observes presented guest pixels, not DOM state.
 const CLOCK_SUFFIX_X = 1000;
 const CLOCK_SUFFIX_Y = 748;
-const CLOCK_FOREGROUND = [0x1a, 0x1a, 0x1a] as const;
+const CLOCK_FOREGROUND = [0x1b, 0x1b, 0x1b] as const;
 const CLOCK_GLYPHS: Readonly<Record<string, readonly number[]>> = {
   C: [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
   D: [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
@@ -89,44 +85,6 @@ async function framebufferPixel(
       return Array.from(context.getImageData(point.x, point.y, 1, 1).data);
     },
     { x, y },
-  );
-}
-
-async function findSolidRun(
-  page: Page,
-  rgb: readonly [number, number, number],
-  minimumRun: number,
-): Promise<{ x: number; y: number } | null> {
-  return page.locator("#pmos-fb").evaluate(
-    (
-      canvas: HTMLCanvasElement,
-      target: { rgb: readonly [number, number, number]; minimumRun: number },
-    ) => {
-      const context = canvas.getContext("2d");
-      if (context === null) return null;
-      const image = context.getImageData(0, 0, canvas.width, 736);
-      for (let y = 0; y < image.height; y += 1) {
-        let runStart = 0;
-        let runLength = 0;
-        for (let x = 0; x < image.width; x += 1) {
-          const offset = (y * image.width + x) * 4;
-          const matches =
-            image.data[offset] === target.rgb[0] &&
-            image.data[offset + 1] === target.rgb[1] &&
-            image.data[offset + 2] === target.rgb[2] &&
-            image.data[offset + 3] === 0xff;
-          if (matches) {
-            if (runLength === 0) runStart = x;
-            runLength += 1;
-            if (runLength >= target.minimumRun) return { x: runStart, y };
-          } else {
-            runLength = 0;
-          }
-        }
-      }
-      return null;
-    },
-    { rgb, minimumRun },
   );
 }
 
@@ -233,42 +191,11 @@ async function assertSpawnTimezone(
   page: Page,
   consoleLines: string[],
   expectedTimezone: string,
-  surfaceX: number,
-  surfaceY: number,
 ): Promise<void> {
   const outputStart = consoleLines.length;
   // `env` is a shell builtin and prints the environment owned by this exact
   // isolated /bin/sh. Send `>` as a physical modifier chord because PMos
   // consumes HID-style key transitions rather than browser text values.
-  const cleanPrompt = await terminalFingerprint(page, surfaceX, surfaceY);
-  await expect
-    .poll(
-      async () => {
-        if (
-          (await terminalFingerprint(page, surfaceX, surfaceY)) !== cleanPrompt
-        ) {
-          return true;
-        }
-        await page.keyboard.press("KeyX");
-        return false;
-      },
-      { timeout: 5_000 },
-    )
-    .toBe(true);
-  await expect
-    .poll(
-      async () => {
-        if (
-          (await terminalFingerprint(page, surfaceX, surfaceY)) === cleanPrompt
-        ) {
-          return true;
-        }
-        await page.keyboard.press("Backspace");
-        return false;
-      },
-      { timeout: 5_000 },
-    )
-    .toBe(true);
   await page.keyboard.type("env ");
   await page.keyboard.press("Shift+Period");
   await page.keyboard.type(" /dev/console");
@@ -287,35 +214,6 @@ async function assertSpawnTimezone(
     .toBe(true);
 }
 
-async function terminalFingerprint(
-  page: Page,
-  surfaceX: number,
-  surfaceY: number,
-): Promise<number> {
-  return page.locator("#pmos-fb").evaluate(
-    (
-      canvas: HTMLCanvasElement,
-      region: { x: number; y: number; width: number; height: number },
-    ) => {
-      const context = canvas.getContext("2d");
-      if (context === null) throw new Error("framebuffer 2d context missing");
-      const bytes = context.getImageData(
-        region.x,
-        region.y,
-        region.width,
-        region.height,
-      ).data;
-      let hash = 0x811c9dc5;
-      for (const byte of bytes) {
-        hash ^= byte;
-        hash = Math.imul(hash, 0x01000193);
-      }
-      return hash >>> 0;
-    },
-    { x: surfaceX, y: surfaceY, width: 720, height: 480 },
-  );
-}
-
 async function waitForTerminalPaint(
   page: Page,
   x: number,
@@ -324,26 +222,6 @@ async function waitForTerminalPaint(
   await expect
     .poll(() => framebufferPixel(page, x, y), { timeout: 10_000 })
     .toEqual(TERMINAL_BACKGROUND);
-}
-
-function taskbarEntrySampleX(index: number, entryCount: number): number {
-  const available =
-    FRAMEBUFFER_WIDTH -
-    TASKBAR_LEFT_MARGIN -
-    TASKBAR_LAUNCHER_RESERVED_WIDTH -
-    TASKBAR_CLOCK_RESERVED_WIDTH -
-    TASKBAR_RIGHT_MARGIN;
-  const gaps = TASKBAR_ENTRY_GAP * Math.max(0, entryCount - 1);
-  const width = Math.max(
-    TASKBAR_MIN_ENTRY_WIDTH,
-    Math.min(TASKBAR_ENTRY_WIDTH, Math.floor((available - gaps) / entryCount)),
-  );
-  return (
-    TASKBAR_LEFT_MARGIN +
-    TASKBAR_LAUNCHER_RESERVED_WIDTH +
-    index * (width + TASKBAR_ENTRY_GAP) +
-    30
-  );
 }
 
 async function focusMappedTerminal(
@@ -359,16 +237,27 @@ async function focusMappedTerminal(
   await expect
     .poll(
       async () => {
+        const task = taskbarEntryPoint(taskbarEntryIndex, taskbarEntryCount);
+        const current = await framebufferPixel(page, task.x, task.y);
+        if (
+          current.every(
+            (channel, index) => channel === TASKBAR_LIGHT_FOCUSED[index],
+          )
+        ) {
+          return current;
+        }
         await clickFramebuffer(page, contentX, contentY);
-        return framebufferPixel(
-          page,
-          taskbarEntrySampleX(taskbarEntryIndex, taskbarEntryCount),
-          TASKBAR_ENTRY_SAMPLE_Y,
-        );
+        return framebufferPixel(page, task.x, task.y);
       },
       { timeout: 5_000 },
     )
-    .toEqual(TASKBAR_FOCUSED);
+    .toEqual([...TASKBAR_LIGHT_FOCUSED]);
+  await waitForActiveWindowBounds(page, {
+    expectedX: taskbarEntryIndex * 32,
+    expectedY: taskbarEntryIndex * 32,
+    expectedWidth: 720,
+    message: `Terminal task ${taskbarEntryIndex} did not present its focused frame`,
+  });
 }
 
 test("Settings applies timezone to new processes only and persists it", async ({
@@ -395,8 +284,8 @@ test("Settings applies timezone to new processes only and persists it", async ({
   await clickFramebuffer(page, 100, 624);
   await waitForLine(consoleLines, (line) => line.includes("term: starting"));
   await waitForTerminalPaint(page, 700, 450);
-  await focusMappedTerminal(page, 700, 450, 1, 2);
-  await assertSpawnTimezone(page, consoleLines, "UTC", 0, 0);
+  await focusMappedTerminal(page, 700, 450, 0, 1);
+  await assertSpawnTimezone(page, consoleLines, "UTC");
 
   // Open Settings, select the fourth tab (Timezone), and Apply once. A fresh
   // profile starts at UTC, so the finite picker advances to America/New_York.
@@ -405,22 +294,18 @@ test("Settings applies timezone to new processes only and persists it", async ({
   await waitForLine(consoleLines, (line) =>
     /shell: launched \/bin\/settings pid=\d+/.test(line),
   );
-  await expect
-    .poll(() => findSolidRun(page, [0x40, 0x60, 0x70], 300), {
-      timeout: 5_000,
-    })
-    .not.toBeNull();
-  const settingsOrigin = await findSolidRun(page, [0x40, 0x60, 0x70], 300);
-  expect(settingsOrigin).not.toBeNull();
+  const settingsOrigin = await waitForActiveWindowBounds(page, {
+    expectedWidth: 560,
+  });
   await clickAndWaitForFrame(
     page,
-    settingsOrigin!.x + 325,
-    settingsOrigin!.y + 27,
+    settingsOrigin.x + 325,
+    settingsOrigin.y + 27,
   );
   await clickAndWaitForFrame(
     page,
-    settingsOrigin!.x + 500,
-    settingsOrigin!.y + 331,
+    settingsOrigin.x + 500,
+    settingsOrigin.y + 331,
   );
 
   // The taskbar is ordinary shell-owned framebuffer output. Its IANA-aware
@@ -431,20 +316,35 @@ test("Settings applies timezone to new processes only and persists it", async ({
 
   // Focus the exact pre-existing Terminal taskbar entry and prove its child
   // shell retained the environment captured before the Settings edit.
-  await expect
-    .poll(
-      async () => {
-        await clickFramebuffer(page, 330, TASKBAR_Y);
-        return framebufferPixel(page, 330, TASKBAR_Y);
-      },
-      { timeout: 5_000 },
+  const terminalTask = taskbarEntryPoint(0, 2);
+  const terminalPalette = await framebufferPixel(
+    page,
+    terminalTask.x,
+    terminalTask.y,
+  );
+  if (
+    !terminalPalette.every(
+      (channel, index) => channel === TASKBAR_LIGHT_FOCUSED[index],
     )
-    .toEqual(TASKBAR_FOCUSED);
+  ) {
+    await clickFramebuffer(page, terminalTask.x, terminalTask.y);
+  }
+  await expect
+    .poll(() => framebufferPixel(page, terminalTask.x, terminalTask.y), {
+      timeout: 5_000,
+    })
+    .toEqual([...TASKBAR_LIGHT_FOCUSED]);
+  await waitForActiveWindowBounds(page, {
+    expectedX: 0,
+    expectedY: 0,
+    expectedWidth: 720,
+    message: "pre-existing Terminal did not complete its focused frame",
+  });
   // The shell's focus event and the compositor's raised scene travel through
   // separate framebuffer commits. This overlap point is light while Settings
   // is on top and dark only once the original Terminal is visibly frontmost.
   await waitForTerminalPaint(page, 400, 300);
-  await assertSpawnTimezone(page, consoleLines, "UTC", 0, 0);
+  await assertSpawnTimezone(page, consoleLines, "UTC");
 
   // A second Terminal is spawned through the shell after the edit. Its own
   // inherited TZ is forwarded to its separately isolated persistent /bin/sh.
@@ -464,8 +364,8 @@ test("Settings applies timezone to new processes only and persists it", async ({
   // This point is inside the third cascaded app surface but outside both the
   // first Terminal and Settings, so it cannot be satisfied by stale pixels.
   await waitForTerminalPaint(page, 760, 500);
-  await focusMappedTerminal(page, 760, 500, 3, 4);
-  await assertSpawnTimezone(page, consoleLines, "America/New_York", 64, 64);
+  await focusMappedTerminal(page, 760, 500, 2, 3);
+  await assertSpawnTimezone(page, consoleLines, "America/New_York");
 
   await waitForLineAfter(consoleLines, secondTerminalLogStart, (line) =>
     /shell: session durable revision=\d+ apps=3 windows=3 bytes=\d+ digest=[0-9a-f]{16}$/.test(
@@ -500,8 +400,8 @@ test("Settings applies timezone to new processes only and persists it", async ({
   await clickAndWaitForFrame(page, 40, TASKBAR_Y);
   await clickFramebuffer(page, 100, 624);
   await waitForTerminalPaint(page, 700, 450);
-  await focusMappedTerminal(page, 700, 450, 4, 5);
-  await assertSpawnTimezone(page, consoleLines, "America/New_York", 96, 96);
+  await focusMappedTerminal(page, 700, 450, 3, 4);
+  await assertSpawnTimezone(page, consoleLines, "America/New_York");
 
   expect(consoleLines.some((line) => line.includes("real kernel panic"))).toBe(
     false,

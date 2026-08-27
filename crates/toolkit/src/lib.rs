@@ -28,6 +28,7 @@ pub mod theme;
 pub mod wasi;
 pub mod widget;
 pub mod window;
+pub mod window_frame_patch;
 
 pub use app::App;
 pub use decorated_window::{DecoratedPointerOutcome, DecoratedWindow};
@@ -44,6 +45,7 @@ pub use wasi::wait_fd;
 #[cfg(target_arch = "wasm32")]
 pub use wasi::{FdConnection, FsWatch, PathWatch};
 pub use window::Window;
+pub use window_frame_patch::{WindowFramePatch, WindowFramePatchProgress};
 
 // Re-export the shared protocol types so toolkit callers get
 // a single namespace (`toolkit::Interface`, `toolkit::ObjectId`,

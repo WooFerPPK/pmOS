@@ -21,9 +21,9 @@ use std::process::ExitCode;
 use display_proto::events::{key_state, pointer_button_state, KeyboardKey, PointerButton};
 use display_proto::Interface;
 use files::{
-    configured_window_size, titlebar_drag_hit, DialogKind, DoubleActivation, FileAction,
-    FileManagerState, FileSystem, PendingDirectoryAction, PointerTarget, StepwiseAction, UiKey,
-    ViewMode, NORMAL_WINDOW_HEIGHT, NORMAL_WINDOW_WIDTH, TITLEBAR_HEIGHT,
+    configured_window_size, DialogKind, DoubleActivation, FileAction, FileManagerState, FileSystem,
+    PendingDirectoryAction, PointerTarget, StepwiseAction, UiKey, ViewMode, NORMAL_WINDOW_HEIGHT,
+    NORMAL_WINDOW_WIDTH, TITLEBAR_HEIGHT,
 };
 #[cfg(target_arch = "wasm32")]
 use files::{
@@ -34,9 +34,10 @@ use files::{
 use files::{
     default_app_for, export_bytes, import_and_dispatch, list_dir, rename, sanitise_filename,
 };
-use toolkit::draw::font::GLYPH_HEIGHT;
 use toolkit::draw::{Canvas, Color, Rect};
-use toolkit::{App, BufferPool, Window};
+use toolkit::theme::Theme;
+use toolkit::widget::frame::{PointerOutcome as ChromePointerOutcome, WindowFrame};
+use toolkit::{App, BufferPool, Window, WindowFramePatch, WindowFramePatchProgress};
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod transfer_pump;
@@ -942,6 +943,19 @@ const STATUS_HEIGHT: u32 = 22;
 const ROW_HEIGHT: i32 = 18;
 const SCROLLBAR_WIDTH: i32 = 22;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseAcknowledgement {
+    DisplayServer,
+    ClientTitlebar,
+}
+
+fn close_acknowledgement(source: CloseAcknowledgement) -> &'static str {
+    match source {
+        CloseAcknowledgement::DisplayServer => "files: close requested by display server",
+        CloseAcknowledgement::ClientTitlebar => "files: close requested by client titlebar",
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 struct Modifiers {
     shift: bool,
@@ -1093,8 +1107,10 @@ fn run_window<C: toolkit::protocol::Connection>(
     let mut configured = false;
     let mut ready_logged = false;
     let mut pool: Option<BufferPool> = None;
+    let mut chrome_patch: Option<WindowFramePatch> = None;
     let mut size = (NORMAL_WINDOW_WIDTH, NORMAL_WINDOW_HEIGHT);
     let mut was_maximized = false;
+    let mut was_activated = false;
     let started = std::time::Instant::now();
     let mut double_activation = DoubleActivation::default();
     #[cfg(target_arch = "wasm32")]
@@ -1102,8 +1118,15 @@ fn run_window<C: toolkit::protocol::Connection>(
 
     loop {
         let events = window.dispatch()?;
+        let focus_changed = window.is_activated() != was_activated;
+        if focus_changed {
+            was_activated = window.is_activated();
+        }
         if window.take_close_requested() {
-            println!("files: close requested by display server");
+            println!(
+                "{}",
+                close_acknowledgement(CloseAcknowledgement::DisplayServer)
+            );
             return Ok(());
         }
         let rows = visible_rows(size.1);
@@ -1153,12 +1176,41 @@ fn run_window<C: toolkit::protocol::Connection>(
                 (Interface::Pointer, 2) => {
                     if let Ok(button) = PointerButton::decode(&event.payload) {
                         if button.button == 1 && button.state == pointer_button_state::PRESSED {
-                            if titlebar_drag_hit(button.x, button.y, size.0) {
-                                if !window.is_maximized() {
-                                    window.request_move(button.serial)?;
-                                    println!("files: move requested serial={}", button.serial);
+                            let mut chrome = files_window_frame(
+                                size.0,
+                                size.1,
+                                window.is_activated(),
+                                window.is_maximized(),
+                            );
+                            match chrome.pointer_down(button.x, button.y) {
+                                ChromePointerOutcome::Minimize => {
+                                    window.set_minimized()?;
+                                    continue;
                                 }
-                                continue;
+                                ChromePointerOutcome::ToggleMaximize => {
+                                    if window.is_maximized() {
+                                        window.unset_maximized()?;
+                                    } else {
+                                        window.set_maximized()?;
+                                    }
+                                    continue;
+                                }
+                                ChromePointerOutcome::Close => {
+                                    println!(
+                                        "{}",
+                                        close_acknowledgement(CloseAcknowledgement::ClientTitlebar)
+                                    );
+                                    return Ok(());
+                                }
+                                ChromePointerOutcome::Titlebar => {
+                                    if !window.is_maximized() {
+                                        window.request_move(button.serial)?;
+                                        println!("files: move requested serial={}", button.serial);
+                                    }
+                                    continue;
+                                }
+                                ChromePointerOutcome::Content => {}
+                                ChromePointerOutcome::Outside => continue,
                             }
                             if let Some(target) =
                                 pointer_target(&state, button.x, button.y, size.0, size.1)
@@ -1279,13 +1331,44 @@ fn run_window<C: toolkit::protocol::Connection>(
             );
         }
 
+        if needs_paint {
+            chrome_patch = None;
+        } else {
+            if focus_changed && configured {
+                chrome_patch = Some(WindowFramePatch::new(&files_window_frame(
+                    size.0,
+                    size.1,
+                    was_activated,
+                    window.is_maximized(),
+                )));
+            }
+            if let (Some(patch), Some(buffers)) = (chrome_patch.as_mut(), pool.as_mut()) {
+                match patch.progress(buffers, &mut window)? {
+                    WindowFramePatchProgress::Complete => chrome_patch = None,
+                    WindowFramePatchProgress::Unavailable => {
+                        chrome_patch = None;
+                        needs_paint = true;
+                    }
+                    WindowFramePatchProgress::Deferred | WindowFramePatchProgress::Pending => {}
+                }
+            }
+        }
+
         if configured && needs_paint {
             let buffers = pool.as_mut().expect("buffer pool configured");
             if let Some(mut canvas) = buffers.acquire_back_canvas() {
-                paint_files(&mut canvas, size.0, size.1, &state);
+                paint_files(
+                    &mut canvas,
+                    size.0,
+                    size.1,
+                    &state,
+                    was_activated,
+                    window.is_maximized(),
+                );
                 drop(canvas);
                 let _ = buffers.commit_and_swap(&mut window)?;
                 needs_paint = false;
+                chrome_patch = None;
                 if !ready_logged {
                     println!("files: ready {}", state.cwd().display());
                     ready_logged = true;
@@ -1302,7 +1385,8 @@ fn run_window<C: toolkit::protocol::Connection>(
             let sources = host_transfer.wait_sources();
             window.flush_outbound()?;
             if pending_directory.is_some()
-                || (pool.as_ref().is_some_and(BufferPool::commit_pending)
+                || ((pool.as_ref().is_some_and(BufferPool::commit_pending)
+                    || chrome_patch.is_some())
                     && !window.outbound_pending())
             {
                 continue;
@@ -1313,7 +1397,8 @@ fn run_window<C: toolkit::protocol::Connection>(
         {
             window.flush_outbound()?;
             if pending_directory.is_some()
-                || (pool.as_ref().is_some_and(BufferPool::commit_pending)
+                || ((pool.as_ref().is_some_and(BufferPool::commit_pending)
+                    || chrome_patch.is_some())
                     && !window.outbound_pending())
             {
                 continue;
@@ -1404,7 +1489,6 @@ fn pointer_target(
                 172..=243 => PointerTarget::Rename,
                 248..=311 => PointerTarget::Delete,
                 316..=391 => PointerTarget::Refresh,
-                _ if x >= width as i32 - 62 && x < width as i32 - 6 => PointerTarget::Close,
                 _ => return None,
             }
         } else {
@@ -1438,39 +1522,30 @@ fn pointer_target(
     None
 }
 
-fn paint_files(canvas: &mut Canvas<'_>, width: u32, height: u32, state: &FileManagerState) {
-    let background = Color::rgb(0xf4, 0xf5, 0xf7);
-    let titlebar = Color::rgb(0x35, 0x5f, 0x84);
-    let toolbar = Color::rgb(0xdd, 0xe2, 0xe7);
-    let button = Color::rgb(0xc8, 0xd2, 0xdc);
-    let row_alt = Color::rgb(0xe9, 0xee, 0xf3);
-    let selected = Color::rgb(0x4b, 0x78, 0xa5);
-    let text = Color::rgb(0x16, 0x1b, 0x20);
-    let muted = Color::rgb(0x68, 0x72, 0x7c);
+fn paint_files(
+    canvas: &mut Canvas<'_>,
+    width: u32,
+    height: u32,
+    state: &FileManagerState,
+    focused: bool,
+    maximized: bool,
+) {
+    let theme = Theme::LIGHT;
+    let background = theme.window_background;
+    let toolbar = theme.titlebar_inactive;
+    let button = theme.button_fill;
+    let row_alt = Color::rgb(0xfa, 0xfa, 0xfa);
+    let selected = theme.border_active;
+    let text = theme.label_text;
+    let muted = theme.text_input_placeholder_fg;
 
     canvas.fill_rect(Rect::new(0, 0, width, height), background);
-    canvas.fill_rect(Rect::new(0, 0, width, TITLEBAR_HEIGHT), titlebar);
-    canvas.draw_text(
-        8,
-        ((TITLEBAR_HEIGHT as i32 - GLYPH_HEIGHT as i32) / 2).max(0),
-        "Files",
-        Color::rgb(0xff, 0xff, 0xff),
-    );
     canvas.fill_rect(Rect::new(0, TOOLBAR_Y, width, TOOLBAR_HEIGHT), toolbar);
     draw_button(canvas, 6, TOOLBAR_Y, 58, "Parent", button, text);
     draw_button(canvas, 68, TOOLBAR_Y, 100, "New Folder", button, text);
     draw_button(canvas, 172, TOOLBAR_Y, 72, "Rename", button, text);
     draw_button(canvas, 248, TOOLBAR_Y, 64, "Delete", button, text);
     draw_button(canvas, 316, TOOLBAR_Y, 76, "Refresh", button, text);
-    draw_button(
-        canvas,
-        width as i32 - 62,
-        TOOLBAR_Y,
-        56,
-        "Close",
-        Color::rgb(0xd8, 0xb8, 0xb8),
-        text,
-    );
     let second_row = TOOLBAR_Y + TOOLBAR_ROW_HEIGHT as i32;
     draw_button(canvas, 6, second_row, 56, "Open", button, text);
     draw_button(canvas, 68, second_row, 72, "Preview", button, text);
@@ -1479,7 +1554,11 @@ fn paint_files(canvas: &mut Canvas<'_>, width: u32, height: u32, state: &FileMan
 
     canvas.fill_rect(
         Rect::new(6, ADDRESS_Y, width.saturating_sub(12), ADDRESS_HEIGHT),
-        Color::rgb(0xff, 0xff, 0xff),
+        theme.text_input_bg,
+    );
+    canvas.stroke_rect(
+        Rect::new(6, ADDRESS_Y, width.saturating_sub(12), ADDRESS_HEIGHT),
+        theme.text_input_border,
     );
     let address = match state.mode() {
         ViewMode::Preview(preview) => preview.path.display().to_string(),
@@ -1545,7 +1624,7 @@ fn paint_files(canvas: &mut Canvas<'_>, width: u32, height: u32, state: &FileMan
                     if is_selected {
                         Color::rgb(0xff, 0xff, 0xff)
                     } else if entry.is_dir {
-                        Color::rgb(0x13, 0x4f, 0x82)
+                        theme.border_active
                     } else {
                         text
                     },
@@ -1623,6 +1702,17 @@ fn paint_files(canvas: &mut Canvas<'_>, width: u32, height: u32, state: &FileMan
         }
         _ => {}
     }
+
+    let frame = files_window_frame(width, height, focused, maximized);
+    frame.draw(canvas);
+}
+
+fn files_window_frame(width: u32, height: u32, focused: bool, maximized: bool) -> WindowFrame {
+    let mut frame = WindowFrame::new(Rect::new(0, 0, width, height), "Files");
+    frame.set_theme(Theme::LIGHT);
+    frame.set_focused(focused);
+    frame.set_maximized(maximized);
+    frame
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1904,5 +1994,17 @@ mod fairness_tests {
         assert_eq!(stop, BoundedReadStop::WouldBlock);
         assert_eq!(reads, 4);
         assert_eq!(chunks, vec![b"ok".to_vec(); 3]);
+    }
+
+    #[test]
+    fn close_acknowledgements_distinguish_protocol_and_client_titlebar_paths() {
+        assert_eq!(
+            close_acknowledgement(CloseAcknowledgement::DisplayServer),
+            "files: close requested by display server"
+        );
+        assert_eq!(
+            close_acknowledgement(CloseAcknowledgement::ClientTitlebar),
+            "files: close requested by client titlebar"
+        );
     }
 }

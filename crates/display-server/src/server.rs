@@ -17,7 +17,8 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use crate::client::{
-    Client, ClientError, ClientId, ClientLimits, FrameCallbackCompletion, ServerResourceBudgets,
+    Client, ClientError, ClientId, ClientLimits, DamageRect as SurfaceDamageRect,
+    FrameCallbackCompletion, ServerResourceBudgets,
 };
 use crate::compositor::{Framebuffer, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use crate::protocol::keymap::{load_bundled, load_default, Keymap, KeymapError, Scancode};
@@ -27,7 +28,7 @@ use display_proto::ids::ObjectId;
 use display_proto::objects::Interface;
 use display_proto::requests::{
     shell_restore_window_flags, ShellManagerBeginRestore, ShellManagerEndRestore,
-    ShellManagerPlaceRestoredWindow, MAX_SHELL_RESTORE_TIMEOUT_MS,
+    ShellManagerPlaceRestoredWindow, SurfacePatchCurrent, MAX_SHELL_RESTORE_TIMEOUT_MS,
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 use preferences::KeyboardLayout;
@@ -173,10 +174,47 @@ pub struct HitResult {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WindowId(pub u32);
 
+/// One conservative output-space rectangle that can contain pixels changed by
+/// the next composed scene. Rectangles are clipped to the framebuffer before
+/// they enter the presentation hint.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OutputDamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Server-owned bound for comparing the composed framebuffer with its last
+/// presented shadow. `Full` is the correctness fallback for any mutation the
+/// server cannot prove local; `Bounded` contains only validated output-space
+/// candidates and may be empty for a proven invisible mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresentationDamage {
+    Full,
+    Bounded(Vec<OutputDamageRect>),
+}
+
+const MAX_PRESENTATION_DAMAGE_RECTS: usize = 8;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct WindowOwner {
     client_id: ClientId,
     toplevel_id: ObjectId,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct SurfaceOutputGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug)]
+struct SurfaceCommitDamageCandidate {
+    damage: PresentationDamage,
+    expected_geometry: Option<SurfaceOutputGeometry>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -273,6 +311,9 @@ pub struct Server {
     /// batch.
     recomposition_deferred: bool,
     recomposition_pending: bool,
+    /// Conservative output-space candidates accumulated with every logical
+    /// scene mutation since the last successful presentation.
+    presentation_damage: PresentationDamage,
     /// Current pointer position in screen space. Updated
     /// by [`Server::inject_pointer_motion`]; consulted by
     /// [`Server::inject_pointer_button`] when the click
@@ -300,6 +341,16 @@ pub struct Server {
     /// Bit 0 = left shift held, bit 1 = right shift held. Tracking both avoids
     /// clearing Shift when only one of two simultaneously-held keys releases.
     shift_mask: u8,
+    /// Bit 0 = left Alt held, bit 1 = right Alt held. This is physical input
+    /// state used only to recognize the desktop Alt+F4 gesture before layout
+    /// mapping; ordinary modifier transitions still route to the focused app.
+    alt_mask: u8,
+    /// Physical F4 state and whether its current press was consumed as a
+    /// close shortcut. The latch suppresses browser key-repeat duplicates and
+    /// the matching release, so applications never receive a release without
+    /// the consumed press.
+    f4_down: bool,
+    f4_close_shortcut_consumed: bool,
     /// Pixels reserved at the bottom of the framebuffer for
     /// the desktop shell's taskbar. `set_maximized`
     /// configures use the framebuffer height MINUS this
@@ -385,6 +436,7 @@ impl Server {
             recomposition_serial: 0,
             recomposition_deferred: false,
             recomposition_pending: false,
+            presentation_damage: PresentationDamage::Bounded(Vec::new()),
             pointer_x: 0,
             pointer_y: 0,
             next_pointer_serial: 1,
@@ -393,6 +445,9 @@ impl Server {
             active_keymap,
             logical_keymap,
             shift_mask: 0,
+            alt_mask: 0,
+            f4_down: false,
+            f4_close_shortcut_consumed: false,
             taskbar_height_px: 0,
             work_area_owner: None,
             pending_shell_command_owner: None,
@@ -434,6 +489,19 @@ impl Server {
         self.recomposition_serial
     }
 
+    /// Conservative candidates for comparing the current composed output to
+    /// the last successfully presented shadow. The production transport clears
+    /// this only after its complete framebuffer command sequence succeeds.
+    pub fn presentation_damage(&self) -> &PresentationDamage {
+        &self.presentation_damage
+    }
+
+    /// Acknowledge that the current composed output crossed a successful
+    /// presentation boundary. Later mutations start a fresh bounded set.
+    pub fn clear_presentation_damage(&mut self) {
+        self.presentation_damage = PresentationDamage::Bounded(Vec::new());
+    }
+
     /// Defer full-scene rebuilds until [`Server::finish_recomposition_batch`].
     /// The display transport opens one batch per input-first outer turn so a
     /// burst of motion, protocol commits, or disconnects cannot trigger an
@@ -456,6 +524,11 @@ impl Server {
     }
 
     fn request_recomposition(&mut self) {
+        self.request_recomposition_with_damage(PresentationDamage::Full);
+    }
+
+    fn request_recomposition_with_damage(&mut self, damage: PresentationDamage) {
+        self.accumulate_presentation_damage(damage);
         self.recomposition_serial = self.recomposition_serial.wrapping_add(1);
         if self.recomposition_deferred {
             self.recomposition_pending = true;
@@ -464,10 +537,286 @@ impl Server {
         }
     }
 
-    /// Whether the transport must wait for a shell surface commit before
-    /// publishing the current logical focus transaction.
+    fn accumulate_presentation_damage(&mut self, damage: PresentationDamage) {
+        if matches!(self.presentation_damage, PresentationDamage::Full) {
+            return;
+        }
+        let PresentationDamage::Bounded(mut added) = damage else {
+            self.presentation_damage = PresentationDamage::Full;
+            return;
+        };
+        let PresentationDamage::Bounded(current) = &mut self.presentation_damage else {
+            unreachable!();
+        };
+        for rect in added.drain(..) {
+            Self::merge_output_damage_rect(current, rect);
+        }
+    }
+
+    fn merge_output_damage_rect(rects: &mut Vec<OutputDamageRect>, mut added: OutputDamageRect) {
+        if added.width == 0 || added.height == 0 {
+            return;
+        }
+        let mut index = 0;
+        while index < rects.len() {
+            if Self::output_rects_overlap_or_touch(rects[index], added) {
+                added = Self::union_output_rects(rects.swap_remove(index), added);
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        rects.push(added);
+        if rects.len() > MAX_PRESENTATION_DAMAGE_RECTS {
+            let mut bounds = rects[0];
+            for rect in rects.iter().skip(1).copied() {
+                bounds = Self::union_output_rects(bounds, rect);
+            }
+            rects.clear();
+            rects.push(bounds);
+        }
+    }
+
+    fn output_rects_overlap_or_touch(left: OutputDamageRect, right: OutputDamageRect) -> bool {
+        let left_right = u64::from(left.x) + u64::from(left.width);
+        let left_bottom = u64::from(left.y) + u64::from(left.height);
+        let right_right = u64::from(right.x) + u64::from(right.width);
+        let right_bottom = u64::from(right.y) + u64::from(right.height);
+        u64::from(left.x) <= right_right
+            && u64::from(right.x) <= left_right
+            && u64::from(left.y) <= right_bottom
+            && u64::from(right.y) <= left_bottom
+    }
+
+    fn union_output_rects(left: OutputDamageRect, right: OutputDamageRect) -> OutputDamageRect {
+        let x = left.x.min(right.x);
+        let y = left.y.min(right.y);
+        let right_edge = (u64::from(left.x) + u64::from(left.width))
+            .max(u64::from(right.x) + u64::from(right.width));
+        let bottom_edge = (u64::from(left.y) + u64::from(left.height))
+            .max(u64::from(right.y) + u64::from(right.height));
+        OutputDamageRect {
+            x,
+            y,
+            width: u32::try_from(right_edge - u64::from(x)).unwrap_or(u32::MAX),
+            height: u32::try_from(bottom_edge - u64::from(y)).unwrap_or(u32::MAX),
+        }
+    }
+
+    fn surface_output_geometry_for_attachment(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        attachment: Option<crate::client::BufferAttachment>,
+    ) -> Option<SurfaceOutputGeometry> {
+        let client = self.clients.get(&client_id)?;
+        let surface = client.surfaces.get(&surface_id)?;
+        let attachment = attachment?;
+        let buffer = client.buffers.get(&attachment.buffer_id)?;
+        if let Some(toplevel_id) = client.toplevel_by_surface.get(&surface_id) {
+            let toplevel = client.toplevels.get(toplevel_id)?;
+            if toplevel.minimized || toplevel.hidden_for_restore {
+                return None;
+            }
+            return Some(SurfaceOutputGeometry {
+                x: toplevel.x.saturating_add(attachment.x),
+                y: toplevel.y.saturating_add(attachment.y),
+                width: buffer.width,
+                height: buffer.height,
+            });
+        }
+        if surface.had_toplevel_role {
+            return None;
+        }
+        Some(SurfaceOutputGeometry {
+            x: attachment.x,
+            y: attachment.y,
+            width: buffer.width,
+            height: buffer.height,
+        })
+    }
+
+    fn surface_output_geometry(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> Option<SurfaceOutputGeometry> {
+        let attachment = self
+            .clients
+            .get(&client_id)?
+            .surfaces
+            .get(&surface_id)?
+            .current_buffer;
+        self.surface_output_geometry_for_attachment(client_id, surface_id, attachment)
+    }
+
+    fn clip_output_damage(
+        &self,
+        x: i64,
+        y: i64,
+        width: u32,
+        height: u32,
+    ) -> Option<OutputDamageRect> {
+        let output_width = i64::from(self.framebuffer.width());
+        let output_height = i64::from(self.framebuffer.height());
+        let left = x.clamp(0, output_width);
+        let top = y.clamp(0, output_height);
+        let right = x.saturating_add(i64::from(width)).clamp(0, output_width);
+        let bottom = y.saturating_add(i64::from(height)).clamp(0, output_height);
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(OutputDamageRect {
+            x: left as u32,
+            y: top as u32,
+            width: (right - left) as u32,
+            height: (bottom - top) as u32,
+        })
+    }
+
+    fn validated_surface_local_damage(
+        &self,
+        geometry: SurfaceOutputGeometry,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<OutputDamageRect>, ()> {
+        let x = u32::try_from(x).map_err(|_| ())?;
+        let y = u32::try_from(y).map_err(|_| ())?;
+        if width == 0 || height == 0 {
+            return Err(());
+        }
+        let right = x.checked_add(width).ok_or(())?;
+        let bottom = y.checked_add(height).ok_or(())?;
+        if right > geometry.width || bottom > geometry.height {
+            return Err(());
+        }
+        Ok(self.clip_output_damage(
+            i64::from(geometry.x) + i64::from(x),
+            i64::from(geometry.y) + i64::from(y),
+            width,
+            height,
+        ))
+    }
+
+    fn surface_commit_damage_candidate(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+    ) -> SurfaceCommitDamageCandidate {
+        let full = || SurfaceCommitDamageCandidate {
+            damage: PresentationDamage::Full,
+            expected_geometry: None,
+        };
+        let Some(client) = self.clients.get(&client_id) else {
+            return full();
+        };
+        let Some(surface) = client.surfaces.get(&surface_id) else {
+            return full();
+        };
+        if surface.pending_damage.is_empty() || surface.pending_damage_unprovable {
+            return full();
+        }
+        let before = self.surface_output_geometry_for_attachment(
+            client_id,
+            surface_id,
+            surface.current_buffer,
+        );
+        let next_attachment = if surface.pending_attach {
+            surface.pending_buffer
+        } else {
+            surface.current_buffer
+        };
+        let expected =
+            self.surface_output_geometry_for_attachment(client_id, surface_id, next_attachment);
+        let Some(geometry) = before.filter(|before| Some(*before) == expected) else {
+            return full();
+        };
+        let mut rects = Vec::new();
+        for SurfaceDamageRect {
+            x,
+            y,
+            width,
+            height,
+        } in surface.pending_damage.iter().copied()
+        {
+            let Ok(width) = u32::try_from(width) else {
+                return full();
+            };
+            let Ok(height) = u32::try_from(height) else {
+                return full();
+            };
+            match self.validated_surface_local_damage(geometry, x, y, width, height) {
+                Ok(Some(rect)) => Self::merge_output_damage_rect(&mut rects, rect),
+                Ok(None) => {}
+                Err(()) => return full(),
+            }
+        }
+        SurfaceCommitDamageCandidate {
+            damage: PresentationDamage::Bounded(rects),
+            expected_geometry: Some(geometry),
+        }
+    }
+
+    fn surface_patch_presentation_damage(
+        &self,
+        client_id: ClientId,
+        surface_id: ObjectId,
+        patch: &SurfacePatchCurrent<'_>,
+    ) -> PresentationDamage {
+        let Some(geometry) = self.surface_output_geometry(client_id, surface_id) else {
+            return PresentationDamage::Full;
+        };
+        match self.validated_surface_local_damage(
+            geometry,
+            patch.x,
+            patch.y,
+            patch.width,
+            patch.height,
+        ) {
+            Ok(rect) => PresentationDamage::Bounded(rect.into_iter().collect()),
+            Err(()) => PresentationDamage::Full,
+        }
+    }
+
+    fn raised_window_presentation_damage(&self, window_id: WindowId) -> PresentationDamage {
+        let Some(owner) = self.windows.get(&window_id) else {
+            return PresentationDamage::Full;
+        };
+        let Some(surface_id) = self
+            .clients
+            .get(&owner.client_id)
+            .and_then(|client| client.toplevels.get(&owner.toplevel_id))
+            .map(|toplevel| toplevel.surface_id)
+        else {
+            return PresentationDamage::Full;
+        };
+        let Some(geometry) = self.surface_output_geometry(owner.client_id, surface_id) else {
+            return PresentationDamage::Full;
+        };
+        // Reordering this validated mapped surface cannot affect pixels outside
+        // its own footprint: every other surface retains the same relative
+        // order there. Occlusion can only make this conservative rectangle
+        // contain unchanged pixels.
+        PresentationDamage::Bounded(
+            self.clip_output_damage(
+                i64::from(geometry.x),
+                i64::from(geometry.y),
+                geometry.width,
+                geometry.height,
+            )
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    /// Whether the transport must wait before publishing the current logical
+    /// scene. A shell-owned focus transaction waits for its matching surface
+    /// commit, and a deferred recomposition batch waits until its accumulated
+    /// logical mutations have been materialized into the framebuffer.
     pub fn presentation_deferred(&self) -> bool {
-        self.deferred_focus_commit_owner.is_some()
+        self.deferred_focus_commit_owner.is_some() || self.recomposition_pending
     }
 
     /// Number of authenticated shell readiness fences waiting for the
@@ -710,44 +1059,50 @@ impl Server {
         else {
             return false;
         };
-        let Some(client) = self.clients.get_mut(&owner.client_id) else {
-            return false;
-        };
-        let Some(toplevel) = client.toplevels.get_mut(&owner.toplevel_id) else {
-            return false;
-        };
-        toplevel.normal_x = normal_x;
-        toplevel.normal_y = normal_y;
-        toplevel.normal_width = normal_width;
-        toplevel.normal_height = normal_height;
-        toplevel.minimized = minimized;
-        toplevel.maximized = maximized;
-        toplevel.initial_configure_sent = true;
-        if maximized {
-            toplevel.restore_origin = Some((normal_x, normal_y));
-            toplevel.x = 0;
-            toplevel.y = 0;
-        } else {
+        {
+            let Some(client) = self.clients.get_mut(&owner.client_id) else {
+                return false;
+            };
+            let Some(toplevel) = client.toplevels.get_mut(&owner.toplevel_id) else {
+                return false;
+            };
+            toplevel.normal_x = normal_x;
+            toplevel.normal_y = normal_y;
+            toplevel.normal_width = normal_width;
+            toplevel.normal_height = normal_height;
+            toplevel.minimized = minimized;
+            // Restore always establishes the saved normal baseline first.
+            // Defer the logical maximize transition until that configure has
+            // been emitted so the baseline cannot inherit MAXIMIZED.
+            toplevel.maximized = false;
+            toplevel.initial_configure_sent = true;
             toplevel.restore_origin = None;
             toplevel.x = normal_x;
             toplevel.y = normal_y;
         }
-        let normal_serial = client.next_configure_serial();
-        let _ = client.emit_xdg_toplevel_configure(
+        self.emit_toplevel_configure(
+            owner.client_id,
             owner.toplevel_id,
-            normal_serial,
             normal_width as i32,
             normal_height as i32,
-            0,
         );
         if maximized {
-            let maximized_serial = client.next_configure_serial();
-            let _ = client.emit_xdg_toplevel_configure(
+            let Some(toplevel) = self
+                .clients
+                .get_mut(&owner.client_id)
+                .and_then(|client| client.toplevels.get_mut(&owner.toplevel_id))
+            else {
+                return false;
+            };
+            toplevel.maximized = true;
+            toplevel.restore_origin = Some((normal_x, normal_y));
+            toplevel.x = 0;
+            toplevel.y = 0;
+            self.emit_toplevel_configure(
+                owner.client_id,
                 owner.toplevel_id,
-                maximized_serial,
                 work_width as i32,
                 work_height as i32,
-                display_proto::xdg_toplevel_state::MAXIMIZED,
             );
         }
         if let Some(restore) = self.restore_transaction.as_mut() {
@@ -854,7 +1209,7 @@ impl Server {
                     .find(|window_id| self.window_is_focusable(*window_id))
             });
         let focus = requested_focus.or(fallback_focus);
-        self.keyboard_focus = focus.and_then(|window_id| {
+        let next_focus = focus.and_then(|window_id| {
             let owner = self.windows.get(&window_id)?;
             let surface_id = self
                 .clients
@@ -864,6 +1219,7 @@ impl Server {
                 .surface_id;
             Some((owner.client_id, surface_id))
         });
+        self.transition_keyboard_focus(next_focus);
         if let Some(window_id) = focus {
             self.move_window_to_top(window_id);
         }
@@ -917,7 +1273,7 @@ impl Server {
                     .find(|window_id| self.window_is_focusable(*window_id))
             }) {
                 let owner = self.windows.get(&window_id).copied();
-                self.keyboard_focus = owner.and_then(|owner| {
+                let next_focus = owner.and_then(|owner| {
                     let surface_id = self
                         .clients
                         .get(&owner.client_id)?
@@ -926,6 +1282,7 @@ impl Server {
                         .surface_id;
                     Some((owner.client_id, surface_id))
                 });
+                self.transition_keyboard_focus(next_focus);
             }
         }
         self.request_recomposition();
@@ -1121,9 +1478,9 @@ impl Server {
     /// from `inject_pointer_motion`.
     fn advance_drag(&mut self, drag: DragState, pointer_x: i32, pointer_y: i32) {
         use display_proto::xdg_toplevel_resize_edge as edge;
-        use display_proto::xdg_toplevel_state;
         let dx = pointer_x - drag.start_pointer.0;
         let dy = pointer_y - drag.start_pointer.1;
+        let mut resize_dimensions = None;
         let moved = {
             let Some(client) = self.clients.get_mut(&drag.client_id) else {
                 return;
@@ -1171,18 +1528,14 @@ impl Server {
                     } else if edges & edge::TOP != 0 {
                         new_h = (start_h - dy).max(1);
                     }
-                    let serial = client.next_configure_serial();
-                    let _ = client.emit_xdg_toplevel_configure(
-                        drag.toplevel_id,
-                        serial,
-                        new_w,
-                        new_h,
-                        xdg_toplevel_state::RESIZING,
-                    );
+                    resize_dimensions = Some((new_w, new_h));
                     false
                 }
             }
         };
+        if let Some((width, height)) = resize_dimensions {
+            self.emit_toplevel_configure(drag.client_id, drag.toplevel_id, width, height);
+        }
         if moved {
             self.request_recomposition();
         }
@@ -1240,7 +1593,7 @@ impl Server {
         if state == display_proto::events::pointer_button_state::PRESSED && !is_shell_command {
             let prev_focus = self.keyboard_focus;
             let new_focus = (hit.client_id, hit.surface_id);
-            self.keyboard_focus = Some(new_focus);
+            self.transition_keyboard_focus(Some(new_focus));
             let focused_window_id = self.window_id_for_surface(hit.client_id, hit.surface_id);
             if focused_window_id
                 .map(|window_id| self.raise_window(window_id))
@@ -1283,22 +1636,20 @@ impl Server {
     /// configures, so this is the size the server "settles
     /// on".
     fn emit_resize_final_configure(&mut self, drag: DragState) {
-        let Some(client) = self.clients.get_mut(&drag.client_id) else {
-            return;
-        };
-        let surface_id = match client.toplevels.get(&drag.toplevel_id) {
-            Some(t) => t.surface_id,
-            None => return,
-        };
-        let (w, h) = client
-            .surfaces
-            .get(&surface_id)
-            .and_then(|s| s.current_buffer)
-            .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
-            .map(|info| (info.width as i32, info.height as i32))
+        let (width, height) = self
+            .clients
+            .get(&drag.client_id)
+            .and_then(|client| {
+                let surface_id = client.toplevels.get(&drag.toplevel_id)?.surface_id;
+                client
+                    .surfaces
+                    .get(&surface_id)
+                    .and_then(|surface| surface.current_buffer)
+                    .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
+                    .map(|buffer| (buffer.width as i32, buffer.height as i32))
+            })
             .unwrap_or((0, 0));
-        let serial = client.next_configure_serial();
-        let _ = client.emit_xdg_toplevel_configure(drag.toplevel_id, serial, w, h, 0);
+        self.emit_toplevel_configure(drag.client_id, drag.toplevel_id, width, height);
     }
 
     fn settle_drag_geometry(&mut self, drag: DragState) {
@@ -1329,16 +1680,46 @@ impl Server {
         }
     }
 
-    /// Inject a keyboard key event. Routes to the
-    /// currently-focused client + surface (if any). The
-    /// target client must have a bound `pmd_keyboard`
-    /// object; otherwise the event is silently dropped.
-    /// Returns the (client_id, surface_id) the event was
-    /// routed to, or `None` if no window has keyboard
-    /// focus.
+    /// Inject a physical keyboard transition. Ordinary keys route to the
+    /// currently-focused client's `pmd_keyboard`. A first F4 press while
+    /// either Alt key is held is instead consumed only when the authoritative
+    /// focus names a visible ordinary toplevel and the active authenticated
+    /// shell-manager can accept a target-specific `close_shortcut` event.
+    /// Repeated presses and the matching release remain consumed for that
+    /// physical hold. Returns the focused target involved, or `None` when no
+    /// window has keyboard focus.
     pub fn inject_keyboard_key(&mut self, key: u32, state: u32) -> Option<(ClientId, ObjectId)> {
-        let (client_id, surface_id) = self.keyboard_focus?;
-        let key = self.map_keyboard_key(key, state);
+        self.track_keyboard_modifier(key, state);
+        let focused = self.keyboard_focus;
+        if u8::try_from(key)
+            .ok()
+            .and_then(|raw| Scancode::try_from(raw).ok())
+            == Some(Scancode::F4)
+        {
+            match state {
+                key_state::PRESSED if !self.f4_down => {
+                    self.f4_down = true;
+                    self.f4_close_shortcut_consumed =
+                        self.alt_mask != 0 && self.try_emit_close_shortcut();
+                    if self.f4_close_shortcut_consumed {
+                        return focused;
+                    }
+                }
+                key_state::PRESSED if self.f4_close_shortcut_consumed => return focused,
+                key_state::RELEASED => {
+                    let consumed = self.f4_close_shortcut_consumed;
+                    self.f4_down = false;
+                    self.f4_close_shortcut_consumed = false;
+                    if consumed {
+                        return focused;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (client_id, surface_id) = focused?;
+        let key = self.map_keyboard_key(key);
         let client = self.clients.get_mut(&client_id)?;
         if client.keyboard_id.is_some() {
             let _ = client.emit_keyboard_key(surface_id, key, state);
@@ -1346,24 +1727,7 @@ impl Server {
         Some((client_id, surface_id))
     }
 
-    fn map_keyboard_key(&mut self, key: u32, state: u32) -> u32 {
-        let shift_bit = match u8::try_from(key)
-            .ok()
-            .and_then(|raw| Scancode::try_from(raw).ok())
-        {
-            Some(Scancode::ShiftLeft) => Some(1),
-            Some(Scancode::ShiftRight) => Some(2),
-            _ => None,
-        };
-        if let Some(bit) = shift_bit {
-            match state {
-                key_state::PRESSED => self.shift_mask |= bit,
-                key_state::RELEASED => self.shift_mask &= !bit,
-                _ => {}
-            }
-            return key;
-        }
-
+    fn map_keyboard_key(&self, key: u32) -> u32 {
         if self.keyboard_layout == KeyboardLayout::UsQwerty {
             return key;
         }
@@ -1371,10 +1735,73 @@ impl Server {
             .map_to_logical_scancode(key, self.shift_mask != 0, &self.logical_keymap)
     }
 
+    fn track_keyboard_modifier(&mut self, key: u32, state: u32) {
+        let modifier = match u8::try_from(key)
+            .ok()
+            .and_then(|raw| Scancode::try_from(raw).ok())
+        {
+            Some(Scancode::ShiftLeft) => Some((&mut self.shift_mask, 1)),
+            Some(Scancode::ShiftRight) => Some((&mut self.shift_mask, 2)),
+            Some(Scancode::AltLeft) => Some((&mut self.alt_mask, 1)),
+            Some(Scancode::AltRight) => Some((&mut self.alt_mask, 2)),
+            _ => None,
+        };
+        let Some((mask, bit)) = modifier else {
+            return;
+        };
+        match state {
+            key_state::PRESSED => *mask |= bit,
+            key_state::RELEASED => *mask &= !bit,
+            _ => {}
+        }
+    }
+
+    /// Emit one privileged shortcut event only after both endpoints have been
+    /// resolved from server-owned state. The work-area owner is the active
+    /// replaceable desktop shell; binding that object was capability-gated
+    /// from kernel-authenticated peer credentials.
+    fn try_emit_close_shortcut(&mut self) -> bool {
+        use abi::cap::Cap;
+
+        let Some(window_id) = self
+            .keyboard_focus
+            .and_then(|(client_id, surface_id)| {
+                let client = self.clients.get(&client_id)?;
+                if client.capabilities.contains(Cap::Shell) {
+                    return None;
+                }
+                self.window_id_for_surface(client_id, surface_id)
+            })
+            .filter(|window_id| self.window_is_focusable(*window_id))
+        else {
+            return false;
+        };
+        let Some(shell_client_id) = self.work_area_owner else {
+            return false;
+        };
+        let Some(shell_manager_id) = self.clients.get(&shell_client_id).and_then(|client| {
+            (client.capabilities.contains(Cap::Shell)
+                && client
+                    .shell_manager_version
+                    .is_some_and(|version| version >= 2))
+            .then_some(client.shell_manager_id)
+            .flatten()
+        }) else {
+            return false;
+        };
+        self.clients
+            .get_mut(&shell_client_id)
+            .is_some_and(|client| {
+                client
+                    .emit_close_shortcut(shell_manager_id, window_id.0)
+                    .is_ok()
+            })
+    }
+
     /// Explicitly set keyboard focus. Used by tests and
     /// by the desktop shell's click-to-focus path.
     pub fn set_keyboard_focus(&mut self, focus: Option<(ClientId, ObjectId)>) {
-        self.keyboard_focus = focus;
+        self.transition_keyboard_focus(focus);
         let raised = focus
             .and_then(|(client_id, surface_id)| self.window_id_for_surface(client_id, surface_id))
             .map(|window_id| self.raise_window(window_id))
@@ -1382,6 +1809,134 @@ impl Server {
         if raised {
             self.request_recomposition();
         }
+    }
+
+    /// Change the keyboard-focus target and publish the activation transition
+    /// to both affected client-owned toplevels. Activation is part of the
+    /// xdg-toplevel configure state, so a shell focus event alone is
+    /// insufficient for ordinary applications to repaint focused chrome.
+    fn transition_keyboard_focus(&mut self, focus: Option<(ClientId, ObjectId)>) -> bool {
+        let previous = self.keyboard_focus;
+        if previous == focus {
+            return false;
+        }
+        self.keyboard_focus = focus;
+        if let Some(previous) = previous {
+            self.emit_current_toplevel_configure(previous);
+        }
+        if let Some(focus) = focus {
+            self.emit_current_toplevel_configure(focus);
+        }
+        true
+    }
+
+    /// Select the topmost remaining mapped, visible toplevel. Destructive and
+    /// minimize paths use an exclusion set while the outgoing window is still
+    /// registered so deactivation can be emitted before removal.
+    fn fallback_keyboard_focus(
+        &self,
+        excluded: &BTreeSet<WindowId>,
+    ) -> Option<(ClientId, ObjectId)> {
+        self.z_order.iter().rev().find_map(|window_id| {
+            if excluded.contains(window_id) || !self.window_is_focusable(*window_id) {
+                return None;
+            }
+            let owner = self.windows.get(window_id)?;
+            let surface_id = self
+                .clients
+                .get(&owner.client_id)?
+                .toplevels
+                .get(&owner.toplevel_id)?
+                .surface_id;
+            Some((owner.client_id, surface_id))
+        })
+    }
+
+    /// Compose the persistent and transient configure state for one
+    /// toplevel. Keeping this in one place prevents a later resize or
+    /// maximize configure from accidentally clearing ACTIVATED.
+    fn composed_toplevel_states(&self, client_id: ClientId, toplevel_id: ObjectId) -> u32 {
+        use display_proto::xdg_toplevel_state;
+
+        let Some(toplevel) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.toplevels.get(&toplevel_id))
+        else {
+            return 0;
+        };
+        let mut states = 0;
+        if toplevel.maximized {
+            states |= xdg_toplevel_state::MAXIMIZED;
+        }
+        if self.keyboard_focus == Some((client_id, toplevel.surface_id)) {
+            states |= xdg_toplevel_state::ACTIVATED;
+        }
+        if self.active_drag.is_some_and(|drag| {
+            drag.client_id == client_id
+                && drag.toplevel_id == toplevel_id
+                && matches!(drag.kind, DragKind::Resize { .. })
+        }) {
+            states |= xdg_toplevel_state::RESIZING;
+        }
+        states
+    }
+
+    /// Emit one configure using the authoritative state composer. Geometry
+    /// producers supply only dimensions; persistent/transient state cannot be
+    /// lost by bypassing focus, maximize, or resize bits at individual sites.
+    fn emit_toplevel_configure(
+        &mut self,
+        client_id: ClientId,
+        toplevel_id: ObjectId,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let states = self.composed_toplevel_states(client_id, toplevel_id);
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        let serial = client.next_configure_serial();
+        client
+            .emit_xdg_toplevel_configure(toplevel_id, serial, width, height, states)
+            .is_ok()
+    }
+
+    /// Emit a bounded focus-transition configure for a live mapped surface.
+    /// Focus changes touch at most the previous and next targets; no global
+    /// client/window scan is needed.
+    fn emit_current_toplevel_configure(&mut self, target: (ClientId, ObjectId)) {
+        let (client_id, surface_id) = target;
+        let Some((toplevel_id, width, height)) = self.clients.get(&client_id).and_then(|client| {
+            let toplevel_id = client.toplevel_by_surface.get(&surface_id).copied()?;
+            let toplevel = client.toplevels.get(&toplevel_id)?;
+            if !toplevel.mapped_once || !toplevel.initial_configure_sent {
+                return None;
+            }
+            let dimensions = if toplevel.maximized {
+                Some((self.work_area_width(), self.work_area_height()))
+            } else {
+                client
+                    .surfaces
+                    .get(&surface_id)
+                    .and_then(|surface| surface.current_buffer)
+                    .and_then(|attachment| client.buffers.get(&attachment.buffer_id))
+                    .map(|buffer| (buffer.width, buffer.height))
+                    .or_else(|| {
+                        (toplevel.normal_width > 0 && toplevel.normal_height > 0)
+                            .then_some((toplevel.normal_width, toplevel.normal_height))
+                    })
+            }?;
+            Some((toplevel_id, dimensions.0, dimensions.1))
+        }) else {
+            return;
+        };
+        self.emit_toplevel_configure(
+            client_id,
+            toplevel_id,
+            width.min(i32::MAX as u32) as i32,
+            height.min(i32::MAX as u32) as i32,
+        );
     }
 
     /// Accept a new client connection. Returns the
@@ -1512,15 +2067,23 @@ impl Server {
             })
             .collect();
         let had_windows = !dying_windows.is_empty();
+        let dying_window_ids = dying_windows
+            .iter()
+            .map(|(_, window_id)| *window_id)
+            .collect::<BTreeSet<_>>();
+        let focus_changed = self.keyboard_focus.map(|(client_id, _)| client_id) == Some(id);
+        let fallback_focus = focus_changed
+            .then(|| self.fallback_keyboard_focus(&dying_window_ids))
+            .flatten();
+        if focus_changed {
+            self.transition_keyboard_focus(fallback_focus);
+        }
         let removed = self.clients.remove(&id);
         if let Some(client) = removed.as_ref() {
             self.pool_bytes = self.pool_bytes.saturating_sub(client.pool_bytes_len());
             self.toplevel_metadata_bytes = self
                 .toplevel_metadata_bytes
                 .saturating_sub(client.toplevel_metadata_bytes_len());
-        }
-        if self.keyboard_focus.map(|(client_id, _)| client_id) == Some(id) {
-            self.keyboard_focus = None;
         }
         if self.active_drag.map(|drag| drag.client_id) == Some(id) {
             self.active_drag = None;
@@ -1538,10 +2101,6 @@ impl Server {
         self.present_fence_clients.remove(&id);
         self.pending_present_fences
             .retain(|(client_id, _)| *client_id != id);
-        let dying_window_ids = dying_windows
-            .iter()
-            .map(|(_, window_id)| *window_id)
-            .collect::<BTreeSet<_>>();
         let shifted_windows = self.remove_from_z_order(&dying_window_ids);
         for (toplevel_id, window_id) in dying_windows {
             self.window_ids.remove(&(id, toplevel_id));
@@ -1554,6 +2113,14 @@ impl Server {
         }
         for window_id in shifted_windows {
             self.broadcast_window_state_changed(window_id);
+        }
+        if focus_changed {
+            let focused_window = fallback_focus
+                .and_then(|(client_id, surface_id)| {
+                    self.window_id_for_surface(client_id, surface_id)
+                })
+                .map_or(0, |window_id| window_id.0);
+            self.broadcast_window_focused(focused_window);
         }
         let restore_aborted =
             owned_restore && self.abort_restore(shell_restore_status::ABORTED, false);
@@ -1683,6 +2250,12 @@ impl Server {
             .clients
             .get(&client_id)
             .and_then(|c| c.get(header.object_id));
+        let surface_commit_damage = (pre_interface == Some(Interface::Surface)
+            && header.opcode == 7)
+            .then(|| self.surface_commit_damage_candidate(client_id, header.object_id));
+        let surface_patch = (pre_interface == Some(Interface::Surface) && header.opcode == 8)
+            .then(|| SurfacePatchCurrent::decode(payload).ok())
+            .flatten();
         let surface_geometry_before = if pre_interface == Some(Interface::Surface) {
             self.clients.get(&client_id).and_then(|client| {
                 let attachment = client.surfaces.get(&header.object_id)?.current_buffer?;
@@ -1695,14 +2268,14 @@ impl Server {
         let reserved_shell_command = pre_interface == Some(Interface::ShellManager)
             && matches!(header.opcode, 2 | 3 | 4 | 5 | 7)
             && self.pending_shell_command_owner == Some(client_id);
-        let restore_holds_toplevel_geometry = pre_interface == Some(Interface::XdgToplevel)
-            && matches!(header.opcode, 5..=8)
+        let restore_holds_toplevel_owner_state = pre_interface == Some(Interface::XdgToplevel)
+            && matches!(header.opcode, 5..=9)
             && self
                 .clients
                 .get(&client_id)
                 .and_then(|client| client.toplevels.get(&header.object_id))
                 .is_some_and(|toplevel| toplevel.hidden_for_restore);
-        if restore_holds_toplevel_geometry {
+        if restore_holds_toplevel_owner_state {
             return Ok(());
         }
 
@@ -1796,7 +2369,15 @@ impl Server {
             let placement_settled =
                 self.settle_restore_placement_after_commit(client_id, header.object_id);
             let newly_focused = self.focus_newly_mapped_toplevel(client_id, header.object_id);
-            self.composite_surface_commit(client_id, header.object_id);
+            let commit_damage = surface_commit_damage
+                .filter(|candidate| {
+                    candidate.expected_geometry.is_some()
+                        && candidate.expected_geometry
+                            == self.surface_output_geometry(client_id, header.object_id)
+                })
+                .map(|candidate| candidate.damage)
+                .unwrap_or(PresentationDamage::Full);
+            self.composite_surface_commit(client_id, header.object_id, commit_damage);
             if self.deferred_focus_commit_owner == Some(client_id) {
                 self.deferred_focus_commit_owner = None;
             }
@@ -1818,14 +2399,31 @@ impl Server {
         if pre_interface == Some(Interface::Surface) && header.opcode == 8
         /* patch_current */
         {
-            self.request_recomposition();
+            let damage = surface_patch
+                .as_ref()
+                .map(|patch| {
+                    self.surface_patch_presentation_damage(client_id, header.object_id, patch)
+                })
+                .unwrap_or(PresentationDamage::Full);
+            self.request_recomposition_with_damage(damage);
         }
 
         if pre_interface == Some(Interface::Surface) && header.opcode == 1
         /* destroy */
         {
             if self.keyboard_focus == Some((client_id, header.object_id)) {
-                self.keyboard_focus = None;
+                // A surface carrying a toplevel role cannot reach this hook:
+                // client dispatch rejects it with SurfaceHasToplevel. Keep
+                // fallback semantics complete for an explicitly-focused
+                // roleless surface (primarily fixture/debug use); there is no
+                // old toplevel configure to emit, but the surviving mapped
+                // target still receives ACTIVATED.
+                let fallback_focus = self.fallback_keyboard_focus(&BTreeSet::new());
+                self.transition_keyboard_focus(fallback_focus);
+                let focused_window = fallback_focus
+                    .and_then(|(owner, surface)| self.window_id_for_surface(owner, surface))
+                    .map_or(0, |window_id| window_id.0);
+                self.broadcast_window_focused(focused_window);
             }
             self.request_recomposition();
         }
@@ -1905,6 +2503,15 @@ impl Server {
                 }
                 7 /* move */ | 8 /* resize */ => {
                     self.start_drag_from_request(client_id, header.object_id, header.opcode, payload);
+                }
+                9 /* set_minimized */ => {
+                    if let Some(window_id) = self
+                        .window_ids
+                        .get(&(client_id, header.object_id))
+                        .copied()
+                    {
+                        self.set_window_minimized(window_id.0, true);
+                    }
                 }
                 _ => {}
             }
@@ -2314,7 +2921,7 @@ impl Server {
             return None;
         }
         let window_id = self.window_ids.get(&(client_id, toplevel_id)).copied()?;
-        self.keyboard_focus = Some((client_id, surface_id));
+        self.transition_keyboard_focus(Some((client_id, surface_id)));
         self.raise_window(window_id);
         Some(window_id)
     }
@@ -2369,6 +2976,19 @@ impl Server {
     }
 
     fn destroy_toplevel(&mut self, client_id: ClientId, toplevel_id: ObjectId) {
+        let window_id = self.window_ids.get(&(client_id, toplevel_id)).copied();
+        let focused_surface = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.toplevels.get(&toplevel_id))
+            .map(|toplevel| toplevel.surface_id)
+            .filter(|surface_id| self.keyboard_focus == Some((client_id, *surface_id)));
+        let fallback_focus = focused_surface.and_then(|_| {
+            self.fallback_keyboard_focus(&window_id.into_iter().collect::<BTreeSet<_>>())
+        });
+        if focused_surface.is_some() {
+            self.transition_keyboard_focus(fallback_focus);
+        }
         let removed_surface = self.clients.get_mut(&client_id).and_then(|client| {
             let pool_bytes_before = client.pool_bytes_len();
             let metadata_bytes_before = client.toplevel_metadata_bytes_len();
@@ -2387,7 +3007,7 @@ impl Server {
             ))
         });
         let Some((
-            surface_id,
+            _surface_id,
             pool_bytes_before,
             pool_bytes_after,
             metadata_bytes_before,
@@ -2404,9 +3024,6 @@ impl Server {
             .toplevel_metadata_bytes
             .saturating_sub(metadata_bytes_before)
             .saturating_add(metadata_bytes_after);
-        if self.keyboard_focus == Some((client_id, surface_id)) {
-            self.keyboard_focus = None;
-        }
         if self
             .active_drag
             .map(|drag| (drag.client_id, drag.toplevel_id))
@@ -2425,6 +3042,12 @@ impl Server {
             for shifted_window in shifted_windows {
                 self.broadcast_window_state_changed(shifted_window);
             }
+        }
+        if focused_surface.is_some() {
+            let focused_window = fallback_focus
+                .and_then(|(owner, surface)| self.window_id_for_surface(owner, surface))
+                .map_or(0, |window_id| window_id.0);
+            self.broadcast_window_focused(focused_window);
         }
         self.request_recomposition();
     }
@@ -2646,6 +3269,9 @@ impl Server {
         {
             flags |= shell_window_state_flags::RESTORE_PLACEMENT_APPLIED;
         }
+        if client.capabilities.contains(abi::cap::Cap::Shell) {
+            flags |= shell_window_state_flags::SHELL_OWNED;
+        }
         Some(ShellWindowState {
             snapshot_id,
             window_id: window_id.0,
@@ -2728,14 +3354,21 @@ impl Server {
                 return;
             };
             let cid = owner.client_id;
-            self.keyboard_focus = Some((cid, surface_id));
+            self.transition_keyboard_focus(Some((cid, surface_id)));
+            let raise_damage = self.raised_window_presentation_damage(global_id);
             let raised = self.raise_window(global_id);
             if restored || raised {
+                let damage = if restored {
+                    PresentationDamage::Full
+                } else {
+                    raise_damage
+                };
                 if let Some(shell_client_id) = defer_until_commit_by {
                     self.deferred_focus_commit_owner = Some(shell_client_id);
+                    self.accumulate_presentation_damage(damage);
                 } else {
                     self.deferred_focus_commit_owner = None;
-                    self.request_recomposition();
+                    self.request_recomposition_with_damage(damage);
                 }
             }
             self.broadcast_window_focused(window_id);
@@ -2792,7 +3425,7 @@ impl Server {
             return false;
         };
 
-        self.keyboard_focus = Some((owner.client_id, surface_id));
+        self.transition_keyboard_focus(Some((owner.client_id, surface_id)));
         let raised = self.raise_window(global_id);
         let generation = self.scene_generation;
         if self
@@ -2823,10 +3456,9 @@ impl Server {
         toplevel_id: display_proto::ids::ObjectId,
         maximize: bool,
     ) -> Result<(), ServerError> {
-        use display_proto::xdg_toplevel_state;
         let work_area_w = self.work_area_width();
         let work_area_h = self.work_area_height();
-        let moved = {
+        let (moved, width, height) = {
             let client = self
                 .clients
                 .get_mut(&client_id)
@@ -2869,27 +3501,18 @@ impl Server {
                     false
                 }
             };
-            let serial = client.next_configure_serial();
-            let (w, h, states) = if maximize {
-                (
-                    work_area_w as i32,
-                    work_area_h as i32,
-                    xdg_toplevel_state::MAXIMIZED,
-                )
+            let (width, height) = if maximize {
+                (work_area_w as i32, work_area_h as i32)
             } else {
                 let toplevel = client
                     .toplevels
                     .get(&toplevel_id)
                     .ok_or(ServerError::NoSuchClient { id: client_id })?;
-                (
-                    toplevel.normal_width as i32,
-                    toplevel.normal_height as i32,
-                    0,
-                )
+                (toplevel.normal_width as i32, toplevel.normal_height as i32)
             };
-            let _ = client.emit_xdg_toplevel_configure(toplevel_id, serial, w, h, states);
-            moved
+            (moved, width, height)
         };
+        self.emit_toplevel_configure(client_id, toplevel_id, width, height);
         if moved {
             self.request_recomposition();
         }
@@ -3007,42 +3630,45 @@ impl Server {
         let output_h = self.framebuffer.height() as i32;
         let work_area_w = self.work_area_width() as i32;
         let work_area_h = self.work_area_height() as i32;
-        let Some(client) = self.clients.get_mut(&client_id) else {
+        let Some(toplevel_id) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.toplevel_by_surface.get(&surface_id).copied())
+        else {
             return;
         };
-        // Find the toplevel that owns this surface.
-        let toplevel_id = match client.toplevel_by_surface.get(&surface_id) {
-            Some(&id) => id,
-            None => return,
+        let Some((already_sent, is_shell, origin)) = self.clients.get(&client_id).map(|client| {
+            let toplevel = client.toplevels.get(&toplevel_id);
+            (
+                toplevel.is_none_or(|toplevel| toplevel.initial_configure_sent),
+                client.capabilities.contains(Cap::Shell),
+                toplevel
+                    .map(|toplevel| (toplevel.x.max(0), toplevel.y.max(0)))
+                    .unwrap_or((0, 0)),
+            )
+        }) else {
+            return;
         };
-        let already_sent = client
-            .toplevels
-            .get(&toplevel_id)
-            .map(|t| t.initial_configure_sent)
-            .unwrap_or(true);
         if already_sent {
             return;
         }
-        let (configured_w, configured_h) = if client.capabilities.contains(Cap::Shell) {
+        let (configured_w, configured_h) = if is_shell {
             // The desktop shell paints the wallpaper and reserved chrome over
             // the complete output. Its own surface is not constrained by the
             // work area it publishes for ordinary application windows.
             (output_w, output_h)
         } else {
-            let (origin_x, origin_y) = client
-                .toplevels
-                .get(&toplevel_id)
-                .map(|top| (top.x.max(0), top.y.max(0)))
-                .unwrap_or((0, 0));
             (
-                work_area_w.saturating_sub(origin_x).max(1),
-                work_area_h.saturating_sub(origin_y).max(1),
+                work_area_w.saturating_sub(origin.0).max(1),
+                work_area_h.saturating_sub(origin.1).max(1),
             )
         };
-        let serial = client.next_configure_serial();
-        let _ =
-            client.emit_xdg_toplevel_configure(toplevel_id, serial, configured_w, configured_h, 0);
-        if let Some(toplevel) = client.toplevels.get_mut(&toplevel_id) {
+        self.emit_toplevel_configure(client_id, toplevel_id, configured_w, configured_h);
+        if let Some(toplevel) = self
+            .clients
+            .get_mut(&client_id)
+            .and_then(|client| client.toplevels.get_mut(&toplevel_id))
+        {
             toplevel.initial_configure_sent = true;
         }
     }
@@ -3062,12 +3688,37 @@ impl Server {
         let Some(client) = self.clients.get_mut(&client_id) else {
             return;
         };
-        let _ = client.emit_global(registry_id, 1, "pmd_compositor", 1);
-        let _ = client.emit_global(registry_id, 2, "pmd_shm", 1);
-        let _ = client.emit_global(registry_id, 3, "pmd_xdg_shell", 1);
-        let _ = client.emit_global(registry_id, 4, "pmd_seat", 1);
+        let _ = client.emit_global(
+            registry_id,
+            1,
+            "pmd_compositor",
+            Interface::Compositor.supported_version(),
+        );
+        let _ = client.emit_global(
+            registry_id,
+            2,
+            "pmd_shm",
+            Interface::Shm.supported_version(),
+        );
+        let _ = client.emit_global(
+            registry_id,
+            3,
+            "pmd_xdg_shell",
+            Interface::XdgShell.supported_version(),
+        );
+        let _ = client.emit_global(
+            registry_id,
+            4,
+            "pmd_seat",
+            Interface::Seat.supported_version(),
+        );
         if client.capabilities.contains(Cap::Shell) {
-            let _ = client.emit_global(registry_id, 5, "pmd_shell_manager", 2);
+            let _ = client.emit_global(
+                registry_id,
+                5,
+                "pmd_shell_manager",
+                Interface::ShellManager.supported_version(),
+            );
         }
     }
 
@@ -3100,9 +3751,6 @@ impl Server {
         if changed {
             let cleared_focus =
                 minimized && self.keyboard_focus == Some((owner.client_id, surface_id));
-            if cleared_focus {
-                self.keyboard_focus = None;
-            }
             if minimized
                 && self
                     .active_drag
@@ -3111,10 +3759,23 @@ impl Server {
             {
                 self.active_drag = None;
             }
+            let fallback_focus = if cleared_focus {
+                self.fallback_keyboard_focus(&BTreeSet::new())
+            } else {
+                None
+            };
+            if cleared_focus {
+                self.transition_keyboard_focus(fallback_focus);
+            }
             self.request_recomposition();
             self.broadcast_window_state_changed(WindowId(window_id));
             if cleared_focus {
-                self.broadcast_window_focused(0);
+                let focused_window = fallback_focus
+                    .and_then(|(client_id, surface_id)| {
+                        self.window_id_for_surface(client_id, surface_id)
+                    })
+                    .map_or(0, |window_id| window_id.0);
+                self.broadcast_window_focused(focused_window);
             }
         }
         true
@@ -3139,6 +3800,7 @@ impl Server {
         &mut self,
         _client_id: ClientId,
         _surface_id: display_proto::ids::ObjectId,
+        damage: PresentationDamage,
     ) {
         // Re-composite the whole scene: clear the backbuffer,
         // draw roleless base-plane surfaces, then draw every
@@ -3147,7 +3809,7 @@ impl Server {
         // surface.commit would not restore the OTHER
         // toplevels' pixels and the shell's wallpaper paint
         // would erase every app window.
-        self.request_recomposition();
+        self.request_recomposition_with_damage(damage);
     }
 
     /// Clear and reconstruct the complete scene. Roleless

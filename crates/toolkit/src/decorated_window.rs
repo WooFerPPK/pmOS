@@ -1,7 +1,7 @@
 //! `DecoratedWindow` — the T129 client-side decorations facade.
 //!
 //! Composes a [`Window`] with a [`WindowFrame`] so apps get a
-//! titlebar + close button + 1-pixel border around their content
+//! titlebar + caption controls + 1-pixel border around their content
 //! "for free" without hand-rolling the chrome geometry. The
 //! decoration is **client-side** per the spec — the server has
 //! no concept of a window's titlebar or close button; the client
@@ -12,7 +12,7 @@
 //!
 //! ```text
 //!     ┌──────────────────────────────────┐  ┐
-//!     │ app-id                       [x] │  │ TITLEBAR_HEIGHT
+//!     │ app-id                    [_][□][x] │ TITLEBAR_HEIGHT
 //!     ├──────────────────────────────────┤  ┘
 //!     │                                  │
 //!     │  Content area (the app paints    │
@@ -43,9 +43,8 @@
 //! 6. on a pointer-down event, `decorated.handle_pointer_down(x,
 //!    y)` returns a [`DecoratedPointerOutcome`] telling the app
 //!    whether the click landed on the titlebar (drag-to-move),
-//!    the close button (auto-fires `close()` on the underlying
-//!    Window), or the content area (apps route the click to
-//!    their own widgets).
+//!    a caption control, a draggable titlebar, or the content
+//!    area (apps route the click to their own widgets).
 //!
 //! Auto-resize: when the server sends a configure event with a
 //! new size, `DecoratedWindow::dispatch` resizes the contained
@@ -69,11 +68,17 @@ use crate::window::Window;
 /// non-titlebar edge.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DecoratedPointerOutcome {
+    /// Press landed on the minimize caption control. The caller should send
+    /// the owner-scoped minimize request through this decorated window.
+    Minimize,
+    /// Press landed on the maximize/restore caption control. The caller
+    /// toggles based on [`DecoratedWindow::is_maximized`].
+    ToggleMaximize,
     /// Press landed on the close button. The decorated window
     /// has already flipped its internal close-requested flag;
     /// the app should `break` out of its main loop after this.
     Close,
-    /// Press landed on the titlebar outside the close button.
+    /// Press landed on the titlebar outside the caption controls.
     /// Apps that support drag-to-move call
     /// [`DecoratedWindow::request_move`] with the pointer-event
     /// serial to ask the server to start an interactive move.
@@ -262,6 +267,8 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
             return DecoratedPointerOutcome::ResizeEdge(edges);
         }
         match self.frame.pointer_down(x, y) {
+            PointerOutcome::Minimize => DecoratedPointerOutcome::Minimize,
+            PointerOutcome::ToggleMaximize => DecoratedPointerOutcome::ToggleMaximize,
             PointerOutcome::Close => {
                 self.close_clicked = true;
                 DecoratedPointerOutcome::Close
@@ -306,7 +313,10 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
     pub fn dispatch(
         &mut self,
     ) -> Result<Vec<crate::protocol::ClientEventWithPayload>, ClientError> {
-        self.window.dispatch()
+        let events = self.window.dispatch()?;
+        self.frame.set_focused(self.window.is_activated());
+        self.frame.set_maximized(self.window.is_maximized());
+        Ok(events)
     }
 
     /// Has the user closed this window? True when either the
@@ -330,6 +340,13 @@ impl<'a, C: Connection> DecoratedWindow<'a, C> {
     /// chrome to that size on the next dispatch tick.
     pub fn set_maximized(&mut self) -> Result<(), ClientError> {
         self.window.set_maximized()
+    }
+
+    /// Ask the display server to hide this owner-controlled toplevel. This is
+    /// distinct from shell-manager minimization, which can target other
+    /// clients by server-global window ID.
+    pub fn set_minimized(&mut self) -> Result<(), ClientError> {
+        self.window.set_minimized()
     }
 
     /// Send `pmd_xdg_toplevel.unset_maximized()`. The server's
@@ -441,6 +458,8 @@ mod tests {
         // surfaces every callsite.
         fn describe(o: DecoratedPointerOutcome) -> &'static str {
             match o {
+                DecoratedPointerOutcome::Minimize => "minimize",
+                DecoratedPointerOutcome::ToggleMaximize => "toggle_maximize",
                 DecoratedPointerOutcome::Close => "close",
                 DecoratedPointerOutcome::Titlebar => "titlebar",
                 DecoratedPointerOutcome::ResizeEdge(_) => "resize_edge",
@@ -448,6 +467,11 @@ mod tests {
                 DecoratedPointerOutcome::Outside => "outside",
             }
         }
+        assert_eq!(describe(DecoratedPointerOutcome::Minimize), "minimize");
+        assert_eq!(
+            describe(DecoratedPointerOutcome::ToggleMaximize),
+            "toggle_maximize"
+        );
         assert_eq!(describe(DecoratedPointerOutcome::Close), "close");
         assert_eq!(describe(DecoratedPointerOutcome::Titlebar), "titlebar");
         assert_eq!(

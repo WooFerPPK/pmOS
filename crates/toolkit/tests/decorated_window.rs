@@ -117,6 +117,27 @@ fn close_button_click_returns_close_and_flips_close_requested() {
 }
 
 #[test]
+fn minimize_and_maximize_buttons_return_distinct_outcomes() {
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 300, 200);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+
+    let minimize = dw.frame().minimize_button_rect();
+    assert_eq!(
+        dw.handle_pointer_down(minimize.x + 1, minimize.y + 1),
+        DecoratedPointerOutcome::Minimize
+    );
+    assert!(!dw.close_requested());
+
+    let maximize = dw.frame().maximize_button_rect();
+    assert_eq!(
+        dw.handle_pointer_down(maximize.x + 1, maximize.y + 1),
+        DecoratedPointerOutcome::ToggleMaximize
+    );
+    assert!(!dw.close_requested());
+}
+
+#[test]
 fn titlebar_click_outside_close_button_returns_titlebar() {
     let mut app = build_app();
     let bounds = Rect::new(0, 0, 300, 200);
@@ -167,6 +188,7 @@ fn resize_re_anchors_the_close_button_to_new_top_right() {
     // After resize, the close button should sit ~CLOSE_BUTTON_MARGIN
     // from the right edge of the new bounds (400).
     let expected_x = bounds_b.x + (bounds_b.width as i32)
+        - (BORDER_WIDTH as i32)
         - (CLOSE_BUTTON_MARGIN as i32)
         - (CLOSE_BUTTON_SIZE as i32);
     assert_eq!(cb_b.x, expected_x);
@@ -225,6 +247,15 @@ fn decorated_window_set_maximized_forwards_to_window() {
     // window state hasn't been mutated client-side
     // (is_maximized still false until configure lands).
     assert!(!dw.is_maximized());
+}
+
+#[test]
+fn decorated_window_set_minimized_forwards_to_window() {
+    let mut app = build_app();
+    let bounds = Rect::new(0, 0, 200, 100);
+    let mut dw = DecoratedWindow::new(&mut app, bounds, "app").expect("new");
+    dw.set_minimized().expect("set_minimized");
+    assert!(!dw.close_requested());
 }
 
 #[test]

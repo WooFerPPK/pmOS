@@ -160,6 +160,21 @@ fn surface_patch_current_encodes_one_bounded_typed_request() {
 }
 
 #[test]
+fn xdg_toplevel_set_minimized_encodes_opcode_nine_with_empty_payload() {
+    let mut client = boot();
+    let toplevel = client.bind_new(Interface::XdgToplevel).unwrap();
+
+    client
+        .xdg_toplevel_set_minimized(toplevel)
+        .expect("set_minimized request");
+
+    let bytes = client.drain_outbound();
+    let header = MessageHeader::decode(&bytes).unwrap();
+    assert_eq!((header.object_id, header.opcode), (toplevel, 9));
+    assert_eq!(header.length as usize, HEADER_SIZE);
+}
+
+#[test]
 fn surface_patch_current_rejects_invalid_shape_before_sending() {
     let mut c = boot();
     let surface = c.bind_new(Interface::Surface).unwrap();

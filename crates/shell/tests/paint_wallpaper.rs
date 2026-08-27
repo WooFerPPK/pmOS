@@ -1872,9 +1872,9 @@ fn production_six_app_focus_changes_damage_only_old_and_new_entries_on_alternati
             {
                 self.attach_count += 1;
                 let click_x = match self.attach_count {
-                    // The typical-desktop workload has seven entries: the
-                    // shell plus six launched apps. Its two Term windows are
-                    // indexes 1 and 6, with fitted 121px entry widths.
+                    // The desktop shell is retained privately, leaving six
+                    // visible app tasks. Its two Term windows are indexes 0
+                    // and 5, with fitted 142px entry widths.
                     2 => Some(836),
                     3 => Some(221),
                     _ => None,
@@ -1969,6 +1969,7 @@ fn production_six_app_focus_changes_damage_only_old_and_new_entries_on_alternati
     ] {
         taskbar.add_window(window_id, title, app_id);
     }
+    taskbar.set_shell_window_id(1);
     taskbar.set_focused_window(2);
     let exit = run_desktop_shell_with_preferences(
         connection,
@@ -1999,8 +2000,8 @@ fn production_six_app_focus_changes_damage_only_old_and_new_entries_on_alternati
         );
     }
     let expected_entry_pairs = [
-        [(213, 738, 121, 28), (828, 738, 121, 28)],
-        [(828, 738, 121, 28), (213, 738, 121, 28)],
+        [(90, 738, 142, 28), (810, 738, 142, 28)],
+        [(810, 738, 142, 28), (90, 738, 142, 28)],
     ];
     for (pair, expected) in damages[2..].chunks_exact(2).zip(expected_entry_pairs) {
         assert_eq!(

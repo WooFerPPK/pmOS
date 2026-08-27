@@ -360,6 +360,7 @@ dependencies = [
 name = "sample-app"
 version = "0.1.0"
 dependencies = [
+ "display-proto",
  "toolkit",
 ]
 

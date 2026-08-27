@@ -15,17 +15,23 @@
 //! process spawn, and pipeline implementation as the CLI shell without
 //! blocking display dispatch.
 
-use display_proto::events::{key_state, KeyboardKey};
+use display_proto::events::{key_state, pointer_button_state, KeyboardKey, PointerButton};
 use display_proto::Interface;
 use toolkit::draw::{Canvas, Color, Rect};
+use toolkit::theme::Theme;
+use toolkit::widget::frame::{
+    PointerOutcome as ChromePointerOutcome, WindowFrame, BORDER_WIDTH, TITLEBAR_HEIGHT,
+};
 use toolkit::{
     App, BufferPool, ClientError, CommitProgress, Connection, CurrentPatch, WaitFd, Window,
+    WindowFramePatch, WindowFramePatchProgress,
 };
 
 use crate::keymap::{translate, Modifiers};
 use crate::pmos_shell::StepwiseCommandRunner;
 use crate::rasterizer::{
-    default_font, rasterize_snapshot_with_palette_and_font, BitmapFont, Palette, BYTES_PER_PIXEL,
+    default_font, rasterize_snapshot_region_with_palette_and_font,
+    rasterize_snapshot_with_palette_and_font, BitmapFont, Palette, RasterRegion, BYTES_PER_PIXEL,
     PADDING,
 };
 use crate::terminal::{CommandRunner, Key, KeyFeedResult, Terminal, TerminalOptions};
@@ -71,6 +77,9 @@ struct TerminalPainter {
     full_generation: u64,
     slots: [SlotFrame; 2],
     pending_full: Option<PendingFullFrame>,
+    chrome_patch: Option<WindowFramePatch>,
+    focused: bool,
+    maximized: bool,
 }
 
 impl Default for TerminalPainter {
@@ -82,6 +91,9 @@ impl Default for TerminalPainter {
             full_generation: 0,
             slots: [SlotFrame::default(), SlotFrame::default()],
             pending_full: None,
+            chrome_patch: None,
+            focused: false,
+            maximized: false,
         }
     }
 }
@@ -148,9 +160,27 @@ impl TerminalWindowGeometry {
 }
 
 impl TerminalPainter {
+    fn observe_chrome(&mut self, focused: bool, maximized: bool) {
+        let focus_changed = self.focused != focused;
+        let maximized_changed = self.maximized != maximized;
+        self.focused = focused;
+        self.maximized = maximized;
+        if maximized_changed {
+            self.request_full();
+        } else if focus_changed && self.request != PaintRequest::Full && self.size != (0, 0) {
+            self.chrome_patch = Some(WindowFramePatch::new(&terminal_window_frame(
+                self.size.0,
+                self.size.1,
+                self.focused,
+                self.maximized,
+            )));
+        }
+    }
+
     fn request_full(&mut self) {
         self.full_generation = self.full_generation.wrapping_add(1);
         self.request = PaintRequest::Full;
+        self.chrome_patch = None;
     }
 
     fn request_input_edit(&mut self) {
@@ -165,6 +195,9 @@ impl TerminalPainter {
 
     fn has_local_work(&self) -> bool {
         if self.commit_pending() {
+            return true;
+        }
+        if self.chrome_patch.is_some() {
             return true;
         }
         match self.request {
@@ -212,7 +245,9 @@ impl TerminalPainter {
         font: &BitmapFont,
         size: (u32, u32),
     ) -> Result<(), ClientError> {
-        if self.request == PaintRequest::None || self.commit_pending() {
+        if (self.request == PaintRequest::None && self.chrome_patch.is_none())
+            || self.commit_pending()
+        {
             return Ok(());
         }
         if self.size != size {
@@ -220,14 +255,48 @@ impl TerminalPainter {
             self.size = size;
             self.slots = [SlotFrame::default(), SlotFrame::default()];
             self.pending_full = None;
+            self.chrome_patch = None;
             self.request = PaintRequest::Full;
         }
 
+        // Make the focused edge visible with the first bounded chrome tile,
+        // then let latency-sensitive terminal input patches preempt the
+        // remaining cosmetic titlebar/border tiles.
+        if self
+            .chrome_patch
+            .as_ref()
+            .is_some_and(|patch| patch.completed_tiles() == 0)
+        {
+            return self.progress_chrome(window);
+        }
+
         match self.request {
-            PaintRequest::None => Ok(()),
+            PaintRequest::None => self.progress_chrome(window),
             PaintRequest::Full => self.paint_full(window, terminal, font),
             PaintRequest::InputEdit => self.paint_input_edit(window, terminal, font),
         }
+    }
+
+    fn progress_chrome<C: Connection>(
+        &mut self,
+        window: &mut Window<'_, C>,
+    ) -> Result<(), ClientError> {
+        let Some(patch) = self.chrome_patch.as_mut() else {
+            return Ok(());
+        };
+        let pool = self
+            .pool
+            .as_mut()
+            .expect("chrome patch requires paint pool");
+        match patch.progress(pool, window)? {
+            WindowFramePatchProgress::Complete => self.chrome_patch = None,
+            WindowFramePatchProgress::Unavailable => {
+                self.chrome_patch = None;
+                self.request_full();
+            }
+            WindowFramePatchProgress::Deferred | WindowFramePatchProgress::Pending => {}
+        }
+        Ok(())
     }
 
     fn paint_full<C: Connection>(
@@ -244,7 +313,15 @@ impl TerminalPainter {
         let Some(mut canvas) = pool.acquire_back_canvas() else {
             return Ok(());
         };
-        paint_into_canvas(&mut canvas, self.size.0, self.size.1, terminal, font);
+        paint_into_canvas(
+            &mut canvas,
+            self.size.0,
+            self.size.1,
+            terminal,
+            font,
+            self.focused,
+            self.maximized,
+        );
         drop(canvas);
 
         let frame = PendingFullFrame {
@@ -302,7 +379,11 @@ impl TerminalPainter {
             }
             InputDamage::Rect(damage) => damage,
         };
-        let packed = packed_damage_pixels(terminal, font, self.size.0, self.size.1, damage);
+        let Some(packed) = packed_damage_pixels(terminal, font, self.size.0, self.size.1, damage)
+        else {
+            self.request = PaintRequest::Full;
+            return self.paint_full(window, terminal, font);
+        };
         if packed.len() > display_proto::MAX_SURFACE_PATCH_BYTES {
             self.request = PaintRequest::Full;
             return self.paint_full(window, terminal, font);
@@ -491,6 +572,7 @@ fn run_term_inner<C: Connection>(
         {
             painter.request_full();
         }
+        painter.observe_chrome(window.is_activated(), window.is_maximized());
 
         if window.close_requested() {
             if let Some(command_runner) = stepwise_runner.as_deref_mut() {
@@ -624,6 +706,41 @@ fn run_term_inner<C: Connection>(
                         }
                     }
                 }
+                (Interface::Pointer, 2 /* button */) => {
+                    if let Ok(button) = PointerButton::decode(&event.payload) {
+                        if button.button != 1 || button.state != pointer_button_state::PRESSED {
+                            continue;
+                        }
+                        let mut chrome = WindowFrame::new(
+                            Rect::new(0, 0, geometry.size().0, geometry.size().1),
+                            "Terminal",
+                        );
+                        chrome.set_theme(Theme::DARK);
+                        chrome.set_maximized(window.is_maximized());
+                        match chrome.pointer_down(button.x, button.y) {
+                            ChromePointerOutcome::Minimize => window.set_minimized()?,
+                            ChromePointerOutcome::ToggleMaximize => {
+                                if window.is_maximized() {
+                                    window.unset_maximized()?;
+                                } else {
+                                    window.set_maximized()?;
+                                }
+                            }
+                            ChromePointerOutcome::Close => {
+                                if let Some(command_runner) = stepwise_runner.as_deref_mut() {
+                                    command_runner.terminate();
+                                }
+                                return Ok(TermExit::CloseRequested);
+                            }
+                            ChromePointerOutcome::Titlebar if !window.is_maximized() => {
+                                window.request_move(button.serial)?;
+                            }
+                            ChromePointerOutcome::Titlebar
+                            | ChromePointerOutcome::Content
+                            | ChromePointerOutcome::Outside => {}
+                        }
+                    }
+                }
                 (Interface::Buffer, 1 /* release */) => {
                     painter.handle_release(event.object_id);
                 }
@@ -677,7 +794,8 @@ fn input_edit_damage(
     height: u32,
     font: &BitmapFont,
 ) -> InputDamage {
-    if old_input == new_input || width <= 2 * PADDING || height <= 2 * PADDING {
+    let content_height = terminal_content_height(height);
+    if old_input == new_input || width <= 2 * PADDING || content_height <= 2 * PADDING {
         return InputDamage::None;
     }
     let cell_width = font.cell_width();
@@ -686,7 +804,7 @@ fn input_edit_damage(
         return InputDamage::Full;
     }
     let cols = ((width - 2 * PADDING) / cell_width) as usize;
-    let rows = (height - 2 * PADDING) / cell_height;
+    let rows = (content_height - 2 * PADDING) / cell_height;
     if cols == 0 || rows == 0 {
         return InputDamage::None;
     }
@@ -714,7 +832,8 @@ fn input_edit_damage(
     }
 
     let x = PADDING as u64 + start_col as u64 * u64::from(cell_width);
-    let y = PADDING as u64 + u64::from(rows - 1) * u64::from(cell_height);
+    let y =
+        u64::from(TITLEBAR_HEIGHT) + PADDING as u64 + u64::from(rows - 1) * u64::from(cell_height);
     let damage_width = (end_col - start_col) as u64 * u64::from(cell_width);
     let Ok(x) = i32::try_from(x) else {
         return InputDamage::Full;
@@ -740,37 +859,33 @@ fn packed_damage_pixels(
     width: u32,
     height: u32,
     damage: Rect,
-) -> Vec<u8> {
-    let rendered = rasterize_snapshot_with_palette_and_font(
+) -> Option<Vec<u8>> {
+    let content_height = terminal_content_height(height);
+    let content_x = u32::try_from(damage.x).ok()?;
+    let content_y = u32::try_from(damage.y).ok()?.checked_sub(TITLEBAR_HEIGHT)?;
+    rasterize_snapshot_region_with_palette_and_font(
         &terminal.snapshot(),
         width,
-        height,
+        content_height,
+        RasterRegion::new(content_x, content_y, damage.width, damage.height),
         Palette::default(),
         font,
-    );
-    let row_bytes = damage.width as usize * BYTES_PER_PIXEL;
-    let mut packed = Vec::with_capacity(row_bytes * damage.height as usize);
-    let stride = width as usize * BYTES_PER_PIXEL;
-    let x = damage.x as usize;
-    let y = damage.y as usize;
-    for row in 0..damage.height as usize {
-        let start = (y + row) * stride + x * BYTES_PER_PIXEL;
-        packed.extend_from_slice(&rendered[start..start + row_bytes]);
-    }
-    packed
+    )
 }
 
-/// Rasterise the terminal snapshot into the supplied
-/// canvas. The rasterizer produces a tightly-packed ARGB8888
-/// frame of `width × height` pixels; we copy it directly
-/// onto the canvas. Both buffers share the same byte order,
-/// so the copy is a single `pixels_mut().copy_from_slice`.
+const fn terminal_content_height(height: u32) -> u32 {
+    height.saturating_sub(TITLEBAR_HEIGHT + BORDER_WIDTH)
+}
+
+/// Rasterise the terminal snapshot beneath the shared client-side chrome.
 fn paint_into_canvas(
     canvas: &mut Canvas<'_>,
     width: u32,
     height: u32,
     terminal: &Terminal,
     font: &BitmapFont,
+    focused: bool,
+    maximized: bool,
 ) {
     // Background fill is performed by the rasterizer itself;
     // the canvas wipe below is defensive — any pixel the
@@ -779,20 +894,41 @@ fn paint_into_canvas(
     // a previous frame still resident in the back buffer.
     canvas.clear(Color::rgb(0x0a, 0x0e, 0x14));
     let snapshot = terminal.snapshot();
+    let content_height = terminal_content_height(height);
     let bytes = rasterize_snapshot_with_palette_and_font(
         &snapshot,
         width,
-        height,
+        content_height,
         Palette::default(),
         font,
     );
-    let pixels = canvas.pixels_mut();
-    let copy_len = pixels.len().min(bytes.len());
-    pixels[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    {
+        let pixels = canvas.pixels_mut();
+        let destination_start = (TITLEBAR_HEIGHT as usize)
+            .saturating_mul(width as usize)
+            .saturating_mul(BYTES_PER_PIXEL)
+            .min(pixels.len());
+        let copy_len = pixels
+            .len()
+            .saturating_sub(destination_start)
+            .min(bytes.len());
+        pixels[destination_start..destination_start + copy_len].copy_from_slice(&bytes[..copy_len]);
+    }
     debug_assert_eq!(
         bytes.len(),
-        (width as usize) * (height as usize) * BYTES_PER_PIXEL
+        (width as usize) * (content_height as usize) * BYTES_PER_PIXEL
     );
+
+    let chrome = terminal_window_frame(width, height, focused, maximized);
+    chrome.draw(canvas);
+}
+
+fn terminal_window_frame(width: u32, height: u32, focused: bool, maximized: bool) -> WindowFrame {
+    let mut chrome = WindowFrame::new(Rect::new(0, 0, width, height), "Terminal");
+    chrome.set_theme(Theme::DARK);
+    chrome.set_focused(focused);
+    chrome.set_maximized(maximized);
+    chrome
 }
 
 #[cfg(test)]
@@ -802,7 +938,7 @@ mod tests {
     #[test]
     fn append_and_backspace_damage_only_the_old_and_new_cursor_cells() {
         let font = default_font();
-        let expected = Rect::new(20, 452, 16, 14);
+        let expected = Rect::new(20, 460, 16, 14);
 
         assert_eq!(
             input_edit_damage("$ ", "", "a", DEFAULT_WIDTH, DEFAULT_HEIGHT, font),
@@ -816,6 +952,44 @@ mod tests {
             expected.width as usize * expected.height as usize * BYTES_PER_PIXEL,
             896,
         );
+    }
+
+    #[test]
+    fn packed_input_damage_matches_full_content_crop_without_full_sized_output() {
+        let font = default_font();
+        let mut terminal = Terminal::new(TerminalOptions {
+            max_lines: 8,
+            banner: Vec::new(),
+            prompt: "$ ".to_string(),
+        });
+        assert_eq!(terminal.feed_key(Key::Char('a')), KeyFeedResult::Edited);
+        let damage = match input_edit_damage("$ ", "", "a", DEFAULT_WIDTH, DEFAULT_HEIGHT, font) {
+            InputDamage::Rect(damage) => damage,
+            other => panic!("expected bounded input damage, got {other:?}"),
+        };
+        let bounded = packed_damage_pixels(&terminal, font, DEFAULT_WIDTH, DEFAULT_HEIGHT, damage)
+            .expect("damage is inside terminal content");
+        let content_height = terminal_content_height(DEFAULT_HEIGHT);
+        let full = rasterize_snapshot_with_palette_and_font(
+            &terminal.snapshot(),
+            DEFAULT_WIDTH,
+            content_height,
+            Palette::default(),
+            font,
+        );
+        let row_bytes = damage.width as usize * BYTES_PER_PIXEL;
+        let stride = DEFAULT_WIDTH as usize * BYTES_PER_PIXEL;
+        let x = damage.x as usize;
+        let y = (damage.y - TITLEBAR_HEIGHT as i32) as usize;
+        let mut expected = Vec::with_capacity(row_bytes * damage.height as usize);
+        for row in 0..damage.height as usize {
+            let start = (y + row) * stride + x * BYTES_PER_PIXEL;
+            expected.extend_from_slice(&full[start..start + row_bytes]);
+        }
+
+        assert_eq!(bounded, expected);
+        assert_eq!(bounded.len(), 896);
+        assert_eq!(full.len(), 1_316_160);
     }
 
     #[test]
@@ -847,6 +1021,28 @@ mod tests {
             ),
             InputDamage::Full,
         );
+    }
+
+    #[test]
+    fn tiny_surfaces_paint_chrome_without_slicing_past_the_canvas() {
+        let terminal = Terminal::new(TerminalOptions {
+            max_lines: 8,
+            banner: Vec::new(),
+            prompt: "$ ".to_string(),
+        });
+        for (width, height) in [(1, 1), (32, TITLEBAR_HEIGHT)] {
+            let mut canvas = Canvas::new(width, height);
+            paint_into_canvas(
+                &mut canvas,
+                width,
+                height,
+                &terminal,
+                default_font(),
+                true,
+                false,
+            );
+            assert_eq!(canvas.pixels().len(), width as usize * height as usize * 4);
+        }
     }
 
     #[test]

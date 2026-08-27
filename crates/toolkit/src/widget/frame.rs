@@ -1,160 +1,79 @@
-//! `WindowFrame` — chrome drawn around a top-level window's
-//! content area.
+//! Client-side top-level window chrome.
 //!
-//! A `WindowFrame` is a pure client-side widget: it takes a
-//! bounds rectangle, a theme, and an app-id, and paints a
-//! 1-pixel border + a titlebar + a close button into any
-//! [`Canvas`] the caller hands it. It has no protocol
-//! affinity — it doesn't know a `pmd_xdg_toplevel` from a
-//! hole in the ground — so it can be composed with the term
-//! rasterizer long before [`crate::app::App`] (T114) exists
-//! to wire it to real window events.
-//!
-//! Composition: the close button is a real
-//! [`Button`] stored as a field, not a handful of direct
-//! draw calls. `WindowFrame` overrides the button's
-//! default `button_*` theme colours with the
-//! `close_button*` chrome slots so the close button
-//! inherits the window's focus-driven border colour while
-//! keeping the red-on-hover fill the user expects. Click
-//! handling, hit-testing, fill state, and the centred "x"
-//! caption are all [`Button`]'s job now — `WindowFrame`
-//! only decides *where* the close button lives and *what
-//! colours* it should paint with.
-//!
-//! Event wiring is shallow by design: `on_close` is sugar
-//! for `close_button.on_click`. When
-//! [`crate::app::App::connect`] lands (T114), an `App`
-//! will call `pointer_down` for every pointer event that
-//! lands on this frame's bounds and translate
-//! `PointerOutcome::Close` into a real `xdg_toplevel.close`
-//! request — but that wiring does **not** live in this
-//! slice.
+//! `WindowFrame` is deliberately protocol-free: it paints a PMos titlebar,
+//! border, app mark, and the familiar minimize / maximize / close caption
+//! controls into a caller-owned [`Canvas`]. Applications translate the
+//! returned [`PointerOutcome`] through their own [`crate::Window`], preserving
+//! the display protocol as the only route to the compositor.
 
-use super::button::{Button, ButtonState};
 use crate::draw::font::GLYPH_HEIGHT;
 use crate::draw::text::fit_text_to_width;
 use crate::draw::{Canvas, Color, Rect};
 use crate::theme::Theme;
 
-/// Height of the titlebar in pixels, including the 1-pixel
-/// top window border. A content area of
-/// `(bounds.height - TITLEBAR_HEIGHT - BORDER_WIDTH)` pixels
-/// sits below.
+/// Existing v1 chrome footprint. Keeping this stable avoids moving every
+/// application's content and preserves the display-server work-area contract.
 pub const TITLEBAR_HEIGHT: u32 = 22;
-
-/// Width of the window border, in pixels. Kept as a named
-/// constant so geometry calculations don't sprinkle `1` all
-/// over the place — if a future slice decides to thicken
-/// the border for a particular theme, one edit lands it.
 pub const BORDER_WIDTH: u32 = 1;
-
-/// Hit-test margin for the resize edges of a decorated
-/// window, in pixels. Pointers within this margin of any
-/// of the four window edges land on a resize-edge outcome
-/// rather than the titlebar / content area, so users can
-/// grab the resize edges even though the visible border is
-/// only [`BORDER_WIDTH`] pixels thick.
 pub const RESIZE_HIT_MARGIN: u32 = 4;
 
-/// Close-button side length. The button is a square.
-pub const CLOSE_BUTTON_SIZE: u32 = 16;
+/// Width of each Windows-style caption control.
+pub const WINDOW_CONTROL_WIDTH: u32 = 30;
 
-/// Margin between the close button and the right / top
-/// edges of the window, in pixels.
-pub const CLOSE_BUTTON_MARGIN: u32 = 3;
+/// Compatibility aliases retained for callers that previously reasoned about
+/// the single square close button. The caption buttons now occupy the full
+/// titlebar interior and therefore have no outer margin.
+pub const CLOSE_BUTTON_SIZE: u32 = WINDOW_CONTROL_WIDTH;
+pub const CLOSE_BUTTON_MARGIN: u32 = 0;
 
-/// Horizontal inset of the titlebar title text from the
-/// left window edge, in pixels.
-pub const TITLE_TEXT_MARGIN_X: u32 = 6;
-
-/// Gap between the end of the title text and the left edge
-/// of the close button, in pixels. Used when clipping long
-/// app-ids.
+/// The PMos four-pane mark occupies the leading titlebar slot; text begins
+/// after it rather than flush against the window edge.
+pub const TITLE_TEXT_MARGIN_X: u32 = 22;
 pub const TITLE_TEXT_TRAILING_GAP: u32 = 4;
+const WINDOW_MARK_SIZE: u32 = 9;
+const WINDOW_MARK_X: u32 = 6;
 
-/// Outcome of a pointer-down event routed through
-/// [`WindowFrame::pointer_down`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WindowControl {
+    Minimize,
+    Maximize,
+    Close,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PointerOutcome {
-    /// The press landed on the close button. The frame's
-    /// close callback (if any) has already fired by the
-    /// time this variant is returned.
+    Minimize,
+    ToggleMaximize,
     Close,
-    /// The press landed on the titlebar outside the close
-    /// button. A future `App::connect` will turn this into
-    /// an interactive move request.
     Titlebar,
-    /// The press landed on the content area — the region
-    /// inside the border and below the titlebar. Apps route
-    /// this to their own widgets.
     Content,
-    /// The press was outside the frame entirely. Returned
-    /// when `pointer_down` is called with coordinates that
-    /// don't intersect `bounds()`.
     Outside,
 }
 
-/// Compute the close-button rectangle for a window with the
-/// given `bounds`. Returns an empty rect if the window is
-/// too small to hold the button. Exists as a free function
-/// so [`WindowFrame::new`] can call it before the struct is
-/// built.
-fn compute_close_button_rect(bounds: Rect) -> Rect {
-    if bounds.width < CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN || bounds.height < TITLEBAR_HEIGHT
-    {
-        return Rect::new(bounds.x, bounds.y, 0, 0);
-    }
-    let x = bounds.x + (bounds.width as i32)
-        - (CLOSE_BUTTON_MARGIN as i32)
-        - (CLOSE_BUTTON_SIZE as i32);
-    let y = bounds.y + CLOSE_BUTTON_MARGIN as i32;
-    Rect::new(x, y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE)
-}
-
-/// Chrome widget drawn around a window's content area.
-///
-/// See the module doc-comment for design notes. Construct
-/// with [`WindowFrame::new`], set focus state with
-/// [`WindowFrame::set_focused`], attach a close callback
-/// with [`WindowFrame::on_close`], then call
-/// [`WindowFrame::draw`] once per frame and route pointer
-/// events through [`WindowFrame::pointer_down`].
 pub struct WindowFrame {
     bounds: Rect,
     app_id: String,
     focused: bool,
+    maximized: bool,
     theme: Theme,
-    close_button: Button,
+    hovered_control: Option<WindowControl>,
+    on_minimize: Option<Box<dyn FnMut()>>,
+    on_toggle_maximize: Option<Box<dyn FnMut()>>,
+    on_close: Option<Box<dyn FnMut()>>,
 }
 
 impl WindowFrame {
-    /// Construct a frame with the given bounds and app-id.
-    /// The frame starts focused (so the active-theme
-    /// colours are in effect) and has no close callback.
     pub fn new(bounds: Rect, app_id: impl Into<String>) -> Self {
-        let theme = Theme::default();
-        let close_rect = compute_close_button_rect(bounds);
-        let mut close_button = Button::new(close_rect, "x");
-        // Override Button's standalone `button_*` palette
-        // with the window-chrome `close_button*` slots.
-        // The close button's border tracks the window's
-        // focused border colour, not the standalone button
-        // border colour.
-        close_button.set_fill(theme.close_button);
-        close_button.set_fill_hover(theme.close_button_hover);
-        // No distinct pressed state for the close button —
-        // press uses the same red as hover.
-        close_button.set_fill_pressed(theme.close_button_hover);
-        close_button.set_border(theme.border_active);
-        close_button.set_caption_color(theme.close_button_glyph);
-
-        WindowFrame {
+        Self {
             bounds,
             app_id: app_id.into(),
             focused: true,
-            theme,
-            close_button,
+            maximized: false,
+            theme: Theme::default(),
+            hovered_control: None,
+            on_minimize: None,
+            on_toggle_maximize: None,
+            on_close: None,
         }
     }
 
@@ -166,194 +85,324 @@ impl WindowFrame {
         &self.app_id
     }
 
-    /// Replace the app-id (titlebar caption). The next
-    /// `draw` will paint the new label after re-running the
-    /// fit-to-width truncation logic.
     pub fn set_app_id(&mut self, app_id: impl Into<String>) {
         self.app_id = app_id.into();
     }
 
-    /// Resize the chrome bounds. Used by `DecoratedWindow`
-    /// when the server sends a configure event with a new
-    /// window size; the close button rect is recomputed so
-    /// it stays anchored to the new top-right corner.
     pub fn set_bounds(&mut self, bounds: Rect) {
+        if self.bounds != bounds {
+            self.hovered_control = None;
+        }
         self.bounds = bounds;
-        let close_rect = compute_close_button_rect(bounds);
-        self.close_button.set_bounds(close_rect);
     }
 
-    /// Route a pointer-up event through the chrome. Used by
-    /// `DecoratedWindow::handle_pointer_up`. Today this just
-    /// resets any close-button pressed state so a click that
-    /// pressed but moved off before release doesn't leave
-    /// the button visually "stuck".
-    pub fn pointer_up(&mut self, _x: i32, _y: i32) {
-        self.close_button.set_state(ButtonState::Resting);
+    pub fn pointer_up(&mut self, x: i32, y: i32) {
+        self.hovered_control = self.control_at(x, y);
     }
 
     pub fn is_focused(&self) -> bool {
         self.focused
     }
 
-    /// Switch between active (focused) and inactive chrome
-    /// colours. The display server's input router will
-    /// drive this when window focus changes; tests flip it
-    /// directly.
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
-        // Sync the close button's border with the window
-        // focus state so the chrome reads as one unit.
-        self.close_button.set_border(self.border_color());
     }
 
-    /// True iff the close button is currently in hover
-    /// state.
+    pub fn is_maximized(&self) -> bool {
+        self.maximized
+    }
+
+    pub fn set_maximized(&mut self, maximized: bool) {
+        self.maximized = maximized;
+    }
+
+    pub fn hovered_control(&self) -> Option<WindowControl> {
+        self.hovered_control
+    }
+
+    /// Update caption-control hover from a surface-local pointer coordinate.
+    /// Returns true only when the visible state changed.
+    pub fn update_hover(&mut self, x: i32, y: i32) -> bool {
+        let next = self.control_at(x, y);
+        if next == self.hovered_control {
+            return false;
+        }
+        self.hovered_control = next;
+        true
+    }
+
+    pub fn clear_hover(&mut self) -> bool {
+        if self.hovered_control.take().is_some() {
+            return true;
+        }
+        false
+    }
+
     pub fn is_close_hover(&self) -> bool {
-        matches!(self.close_button.state(), ButtonState::Hover)
+        self.hovered_control == Some(WindowControl::Close)
     }
 
-    /// Mark the close button as hovered (`true`) or not
-    /// (`false`). A hovered close button paints with
-    /// [`Theme::close_button_hover`] instead of
-    /// [`Theme::close_button`].
+    /// Compatibility setter used by existing callers and isolation tests.
     pub fn set_close_hover(&mut self, hovered: bool) {
-        self.close_button.set_state(if hovered {
-            ButtonState::Hover
-        } else {
-            ButtonState::Resting
-        });
+        self.hovered_control = hovered.then_some(WindowControl::Close);
     }
 
     pub fn theme(&self) -> &Theme {
         &self.theme
     }
 
-    /// Replace the active theme. Resyncs the close
-    /// button's colours from the new theme.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
-        self.close_button.set_fill(theme.close_button);
-        self.close_button.set_fill_hover(theme.close_button_hover);
-        self.close_button.set_fill_pressed(theme.close_button_hover);
-        self.close_button
-            .set_caption_color(theme.close_button_glyph);
-        self.close_button.set_border(self.border_color());
     }
 
-    /// Install a close callback. Called exactly once per
-    /// `pointer_down` that hits the close button. The
-    /// previous callback (if any) is replaced.
+    pub fn on_minimize<F: FnMut() + 'static>(&mut self, callback: F) {
+        self.on_minimize = Some(Box::new(callback));
+    }
+
+    pub fn on_toggle_maximize<F: FnMut() + 'static>(&mut self, callback: F) {
+        self.on_toggle_maximize = Some(Box::new(callback));
+    }
+
     pub fn on_close<F: FnMut() + 'static>(&mut self, callback: F) {
-        self.close_button.on_click(callback);
+        self.on_close = Some(Box::new(callback));
     }
 
-    /// The titlebar rectangle, including the top 1-pixel
-    /// border row. Empty if the window bounds can't fit a
-    /// titlebar at all.
     pub fn titlebar_rect(&self) -> Rect {
-        if self.bounds.width == 0 || self.bounds.height == 0 {
+        if self.bounds.is_empty() {
             return Rect::new(self.bounds.x, self.bounds.y, 0, 0);
         }
-        let h = TITLEBAR_HEIGHT.min(self.bounds.height);
-        Rect::new(self.bounds.x, self.bounds.y, self.bounds.width, h)
+        Rect::new(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.width,
+            TITLEBAR_HEIGHT.min(self.bounds.height),
+        )
     }
 
-    /// The close-button rectangle. Empty if the window is
-    /// too small to hold it.
+    fn caption_rect_from_right(&self, position: u32) -> Rect {
+        let titlebar = self.titlebar_rect();
+        let height = titlebar.height.saturating_sub(BORDER_WIDTH);
+        let required = position
+            .saturating_add(1)
+            .saturating_mul(WINDOW_CONTROL_WIDTH)
+            .saturating_add(2 * BORDER_WIDTH);
+        if height == 0 || titlebar.width < required {
+            return Rect::new(titlebar.right(), titlebar.y, 0, 0);
+        }
+        Rect::new(
+            titlebar.right() - BORDER_WIDTH as i32 - ((position + 1) * WINDOW_CONTROL_WIDTH) as i32,
+            titlebar.y + BORDER_WIDTH as i32,
+            WINDOW_CONTROL_WIDTH,
+            height,
+        )
+    }
+
     pub fn close_button_rect(&self) -> Rect {
-        self.close_button.bounds()
+        self.caption_rect_from_right(0)
     }
 
-    /// The content rectangle — the area inside the border
-    /// and below the titlebar that the app should paint
-    /// into. Empty if the window can't spare any rows.
+    pub fn maximize_button_rect(&self) -> Rect {
+        // Preserve a useful title drag target on very narrow windows.
+        if self.bounds.width < 2 * WINDOW_CONTROL_WIDTH + 48 {
+            return Rect::new(self.bounds.right(), self.bounds.y, 0, 0);
+        }
+        self.caption_rect_from_right(1)
+    }
+
+    pub fn minimize_button_rect(&self) -> Rect {
+        if self.bounds.width < 3 * WINDOW_CONTROL_WIDTH + 48 {
+            return Rect::new(self.bounds.right(), self.bounds.y, 0, 0);
+        }
+        self.caption_rect_from_right(2)
+    }
+
+    pub fn control_rect(&self, control: WindowControl) -> Rect {
+        match control {
+            WindowControl::Minimize => self.minimize_button_rect(),
+            WindowControl::Maximize => self.maximize_button_rect(),
+            WindowControl::Close => self.close_button_rect(),
+        }
+    }
+
     pub fn content_rect(&self) -> Rect {
         if self.bounds.width < 2 * BORDER_WIDTH
             || self.bounds.height < TITLEBAR_HEIGHT + BORDER_WIDTH
         {
             return Rect::new(self.bounds.x, self.bounds.y, 0, 0);
         }
-        let x = self.bounds.x + BORDER_WIDTH as i32;
-        let y = self.bounds.y + TITLEBAR_HEIGHT as i32;
-        let w = self.bounds.width - 2 * BORDER_WIDTH;
-        let h = self.bounds.height - TITLEBAR_HEIGHT - BORDER_WIDTH;
-        Rect::new(x, y, w, h)
+        Rect::new(
+            self.bounds.x + BORDER_WIDTH as i32,
+            self.bounds.y + TITLEBAR_HEIGHT as i32,
+            self.bounds.width - 2 * BORDER_WIDTH,
+            self.bounds.height - TITLEBAR_HEIGHT - BORDER_WIDTH,
+        )
     }
 
-    /// Pixel width available to the title text between the
-    /// title's left margin and the close button (or the
-    /// right edge, when the window is too small for a
-    /// close button). Returns `0` if the window is too
-    /// narrow to fit any title text at all.
+    /// Non-overlapping regions whose pixels can change when only the frame's
+    /// focused state changes. The titlebar is one filled region; the remaining
+    /// three rectangles cover the side and bottom borders without touching
+    /// application content.
+    ///
+    /// This is a paint-only description. Protocol-aware code may tile these
+    /// rectangles to its own transport limit.
+    pub fn focus_damage_regions(&self) -> Vec<Rect> {
+        let titlebar = self.titlebar_rect();
+        if titlebar.is_empty() {
+            return Vec::new();
+        }
+
+        let mut regions = vec![titlebar];
+        if self.bounds.height <= titlebar.height {
+            return regions;
+        }
+
+        let bottom_y = self.bounds.bottom() - 1;
+        let sides_y = titlebar.bottom();
+        let sides_height = bottom_y.saturating_sub(sides_y) as u32;
+        if sides_height > 0 {
+            regions.push(Rect::new(self.bounds.x, sides_y, 1, sides_height));
+            if self.bounds.width > 1 {
+                regions.push(Rect::new(self.bounds.right() - 1, sides_y, 1, sides_height));
+            }
+        }
+        regions.push(Rect::new(self.bounds.x, bottom_y, self.bounds.width, 1));
+        regions
+    }
+
+    /// Rasterize one frame-owned region into a densely packed RGBA buffer.
+    /// Returns `None` unless the rectangle is non-empty and wholly contained
+    /// by this frame's bounds.
+    ///
+    /// The temporary frame is translated so the returned pixels are exactly
+    /// the same crop that [`Self::draw`] would place in a full window canvas.
+    pub fn rasterize_region(&self, region: Rect) -> Option<Vec<u8>> {
+        if region.is_empty()
+            || region.x < self.bounds.x
+            || region.y < self.bounds.y
+            || region.right() > self.bounds.right()
+            || region.bottom() > self.bounds.bottom()
+        {
+            return None;
+        }
+
+        let mut canvas = Canvas::new(region.width, region.height);
+        let mut translated = WindowFrame::new(
+            Rect::new(
+                self.bounds.x - region.x,
+                self.bounds.y - region.y,
+                self.bounds.width,
+                self.bounds.height,
+            ),
+            self.app_id.clone(),
+        );
+        translated.focused = self.focused;
+        translated.maximized = self.maximized;
+        translated.theme = self.theme;
+        translated.hovered_control = self.hovered_control;
+        translated.draw(&mut canvas);
+        Some(canvas.into_pixels())
+    }
+
+    /// Copy only immutable paint state for a deferred chrome update. Pointer
+    /// callbacks stay with the live widget and are never retained by a patch.
+    pub(crate) fn paint_snapshot(&self) -> Self {
+        Self {
+            bounds: self.bounds,
+            app_id: self.app_id.clone(),
+            focused: self.focused,
+            maximized: self.maximized,
+            theme: self.theme,
+            hovered_control: self.hovered_control,
+            on_minimize: None,
+            on_toggle_maximize: None,
+            on_close: None,
+        }
+    }
+
+    fn first_caption_x(&self) -> i32 {
+        [
+            self.minimize_button_rect(),
+            self.maximize_button_rect(),
+            self.close_button_rect(),
+        ]
+        .into_iter()
+        .find(|rect| !rect.is_empty())
+        .map(|rect| rect.x)
+        .unwrap_or(self.bounds.right() - BORDER_WIDTH as i32)
+    }
+
     fn title_text_budget_px(&self) -> u32 {
         let text_start_x = self.bounds.x + TITLE_TEXT_MARGIN_X as i32;
-        let close = self.close_button_rect();
-        let text_end_limit = if close.is_empty() {
-            self.bounds.right() - TITLE_TEXT_MARGIN_X as i32
-        } else {
-            close.x - TITLE_TEXT_TRAILING_GAP as i32
-        };
-        if text_end_limit <= text_start_x {
-            return 0;
-        }
-        (text_end_limit - text_start_x) as u32
+        let text_end = self.first_caption_x() - TITLE_TEXT_TRAILING_GAP as i32;
+        text_end.saturating_sub(text_start_x).max(0) as u32
     }
 
-    /// Leading slice of the app-id that actually gets
-    /// drawn. The rest is clipped by the close button.
     pub fn visible_title(&self) -> &str {
         fit_text_to_width(&self.app_id, self.title_text_budget_px())
     }
 
-    /// Number of characters of the app-id that will be
-    /// drawn. Thin wrapper over [`Self::visible_title`]
-    /// kept for callers that only care about the count.
     pub fn visible_title_chars(&self) -> usize {
         self.visible_title().chars().count()
     }
 
-    /// True iff `(x, y)` falls inside the close button.
     pub fn hit_test_close(&self, x: i32, y: i32) -> bool {
-        self.close_button.hit_test(x, y)
+        rect_contains(self.close_button_rect(), x, y)
     }
 
-    /// True iff `(x, y)` falls inside the titlebar
-    /// (regardless of whether the close button claims it).
+    pub fn hit_test_maximize(&self, x: i32, y: i32) -> bool {
+        rect_contains(self.maximize_button_rect(), x, y)
+    }
+
+    pub fn hit_test_minimize(&self, x: i32, y: i32) -> bool {
+        rect_contains(self.minimize_button_rect(), x, y)
+    }
+
+    pub fn control_at(&self, x: i32, y: i32) -> Option<WindowControl> {
+        if self.hit_test_close(x, y) {
+            Some(WindowControl::Close)
+        } else if self.hit_test_maximize(x, y) {
+            Some(WindowControl::Maximize)
+        } else if self.hit_test_minimize(x, y) {
+            Some(WindowControl::Minimize)
+        } else {
+            None
+        }
+    }
+
     pub fn hit_test_titlebar(&self, x: i32, y: i32) -> bool {
-        let tb = self.titlebar_rect();
-        if tb.is_empty() {
-            return false;
-        }
-        x >= tb.x && x < tb.right() && y >= tb.y && y < tb.bottom()
+        rect_contains(self.titlebar_rect(), x, y)
     }
 
-    /// True iff `(x, y)` falls inside the window's overall
-    /// bounds.
     pub fn hit_test_window(&self, x: i32, y: i32) -> bool {
-        let b = self.bounds;
-        if b.is_empty() {
-            return false;
-        }
-        x >= b.x && x < b.right() && y >= b.y && y < b.bottom()
+        rect_contains(self.bounds, x, y)
     }
 
-    /// Route a pointer-down event through the frame. Fires
-    /// the close callback if the press lands on the close
-    /// button. Returns a [`PointerOutcome`] describing
-    /// where the press landed so the caller can route
-    /// content-area presses into their own widgets.
     pub fn pointer_down(&mut self, x: i32, y: i32) -> PointerOutcome {
         if !self.hit_test_window(x, y) {
             return PointerOutcome::Outside;
         }
-        if self.close_button.pointer_down(x, y) {
-            return PointerOutcome::Close;
+        match self.control_at(x, y) {
+            Some(WindowControl::Close) => {
+                if let Some(callback) = self.on_close.as_mut() {
+                    callback();
+                }
+                PointerOutcome::Close
+            }
+            Some(WindowControl::Maximize) => {
+                if let Some(callback) = self.on_toggle_maximize.as_mut() {
+                    callback();
+                }
+                PointerOutcome::ToggleMaximize
+            }
+            Some(WindowControl::Minimize) => {
+                if let Some(callback) = self.on_minimize.as_mut() {
+                    callback();
+                }
+                PointerOutcome::Minimize
+            }
+            None if self.hit_test_titlebar(x, y) => PointerOutcome::Titlebar,
+            None => PointerOutcome::Content,
         }
-        if self.hit_test_titlebar(x, y) {
-            return PointerOutcome::Titlebar;
-        }
-        PointerOutcome::Content
     }
 
     fn border_color(&self) -> Color {
@@ -380,37 +429,108 @@ impl WindowFrame {
         }
     }
 
-    /// Paint the frame's chrome into `canvas`. Does not
-    /// touch the content rectangle — that's the app's
-    /// responsibility.
-    pub fn draw(&self, canvas: &mut Canvas) {
+    pub fn draw(&self, canvas: &mut Canvas<'_>) {
         if self.bounds.is_empty() {
             return;
         }
-
         let titlebar = self.titlebar_rect();
-        if !titlebar.is_empty() {
-            let fill = Rect::new(
-                titlebar.x + BORDER_WIDTH as i32,
-                titlebar.y + BORDER_WIDTH as i32,
-                titlebar.width.saturating_sub(2 * BORDER_WIDTH),
-                titlebar.height.saturating_sub(BORDER_WIDTH),
-            );
-            canvas.fill_rect(fill, self.titlebar_fill_color());
-        }
+        let fill = Rect::new(
+            titlebar.x + BORDER_WIDTH as i32,
+            titlebar.y + BORDER_WIDTH as i32,
+            titlebar.width.saturating_sub(2 * BORDER_WIDTH),
+            titlebar.height.saturating_sub(BORDER_WIDTH),
+        );
+        canvas.fill_rect(fill, self.titlebar_fill_color());
 
+        self.draw_mark(canvas);
         let text = self.visible_title();
-        if !text.is_empty() && self.bounds.height >= GLYPH_HEIGHT + 2 * BORDER_WIDTH {
-            let text_x = self.bounds.x + TITLE_TEXT_MARGIN_X as i32;
-            let titlebar_interior_h = titlebar.height.saturating_sub(BORDER_WIDTH);
-            let text_y = self.bounds.y
+        if !text.is_empty() && titlebar.height >= GLYPH_HEIGHT + BORDER_WIDTH {
+            let text_y = titlebar.y
                 + BORDER_WIDTH as i32
-                + ((titlebar_interior_h.saturating_sub(GLYPH_HEIGHT)) / 2) as i32;
-            canvas.draw_text(text_x, text_y, text, self.title_text_color());
+                + ((titlebar.height - BORDER_WIDTH).saturating_sub(GLYPH_HEIGHT) / 2) as i32;
+            canvas.draw_text(
+                self.bounds.x + TITLE_TEXT_MARGIN_X as i32,
+                text_y,
+                text,
+                self.title_text_color(),
+            );
         }
 
-        self.close_button.draw(canvas);
-
+        for control in [
+            WindowControl::Minimize,
+            WindowControl::Maximize,
+            WindowControl::Close,
+        ] {
+            self.draw_control(canvas, control);
+        }
         canvas.stroke_rect(self.bounds, self.border_color());
     }
+
+    fn draw_mark(&self, canvas: &mut Canvas<'_>) {
+        if self.bounds.width < TITLE_TEXT_MARGIN_X || self.titlebar_rect().height < WINDOW_MARK_SIZE
+        {
+            return;
+        }
+        let x = self.bounds.x + WINDOW_MARK_X as i32;
+        // Caption controls win on narrow windows. Do not paint the leading app
+        // mark underneath the close target; the first width where the two
+        // regions merely meet is safe because Rect right edges are exclusive.
+        if x + WINDOW_MARK_SIZE as i32 > self.first_caption_x() {
+            return;
+        }
+        let y = self.bounds.y + ((TITLEBAR_HEIGHT - WINDOW_MARK_SIZE) / 2) as i32;
+        let color = if self.focused {
+            self.theme.border_active
+        } else {
+            self.theme.titlebar_text_inactive
+        };
+        for (dx, dy) in [(0, 0), (5, 0), (0, 5), (5, 5)] {
+            canvas.fill_rect(Rect::new(x + dx, y + dy, 4, 4), color);
+        }
+    }
+
+    fn draw_control(&self, canvas: &mut Canvas<'_>, control: WindowControl) {
+        let rect = self.control_rect(control);
+        if rect.is_empty() {
+            return;
+        }
+        let hovered = self.hovered_control == Some(control);
+        if hovered {
+            let fill = if control == WindowControl::Close {
+                self.theme.close_button_hover
+            } else {
+                self.theme.button_fill_hover
+            };
+            canvas.fill_rect(rect, fill);
+        }
+        let glyph = if hovered && control == WindowControl::Close {
+            Color::rgb(0xff, 0xff, 0xff)
+        } else {
+            self.title_text_color()
+        };
+        let cx = rect.x + rect.width as i32 / 2;
+        let cy = rect.y + rect.height as i32 / 2;
+        match control {
+            WindowControl::Minimize => {
+                canvas.fill_rect(Rect::new(cx - 4, cy + 3, 9, 1), glyph);
+            }
+            WindowControl::Maximize if self.maximized => {
+                canvas.stroke_rect(Rect::new(cx - 3, cy - 4, 7, 7), glyph);
+                canvas.stroke_rect(Rect::new(cx - 5, cy - 2, 7, 7), glyph);
+            }
+            WindowControl::Maximize => {
+                canvas.stroke_rect(Rect::new(cx - 4, cy - 4, 9, 8), glyph);
+            }
+            WindowControl::Close => {
+                for offset in 0..=7 {
+                    canvas.set_pixel(cx - 4 + offset, cy - 4 + offset, glyph);
+                    canvas.set_pixel(cx + 3 - offset, cy - 4 + offset, glyph);
+                }
+            }
+        }
+    }
+}
+
+fn rect_contains(rect: Rect, x: i32, y: i32) -> bool {
+    !rect.is_empty() && x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }

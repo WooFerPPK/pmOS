@@ -3,9 +3,9 @@
 
 use display_proto::events::shell_window_state_flags;
 use display_proto::{
-    Interface, ShellManagerBeginRestore, ShellManagerCloseWindow, ShellManagerDesktopReady,
-    ShellManagerEndRestore, ShellManagerFocusWindow, ShellManagerMinimizeWindow,
-    ShellManagerPlaceRestoredWindow, ShellManagerSetWorkAreaBottom,
+    Interface, ShellCloseShortcut, ShellManagerBeginRestore, ShellManagerCloseWindow,
+    ShellManagerDesktopReady, ShellManagerEndRestore, ShellManagerFocusWindow,
+    ShellManagerMinimizeWindow, ShellManagerPlaceRestoredWindow, ShellManagerSetWorkAreaBottom,
     ShellManagerSubscribeWindowState, ShellManagerSubscribeWindows,
     ShellManagerToggleMaximizedWindow, ShellManagerUnminimizeWindow, ShellRestoreFinished,
     ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused, ShellWindowSnapshotDone,
@@ -43,7 +43,8 @@ fn shell_manager_event_opcodes_are_window_created_destroyed_focused_title_change
     assert_eq!(s.lookup_event(6).unwrap().name, "window_state_changed");
     assert_eq!(s.lookup_event(7).unwrap().name, "window_snapshot_done");
     assert_eq!(s.lookup_event(8).unwrap().name, "restore_finished");
-    assert!(s.lookup_event(9).is_err());
+    assert_eq!(s.lookup_event(9).unwrap().name, "close_shortcut");
+    assert!(s.lookup_event(10).is_err());
 }
 
 // ---- Request decoders -------------------------------------------
@@ -237,6 +238,7 @@ fn window_created_rejects_truncated_payload() {
 
 #[test]
 fn authoritative_window_state_round_trips_all_identity_and_geometry() {
+    assert_eq!(shell_window_state_flags::SHELL_OWNED, 1 << 6);
     let original = ShellWindowState {
         snapshot_id: 91,
         window_id: 42,
@@ -279,4 +281,16 @@ fn snapshot_and_restore_completion_ids_round_trip() {
     payload.clear();
     finished.encode(&mut payload);
     assert_eq!(ShellRestoreFinished::decode(&payload).unwrap(), finished);
+}
+
+#[test]
+fn close_shortcut_round_trips_exact_target_id() {
+    let shortcut = ShellCloseShortcut { window_id: 73 };
+    let mut payload = Vec::new();
+    shortcut.encode(&mut payload);
+    assert_eq!(payload, 73_u32.to_le_bytes());
+    assert_eq!(ShellCloseShortcut::decode(&payload).unwrap(), shortcut);
+    assert!(ShellCloseShortcut::decode(&payload[..3]).is_err());
+    payload.push(0);
+    assert!(ShellCloseShortcut::decode(&payload).is_err());
 }

@@ -10,12 +10,14 @@ import {
   confirmedHostFilePicker,
   createBrowserControlKeyRouter,
   createGuiDesktopReadyLatch,
+  createGuiKeyboardInputBridge,
   createGuiKeyboardInputHandler,
   createLegacyKeyboardInputHandler,
   hasAtomicsWait,
   hasAtomicsWaitAsync,
   hasOpfs,
   installHostFileDropHandler,
+  installGuiKeyboardFocusLossHandlers,
   isBootInteractionAllowed,
   requestHostFilePicker,
   saveHostDownload,
@@ -656,6 +658,32 @@ describe("createGuiKeyboardInputHandler", () => {
     });
   });
 
+  it("forwards F4 press and release as the USB HID shortcut key", () => {
+    const messages: MainToKernel[] = [];
+    const target = {
+      postMessage: (message: MainToKernel) => messages.push(message),
+    };
+    const press = createGuiKeyboardInputHandler(target, KbdKeyState.Pressed);
+    const release = createGuiKeyboardInputHandler(target, KbdKeyState.Released);
+    const down = keyEvent("F4");
+    const up = keyEvent("F4");
+
+    press(down);
+    release(up);
+
+    expect(down.prevented()).toBe(true);
+    expect(up.prevented()).toBe(true);
+    expect(
+      messages.map((message) => {
+        if (message.kind !== "input:kbd") throw new Error("unexpected message");
+        return unpackKbdEvent(message.bytes);
+      }),
+    ).toEqual([
+      { key: 0x3d, state: KbdKeyState.Pressed },
+      { key: 0x3d, state: KbdKeyState.Released },
+    ]);
+  });
+
   it("owns a confirmation key through body-retargeted keyup", () => {
     const messages: MainToKernel[] = [];
     const target = {
@@ -778,6 +806,115 @@ describe("createGuiKeyboardInputHandler", () => {
         { key, state: KbdKeyState.Released },
       ]),
     );
+  });
+});
+
+describe("createGuiKeyboardInputBridge", () => {
+  function keyEvent(
+    code: string,
+    target: EventTarget,
+    repeat = false,
+  ): GuiKeyboardEvent & { readonly prevented: () => boolean } {
+    let wasPrevented = false;
+    return {
+      code,
+      metaKey: false,
+      repeat,
+      target,
+      preventDefault: () => {
+        wasPrevented = true;
+      },
+      prevented: () => wasPrevented,
+    };
+  }
+
+  function decodedKeyboardMessages(messages: MainToKernel[]) {
+    return messages.map((message) => {
+      if (message.kind !== "input:kbd") throw new Error("unexpected message");
+      return unpackKbdEvent(message.bytes);
+    });
+  }
+
+  it("synthesizes releases only for held guest-forwarded keys", () => {
+    const messages: MainToKernel[] = [];
+    const guest = new EventTarget();
+    const browserControl = new EventTarget();
+    const bridge = createGuiKeyboardInputBridge(
+      { postMessage: (message) => messages.push(message) },
+      () => true,
+      (event) => event.target === browserControl,
+    );
+
+    const altDown = keyEvent("AltLeft", guest);
+    const f4Down = keyEvent("F4", guest);
+    const browserDown = keyEvent("Enter", browserControl);
+    bridge.keydown(altDown);
+    bridge.keydown(f4Down);
+    bridge.keydown(browserDown);
+    bridge.releaseHeldKeys();
+    bridge.releaseHeldKeys();
+
+    expect(altDown.prevented()).toBe(true);
+    expect(f4Down.prevented()).toBe(true);
+    expect(browserDown.prevented()).toBe(false);
+    expect(decodedKeyboardMessages(messages)).toEqual([
+      { key: 0xe2, state: KbdKeyState.Pressed },
+      { key: 0x3d, state: KbdKeyState.Pressed },
+      { key: 0xe2, state: KbdKeyState.Released },
+      { key: 0x3d, state: KbdKeyState.Released },
+    ]);
+
+    const lateAltUp = keyEvent("AltLeft", guest);
+    const lateF4Up = keyEvent("F4", guest);
+    bridge.keyup(lateAltUp);
+    bridge.keyup(lateF4Up);
+    expect(lateAltUp.prevented()).toBe(true);
+    expect(lateF4Up.prevented()).toBe(true);
+    expect(messages).toHaveLength(4);
+  });
+
+  it("removes normally released keys from focus-loss recovery", () => {
+    const messages: MainToKernel[] = [];
+    const guest = new EventTarget();
+    const bridge = createGuiKeyboardInputBridge(
+      { postMessage: (message) => messages.push(message) },
+      () => true,
+      () => false,
+    );
+
+    bridge.keydown(keyEvent("AltRight", guest));
+    bridge.keyup(keyEvent("AltRight", guest));
+    bridge.releaseHeldKeys();
+
+    expect(decodedKeyboardMessages(messages)).toEqual([
+      { key: 0xe6, state: KbdKeyState.Pressed },
+      { key: 0xe6, state: KbdKeyState.Released },
+    ]);
+  });
+
+  it("wires blur and hidden visibility loss to held-key release", () => {
+    const windowTarget = new EventTarget();
+    const documentTarget = new EventTarget() as EventTarget & {
+      hidden: boolean;
+    };
+    documentTarget.hidden = false;
+    const releaseHeldKeys = vi.fn();
+    const dispose = installGuiKeyboardFocusLossHandlers(
+      windowTarget,
+      documentTarget,
+      releaseHeldKeys,
+    );
+
+    windowTarget.dispatchEvent(new Event("blur"));
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+    documentTarget.hidden = true;
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+    expect(releaseHeldKeys).toHaveBeenCalledTimes(2);
+
+    dispose();
+    windowTarget.dispatchEvent(new Event("blur"));
+    documentTarget.dispatchEvent(new Event("visibilitychange"));
+    expect(releaseHeldKeys).toHaveBeenCalledTimes(2);
   });
 });
 

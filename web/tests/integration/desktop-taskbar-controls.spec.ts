@@ -1,4 +1,13 @@
 import { expect, test, type Page } from "@playwright/test";
+import {
+  TASKBAR_LIGHT,
+  TASKBAR_LIGHT_FOCUSED,
+  TASKBAR_LIGHT_MINIMIZED,
+  activeWindowBounds,
+  taskbarEntryPoint,
+  titlebarControlPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -150,7 +159,7 @@ async function pixel(page: Page, x: number, y: number): Promise<number[]> {
   );
 }
 
-test("taskbar controls and app transition paint below 100 ms", async ({
+test("task buttons, titlebar controls, and app transitions paint below 100 ms", async ({
   page,
 }) => {
   const consoleLines: string[] = [];
@@ -188,23 +197,65 @@ test("taskbar controls and app transition paint below 100 ms", async ({
     .toBe(true);
   await waitForPresentationIdle(page);
 
-  // The shell is entry 0; the newly focused Terminal is entry 1. Sample the
-  // label body clear of text and the `_`/`[]`/`x` controls.
-  await expect.poll(() => pixel(page, 330, TASKBAR_Y)).toEqual([194, 198, 207, 255]);
+  // The shell is not exposed as an application task. Terminal is the first
+  // visible task button and is initially focused.
+  const terminalTask = taskbarEntryPoint(0, 1);
+  await expect
+    .poll(() => pixel(page, terminalTask.x, terminalTask.y))
+    .toEqual([...TASKBAR_LIGHT_FOCUSED]);
+  const terminalWindow = await waitForActiveWindowBounds(page, {
+    expectedWidth: 720,
+  });
 
-  // Entry 1 spans x=252..412. Its three controls are minimize
-  // 348..368, maximize/restore 370..390, and close 392..412.
-  latencies.push(await clickToPresentedFrame(page, 358, TASKBAR_Y, consoleLines));
+  // Clicking a focused task minimizes; clicking its dimmed task restores it.
+  latencies.push(
+    await clickToPresentedFrame(
+      page,
+      terminalTask.x,
+      terminalTask.y,
+      consoleLines,
+    ),
+  );
   await waitForPresentationIdle(page);
-  await expect.poll(() => pixel(page, 330, TASKBAR_Y)).toEqual([226, 228, 234, 255]);
+  await expect
+    .poll(() => pixel(page, terminalTask.x, terminalTask.y))
+    .toEqual([...TASKBAR_LIGHT_MINIMIZED]);
 
-  latencies.push(await clickToPresentedFrame(page, 330, TASKBAR_Y, consoleLines));
+  latencies.push(
+    await clickToPresentedFrame(
+      page,
+      terminalTask.x,
+      terminalTask.y,
+      consoleLines,
+    ),
+  );
   await waitForPresentationIdle(page);
-  await expect.poll(() => pixel(page, 330, TASKBAR_Y)).toEqual([194, 198, 207, 255]);
+  await expect
+    .poll(() => pixel(page, terminalTask.x, terminalTask.y))
+    .toEqual([...TASKBAR_LIGHT_FOCUSED]);
 
-  latencies.push(await clickToPresentedFrame(page, 400, TASKBAR_Y, consoleLines));
+  // Window lifecycle controls now live where users expect them: in the
+  // client-painted titlebar.
+  const workersBeforeClose = Number(
+    (await page.locator("body").getAttribute("data-pmos-live-workers")) ?? "0",
+  );
+  const close = titlebarControlPoint(terminalWindow, "close");
+  latencies.push(
+    await clickToPresentedFrame(page, close.x, close.y, consoleLines),
+  );
   await waitForPresentationIdle(page);
-  await expect.poll(() => pixel(page, 330, TASKBAR_Y)).toEqual([216, 220, 228, 255]);
+  await expect
+    .poll(() => pixel(page, terminalTask.x, terminalTask.y))
+    .toEqual([...TASKBAR_LIGHT]);
+  await expect
+    .poll(async () =>
+      Number(
+        (await page.locator("body").getAttribute("data-pmos-live-workers")) ??
+          "0",
+      ),
+    )
+    .toBeLessThan(workersBeforeClose);
+  await expect.poll(() => activeWindowBounds(page)).toBeNull();
 
   console.log(
     `[desktop-taskbar] click_to_frame_ms=${latencies

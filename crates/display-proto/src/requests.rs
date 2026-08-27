@@ -778,6 +778,24 @@ impl XdgToplevelResize {
     }
 }
 
+/// `pmd_xdg_toplevel.set_minimized()` — ask the server to hide this
+/// client-owned toplevel while preserving its surface and window state for a
+/// later shell-driven restore. Empty payload.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XdgToplevelSetMinimized;
+
+impl XdgToplevelSetMinimized {
+    pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
+        if !payload.is_empty() {
+            return Err(DecodeError::PayloadLengthMismatch {
+                expected: 0,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self)
+    }
+}
+
 // ---- pmd_seat (narrowed Wayland wl_seat) ----------------------
 
 /// `pmd_seat.get_pointer(new_id pointer)` — carve a new

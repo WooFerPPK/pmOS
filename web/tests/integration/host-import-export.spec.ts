@@ -1,6 +1,10 @@
 import fs from "node:fs";
 
 import { expect, test, type Page } from "@playwright/test";
+import {
+  LIGHT_ACTIVE_BORDER,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 test.setTimeout(45_000);
@@ -37,37 +41,12 @@ async function waitForLine(
   return lines.find(predicate)!;
 }
 
-async function findFramebufferColor(
-  page: Page,
-  rgb: readonly [number, number, number],
-): Promise<{ x: number; y: number } | null> {
-  return page.evaluate(([red, green, blue]) => {
-    const canvas = document.querySelector<HTMLCanvasElement>("#pmos-fb");
-    const context = canvas?.getContext("2d");
-    if (canvas == null || context == null) return null;
-    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let y = 0; y < canvas.height; y += 2) {
-      for (let x = 0; x < canvas.width; x += 2) {
-        const offset = (y * canvas.width + x) * 4;
-        if (
-          pixels[offset] === red &&
-          pixels[offset + 1] === green &&
-          pixels[offset + 2] === blue
-        ) {
-          return { x, y };
-        }
-      }
-    }
-    return null;
-  }, rgb);
-}
-
 async function findFilesSelectedRowY(
   page: Page,
   origin: { x: number; y: number },
 ): Promise<number | null> {
   return page.evaluate(
-    ({ originX, originY }) => {
+    ({ originX, originY, selected }) => {
       const canvas = document.querySelector<HTMLCanvasElement>("#pmos-fb");
       const context = canvas?.getContext("2d");
       if (canvas === null || canvas === undefined || context == null)
@@ -79,16 +58,16 @@ async function findFilesSelectedRowY(
       for (let index = 0; index < bottom - top; index += 1) {
         const offset = index * 4;
         if (
-          pixels[offset] === 0x4b &&
-          pixels[offset + 1] === 0x78 &&
-          pixels[offset + 2] === 0xa5
+          pixels[offset] === selected[0] &&
+          pixels[offset + 1] === selected[1] &&
+          pixels[offset + 2] === selected[2]
         ) {
           return top + index;
         }
       }
       return null;
     },
-    { originX: origin.x, originY: origin.y },
+    { originX: origin.x, originY: origin.y, selected: LIGHT_ACTIVE_BORDER },
   );
 }
 
@@ -162,15 +141,12 @@ test("Files imports drag/drop and picker files, then exports exact bytes", async
   await waitForLine(consoleLines, (line) =>
     line.includes("files: host transfer ready"),
   );
-  await expect
-    .poll(() => findFramebufferColor(page, [0x35, 0x5f, 0x84]), {
-      timeout: 10_000,
-    })
-    .not.toBeNull();
-  const origin = await findFramebufferColor(page, [0x35, 0x5f, 0x84]);
-  expect(origin).not.toBeNull();
-  await clickFramebuffer(page, origin!.x + 88, origin!.y + 109);
-  const selectedBeforeImport = await findFilesSelectedRowY(page, origin!);
+  const origin = await waitForActiveWindowBounds(page, {
+    expectedWidth: 640,
+    timeout: 10_000,
+  });
+  await clickFramebuffer(page, origin.x + 88, origin.y + 109);
+  const selectedBeforeImport = await findFilesSelectedRowY(page, origin);
   expect(selectedBeforeImport).not.toBeNull();
 
   // Larger than both the old 60 KiB bootstrap cap and the 32 KiB syscall

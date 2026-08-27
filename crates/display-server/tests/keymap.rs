@@ -163,6 +163,23 @@ fn default_keymap_modifier_keys_have_zero_codepoints() {
 }
 
 #[test]
+fn desktop_shortcut_physical_scancodes_are_stable_and_never_layout_mapped() {
+    let us = load_default();
+    let dvorak = load_bundled(KeyboardLayout::Dvorak).unwrap();
+    for (raw, expected) in [
+        (0x3D, Scancode::F4),
+        (0xE2, Scancode::AltLeft),
+        (0xE6, Scancode::AltRight),
+    ] {
+        assert_eq!(Scancode::try_from(raw).unwrap(), expected);
+        assert_eq!(
+            dvorak.map_to_logical_scancode(u32::from(raw), false, &us),
+            u32::from(raw),
+        );
+    }
+}
+
+#[test]
 fn roundtrip_manually_constructed_keymap() {
     // Build a minimal 1-entry keymap by hand and parse it.
     let mut bytes: Vec<u8> = Vec::new();

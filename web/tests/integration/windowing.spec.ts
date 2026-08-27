@@ -4,17 +4,21 @@
 // lifecycle state.
 
 import { expect, test, type Page } from "@playwright/test";
+import {
+  LIGHT_TITLEBAR,
+  TASKBAR_LIGHT_FOCUSED,
+  TASKBAR_LIGHT_MINIMIZED,
+  activeWindowBounds,
+  taskbarEntryPoint,
+  titlebarControlPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
 const TASKBAR_Y = 752;
-const FILES_TITLEBAR = [0x35, 0x5f, 0x84, 0xff] as const;
-const TASKBAR_FOCUSED = [0xc2, 0xc6, 0xcf, 0xff] as const;
-const TASKBAR_MINIMIZED = [0xe2, 0xe4, 0xea, 0xff] as const;
-const TASKBAR_FIRST_ENTRY_X = 90;
-const TASKBAR_ENTRY_STRIDE = 162;
 
 interface Point {
   readonly x: number;
@@ -76,44 +80,6 @@ async function pixel(page: Page, x: number, y: number): Promise<number[]> {
   );
 }
 
-async function colorBounds(
-  page: Page,
-  rgba: readonly [number, number, number, number],
-): Promise<ColorBounds | null> {
-  return page.locator("#pmos-fb").evaluate(
-    (canvas: HTMLCanvasElement, target) => {
-      const context = canvas.getContext("2d");
-      if (context === null) throw new Error("framebuffer 2d context missing");
-      const bytes = context.getImageData(0, 0, canvas.width, 736).data;
-      let best: ColorBounds | null = null;
-      for (let y = 0; y < 736; y += 1) {
-        let minX = canvas.width;
-        let maxX = -1;
-        let count = 0;
-        for (let x = 0; x < canvas.width; x += 1) {
-          const offset = (y * canvas.width + x) * 4;
-          if (
-            bytes[offset] !== target[0] ||
-            bytes[offset + 1] !== target[1] ||
-            bytes[offset + 2] !== target[2] ||
-            bytes[offset + 3] !== target[3]
-          ) {
-            continue;
-          }
-          minX = Math.min(minX, x);
-          maxX = Math.max(maxX, x);
-          count += 1;
-        }
-        if (best === null || count > best.count) {
-          best = { x: minX, y, right: maxX + 1, bottom: y + 1, count };
-        }
-      }
-      return best !== null && best.count >= 300 ? best : null;
-    },
-    rgba,
-  );
-}
-
 async function waitForLine(
   lines: string[],
   predicate: (line: string) => boolean,
@@ -129,38 +95,31 @@ async function waitForLine(
   return lines.slice(startIndex).find(predicate)!;
 }
 
-async function focusedTaskEntryIndex(page: Page): Promise<number | null> {
-  for (let index = 0; index < 5; index += 1) {
-    // Relative x=95 is the unpainted gap between the clipped label and the
-    // first control, so it exposes the entry palette without glyph noise.
-    const sample = await pixel(
-      page,
-      TASKBAR_FIRST_ENTRY_X + index * TASKBAR_ENTRY_STRIDE + 95,
-      TASKBAR_Y,
-    );
-    if (sample.every((channel, offset) => channel === TASKBAR_FOCUSED[offset])) {
+async function focusedTaskEntryIndex(
+  page: Page,
+  entryCount: number,
+): Promise<number | null> {
+  for (let index = 0; index < entryCount; index += 1) {
+    const point = taskbarEntryPoint(index, entryCount);
+    const sample = await pixel(page, point.x, point.y);
+    if (
+      sample.every(
+        (channel, offset) => channel === TASKBAR_LIGHT_FOCUSED[offset],
+      )
+    ) {
       return index;
     }
   }
   return null;
 }
 
-function taskEntryControls(index: number) {
-  const x = TASKBAR_FIRST_ENTRY_X + index * TASKBAR_ENTRY_STRIDE;
-  return {
-    label: x + 78,
-    minimize: x + 106,
-    maximize: x + 128,
-    close: x + 150,
-  };
-}
-
-async function taskEntryPalette(page: Page, index: number): Promise<number[]> {
-  return pixel(
-    page,
-    TASKBAR_FIRST_ENTRY_X + index * TASKBAR_ENTRY_STRIDE + 95,
-    TASKBAR_Y,
-  );
+async function taskEntryPalette(
+  page: Page,
+  index: number,
+  entryCount: number,
+): Promise<number[]> {
+  const point = taskbarEntryPoint(index, entryCount);
+  return pixel(page, point.x, point.y);
 }
 
 async function bootDesktop(page: Page, lines: string[]): Promise<void> {
@@ -182,10 +141,15 @@ async function launchFiles(page: Page, lines: string[]): Promise<ColorBounds> {
   await clickFramebuffer(page, 100, 648);
   await waitForLine(lines, (line) => line.includes("files: starting"));
   await waitForLine(lines, (line) => /files: ready \/.*$/.test(line));
-  await expect
-    .poll(() => colorBounds(page, FILES_TITLEBAR), { timeout: 10_000 })
-    .not.toBeNull();
-  return (await colorBounds(page, FILES_TITLEBAR))!;
+  const bounds = await waitForActiveWindowBounds(page, {
+    expectedWidth: 640,
+    timeout: 10_000,
+  });
+  return {
+    ...bounds,
+    bottom: bounds.y + 1,
+    count: bounds.width,
+  };
 }
 
 test("real Files window focuses, raises, drags, minimizes, restores, and toggles work-area maximize", async ({
@@ -198,20 +162,12 @@ test("real Files window focuses, raises, drags, minimizes, restores, and toggles
   );
 
   await bootDesktop(page, consoleLines);
-  await expect
-    .poll(() => focusedTaskEntryIndex(page), { timeout: 5_000 })
-    .not.toBeNull();
-  const shellEntry = (await focusedTaskEntryIndex(page))!;
   const initialFiles = await launchFiles(page, consoleLines);
   expect(initialFiles.count).toBeGreaterThan(500);
   await expect
-    .poll(async () => {
-      const focused = await focusedTaskEntryIndex(page);
-      return focused !== null && focused !== shellEntry;
-    }, { timeout: 5_000 })
-    .toBe(true);
-  const filesEntry = (await focusedTaskEntryIndex(page))!;
-  const controls = taskEntryControls(filesEntry);
+    .poll(() => focusedTaskEntryIndex(page, 1), { timeout: 5_000 })
+    .toBe(0);
+  const filesEntry = 0;
 
   // Launch Terminal so its newer overlapping toplevel covers a known Files
   // toolbar pixel.
@@ -228,21 +184,21 @@ test("real Files window focuses, raises, drags, minimizes, restores, and toggles
     .not.toEqual(filesOverlapPixel);
   await expect
     .poll(async () => {
-      const focused = await focusedTaskEntryIndex(page);
-      return focused !== null && focused !== shellEntry && focused !== filesEntry;
+      const focused = await focusedTaskEntryIndex(page, 2);
+      return focused === 1;
     }, { timeout: 5_000 })
     .toBe(true);
-  const terminalEntry = (await focusedTaskEntryIndex(page))!;
-  const terminalControls = taskEntryControls(terminalEntry);
+  const terminalEntry = 1;
 
   // The taskbar label routes through the shell-manager focus request. It must
   // focus Files and raise the real surface in the server's global z-order.
-  await clickFramebuffer(page, controls.label, TASKBAR_Y);
+  const filesTask = taskbarEntryPoint(filesEntry, 2);
+  await clickFramebuffer(page, filesTask.x, filesTask.y);
   await expect
     .poll(() => pixel(page, overlap.x, overlap.y), { timeout: 5_000 })
     .toEqual(filesOverlapPixel);
   await expect
-    .poll(() => focusedTaskEntryIndex(page), { timeout: 5_000 })
+    .poll(() => focusedTaskEntryIndex(page, 2), { timeout: 5_000 })
     .toBe(filesEntry);
 
   // Press inside the client-painted Files titlebar. Files logs after sending
@@ -274,7 +230,7 @@ test("real Files window focuses, raises, drags, minimizes, restores, and toggles
   await page.mouse.move(warmPage.x, warmPage.y, { steps: 16 });
   await expect
     .poll(async () => {
-      const bounds = await colorBounds(page, FILES_TITLEBAR);
+      const bounds = await activeWindowBounds(page);
       return bounds !== null &&
         (bounds.x > initialFiles.x || bounds.y > initialFiles.y);
     }, { timeout: 3_000 })
@@ -286,7 +242,7 @@ test("real Files window focuses, raises, drags, minimizes, restores, and toggles
     .toBeGreaterThan(beforeDragFrame);
   await expect
     .poll(async () => {
-      const bounds = await colorBounds(page, FILES_TITLEBAR);
+      const bounds = await activeWindowBounds(page);
       return bounds !== null &&
         bounds.x > initialFiles.x + 60 &&
         bounds.y > initialFiles.y + 40;
@@ -300,62 +256,68 @@ test("real Files window focuses, raises, drags, minimizes, restores, and toggles
     3_000,
     releaseLogStart,
   );
-  await expect
-    .poll(() => colorBounds(page, FILES_TITLEBAR), { timeout: 5_000 })
-    .not.toBeNull();
-  const draggedFiles = (await colorBounds(page, FILES_TITLEBAR))!;
+  const draggedFiles = await waitForActiveWindowBounds(page, {
+    expectedWidth: 640,
+  });
   expect(draggedFiles.x).toBeGreaterThan(initialFiles.x + 60);
   expect(draggedFiles.y).toBeGreaterThan(initialFiles.y + 40);
   await expect
     .poll(() => pixel(page, draggedFiles.x + 220, draggedFiles.y + 10))
-    .toEqual([...FILES_TITLEBAR]);
+    .toEqual([...LIGHT_TITLEBAR]);
 
   // A completed drag release must hand pointer ownership back to normal shell
   // hit-testing. Exercise both real task labels once more and prove the
   // overlapping dragged surface follows the global focus/raise order.
-  await clickFramebuffer(page, terminalControls.label, TASKBAR_Y);
+  const terminalTask = taskbarEntryPoint(terminalEntry, 2);
+  await clickFramebuffer(page, terminalTask.x, terminalTask.y);
   await expect
-    .poll(() => focusedTaskEntryIndex(page), { timeout: 5_000 })
+    .poll(() => focusedTaskEntryIndex(page, 2), { timeout: 5_000 })
     .toBe(terminalEntry);
   await expect
     .poll(() => pixel(page, draggedFiles.x + 220, draggedFiles.y + 10))
-    .not.toEqual([...FILES_TITLEBAR]);
-  await clickFramebuffer(page, controls.label, TASKBAR_Y);
+    .not.toEqual([...LIGHT_TITLEBAR]);
+  await clickFramebuffer(page, filesTask.x, filesTask.y);
   await expect
-    .poll(() => focusedTaskEntryIndex(page), { timeout: 5_000 })
+    .poll(() => focusedTaskEntryIndex(page, 2), { timeout: 5_000 })
     .toBe(filesEntry);
   await expect
     .poll(() => pixel(page, draggedFiles.x + 220, draggedFiles.y + 10))
-    .toEqual([...FILES_TITLEBAR]);
+    .toEqual([...LIGHT_TITLEBAR]);
 
   // Minimizing removes Files from composition; clicking its dynamically found
   // label restores and raises the same dragged window.
-  await clickFramebuffer(page, controls.minimize, TASKBAR_Y);
+  await clickFramebuffer(page, filesTask.x, filesTask.y);
   await expect
     .poll(() => pixel(page, draggedFiles.x + 220, draggedFiles.y + 10))
-    .not.toEqual([...FILES_TITLEBAR]);
+    .not.toEqual([...LIGHT_TITLEBAR]);
   await expect
-    .poll(() => taskEntryPalette(page, filesEntry))
-    .toEqual([...TASKBAR_MINIMIZED]);
-  await clickFramebuffer(page, controls.label, TASKBAR_Y);
+    .poll(() => taskEntryPalette(page, filesEntry, 2))
+    .toEqual([...TASKBAR_LIGHT_MINIMIZED]);
+  await clickFramebuffer(page, filesTask.x, filesTask.y);
   await expect
     .poll(() => pixel(page, draggedFiles.x + 220, draggedFiles.y + 10))
-    .toEqual([...FILES_TITLEBAR]);
+    .toEqual([...LIGHT_TITLEBAR]);
   await expect
-    .poll(() => taskEntryPalette(page, filesEntry))
-    .toEqual([...TASKBAR_FOCUSED]);
+    .poll(() => taskEntryPalette(page, filesEntry, 2))
+    .toEqual([...TASKBAR_LIGHT_FOCUSED]);
 
   const taskbarPixel = await pixel(page, 700, TASKBAR_Y);
-  await clickFramebuffer(page, controls.maximize, TASKBAR_Y);
+  const maximize = titlebarControlPoint(draggedFiles, "maximize");
+  await clickFramebuffer(page, maximize.x, maximize.y);
   await waitForLine(
     consoleLines,
     (line) => line.includes("files: window maximized 1024x736"),
     5_000,
   );
-  await expect.poll(() => pixel(page, 900, 10)).toEqual([...FILES_TITLEBAR]);
+  await expect.poll(() => pixel(page, 900, 10)).toEqual([...LIGHT_TITLEBAR]);
   await expect.poll(() => pixel(page, 700, TASKBAR_Y)).toEqual(taskbarPixel);
 
-  await clickFramebuffer(page, controls.maximize, TASKBAR_Y);
+  const maximizedFiles = await waitForActiveWindowBounds(page, {
+    minimumWidth: 900,
+    message: "maximized Files frame vanished",
+  });
+  const restore = titlebarControlPoint(maximizedFiles, "maximize");
+  await clickFramebuffer(page, restore.x, restore.y);
   await waitForLine(
     consoleLines,
     (line) => line.includes("files: window restored 640x420"),
@@ -363,8 +325,8 @@ test("real Files window focuses, raises, drags, minimizes, restores, and toggles
   );
   await expect
     .poll(() => pixel(page, draggedFiles.x + 220, draggedFiles.y + 10))
-    .toEqual([...FILES_TITLEBAR]);
-  await expect.poll(() => pixel(page, 900, 10)).not.toEqual([...FILES_TITLEBAR]);
+    .toEqual([...LIGHT_TITLEBAR]);
+  await expect.poll(() => pixel(page, 900, 10)).not.toEqual([...LIGHT_TITLEBAR]);
 
   expect(consoleLines.some((line) => line.includes("real kernel panic"))).toBe(
     false,

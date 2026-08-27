@@ -410,6 +410,18 @@ clears the backbuffer to its configured scene background and recomposes
 the complete live scene; it never relies on pixels left by a previous
 frame.
 
+For a commit whose old and newly-current attachments have identical validated
+output geometry and visibility, a non-empty `damage` collection is the
+client's complete declaration of every buffer-local pixel that may differ.
+This remains true when the commit swaps between same-geometry buffers. The
+server may use those rectangles only to bound comparison of the fully
+recomposed scene with its last presented shadow. Omitting damage, supplying an
+empty or invalid rectangle, changing attachment geometry or visibility, or
+otherwise making the declaration unprovable requires a full-output comparison.
+A client that changes pixels outside its declared damage violates the protocol
+and may observe stale displayed pixels; the declaration is never trusted for
+memory access, clipping, or resource validation.
+
 `frame` has an exact four-byte payload containing one client-owned callback
 ID; short or trailing payload bytes are malformed. A valid request binds a
 real `pmd_callback` object and appends it to that surface's pending callback
@@ -552,6 +564,7 @@ older revisions of this contract.
 | 6      | `unset_maximized` | —                       |                                    |
 | 7      | `move`            | `u32 serial`            | echoes pointer-button serial       |
 | 8      | `resize`          | `u32 serial, u32 edges` | serial plus resize-edge bits       |
+| 9      | `set_minimized`   | —                       | minimizes only this owned toplevel |
 
 ### Events
 
@@ -565,13 +578,23 @@ state event. Width/height `0` means the client may use its preferred size. The
 state bitfield uses `MAXIMIZED = 1<<0`, `FULLSCREEN = 1<<1`, `RESIZING = 1<<2`,
 and `ACTIVATED = 1<<3`.
 
+`ACTIVATED` mirrors the display server's authoritative keyboard-focus target.
+When focus changes, the server emits a current-size `configure` to both the
+previous and next live mapped toplevel (when present): the previous target has
+`ACTIVATED` cleared and the next target has it set. Every configure composes
+the toplevel's current persistent and transient state, so maximize and resize
+configures preserve `ACTIVATED`, while focus configures preserve `MAXIMIZED`
+and `RESIZING`. Minimizing, destroying, or disconnecting the focused window
+deactivates it before removal when it is still live and activates the topmost
+remaining focusable toplevel, if one exists.
+
 ---
 
 ## 12. Post-v1 xdg expansion
 
 The more Wayland-like `pmd_xdg_wm_base` + `pmd_xdg_surface` split, wm-base
 `ping`/`pong`, popups, parent/min/max-size setters, fullscreen setters, and a
-client-issued minimize/close request are reserved post-v1 work. None is
+client-issued close request are reserved post-v1 work. None is
 advertised by the shipped server. Adding them requires matching
 `display-proto`, server-dispatch, raw-client, toolkit-isolation, and browser
 integration coverage; documentation alone does not make an opcode available.
@@ -613,6 +636,20 @@ the resulting character back into the stable logical HID namespace consumed by
 v1 clients. Modifier, non-printing, unknown, and not-representable keys retain
 their physical value. This wire shape remains 12 bytes and existing clients do
 not reconnect when the layout changes.
+
+The browser boundary maps DOM `F4` to USB HID usage `0x3d` and maps left/right
+Alt independently to `0xe2`/`0xe6`. The display server tracks those physical
+modifier transitions before layout mapping so the replaceable shell can own
+desktop shortcut policy through the capability-gated event below; the browser
+substrate does not close guest windows directly.
+
+The browser input bridge records only mapped key presses actually forwarded to
+the guest. Because a host-window blur or transition of the document to hidden
+may suppress later DOM `keyup` events, either transition synthesizes one guest
+release for every such held key and clears the held set. Keys routed to browser
+substrate controls and reserved host shortcuts are never included. A delayed
+physical `keyup` for a synthetically released key is consumed rather than
+forwarding a duplicate release.
 
 The condensed v1 pointer-button shape is
 `button(serial, surface_id, x, y, button, state)`. `serial` is allocated
@@ -666,6 +703,7 @@ bytes has no authority and MUST be ignored.
 | 6      | `window_state_changed` | `window_state`                            | authoritative stable-boundary update |
 | 7      | `window_snapshot_done` | `u32 snapshot_id`                         | catch-up terminator         |
 | 8      | `restore_finished`     | `u32 restore_id, u32 status, u32 placed`  | completion or fail-open result |
+| 9      | `close_shortcut`       | `u32 window_id`                           | v2 focused ordinary Alt+F4 target |
 
 The v2 `window_state` payload is exactly:
 
@@ -689,12 +727,16 @@ string app_id
 ```
 
 `flags` uses `MAPPED = 1<<0`, `MINIMIZED = 1<<1`, `MAXIMIZED =
-1<<2`, `FOCUSED = 1<<3`, `HIDDEN_FOR_RESTORE = 1<<4`, and
-`RESTORE_PLACEMENT_APPLIED = 1<<5`; all other bits are zero. The final bit is
-set only while an active placement has the causal buffer-size proof described
-in §15.1. `z_rank` is bottom-to-top with zero at the bottom. The decoder MUST
-consume the payload exactly, including both padded strings, and reject
-truncation or trailing bytes.
+1<<2`, `FOCUSED = 1<<3`, `HIDDEN_FOR_RESTORE = 1<<4`,
+`RESTORE_PLACEMENT_APPLIED = 1<<5`, and `SHELL_OWNED = 1<<6`; all other bits
+are zero. `RESTORE_PLACEMENT_APPLIED` is set only while an active placement has
+the causal buffer-size proof described in §15.1. `SHELL_OWNED` is set only when
+the window's owning connection held the kernel-authenticated `SHELL`
+capability when accepted. Title and app-ID strings cannot influence it, so an
+ordinary application naming itself `pmos.shell` remains an ordinary task.
+`z_rank` is bottom-to-top with zero at the bottom. The decoder MUST consume the
+payload exactly, including both padded strings, and reject truncation or
+trailing bytes.
 
 `owner_pid` is the immutable kernel-authenticated `ipc_peer_pid` snapshot from
 the accepted socket. `ordinal` is non-zero and allocated monotonically by the
@@ -712,6 +754,16 @@ one opcode-7 terminator carrying the same ID. Subsequent opcode-5/6 events keep
 that `snapshot_id` until another subscription request. A shell discards events
 from stale IDs. Legacy opcode 1 remains independent and continues to emit only
 events 1-4.
+
+A v2 shell uses `SHELL_OWNED`, not application metadata, to classify desktop
+infrastructure. It records its private desktop surface only when both the flag
+is set and `owner_pid` equals its own kernel-authenticated PID. Flagged surfaces
+owned by an overlapping old or replacement shell are removed from the visible
+task list. Because the independent v1 stream may provisionally announce such
+a surface first, the v2 flagged event actively removes any transient entry.
+All `SHELL_OWNED` states are excluded from session-runtime live state, identity
+resolution, replacement-app detection, and persisted capture; desktop shells
+are infrastructure rather than restorable application instances.
 
 `window_state_changed` is emitted only at stable state boundaries: accepted
 title/app-ID replacement, first map or mapped/unmapped transition, a
@@ -738,6 +790,28 @@ client disconnect atomically retires the mapping before
 only through this mapping; an unknown or retired ID is a no-op and MUST never fall back to scanning
 client-local object tables.
 
+`close_shortcut(window_id)` preserves the boundary between display input
+routing and replaceable shell policy. The server recognizes only the first F4
+press of a physical hold while either independently tracked Alt key is down.
+It emits exactly one event to the authenticated shell-manager client that owns
+the current bottom work-area reservation, and only when that object was bound
+at negotiated version 2 or newer and keyboard focus resolves to a mapped,
+non-minimized, non-restore-hidden ordinary toplevel. The server retains the
+version from `registry.bind`; an explicit v1 binding never receives opcode 9.
+A shell-owned toplevel, absent focus, absent compatible active shell recipient,
+or an event-queue admission failure produces no privileged event; in those
+cases F4 keeps its ordinary focused-client routing.
+
+After successfully queuing `close_shortcut`, the server consumes the initial
+F4 press, browser repeat presses, and its matching release. Alt press/release
+events continue to route normally, and releasing one Alt key does not clear the
+other. The event carries the exact authoritative global ID captured at the
+gesture; it is never broadcast or exposed on an ordinary-client object. The
+shell verifies that the ID still names its focused visible ordinary task and
+then sends the existing authenticated `close_window(window_id)` request.
+Thus the owning application still receives the advisory
+`pmd_xdg_toplevel.close` lifecycle and decides when to destroy and exit.
+
 ### 15.1 Atomic session-restore transaction (v2)
 
 `begin_restore` is accepted only on the authenticated shell-manager object,
@@ -760,11 +834,12 @@ windows that existed before the begin are not hidden.
 
 While a toplevel is `HIDDEN_FOR_RESTORE`, the restore transaction owns its
 placement state. Owner `set_maximized`, `unset_maximized`, `move`, and `resize`
-requests are accepted as bounded no-ops, as are shell-manager focus,
-minimize/unminimize, and maximize toggles targeting that hidden window. This
-prevents an application or concurrent shell command from invalidating a saved
-normal rectangle or min/max state after placement has been proven. Ordinary
-title, app-ID, buffer, and lifecycle requests remain live.
+and `set_minimized` requests are accepted as bounded no-ops, as are
+shell-manager focus, minimize/unminimize, and maximize toggles targeting that
+hidden window. This prevents an application or concurrent shell command from
+invalidating a saved normal rectangle or min/max state after placement has
+been proven. Ordinary title, app-ID, buffer, and lifecycle requests remain
+live.
 
 `place_restored_window` must repeat the active non-zero `restore_id` and target
 a window in that transaction's hidden set. Width/height must be non-zero and
@@ -845,6 +920,15 @@ fence as specified by `driver-kernel.md §3`.
 minimized flag, raises the window, assigns keyboard focus, recomposes the
 scene, and emits `window_focused`. This makes restore a single atomic
 server operation rather than a client-observable unminimize/focus race.
+
+`pmd_xdg_toplevel.set_minimized` is the owner-scoped titlebar minimize
+operation. The request carries no global ID and can affect only the toplevel
+object named in the requesting client's object namespace. The server resolves
+that exact `(connection, toplevel ObjectId)` through its global registry, then
+uses the same authoritative minimize transition as `minimize_window`: it clears
+focus and any active drag for the target, recomposes the scene, and emits the
+v2 `window_state_changed` broadcast. Applications do not gain shell-manager
+access, and restoration remains the shell's atomic taskbar operation above.
 
 `set_work_area_bottom` is capability-gated with the shell-manager object. The
 height is clamped to the output height. Subsequent non-shell initial configures
@@ -1032,6 +1116,13 @@ the explicit v2 subscription/transaction requests. Additions to the protocol
 (new requests, new events, new objects) bump the affected interface version;
 existing clients MUST continue to work without recompilation. Breaking changes
 bump the major and MUST be considered protocol rewrites.
+
+The version requested by `registry.bind` MUST be non-zero and no greater than
+the advertised interface version; an unsupported bind is rejected without
+installing its target object. A client connection may bind the singleton
+`pmd_shell_manager` at most once. The server MUST reject a request introduced
+after that object's negotiated version before mutating state or emitting any
+event from that request.
 
 ---
 

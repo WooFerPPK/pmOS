@@ -638,6 +638,73 @@ describe("startDispatchLoop: termination", () => {
     expect(taskYields).toBe(1);
   });
 
+  it("resets the task-yield budget after a genuine asynchronous park", async () => {
+    const { host } = await freshHost();
+    let parkCalls = 0;
+    let taskYields = 0;
+
+    await host.startDispatchLoop({
+      pidSource: () => new Map(),
+      halted: () => parkCalls >= 5,
+      parkFn: async () => {
+        parkCalls += 1;
+        // Production defaultPark returns true only for Atomics.waitAsync's
+        // asynchronous form, which already releases the Worker event loop.
+        return parkCalls === 3;
+      },
+      passesBeforeTaskYield: 3,
+      taskYieldFn: async () => {
+        taskYields += 1;
+      },
+    });
+
+    expect(parkCalls).toBe(5);
+    expect(taskYields).toBe(0);
+  });
+
+  it("reports whether the default waitAsync park was asynchronous", async () => {
+    const { host } = await freshHost();
+    type WaitResult =
+      | { readonly async: false; readonly value: "not-equal" | "timed-out" }
+      | {
+          readonly async: true;
+          readonly value: Promise<"ok" | "timed-out">;
+        };
+    type WaitAsync = (
+      view: Int32Array,
+      index: number,
+      value: number,
+      timeout?: number,
+    ) => WaitResult;
+    const atomics = Atomics as unknown as { waitAsync: WaitAsync };
+    const original = atomics.waitAsync;
+    let waitCalls = 0;
+    const taskYieldsAtWaitCall: number[] = [];
+    atomics.waitAsync = () => {
+      waitCalls += 1;
+      if (waitCalls === 1) {
+        return { async: false, value: "not-equal" };
+      }
+      return { async: true, value: Promise.resolve("ok") };
+    };
+
+    try {
+      await host.startDispatchLoop({
+        pidSource: () => new Map(),
+        halted: () => waitCalls >= 2,
+        passesBeforeTaskYield: 1,
+        taskYieldFn: async () => {
+          taskYieldsAtWaitCall.push(waitCalls);
+        },
+      });
+    } finally {
+      atomics.waitAsync = original;
+    }
+
+    expect(waitCalls).toBe(2);
+    expect(taskYieldsAtWaitCall).toEqual([1]);
+  });
+
   it("default waitAsync compares against the pre-scan wake epoch", async () => {
     const { host } = await freshHost();
     const wakeSlot = host.wakeSlot;

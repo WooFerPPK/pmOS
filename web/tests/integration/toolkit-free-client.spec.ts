@@ -1,7 +1,7 @@
 // Principle VII release gate: launch the real standalone WASI binary through
 // the guest shell, prove its separately isolated Worker speaks the production
-// display protocol without toolkit, then route a real keyboard event and a
-// taskbar close request through the display server.
+// display protocol without toolkit, then route real keyboard, task-button,
+// and standard Alt+F4 close interactions through the display server.
 
 import { expect, test, type Page } from "@playwright/test";
 
@@ -12,13 +12,13 @@ import {
   submitTerminalCommand,
   waitForLine,
 } from "./guest-terminal";
+import {
+  TASKBAR_LIGHT_FOCUSED,
+  taskbarEntryPoint,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
-const TASKBAR_Y = 752;
-const TASKBAR_FIRST_ENTRY_X = 90;
-const TASKBAR_ENTRY_STRIDE = 162;
-const TASKBAR_FOCUSED = [0xc2, 0xc6, 0xcf, 0xff] as const;
 const RAW_INITIAL = [0x19, 0xd3, 0xb3, 0xff] as const;
 const RAW_INPUT = [0xff, 0x8a, 0x1f, 0xff] as const;
 const RAW_ACCENT = [0x9b, 0x2c, 0xff, 0xff] as const;
@@ -80,13 +80,14 @@ async function pixel(page: Page, x: number, y: number): Promise<number[]> {
 }
 
 async function focusedTaskEntryIndex(page: Page): Promise<number | null> {
-  for (let index = 0; index < 5; index += 1) {
-    const sample = await pixel(
-      page,
-      TASKBAR_FIRST_ENTRY_X + index * TASKBAR_ENTRY_STRIDE + 95,
-      TASKBAR_Y,
-    );
-    if (sample.every((channel, offset) => channel === TASKBAR_FOCUSED[offset])) {
+  for (let index = 0; index < 2; index += 1) {
+    const point = taskbarEntryPoint(index, 2);
+    const sample = await pixel(page, point.x, point.y);
+    if (
+      sample.every(
+        (channel, offset) => channel === TASKBAR_LIGHT_FOCUSED[offset],
+      )
+    ) {
       return index;
     }
   }
@@ -99,7 +100,7 @@ async function workerCount(page: Page): Promise<number> {
   );
 }
 
-test("a separately isolated toolkit-free client maps, receives input, repaints, and closes", async ({
+test("a separately isolated toolkit-free client maps, receives input, repaints, minimizes, restores, and closes", async ({
   page,
   browserName,
 }) => {
@@ -114,7 +115,6 @@ test("a separately isolated toolkit-free client maps, receives input, repaints, 
 
   await bootDesktop(page, lines);
   await launchTerminal(page, lines);
-  const steadyWorkers = await workerCount(page);
 
   await submitTerminalCommand(
     page,
@@ -131,7 +131,6 @@ test("a separately isolated toolkit-free client maps, receives input, repaints, 
   await waitForLine(lines, (line) =>
     line.includes("toolkit-free-client: presented raw 320x200 frame"),
   );
-  await expect.poll(() => workerCount(page)).toBe(steadyWorkers + 1);
 
   await expect
     .poll(async () => (await colourStats(page, RAW_INITIAL)).count, {
@@ -146,6 +145,8 @@ test("a separately isolated toolkit-free client maps, receives input, repaints, 
   expect(initialStats.maxY - initialStats.minY + 1).toBeGreaterThanOrEqual(170);
   expect(initialStats.maxY - initialStats.minY + 1).toBeLessThanOrEqual(184);
   expect((await colourStats(page, RAW_ACCENT)).count).toBeGreaterThan(5_000);
+  const rawWorkers = await workerCount(page);
+  expect(rawWorkers).toBeGreaterThan(0);
 
   // First-map focus is owned by the raw surface. A physical key crosses the
   // browser input driver, kernel, display server, and pmd_keyboard event path;
@@ -165,17 +166,27 @@ test("a separately isolated toolkit-free client maps, receives input, repaints, 
     .toBeGreaterThan(45_000);
   await expect.poll(async () => (await colourStats(page, RAW_INITIAL)).count).toBe(0);
 
-  // The newly mapped raw window is the focused task entry. The shell-manager
-  // close request becomes pmd_xdg_toplevel.close; the raw client destroys its
-  // objects, exits, and its independently counted Worker disappears.
+  // The newly mapped raw window is the focused task entry. Modern task buttons
+  // minimize when focused and restore when minimized; the raw client remains
+  // independently alive throughout both compositor transitions.
   await expect.poll(() => focusedTaskEntryIndex(page)).not.toBeNull();
   const taskIndex = await focusedTaskEntryIndex(page);
   if (taskIndex === null) throw new Error("raw client task entry disappeared");
-  await clickFramebuffer(
-    page,
-    TASKBAR_FIRST_ENTRY_X + taskIndex * TASKBAR_ENTRY_STRIDE + 150,
-    TASKBAR_Y,
-  );
+  const taskPoint = taskbarEntryPoint(taskIndex, 2);
+  await clickFramebuffer(page, taskPoint.x, taskPoint.y);
+  await expect.poll(async () => (await colourStats(page, RAW_INPUT)).count).toBe(0);
+  expect(await workerCount(page)).toBe(rawWorkers);
+  await clickFramebuffer(page, taskPoint.x, taskPoint.y);
+  await expect
+    .poll(async () => (await colourStats(page, RAW_INPUT)).count)
+    .toBeGreaterThan(45_000);
+  expect(await workerCount(page)).toBe(rawWorkers);
+  await expect.poll(() => focusedTaskEntryIndex(page)).toBe(taskIndex);
+
+  // Closing remains a distinct lifecycle gate. Alt+F4 is routed by the shell
+  // to pmd_shell_manager.close_window; the raw protocol client must receive
+  // xdg_toplevel.close, destroy its objects, exit cleanly, and lose its Worker.
+  await page.keyboard.press("Alt+F4");
   await waitForLine(
     lines,
     (line) => line.includes("toolkit-free-client: close requested"),
@@ -186,8 +197,10 @@ test("a separately isolated toolkit-free client maps, receives input, repaints, 
     (line) => line.includes("toolkit-free-client: clean exit"),
     2_000,
   );
-  await expect.poll(() => workerCount(page), { timeout: 2_000 }).toBe(steadyWorkers);
   await expect.poll(async () => (await colourStats(page, RAW_INPUT)).count).toBe(0);
+  await expect
+    .poll(() => workerCount(page), { timeout: 2_000 })
+    .toBe(rawWorkers - 1);
 
   expect(lines.some((line) => line.includes("real kernel panic"))).toBe(false);
   expect(lines.some((line) => line.includes("user worker crashed pid="))).toBe(false);

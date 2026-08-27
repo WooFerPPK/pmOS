@@ -25,30 +25,24 @@ import {
   openLauncherMenuBefore,
   selectLauncherRowBefore,
 } from "./launcher-interaction";
+import {
+  LIGHT_INACTIVE_TITLEBAR,
+  LIGHT_TITLEBAR,
+  TASKBAR_LIGHT_FOCUSED,
+  TASKBAR_LIGHT_MINIMIZED,
+  TASKBAR_LIGHT_UNFOCUSED,
+  activeWindowBounds,
+  taskbarEntryPoint,
+  titlebarControlPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 test.setTimeout(120_000);
 
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
-const TASKBAR_Y = 752;
-const TASKBAR_ENTRY_SAMPLE_Y = 762;
-const TASKBAR_LEFT_MARGIN = 4;
-const TASKBAR_LAUNCHER_RESERVED_WIDTH = 86;
-const TASKBAR_CLOCK_RESERVED_WIDTH = 68;
-const TASKBAR_RIGHT_MARGIN = 4;
-const TASKBAR_ENTRY_GAP = 2;
-const TASKBAR_ENTRY_WIDTH = 160;
-const TASKBAR_MIN_ENTRY_WIDTH = 112;
-const TASKBAR_CONTROL_WIDTH = 20;
-const TASKBAR_CONTROL_GAP = 2;
-const TASKBAR_FOCUSED = [0xc2, 0xc6, 0xcf, 0xff] as const;
-const TASKBAR_UNFOCUSED = [0xec, 0xee, 0xf4, 0xff] as const;
-const TASKBAR_MINIMIZED = [0xe2, 0xe4, 0xea, 0xff] as const;
-const TASKBAR_CLOSE_FILL = [0xd8, 0xdc, 0xe4, 0xff] as const;
-const TASKBAR_TAIL_POINT = { x: 945, y: TASKBAR_ENTRY_SAMPLE_Y } as const;
-const FILES_TITLEBAR = [0x35, 0x5f, 0x84, 0xff] as const;
-const SETTINGS_TITLEBAR = [0x40, 0x60, 0x70, 0xff] as const;
+const TASKBAR_TAIL_POINT = { x: 945, y: 740 } as const;
 const TERMINAL_BACKGROUND = [0x14, 0x0e, 0x0a, 0xff] as const;
 const SESSION_HEADER = "PMOS_SESSION_V1";
 const SESSION_PATH = "/home/user/.config/pmos/session-v1";
@@ -57,7 +51,7 @@ const SENTINEL_TEXT = "pmos-session-restore-sentinel";
 const SESSION_FLAG_MINIMIZED = 1;
 const SESSION_FLAG_MAXIMIZED = 2;
 const APP_WINDOW_COUNT = 6;
-const TASK_ENTRY_COUNT = APP_WINDOW_COUNT + 1;
+const TASK_ENTRY_COUNT = APP_WINDOW_COUNT;
 const RESTORED_INPUT_SAMPLE_COUNT = 20;
 const LATENCY_BUDGET_MS = 100;
 
@@ -196,94 +190,15 @@ async function pixel(page: Page, point: Point): Promise<number[]> {
 
 async function colorBounds(
   page: Page,
-  rgba: readonly [number, number, number, number],
 ): Promise<ColorBounds | null> {
-  return page
-    .locator("#pmos-fb")
-    .evaluate((canvas: HTMLCanvasElement, target) => {
-      const context = canvas.getContext("2d");
-      if (context === null) throw new Error("framebuffer 2d context missing");
-      const bytes = context.getImageData(0, 0, canvas.width, 736).data;
-      let best: ColorBounds | null = null;
-      for (let y = 0; y < 736; y += 1) {
-        let runStart = -1;
-        for (let x = 0; x <= canvas.width; x += 1) {
-          const offset = (y * canvas.width + x) * 4;
-          const matched =
-            x < canvas.width &&
-            bytes[offset] === target[0] &&
-            bytes[offset + 1] === target[1] &&
-            bytes[offset + 2] === target[2] &&
-            bytes[offset + 3] === target[3];
-          if (matched && runStart < 0) runStart = x;
-          if (!matched && runStart >= 0) {
-            const count = x - runStart;
-            if (best === null || count > best.count) {
-              best = { x: runStart, y, right: x, count };
-            }
-            runStart = -1;
-          }
-        }
-      }
-      return best !== null && best.count >= 300 ? best : null;
-    }, rgba);
-}
-
-function taskbarEntryWidth(entryCount: number): number {
-  const available =
-    FRAMEBUFFER_WIDTH -
-    TASKBAR_LEFT_MARGIN -
-    TASKBAR_LAUNCHER_RESERVED_WIDTH -
-    TASKBAR_CLOCK_RESERVED_WIDTH -
-    TASKBAR_RIGHT_MARGIN;
-  const gaps = TASKBAR_ENTRY_GAP * Math.max(0, entryCount - 1);
-  return Math.max(
-    TASKBAR_MIN_ENTRY_WIDTH,
-    Math.min(TASKBAR_ENTRY_WIDTH, Math.floor((available - gaps) / entryCount)),
-  );
-}
-
-function taskbarEntryX(index: number, entryCount: number): number {
-  return (
-    TASKBAR_LEFT_MARGIN +
-    TASKBAR_LAUNCHER_RESERVED_WIDTH +
-    index * (taskbarEntryWidth(entryCount) + TASKBAR_ENTRY_GAP)
-  );
-}
-
-function taskbarEntryPoint(index: number, entryCount: number): Point {
-  return {
-    x: taskbarEntryX(index, entryCount) + 30,
-    y: TASKBAR_ENTRY_SAMPLE_Y,
-  };
+  const bounds = await activeWindowBounds(page);
+  return bounds === null
+    ? null
+    : { ...bounds, count: bounds.width };
 }
 
 function taskbarLabelPoint(index: number, entryCount: number): Point {
-  const width = taskbarEntryWidth(entryCount);
-  const labelWidth =
-    width - 3 * TASKBAR_CONTROL_WIDTH - 3 * TASKBAR_CONTROL_GAP;
-  return {
-    x:
-      taskbarEntryX(index, entryCount) +
-      Math.max(12, Math.floor(labelWidth / 2)),
-    y: TASKBAR_Y,
-  };
-}
-
-function taskbarControlPoint(
-  index: number,
-  entryCount: number,
-  control: "minimize" | "maximize",
-): Point {
-  const right =
-    taskbarEntryX(index, entryCount) + taskbarEntryWidth(entryCount);
-  return {
-    x:
-      control === "maximize"
-        ? right - TASKBAR_CONTROL_WIDTH - TASKBAR_CONTROL_GAP - 10
-        : right - 2 * TASKBAR_CONTROL_WIDTH - 2 * TASKBAR_CONTROL_GAP - 10,
-    y: TASKBAR_Y,
-  };
+  return taskbarEntryPoint(index, entryCount);
 }
 
 function channelsEqual(
@@ -294,9 +209,9 @@ function channelsEqual(
 }
 
 function classifyTaskPalette(channels: readonly number[]): TaskPalette {
-  if (channelsEqual(channels, TASKBAR_FOCUSED)) return "focused";
-  if (channelsEqual(channels, TASKBAR_UNFOCUSED)) return "unfocused";
-  if (channelsEqual(channels, TASKBAR_MINIMIZED)) return "minimized";
+  if (channelsEqual(channels, TASKBAR_LIGHT_FOCUSED)) return "focused";
+  if (channelsEqual(channels, TASKBAR_LIGHT_UNFOCUSED)) return "unfocused";
+  if (channelsEqual(channels, TASKBAR_LIGHT_MINIMIZED)) return "minimized";
   return "other";
 }
 
@@ -384,8 +299,8 @@ async function launchBundledApp(
   );
   await waitForFocusedTaskEntry(
     page,
+    appIndex,
     appIndex + 1,
-    appIndex + 2,
     app.name,
     menuCloseFrame,
   );
@@ -428,7 +343,7 @@ async function dragFiles(
   await expect
     .poll(
       async () => {
-        const bounds = await colorBounds(page, FILES_TITLEBAR);
+        const bounds = await colorBounds(page);
         return (
           bounds !== null && (bounds.x > initial.x || bounds.y > initial.y)
         );
@@ -448,7 +363,7 @@ async function dragFiles(
   await expect
     .poll(
       async () => {
-        const bounds = await colorBounds(page, FILES_TITLEBAR);
+        const bounds = await colorBounds(page);
         return (
           bounds !== null &&
           bounds.x > initial.x + 60 &&
@@ -471,7 +386,7 @@ async function dragFiles(
     "Files drag completion",
     3_000,
   );
-  const dragged = await colorBounds(page, FILES_TITLEBAR);
+  const dragged = await colorBounds(page);
   if (dragged === null) throw new Error("Files titlebar vanished after drag");
   return dragged;
 }
@@ -881,20 +796,18 @@ test("a tab close restores the durable six-app session before warm readiness", a
     (line) => line.includes("session-sentinel-durable"),
   );
 
-  await focusTaskEntry(page, 2, TASK_ENTRY_COUNT, "Files");
+  await focusTaskEntry(page, 1, TASK_ENTRY_COUNT, "Files");
   await expect
-    .poll(() => colorBounds(page, FILES_TITLEBAR), { timeout: 5_000 })
+    .poll(() => colorBounds(page), { timeout: 5_000 })
     .not.toBeNull();
-  const initialFiles = await colorBounds(page, FILES_TITLEBAR);
+  const initialFiles = await colorBounds(page);
   if (initialFiles === null) throw new Error("Files titlebar was not visible");
   const draggedFiles = await dragFiles(page, firstLines, initialFiles);
 
   const maximizeLogStart = firstLines.length;
   const maximizeFrame = await frameSequence(page);
-  await clickFramebuffer(
-    page,
-    taskbarControlPoint(2, TASK_ENTRY_COUNT, "maximize"),
-  );
+  const maximize = titlebarControlPoint(draggedFiles, "maximize");
+  await clickFramebuffer(page, maximize);
   await waitForLineAfter(
     firstLines,
     maximizeLogStart,
@@ -907,16 +820,13 @@ test("a tab close restores the durable six-app session before warm readiness", a
     .toBeGreaterThan(maximizeFrame);
   await expect
     .poll(() => pixel(page, { x: 900, y: 10 }), { timeout: 5_000 })
-    .toEqual([...FILES_TITLEBAR]);
+    .toEqual([...LIGHT_TITLEBAR]);
 
-  await focusTaskEntry(page, 3, TASK_ENTRY_COUNT, "Edit");
+  await focusTaskEntry(page, 2, TASK_ENTRY_COUNT, "Edit");
   const minimizeFrame = await frameSequence(page);
-  await clickFramebuffer(
-    page,
-    taskbarControlPoint(3, TASK_ENTRY_COUNT, "minimize"),
-  );
+  await clickFramebuffer(page, taskbarEntryPoint(2, TASK_ENTRY_COUNT));
   await expect
-    .poll(async () => (await taskPalettes(page, TASK_ENTRY_COUNT))[3], {
+    .poll(async () => (await taskPalettes(page, TASK_ENTRY_COUNT))[2], {
       timeout: 5_000,
     })
     .toBe("minimized");
@@ -924,9 +834,9 @@ test("a tab close restores the durable six-app session before warm readiness", a
     .poll(() => frameSequence(page), { timeout: 3_000 })
     .toBeGreaterThan(minimizeFrame);
 
-  await focusTaskEntry(page, 5, TASK_ENTRY_COUNT, "System Monitor");
+  await focusTaskEntry(page, 4, TASK_ENTRY_COUNT, "System Monitor");
   const beforeTerminalOne = latestDurableRevision(firstLines);
-  await focusTaskEntry(page, 1, TASK_ENTRY_COUNT, "Terminal 1");
+  await focusTaskEntry(page, 0, TASK_ENTRY_COUNT, "Terminal 1");
   await expect
     .poll(() => pixel(page, { x: 700, y: 140 }), { timeout: 5_000 })
     .toEqual([...TERMINAL_BACKGROUND]);
@@ -940,11 +850,11 @@ test("a tab close restores the durable six-app session before warm readiness", a
   // Settings is raised after Terminal 1, but it does not cover the x=700
   // Terminal/Sysmon overlap. The two probes therefore pin both neighboring
   // z-order relationships without relying on restored taskbar creation order.
-  await focusTaskEntry(page, 4, TASK_ENTRY_COUNT, "Settings");
+  await focusTaskEntry(page, 3, TASK_ENTRY_COUNT, "Settings");
   await expect
     .poll(() => pixel(page, { x: 400, y: 100 }), { timeout: 5_000 })
-    .toEqual([...SETTINGS_TITLEBAR]);
-  await focusTaskEntry(page, 6, TASK_ENTRY_COUNT, "Terminal 2");
+    .toEqual([...LIGHT_TITLEBAR]);
+  await focusTaskEntry(page, 5, TASK_ENTRY_COUNT, "Terminal 2");
   const finalSnapshot = await waitForDurableSnapshot(
     page,
     firstLines,
@@ -956,14 +866,13 @@ test("a tab close restores the durable six-app session before warm readiness", a
   const expectedSettingsPixel = await pixel(page, { x: 400, y: 100 });
   const expectedStackPixel = await pixel(page, { x: 700, y: 140 });
   const expectedTaskbarTailPixel = await pixel(page, TASKBAR_TAIL_POINT);
-  expect(expectedMaxPixel).toEqual([...FILES_TITLEBAR]);
-  expect(expectedSettingsPixel).toEqual([...SETTINGS_TITLEBAR]);
+  expect(expectedMaxPixel).toEqual([...LIGHT_INACTIVE_TITLEBAR]);
+  expect(expectedSettingsPixel).toEqual([...LIGHT_INACTIVE_TITLEBAR]);
   expect(expectedStackPixel).toEqual([...TERMINAL_BACKGROUND]);
-  // Seven entries end in the last close control at x=945. An eighth entry
-  // replaces this pixel with the taskbar's overflow control.
-  expect(expectedTaskbarTailPixel).toEqual([...TASKBAR_CLOSE_FILL]);
+  // Six app-only entries fit without overflow; the tail is part of the
+  // focused final Terminal task rather than an embedded close control.
+  expect(expectedTaskbarTailPixel).toEqual([...TASKBAR_LIGHT_FOCUSED]);
   expect(await taskPalettes(page, TASK_ENTRY_COUNT)).toEqual([
-    "unfocused",
     "unfocused",
     "unfocused",
     "minimized",
@@ -1063,15 +972,14 @@ test("a tab close restores the durable six-app session before warm readiness", a
   ).toHaveLength(1);
   expect(
     restoredPalettes.filter((palette) => palette === "unfocused"),
-  ).toHaveLength(5);
-  expect(
-    restoredPalettes[0],
-    "the late shell wallpaper map must not steal restored app focus",
-  ).toBe("unfocused");
+  ).toHaveLength(4);
   expect(restoredPalettes).not.toContain("other");
-  expect(await pixel(secondPage, TASKBAR_TAIL_POINT)).toEqual(
-    expectedTaskbarTailPixel,
-  );
+  // Restored apps race through their display handshakes, so task-slot order
+  // is not durable identity. Still pin the final slot's full-width paint by
+  // requiring its tail to carry the same exact palette as its sampled body.
+  expect(
+    classifyTaskPalette(await pixel(secondPage, TASKBAR_TAIL_POINT)),
+  ).toBe(restoredPalettes[5]);
   expect(await pixel(secondPage, { x: 900, y: 10 })).toEqual(expectedMaxPixel);
   expect(await pixel(secondPage, { x: 400, y: 100 })).toEqual(
     expectedSettingsPixel,
@@ -1174,9 +1082,13 @@ test("a tab close restores the durable six-app session before warm readiness", a
 
   const restoreLogStart = secondLines.length;
   const unmaximizeFrame = await frameSequence(secondPage);
+  const maximizedFiles = await waitForActiveWindowBounds(secondPage, {
+    minimumWidth: 900,
+    message: "focused maximized Files frame vanished",
+  });
   await clickFramebuffer(
     secondPage,
-    taskbarControlPoint(filesEntry, TASK_ENTRY_COUNT, "maximize"),
+    titlebarControlPoint(maximizedFiles, "maximize"),
   );
   await waitForLineAfter(
     secondLines,
@@ -1189,7 +1101,7 @@ test("a tab close restores the durable six-app session before warm readiness", a
     .poll(
       async () => {
         if ((await frameSequence(secondPage)) <= unmaximizeFrame) return null;
-        const bounds = await colorBounds(secondPage, FILES_TITLEBAR);
+        const bounds = await colorBounds(secondPage);
         return bounds === null
           ? null
           : { x: bounds.x, y: bounds.y, right: bounds.right };

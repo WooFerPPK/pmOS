@@ -1,17 +1,20 @@
-// T219 — graceful window close through the real taskbar shell-manager path.
+// T219 — graceful window close through a real client-painted caption button.
 
 import { expect, test, type Page } from "@playwright/test";
+import {
+  LIGHT_TITLEBAR,
+  TASKBAR_LIGHT,
+  TASKBAR_LIGHT_FOCUSED,
+  taskbarEntryPoint,
+  titlebarControlPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
 const TASKBAR_Y = 752;
-const FILES_TITLEBAR = [0x35, 0x5f, 0x84, 0xff] as const;
-const TASKBAR_FOCUSED = [0xc2, 0xc6, 0xcf, 0xff] as const;
-const TASKBAR_FIRST_ENTRY_X = 90;
-const TASKBAR_ENTRY_STRIDE = 162;
-const FILES_TASK_ENTRY_INDEX = 1;
 
 async function clickFramebuffer(
   page: Page,
@@ -38,45 +41,14 @@ async function pixel(page: Page, x: number, y: number): Promise<number[]> {
   );
 }
 
-async function titlebarAnchor(
-  page: Page,
-): Promise<{ x: number; y: number } | null> {
-  return page
-    .locator("#pmos-fb")
-    .evaluate((canvas: HTMLCanvasElement, target) => {
-      const context = canvas.getContext("2d");
-      if (context === null) throw new Error("framebuffer 2d context missing");
-      const bytes = context.getImageData(0, 0, canvas.width, 736).data;
-      for (let y = 0; y < 736; y += 1) {
-        let minX = canvas.width;
-        let matches = 0;
-        for (let x = 0; x < canvas.width; x += 1) {
-          const offset = (y * canvas.width + x) * 4;
-          if (
-            bytes[offset] === target[0] &&
-            bytes[offset + 1] === target[1] &&
-            bytes[offset + 2] === target[2] &&
-            bytes[offset + 3] === target[3]
-          ) {
-            minX = Math.min(minX, x);
-            matches += 1;
-          }
-        }
-        if (matches >= 300) return { x: minX, y };
-      }
-      return null;
-    }, FILES_TITLEBAR);
-}
-
 async function focusedTaskEntryIndex(page: Page): Promise<number | null> {
-  for (let index = 0; index < 5; index += 1) {
-    const sample = await pixel(
-      page,
-      TASKBAR_FIRST_ENTRY_X + index * TASKBAR_ENTRY_STRIDE + 95,
-      TASKBAR_Y,
-    );
+  for (let index = 0; index < 1; index += 1) {
+    const point = taskbarEntryPoint(index, 1);
+    const sample = await pixel(page, point.x, point.y);
     if (
-      sample.every((channel, offset) => channel === TASKBAR_FOCUSED[offset])
+      sample.every(
+        (channel, offset) => channel === TASKBAR_LIGHT_FOCUSED[offset],
+      )
     ) {
       return index;
     }
@@ -104,7 +76,7 @@ async function waitForLine(
   return lines.find(predicate)!;
 }
 
-test("taskbar close is acknowledged by Files and exits its process within one second", async ({
+test("titlebar close is acknowledged by Files and exits its process within one second", async ({
   page,
 }) => {
   const consoleLines: string[] = [];
@@ -125,25 +97,25 @@ test("taskbar close is acknowledged by Files and exits its process within one se
   await clickFramebuffer(page, 100, 648);
   await waitForLine(consoleLines, (line) => line.includes("files: starting"));
   await waitForLine(consoleLines, (line) => /files: ready \/.*$/.test(line));
-  await expect.poll(() => titlebarAnchor(page)).not.toBeNull();
-  const filesOrigin = (await titlebarAnchor(page))!;
+  const filesOrigin = await waitForActiveWindowBounds(page, {
+    expectedWidth: 640,
+  });
   const titlebarPoint = { x: filesOrigin.x + 500, y: filesOrigin.y + 10 };
-  const filesEntry = FILES_TASK_ENTRY_INDEX;
   await expect
     .poll(async () => ({
       focusedEntry: await focusedTaskEntryIndex(page),
       titlebar: await pixel(page, titlebarPoint.x, titlebarPoint.y),
     }))
     .toEqual({
-      focusedEntry: FILES_TASK_ENTRY_INDEX,
-      titlebar: [...FILES_TITLEBAR],
+      focusedEntry: 0,
+      titlebar: [...LIGHT_TITLEBAR],
     });
-  const filesEntryX = TASKBAR_FIRST_ENTRY_X + filesEntry * TASKBAR_ENTRY_STRIDE;
 
   const workersBeforeClose = await workerCount(page);
   expect(workersBeforeClose).toBeGreaterThan(0);
   const closeStarted = performance.now();
-  await clickFramebuffer(page, filesEntryX + 150, TASKBAR_Y);
+  const close = titlebarControlPoint(filesOrigin, "close");
+  await clickFramebuffer(page, close.x, close.y);
   await expect
     .poll(() => workerCount(page), {
       timeout: 1_000,
@@ -153,19 +125,20 @@ test("taskbar close is acknowledged by Files and exits its process within one se
   expect(performance.now() - closeStarted).toBeLessThan(1_000);
   await waitForLine(
     consoleLines,
-    (line) => line.includes("files: close requested by display server"),
+    (line) => line.includes("files: close requested by client titlebar"),
     1_000,
   );
-
   // Disconnect destroys the toplevel: its titlebar pixels disappear and the
   // retired task entry exposes the same taskbar base colour as empty space.
   await expect
     .poll(() => pixel(page, titlebarPoint.x, titlebarPoint.y))
-    .not.toEqual([...FILES_TITLEBAR]);
-  const emptyTaskbar = await pixel(page, 700, TASKBAR_Y);
+    .not.toEqual([...LIGHT_TITLEBAR]);
   await expect
-    .poll(() => pixel(page, filesEntryX + 10, TASKBAR_Y))
-    .toEqual(emptyTaskbar);
+    .poll(() => {
+      const task = taskbarEntryPoint(0, 1);
+      return pixel(page, task.x, task.y);
+    })
+    .toEqual([...TASKBAR_LIGHT]);
 
   expect(consoleLines.some((line) => line.includes("real kernel panic"))).toBe(
     false,

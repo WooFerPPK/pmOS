@@ -14,23 +14,21 @@ import {
   openLauncherMenuBefore,
   selectLauncherRowBefore,
 } from "./launcher-interaction";
+import {
+  DARK_ACTIVE_BORDER,
+  LIGHT_TITLEBAR,
+  TASKBAR_LIGHT_FOCUSED,
+  TASKBAR_LIGHT_UNFOCUSED,
+  activeWindowBounds,
+  activeWindowBorderPoint,
+  taskbarEntryPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
-const TASKBAR_Y = 752;
-const TASKBAR_ENTRY_SAMPLE_Y = 762;
-const TASKBAR_LEFT_MARGIN = 4;
-const TASKBAR_LAUNCHER_RESERVED_WIDTH = 86;
-const TASKBAR_CLOCK_RESERVED_WIDTH = 68;
-const TASKBAR_RIGHT_MARGIN = 4;
-const TASKBAR_ENTRY_GAP = 2;
-const TASKBAR_ENTRY_WIDTH = 160;
-const TASKBAR_MIN_ENTRY_WIDTH = 112;
-const TASKBAR_FOCUSED = [0xc2, 0xc6, 0xcf, 0xff] as const;
-const TASKBAR_UNFOCUSED = [0xec, 0xee, 0xf4, 0xff] as const;
-const FILES_TITLEBAR = [0x35, 0x5f, 0x84, 0xff] as const;
 const TERMINAL_BACKGROUND = [0x14, 0x0e, 0x0a, 0xff] as const;
 const TERMINAL_WIDTH = 720;
 const TERMINAL_HEIGHT = 480;
@@ -132,45 +130,20 @@ async function pixel(page: Page, point: Point): Promise<number[]> {
 
 async function colorBounds(
   page: Page,
-  rgba: readonly [number, number, number, number],
 ): Promise<ColorBounds | null> {
-  return page.locator("#pmos-fb").evaluate(
-    (canvas: HTMLCanvasElement, target) => {
-      const context = canvas.getContext("2d");
-      if (context === null) throw new Error("framebuffer 2d context missing");
-      const bytes = context.getImageData(0, 0, canvas.width, 736).data;
-      let best: ColorBounds | null = null;
-      for (let y = 0; y < 736; y += 1) {
-        let minX = canvas.width;
-        let maxX = -1;
-        let count = 0;
-        for (let x = 0; x < canvas.width; x += 1) {
-          const offset = (y * canvas.width + x) * 4;
-          if (
-            bytes[offset] !== target[0] ||
-            bytes[offset + 1] !== target[1] ||
-            bytes[offset + 2] !== target[2] ||
-            bytes[offset + 3] !== target[3]
-          ) {
-            continue;
-          }
-          minX = Math.min(minX, x);
-          maxX = Math.max(maxX, x);
-          count += 1;
-        }
-        if (best === null || count > best.count) {
-          best = { x: minX, y, right: maxX + 1, bottom: y + 1, count };
-        }
-      }
-      return best !== null && best.count >= 300 ? best : null;
-    },
-    rgba,
-  );
+  const bounds = await activeWindowBounds(page);
+  return bounds === null
+    ? null
+    : {
+        ...bounds,
+        bottom: bounds.y + 1,
+        count: bounds.width,
+      };
 }
 
 function terminalPromptRegionAt(origin: Point): Region {
-  // Both shipped 8x14 and 8x16 fonts place the input row at local y=452 in a
-  // 720x480 Terminal. A 24-pixel band around it captures prompt, input, and
+  // Both shipped fonts keep the input row in the bottom content band below
+  // the 22-pixel shared titlebar. This region captures prompt, input, and
   // cursor while excluding taskbar pixels and every other app's content.
   return {
     x: origin.x + 4,
@@ -180,43 +153,8 @@ function terminalPromptRegionAt(origin: Point): Region {
   };
 }
 
-function taskbarEntryWidth(entryCount: number): number {
-  const available =
-    FRAMEBUFFER_WIDTH -
-    TASKBAR_LEFT_MARGIN -
-    TASKBAR_LAUNCHER_RESERVED_WIDTH -
-    TASKBAR_CLOCK_RESERVED_WIDTH -
-    TASKBAR_RIGHT_MARGIN;
-  const gaps = TASKBAR_ENTRY_GAP * Math.max(0, entryCount - 1);
-  return Math.max(
-    TASKBAR_MIN_ENTRY_WIDTH,
-    Math.min(TASKBAR_ENTRY_WIDTH, Math.floor((available - gaps) / entryCount)),
-  );
-}
-
-function taskbarEntryPoint(index: number, entryCount: number): Point {
-  const width = taskbarEntryWidth(entryCount);
-  return {
-    x:
-      TASKBAR_LEFT_MARGIN +
-      TASKBAR_LAUNCHER_RESERVED_WIDTH +
-      index * (width + TASKBAR_ENTRY_GAP) +
-      30,
-    y: TASKBAR_ENTRY_SAMPLE_Y,
-  };
-}
-
 function taskbarEntryClickPoint(index: number, entryCount: number): Point {
-  const width = taskbarEntryWidth(entryCount);
-  const labelWidth = width - 3 * 20 - 3 * TASKBAR_ENTRY_GAP;
-  return {
-    x:
-      TASKBAR_LEFT_MARGIN +
-      TASKBAR_LAUNCHER_RESERVED_WIDTH +
-      index * (width + TASKBAR_ENTRY_GAP) +
-      Math.max(12, Math.floor(labelWidth / 2)),
-    y: TASKBAR_Y,
-  };
+  return taskbarEntryPoint(index, entryCount);
 }
 
 async function waitForLineAfter(
@@ -257,7 +195,9 @@ async function waitForFocusedTaskEntry(
       );
       return entryPixels.every((entryPixel, entryIndex) => {
         const expected =
-          entryIndex === index ? TASKBAR_FOCUSED : TASKBAR_UNFOCUSED;
+          entryIndex === index
+            ? TASKBAR_LIGHT_FOCUSED
+            : TASKBAR_LIGHT_UNFOCUSED;
         return entryPixel.every(
           (channel, channelIndex) => channel === expected[channelIndex],
         );
@@ -305,13 +245,13 @@ async function launchBundledApp(
     app.started,
     `${app.name} process startup`,
   );
-  // The shell itself is entry zero. Requiring the newly appended entry's
-  // focused palette proves this exact process completed its display handshake
-  // and mapped a graphical toplevel; a spawn log alone is insufficient.
+  // Requiring the newly appended app task's focused palette proves this exact
+  // process completed its display handshake and mapped a graphical toplevel;
+  // a spawn log alone is insufficient.
   await waitForFocusedTaskEntry(
     page,
+    appIndex,
     appIndex + 1,
-    appIndex + 2,
     app.name,
     menuCloseFrame,
   );
@@ -384,23 +324,47 @@ async function measureFocusClick(
   workloadStartedAt: number,
   targetIndex: number,
   entryCount: number,
+  targetOrigin: Point,
   consoleLines: readonly string[],
 ): Promise<CausalLatencySample> {
   const evidencePoint = taskbarEntryPoint(targetIndex, entryCount);
-  expect(await pixel(page, evidencePoint)).toEqual([...TASKBAR_UNFOCUSED]);
+  const activeBorderPoint = activeWindowBorderPoint({
+    ...targetOrigin,
+    width: TERMINAL_WIDTH,
+  });
+  expect(await pixel(page, evidencePoint)).toEqual([
+    ...TASKBAR_LIGHT_UNFOCUSED,
+  ]);
+  expect(
+    await pixel(page, activeBorderPoint),
+    "target Terminal already exposed an active border before its focus input",
+  ).not.toEqual([...DARK_ACTIVE_BORDER]);
   await armCausalSample(page, {
     id,
     kind: "focus",
     input: "pointerdown",
     notBefore: sampleDeadline(workloadStartedAt, id),
     evidence: {
-      kind: "pixel",
-      point: evidencePoint,
-      expected: TASKBAR_FOCUSED,
+      kind: "pixels",
+      samples: [
+        { point: evidencePoint, expected: TASKBAR_LIGHT_FOCUSED },
+        { point: activeBorderPoint, expected: DARK_ACTIVE_BORDER },
+      ],
     },
   });
   await clickFramebuffer(page, taskbarEntryClickPoint(targetIndex, entryCount));
-  return readCausalSample(page, id, consoleLines);
+  const sample = await readCausalSample(page, id, consoleLines);
+  // The latency endpoint observes the first frame containing both causal
+  // pixels. Before the next key sample, also require the complete focused top
+  // edge so a stale partial activation cannot leak into the next round.
+  await waitForActiveWindowBounds(page, {
+    expectedX: targetOrigin.x,
+    expectedY: targetOrigin.y,
+    expectedWidth: TERMINAL_WIDTH,
+    timeout: 2_000,
+    message: `Terminal task ${targetIndex} did not complete its active frame`,
+  });
+  return sample;
 }
 
 async function measureDragMove(
@@ -411,7 +375,7 @@ async function measureDragMove(
   evidencePoint: Point,
   consoleLines: readonly string[],
 ): Promise<CausalLatencySample> {
-  expect(await pixel(page, evidencePoint)).not.toEqual([...FILES_TITLEBAR]);
+  expect(await pixel(page, evidencePoint)).not.toEqual([...LIGHT_TITLEBAR]);
   await armCausalSample(page, {
     id,
     kind: "drag",
@@ -420,7 +384,7 @@ async function measureDragMove(
     evidence: {
       kind: "pixel",
       point: evidencePoint,
-      expected: FILES_TITLEBAR,
+      expected: LIGHT_TITLEBAR,
     },
   });
   const target = await toPagePoint(page, pointer);
@@ -493,11 +457,11 @@ test("typical six-app desktop keeps 300 causal interactions below 100 ms p95", a
     );
   }
 
-  const entryCount = BUNDLED_APPS.length + 1;
+  const entryCount = BUNDLED_APPS.length;
   for (let index = 0; index < entryCount; index += 1) {
     const taskPixel = await pixel(page, taskbarEntryPoint(index, entryCount));
     expect(
-      [TASKBAR_FOCUSED, TASKBAR_UNFOCUSED].some((palette) =>
+      [TASKBAR_LIGHT_FOCUSED, TASKBAR_LIGHT_UNFOCUSED].some((palette) =>
         taskPixel.every((channel, offset) => channel === palette[offset]),
       ),
       `task entry ${index} was not visibly mapped: ${taskPixel.join(",")}`,
@@ -520,7 +484,7 @@ test("typical six-app desktop keeps 300 causal interactions below 100 ms p95", a
 
   // Capture each Terminal's prompt only while that exact task entry is raised,
   // then prove the region responds to input and returns to its empty baseline.
-  const terminalEntryIndexes = [1, 6] as const;
+  const terminalEntryIndexes = [0, 5] as const;
   const terminalOrigins = [
     { x: 0, y: 0 },
     {
@@ -548,16 +512,16 @@ test("typical six-app desktop keeps 300 causal interactions below 100 ms p95", a
     promptRegions.push(region);
   }
 
-  // Files is entry two by deterministic launch order. Its distinctive blue
+  // Files is entry one by deterministic app-only launch order. Its shared
   // client-painted titlebar gives every drag step exact newly occupied pixels.
-  await focusTaskEntry(page, 2, entryCount, "Files");
+  await focusTaskEntry(page, 1, entryCount, "Files");
   await expect
-    .poll(() => colorBounds(page, FILES_TITLEBAR), {
+    .poll(() => colorBounds(page), {
       timeout: 5_000,
       message: "Files titlebar did not become fully visible",
     })
     .not.toBeNull();
-  const initialFiles = await colorBounds(page, FILES_TITLEBAR);
+  const initialFiles = await colorBounds(page);
   if (initialFiles === null) throw new Error("Files titlebar vanished");
   const dragStart = { x: initialFiles.x + 300, y: initialFiles.y + 10 };
   const dragStartPage = await toPagePoint(page, dragStart);
@@ -576,14 +540,14 @@ test("typical six-app desktop keeps 300 causal interactions below 100 ms p95", a
   await page.mouse.move(warmDragPage.x, warmDragPage.y, { steps: 16 });
   await expect
     .poll(async () => {
-      const bounds = await colorBounds(page, FILES_TITLEBAR);
+      const bounds = await colorBounds(page);
       return bounds?.x ?? null;
     }, {
       timeout: 3_000,
       message: "display server did not present the complete Files drag warm-up",
     })
     .toBe(initialFiles.x + 16);
-  const warmFiles = await colorBounds(page, FILES_TITLEBAR);
+  const warmFiles = await colorBounds(page);
   if (warmFiles === null) throw new Error("Files titlebar vanished during drag warm-up");
 
   const samples: CausalLatencySample[] = [];
@@ -657,6 +621,7 @@ test("typical six-app desktop keeps 300 causal interactions below 100 ms p95", a
         workloadStartedAt,
         terminalEntryIndexes[targetTerminal]!,
         entryCount,
+        terminalOrigins[targetTerminal]!,
         consoleLines,
       ),
     );

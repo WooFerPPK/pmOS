@@ -329,6 +329,15 @@ impl<'a, C: Connection> Window<'a, C> {
             .xdg_toplevel_unset_maximized(self.xdg_toplevel)
     }
 
+    /// Send `pmd_xdg_toplevel.set_minimized()` — hide this window while
+    /// preserving its live surface and state. The desktop shell later restores,
+    /// raises, and activates it as one taskbar operation.
+    pub fn set_minimized(&mut self) -> Result<(), ClientError> {
+        self.app
+            .client_mut()
+            .xdg_toplevel_set_minimized(self.xdg_toplevel)
+    }
+
     /// Ask the server to initiate an interactive move drag.
     /// Sends `pmd_xdg_toplevel.move(serial)`. The caller
     /// passes the serial from the pointer-button event that

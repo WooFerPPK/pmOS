@@ -37,14 +37,14 @@ use crate::launcher::{
     Launcher, LauncherClock, LauncherReloadStep, LauncherRuntime, SystemLauncherClock,
 };
 use crate::session_restore::{SessionAction, SessionRuntime, SESSION_SNAPSHOT_ID};
-use crate::taskbar::Taskbar;
+use crate::taskbar::{draw_app_mark, draw_pmos_mark, Taskbar};
 use crate::wallpaper::{
     FilesystemWallpaperSource, WallpaperRefreshStep, WallpaperRuntime, WallpaperSource,
 };
 use display_proto::events::{
-    shell_window_state_flags, CallbackDone, PointerButton, PointerMotion, ShellRestoreFinished,
-    ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused, ShellWindowSnapshotDone,
-    ShellWindowState, ShellWindowTitleChanged,
+    shell_window_state_flags, CallbackDone, PointerButton, PointerMotion, ShellCloseShortcut,
+    ShellRestoreFinished, ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused,
+    ShellWindowSnapshotDone, ShellWindowState, ShellWindowTitleChanged,
 };
 use display_proto::Interface;
 use std::time::{Duration, Instant};
@@ -225,8 +225,8 @@ pub const DEFAULT_LAUNCHER_SLOTS: &[LauncherSlot<'static>] = &[
     },
 ];
 
-/// Width of the launcher button in pixels — the leftmost
-/// item on the taskbar strip. Reads "Launch" by default.
+/// Width of the Start control in pixels — the leftmost item on the taskbar
+/// strip. Its existing footprint is retained for stable work-area geometry.
 pub const LAUNCHER_BUTTON_WIDTH: u32 = 80;
 /// Margin between the launcher button and the leftmost
 /// taskbar entry.
@@ -244,6 +244,9 @@ const LAUNCHER_FEEDBACK_HEIGHT: u32 = 24;
 const LAUNCHER_FEEDBACK_WIDTH: u32 = 360;
 const LAUNCHER_FEEDBACK_BG: Color = Color::rgb(0xa8, 0x2d, 0x2d);
 const LAUNCHER_FEEDBACK_FG: Color = Color::rgb(0xff, 0xff, 0xff);
+const LAUNCHER_MARK_SIZE: u32 = 14;
+const LAUNCHER_MENU_ICON_SIZE: u32 = 14;
+const LAUNCHER_MENU_ICON_GAP: u32 = 6;
 
 /// Persistent user-visible result of a failed launcher request. It remains on
 /// screen until a later launch succeeds, so a missing binary is not reduced to
@@ -1049,18 +1052,12 @@ where
                 }
                 (Interface::ShellManager, 5 | 6 /* full v2 state */) => {
                     if let Ok(decoded) = ShellWindowState::decode(&event.payload) {
-                        taskbar.add_window(
-                            decoded.window_id,
-                            decoded.title.clone(),
-                            decoded.app_id.clone(),
+                        let own_pid = session.as_ref().and_then(|runtime| runtime.own_pid());
+                        let taskbar_change = apply_authoritative_window_state_to_taskbar(
+                            &mut taskbar,
+                            &decoded,
+                            own_pid,
                         );
-                        taskbar.set_window_minimized(
-                            decoded.window_id,
-                            decoded.flags & shell_window_state_flags::MINIMIZED != 0,
-                        );
-                        if decoded.flags & shell_window_state_flags::FOCUSED != 0 {
-                            taskbar.set_focused_window(decoded.window_id);
-                        }
                         if let Some(session) = session.as_mut() {
                             session.observe_window_state(decoded);
                             refresh_session_time(
@@ -1070,8 +1067,12 @@ where
                                 &mut session_clock_sampled,
                             );
                         }
-                        advance_generation(&mut taskbar_layout_generation);
-                        request_paint(&mut needs_paint, &mut paint_serial);
+                        if taskbar_change.visual_changed {
+                            if taskbar_change.layout_changed {
+                                advance_generation(&mut taskbar_layout_generation);
+                            }
+                            request_paint(&mut needs_paint, &mut paint_serial);
+                        }
                     }
                 }
                 (Interface::ShellManager, 7 /* window_snapshot_done */) => {
@@ -1103,6 +1104,9 @@ where
                             );
                         }
                     }
+                }
+                (Interface::ShellManager, 9 /* close_shortcut */) => {
+                    handle_close_shortcut(&event.payload, &taskbar, window.app_mut());
                 }
                 (Interface::Callback, 1 /* done */) => {
                     if CallbackDone::decode(&event.payload).is_ok()
@@ -1557,6 +1561,117 @@ fn shell_manager_send<C: Connection>(
     app.client_mut().send_request(manager, opcode, payload)
 }
 
+/// Apply server-authenticated v2 classification to the taskbar. A legacy v1
+/// creation may have provisionally added either shell surface, so every
+/// `SHELL_OWNED` state actively removes that entry. Only the exact surface
+/// whose authenticated owner PID is this process becomes the private desktop
+/// target; application-controlled app IDs never participate.
+/// The returned change classification keeps authoritative z-rank/state echoes
+/// from repainting pixels that optimistic taskbar input already made current.
+fn apply_authoritative_window_state_to_taskbar(
+    taskbar: &mut Taskbar,
+    state: &ShellWindowState,
+    own_pid: Option<u32>,
+) -> TaskbarFocusChange {
+    let previous_focus = taskbar
+        .entries()
+        .iter()
+        .find(|entry| entry.focused)
+        .map(|entry| entry.window_id);
+    let previous_page = taskbar.visible_range();
+
+    if state.flags & shell_window_state_flags::SHELL_OWNED != 0 {
+        let previous_shell = taskbar.shell_window_id();
+        let provisional_entry_present = taskbar
+            .entries()
+            .iter()
+            .any(|entry| entry.window_id == state.window_id);
+        if own_pid == Some(state.owner_pid) {
+            taskbar.set_shell_window_id(state.window_id);
+        } else {
+            taskbar.remove_window(state.window_id);
+        }
+        if state.flags & shell_window_state_flags::FOCUSED != 0 {
+            taskbar.set_focused_window(state.window_id);
+        }
+        let current_focus = taskbar
+            .entries()
+            .iter()
+            .find(|entry| entry.focused)
+            .map(|entry| entry.window_id);
+        let structural_changed = previous_shell != taskbar.shell_window_id()
+            || provisional_entry_present
+            || previous_page != taskbar.visible_range();
+        return TaskbarFocusChange {
+            visual_changed: structural_changed || previous_focus != current_focus,
+            layout_changed: structural_changed,
+        };
+    }
+
+    let minimized = state.flags & shell_window_state_flags::MINIMIZED != 0;
+    let (entry_metadata_changed, minimized_changed) = taskbar
+        .entries()
+        .iter()
+        .find(|entry| entry.window_id == state.window_id)
+        .map(|entry| {
+            (
+                entry.title != state.title || entry.app_id != state.app_id,
+                entry.minimized != minimized,
+            )
+        })
+        .unwrap_or((true, true));
+    if entry_metadata_changed {
+        taskbar.add_window(state.window_id, state.title.clone(), state.app_id.clone());
+    }
+    taskbar.set_window_minimized(state.window_id, minimized);
+    if state.flags & shell_window_state_flags::FOCUSED != 0 {
+        taskbar.set_focused_window(state.window_id);
+    }
+    let current_focus = taskbar
+        .entries()
+        .iter()
+        .find(|entry| entry.focused)
+        .map(|entry| entry.window_id);
+    let page_changed = previous_page != taskbar.visible_range();
+    let entry_changed = entry_metadata_changed || minimized_changed;
+    TaskbarFocusChange {
+        visual_changed: entry_changed || previous_focus != current_focus || page_changed,
+        layout_changed: entry_changed || page_changed,
+    }
+}
+
+/// Apply one privileged close-shortcut event only when its authoritative ID
+/// still names the shell's focused, visible ordinary task. This secondary
+/// validation makes stale/malformed events harmless and ensures a shell or an
+/// unfocused task cannot be confused with the user-selected target.
+fn handle_close_shortcut<C: Connection>(
+    payload: &[u8],
+    taskbar: &Taskbar,
+    app: &mut App<C>,
+) -> bool {
+    let Ok(event) = ShellCloseShortcut::decode(payload) else {
+        return false;
+    };
+    if taskbar.shell_window_id() == Some(event.window_id) {
+        return false;
+    }
+    let eligible = taskbar
+        .entries()
+        .iter()
+        .any(|entry| entry.window_id == event.window_id && entry.focused && !entry.minimized);
+    if !eligible {
+        return false;
+    }
+    if app.shell_manager_close_window(event.window_id).is_err() {
+        return false;
+    }
+    println!(
+        "shell: Alt+F4 close requested window_id={}",
+        event.window_id
+    );
+    true
+}
+
 fn shell_manager_subscribe_window_state<C: Connection>(
     app: &mut App<C>,
     snapshot_id: u32,
@@ -1674,22 +1789,30 @@ fn launcher_menu_row_at(
     None
 }
 
-/// Paint the "Launch" button onto the canvas. Distinguishes
-/// open / closed states with the active-titlebar / hover
-/// palette swap.
+/// Paint the PMos four-pane Start control. The button keeps the legacy 80px
+/// hit target while replacing its text and box border with quieter desktop
+/// chrome.
 fn draw_launcher_button(canvas: &mut Canvas<'_>, taskbar: &Taskbar, theme: &Theme, open: bool) {
     let bounds = launcher_button_bounds(taskbar);
     let fill = if open {
         theme.button_fill_pressed
     } else {
-        theme.button_fill
+        theme.titlebar_active
     };
     canvas.fill_rect(bounds, fill);
-    canvas.stroke_rect(bounds, theme.border_active);
-    let label = "Launch";
-    let text_x = bounds.x + 8;
-    let text_y = bounds.y + ((bounds.height as i32 - GLYPH_HEIGHT as i32) / 2).max(0);
-    canvas.draw_text(text_x, text_y, label, theme.button_text);
+    let mark = Rect::new(
+        bounds.x + (bounds.width.saturating_sub(LAUNCHER_MARK_SIZE) / 2) as i32,
+        bounds.y + (bounds.height.saturating_sub(LAUNCHER_MARK_SIZE) / 2) as i32,
+        LAUNCHER_MARK_SIZE,
+        LAUNCHER_MARK_SIZE,
+    );
+    draw_pmos_mark(canvas, mark, theme.border_active);
+    if open {
+        canvas.fill_rect(
+            Rect::new(bounds.x + 29, bounds.bottom() - 2, 22, 2),
+            theme.border_active,
+        );
+    }
 }
 
 fn draw_shell_chrome(
@@ -1709,7 +1832,9 @@ fn draw_shell_chrome(
     }
 }
 
-/// Paint the launcher popup menu (only when open).
+/// Paint the launcher popup as a compact modern Start app list. Its outer
+/// geometry remains the established x=4, 200px-wide, bottom-anchored rectangle
+/// so opening and closing still use the same narrow damage footprint.
 fn draw_launcher_menu(
     canvas: &mut Canvas<'_>,
     taskbar: &Taskbar,
@@ -1719,15 +1844,23 @@ fn draw_launcher_menu(
 ) {
     let menu = launcher_menu_bounds(taskbar, slots);
     canvas.fill_rect(menu, theme.window_background);
-    canvas.stroke_rect(menu, theme.border_active);
+    canvas.stroke_rect(menu, theme.button_border);
     for (idx, slot) in slots.iter().enumerate() {
         let Some(row) = launcher_menu_row_bounds(taskbar, slots, idx) else {
             continue;
         };
+        let row_surface = Rect::new(row.x + 4, row.y, row.width.saturating_sub(8), row.height);
         if Some(idx) == hover {
-            canvas.fill_rect(row, theme.button_fill_hover);
+            canvas.fill_rect(row_surface, theme.button_fill_hover);
         }
-        let text_x = row.x + LAUNCHER_MENU_TEXT_MARGIN as i32;
+        let icon = Rect::new(
+            row.x + LAUNCHER_MENU_TEXT_MARGIN as i32,
+            row.y + (row.height.saturating_sub(LAUNCHER_MENU_ICON_SIZE) / 2) as i32,
+            LAUNCHER_MENU_ICON_SIZE,
+            LAUNCHER_MENU_ICON_SIZE,
+        );
+        draw_app_mark(canvas, icon, slot.label, theme, false);
+        let text_x = icon.right() + LAUNCHER_MENU_ICON_GAP as i32;
         let text_y = row.y + ((row.height as i32 - GLYPH_HEIGHT as i32) / 2).max(0);
         canvas.draw_text(text_x, text_y, slot.label, theme.label_text);
     }
@@ -1965,18 +2098,16 @@ fn focus_taskbar_window(taskbar: &mut Taskbar, window_id: u32) -> TaskbarFocusCh
         .iter()
         .find(|entry| entry.focused)
         .map(|entry| entry.window_id);
-    if previous_focus == Some(window_id) {
-        return TaskbarFocusChange::default();
-    }
     let previous_page = taskbar.visible_range();
-    let restored_from_minimized = taskbar
+    taskbar.set_focused_window(window_id);
+    let current_focus = taskbar
         .entries()
         .iter()
-        .any(|entry| entry.window_id == window_id && entry.minimized);
-    taskbar.set_focused_window(window_id);
+        .find(|entry| entry.focused)
+        .map(|entry| entry.window_id);
     TaskbarFocusChange {
-        visual_changed: true,
-        layout_changed: restored_from_minimized || taskbar.visible_range() != previous_page,
+        visual_changed: current_focus != previous_focus,
+        layout_changed: taskbar.visible_range() != previous_page,
     }
 }
 
@@ -2032,12 +2163,7 @@ fn handle_press<C: Connection>(
         launcher_ui.hover = None;
         outcome.visual_changed = true;
         outcome.launcher_changed = true;
-        if let Some(shell_window_id) = taskbar
-            .entries()
-            .iter()
-            .find(|entry| entry.app_id == "pmos.shell")
-            .map(|entry| entry.window_id)
-        {
+        if let Some(shell_window_id) = taskbar.shell_window_id() {
             if app.shell_manager_focus_window(shell_window_id).is_ok() {
                 let focus_change = focus_taskbar_window(taskbar, shell_window_id);
                 if focus_change.visual_changed {
@@ -2061,6 +2187,7 @@ fn handle_press<C: Connection>(
                         outcome.visual_changed = true;
                         outcome.taskbar_focus_changed = true;
                     }
+                    outcome.taskbar_layout_changed = focus_change.layout_changed;
                     println!("shell: taskbar focus requested window_id={window_id}");
                 }
             }
@@ -2069,7 +2196,6 @@ fn handle_press<C: Connection>(
                     taskbar.set_window_minimized(window_id, false);
                     taskbar.set_focused_window(window_id);
                     outcome.visual_changed = true;
-                    outcome.taskbar_layout_changed = true;
                     outcome.taskbar_focus_changed = true;
                     println!("shell: taskbar restore requested window_id={window_id}");
                 }
@@ -2078,7 +2204,7 @@ fn handle_press<C: Connection>(
                 if app.shell_manager_minimize_window(window_id).is_ok() {
                     taskbar.set_window_minimized(window_id, true);
                     outcome.visual_changed = true;
-                    outcome.taskbar_layout_changed = true;
+                    outcome.taskbar_focus_changed = true;
                     println!("shell: taskbar minimize requested window_id={window_id}");
                 }
             }
@@ -2138,15 +2264,233 @@ mod tests {
         App::connect_with_shell(connection).expect("shell manager fixture connects")
     }
 
+    fn close_shortcut_payload(window_id: u32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        ShellCloseShortcut { window_id }.encode(&mut payload);
+        payload
+    }
+
+    fn authoritative_state(
+        window_id: u32,
+        owner_pid: u32,
+        flags: u32,
+        app_id: &str,
+    ) -> ShellWindowState {
+        ShellWindowState {
+            snapshot_id: SESSION_SNAPSHOT_ID,
+            window_id,
+            owner_pid,
+            ordinal: 1,
+            current_x: 0,
+            current_y: 0,
+            current_width: 640,
+            current_height: 480,
+            normal_x: 0,
+            normal_y: 0,
+            normal_width: 640,
+            normal_height: 480,
+            flags,
+            z_rank: window_id,
+            title: format!("Window {window_id}"),
+            app_id: app_id.to_string(),
+        }
+    }
+
     #[test]
-    fn focus_press_updates_taskbar_before_server_broadcast_and_emits_request() {
+    fn authenticated_shell_states_remove_overlap_entries_but_app_id_spoofs_remain_apps() {
+        let mut taskbar = Taskbar::new(1024, 768);
+        // Legacy v1 creation events provisionally expose every toplevel.
+        taskbar.add_window(10, "Current desktop", "anything");
+        taskbar.add_window(20, "Replacement desktop", "pmos.shell");
+        taskbar.add_window(30, "Ordinary spoof", "pmos.shell");
+        taskbar.set_focused_window(30);
+
+        apply_authoritative_window_state_to_taskbar(
+            &mut taskbar,
+            &authoritative_state(10, 7, shell_window_state_flags::SHELL_OWNED, "anything"),
+            Some(7),
+        );
+        apply_authoritative_window_state_to_taskbar(
+            &mut taskbar,
+            &authoritative_state(
+                20,
+                8,
+                shell_window_state_flags::SHELL_OWNED | shell_window_state_flags::FOCUSED,
+                "pmos.shell",
+            ),
+            Some(7),
+        );
+        apply_authoritative_window_state_to_taskbar(
+            &mut taskbar,
+            &authoritative_state(30, 99, shell_window_state_flags::MAPPED, "pmos.shell"),
+            Some(7),
+        );
+
+        assert_eq!(taskbar.shell_window_id(), Some(10));
+        assert_eq!(
+            taskbar
+                .entries()
+                .iter()
+                .map(|entry| entry.window_id)
+                .collect::<Vec<_>>(),
+            vec![30],
+        );
+        assert!(
+            !taskbar.entries()[0].focused,
+            "focus on another authenticated shell clears ordinary highlights",
+        );
+    }
+
+    #[test]
+    fn repeated_authoritative_state_is_a_paint_noop_and_focus_stays_sparse() {
+        let mut taskbar = Taskbar::new(1024, 768);
+        let first = authoritative_state(
+            10,
+            41,
+            shell_window_state_flags::MAPPED | shell_window_state_flags::FOCUSED,
+            "pmos.term",
+        );
+        let second = authoritative_state(20, 42, shell_window_state_flags::MAPPED, "pmos.files");
+
+        assert_eq!(
+            apply_authoritative_window_state_to_taskbar(&mut taskbar, &first, Some(7)),
+            TaskbarFocusChange {
+                visual_changed: true,
+                layout_changed: true,
+            }
+        );
+        assert_eq!(
+            apply_authoritative_window_state_to_taskbar(&mut taskbar, &second, Some(7)),
+            TaskbarFocusChange {
+                visual_changed: true,
+                layout_changed: true,
+            }
+        );
+        assert_eq!(
+            apply_authoritative_window_state_to_taskbar(&mut taskbar, &first, Some(7)),
+            TaskbarFocusChange::default(),
+            "an unchanged state or z-rank refresh must not schedule taskbar pixels",
+        );
+
+        let mut focused_second = second.clone();
+        focused_second.flags |= shell_window_state_flags::FOCUSED;
+        assert_eq!(
+            apply_authoritative_window_state_to_taskbar(&mut taskbar, &focused_second, Some(7),),
+            TaskbarFocusChange {
+                visual_changed: true,
+                layout_changed: false,
+            },
+            "focus-only authoritative state keeps the exact two-entry damage path",
+        );
+        assert_eq!(
+            apply_authoritative_window_state_to_taskbar(&mut taskbar, &focused_second, Some(7),),
+            TaskbarFocusChange::default(),
+            "the authoritative echo after optimistic focus is a paint no-op",
+        );
+    }
+
+    #[test]
+    fn authoritative_metadata_or_minimize_change_remains_structural_damage() {
+        let mut taskbar = Taskbar::new(1024, 768);
+        let mapped = authoritative_state(10, 41, shell_window_state_flags::MAPPED, "pmos.term");
+        let _ = apply_authoritative_window_state_to_taskbar(&mut taskbar, &mapped, Some(7));
+
+        let mut minimized = mapped.clone();
+        minimized.flags |= shell_window_state_flags::MINIMIZED;
+        assert_eq!(
+            apply_authoritative_window_state_to_taskbar(&mut taskbar, &minimized, Some(7)),
+            TaskbarFocusChange {
+                visual_changed: true,
+                layout_changed: true,
+            }
+        );
+
+        let mut retitled = minimized.clone();
+        retitled.title = "Renamed".to_string();
+        assert_eq!(
+            apply_authoritative_window_state_to_taskbar(&mut taskbar, &retitled, Some(7)),
+            TaskbarFocusChange {
+                visual_changed: true,
+                layout_changed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn close_shortcut_requests_authenticated_close_for_exact_focused_app() {
+        let mut app = shell_app();
+        let _ = app.client_mut().connection_mut().drain_outbound();
+        let shell_manager = app.shell_manager().expect("shell manager bound");
+        let mut taskbar = Taskbar::new(1024, 768);
+        taskbar.set_shell_window_id(1);
+        taskbar.add_window(2, "Terminal", "pmos.term");
+        taskbar.add_window(3, "Files", "pmos.files");
+        taskbar.set_focused_window(2);
+
+        assert!(handle_close_shortcut(
+            &close_shortcut_payload(2),
+            &taskbar,
+            &mut app,
+        ));
+
+        let request = app.client_mut().connection_mut().drain_outbound();
+        let header = MessageHeader::decode(&request).expect("close request header");
+        assert_eq!(header.object_id, shell_manager);
+        assert_eq!(header.opcode, 3 /* close_window */);
+        assert_eq!(&request[HEADER_SIZE..], &2_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn close_shortcut_ignores_no_app_malformed_and_privilege_confused_targets() {
+        let mut app = shell_app();
+        let _ = app.client_mut().connection_mut().drain_outbound();
+        let mut taskbar = Taskbar::new(1024, 768);
+        taskbar.set_shell_window_id(1);
+
+        assert!(!handle_close_shortcut(
+            &close_shortcut_payload(2),
+            &taskbar,
+            &mut app,
+        ));
+        assert!(!handle_close_shortcut(&[2, 0, 0], &taskbar, &mut app));
+
+        taskbar.add_window(2, "Terminal", "pmos.term");
+        taskbar.add_window(3, "Files", "pmos.files");
+        taskbar.set_focused_window(2);
+        assert!(!handle_close_shortcut(
+            &close_shortcut_payload(1),
+            &taskbar,
+            &mut app,
+        ));
+        assert!(!handle_close_shortcut(
+            &close_shortcut_payload(3),
+            &taskbar,
+            &mut app,
+        ));
+        taskbar.set_window_minimized(2, true);
+        assert!(!handle_close_shortcut(
+            &close_shortcut_payload(2),
+            &taskbar,
+            &mut app,
+        ));
+        assert!(app
+            .client_mut()
+            .connection_mut()
+            .drain_outbound()
+            .is_empty());
+    }
+
+    #[test]
+    fn task_button_focuses_then_minimizes_before_server_broadcasts() {
         let mut app = shell_app();
         let _ = app.client_mut().connection_mut().drain_outbound();
         let shell_manager = app.shell_manager().expect("shell manager bound");
         let mut taskbar = Taskbar::new(1024, 768);
         taskbar.add_window(1, "PMos", "pmos.shell");
+        taskbar.set_shell_window_id(1);
         taskbar.add_window(2, "Terminal", "pmos.term");
-        taskbar.set_focused_window(1);
+        taskbar.add_window(3, "Files", "pmos.files");
+        taskbar.set_focused_window(2);
         let target = taskbar.entry_rect(1).expect("target taskbar entry");
 
         let outcome = handle_press(
@@ -2173,21 +2517,30 @@ mod tests {
         let header = MessageHeader::decode(&request).expect("focus request header");
         assert_eq!(header.object_id, shell_manager);
         assert_eq!(header.opcode, 2);
-        assert_eq!(&request[HEADER_SIZE..], &2_u32.to_le_bytes());
+        assert_eq!(&request[HEADER_SIZE..], &3_u32.to_le_bytes());
 
-        assert!(
-            !handle_press(
+        assert_eq!(
+            handle_press(
                 target.x + 8,
                 target.y + 8,
                 &mut taskbar,
                 &[],
                 &mut LauncherUiState::default(),
                 &mut app,
-            )
-            .visual_changed
+            ),
+            PressOutcome {
+                visual_changed: true,
+                taskbar_layout_changed: false,
+                taskbar_focus_changed: true,
+                launcher_changed: false,
+            }
         );
+        assert!(taskbar.entries()[1].minimized);
+        assert!(!taskbar.entries()[1].focused);
         let repeat = app.client_mut().connection_mut().drain_outbound();
-        assert_eq!(MessageHeader::decode(&repeat).unwrap().opcode, 2);
+        let repeat_header = MessageHeader::decode(&repeat).expect("minimize request header");
+        assert_eq!(repeat_header.opcode, 4);
+        assert_eq!(&repeat[HEADER_SIZE..], &3_u32.to_le_bytes());
     }
 
     #[test]
@@ -2197,6 +2550,7 @@ mod tests {
         let shell_manager = app.shell_manager().expect("shell manager bound");
         let mut taskbar = Taskbar::new(1024, 768);
         taskbar.add_window(1, "PMos", "pmos.shell");
+        taskbar.set_shell_window_id(1);
         taskbar.add_window(2, "Terminal", "pmos.term");
         taskbar.set_focused_window(2);
         let launcher = launcher_button_bounds(&taskbar);
@@ -2215,14 +2569,68 @@ mod tests {
         assert!(outcome.taskbar_focus_changed);
         assert!(outcome.launcher_changed);
         assert!(launcher_ui.open);
-        assert!(taskbar.entries()[0].focused);
-        assert!(!taskbar.entries()[1].focused);
+        assert_eq!(taskbar.entries().len(), 1);
+        assert!(!taskbar.entries()[0].focused);
 
         let request = app.client_mut().connection_mut().drain_outbound();
         let header = MessageHeader::decode(&request).expect("shell focus request header");
         assert_eq!(header.object_id, shell_manager);
         assert_eq!(header.opcode, 2);
         assert_eq!(&request[HEADER_SIZE..], &1_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn launcher_paints_four_pane_start_mark_and_hovered_app_icon() {
+        let taskbar = Taskbar::new(1024, 768);
+        let theme = Theme::LIGHT;
+        let mut canvas = Canvas::new(1024, 768);
+        let accent = [
+            theme.border_active.r(),
+            theme.border_active.g(),
+            theme.border_active.b(),
+            theme.border_active.a(),
+        ];
+        let taskbar_surface = [
+            theme.titlebar_active.r(),
+            theme.titlebar_active.g(),
+            theme.titlebar_active.b(),
+            theme.titlebar_active.a(),
+        ];
+        let hover = [
+            theme.button_fill_hover.r(),
+            theme.button_fill_hover.g(),
+            theme.button_fill_hover.b(),
+            theme.button_fill_hover.a(),
+        ];
+
+        draw_launcher_button(&mut canvas, &taskbar, &theme, false);
+        let button = launcher_button_bounds(&taskbar);
+        let mark_x = button.x as u32 + (button.width - LAUNCHER_MARK_SIZE) / 2;
+        let mark_y = button.y as u32 + (button.height - LAUNCHER_MARK_SIZE) / 2;
+        assert_eq!(canvas.pixel(mark_x, mark_y), Some(&accent[..]));
+        assert_eq!(
+            canvas.pixel(mark_x + 6, mark_y),
+            Some(&taskbar_surface[..]),
+            "the two-pixel center gutter keeps the mark visibly four-pane",
+        );
+
+        let slots = [LauncherSlot {
+            label: "Terminal",
+            exec: "/bin/term",
+        }];
+        draw_launcher_menu(&mut canvas, &taskbar, &theme, &slots, Some(0));
+        let row = launcher_menu_row_bounds(&taskbar, &slots, 0).expect("launcher row");
+        assert_eq!(
+            canvas.pixel((row.x + 5) as u32, (row.y + 1) as u32),
+            Some(&hover[..])
+        );
+        assert_eq!(
+            canvas.pixel(
+                (row.x + LAUNCHER_MENU_TEXT_MARGIN as i32) as u32,
+                (row.y + (row.height - LAUNCHER_MENU_ICON_SIZE) as i32 / 2) as u32,
+            ),
+            Some(&accent[..]),
+        );
     }
 
     #[test]
@@ -2300,10 +2708,12 @@ mod tests {
     fn focus_only_damage_is_the_exact_two_entry_pair() {
         let mut taskbar = Taskbar::new(1024, 768);
         taskbar.add_window(1, "PMos", "pmos.shell");
+        taskbar.set_shell_window_id(1);
         taskbar.add_window(2, "Terminal", "pmos.term");
-        taskbar.set_focused_window(1);
-        let old = shell_chrome_state(&taskbar, &[], &LauncherUiState::default(), 7, 3);
+        taskbar.add_window(3, "Files", "pmos.files");
         taskbar.set_focused_window(2);
+        let old = shell_chrome_state(&taskbar, &[], &LauncherUiState::default(), 7, 3);
+        taskbar.set_focused_window(3);
         let desired = shell_chrome_state(&taskbar, &[], &LauncherUiState::default(), 7, 3);
 
         assert_eq!(
@@ -2316,10 +2726,12 @@ mod tests {
     fn focus_damage_includes_stale_presented_history_when_target_is_already_desired() {
         let mut taskbar = Taskbar::new(1024, 768);
         taskbar.add_window(1, "PMos", "pmos.shell");
+        taskbar.set_shell_window_id(1);
         taskbar.add_window(2, "Terminal", "pmos.term");
-        taskbar.set_focused_window(1);
-        let old_front = shell_chrome_state(&taskbar, &[], &LauncherUiState::default(), 11, 4);
+        taskbar.add_window(3, "Files", "pmos.files");
         taskbar.set_focused_window(2);
+        let old_front = shell_chrome_state(&taskbar, &[], &LauncherUiState::default(), 11, 4);
+        taskbar.set_focused_window(3);
         let desired = shell_chrome_state(&taskbar, &[], &LauncherUiState::default(), 11, 4);
 
         assert_eq!(
@@ -2332,6 +2744,7 @@ mod tests {
     fn taskbar_layout_mismatch_falls_back_to_the_full_band() {
         let mut taskbar = Taskbar::new(1024, 768);
         taskbar.add_window(1, "PMos", "pmos.shell");
+        taskbar.set_shell_window_id(1);
         taskbar.add_window(2, "Terminal", "pmos.term");
         taskbar.set_focused_window(2);
         let desired = shell_chrome_state(&taskbar, &[], &LauncherUiState::default(), 13, 5);
@@ -2388,6 +2801,7 @@ mod tests {
         ] {
             taskbar.add_window(window_id, app_id, app_id);
         }
+        taskbar.set_shell_window_id(1);
         taskbar.set_focused_window(2);
         let slots = &DEFAULT_LAUNCHER_SLOTS[..5];
         let mut launcher_ui = LauncherUiState {
@@ -2395,7 +2809,7 @@ mod tests {
             ..LauncherUiState::default()
         };
         let old = shell_chrome_state(&taskbar, slots, &launcher_ui, 31, 9);
-        let target = taskbar.entry_rect(6).expect("second Term is visible");
+        let target = taskbar.entry_rect(5).expect("second Term is visible");
 
         let outcome = handle_press(
             target.x + 8,
@@ -2419,8 +2833,8 @@ mod tests {
         assert_eq!(
             shell_chrome_damage_regions(&taskbar, Some(old), Some(old), desired),
             vec![
-                Rect::new(213, 738, 121, 28),
-                Rect::new(828, 738, 121, 28),
+                Rect::new(90, 738, 142, 28),
+                Rect::new(810, 738, 142, 28),
                 Rect::new(4, 608, 200, 158),
             ]
         );

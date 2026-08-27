@@ -31,11 +31,12 @@ pub use keymap::{translate as translate_scancode, Modifiers};
 pub use pmos_shell::{PmosShellSession, StepwiseCommandRunner, StepwiseShellUpdate};
 pub use rasterizer::{
     colors, default_font, load_startup_font, load_startup_font_with, rasterize_snapshot,
-    rasterize_snapshot_with_font, rasterize_snapshot_with_palette,
-    rasterize_snapshot_with_palette_and_font, BitmapFont, FontError, Palette, BYTES_PER_PIXEL,
-    DEFAULT_CELL_HEIGHT as CELL_HEIGHT, DEFAULT_CELL_WIDTH as CELL_WIDTH, DEFAULT_FONT_NAME,
-    DEFAULT_GLYPH_HEIGHT as GLYPH_HEIGHT, DEFAULT_GLYPH_WIDTH as GLYPH_WIDTH, FONT_DIR,
-    MAX_FONT_BYTES, MAX_PREFERENCES_BYTES, PADDING, VGA_FONT_NAME,
+    rasterize_snapshot_region_with_palette_and_font, rasterize_snapshot_with_font,
+    rasterize_snapshot_with_palette, rasterize_snapshot_with_palette_and_font, BitmapFont,
+    FontError, Palette, RasterRegion, BYTES_PER_PIXEL, DEFAULT_CELL_HEIGHT as CELL_HEIGHT,
+    DEFAULT_CELL_WIDTH as CELL_WIDTH, DEFAULT_FONT_NAME, DEFAULT_GLYPH_HEIGHT as GLYPH_HEIGHT,
+    DEFAULT_GLYPH_WIDTH as GLYPH_WIDTH, FONT_DIR, MAX_FONT_BYTES, MAX_PREFERENCES_BYTES, PADDING,
+    VGA_FONT_NAME,
 };
 pub use run::{
     run_term, run_term_with_font, run_term_with_options, run_term_with_runner,

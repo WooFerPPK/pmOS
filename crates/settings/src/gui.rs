@@ -15,7 +15,7 @@
 //! use, so the round-trip semantics stay identical.
 
 #[cfg(target_arch = "wasm32")]
-use display_proto::events::{key_state, KeyboardKey, PointerButton};
+use display_proto::events::{key_state, pointer_button_state, KeyboardKey, PointerButton};
 #[cfg(target_arch = "wasm32")]
 use display_proto::Interface;
 use preferences::Preferences;
@@ -24,9 +24,19 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use toolkit::draw::font::GLYPH_HEIGHT;
-use toolkit::draw::{Canvas, Color, Rect};
+use toolkit::draw::text::text_width_px;
+use toolkit::draw::{Canvas, Rect};
+use toolkit::theme::Theme;
 #[cfg(target_arch = "wasm32")]
-use toolkit::{App, BufferPool, ClientError, Connection, WaitFd, Window};
+use toolkit::widget::PointerOutcome as ChromePointerOutcome;
+use toolkit::widget::{
+    TabKey, TabKeyOutcome, TabStrip, WindowFrame, TAB_STRIP_HEIGHT, TITLEBAR_HEIGHT,
+};
+#[cfg(target_arch = "wasm32")]
+use toolkit::{
+    App, BufferPool, ClientError, Connection, WaitFd, Window, WindowFramePatch,
+    WindowFramePatchProgress,
+};
 
 /// Path that the GUI reads/writes. Resolved once on entry; an
 /// override exists primarily for tests.
@@ -318,17 +328,22 @@ impl Tab {
         Tab::About,
     ];
 
-    fn label(self) -> &'static str {
-        match self {
-            Tab::Wallpaper => "Wallpaper",
-            Tab::Appearance => "Appearance",
-            Tab::Keyboard => "Keyboard",
-            Tab::Timezone => "Timezone",
-            Tab::Terminal => "Terminal",
-            Tab::About => "About",
-        }
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .expect("settings tab is present in Tab::ALL")
     }
 }
+
+static TAB_LABELS: [&str; 6] = [
+    "Wallpaper",
+    "Appearance",
+    "Keyboard",
+    "Timezone",
+    "Terminal",
+    "About",
+];
 
 /// Bundled allow-lists. Kept module-private — the CLI-side
 /// subcommands accept any string for forward-compat, but the GUI
@@ -346,6 +361,48 @@ const FONTS: &[&str] = preferences::TERMINAL_FONT_NAMES;
 pub const DEFAULT_WIDTH: u32 = 560;
 pub const DEFAULT_HEIGHT: u32 = 360;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsWindowGeometry {
+    current: (u32, u32),
+    last_configure: Option<((u32, u32), bool)>,
+    configured: bool,
+}
+
+impl Default for SettingsWindowGeometry {
+    fn default() -> Self {
+        Self {
+            current: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            last_configure: None,
+            configured: false,
+        }
+    }
+}
+
+impl SettingsWindowGeometry {
+    /// Apply the server's latest configure. Ordinary and restored windows keep
+    /// Settings' preferred 560x360 geometry; maximized windows accept the
+    /// explicit work-area offer.
+    fn observe_configure(&mut self, offered: (u32, u32), maximized: bool) -> bool {
+        if self.last_configure == Some((offered, maximized)) {
+            return false;
+        }
+        let next = if maximized && offered.0 > 0 && offered.1 > 0 {
+            offered
+        } else {
+            (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        };
+        let changed = !self.configured || self.current != next;
+        self.current = next;
+        self.last_configure = Some((offered, maximized));
+        self.configured = true;
+        changed
+    }
+
+    const fn size(self) -> (u32, u32) {
+        self.current
+    }
+}
+
 /// Run the settings GUI against `connection`. Reads + writes
 /// `config_path` directly. Returns when the window closes.
 #[cfg(target_arch = "wasm32")]
@@ -358,31 +415,75 @@ pub fn run<C: Connection>(connection: C, config_path: &str) -> Result<(), Client
 
     let source = FsAboutSource;
     let mut state = State::new(config_path);
+    let mut geometry = SettingsWindowGeometry::default();
+    let mut size = geometry.size();
+    let mut chrome = WindowFrame::new(Rect::new(0, 0, size.0, size.1), "Settings");
+    chrome.set_theme(Theme::from_name(state.prefs.theme_name.as_deref()));
     let mut needs_paint = true;
     let mut configured_once = false;
     let mut pool: Option<BufferPool> = None;
+    let mut chrome_patch: Option<WindowFramePatch> = None;
     let mut active_save: Option<ActivePreferenceSave> = None;
     let mut close_pending = false;
 
     loop {
         let events = window.dispatch()?;
-        close_pending |= window.close_requested();
+        if window.is_configured()
+            && geometry.observe_configure(window.configured_size(), window.is_maximized())
+        {
+            needs_paint = true;
+        }
+        let focus_changed = chrome.is_focused() != window.is_activated();
+        if focus_changed {
+            chrome.set_focused(window.is_activated());
+        }
+        if chrome.is_maximized() != window.is_maximized() {
+            chrome.set_maximized(window.is_maximized());
+            needs_paint = true;
+        }
+        close_pending |= window.take_close_requested();
 
         for event in events {
             match (event.interface, event.opcode) {
                 (Interface::Pointer, 2 /* button */) => {
                     if let Ok(btn) = PointerButton::decode(&event.payload) {
-                        let save_in_progress = active_save.is_some() || state.save_requested();
-                        if btn.state == 1
-                            && state.handle_pointer_press(btn.x, btn.y, &source, save_in_progress)
-                        {
-                            needs_paint = true;
+                        if btn.button != 1 {
+                            continue;
+                        }
+                        if btn.state != pointer_button_state::PRESSED {
+                            continue;
+                        }
+                        match chrome.pointer_down(btn.x, btn.y) {
+                            ChromePointerOutcome::Minimize => window.set_minimized()?,
+                            ChromePointerOutcome::ToggleMaximize => {
+                                if window.is_maximized() {
+                                    window.unset_maximized()?;
+                                } else {
+                                    window.set_maximized()?;
+                                }
+                            }
+                            ChromePointerOutcome::Close => close_pending = true,
+                            ChromePointerOutcome::Titlebar => {
+                                if !window.is_maximized() {
+                                    window.request_move(btn.serial)?;
+                                }
+                            }
+                            ChromePointerOutcome::Content => {
+                                let save_in_progress =
+                                    active_save.is_some() || state.save_requested();
+                                if state.handle_pointer_press(
+                                    btn.x,
+                                    btn.y,
+                                    size,
+                                    &source,
+                                    save_in_progress,
+                                ) {
+                                    needs_paint = true;
+                                }
+                            }
+                            ChromePointerOutcome::Outside => {}
                         }
                     }
-                }
-                (Interface::Pointer, 0 /* enter */) | (Interface::Pointer, 1 /* motion */) => {
-                    // Hover-state isn't tracked in v1; the apply / cycle
-                    // buttons highlight on press only.
                 }
                 (Interface::Keyboard, 1 /* key */) => {
                     if let Ok(key) = KeyboardKey::decode(&event.payload) {
@@ -405,20 +506,12 @@ pub fn run<C: Connection>(connection: C, config_path: &str) -> Result<(), Client
             }
         }
 
-        // A close with no in-flight write can finish immediately after every
-        // queued display event (including buffer releases) has been handled.
-        if close_pending && active_save.is_none() {
-            state.discard_save_request();
+        // Both protocol close events and the shared frame's close control use
+        // the same durability-aware exit path.
+        if close_pending && prepare_close(&mut state, active_save.as_mut()) {
             return Ok(());
         }
         if close_pending {
-            let save = active_save.as_mut().expect("active save checked above");
-            if save.job.committed {
-                state.status = "finishing durable save before closing...".to_string();
-            } else {
-                let _ = save.job.request_cancel();
-                state.status = "closing after save cleanup...".to_string();
-            }
             needs_paint = true;
         }
 
@@ -426,19 +519,44 @@ pub fn run<C: Connection>(connection: C, config_path: &str) -> Result<(), Client
             let _ = buffers.progress_commit(&mut window)?;
         }
 
-        if !configured_once && window.is_configured() {
+        if window.is_configured()
+            && !pool.as_ref().is_some_and(BufferPool::commit_pending)
+            && (!configured_once || size != geometry.size())
+        {
             configured_once = true;
-            BufferPool::replace(&mut pool, window.app_mut(), DEFAULT_WIDTH, DEFAULT_HEIGHT)?;
+            size = geometry.size();
+            chrome.set_bounds(Rect::new(0, 0, size.0, size.1));
+            BufferPool::replace(&mut pool, window.app_mut(), size.0, size.1)?;
             needs_paint = true;
         }
 
-        if needs_paint && configured_once {
+        chrome.set_theme(Theme::from_name(state.prefs.theme_name.as_deref()));
+        if needs_paint {
+            chrome_patch = None;
+        } else {
+            if focus_changed && configured_once {
+                chrome_patch = Some(WindowFramePatch::new(&chrome));
+            }
+            if let (Some(patch), Some(buffers)) = (chrome_patch.as_mut(), pool.as_mut()) {
+                match patch.progress(buffers, &mut window)? {
+                    WindowFramePatchProgress::Complete => chrome_patch = None,
+                    WindowFramePatchProgress::Unavailable => {
+                        chrome_patch = None;
+                        needs_paint = true;
+                    }
+                    WindowFramePatchProgress::Deferred | WindowFramePatchProgress::Pending => {}
+                }
+            }
+        }
+
+        if needs_paint && configured_once && size == geometry.size() {
             let p = pool.as_mut().expect("pool initialised");
             if let Some(mut canvas) = p.acquire_back_canvas() {
-                paint(&mut canvas, &state);
+                paint(&mut canvas, &state, size, &chrome);
                 drop(canvas);
                 let _ = p.commit_and_swap(&mut window)?;
                 needs_paint = false;
+                chrome_patch = None;
             }
         }
         window.flush_outbound()?;
@@ -502,7 +620,9 @@ pub fn run<C: Connection>(connection: C, config_path: &str) -> Result<(), Client
         if save_progress {
             continue;
         }
-        if pool.as_ref().is_some_and(BufferPool::commit_pending) && !window.outbound_pending() {
+        if (pool.as_ref().is_some_and(BufferPool::commit_pending) || chrome_patch.is_some())
+            && !window.outbound_pending()
+        {
             continue;
         }
         if let Some(wait) = save_wait {
@@ -511,6 +631,20 @@ pub fn run<C: Connection>(connection: C, config_path: &str) -> Result<(), Client
             window.wait(None)?;
         }
     }
+}
+
+fn prepare_close(state: &mut State, active_save: Option<&mut ActivePreferenceSave>) -> bool {
+    let Some(save) = active_save else {
+        state.discard_save_request();
+        return true;
+    };
+    if save.job.committed {
+        state.status = "finishing durable save before closing...".to_string();
+    } else {
+        let _ = save.job.request_cancel();
+        state.status = "closing after save cleanup...".to_string();
+    }
+    false
 }
 
 /// Test-only: run a single paint pass into a host-allocated
@@ -522,7 +656,10 @@ pub fn paint_for_test(canvas: &mut Canvas<'_>, tab: Tab) {
         tab,
         ..State::default()
     };
-    paint(canvas, &state);
+    let theme = Theme::from_name(state.prefs.theme_name.as_deref());
+    let mut chrome = WindowFrame::new(Rect::new(0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT), "Settings");
+    chrome.set_theme(theme);
+    paint(canvas, &state, (DEFAULT_WIDTH, DEFAULT_HEIGHT), &chrome);
 }
 
 #[derive(Debug, Clone)]
@@ -569,20 +706,18 @@ impl State {
         &mut self,
         x: i32,
         y: i32,
+        size: (u32, u32),
         source: &S,
         save_in_progress: bool,
     ) -> bool {
-        if (TAB_BAR_TOP..TAB_BAR_TOP + TAB_BAR_HEIGHT).contains(&y) {
-            let tab_w = (DEFAULT_WIDTH as i32) / Tab::ALL.len() as i32;
-            let idx = (x / tab_w).clamp(0, (Tab::ALL.len() as i32) - 1) as usize;
+        if let Some(idx) = settings_tab_strip().on_pointer_down((x, y), tab_bar_bounds(size)) {
             self.select_tab(Tab::ALL[idx], source, save_in_progress);
             return true;
         }
         // The shared action area applies a preference or refreshes
         // the live About snapshot, depending on the selected tab.
-        if (ACTION_BUTTON_X..ACTION_BUTTON_X + ACTION_BUTTON_W as i32).contains(&x)
-            && (ACTION_BUTTON_Y..ACTION_BUTTON_Y + ACTION_BUTTON_H as i32).contains(&y)
-        {
+        let action = action_button_bounds(size);
+        if rect_contains(action, x, y) {
             self.activate(source, save_in_progress);
             return true;
         }
@@ -597,13 +732,13 @@ impl State {
     ) -> bool {
         match scancode {
             0x2B /* tab */ => {
-                let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
-                self.select_tab(
-                    Tab::ALL[(idx + 1) % Tab::ALL.len()],
-                    source,
-                    save_in_progress,
-                );
-                true
+                match settings_tab_strip().handle_key(Some(self.tab.index()), TabKey::Next) {
+                    TabKeyOutcome::SelectionChanged(idx) => {
+                        self.select_tab(Tab::ALL[idx], source, save_in_progress);
+                        true
+                    }
+                    TabKeyOutcome::Ignored => false,
+                }
             }
             0x28 /* enter */ => {
                 self.activate(source, save_in_progress);
@@ -728,87 +863,60 @@ fn cycle_str(current: Option<&str>, choices: &[&str], reverse: bool) -> String {
     choices[next_idx].to_string()
 }
 
-const TAB_BAR_TOP: i32 = 22;
-const TAB_BAR_HEIGHT: i32 = 24;
+const TAB_BAR_TOP: i32 = TITLEBAR_HEIGHT as i32;
+const TAB_BAR_HEIGHT: i32 = TAB_STRIP_HEIGHT as i32;
 const PANE_TOP: i32 = TAB_BAR_TOP + TAB_BAR_HEIGHT + 6;
-const ACTION_BUTTON_X: i32 = (DEFAULT_WIDTH as i32) - 110;
-const ACTION_BUTTON_Y: i32 = (DEFAULT_HEIGHT as i32) - 40;
 const ACTION_BUTTON_W: u32 = 96;
 const ACTION_BUTTON_H: u32 = 22;
+const ACTION_BUTTON_RIGHT_MARGIN: u32 = 14;
+const ACTION_BUTTON_BOTTOM_MARGIN: u32 = 18;
 
-fn paint(canvas: &mut Canvas<'_>, state: &State) {
-    let bg = Color::rgb(0xfa, 0xfa, 0xfa);
-    let titlebar = Color::rgb(0x40, 0x60, 0x70);
-    let tab_bar_bg = Color::rgb(0xe0, 0xe0, 0xe6);
-    let tab_active = Color::rgb(0xfa, 0xfa, 0xfa);
-    let tab_inactive = Color::rgb(0xd0, 0xd0, 0xd6);
-    let text_fg = Color::rgb(0x10, 0x10, 0x10);
-    let muted_fg = Color::rgb(0x60, 0x60, 0x70);
-    let button_bg = Color::rgb(0x6a, 0x82, 0x9a);
-    let button_fg = Color::rgb(0xff, 0xff, 0xff);
+fn settings_tab_strip() -> TabStrip<'static> {
+    TabStrip::new(&TAB_LABELS)
+}
 
-    canvas.fill_rect(
-        Rect {
-            x: 0,
-            y: 0,
-            width: DEFAULT_WIDTH,
-            height: DEFAULT_HEIGHT,
-        },
-        bg,
-    );
-    let titlebar_h = TAB_BAR_TOP as u32;
-    canvas.fill_rect(
-        Rect {
-            x: 0,
-            y: 0,
-            width: DEFAULT_WIDTH,
-            height: titlebar_h,
-        },
-        titlebar,
-    );
-    canvas.draw_text(
-        8,
-        ((titlebar_h as i32 - GLYPH_HEIGHT as i32) / 2).max(0),
-        "Settings",
-        Color::rgb(0xff, 0xff, 0xff),
-    );
+fn tab_bar_bounds(size: (u32, u32)) -> Rect {
+    let available_height = size.1.saturating_sub(TITLEBAR_HEIGHT);
+    Rect::new(
+        0,
+        TAB_BAR_TOP,
+        size.0,
+        TAB_STRIP_HEIGHT.min(available_height),
+    )
+}
 
-    canvas.fill_rect(
-        Rect {
-            x: 0,
-            y: TAB_BAR_TOP,
-            width: DEFAULT_WIDTH,
-            height: TAB_BAR_HEIGHT as u32,
-        },
-        tab_bar_bg,
+fn action_button_bounds(size: (u32, u32)) -> Rect {
+    let x = size
+        .0
+        .saturating_sub(ACTION_BUTTON_W + ACTION_BUTTON_RIGHT_MARGIN);
+    let y = size
+        .1
+        .saturating_sub(ACTION_BUTTON_H + ACTION_BUTTON_BOTTOM_MARGIN);
+    Rect::new(
+        x as i32,
+        y as i32,
+        ACTION_BUTTON_W.min(size.0.saturating_sub(x)),
+        ACTION_BUTTON_H.min(size.1.saturating_sub(y)),
+    )
+}
+
+fn rect_contains(rect: Rect, x: i32, y: i32) -> bool {
+    !rect.is_empty() && x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+}
+
+fn paint(canvas: &mut Canvas<'_>, state: &State, size: (u32, u32), chrome: &WindowFrame) {
+    let theme = Theme::from_name(state.prefs.theme_name.as_deref());
+    let text_fg = theme.label_text;
+    let muted_fg = theme.text_input_placeholder_fg;
+
+    canvas.fill_rect(Rect::new(0, 0, size.0, size.1), theme.window_background);
+
+    settings_tab_strip().paint(
+        canvas,
+        tab_bar_bounds(size),
+        Some(state.tab.index()),
+        &theme,
     );
-    let tab_w = (DEFAULT_WIDTH as i32) / Tab::ALL.len() as i32;
-    for (i, tab) in Tab::ALL.iter().enumerate() {
-        let x = (i as i32) * tab_w;
-        let w = if i == Tab::ALL.len() - 1 {
-            DEFAULT_WIDTH as i32 - x
-        } else {
-            tab_w
-        };
-        let active = *tab == state.tab;
-        canvas.fill_rect(
-            Rect {
-                x,
-                y: TAB_BAR_TOP,
-                width: w as u32,
-                height: TAB_BAR_HEIGHT as u32,
-            },
-            if active { tab_active } else { tab_inactive },
-        );
-        let text = tab.label();
-        let text_w = (text.chars().count() as i32) * 8;
-        canvas.draw_text(
-            x + (w - text_w) / 2,
-            TAB_BAR_TOP + (TAB_BAR_HEIGHT - GLYPH_HEIGHT as i32) / 2,
-            text,
-            text_fg,
-        );
-    }
 
     let mut y = PANE_TOP;
     let line_h = 16;
@@ -943,32 +1051,27 @@ fn paint(canvas: &mut Canvas<'_>, state: &State) {
         }
     }
 
-    canvas.fill_rect(
-        Rect {
-            x: ACTION_BUTTON_X,
-            y: ACTION_BUTTON_Y,
-            width: ACTION_BUTTON_W,
-            height: ACTION_BUTTON_H,
-        },
-        button_bg,
-    );
-    let (action_label, action_offset) = if state.tab == Tab::About {
-        ("Refresh", 20)
+    let action = action_button_bounds(size);
+    canvas.fill_rect(action, theme.button_fill);
+    canvas.stroke_rect(action, theme.button_border);
+    let action_label = if state.tab == Tab::About {
+        "Refresh"
     } else {
-        ("Apply >", 24)
+        "Apply >"
     };
+    let action_text_width = text_width_px(action_label);
     canvas.draw_text(
-        ACTION_BUTTON_X + action_offset,
-        ACTION_BUTTON_Y + (ACTION_BUTTON_H as i32 - GLYPH_HEIGHT as i32) / 2,
+        action.x + (action.width.saturating_sub(action_text_width) / 2) as i32,
+        action.y + (action.height.saturating_sub(GLYPH_HEIGHT) / 2) as i32,
         action_label,
-        button_fg,
+        theme.button_text,
     );
 
     let (status, status_color) = if !state.status.is_empty() {
         (
             state.status.as_str(),
             if state.status.starts_with("save failed:") {
-                Color::rgb(0x9a, 0x20, 0x20)
+                theme.close_button_hover
             } else {
                 text_fg
             },
@@ -977,7 +1080,7 @@ fn paint(canvas: &mut Canvas<'_>, state: &State) {
         (
             state.about.status.as_str(),
             if state.about.has_errors() {
-                Color::rgb(0x9a, 0x20, 0x20)
+                theme.close_button_hover
             } else {
                 text_fg
             },
@@ -988,11 +1091,13 @@ fn paint(canvas: &mut Canvas<'_>, state: &State) {
     if !status.is_empty() {
         canvas.draw_text(
             16,
-            DEFAULT_HEIGHT as i32 - 24,
+            size.1.saturating_sub(24) as i32,
             &elide(status, ABOUT_LINE_CHARS),
             status_color,
         );
     }
+
+    chrome.draw(canvas);
 }
 
 trait PreferenceFile {
@@ -1441,7 +1546,7 @@ fn io_would_block(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(abi::errno::EAGAIN)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 struct ActivePreferenceSave {
     revision: u64,
     job: PreferenceWriteJob,
@@ -1931,6 +2036,40 @@ mod tests {
     }
 
     #[test]
+    fn shared_frame_close_path_preserves_pending_and_inflight_save_semantics() {
+        let source = FakeSource::valid();
+        let mut no_active_save = State::default();
+        no_active_save.activate(&source, false);
+        assert!(no_active_save.save_requested());
+        assert!(prepare_close(&mut no_active_save, None));
+        assert!(!no_active_save.save_requested());
+
+        let target = PathBuf::from("/etc/preferences.toml");
+        let mut prefs = Preferences::empty();
+        prefs.theme_name = Some("dark".to_string());
+        let (job, fake) = fake_job(&target, prefs, 31, b"old");
+        let mut active = ActivePreferenceSave { revision: 0, job };
+        assert_eq!(active.revision, 0);
+        let mut state = State::default();
+        assert!(!prepare_close(&mut state, Some(&mut active)));
+        assert_eq!(state.status, "closing after save cleanup...");
+
+        loop {
+            match active.job.step() {
+                PreferenceWriteTurn::Progress => {}
+                PreferenceWriteTurn::Cancelled => break,
+                PreferenceWriteTurn::Blocked(fd) => panic!("cleanup blocked on fd {fd}"),
+                PreferenceWriteTurn::Complete => panic!("close completed a cancelled save"),
+                PreferenceWriteTurn::Failed(error) => panic!("close cleanup failed: {error}"),
+            }
+        }
+        assert_eq!(
+            fake.borrow().files.get(&target).map(Vec::as_slice),
+            Some(b"old".as_slice())
+        );
+    }
+
+    #[test]
     fn apply_reports_saving_until_the_matching_revision_finishes() {
         let source = FakeSource::valid();
         let mut state = State::default();
@@ -1992,14 +2131,68 @@ mod tests {
     }
 
     #[test]
+    fn maximize_uses_offered_size_and_restore_returns_to_default_geometry() {
+        let mut geometry = SettingsWindowGeometry::default();
+
+        assert!(geometry.observe_configure((1024, 736), false));
+        assert_eq!(geometry.size(), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        assert!(!geometry.observe_configure((1024, 736), false));
+
+        assert!(geometry.observe_configure((1024, 736), true));
+        assert_eq!(geometry.size(), (1024, 736));
+
+        assert!(geometry.observe_configure((0, 0), false));
+        assert_eq!(geometry.size(), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn tab_and_action_geometry_follow_the_current_surface_size() {
+        let size = (1024, 736);
+        assert_eq!(
+            tab_bar_bounds(size),
+            Rect::new(0, TITLEBAR_HEIGHT as i32, 1024, TAB_STRIP_HEIGHT)
+        );
+        assert_eq!(
+            action_button_bounds(size),
+            Rect::new(914, 696, ACTION_BUTTON_W, ACTION_BUTTON_H)
+        );
+
+        let narrow = (70, 35);
+        let action = action_button_bounds(narrow);
+        assert!(action.x >= 0 && action.y >= 0);
+        assert!(action.right() <= narrow.0 as i32);
+        assert!(action.bottom() <= narrow.1 as i32);
+    }
+
+    #[test]
     fn handle_pointer_press_in_tab_strip_changes_tab() {
         let mut state = State::default();
         let source = FakeSource::valid();
-        let tab_w = (DEFAULT_WIDTH as i32) / Tab::ALL.len() as i32;
-        let third_tab_x = tab_w * 2 + 4;
-        let changed = state.handle_pointer_press(third_tab_x, TAB_BAR_TOP + 5, &source, false);
+        let size = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let third_tab = settings_tab_strip()
+            .tab_bounds(2, tab_bar_bounds(size))
+            .expect("Keyboard tab bounds");
+        let changed =
+            state.handle_pointer_press(third_tab.x + 4, third_tab.y + 5, size, &source, false);
         assert!(changed);
         assert_eq!(state.tab, Tab::Keyboard);
+    }
+
+    #[test]
+    fn tab_strip_pointer_hit_test_does_not_clamp_outside_width() {
+        let mut state = State::default();
+        let source = FakeSource::valid();
+        let size = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+
+        assert!(!state.handle_pointer_press(-1, TAB_BAR_TOP + 5, size, &source, false));
+        assert!(!state.handle_pointer_press(
+            DEFAULT_WIDTH as i32,
+            TAB_BAR_TOP + 5,
+            size,
+            &source,
+            false,
+        ));
+        assert_eq!(state.tab, Tab::Wallpaper);
     }
 
     #[test]
@@ -2017,6 +2210,92 @@ mod tests {
             assert!(state.handle_key(0x2B, &source, false));
             assert_eq!(state.tab, expected);
         }
+    }
+
+    #[test]
+    fn settings_paint_uses_tab_widget_geometry_and_theme() {
+        let state = State::default();
+        let mut canvas = Canvas::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let size = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let mut chrome = WindowFrame::new(Rect::new(0, 0, size.0, size.1), "Settings");
+        chrome.set_theme(Theme::LIGHT);
+        paint(&mut canvas, &state, size, &chrome);
+
+        let selected = settings_tab_strip()
+            .tab_bounds(0, tab_bar_bounds(size))
+            .expect("selected tab bounds");
+        let inactive = settings_tab_strip()
+            .tab_bounds(1, tab_bar_bounds(size))
+            .expect("inactive tab bounds");
+        assert_eq!(
+            canvas.pixel((selected.x + 2) as u32, (selected.y + 10) as u32),
+            Some(
+                &[
+                    Theme::LIGHT.window_background.r(),
+                    Theme::LIGHT.window_background.g(),
+                    Theme::LIGHT.window_background.b(),
+                    Theme::LIGHT.window_background.a(),
+                ][..]
+            ),
+        );
+        assert_eq!(
+            canvas.pixel((inactive.x + 2) as u32, (inactive.y + 10) as u32),
+            Some(
+                &[
+                    Theme::LIGHT.button_fill.r(),
+                    Theme::LIGHT.button_fill.g(),
+                    Theme::LIGHT.button_fill.b(),
+                    Theme::LIGHT.button_fill.a(),
+                ][..]
+            ),
+        );
+        assert_eq!(TAB_BAR_TOP, 22);
+        assert_eq!(TAB_BAR_HEIGHT, 24);
+    }
+
+    #[test]
+    fn settings_paint_themes_entire_resized_surface_and_shared_frame() {
+        let mut state = State::default();
+        state.prefs.theme_name = Some("dark".to_string());
+        let size = (800, 600);
+        let mut canvas = Canvas::new(size.0, size.1);
+        let mut chrome = WindowFrame::new(Rect::new(0, 0, size.0, size.1), "Settings");
+        chrome.set_theme(Theme::DARK);
+        chrome.set_focused(true);
+        chrome.set_maximized(true);
+
+        paint(&mut canvas, &state, size, &chrome);
+
+        let pixel = |x, y| canvas.pixel(x, y).expect("sample pixel");
+        assert_eq!(
+            pixel(300, 200),
+            &[
+                Theme::DARK.window_background.r(),
+                Theme::DARK.window_background.g(),
+                Theme::DARK.window_background.b(),
+                Theme::DARK.window_background.a(),
+            ]
+        );
+        assert_eq!(
+            pixel(200, 10),
+            &[
+                Theme::DARK.titlebar_active.r(),
+                Theme::DARK.titlebar_active.g(),
+                Theme::DARK.titlebar_active.b(),
+                Theme::DARK.titlebar_active.a(),
+            ],
+            "titlebar is painted by the shared frame"
+        );
+        let action = action_button_bounds(size);
+        assert_eq!(
+            pixel((action.x + 2) as u32, (action.y + 2) as u32),
+            &[
+                Theme::DARK.button_fill.r(),
+                Theme::DARK.button_fill.g(),
+                Theme::DARK.button_fill.b(),
+                Theme::DARK.button_fill.a(),
+            ]
+        );
     }
 
     #[test]
@@ -2139,16 +2418,13 @@ mod tests {
         let source = FakeSource::valid();
         let mut state = State::new(path.to_str().unwrap());
         state.tab = Tab::About;
+        let size = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let action = action_button_bounds(size);
 
         assert!(state.handle_key(0x28, &source, false));
         assert_eq!(state.about.status, "Live system details refreshed");
         assert!(!path.exists());
-        assert!(state.handle_pointer_press(
-            ACTION_BUTTON_X + 2,
-            ACTION_BUTTON_Y + 2,
-            &source,
-            false,
-        ));
+        assert!(state.handle_pointer_press(action.x + 2, action.y + 2, size, &source, false,));
         assert_eq!(source.reads.borrow().len(), 8);
         assert!(!path.exists());
     }
@@ -2157,14 +2433,12 @@ mod tests {
     fn selecting_about_refreshes_and_every_tab_paints() {
         let source = FakeSource::valid();
         let mut state = State::default();
-        let tab_width = (DEFAULT_WIDTH as i32) / Tab::ALL.len() as i32;
+        let size = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        let about_tab = settings_tab_strip()
+            .tab_bounds(Tab::About.index(), tab_bar_bounds(size))
+            .expect("About tab bounds");
 
-        assert!(state.handle_pointer_press(
-            tab_width * (Tab::ALL.len() as i32 - 1) + 2,
-            TAB_BAR_TOP + 2,
-            &source,
-            false,
-        ));
+        assert!(state.handle_pointer_press(about_tab.x + 2, about_tab.y + 2, size, &source, false,));
         assert_eq!(state.tab, Tab::About);
         assert_eq!(source.reads.borrow().len(), 4);
 

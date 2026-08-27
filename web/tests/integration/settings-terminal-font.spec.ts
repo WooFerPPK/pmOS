@@ -13,6 +13,7 @@ import {
   openLauncherMenuBefore,
   selectLauncherRowBefore,
 } from "./launcher-interaction";
+import { waitForActiveWindowBounds } from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -75,38 +76,6 @@ async function clickAndWaitForSettingsPaint(
     .not.toBe(before);
 }
 
-async function findFramebufferColor(
-  page: Page,
-  rgb: readonly [number, number, number],
-): Promise<{ x: number; y: number } | null> {
-  return page
-    .locator("#pmos-fb")
-    .evaluate(
-      (
-        canvas: HTMLCanvasElement,
-        target: readonly [number, number, number],
-      ) => {
-        const context = canvas.getContext("2d");
-        if (context === null) return null;
-        const image = context.getImageData(0, 0, canvas.width, canvas.height);
-        for (let y = 0; y < canvas.height; y += 1) {
-          for (let x = 0; x < canvas.width; x += 1) {
-            const offset = (y * canvas.width + x) * 4;
-            if (
-              image.data[offset] === target[0] &&
-              image.data[offset + 1] === target[1] &&
-              image.data[offset + 2] === target[2]
-            ) {
-              return { x, y };
-            }
-          }
-        }
-        return null;
-      },
-      rgb,
-    );
-}
-
 test("Settings font applies to a new Terminal only", async ({ page }) => {
   const consoleLines: string[] = [];
   page.on("console", (message) => consoleLines.push(message.text()));
@@ -143,16 +112,12 @@ test("Settings font applies to a new Terminal only", async ({ page }) => {
       { timeout: 5_000 },
     )
     .toBe(true);
-  await expect
-    .poll(() => findFramebufferColor(page, [0x40, 0x60, 0x70]), {
-      timeout: 5_000,
-    })
-    .not.toBeNull();
-  const settingsOrigin = await findFramebufferColor(page, [0x40, 0x60, 0x70]);
-  expect(settingsOrigin).not.toBeNull();
+  const settingsOrigin = await waitForActiveWindowBounds(page, {
+    expectedWidth: 560,
+  });
   const settingsRegion = {
-    x: settingsOrigin!.x,
-    y: settingsOrigin!.y,
+    x: settingsOrigin.x,
+    y: settingsOrigin.y,
     width: 560,
     height: 360,
   };
@@ -161,14 +126,14 @@ test("Settings font applies to a new Terminal only", async ({ page }) => {
   // preference from the compact default to pc-vga-16.pbm.
   await clickAndWaitForSettingsPaint(
     page,
-    settingsOrigin!.x + 418,
-    settingsOrigin!.y + 27,
+    settingsOrigin.x + 418,
+    settingsOrigin.y + 27,
     settingsRegion,
   );
   await clickAndWaitForSettingsPaint(
     page,
-    settingsOrigin!.x + 500,
-    settingsOrigin!.y + 331,
+    settingsOrigin.x + 500,
+    settingsOrigin.y + 331,
     settingsRegion,
   );
 

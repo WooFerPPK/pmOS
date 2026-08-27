@@ -10,3 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 toolkit = { path = "../toolkit" }
+
+[dev-dependencies]
+display-proto = { path = "../display-proto" }

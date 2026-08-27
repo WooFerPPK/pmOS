@@ -1,4 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
+import {
+  titlebarControlPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
@@ -56,33 +60,11 @@ async function waitForLineAfter(
   return lines.slice(start).find(predicate)!;
 }
 
-async function findEditorOrigin(
-  page: Page,
-): Promise<{ x: number; y: number } | null> {
-  return page.locator("#pmos-fb").evaluate((canvas: HTMLCanvasElement) => {
-    const context = canvas.getContext("2d");
-    if (context === null) return null;
-    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
-    for (let y = 0; y < canvas.height; y += 1) {
-      for (let x = 0; x < canvas.width; x += 1) {
-        const index = (y * canvas.width + x) * 4;
-        if (
-          pixels[index] === 0x6a &&
-          pixels[index + 1] === 0x4a &&
-          pixels[index + 2] === 0x8a
-        ) {
-          return { x, y };
-        }
-      }
-    }
-    return null;
-  });
-}
-
 async function waitForEditorPaint(page: Page): Promise<void> {
-  await expect
-    .poll(() => findEditorOrigin(page), { timeout: 10_000 })
-    .not.toBeNull();
+  await waitForActiveWindowBounds(page, {
+    expectedWidth: 640,
+    timeout: 10_000,
+  });
 }
 
 async function bootDesktop(page: Page, lines: readonly string[]): Promise<void> {
@@ -186,11 +168,14 @@ test("Edit saves a new file, guards dirty close, and preserves exact VFS content
   await page.keyboard.type(SECOND_LINE);
   const editorWorkers = await workerCount(page);
   start = consoleLines.length;
-  // Use the shell taskbar's close control for the first request. The display
-  // server must reactivate Edit before delivering advisory xdg_toplevel.close;
-  // otherwise the full-screen shell surface hides the veto prompt and steals
-  // its keyboard input. With only Edit open, (400, 752) is its close button.
-  await clickFramebuffer(page, 400, 752);
+  // Use Edit's client-painted caption close button for the first request. The
+  // unsaved-change prompt must keep the same worker alive after Cancel.
+  const editorWindow = await waitForActiveWindowBounds(page, {
+    expectedWidth: 640,
+    message: "Edit window disappeared",
+  });
+  const close = titlebarControlPoint(editorWindow, "close");
+  await clickFramebuffer(page, close.x, close.y);
   await waitForLineAfter(
     consoleLines,
     start,

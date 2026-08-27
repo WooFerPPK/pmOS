@@ -43,8 +43,8 @@ use abi::cap::{Cap, CapSet};
 use display_proto::decode::DecodeError;
 use display_proto::events::{
     CallbackDone, DisplayDeleteId, DisplayError, RegistryGlobal, RegistryGlobalRemove,
-    ShellRestoreFinished, ShellWindowCreated, ShellWindowDestroyed, ShellWindowFocused,
-    ShellWindowSnapshotDone, ShellWindowState, ShellWindowTitleChanged,
+    ShellCloseShortcut, ShellRestoreFinished, ShellWindowCreated, ShellWindowDestroyed,
+    ShellWindowFocused, ShellWindowSnapshotDone, ShellWindowState, ShellWindowTitleChanged,
 };
 use display_proto::events::{KeyboardKey, PointerButton, PointerMotion};
 use display_proto::ids::{IdAllocator, IdKind, ObjectId};
@@ -55,7 +55,7 @@ use display_proto::requests::{
     ShellManagerPlaceRestoredWindow, ShellManagerSubscribeWindowState, ShmCreatePool,
     ShmPoolCreateBuffer, ShmPoolResize, ShmPoolWriteRows, SurfaceAttach, SurfaceDamage,
     SurfaceFrame, SurfacePatchCurrent, XdgShellGetToplevel, XdgToplevelSetAppId,
-    XdgToplevelSetTitle, MAX_SURFACE_PATCH_BYTES,
+    XdgToplevelSetMinimized, XdgToplevelSetTitle, MAX_SURFACE_PATCH_BYTES,
 };
 use display_proto::wire::{MessageHeader, WireError, HEADER_SIZE};
 
@@ -247,6 +247,10 @@ pub struct Surface {
     /// but only the latter must detach the current buffer on commit.
     pub pending_attach: bool,
     pub pending_damage: Vec<DamageRect>,
+    /// At least one raw damage request in this pending transaction could not
+    /// be a valid complete pixel declaration. Retain this separately because
+    /// bounded rectangle coalescing deliberately normalizes signed extents.
+    pub pending_damage_unprovable: bool,
     pub current_buffer: Option<BufferAttachment>,
     pub commit_count: u32,
     /// One-shot callbacks requested since the last commit. A frame request
@@ -269,6 +273,7 @@ impl Surface {
             pending_buffer: None,
             pending_attach: false,
             pending_damage: Vec::new(),
+            pending_damage_unprovable: false,
             current_buffer: None,
             commit_count: 0,
             pending_frame_callbacks: Vec::new(),
@@ -323,8 +328,8 @@ pub struct Toplevel {
     pub normal_y: i32,
     pub normal_width: u32,
     pub normal_height: u32,
-    /// `true` after the shell has called
-    /// `pmd_shell_manager.minimize_window(global_window_id)` (T131).
+    /// `true` after the owner has called `pmd_xdg_toplevel.set_minimized()` or
+    /// the shell has called `pmd_shell_manager.minimize_window(window_id)`.
     /// While minimized, the compositor must skip this
     /// toplevel's surface in its blit pass — the surface is
     /// "unmapped" but NOT destroyed; a subsequent restore
@@ -480,6 +485,29 @@ pub enum ClientError {
         interface: Interface,
         required: Cap,
         new_id: ObjectId,
+    },
+    /// `pmd_registry.bind` requested version zero or a version newer than the
+    /// advertised implementation. The target object is not installed.
+    UnsupportedBindVersion {
+        interface: Interface,
+        requested: u32,
+        supported: u32,
+        new_id: ObjectId,
+    },
+    /// A second `pmd_shell_manager` object would make its negotiated version
+    /// and subscription state ambiguous. The singleton binding remains live.
+    ShellManagerAlreadyBound {
+        existing: ObjectId,
+        new_id: ObjectId,
+    },
+    /// The request was introduced after the target object's negotiated
+    /// interface version. It is rejected before decoding or state mutation.
+    RequestRequiresVersion {
+        interface: Interface,
+        object_id: ObjectId,
+        opcode: u16,
+        negotiated: u32,
+        required: u32,
     },
     /// An emit-path wire-format failure — usually a payload
     /// whose length would overflow the 16-bit `length`
@@ -744,6 +772,10 @@ pub struct Client {
     /// `shell_manager_subscribed` is true, emitting
     /// window_* events on the shell_manager object.
     pub shell_manager_id: Option<ObjectId>,
+    /// Version requested in the successful `registry.bind` for
+    /// `pmd_shell_manager`. New events must not be sent to an explicitly
+    /// older binding even though object-interface lookup is shared.
+    pub shell_manager_version: Option<u32>,
     /// True iff this client has sent
     /// `pmd_shell_manager.subscribe_windows`. Window-list
     /// events are only broadcast to subscribed clients.
@@ -822,6 +854,7 @@ impl Client {
             keyboard_id: None,
             next_configure_serial: 1,
             shell_manager_id: None,
+            shell_manager_version: None,
             shell_manager_subscribed: false,
             shell_manager_state_snapshot_id: None,
         }
@@ -1209,6 +1242,23 @@ impl Client {
                 }
             })?;
 
+        if interface == Interface::ShellManager && matches!(header.opcode, 9..=12) {
+            let negotiated = (self.shell_manager_id == Some(header.object_id))
+                .then_some(self.shell_manager_version)
+                .flatten()
+                .unwrap_or(0);
+            const REQUIRED: u32 = 2;
+            if negotiated < REQUIRED {
+                return Err(ClientError::RequestRequiresVersion {
+                    interface,
+                    object_id: header.object_id,
+                    opcode: header.opcode,
+                    negotiated,
+                    required: REQUIRED,
+                });
+            }
+        }
+
         if interface == Interface::ShellManager && header.opcode == 8 {
             display_proto::requests::ShellManagerDesktopReady::decode(payload).map_err(
                 |error| ClientError::Malformed {
@@ -1588,6 +1638,7 @@ impl Client {
             surface.pending_buffer = None;
             surface.pending_attach = false;
             surface.pending_damage.clear();
+            surface.pending_damage_unprovable = false;
             surface.current_buffer = None;
             released_buffer
         } else {
@@ -1828,11 +1879,10 @@ impl Client {
     /// `commit` (7). Returns an error on validation
     /// failures (unknown buffer id, unknown surface); other
     /// opcodes fall through as no-ops.
-    /// Apply a `pmd_xdg_toplevel.*` state transition. Called
-    /// from [`Client::dispatch_request`] for the two opcodes
-    /// that mutate per-toplevel state: `set_title` (1) and
-    /// `set_app_id` (2). Other opcodes fall through as
-    /// no-ops.
+    /// Apply or validate a `pmd_xdg_toplevel.*` state transition. Local
+    /// metadata/maximize state is mutated here; owner minimize is only
+    /// validated because the top-level server must apply it through the
+    /// server-global window registry. Other opcodes fall through as no-ops.
     fn apply_toplevel_state(
         &mut self,
         toplevel_id: ObjectId,
@@ -1888,6 +1938,22 @@ impl Client {
                     .get_mut(&toplevel_id)
                     .ok_or(ClientError::UnknownToplevel { toplevel_id })?;
                 toplevel.maximized = false;
+                Ok(())
+            }
+            9 /* set_minimized */ => {
+                XdgToplevelSetMinimized::decode(payload).map_err(|e| {
+                    ClientError::Malformed {
+                        interface,
+                        opcode,
+                        error: e,
+                    }
+                })?;
+                self.toplevels
+                    .get(&toplevel_id)
+                    .ok_or(ClientError::UnknownToplevel { toplevel_id })?;
+                // Server-global window state owns the mutation so the
+                // compositor, focus bookkeeping, and shell subscribers all
+                // observe one authoritative transition.
                 Ok(())
             }
             _ => Ok(()),
@@ -1958,6 +2024,12 @@ impl Client {
                     .surfaces
                     .get_mut(&surface_id)
                     .ok_or(ClientError::UnknownSurface { surface_id })?;
+                surface.pending_damage_unprovable |= req.x < 0
+                    || req.y < 0
+                    || req.width <= 0
+                    || req.height <= 0
+                    || req.x.checked_add(req.width).is_none()
+                    || req.y.checked_add(req.height).is_none();
                 if max_damage == 0 {
                     return Ok(());
                 }
@@ -1989,6 +2061,7 @@ impl Client {
                         .current_buffer
                         .map(|attachment| attachment.buffer_id);
                     surface.pending_damage.clear();
+                    surface.pending_damage_unprovable = false;
                     surface.commit_count = surface.commit_count.saturating_add(1);
                     (
                         (old_buffer != current_buffer).then_some(old_buffer).flatten(),
@@ -2273,9 +2346,27 @@ impl Client {
                         });
                     }
                 }
+                let supported = target.supported_version();
+                if req.version == 0 || req.version > supported {
+                    return Err(ClientError::UnsupportedBindVersion {
+                        interface: target,
+                        requested: req.version,
+                        supported,
+                        new_id: req.new_id,
+                    });
+                }
+                if target == Interface::ShellManager {
+                    if let Some(existing) = self.shell_manager_id {
+                        return Err(ClientError::ShellManagerAlreadyBound {
+                            existing,
+                            new_id: req.new_id,
+                        });
+                    }
+                }
                 self.install_client_object(req.new_id, target)?;
                 if target == Interface::ShellManager {
                     self.shell_manager_id = Some(req.new_id);
+                    self.shell_manager_version = Some(req.version);
                 }
                 Ok(())
             }
@@ -3028,6 +3119,19 @@ impl Client {
         let mut payload = Vec::new();
         event.encode(&mut payload);
         self.emit_raw(shell_manager_id, 8 /* restore_finished */, &payload)
+    }
+
+    /// Emit the authoritative target selected for one display-server-owned
+    /// Alt+F4 gesture. The top-level server calls this only for a
+    /// capability-authenticated shell-manager connection.
+    pub fn emit_close_shortcut(
+        &mut self,
+        shell_manager_id: ObjectId,
+        window_id: u32,
+    ) -> Result<usize, ClientError> {
+        let mut payload = Vec::new();
+        ShellCloseShortcut { window_id }.encode(&mut payload);
+        self.emit_raw(shell_manager_id, 9 /* close_shortcut */, &payload)
     }
 
     /// Emit `pmd_pointer.motion(surface_id, x, y)` on

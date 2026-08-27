@@ -6,13 +6,18 @@
 // choices after a full page reload.
 
 import { expect, test, type Page } from "@playwright/test";
+import {
+  DARK_TITLEBAR,
+  TASKBAR_DARK,
+  taskbarEntryPoint,
+  waitForActiveWindowBounds,
+} from "./windows-ui";
 
 test.use({ viewport: { width: 1280, height: 900 } });
 
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
 const TASKBAR_Y = 752;
-const DARK_TITLEBAR = [0x2b, 0x31, 0x3d, 0xff];
 
 async function clickFramebuffer(page: Page, x: number, y: number): Promise<void> {
   const box = await page.locator("#pmos-fb").boundingBox();
@@ -70,47 +75,6 @@ async function wallpaperFingerprint(page: Page): Promise<number> {
   });
 }
 
-async function findSolidRun(
-  page: Page,
-  rgb: readonly [number, number, number],
-  minimumRun: number,
-): Promise<{ x: number; y: number } | null> {
-  return page.locator("#pmos-fb").evaluate(
-    (
-      canvas: HTMLCanvasElement,
-      target: { rgb: readonly [number, number, number]; minimumRun: number },
-    ) => {
-      const context = canvas.getContext("2d");
-      if (context === null) return null;
-      const height = Math.min(canvas.height, 736); // exclude the taskbar
-      const image = context.getImageData(0, 0, canvas.width, height);
-      for (let y = 0; y < height; y += 1) {
-        let runStart = 0;
-        let runLength = 0;
-        for (let x = 0; x < canvas.width; x += 1) {
-          const offset = (y * canvas.width + x) * 4;
-          const matches =
-            image.data[offset] === target.rgb[0] &&
-            image.data[offset + 1] === target.rgb[1] &&
-            image.data[offset + 2] === target.rgb[2] &&
-            image.data[offset + 3] === 0xff;
-          if (matches) {
-            if (runLength === 0) runStart = x;
-            runLength += 1;
-            if (runLength >= target.minimumRun) {
-              return { x: runStart, y };
-            }
-          } else {
-            runLength = 0;
-          }
-        }
-      }
-      return null;
-    },
-    { rgb, minimumRun },
-  );
-}
-
 test("Settings repaints wallpaper and a running themed app, then persists both", async ({
   page,
 }) => {
@@ -151,24 +115,20 @@ test("Settings repaints wallpaper and a running themed app, then persists both",
     )
     .toBe(true);
 
-  // Settings is launcher row four. Its custom titlebar is a long solid run,
-  // which gives us its framebuffer-space origin without a DOM/UI shortcut.
+  // Settings is launcher row four. Its shared focused border gives us its
+  // framebuffer-space origin without a DOM/UI shortcut.
   await clickAndWaitForFrame(page, 40, TASKBAR_Y);
   await clickFramebuffer(page, 100, 696);
-  await expect
-    .poll(() => findSolidRun(page, [0x40, 0x60, 0x70], 300), {
-      timeout: 5_000,
-    })
-    .not.toBeNull();
-  const settingsOrigin = await findSolidRun(page, [0x40, 0x60, 0x70], 300);
-  expect(settingsOrigin).not.toBeNull();
+  const settingsOrigin = await waitForActiveWindowBounds(page, {
+    expectedWidth: 560,
+  });
 
   // Wallpaper is the initially selected tab. The first Apply moves the fresh
   // default from blue.png to green.png and the shell repaints from VFS bytes.
   await clickAndWaitForFrame(
     page,
-    settingsOrigin!.x + 500,
-    settingsOrigin!.y + 331,
+    settingsOrigin.x + 500,
+    settingsOrigin.y + 331,
   );
   await expect
     .poll(() => wallpaperFingerprint(page), { timeout: 5_000 })
@@ -178,13 +138,13 @@ test("Settings repaints wallpaper and a running themed app, then persists both",
   // dark. The same already-running Sysmon process must observe and repaint.
   await clickAndWaitForFrame(
     page,
-    settingsOrigin!.x + 139,
-    settingsOrigin!.y + 27,
+    settingsOrigin.x + 139,
+    settingsOrigin.y + 27,
   );
   await clickAndWaitForFrame(
     page,
-    settingsOrigin!.x + 500,
-    settingsOrigin!.y + 331,
+    settingsOrigin.x + 500,
+    settingsOrigin.y + 331,
   );
   await expect
     .poll(
@@ -197,22 +157,21 @@ test("Settings repaints wallpaper and a running themed app, then persists both",
   expect(
     consoleLines.filter((line) => line.includes("sysmon: starting")),
   ).toHaveLength(1);
-  await expect.poll(() => pixel(page, 800, TASKBAR_Y)).toEqual(DARK_TITLEBAR);
+  await expect
+    .poll(() => pixel(page, 800, TASKBAR_Y))
+    .toEqual([...TASKBAR_DARK]);
 
   // Bring Sysmon back to the front through its original taskbar entry. Its
   // dark toolkit titlebar is framebuffer evidence that the live process used
   // the new palette; no restart or replacement process is accepted.
-  await clickAndWaitForFrame(page, 330, TASKBAR_Y);
+  const sysmonTask = taskbarEntryPoint(0, 2);
+  await clickAndWaitForFrame(page, sysmonTask.x, sysmonTask.y);
+  const sysmonOrigin = await waitForActiveWindowBounds(page, {
+    expectedWidth: 720,
+  });
   await expect
-    .poll(() => findSolidRun(page, [0x2b, 0x31, 0x3d], 300), {
-      timeout: 5_000,
-    })
-    .not.toBeNull();
-  const sysmonOrigin = await findSolidRun(page, [0x2b, 0x31, 0x3d], 300);
-  expect(sysmonOrigin).not.toBeNull();
-  await expect
-    .poll(() => pixel(page, sysmonOrigin!.x + 300, sysmonOrigin!.y + 10))
-    .toEqual(DARK_TITLEBAR);
+    .poll(() => pixel(page, sysmonOrigin.x + 300, sysmonOrigin.y + 10))
+    .toEqual([...DARK_TITLEBAR]);
   expect(
     consoleLines.filter((line) => line.includes("sysmon: starting")),
   ).toHaveLength(1);
@@ -226,7 +185,9 @@ test("Settings repaints wallpaper and a running themed app, then persists both",
   await expect(page.locator("#pmos-boot-splash")).toHaveCount(0, {
     timeout: 12_000,
   });
-  await expect.poll(() => pixel(page, 800, TASKBAR_Y)).toEqual(DARK_TITLEBAR);
+  await expect
+    .poll(() => pixel(page, 800, TASKBAR_Y))
+    .toEqual([...TASKBAR_DARK]);
   await expect
     .poll(() => wallpaperFingerprint(page), { timeout: 5_000 })
     .toBe(persistedWallpaper);

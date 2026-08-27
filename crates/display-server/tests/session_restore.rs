@@ -1,7 +1,7 @@
 use abi::cap::{Cap, CapSet};
 use display_proto::events::{
     shell_restore_status, shell_window_state_flags, ShellRestoreFinished, ShellWindowDestroyed,
-    ShellWindowSnapshotDone, ShellWindowState,
+    ShellWindowSnapshotDone, ShellWindowState, XdgToplevelConfigure,
 };
 use display_proto::requests::{shell_restore_window_flags, MAX_SHELL_RESTORE_TIMEOUT_MS};
 use display_proto::wire::{MessageHeader, HEADER_SIZE};
@@ -420,6 +420,127 @@ fn repeated_set_maximized_preserves_authoritative_normal_geometry() {
 }
 
 #[test]
+fn owner_set_minimized_is_connection_scoped_and_broadcasts_global_state() {
+    let mut server = Server::with_framebuffer_size(64, 64);
+    let (app_a, compositor_a, shm_a, xdg_a) = bind_app(&mut server, 721);
+    let (app_b, compositor_b, shm_b, xdg_b) = bind_app(&mut server, 722);
+    let (surface_a, toplevel_a, window_a) =
+        create_mapped_window(&mut server, app_a, compositor_a, shm_a, xdg_a);
+    let (surface_b, toplevel_b, window_b) =
+        create_mapped_window(&mut server, app_b, compositor_b, shm_b, xdg_b);
+    assert_eq!(toplevel_a, toplevel_b, "fixture must collide local IDs");
+    assert_ne!(window_a, window_b);
+
+    let (shell, manager) = bind_shell(&mut server, 44);
+    subscribe_state(&mut server, shell, manager, 99);
+    let _ = server.drain_client_events(shell);
+
+    server
+        .dispatch_request(shell, &request(manager, 2, &window_a.to_le_bytes()))
+        .unwrap();
+    let _ = server.drain_client_events(shell);
+    assert_eq!(server.keyboard_focus(), Some((app_a, surface_a)));
+
+    let malformed = server
+        .dispatch_request(app_a, &request(toplevel_a, 9, &[0]))
+        .unwrap_err();
+    assert!(matches!(
+        malformed,
+        display_server::ServerError::Client(display_server::ClientError::Malformed {
+            interface: Interface::XdgToplevel,
+            opcode: 9,
+            error: display_proto::DecodeError::PayloadLengthMismatch {
+                expected: 0,
+                actual: 1,
+            },
+        })
+    ));
+    assert!(
+        !server
+            .client(app_a)
+            .unwrap()
+            .toplevel(toplevel_a)
+            .unwrap()
+            .minimized
+    );
+
+    server
+        .dispatch_request(app_a, &request(toplevel_a, 9, &[]))
+        .unwrap();
+
+    assert!(
+        server
+            .client(app_a)
+            .unwrap()
+            .toplevel(toplevel_a)
+            .unwrap()
+            .minimized
+    );
+    assert!(
+        !server
+            .client(app_b)
+            .unwrap()
+            .toplevel(toplevel_b)
+            .unwrap()
+            .minimized,
+        "the same local ObjectId on another connection must be untouched",
+    );
+    assert_eq!(
+        server.keyboard_focus(),
+        Some((app_b, surface_b)),
+        "minimizing the active window focuses the topmost mapped survivor",
+    );
+
+    let bytes = server.drain_client_events(shell).unwrap();
+    let minimized = events(&bytes, manager)
+        .into_iter()
+        .find_map(|(opcode, payload)| {
+            (opcode == 6)
+                .then(|| ShellWindowState::decode(payload).unwrap())
+                .filter(|state| state.window_id == window_a)
+        })
+        .expect("owner minimize must publish authoritative global state");
+    assert_eq!(minimized.snapshot_id, 99);
+    assert_ne!(minimized.flags & shell_window_state_flags::MINIMIZED, 0);
+}
+
+#[test]
+fn disconnecting_focused_client_deactivates_it_and_activates_survivor() {
+    let mut server = Server::with_framebuffer_size(64, 64);
+    let (app_a, compositor_a, shm_a, xdg_a) = bind_app(&mut server, 731);
+    let (surface_a, toplevel_a, _) =
+        create_mapped_window(&mut server, app_a, compositor_a, shm_a, xdg_a);
+    let (app_b, compositor_b, shm_b, xdg_b) = bind_app(&mut server, 732);
+    let (surface_b, toplevel_b, _) =
+        create_mapped_window(&mut server, app_b, compositor_b, shm_b, xdg_b);
+    assert_eq!(server.keyboard_focus(), Some((app_b, surface_b)));
+    let _ = server.drain_client_events(app_a);
+    let _ = server.drain_client_events(app_b);
+
+    let mut removed = server.disconnect(app_b).unwrap();
+    assert_eq!(server.keyboard_focus(), Some((app_a, surface_a)));
+
+    let removed_bytes = removed.drain_pending_events();
+    let removed_header = MessageHeader::decode(&removed_bytes).unwrap();
+    assert_eq!(removed_header.object_id, toplevel_b);
+    let deactivated =
+        XdgToplevelConfigure::decode(&removed_bytes[HEADER_SIZE..removed_header.length as usize])
+            .unwrap();
+    assert_eq!(deactivated.states, 0);
+
+    let survivor_bytes = server.drain_client_events(app_a).unwrap();
+    let survivor_header = MessageHeader::decode(&survivor_bytes).unwrap();
+    assert_eq!(survivor_header.object_id, toplevel_a);
+    let activated =
+        XdgToplevelConfigure::decode(&survivor_bytes[HEADER_SIZE..survivor_header.length as usize])
+            .unwrap();
+    assert_eq!(
+        activated.states,
+        display_proto::xdg_toplevel_state::ACTIVATED
+    );
+}
+
+#[test]
 fn hidden_normal_placement_ignores_owner_maximize_before_end() {
     let mut server = Server::with_framebuffer_size(64, 64);
     let (shell, manager) = bind_shell(&mut server, 44);
@@ -499,6 +620,85 @@ fn hidden_maximized_placement_ignores_owner_unmaximize_before_end() {
         ),
         (7, 9, 2, 2)
     );
+}
+
+#[test]
+fn maximized_restore_configures_normal_baseline_before_composed_maximized_state() {
+    let mut server = Server::with_framebuffer_size(64, 64);
+    let (shell, manager) = bind_shell(&mut server, 44);
+    begin_restore(&mut server, shell, manager, 74, 400);
+    let (app, compositor, shm, xdg) = bind_app(&mut server, 724);
+    let (_surface, toplevel, window_id) =
+        create_mapped_window(&mut server, app, compositor, shm, xdg);
+    let _ = server.drain_client_events(app);
+
+    place(
+        &mut server,
+        shell,
+        manager,
+        74,
+        window_id,
+        7,
+        9,
+        12,
+        11,
+        0,
+        shell_restore_window_flags::MAXIMIZED,
+    );
+
+    let bytes = server.drain_client_events(app).unwrap();
+    let mut remaining = bytes.as_slice();
+    let mut configures = Vec::new();
+    while !remaining.is_empty() {
+        let header = MessageHeader::decode(remaining).unwrap();
+        let message_len = header.length as usize;
+        if header.object_id == toplevel && header.opcode == 1 {
+            configures
+                .push(XdgToplevelConfigure::decode(&remaining[HEADER_SIZE..message_len]).unwrap());
+        }
+        remaining = &remaining[message_len..];
+    }
+    assert_eq!(configures.len(), 2);
+    assert_eq!(
+        (
+            configures[0].width,
+            configures[0].height,
+            configures[0].states
+        ),
+        (12, 11, 0),
+        "restore must establish saved normal geometry without maximized state",
+    );
+    assert_eq!(
+        (
+            configures[1].width,
+            configures[1].height,
+            configures[1].states
+        ),
+        (64, 64, display_proto::xdg_toplevel_state::MAXIMIZED),
+    );
+}
+
+#[test]
+fn hidden_restore_placement_ignores_owner_minimize_before_end() {
+    let mut server = Server::with_framebuffer_size(64, 64);
+    let (shell, manager) = bind_shell(&mut server, 44);
+    begin_restore(&mut server, shell, manager, 73, 400);
+    let (app, compositor, shm, xdg) = bind_app(&mut server, 723);
+    let (_surface, toplevel, window_id) =
+        create_mapped_window(&mut server, app, compositor, shm, xdg);
+
+    place(&mut server, shell, manager, 73, window_id, 7, 9, 2, 2, 0, 0);
+    server
+        .dispatch_request(app, &request(toplevel, 9, &[]))
+        .unwrap();
+    let placed = server.client(app).unwrap().toplevel(toplevel).unwrap();
+    assert!(!placed.minimized);
+    assert!(placed.hidden_for_restore);
+
+    end_restore(&mut server, shell, manager, 73, window_id);
+    let revealed = server.client(app).unwrap().toplevel(toplevel).unwrap();
+    assert!(!revealed.minimized);
+    assert!(!revealed.hidden_for_restore);
 }
 
 #[test]
@@ -932,6 +1132,69 @@ fn replacement_shell_registers_and_maps_below_surviving_focused_app() {
         server.framebuffer().pixel(0, 0).unwrap(),
         &[0xff, 0, 0, 0xff]
     );
+}
+
+#[test]
+fn v2_shell_owned_flag_is_authenticated_across_shell_overlap_and_app_id_spoofing() {
+    fn latest_state(bytes: &[u8], manager: ObjectId, window_id: u32) -> Option<ShellWindowState> {
+        events(bytes, manager)
+            .into_iter()
+            .rev()
+            .filter(|(opcode, _)| matches!(*opcode, 5 | 6))
+            .map(|(_, payload)| ShellWindowState::decode(payload).unwrap())
+            .find(|state| state.window_id == window_id)
+    }
+
+    let mut server = Server::with_framebuffer_size(64, 64);
+    let (first, first_manager) = bind_shell(&mut server, 44);
+    subscribe_state(&mut server, first, first_manager, 301);
+    let _ = server.drain_client_events(first);
+    let (_, _, first_window) = create_mapped_shell_window(&mut server, first);
+    let first_bytes = server.drain_client_events(first).unwrap();
+    let first_state = latest_state(&first_bytes, first_manager, first_window)
+        .expect("first shell publishes its authenticated classification");
+    assert_eq!(first_state.owner_pid, 44);
+    assert_ne!(first_state.flags & shell_window_state_flags::SHELL_OWNED, 0);
+
+    let (replacement, replacement_manager) = bind_shell(&mut server, 45);
+    subscribe_state(&mut server, replacement, replacement_manager, 302);
+    let catchup = server.drain_client_events(replacement).unwrap();
+    let caught_up_first = latest_state(&catchup, replacement_manager, first_window)
+        .expect("replacement catch-up includes the existing shell");
+    assert_eq!(caught_up_first.owner_pid, 44);
+    assert_ne!(
+        caught_up_first.flags & shell_window_state_flags::SHELL_OWNED,
+        0
+    );
+
+    let (_, _, replacement_window) = create_mapped_shell_window(&mut server, replacement);
+    let first_overlap = server.drain_client_events(first).unwrap();
+    let replacement_overlap = server.drain_client_events(replacement).unwrap();
+    for (bytes, manager) in [
+        (first_overlap.as_slice(), first_manager),
+        (replacement_overlap.as_slice(), replacement_manager),
+    ] {
+        let state = latest_state(bytes, manager, replacement_window)
+            .expect("both authenticated subscribers classify the replacement shell");
+        assert_eq!(state.owner_pid, 45);
+        assert_ne!(state.flags & shell_window_state_flags::SHELL_OWNED, 0);
+    }
+
+    let (app, compositor, shm, xdg) = bind_app(&mut server, 701);
+    let (_, app_toplevel, app_window) =
+        create_mapped_window(&mut server, app, compositor, shm, xdg);
+    server
+        .dispatch_request(
+            app,
+            &request(app_toplevel, 2, &string_payload("pmos.shell")),
+        )
+        .unwrap();
+    let app_bytes = server.drain_client_events(replacement).unwrap();
+    let spoof = latest_state(&app_bytes, replacement_manager, app_window)
+        .expect("ordinary app metadata update publishes v2 state");
+    assert_eq!(spoof.app_id, "pmos.shell");
+    assert_eq!(spoof.owner_pid, 701);
+    assert_eq!(spoof.flags & shell_window_state_flags::SHELL_OWNED, 0);
 }
 
 #[test]

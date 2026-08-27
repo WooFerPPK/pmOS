@@ -14,7 +14,7 @@ use toolkit::draw::{Canvas, Color, Rect};
 use toolkit::theme::Theme;
 use toolkit::widget::frame::{
     PointerOutcome, WindowFrame, BORDER_WIDTH, CLOSE_BUTTON_MARGIN, CLOSE_BUTTON_SIZE,
-    TITLEBAR_HEIGHT, TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP,
+    TITLEBAR_HEIGHT, TITLE_TEXT_MARGIN_X, TITLE_TEXT_TRAILING_GAP, WINDOW_CONTROL_WIDTH,
 };
 
 fn rgba(color: Color) -> [u8; 4] {
@@ -171,6 +171,62 @@ fn close_callback_does_not_fire_on_titlebar_or_content_press() {
     assert!(!fired.get());
 }
 
+#[test]
+fn caption_controls_have_distinct_windows_style_hit_targets() {
+    let mut frame = WindowFrame::new(Rect::new(0, 0, 300, 150), "x");
+    let minimize = frame.minimize_button_rect();
+    let maximize = frame.maximize_button_rect();
+    let close = frame.close_button_rect();
+
+    assert_eq!(minimize.width, WINDOW_CONTROL_WIDTH);
+    assert_eq!(maximize.width, WINDOW_CONTROL_WIDTH);
+    assert_eq!(close.width, WINDOW_CONTROL_WIDTH);
+    assert_eq!(minimize.right(), maximize.x);
+    assert_eq!(maximize.right(), close.x);
+
+    assert_eq!(
+        frame.pointer_down(minimize.x + 1, minimize.y + 1),
+        PointerOutcome::Minimize
+    );
+    assert_eq!(
+        frame.pointer_down(maximize.x + 1, maximize.y + 1),
+        PointerOutcome::ToggleMaximize
+    );
+    assert_eq!(
+        frame.pointer_down(close.x + 1, close.y + 1),
+        PointerOutcome::Close
+    );
+}
+
+#[test]
+fn narrow_titlebar_keeps_close_and_drops_secondary_controls() {
+    let frame = WindowFrame::new(Rect::new(0, 0, 80, 40), "Narrow");
+    assert!(!frame.close_button_rect().is_empty());
+    assert!(frame.maximize_button_rect().is_empty());
+    assert!(frame.minimize_button_rect().is_empty());
+    assert!(frame.visible_title_chars() > 0);
+}
+
+#[test]
+fn app_mark_never_paints_under_the_narrow_close_target() {
+    let mark_pixel = (6, (TITLEBAR_HEIGHT - 9) / 2);
+    for (width, mark_visible) in [(31, true), (32, false), (45, false), (46, true)] {
+        let mut canvas = Canvas::new(width, TITLEBAR_HEIGHT);
+        let frame = WindowFrame::new(Rect::new(0, 0, width, TITLEBAR_HEIGHT), "x");
+        frame.draw(&mut canvas);
+        let expected = if mark_visible {
+            rgba(Theme::LIGHT.border_active)
+        } else {
+            rgba(Theme::LIGHT.titlebar_active)
+        };
+        assert_eq!(
+            px(&canvas, mark_pixel.0, mark_pixel.1),
+            expected,
+            "unexpected app-mark visibility at width {width}",
+        );
+    }
+}
+
 // ---- active vs inactive themes ------------------------------------
 
 #[test]
@@ -299,10 +355,55 @@ fn titlebar_text_fully_fits_when_app_id_is_short() {
 
 #[test]
 fn close_button_fits_inside_titlebar() {
-    // Validates the chosen dimensions without relying on a specific
-    // numeric answer.
+    // Caption buttons use the full titlebar interior rather than the old
+    // inset square geometry.
     const {
-        assert!(CLOSE_BUTTON_SIZE + 2 * CLOSE_BUTTON_MARGIN <= TITLEBAR_HEIGHT + CLOSE_BUTTON_SIZE);
-        assert!(CLOSE_BUTTON_SIZE + 2 * BORDER_WIDTH <= TITLEBAR_HEIGHT);
+        assert!(CLOSE_BUTTON_SIZE == WINDOW_CONTROL_WIDTH);
+        assert!(CLOSE_BUTTON_MARGIN == 0);
+        assert!(TITLEBAR_HEIGHT > BORDER_WIDTH);
+    }
+}
+
+#[test]
+fn focus_damage_regions_are_non_overlapping_chrome_only() {
+    let frame = WindowFrame::new(Rect::new(10, 20, 100, 80), "Files");
+    assert_eq!(
+        frame.focus_damage_regions(),
+        vec![
+            Rect::new(10, 20, 100, 22),
+            Rect::new(10, 42, 1, 57),
+            Rect::new(109, 42, 1, 57),
+            Rect::new(10, 99, 100, 1),
+        ]
+    );
+}
+
+#[test]
+fn rasterized_frame_regions_match_full_canvas_crops() {
+    let mut frame = WindowFrame::new(Rect::new(10, 20, 100, 80), "Settings");
+    frame.set_theme(Theme::DARK);
+    frame.set_focused(false);
+    frame.set_maximized(true);
+    let mut full = Canvas::new(130, 120);
+    frame.draw(&mut full);
+
+    for region in frame.focus_damage_regions() {
+        let packed = frame
+            .rasterize_region(region)
+            .expect("frame-owned region rasterizes");
+        let row_bytes = region.width as usize * 4;
+        for row in 0..region.height as usize {
+            for column in 0..region.width as usize {
+                let packed_offset = row * row_bytes + column * 4;
+                assert_eq!(
+                    &packed[packed_offset..packed_offset + 4],
+                    full.pixel(
+                        (region.x as usize + column) as u32,
+                        (region.y as usize + row) as u32,
+                    )
+                    .expect("full crop pixel"),
+                );
+            }
+        }
     }
 }

@@ -51,7 +51,7 @@ pub use display_proto::{
     Opcode, OpcodeError, WireError, HEADER_SIZE,
 };
 pub use server::{
-    HitResult, Server, ServerError, ServerLimits, WindowId,
+    HitResult, OutputDamageRect, PresentationDamage, Server, ServerError, ServerLimits, WindowId,
     MAX_FRAME_CALLBACK_COMPLETIONS_PER_TURN, MAX_SERVER_CLIENTS, MAX_SERVER_ORDINARY_CLIENTS,
     MAX_SERVER_POOL_BYTES, MAX_SERVER_SHELL_CLIENTS, MAX_SERVER_TOPLEVELS,
     MAX_SERVER_TOPLEVEL_METADATA_BYTES, MAX_SERVER_WINDOW_SNAPSHOT_BYTES,

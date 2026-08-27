@@ -55,22 +55,23 @@ const KILL_GRACE_MS = 1_000;
 const RESERVED_INTEGRATION_PORT = 8081;
 const FRAMEBUFFER_WIDTH = 1024;
 const FRAMEBUFFER_HEIGHT = 768;
-const TASKBAR_ENTRY_SAMPLE_Y = 762;
+const TASKBAR_ENTRY_SAMPLE_Y = 740;
 const TASKBAR_LEFT_MARGIN = 4;
 const TASKBAR_LAUNCHER_RESERVED_WIDTH = 86;
 const TASKBAR_CLOCK_RESERVED_WIDTH = 68;
 const TASKBAR_RIGHT_MARGIN = 4;
 const TASKBAR_ENTRY_GAP = 2;
 const TASKBAR_ENTRY_WIDTH = 160;
+const TASKBAR_ENTRY_HEIGHT = 28;
 const TASKBAR_MIN_ENTRY_WIDTH = 112;
 const TASKBAR_PALETTES = {
   focused: [
-    [0xc2, 0xc6, 0xcf, 0xff],
-    [0x22, 0x26, 0x2e, 0xff],
+    [0xe9, 0xe9, 0xe9, 0xff],
+    [0x3a, 0x3a, 0x3a, 0xff],
   ],
   unfocused: [
-    [0xec, 0xee, 0xf4, 0xff],
-    [0x3e, 0x44, 0x4c, 0xff],
+    [0xf9, 0xf9, 0xf9, 0xff],
+    [0x20, 0x20, 0x20, 0xff],
   ],
 };
 const LAUNCHER_MARKER = {
@@ -78,8 +79,8 @@ const LAUNCHER_MARKER = {
   width: 200,
   bottom: 736,
   palettes: [
-    { background: [0xf2, 0xf2, 0xf2], border: [0x3b, 0x5b, 0x8d] },
-    { background: [0x1c, 0x1f, 0x26], border: [0x5b, 0x7c, 0xc2] },
+    { background: [0xf3, 0xf3, 0xf3], border: [0xd0, 0xd0, 0xd0] },
+    { background: [0x20, 0x20, 0x20], border: [0x50, 0x50, 0x50] },
   ],
 };
 const LAUNCHER_REGION = { x: 4, y: 608, width: 200, height: 128 };
@@ -719,6 +720,24 @@ async function framebufferFingerprint(page, region, context) {
   }, region), context, "framebuffer fingerprint read");
 }
 
+async function framebufferRegionPixels(page, region, context) {
+  return awaitWithinContext(() => page.locator("#pmos-fb").evaluate((canvas, sample) => {
+    const drawing = canvas.getContext("2d");
+    if (drawing === null) throw new Error("framebuffer 2d context missing");
+    const bytes = drawing.getImageData(
+      sample.x,
+      sample.y,
+      sample.width,
+      sample.height,
+    ).data;
+    const pixels = [];
+    for (let offset = 0; offset < bytes.length; offset += 4) {
+      pixels.push(Array.from(bytes.slice(offset, offset + 4)));
+    }
+    return pixels;
+  }, region), context, "framebuffer region pixel read");
+}
+
 async function launcherMenuIsOpen(page, context) {
   return awaitWithinContext(() => page.locator("#pmos-fb").evaluate((canvas, marker) => {
     const context = canvas.getContext("2d");
@@ -790,21 +809,47 @@ function taskbarEntryPoint(index, entryCount) {
   };
 }
 
+export function taskbarPixelsMatchLayout(pixels, entryCount, focusedIndex) {
+  if (entryCount === 0) {
+    return pixels.length === TASKBAR_ENTRY_WIDTH * TASKBAR_ENTRY_HEIGHT &&
+      TASKBAR_PALETTES.unfocused.some((palette) =>
+      pixels.every((pixel) =>
+        palette.every((channel, index) => pixel[index] === channel)
+      )
+    );
+  }
+  if (pixels.length !== entryCount) return false;
+  return pixels.every((pixel, index) =>
+    matchesPalette(
+      pixel,
+      index === focusedIndex
+        ? TASKBAR_PALETTES.focused
+        : TASKBAR_PALETTES.unfocused,
+    )
+  );
+}
+
 async function assertTaskbarLayout(page, entryCount, focusedIndex, context, label) {
   return pollUntil(
     async () => {
+      if (entryCount === 0) {
+        const empty = await framebufferRegionPixels(
+          page,
+          {
+            x: 90,
+            y: 738,
+            width: TASKBAR_ENTRY_WIDTH,
+            height: TASKBAR_ENTRY_HEIGHT,
+          },
+          context,
+        );
+        return taskbarPixelsMatchLayout(empty, entryCount, focusedIndex);
+      }
       const pixels = await Promise.all(
         Array.from({ length: entryCount }, (_, index) =>
           framebufferPixel(page, taskbarEntryPoint(index, entryCount), context)),
       );
-      return pixels.every((pixel, index) =>
-        matchesPalette(
-          pixel,
-          index === focusedIndex
-            ? TASKBAR_PALETTES.focused
-            : TASKBAR_PALETTES.unfocused,
-        ),
-      );
+      return taskbarPixelsMatchLayout(pixels, entryCount, focusedIndex);
     },
     { context, timeoutMs: STATE_TIMEOUT_MS, label },
   );
@@ -814,8 +859,8 @@ async function assertRestoredSixAppTaskbar(page, context) {
   return pollUntil(
     async () => {
       const pixels = await Promise.all(
-        Array.from({ length: 7 }, (_, index) =>
-          framebufferPixel(page, taskbarEntryPoint(index, 7), context)),
+        Array.from({ length: 6 }, (_, index) =>
+          framebufferPixel(page, taskbarEntryPoint(index, 6), context)),
       );
       const palettes = pixels.map((pixel) => {
         if (matchesPalette(pixel, TASKBAR_PALETTES.focused)) return "focused";
@@ -826,15 +871,14 @@ async function assertRestoredSixAppTaskbar(page, context) {
         palette === "focused" ? [index] : []
       );
       return focusedIndexes.length === 1 &&
-          focusedIndexes[0] !== 0 &&
-          palettes.filter((palette) => palette === "unfocused").length === 6
+          palettes.filter((palette) => palette === "unfocused").length === 5
         ? { focused_index: focusedIndexes[0], palettes }
         : false;
     },
     {
       context,
       timeoutMs: STATE_TIMEOUT_MS,
-      label: "restored seven-entry six-app taskbar",
+      label: "restored six-app taskbar",
     },
   );
 }
@@ -913,8 +957,8 @@ async function launchApp(page, lines, app, index, context) {
   await waitForLine(lines, logStart, app.started, `${app.name} startup`, context);
   await assertTaskbarLayout(
     page,
-    index + 2,
     index + 1,
+    index,
     context,
     `${app.name} mapped taskbar entry`,
   );
@@ -968,9 +1012,9 @@ async function assertShellOnly(page, lines, shellWorkers, context) {
     launches,
   });
   await assertStableWorkerCount(page, shellWorkers, context, "shell-only worker count");
-  await assertTaskbarLayout(page, 1, 0, context, "shell-only one-entry taskbar");
+  await assertTaskbarLayout(page, 0, -1, context, "shell-only empty taskbar");
   assertHealthyConsole(lines);
-  return { worker_count: shellWorkers, launch_count: 0, taskbar_entries: 1 };
+  return { worker_count: shellWorkers, launch_count: 0, taskbar_entries: 0 };
 }
 
 function appLaunchLines(lines) {
@@ -1009,7 +1053,7 @@ async function assertSixApps(page, lines, launched, shellWorkers, context) {
     context,
     "six apps plus two Terminal shell children",
   );
-  await assertTaskbarLayout(page, 7, 6, context, "seven-entry six-app taskbar");
+  await assertTaskbarLayout(page, 6, 5, context, "six-app taskbar");
   const observations = [];
   for (const app of launched) {
     const row = await waitForLine(
@@ -1039,7 +1083,7 @@ async function assertSixApps(page, lines, launched, shellWorkers, context) {
   assertHealthyConsole(lines);
   return {
     worker_count: shellWorkers + 8,
-    taskbar_entries: 7,
+    taskbar_entries: 6,
     app_pids: pids,
     observations,
   };
@@ -1091,7 +1135,7 @@ async function assertRestoredSixApps(
   assertHealthyConsole(lines);
   return {
     worker_count: shellWorkers + 8,
-    taskbar_entries: 7,
+    taskbar_entries: 6,
     focused_index: taskbar.focused_index,
     taskbar_palettes: taskbar.palettes,
     starts,

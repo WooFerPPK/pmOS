@@ -3,10 +3,10 @@
 //! The shell is the process that holds the `Shell` +
 //! `DisplayClient` + `ProcEnumerate` + `KeymapAdmin`
 //! capabilities (see `abi::cap::initial::DESKTOP_SHELL`).
-//! In production it draws the wallpaper, the taskbar, the
-//! launcher, and the window chrome for every open app; it
-//! is the "root" userland UI process and it is the SINGLE
-//! most replaceable layer in the system (Principle II).
+//! In production it draws the wallpaper, taskbar, and launcher and coordinates
+//! cross-client window management. Applications paint their own client-side
+//! chrome through the toolkit; the shell remains the "root" userland UI
+//! process and the SINGLE most replaceable layer in the system (Principle II).
 //!
 //! This crate is a hybrid lib + bin. The library layer
 //! below is the canonical protocol state machine: a
@@ -82,10 +82,12 @@ pub use session_store::{
 };
 pub use spawn::encode_with_spawn_timezone;
 pub use taskbar::{
-    Taskbar, TaskbarClick, TaskbarEntry, TaskbarError, TASKBAR_CLOCK_RESERVED_WIDTH,
-    TASKBAR_CLOCK_RIGHT_MARGIN, TASKBAR_ENTRY_CONTROL_GAP, TASKBAR_ENTRY_CONTROL_WIDTH,
-    TASKBAR_ENTRY_GAP, TASKBAR_ENTRY_WIDTH, TASKBAR_HEIGHT, TASKBAR_LAUNCHER_RESERVED_WIDTH,
-    TASKBAR_LEFT_MARGIN, TASKBAR_MIN_ENTRY_WIDTH, TASKBAR_OVERFLOW_WIDTH,
+    Taskbar, TaskbarClick, TaskbarEntry, TaskbarError, TASKBAR_APP_MARK_GAP, TASKBAR_APP_MARK_SIZE,
+    TASKBAR_CLOCK_RESERVED_WIDTH, TASKBAR_CLOCK_RIGHT_MARGIN, TASKBAR_ENTRY_CONTROL_GAP,
+    TASKBAR_ENTRY_CONTROL_WIDTH, TASKBAR_ENTRY_GAP, TASKBAR_ENTRY_TEXT_MARGIN, TASKBAR_ENTRY_WIDTH,
+    TASKBAR_FOCUS_INDICATOR_HEIGHT, TASKBAR_FOCUS_INDICATOR_WIDTH, TASKBAR_HEIGHT,
+    TASKBAR_LAUNCHER_RESERVED_WIDTH, TASKBAR_LEFT_MARGIN, TASKBAR_MIN_ENTRY_WIDTH,
+    TASKBAR_OVERFLOW_WIDTH,
 };
 pub use wallpaper::{
     paint_wallpaper, FilesystemWallpaperSource, WallpaperDecodeError, WallpaperImage,
